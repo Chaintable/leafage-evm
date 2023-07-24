@@ -1,0 +1,1 @@
+A lightweight Geth that only retains the state of the most recent 128 blocks, which can only be updated through a specific subscription interface.

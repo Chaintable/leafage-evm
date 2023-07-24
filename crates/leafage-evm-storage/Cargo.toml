@@ -1,0 +1,16 @@
+[package]
+name = "leafage-evm-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+exclude.workspace = true
+
+
+[dependencies]
+revm.workspace = true
+reth-primitives.workspace = true
+leafage-evm-types.workspace = true
+auto_impl.workspace = true
+arc-swap.workspace = true

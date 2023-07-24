@@ -1,0 +1,16 @@
+[package]
+name = "leafage-evm-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+exclude.workspace = true
+
+
+[dependencies]
+revm.workspace = true
+reth-primitives.workspace = true
+reth-rlp.workspace = true
+reth-rlp-derive.workspace = true
+bytes.workspace = true

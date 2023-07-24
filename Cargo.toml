@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.70"
+authors = ["leafage-evm Contributors"]
+license = "MIT OR Apache-2.0"
+exclude = ["benches/", "tests/"]
+
+
+[workspace.dependencies]
+revm = { version = "3.3.0" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v0.1.0-alpha.4" }
+reth-rlp = { git = "https://github.com/paradigmxyz/reth", tag = "v0.1.0-alpha.4" }
+reth-rlp-derive = { git = "https://github.com/paradigmxyz/reth", tag = "v0.1.0-alpha.4" }
+leafage-evm-storage = { path = "crates/leafage-evm-storage" }
+leafage-evm-types = { path = "crates/leafage-evm-types" }
+auto_impl = "1.1.0"
+arc-swap = "1.6.0"
+bytes = "1.4.0"
