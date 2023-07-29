@@ -8,6 +8,8 @@ pub struct BlockInfo {
     pub number: U256,
     /// Block hash.
     pub hash: H256,
+    /// Parent block hash.
+    pub parent_hash: H256,
     /// Block root hash.
     pub root: H256,
     /// Parent block root hash.
@@ -98,7 +100,21 @@ impl Into<AccountInfo> for RawAccount {
     }
 }
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable)]
+impl From<AccountInfo> for RawAccount {
+    fn from(account_info: AccountInfo) -> Self {
+        Self {
+            balance: account_info.balance,
+            nonce: account_info.nonce,
+            code_hash: account_info.code_hash,
+            code: account_info
+                .code
+                .map(|code| code.original_bytes().into())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable, Default)]
 pub struct AccountDiff {
     pub account_addr: Address,
     pub value: Vec<IndexValuePair>,
