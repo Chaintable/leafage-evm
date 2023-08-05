@@ -14,3 +14,5 @@ reth-primitives.workspace = true
 leafage-evm-types.workspace = true
 auto_impl.workspace = true
 arc-swap.workspace = true
+tracing.workspace = true
+dashmap.workspace = true

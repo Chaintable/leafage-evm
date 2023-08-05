@@ -47,7 +47,7 @@ impl Into<BlockEnv> for &BlockInfo {
     }
 }
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct BlockDiff {
     /// Block root hash.
     pub root: H256,
@@ -59,7 +59,7 @@ pub struct BlockDiff {
     pub storage_diff: Vec<AccountDiff>,
 }
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 #[rlp(trailing)]
 pub struct RawAccountChange {
     /// Account address
@@ -68,7 +68,7 @@ pub struct RawAccountChange {
     pub info: Option<RawAccount>,
 }
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct RawAccount {
     /// Account balance
     pub balance: U256,
@@ -114,13 +114,13 @@ impl From<AccountInfo> for RawAccount {
     }
 }
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable, Default)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
 pub struct AccountDiff {
     pub account_addr: Address,
     pub value: Vec<IndexValuePair>,
 }
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct IndexValuePair {
     pub index: U256,
     pub value: U256,
