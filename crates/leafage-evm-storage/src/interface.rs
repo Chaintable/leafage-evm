@@ -18,9 +18,13 @@ pub trait StateDB {
 
     // History related
     fn block_hash(&self, number: U256) -> Result<B256, Self::Error>;
+}
 
+#[auto_impl(&, Box, Arc)]
+pub trait BlockContext {
+    type Error;
     // Block ctx related
-    fn latest_block_info(&self) -> Result<BlockInfo, Self::Error>;
+    fn block_info(&self) -> Result<BlockInfo, Self::Error>;
 }
 
 pub struct WrapDB<T>(T);
@@ -44,15 +48,8 @@ impl<T: StateDB> DatabaseRef for WrapDB<T> {
 #[auto_impl(&, Box)]
 pub trait EvmStorageRead {
     type Error;
-    type StateDB: StateDB;
-    fn state_at(
-        &self,
-        block_arg: BlockId,
-    ) -> Result<Option<(BlockInfo, Self::StateDB)>, Self::Error>;
-
-    fn block_info_at(&self, block_arg: BlockId) -> Result<Option<BlockInfo>, Self::Error> {
-        Ok(self.state_at(block_arg)?.map(|(block_info, _)| block_info))
-    }
+    type StateDB: StateDB + BlockContext<Error = <Self::StateDB as StateDB>::Error>;
+    fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error>;
 }
 
 #[auto_impl(&, Box)]

@@ -1,4 +1,4 @@
-use crate::interface::{EvmStorageWrite, StateDB};
+use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::linked_diff::error::Error;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -7,8 +7,8 @@ use leafage_evm_types::{
 };
 use reth_primitives::H256;
 use revm::primitives::{AccountInfo, Bytecode, B160, B256, U256};
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,43 +23,100 @@ impl<DB> LinkedDiffLayer<DB>
 where
     DB: EvmStorageWrite,
 {
-    pub fn write_disk_and_clear_layers(
-        self: Arc<Self>,
-        depth_limit: usize,
-    ) -> Result<HashSet<H256>, DB::Error> {
-        let mut used_hashes = HashSet::new();
-        let mut depth = 0;
-        let mut cur = self;
-        if cur.is_disk_layer() {
-            return Ok(used_hashes);
+    pub fn flatten_diff_to_cache_layer(self: Arc<Self>) {
+        let cur = self;
+        if cur.is_cache_layer() {
+            return;
         }
-        used_hashes.insert(cur.unwrap_diff_layer().block_info.hash);
-        depth += 1;
-        let mut next = cur.unwrap_diff_layer().next.load().clone();
-        if next.is_disk_layer() {
-            return Ok(used_hashes);
+        let next = cur.unwrap_diff_layer().next.load();
+        if next.is_cache_layer() {
+            return;
         }
-        used_hashes.insert(next.unwrap_diff_layer().block_info.hash);
-        depth += 1;
-        let mut next_next = next.unwrap_diff_layer().next.load().clone();
+        debug_assert!(next.is_diff_layer());
+        let cache = next.unwrap_diff_layer().next.load().clone();
+        debug_assert!(cache.is_cache_layer());
+
+        let cache_layer = cache.unwrap_cache_layer();
+        cache_layer.update(next.unwrap_diff_layer());
+
+        cur.as_ref().unwrap_diff_layer().next.store(cache);
+    }
+
+    pub fn reorg_flatten_diff_to_cache_layer(self: Arc<Self>) -> Arc<Self> {
+        let cur = self;
+        let mut diffs = VecDeque::new();
+        diffs.push_back(cur);
         loop {
-            if next_next.is_disk_layer() {
+            let cur = diffs.back().unwrap();
+            if cur.is_disk_layer() {
                 break;
             }
-            cur = next;
-            next = next_next;
-            depth += 1;
-            next_next = next.unwrap_diff_layer().next.load().clone();
-            used_hashes.insert(next_next.unwrap_diff_layer().block_info.hash);
+            let next = cur.unwrap_diff_layer().next.load().clone();
+            diffs.push_back(next);
         }
-        if depth < depth_limit {
-            return Ok(used_hashes);
+        let disk_layer = diffs.pop_back().unwrap();
+        let cache_layer = Arc::new(LinkedDiffLayer::CacheLayer(CacheLayer::new(disk_layer)));
+        if diffs.is_empty() {
+            return cache_layer;
         }
-        let (next_block_info, next_block_diff) = next.as_ref().unwrap_diff_layer().get_raw();
-        let db = next_next.unwrap_disk_layer();
-        db.update_block(next_block_info, next_block_diff)?;
-        cur.as_ref().unwrap_diff_layer().next.store(next_next);
-        Ok(used_hashes)
+        let cur = diffs.pop_front().unwrap();
+        while !diffs.is_empty() {
+            let diff_layer = diffs.pop_back().unwrap();
+            cache_layer
+                .unwrap_cache_layer()
+                .update(diff_layer.unwrap_diff_layer());
+        }
+        Arc::new(LinkedDiffLayer::DiffLayer(
+            cur.unwrap_diff_layer().fork(cache_layer),
+        ))
+    }
+
+    pub fn cap_diff_to_db(self: Arc<Self>, depth_limit: usize) -> Result<U256, DB::Error> {
+        let cur = self;
+        let mut diffs = VecDeque::new();
+        diffs.push_back(cur);
+        loop {
+            let cur = diffs.back().unwrap();
+            if cur.is_disk_layer() {
+                break;
+            }
+            let next = cur.unwrap_diff_layer().next.load().clone();
+            diffs.push_back(next);
+        }
+        let disk_layer = diffs.pop_back().unwrap();
+        let mut height = U256::ZERO;
+        while diffs.len() > depth_limit {
+            let diff_layer = diffs.pop_back().unwrap();
+            let (next_block_info, next_block_diff) = diff_layer.unwrap_diff_layer().get_raw();
+            if next_block_info.number > height {
+                height = next_block_info.number;
+            }
+            disk_layer
+                .unwrap_disk_layer()
+                .update_block(next_block_info, next_block_diff)?;
+        }
+        Ok(height)
+    }
+
+    pub fn cap_cache_diff(
+        self: Arc<Self>,
+        depth_limit: usize,
+        memory_limit: usize,
+    ) -> Result<(), DB::Error> {
+        let cur = self;
+        if cur.is_disk_layer() {
+            return Ok(());
+        }
+        if cur.is_cache_layer() {
+            let cache_layer = cur.unwrap_cache_layer();
+            cache_layer.pop(depth_limit, memory_limit);
+            return Ok(());
+        }
+        let next = cur.unwrap_diff_layer().next.load().clone();
+        debug_assert!(next.is_diff_layer());
+        let cache_layer = next.unwrap_cache_layer();
+        cache_layer.pop(depth_limit, memory_limit);
+        return Ok(());
     }
 }
 
@@ -155,20 +212,18 @@ impl<DB> CacheLayer<DB> {
         }
     }
 
-    pub fn pop(&self, depth_limit: usize, memory_limit: usize) -> Vec<B256> {
+    pub fn pop(&self, depth_limit: usize, memory_limit: usize) {
         let mut size_change = 0i64;
-        let mut remove_hashes = Vec::new();
         if self.diff_layer_list.lock().unwrap().len() < depth_limit {
-            return remove_hashes;
+            return;
         }
         let mut diff_layer_list = self.diff_layer_list.lock().unwrap();
         loop {
             if self.size.load(std::sync::atomic::Ordering::SeqCst) < memory_limit {
-                return remove_hashes;
+                return;
             }
             let linked_diff_layer = diff_layer_list.pop_back().unwrap();
             let diff_layer = linked_diff_layer.unwrap_diff_layer();
-            remove_hashes.push(diff_layer.block_info.hash);
             for (key, _) in diff_layer.accounts.iter() {
                 let accout_hash = self.accounts.get(key).map(|v| v.block_hash);
                 if let Some(accout_hash) = accout_hash {
@@ -321,6 +376,16 @@ impl<DB> DiffLayer<DB> {
         }
     }
 
+    fn fork(&self, next: Arc<LinkedDiffLayer<DB>>) -> Self {
+        Self {
+            block_info: self.block_info.clone(),
+            accounts: self.accounts.clone(),
+            storage: self.storage.clone(),
+            contracts: self.contracts.clone(),
+            next: ArcSwap::new(next),
+        }
+    }
+
     fn get_raw(&self) -> (BlockInfo, BlockDiff) {
         let mut accounts_diff = Vec::new();
         let mut storage_diff = Vec::new();
@@ -436,10 +501,14 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
             },
         }
     }
-    fn latest_block_info(&self) -> Result<BlockInfo, Self::Error> {
+}
+
+impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
+    type Error = Error<DB::Error>;
+    fn block_info(&self) -> Result<BlockInfo, Self::Error> {
         match self {
             LinkedDiffLayer::DiskLayer(db) => {
-                let res = db.latest_block_info()?;
+                let res = db.block_info()?;
                 Ok(res)
             }
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
