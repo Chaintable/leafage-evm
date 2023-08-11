@@ -14,3 +14,6 @@ revm.workspace = true
 bytes.workspace = true
 alloy-rlp.workspace = true
 alloy-rlp-derive.workspace = true
+serde.workspace = true
+rustc-hex.workspace = true
+hex.workspace = true

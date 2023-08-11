@@ -1,0 +1,15 @@
+[package]
+name = "leafage-evm-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+exclude.workspace = true
+
+
+[dependencies]
+leafage-evm-types.workspace = true
+leafage-evm-storage.workspace = true
+revm.workspace = true
+jsonrpsee.workspace = true

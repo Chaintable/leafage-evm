@@ -1,8 +1,11 @@
+use std::str::FromStr;
+
 use alloy_rlp::{Buf, Decodable, Encodable};
 pub use revm::primitives::{AccountInfo, BlockEnv, Bytecode, Bytes, U256};
 use revm::primitives::{B160, B256};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Deserialize, Serialize)]
 pub struct H256(pub B256);
 
 impl H256 {
@@ -38,6 +41,13 @@ impl Into<B256> for H256 {
     }
 }
 
+impl FromStr for H256 {
+    type Err = rustc_hex::FromHexError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        B256::from_str(s).map(|h| h.into())
+    }
+}
+
 impl Encodable for H256 {
     fn length(&self) -> usize {
         B256::len_bytes()
@@ -55,7 +65,7 @@ impl Decodable for H256 {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Deserialize, Serialize)]
 pub struct H160(pub B160);
 
 impl Default for H160 {
@@ -99,12 +109,11 @@ impl Decodable for H160 {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BlockId {
-    /// A block hash and an optional bool that defines if it's canonical
-    Hash(H256),
-    /// A block number
-    Number(u64),
-    /// The latest block
-    Latest,
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessListItem {
+    pub address: B160,
+    pub storage_keys: Vec<B256>,
 }
+
+pub type AccessList = Vec<AccessListItem>;

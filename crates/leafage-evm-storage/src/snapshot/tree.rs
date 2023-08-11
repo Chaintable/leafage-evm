@@ -2,7 +2,7 @@ use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheLayer, DiffLayer, LinkedDiffLayer};
 use arc_swap::ArcSwap;
-use leafage_evm_types::{BlockId, BlockInfo, BlockStorageDiff, H256, U256};
+use leafage_evm_types::{BlockId, BlockInfo, BlockNumber, BlockStorageDiff, H256, U256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::debug;
@@ -151,19 +151,22 @@ where
                 }
                 Ok(None)
             }
-            BlockId::Number(number) => {
-                let cache = self.cache.load().clone();
-                let block_hash = cache.block_hash(U256::from(number))?;
-                if !block_hash.as_ref().is_zero() {
-                    if let Some(layer) = self.diff_map.read().unwrap().get(&block_hash) {
-                        if layer.is_diff_layer() {
-                            return Ok(Some(layer.clone()));
+            BlockId::Number(number) => match number {
+                BlockNumber::Latest | BlockNumber::Pending => Ok(Some(self.cache.load().clone())),
+                BlockNumber::Number(num) => {
+                    let cache = self.cache.load().clone();
+                    let block_hash = cache.block_hash(U256::from(num))?;
+                    if !block_hash.as_ref().is_zero() {
+                        if let Some(layer) = self.diff_map.read().unwrap().get(&block_hash) {
+                            if layer.is_diff_layer() {
+                                return Ok(Some(layer.clone()));
+                            }
                         }
                     }
+                    Ok(None)
                 }
-                Ok(None)
-            }
-            BlockId::Latest => Ok(Some(self.cache.load().clone())),
+                _ => unreachable!(),
+            },
         }
     }
 }
