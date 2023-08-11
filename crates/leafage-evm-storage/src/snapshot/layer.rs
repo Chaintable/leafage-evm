@@ -1,17 +1,14 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
-use crate::linked_diff::error::Error;
+use crate::snapshot::error::Error;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use leafage_evm_types::{
-    AccountDiff, BlockDiff, BlockInfo, IndexValuePair, RawAccount, RawAccountChange,
+    AccountInfo, AccountStorageDiff, BlockInfo, BlockStorageDiff, Bytecode, IndexValuePair,
+    NewAccount, H160, H256, U256,
 };
-use reth_primitives::H256;
-use revm::primitives::{AccountInfo, Bytecode, B160, B256, U256};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub enum LinkedDiffLayer<DB> {
     DiskLayer(DB),
@@ -190,10 +187,10 @@ impl<T> ValueWithBlockHash<T> {
 }
 
 pub struct CacheLayer<DB> {
-    pub accounts: DashMap<B160, ValueWithBlockHash<Option<AccountInfo>>>,
-    pub storage: DashMap<(B160, U256), ValueWithBlockHash<U256>>,
-    pub contracts: DashMap<B256, ValueWithBlockHash<Bytecode>>,
-    pub block_hashes: DashMap<U256, ValueWithBlockHash<B256>>,
+    pub accounts: DashMap<H160, ValueWithBlockHash<Option<AccountInfo>>>,
+    pub storage: DashMap<(H160, U256), ValueWithBlockHash<U256>>,
+    pub contracts: DashMap<H256, ValueWithBlockHash<Bytecode>>,
+    pub block_hashes: DashMap<U256, ValueWithBlockHash<H256>>,
     pub size: AtomicUsize,
     pub diff_layer_list: Mutex<VecDeque<Arc<LinkedDiffLayer<DB>>>>,
     pub db: ArcSwap<LinkedDiffLayer<DB>>,
@@ -322,22 +319,22 @@ impl<DB> CacheLayer<DB> {
 
 pub struct DiffLayer<DB> {
     pub block_info: BlockInfo,
-    pub accounts: HashMap<B160, Option<AccountInfo>>,
-    pub storage: HashMap<(B160, U256), U256>,
-    pub contracts: HashMap<B256, Bytecode>,
+    pub accounts: HashMap<H160, Option<AccountInfo>>,
+    pub storage: HashMap<(H160, U256), U256>,
+    pub contracts: HashMap<H256, Bytecode>,
     pub next: ArcSwap<LinkedDiffLayer<DB>>,
 }
 
-impl<DB> From<(BlockInfo, BlockDiff, Arc<LinkedDiffLayer<DB>>)> for DiffLayer<DB> {
+impl<DB> From<(BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer<DB>>)> for DiffLayer<DB> {
     fn from(
-        (block_info, block_diff, db): (BlockInfo, BlockDiff, Arc<LinkedDiffLayer<DB>>),
+        (block_info, block_diff, db): (BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer<DB>>),
     ) -> Self {
         Self::new(block_info, block_diff, db)
     }
 }
 
-impl<DB> Into<(BlockInfo, BlockDiff)> for &DiffLayer<DB> {
-    fn into(self) -> (BlockInfo, BlockDiff) {
+impl<DB> Into<(BlockInfo, BlockStorageDiff)> for &DiffLayer<DB> {
+    fn into(self) -> (BlockInfo, BlockStorageDiff) {
         self.get_raw()
     }
 }
@@ -345,21 +342,19 @@ impl<DB> Into<(BlockInfo, BlockDiff)> for &DiffLayer<DB> {
 impl<DB> DiffLayer<DB> {
     pub fn new(
         block_info: BlockInfo,
-        block_diff: BlockDiff,
+        block_diff: BlockStorageDiff,
         next: Arc<LinkedDiffLayer<DB>>,
     ) -> Self {
         let mut accounts = HashMap::new();
         let mut storage = HashMap::new();
         let mut contracts = HashMap::new();
-        for account in block_diff.accounts_diff {
-            let address = account.address;
-            let account_info: Option<AccountInfo> = account.info.map(|info| info.into());
-            if let Some(account_info) = account_info.as_ref() {
-                if let Some(code) = account_info.code.as_ref() {
-                    contracts.insert(account_info.code_hash, code.clone());
-                }
+        for new_account in block_diff.new_accounts {
+            let address = new_account.address;
+            let account_info: AccountInfo = new_account.into();
+            if let Some(code) = account_info.code.as_ref() {
+                contracts.insert(account_info.code_hash.into(), code.clone());
             }
-            accounts.insert(address, account_info);
+            accounts.insert(address, Some(account_info));
         }
         for account_diff in block_diff.storage_diff {
             let address = account_diff.account_addr;
@@ -386,19 +381,22 @@ impl<DB> DiffLayer<DB> {
         }
     }
 
-    fn get_raw(&self) -> (BlockInfo, BlockDiff) {
-        let mut accounts_diff = Vec::new();
+    fn get_raw(&self) -> (BlockInfo, BlockStorageDiff) {
+        let mut new_accounts = Vec::new();
+        let mut deleted_accounts = Vec::new();
         let mut storage_diff = Vec::new();
         for (address, account) in self.accounts.iter() {
-            let info = account.as_ref().map(|info| RawAccount::from(info.clone()));
-            accounts_diff.push(RawAccountChange {
-                address: *address,
-                info,
-            });
+            if let Some(account) = account {
+                new_accounts.push(NewAccount::from((*address, account.clone())));
+            } else {
+                deleted_accounts.push(*address);
+            }
         }
         for ((address, index), value) in self.storage.iter() {
-            let mut account_diff = AccountDiff::default();
-            account_diff.account_addr = *address;
+            let mut account_diff = AccountStorageDiff {
+                account_addr: *address,
+                value: Vec::new(),
+            };
             account_diff.value.push(IndexValuePair {
                 index: *index,
                 value: *value,
@@ -406,10 +404,11 @@ impl<DB> DiffLayer<DB> {
             storage_diff.push(account_diff);
         }
         let block_info = self.block_info.clone();
-        let block_diff = BlockDiff {
-            root: self.block_info.root,
-            parent_root: self.block_info.parent_root,
-            accounts_diff,
+        let block_diff = BlockStorageDiff {
+            hash: self.block_info.hash,
+            parent_hash: self.block_info.parent_hash,
+            new_accounts,
+            deleted_accounts,
             storage_diff,
         };
         return (block_info, block_diff);
@@ -419,7 +418,7 @@ impl<DB> DiffLayer<DB> {
 impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
     type Error = Error<DB::Error>;
 
-    fn basic(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic(&self, address: H160) -> Result<Option<AccountInfo>, Self::Error> {
         match self {
             LinkedDiffLayer::DiskLayer(db) => {
                 let res = db.basic(address)?;
@@ -442,7 +441,7 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
         }
     }
 
-    fn storage(&self, address: B160, index: U256) -> Result<U256, Self::Error> {
+    fn storage(&self, address: H160, index: U256) -> Result<U256, Self::Error> {
         match self {
             LinkedDiffLayer::DiskLayer(db) => {
                 let res = db.storage(address, index)?;
@@ -465,7 +464,7 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
         }
     }
 
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+    fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         match self {
             LinkedDiffLayer::DiskLayer(db) => {
                 let res = db.code_by_hash(code_hash)?;
@@ -482,7 +481,7 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
         }
     }
 
-    fn block_hash(&self, number: U256) -> Result<B256, Self::Error> {
+    fn block_hash(&self, number: U256) -> Result<H256, Self::Error> {
         match self {
             LinkedDiffLayer::DiskLayer(db) => {
                 let res = db.block_hash(number)?;

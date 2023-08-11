@@ -13,9 +13,6 @@ exclude = ["benches/", "tests/"]
 
 [workspace.dependencies]
 revm = { version = "3.3.0" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v0.1.0-alpha.4" }
-reth-rlp = { git = "https://github.com/paradigmxyz/reth", tag = "v0.1.0-alpha.4" }
-reth-rlp-derive = { git = "https://github.com/paradigmxyz/reth", tag = "v0.1.0-alpha.4" }
 leafage-evm-storage = { path = "crates/leafage-evm-storage" }
 leafage-evm-types = { path = "crates/leafage-evm-types" }
 auto_impl = "1.1.0"
@@ -24,3 +21,11 @@ bytes = "1.4.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 dashmap = "5.5.0"
+rocksdb = "0.21.0"
+alloy-rlp = "0.3.2"
+alloy-rlp-derive = "0.3.2"
+ruint = { version = "1.10.1", features = [
+    "primitive-types",
+    "rlp",
+    "alloy-rlp",
+] }

@@ -1,9 +1,8 @@
 use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
-use crate::linked_diff::error::Error;
-use crate::linked_diff::layer::{CacheLayer, DiffLayer, LinkedDiffLayer};
+use crate::snapshot::error::Error;
+use crate::snapshot::layer::{CacheLayer, DiffLayer, LinkedDiffLayer};
 use arc_swap::ArcSwap;
-use leafage_evm_types::{BlockDiff, BlockInfo};
-use reth_primitives::{BlockId, H256, U256};
+use leafage_evm_types::{BlockId, BlockInfo, BlockStorageDiff, H256, U256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::debug;
@@ -13,8 +12,8 @@ const DEFAULT_DIFF_TREE_DEPTH_LIMIT: usize = 128;
 // 1GB
 const DEFAULT_MEMORY_LIMIT: usize = 1 << 30;
 
-/// LinkedDiffTree is a tree structure that stores the state of the EVM.
-pub struct LinkedDiffTree<DB> {
+/// SnapshotTree is a tree structure that stores the state of the EVM.
+pub struct SnapshotTree<DB> {
     /// latest is a single linked list that stores the latest state of the EVM.
     /// two cases:
     /// 1. bottom disk db (when init).
@@ -29,7 +28,7 @@ pub struct LinkedDiffTree<DB> {
     diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer<DB>>>>,
 }
 
-impl<DB> LinkedDiffTree<DB> {
+impl<DB> SnapshotTree<DB> {
     fn clear_diff_map(&self, bottom_height: U256) {
         if bottom_height == U256::ZERO {
             return;
@@ -50,7 +49,7 @@ impl<DB> LinkedDiffTree<DB> {
     }
 }
 
-impl<DB> LinkedDiffTree<DB>
+impl<DB> SnapshotTree<DB>
 where
     DB: StateDB + BlockContext<Error = <DB as StateDB>::Error>,
 {
@@ -70,7 +69,7 @@ where
     }
 }
 
-impl<DB> EvmStorageWrite for LinkedDiffTree<DB>
+impl<DB> EvmStorageWrite for SnapshotTree<DB>
 where
     DB: EvmStorageWrite + BlockContext<Error = <DB as EvmStorageWrite>::Error>,
 {
@@ -78,13 +77,13 @@ where
     fn update_block(
         &self,
         block_info: BlockInfo,
-        block_diff: BlockDiff,
+        block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         if let Some(_) = self.diff_map.read().unwrap().get(&block_info.hash) {
-            debug!("block {} already exists", block_info.hash);
+            debug!("block {:?} already exists", block_info.hash);
             return Ok(());
         }
-        if let Some(parent_layer) = self.diff_map.read().unwrap().get(&block_info.parent_root) {
+        if let Some(parent_layer) = self.diff_map.read().unwrap().get(&block_info.parent_hash) {
             let new_diff_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
                 block_info.clone(),
                 block_diff.clone(),
@@ -129,14 +128,14 @@ where
     }
 }
 
-impl<DB: BlockContext> BlockContext for LinkedDiffTree<DB> {
+impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
     type Error = Error<DB::Error>;
     fn block_info(&self) -> Result<BlockInfo, Self::Error> {
         self.cache.load().block_info()
     }
 }
 
-impl<DB> EvmStorageRead for LinkedDiffTree<DB>
+impl<DB> EvmStorageRead for SnapshotTree<DB>
 where
     DB: StateDB + BlockContext<Error = <DB as StateDB>::Error>,
 {
@@ -145,7 +144,7 @@ where
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
         match block_arg {
             BlockId::Hash(hash) => {
-                if let Some(layer) = self.diff_map.read().unwrap().get(&hash.block_hash) {
+                if let Some(layer) = self.diff_map.read().unwrap().get(&hash) {
                     if layer.is_diff_layer() {
                         return Ok(Some(layer.clone()));
                     }
@@ -153,22 +152,18 @@ where
                 Ok(None)
             }
             BlockId::Number(number) => {
-                if number.is_latest() || number.is_pending() {
-                    return Ok(Some(self.cache.load().clone()));
-                }
-                if let Some(number) = number.as_number() {
-                    let cache = self.cache.load().clone();
-                    let block_hash = cache.block_hash(U256::from(number))?;
-                    if !block_hash.is_zero() {
-                        if let Some(layer) = self.diff_map.read().unwrap().get(&block_hash) {
-                            if layer.is_diff_layer() {
-                                return Ok(Some(layer.clone()));
-                            }
+                let cache = self.cache.load().clone();
+                let block_hash = cache.block_hash(U256::from(number))?;
+                if !block_hash.as_ref().is_zero() {
+                    if let Some(layer) = self.diff_map.read().unwrap().get(&block_hash) {
+                        if layer.is_diff_layer() {
+                            return Ok(Some(layer.clone()));
                         }
                     }
                 }
                 Ok(None)
             }
+            BlockId::Latest => Ok(Some(self.cache.load().clone())),
         }
     }
 }

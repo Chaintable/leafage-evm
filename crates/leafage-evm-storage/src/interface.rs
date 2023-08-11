@@ -1,23 +1,21 @@
 use auto_impl::auto_impl;
-use leafage_evm_types::{BlockDiff, BlockInfo};
-use reth_primitives::BlockId;
+use leafage_evm_types::{
+    AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, H160, H256, U256,
+};
 use revm::db::DatabaseRef;
-use revm::primitives::{AccountInfo, Bytecode, B160, B256, U256};
+use revm::primitives::{B160, B256};
 
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
     type Error;
-    /// Whether account at address exists.
-    //fn exists(&self, address: B160) -> Option<AccountInfo>;
     /// Get basic account information.
-    fn basic(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error>;
+    fn basic(&self, address: H160) -> Result<Option<AccountInfo>, Self::Error>;
     /// Get account code by its hash
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error>;
+    fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error>;
     /// Get storage value of address at index.
-    fn storage(&self, address: B160, index: U256) -> Result<U256, Self::Error>;
-
+    fn storage(&self, address: H160, index: U256) -> Result<U256, Self::Error>;
     // History related
-    fn block_hash(&self, number: U256) -> Result<B256, Self::Error>;
+    fn block_hash(&self, number: U256) -> Result<H256, Self::Error>;
 }
 
 #[auto_impl(&, Box, Arc)]
@@ -32,16 +30,16 @@ pub struct WrapDB<T>(T);
 impl<T: StateDB> DatabaseRef for WrapDB<T> {
     type Error = T::Error;
     fn basic(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
-        self.0.basic(address)
+        self.0.basic(address.into())
     }
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.0.code_by_hash(code_hash)
+        self.0.code_by_hash(code_hash.into())
     }
     fn storage(&self, address: B160, index: U256) -> Result<U256, Self::Error> {
-        self.0.storage(address, index)
+        self.0.storage(address.into(), index)
     }
     fn block_hash(&self, number: U256) -> Result<B256, Self::Error> {
-        self.0.block_hash(number)
+        self.0.block_hash(number).map(|h| h.into())
     }
 }
 
@@ -55,6 +53,9 @@ pub trait EvmStorageRead {
 #[auto_impl(&, Box)]
 pub trait EvmStorageWrite {
     type Error;
-    fn update_block(&self, block_info: BlockInfo, block_diff: BlockDiff)
-        -> Result<(), Self::Error>;
+    fn update_block(
+        &self,
+        block_info: BlockInfo,
+        block_diff: BlockStorageDiff,
+    ) -> Result<(), Self::Error>;
 }

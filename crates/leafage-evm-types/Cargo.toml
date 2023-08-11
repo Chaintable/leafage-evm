@@ -9,8 +9,8 @@ exclude.workspace = true
 
 
 [dependencies]
+ruint.workspace = true
 revm.workspace = true
-reth-primitives.workspace = true
-reth-rlp.workspace = true
-reth-rlp-derive.workspace = true
 bytes.workspace = true
+alloy-rlp.workspace = true
+alloy-rlp-derive.workspace = true

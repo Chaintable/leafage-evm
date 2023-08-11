@@ -9,10 +9,15 @@ exclude.workspace = true
 
 
 [dependencies]
-revm.workspace = true
-reth-primitives.workspace = true
 leafage-evm-types.workspace = true
+revm.workspace = true
+alloy-rlp.workspace = true
 auto_impl.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
+rocksdb = { workspace = true, optional = true }
+
+[features]
+default = []
+with-rocksdb = ["rocksdb"]
