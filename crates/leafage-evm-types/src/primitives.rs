@@ -112,8 +112,26 @@ impl Decodable for H160 {
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessListItem {
-    pub address: B160,
-    pub storage_keys: Vec<B256>,
+    pub address: H160,
+    pub storage_keys: Vec<H256>,
 }
 
 pub type AccessList = Vec<AccessListItem>;
+
+pub fn access_list_flattened(access_list: AccessList) -> Vec<(B160, Vec<U256>)> {
+    access_list
+        .into_iter()
+        .map(|item| {
+            (
+                item.address.into(),
+                item.storage_keys
+                    .into_iter()
+                    .map(|v| {
+                        let v: B256 = v.into();
+                        U256::from_be_bytes(v.0)
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}

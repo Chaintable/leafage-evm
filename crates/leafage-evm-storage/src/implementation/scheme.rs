@@ -8,7 +8,7 @@ use revm::primitives::{B160, B256};
 
 #[auto_impl(&, Box)]
 pub trait StateDBRead {
-    type Error;
+    type Error: std::error::Error;
     /// latest block hash
     fn read_latest_block_hash(&self) -> Result<Option<H256>, Self::Error>;
 
@@ -30,7 +30,7 @@ pub trait StateDBRead {
 
 #[auto_impl(& , Box)]
 pub trait StateDBWrite {
-    type Error;
+    type Error: std::error::Error;
     /// latest block hash
     fn write_latest_block_hash(&self, block_hash: H256) -> Result<(), Self::Error>;
 

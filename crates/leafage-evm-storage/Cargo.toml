@@ -9,6 +9,7 @@ exclude.workspace = true
 
 
 [dependencies]
+thiserror.workspace = true
 leafage-evm-types.workspace = true
 revm.workspace = true
 alloy-rlp.workspace = true

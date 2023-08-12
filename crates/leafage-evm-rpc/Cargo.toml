@@ -13,3 +13,5 @@ leafage-evm-types.workspace = true
 leafage-evm-storage.workspace = true
 revm.workspace = true
 jsonrpsee.workspace = true
+hex.workspace = true
+async-trait.workspace = true

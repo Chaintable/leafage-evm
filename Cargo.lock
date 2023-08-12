@@ -1270,6 +1270,8 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 name = "leafage-evm-rpc"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "hex",
  "jsonrpsee",
  "leafage-evm-storage",
  "leafage-evm-types",
@@ -1287,6 +1289,7 @@ dependencies = [
  "leafage-evm-types",
  "revm",
  "rocksdb",
+ "thiserror",
  "tracing",
 ]
 

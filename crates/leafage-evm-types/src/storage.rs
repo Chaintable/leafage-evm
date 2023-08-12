@@ -24,7 +24,7 @@ pub struct BlockInfo {
     pub prevrandao: H256,
 }
 
-impl Into<BlockEnv> for &BlockInfo {
+impl Into<BlockEnv> for BlockInfo {
     fn into(self) -> BlockEnv {
         BlockEnv {
             number: self.number,

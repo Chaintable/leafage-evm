@@ -1,6 +1,6 @@
 use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
-use crate::snapshot::layer::{CacheLayer, DiffLayer, LinkedDiffLayer};
+use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
 use arc_swap::ArcSwap;
 use leafage_evm_types::{BlockId, BlockInfo, BlockNumber, BlockStorageDiff, H256, U256};
 use std::collections::HashMap;
@@ -19,11 +19,6 @@ pub struct SnapshotTree<DB> {
     /// 1. bottom disk db (when init).
     /// 2. top diff -> (top-1) diif -> ... -> bottom disk db.
     latest: ArcSwap<LinkedDiffLayer<DB>>,
-    /// cache is a single linked list that stores the latest state of the EVM.
-    /// two cases:
-    /// 1. flatten cache map  -> bottom disk db (init).
-    /// 2. top diff -> flatten cache map -> bottom disk db. (more than one diff layer)
-    cache: ArcSwap<LinkedDiffLayer<DB>>,
     /// diff_map stores all the diff layer of the EVM.
     diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer<DB>>>>,
 }
@@ -51,19 +46,17 @@ impl<DB> SnapshotTree<DB> {
 
 impl<DB> SnapshotTree<DB>
 where
-    DB: StateDB + BlockContext<Error = <DB as StateDB>::Error>,
+    DB: StateDB
+        + EvmStorageWrite<Error = <DB as StateDB>::Error>
+        + BlockContext<Error = <DB as StateDB>::Error>,
 {
     pub fn new(db: DB) -> Result<Self, <DB as StateDB>::Error> {
         let mut diffs = HashMap::new();
         let info = db.block_info()?;
-        let disk_layer = Arc::new(LinkedDiffLayer::DiskLayer(db));
-        diffs.insert(info.hash, disk_layer.clone());
-        let cache_layer = Arc::new(LinkedDiffLayer::CacheLayer(CacheLayer::new(
-            disk_layer.clone(),
-        )));
+        let cache_layer = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(db)));
+        diffs.insert(info.hash, cache_layer.clone());
         Ok(Self {
-            latest: ArcSwap::new(disk_layer.clone()),
-            cache: ArcSwap::new(cache_layer.clone()),
+            latest: ArcSwap::new(cache_layer),
             diff_map: RwLock::new(diffs),
         })
     }
@@ -100,26 +93,9 @@ where
             if block_info.number < latest_block_info.number {
                 return Ok(());
             }
-            if block_info.parent_hash == latest_block_info.hash {
-                // normal import
-                self.latest.store(new_diff_layer.clone());
-                let new_cache_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
-                    block_info.clone(),
-                    block_diff.clone(),
-                    self.cache.load().clone(),
-                )));
-                self.cache.store(new_cache_layer.clone());
-                new_cache_layer.flatten_diff_to_cache_layer();
-            } else {
-                // reorg import
-                self.latest.store(new_diff_layer.clone());
-                let new_cache_layer = new_diff_layer.reorg_flatten_diff_to_cache_layer();
-                self.cache.store(new_cache_layer);
-            }
-            let cache_layer = self.cache.load().clone();
-            let latest = self.latest.load().clone();
-            let bottom_height = latest.cap_diff_to_db(DEFAULT_DIFF_TREE_DEPTH_LIMIT)?;
-            cache_layer.cap_cache_diff(DEFAULT_DIFF_TREE_DEPTH_LIMIT, DEFAULT_MEMORY_LIMIT)?;
+            self.latest.store(new_diff_layer.clone());
+            let bottom_height = new_diff_layer
+                .cap_diff_to_db(DEFAULT_DIFF_TREE_DEPTH_LIMIT, DEFAULT_MEMORY_LIMIT)?;
             self.clear_diff_map(bottom_height);
             Ok(())
         } else {
@@ -131,13 +107,13 @@ where
 impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
     type Error = Error<DB::Error>;
     fn block_info(&self) -> Result<BlockInfo, Self::Error> {
-        self.cache.load().block_info()
+        self.latest.load().block_info()
     }
 }
 
 impl<DB> EvmStorageRead for SnapshotTree<DB>
 where
-    DB: StateDB + BlockContext<Error = <DB as StateDB>::Error>,
+    DB: StateDB + BlockContext<Error = <DB as StateDB>::Error> + Send + Sync,
 {
     type Error = Error<<DB as StateDB>::Error>;
     type StateDB = Arc<LinkedDiffLayer<DB>>;
@@ -152,18 +128,23 @@ where
                 Ok(None)
             }
             BlockId::Number(number) => match number {
-                BlockNumber::Latest | BlockNumber::Pending => Ok(Some(self.cache.load().clone())),
+                BlockNumber::Latest | BlockNumber::Pending => Ok(Some(self.latest.load().clone())),
                 BlockNumber::Number(num) => {
-                    let cache = self.cache.load().clone();
-                    let block_hash = cache.block_hash(U256::from(num))?;
-                    if !block_hash.as_ref().is_zero() {
-                        if let Some(layer) = self.diff_map.read().unwrap().get(&block_hash) {
-                            if layer.is_diff_layer() {
-                                return Ok(Some(layer.clone()));
+                    let mut layer = self.latest.load().clone();
+                    loop {
+                        if layer.is_diff_layer() {
+                            let diff_layer = layer.unwrap_diff_layer();
+                            if diff_layer.block_info.number == num {
+                                return Ok(Some(layer));
+                            } else if diff_layer.block_info.number < num {
+                                return Ok(None);
+                            } else {
+                                layer = diff_layer.next.load().clone();
                             }
+                        } else {
+                            return Ok(None);
                         }
                     }
-                    Ok(None)
                 }
                 _ => unreachable!(),
             },

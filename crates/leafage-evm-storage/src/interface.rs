@@ -7,7 +7,7 @@ use revm::primitives::{B160, B256};
 
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
-    type Error;
+    type Error: std::error::Error;
     /// Get basic account information.
     fn basic(&self, address: H160) -> Result<Option<AccountInfo>, Self::Error>;
     /// Get account code by its hash
@@ -20,12 +20,12 @@ pub trait StateDB {
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockContext {
-    type Error;
+    type Error: std::error::Error;
     // Block ctx related
     fn block_info(&self) -> Result<BlockInfo, Self::Error>;
 }
 
-pub struct WrapDB<T>(T);
+pub struct WrapDB<T>(pub T);
 
 impl<T: StateDB> DatabaseRef for WrapDB<T> {
     type Error = T::Error;
@@ -45,14 +45,14 @@ impl<T: StateDB> DatabaseRef for WrapDB<T> {
 
 #[auto_impl(&, Box)]
 pub trait EvmStorageRead {
-    type Error;
-    type StateDB: StateDB + BlockContext<Error = <Self::StateDB as StateDB>::Error>;
+    type Error: std::error::Error;
+    type StateDB: StateDB + BlockContext<Error = <Self::StateDB as StateDB>::Error> + Send + Sync;
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error>;
 }
 
 #[auto_impl(&, Box)]
 pub trait EvmStorageWrite {
-    type Error;
+    type Error: std::error::Error;
     fn update_block(
         &self,
         block_info: BlockInfo,

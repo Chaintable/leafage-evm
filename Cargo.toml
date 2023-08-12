@@ -12,7 +12,13 @@ exclude = ["benches/", "tests/"]
 
 
 [workspace.dependencies]
-revm = { version = "3.3.0", features = ["serde"] }
+revm = { version = "3.3.0", features = [
+    "serde",
+    "optional_eip3607",
+    "optional_no_base_fee",
+    "optional_balance_check",
+    "optional_block_gas_limit",
+] }
 leafage-evm-storage = { path = "crates/leafage-evm-storage" }
 leafage-evm-types = { path = "crates/leafage-evm-types" }
 auto_impl = "1.1.0"
@@ -33,3 +39,5 @@ jsonrpsee = { version = "0.18", features = ["server", "client", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 rustc-hex = "2.1.0"
 hex = "0.4.3"
+thiserror = "1.0.43"
+async-trait = "0.1.68"
