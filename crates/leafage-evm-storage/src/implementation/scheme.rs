@@ -8,7 +8,7 @@ use revm::primitives::{B160, B256};
 
 #[auto_impl(&, Box)]
 pub trait StateDBRead {
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send + Sync + 'static;
     /// latest block hash
     fn read_latest_block_hash(&self) -> Result<Option<H256>, Self::Error>;
 
@@ -30,7 +30,10 @@ pub trait StateDBRead {
 
 #[auto_impl(& , Box)]
 pub trait StateDBWrite {
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn before_block(&self) -> Result<(), Self::Error>;
+
     /// latest block hash
     fn write_latest_block_hash(&self, block_hash: H256) -> Result<(), Self::Error>;
 
@@ -52,6 +55,8 @@ pub trait StateDBWrite {
 
     /// account address | storage index -> storage value
     fn write_storage(&self, key: (H160, U256), value: U256) -> Result<(), Self::Error>;
+
+    fn after_block(&self) -> Result<(), Self::Error>;
 }
 
 struct DBWrapper<T>(T);
@@ -109,6 +114,7 @@ where
         block_info: BlockInfo,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
+        self.0.before_block()?;
         self.0.write_block_num(block_info.number, block_info.hash)?;
         let hash = block_info.hash;
         self.0.write_block_info(block_info)?;
@@ -130,6 +136,7 @@ where
             }
         }
         self.0.write_latest_block_hash(hash)?;
+        self.0.after_block()?;
         Ok(())
     }
 }

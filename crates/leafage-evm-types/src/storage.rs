@@ -1,7 +1,8 @@
 use crate::primitives::{AccountInfo, BlockEnv, Bytecode, Bytes, H160, H256, U256};
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable, Clone)]
+#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable, Clone, Serialize, Deserialize)]
 pub struct BlockInfo {
     /// Block number.
     pub number: U256,
@@ -33,10 +34,10 @@ impl Into<BlockEnv> for BlockInfo {
             difficulty: self.difficulty,
             basefee: self.basefee,
             gas_limit: self.gas_limit,
-            prevrandao: if self.prevrandao.as_ref().is_zero() {
-                None
-            } else {
+            prevrandao: if self.difficulty == U256::ZERO {
                 Some(self.prevrandao.into())
+            } else {
+                None
             },
         }
     }

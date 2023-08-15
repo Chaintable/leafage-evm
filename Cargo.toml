@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["bin/leafage-evm", "crates/*"]
 resolver = "2"
 
 [workspace.package]
@@ -21,11 +21,12 @@ revm = { version = "3.3.0", features = [
 ] }
 leafage-evm-storage = { path = "crates/leafage-evm-storage" }
 leafage-evm-types = { path = "crates/leafage-evm-types" }
+leafage-evm-rpc = { path = "crates/leafage-evm-rpc" }
 auto_impl = "1.1.0"
 arc-swap = "1.6.0"
 bytes = "1.4.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "5.5.0"
 rocksdb = "0.21.0"
 alloy-rlp = "0.3.2"
@@ -41,3 +42,8 @@ rustc-hex = "2.1.0"
 hex = "0.4.3"
 thiserror = "1.0.43"
 async-trait = "0.1.68"
+ethers-core = "2.0.8"
+anyhow = "1.0.72"
+tokio = { version = "1.29", features = ["full"] }
+clap = { version = "4.3.21", features = ["derive"] }
+serde_json = "1.0"

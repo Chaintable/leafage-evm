@@ -12,6 +12,7 @@ pub(crate) fn internal_rpc_err(
     rpc_err(jsonrpsee::types::error::INTERNAL_ERROR_CODE, msg, None)
 }
 
+#[allow(dead_code)]
 /// Constructs an internal JSON-RPC error with data
 pub(crate) fn internal_rpc_err_with_data(
     msg: impl Into<String>,
@@ -24,6 +25,7 @@ pub(crate) fn internal_rpc_err_with_data(
     )
 }
 
+#[allow(dead_code)]
 /// Constructs an internal JSON-RPC error with code and message
 pub(crate) fn rpc_error_with_code(
     code: i32,

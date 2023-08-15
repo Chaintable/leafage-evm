@@ -15,3 +15,4 @@ revm.workspace = true
 jsonrpsee.workspace = true
 hex.workspace = true
 async-trait.workspace = true
+ethers-core.workspace = true

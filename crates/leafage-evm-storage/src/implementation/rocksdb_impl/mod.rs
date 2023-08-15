@@ -322,6 +322,7 @@ impl EvmStorageWrite for DataBase {
             }
         }
         self.write_latest_block_hash(&mut write_batch, hash)?;
+        self.db.write(write_batch)?;
         Ok(())
     }
 }
