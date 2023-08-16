@@ -1,4 +1,4 @@
-use crate::standalone;
+use crate::{migrate, standalone};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::future::Future;
@@ -25,12 +25,15 @@ pub(crate) enum Commands {
     /// Start the node
     #[command(name = "standalone")]
     Standalone(standalone::Command),
+    #[command(name = "migrate")]
+    Migrate(migrate::Command),
 }
 
 impl Commands {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
             Commands::Standalone(mut cmd) => cmd.run().await,
+            Commands::Migrate(mut cmd) => cmd.run().await,
         }
     }
 }

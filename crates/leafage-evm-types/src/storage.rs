@@ -14,13 +14,13 @@ pub struct BlockInfo {
     /// Address where we are going to send gas spend
     pub coinbase: H160,
     /// Timestamp of block.
-    pub timestamp: U256,
+    pub timestamp: u64,
     /// Difficulty is removed and not used after Paris (aka TheMerge). Value is replaced with prevrandao.
     pub difficulty: U256,
     /// Basefee is added in EIP1559 London upgrade
-    pub basefee: U256,
+    pub base_fee: U256,
     /// Gas limit of block.
-    pub gas_limit: U256,
+    pub gas_limit: u64,
     /// Prevrandao is used after Paris (aka TheMerge) instead of the difficulty value.
     pub prevrandao: H256,
 }
@@ -30,10 +30,10 @@ impl Into<BlockEnv> for BlockInfo {
         BlockEnv {
             number: self.number,
             coinbase: self.coinbase.into(),
-            timestamp: self.timestamp,
+            timestamp: U256::from(self.timestamp),
             difficulty: self.difficulty,
-            basefee: self.basefee,
-            gas_limit: self.gas_limit,
+            basefee: self.base_fee,
+            gas_limit: U256::from(self.gas_limit),
             prevrandao: if self.difficulty == U256::ZERO {
                 Some(self.prevrandao.into())
             } else {

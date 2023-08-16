@@ -2,7 +2,7 @@ use crate::api::EthApiServer;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use crate::implementation::utils::{create_txn_env, decode_revert_reason};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, EvmStorageRead, WrapDB};
+use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{BlockId, CallRequest, RpcBytes};
 use revm::primitives::{CfgEnv, Env, ExecutionResult};
 use revm::EVM;
@@ -38,7 +38,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         let env = Env { block, cfg, tx };
         // let state =
         let mut evm = EVM::with_env(env);
-        evm.database(WrapDB(state));
+        evm.database(EvmStorageWrapper(state));
         let res = evm
             .transact_ref()
             .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;

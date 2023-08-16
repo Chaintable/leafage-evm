@@ -12,8 +12,23 @@ impl H256 {
     pub fn zero() -> Self {
         Self(B256::zero())
     }
+
     pub fn from_slice(bytes: &[u8]) -> Self {
+        if bytes.len() < 32 {
+            let mut b = [0u8; 32];
+            b[32 - bytes.len()..].copy_from_slice(bytes);
+            return Self(B256::from_slice(&b));
+        }
         Self(B256::from_slice(bytes))
+    }
+
+    pub fn trim_left_zero(&self) -> Vec<u8> {
+        let bytes = self.0.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] == 0 {
+            i += 1;
+        }
+        bytes[i..].to_vec()
     }
 }
 
@@ -67,6 +82,12 @@ impl Decodable for H256 {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Deserialize, Serialize)]
 pub struct H160(pub B160);
+
+impl H160 {
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self(B160::from_slice(bytes))
+    }
+}
 
 impl Default for H160 {
     fn default() -> Self {
@@ -134,4 +155,12 @@ pub fn access_list_flattened(access_list: AccessList) -> Vec<(B160, Vec<U256>)> 
             )
         })
         .collect()
+}
+
+pub fn trim_left_zero_bytes(bytes: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == 0 {
+        i += 1;
+    }
+    &bytes[i..]
 }

@@ -13,10 +13,12 @@ thiserror.workspace = true
 leafage-evm-types.workspace = true
 revm.workspace = true
 alloy-rlp.workspace = true
+alloy-rlp-derive.workspace = true
 auto_impl.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
+leveldb-rs.workspace = true
 rocksdb = { workspace = true, optional = true }
 
 [features]
