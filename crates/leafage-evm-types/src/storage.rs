@@ -1,7 +1,6 @@
 use crate::primitives::{AccountInfo, BlockEnv, Bytecode, Bytes, H160, H256, U256};
-use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
+use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
-
 #[derive(Debug, PartialEq, RlpDecodable, RlpEncodable, Clone, Serialize, Deserialize)]
 pub struct BlockInfo {
     /// Block number.
@@ -28,13 +27,13 @@ pub struct BlockInfo {
 impl Into<BlockEnv> for BlockInfo {
     fn into(self) -> BlockEnv {
         BlockEnv {
-            number: self.number,
+            number: self.number.into(),
             coinbase: self.coinbase.into(),
-            timestamp: U256::from(self.timestamp),
-            difficulty: self.difficulty,
-            basefee: self.base_fee,
-            gas_limit: U256::from(self.gas_limit),
-            prevrandao: if self.difficulty == U256::ZERO {
+            timestamp: U256::from(self.timestamp).into(),
+            difficulty: self.difficulty.into(),
+            basefee: self.base_fee.into(),
+            gas_limit: U256::from(self.gas_limit).into(),
+            prevrandao: if self.difficulty.is_zero() {
                 Some(self.prevrandao.into())
             } else {
                 None
@@ -74,7 +73,7 @@ pub struct NewAccount {
 impl Into<AccountInfo> for NewAccount {
     fn into(self) -> AccountInfo {
         AccountInfo {
-            balance: self.balance,
+            balance: self.balance.into(),
             nonce: self.nonce,
             code_hash: self.code_hash.into(),
             code: if self.code.is_empty() {
@@ -82,7 +81,7 @@ impl Into<AccountInfo> for NewAccount {
             } else {
                 unsafe {
                     Some(Bytecode::new_raw_with_hash(
-                        self.code.into(),
+                        self.code.0,
                         self.code_hash.into(),
                     ))
                 }
@@ -95,7 +94,7 @@ impl From<(H160, AccountInfo)> for NewAccount {
     fn from((address, account_info): (H160, AccountInfo)) -> Self {
         Self {
             address: address.into(),
-            balance: account_info.balance,
+            balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.into(),
             code: account_info

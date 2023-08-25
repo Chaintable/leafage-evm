@@ -3,5 +3,5 @@ pub use api::{EthApiClient, EthApiServer, LeafAgeApiClient, LeafAgeApiServer};
 
 mod error;
 
-mod implementation;
-pub use implementation::{ApiBuilder, EthApiImpl};
+mod api_impl;
+pub use api_impl::{ApiBuilder, EthApiImpl};

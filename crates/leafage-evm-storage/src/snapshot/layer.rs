@@ -7,8 +7,8 @@ use leafage_evm_types::{
     NewAccount, H160, H256, U256,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+use tracing::info;
 
 pub enum LinkedDiffLayer<DB> {
     CacheDiskLayer(CacheDiskLayer<DB>),
@@ -22,7 +22,7 @@ where
     pub fn cap_diff_to_db(
         self: Arc<Self>,
         depth_limit: usize,
-        memory_limit: usize,
+        max_items: usize,
     ) -> Result<U256, DB::Error> {
         let cur = self;
         let mut diffs = VecDeque::new();
@@ -36,16 +36,14 @@ where
             diffs.push_back(next);
         }
         let cache_layer = diffs.pop_back().unwrap();
-        let mut bottom_num = U256::ZERO;
+        let mut bottom_num = U256::zero();
         while diffs.len() > depth_limit {
             let diff_layer = diffs.pop_back().unwrap();
-            if diff_layer.unwrap_diff_layer().block_info.number > bottom_num {
+            if diff_layer.unwrap_diff_layer().block_info.number.0 > bottom_num.0 {
                 bottom_num = diff_layer.unwrap_diff_layer().block_info.number;
             }
-            cache_layer
-                .unwrap_cache_layer()
-                .update(&diff_layer.unwrap_diff_layer())?;
-            cache_layer.unwrap_cache_layer().pop(memory_limit);
+            cache_layer.unwrap_cache_layer().update(diff_layer)?;
+            cache_layer.unwrap_cache_layer().pop(max_items);
         }
         Ok(bottom_num)
     }
@@ -69,10 +67,26 @@ impl<DB> LinkedDiffLayer<DB> {
     }
 
     #[inline]
+    pub fn diff_layer(&self) -> Option<&DiffLayer<DB>> {
+        match self {
+            LinkedDiffLayer::DiffLayer(diff) => Some(diff),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn unwrap_diff_layer(&self) -> &DiffLayer<DB> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => diff,
             _ => panic!("unwrap_diff_layer"),
+        }
+    }
+
+    #[inline]
+    pub fn cache_layer(&self) -> Option<&CacheDiskLayer<DB>> {
+        match self {
+            LinkedDiffLayer::CacheDiskLayer(cache) => Some(cache),
+            _ => None,
         }
     }
 
@@ -109,7 +123,7 @@ pub struct CacheDiskLayer<DB> {
     pub storage: DashMap<(H160, U256), ValueWithBlockHash<U256>>,
     pub contracts: DashMap<H256, ValueWithBlockHash<Bytecode>>,
     pub block_hashes: DashMap<U256, ValueWithBlockHash<H256>>,
-    pub size: AtomicUsize,
+    /// The diff layer list is sorted from the newest to the oldest
     pub diff_layer_list: Mutex<VecDeque<Arc<LinkedDiffLayer<DB>>>>,
     pub db: DB,
 }
@@ -121,28 +135,31 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
             storage: DashMap::new(),
             contracts: DashMap::new(),
             block_hashes: DashMap::new(),
-            size: AtomicUsize::new(0),
             diff_layer_list: Mutex::new(VecDeque::new()),
             db,
         }
     }
 
-    pub fn pop(&self, memory_limit: usize) {
-        let mut size_change = 0i64;
-        let mut diff_layer_list = self.diff_layer_list.lock().unwrap();
+    pub fn len(&self) -> usize {
+        self.accounts.len() + self.storage.len() + self.contracts.len() + self.block_hashes.len()
+    }
+
+    pub fn pop(&self, max_items: usize) {
         loop {
-            if self.size.load(std::sync::atomic::Ordering::SeqCst) < memory_limit {
-                return;
+            if self.len() <= max_items {
+                break;
             }
-            let linked_diff_layer = diff_layer_list.pop_back().unwrap();
+            let linked_diff_layer = self.diff_layer_list.lock().unwrap().pop_back().unwrap();
             let diff_layer = linked_diff_layer.unwrap_diff_layer();
+            info!(target: "storage",
+                "cache pop diff layer, block number: {}, block hash: {}",
+                diff_layer.block_info.number, diff_layer.block_info.hash
+            );
             for (key, _) in diff_layer.accounts.iter() {
                 let accout_hash = self.accounts.get(key).map(|v| v.block_hash);
                 if let Some(accout_hash) = accout_hash {
                     if accout_hash == diff_layer.block_info.hash {
-                        let value = self.accounts.remove(key).unwrap();
-                        size_change -= std::mem::size_of_val(&key) as i64;
-                        size_change -= std::mem::size_of_val(&value) as i64;
+                        self.accounts.remove(key);
                     }
                 }
             }
@@ -150,9 +167,7 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
                 let storage_hash = self.storage.get(key).map(|v| v.block_hash);
                 if let Some(storage_hash) = storage_hash {
                     if storage_hash == diff_layer.block_info.hash {
-                        let value = self.storage.remove(key).unwrap();
-                        size_change -= std::mem::size_of_val(&value) as i64;
-                        size_change -= std::mem::size_of_val(&key) as i64;
+                        self.storage.remove(key);
                     }
                 }
             }
@@ -160,9 +175,7 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
                 let contract_hash = self.contracts.get(key).map(|v| v.block_hash);
                 if let Some(contract_hash) = contract_hash {
                     if contract_hash == diff_layer.block_info.hash {
-                        let value = self.contracts.remove(key).unwrap();
-                        size_change -= std::mem::size_of_val(&key) as i64;
-                        size_change -= std::mem::size_of_val(&value) as i64;
+                        self.contracts.remove(key);
                     }
                 }
             }
@@ -172,62 +185,29 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
                 .map(|v| v.block_hash);
             if let Some(block_hash) = block_hash {
                 if block_hash == diff_layer.block_info.hash {
-                    let value = self.block_hashes.remove(&diff_layer.block_info.number);
-                    size_change -= std::mem::size_of_val(&diff_layer.block_info.number) as i64;
-                    size_change -= std::mem::size_of_val(&value) as i64;
+                    self.block_hashes.remove(&diff_layer.block_info.number);
                 }
-            }
-            if size_change > 0 {
-                self.size
-                    .fetch_add(size_change as usize, std::sync::atomic::Ordering::SeqCst);
-            } else {
-                self.size
-                    .fetch_sub(-size_change as usize, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }
 
-    pub fn update(&self, diff_layer: &DiffLayer<DB>) -> Result<(), DB::Error> {
-        let mut size_change = 0i64;
+    pub fn update(&self, linked_layer: Arc<LinkedDiffLayer<DB>>) -> Result<(), DB::Error> {
+        self.diff_layer_list
+            .lock()
+            .unwrap()
+            .push_front(linked_layer.clone());
+        let diff_layer = linked_layer.unwrap_diff_layer();
         for (key, value) in diff_layer.accounts.iter() {
-            let old_value = self.accounts.remove(&key);
-            if let Some(old_value) = old_value {
-                size_change -= std::mem::size_of_val(&key) as i64;
-                size_change -= std::mem::size_of_val(&old_value) as i64;
-            }
             let value = ValueWithBlockHash::new(value.clone(), diff_layer.block_info.hash);
-            size_change += std::mem::size_of_val(&key) as i64;
-            size_change += std::mem::size_of_val(&value) as i64;
             self.accounts.insert(key.clone(), value);
         }
         for (key, value) in diff_layer.storage.iter() {
-            let old_value = self.storage.remove(&key);
-            if let Some(old_value) = old_value {
-                size_change -= std::mem::size_of_val(&key) as i64;
-                size_change -= std::mem::size_of_val(&old_value) as i64;
-            }
             let value = ValueWithBlockHash::new(value.clone(), diff_layer.block_info.hash);
-            size_change += std::mem::size_of_val(&key) as i64;
-            size_change += std::mem::size_of_val(&value) as i64;
             self.storage.insert(key.clone(), value);
         }
         for (key, value) in diff_layer.contracts.iter() {
-            let old_value = self.contracts.remove(&key);
-            if let Some(old_value) = old_value {
-                size_change -= std::mem::size_of_val(&key) as i64;
-                size_change -= std::mem::size_of_val(&old_value) as i64;
-            }
             let value = ValueWithBlockHash::new(value.clone(), diff_layer.block_info.hash);
-            size_change += std::mem::size_of_val(&key) as i64;
-            size_change += std::mem::size_of_val(&value) as i64;
             self.contracts.insert(key.clone(), value);
-        }
-        if size_change > 0 {
-            self.size
-                .fetch_add(size_change as usize, std::sync::atomic::Ordering::SeqCst);
-        } else {
-            self.size
-                .fetch_sub(-size_change as usize, std::sync::atomic::Ordering::SeqCst);
         }
         let (block_info, block_diff) = diff_layer.get_info_diff();
         self.db.update_block(block_info, block_diff)
@@ -405,10 +385,12 @@ impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {
-                let layer_list = cache.diff_layer_list.lock().unwrap();
-                let last = layer_list.back().unwrap();
-                let diff = last.unwrap_diff_layer();
-                Ok(diff.block_info.clone())
+                let last_diff = cache.diff_layer_list.lock().unwrap().front().cloned();
+                if let Some(last_diff) = last_diff {
+                    return Ok(last_diff.unwrap_diff_layer().block_info.clone());
+                }
+                let res = cache.db.block_info()?;
+                Ok(res)
             }
         }
     }

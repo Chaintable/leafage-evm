@@ -1,12 +1,12 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
-use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
     AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H160, H256, U256,
 };
+use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
 
 #[auto_impl(&, Box)]
-pub trait StateDBRead {
+pub trait StateDBRead: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     /// latest block hash
     fn read_latest_block_hash(&self) -> Result<H256, Self::Error>;
@@ -15,7 +15,7 @@ pub trait StateDBRead {
     fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Self::Error>;
 
     /// block num -> block hash
-    fn read_block_num(&self, block_num: U256) -> Result<H256, Self::Error>;
+    fn read_block_hash(&self, block_num: U256) -> Result<H256, Self::Error>;
 
     /// account address -> raw account
     fn read_account(&self, address: H160) -> Result<Option<NewAccount>, Self::Error>;
@@ -27,35 +27,61 @@ pub trait StateDBRead {
     fn read_storage(&self, address: H160, key: U256) -> Result<U256, Self::Error>;
 }
 
-#[auto_impl(& , Box)]
-pub trait StateDBWrite {
+#[auto_impl(& , Box, Arc)]
+pub trait StateDBWrite: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
+    type DBWriteBatch: Send;
 
-    fn prepare_write_batch(&self) -> Result<(), Self::Error>;
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Self::Error>;
 
     /// latest block hash
-    fn write_latest_block_hash(&self, block_hash: H256) -> Result<(), Self::Error>;
+    fn write_latest_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_hash: H256,
+    ) -> Result<(), Self::Error>;
 
     /// block hash -> block info
-    fn write_block_info(&self, block_info: BlockInfo) -> Result<(), Self::Error>;
+    fn write_block_info(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_info: BlockInfo,
+    ) -> Result<(), Self::Error>;
 
     /// block num -> block hash
-    fn write_block_num(&self, block_num: U256, block_hash: H256) -> Result<(), Self::Error>;
+    fn write_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_num: U256,
+        block_hash: H256,
+    ) -> Result<(), Self::Error>;
 
     /// account address -> raw account
     fn write_account(
         &self,
+        batch: &mut Self::DBWriteBatch,
         address: H160,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Self::Error>;
 
     /// code hash -> code
-    fn write_code(&self, code_hash: H256, code: Bytes) -> Result<(), Self::Error>;
+    fn write_code(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        code_hash: H256,
+        code: Bytes,
+    ) -> Result<(), Self::Error>;
 
     /// account address | storage index -> storage value
-    fn write_storage(&self, address: H160, key: U256, value: U256) -> Result<(), Self::Error>;
+    fn write_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H160,
+        key: U256,
+        value: U256,
+    ) -> Result<(), Self::Error>;
 
-    fn commit(&self) -> Result<(), Self::Error>;
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error>;
 }
 
 pub struct DBWrapper<T>(pub T);
@@ -98,7 +124,7 @@ where
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         let code = self.0.read_code(code_hash.into())?;
         if let Some(code) = code {
-            Ok(Bytecode::new_raw(code.into()))
+            Ok(Bytecode::new_raw(code.0))
         } else {
             Ok(Bytecode::default())
         }
@@ -110,7 +136,7 @@ where
 
     // History related
     fn block_hash(&self, number: U256) -> Result<H256, Self::Error> {
-        Ok(self.0.read_block_num(number)?.into())
+        Ok(self.0.read_block_hash(number)?.into())
     }
 }
 
@@ -125,36 +151,40 @@ where
         block_info: BlockInfo,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
-        self.0.prepare_write_batch()?;
-        self.0.write_block_num(block_info.number, block_info.hash)?;
+        let mut batch = self.0.prepare_write_batch()?;
+        self.0
+            .write_block_hash(&mut batch, block_info.number, block_info.hash)?;
         let hash = block_info.hash;
-        self.0.write_block_info(block_info)?;
+        self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.new_accounts {
-            if !account.code_hash.as_ref().is_zero() {
-                self.0.write_code(account.code_hash, account.code.clone())?;
+            if !account.code_hash.is_zero() {
+                self.0
+                    .write_code(&mut batch, account.code_hash, account.code.clone())?;
             }
-            self.0.write_account(account.address, Some(account))?;
+            self.0
+                .write_account(&mut batch, account.address, Some(account))?;
         }
         for account in block_diff.deleted_accounts {
-            self.0.write_account(account, None)?;
+            self.0.write_account(&mut batch, account, None)?;
         }
         for account_diff in block_diff.storage_diff {
             for index_value_pair in account_diff.value {
                 self.0.write_storage(
+                    &mut batch,
                     account_diff.account_addr,
                     index_value_pair.index,
                     index_value_pair.value,
                 )?;
             }
         }
-        self.0.write_latest_block_hash(hash)?;
-        self.0.commit()?;
+        self.0.write_latest_block_hash(&mut batch, hash)?;
+        self.0.commit(batch)?;
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
-pub(crate) struct SlimAccount {
+pub struct SlimAccount {
     /// Account balance
     pub balance: U256,
     /// Account nonce

@@ -1,5 +1,5 @@
 use crate::api::EthApiServer;
-use crate::implementation::EthApiImpl;
+use crate::api_impl::EthApiImpl;
 use jsonrpsee::{
     core::Error,
     server::{ServerBuilder, ServerHandle},

@@ -3,7 +3,7 @@ use crate::updater::Updater;
 use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
-use leafage_evm_storage::{LevelDBStorage, RocksDBStorage, SnapshotTree, StateDBWrapper};
+use leafage_evm_storage::{RocksDBStorage, SnapshotTree, StateDBWrapper};
 use revm::primitives::CfgEnv;
 use serde_json::from_str;
 use std::fs;
@@ -27,7 +27,7 @@ pub struct Command {
 
     /// The type of database to use for this node.
     /// Default: rocksdb
-    /// current support rocksdb and leveldb
+    /// current support rocksdb
     #[arg(long, default_value = "rocksdb")]
     db_type: String,
 
@@ -52,16 +52,6 @@ impl Command {
         jsonrpsee::server::ServerHandle,
     )> {
         match self.db_type.as_str() {
-            "leveldb" => {
-                let db = StateDBWrapper(LevelDBStorage::open(self.db_path.as_path()));
-                let snaps = Arc::new(SnapshotTree::new(db)?);
-                let updater = Updater::new(snaps.clone(), self.rpc_addr.clone())?;
-                let updater_handle = updater.start();
-                let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
-                    .build_and_run(&self.listen_addr)
-                    .await?;
-                Ok((updater_handle, rpc_handle))
-            }
             "rocksdb" => {
                 let db = StateDBWrapper(RocksDBStorage::open(self.db_path.as_path()));
                 let snaps = Arc::new(SnapshotTree::new(db)?);

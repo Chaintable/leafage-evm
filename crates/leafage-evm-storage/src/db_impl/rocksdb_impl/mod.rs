@@ -1,24 +1,23 @@
-use crate::scheme::{SlimAccount, StateDBRead, StateDBWrite};
-use alloy_rlp::{Decodable, Encodable};
-use leafage_evm_types::{BlockInfo, Bytes, NewAccount, H160, H256, U256};
+use crate::db::{SlimAccount, StateDBRead, StateDBWrite};
+use leafage_evm_types::{trim_left_zero_bytes, BlockInfo, Bytes, NewAccount, H160, H256, U256};
+use open_fastrlp::{Decodable, Encodable};
 use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Error, Options, WriteBatch, DB};
 use std::path::Path;
-use std::sync::Mutex;
 
 #[repr(u16)]
 #[derive(Debug)]
 enum StorageTypeColumn {
-    LatestBlockHash,
+    LatestBlockHash = 1,
     // block hash -> block info
-    BlockHashToBlockInfo,
+    BlockHashToBlockInfo = 2,
     // block num -> block hash
-    BlockNumToBlockHash,
+    BlockNumToBlockHash = 3,
     // address -> account
-    AddressToAccount,
+    AddressToAccount = 4,
     // address || storage index -> storage
-    AddressToStorage,
+    AddressToStorage = 5,
     // code hash -> code
-    HashToCode,
+    HashToCode = 6,
 }
 
 impl StorageTypeColumn {
@@ -36,17 +35,19 @@ impl StorageTypeColumn {
 
 pub struct DataBase {
     db: DB,
-    write_batch: Mutex<Option<WriteBatch>>,
 }
 
 impl StateDBRead for DataBase {
     type Error = Error;
-    fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        let latest_block_hash_cf = self
+    fn read_block_hash(&self, block_num: U256) -> Result<H256, Error> {
+        let block_num_to_block_hash_cf = self
             .db
-            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
-        let block_hash_bytes = self.db.get_cf(latest_block_hash_cf, [1u8].to_vec())?;
+        let block_num_bytes: [u8; 32] = block_num.into();
+        let block_hash_bytes = self
+            .db
+            .get_cf(block_num_to_block_hash_cf, block_num_bytes)?;
         if block_hash_bytes.is_none() {
             return Ok(H256::zero());
         }
@@ -60,7 +61,7 @@ impl StateDBRead for DataBase {
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
-        let block_hash_bytes = block_hash.as_ref().as_bytes();
+        let block_hash_bytes = block_hash.as_bytes();
         let block_info_bytes = self
             .db
             .get_cf(block_hash_to_block_info_cf, block_hash_bytes)?;
@@ -73,60 +74,12 @@ impl StateDBRead for DataBase {
         Ok(Some(block_info))
     }
 
-    fn read_block_num(&self, block_num: U256) -> Result<H256, Error> {
-        let block_num_to_block_hash_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
-            .unwrap();
-        let block_num_bytes = block_num.as_le_bytes();
-        let block_hash_bytes = self
-            .db
-            .get_cf(block_num_to_block_hash_cf, block_num_bytes)?;
-        if block_hash_bytes.is_none() {
-            return Ok(H256::zero());
-        }
-        let block_hash_bytes = block_hash_bytes.unwrap();
-        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
-        Ok(block_hash)
-    }
-
-    fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
-        let address_to_code_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::HashToCode.to_str())
-            .unwrap();
-        let code_hash_bytes = code_hash.as_ref().as_bytes();
-        let code = self.db.get_cf(address_to_code_cf, code_hash_bytes)?;
-        if code.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(Bytes::from(code.unwrap())))
-    }
-
-    fn read_storage(&self, address: H160, key: U256) -> Result<U256, Error> {
-        let address_to_storage_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-        let address_bytes = address.as_ref().as_bytes();
-        let key_bytes = key.as_le_bytes_trimmed();
-        let key_bytes = [address_bytes, key_bytes.as_ref()].concat();
-        let value_bytes = self.db.get_cf(address_to_storage_cf, key_bytes)?;
-        if value_bytes.is_none() {
-            return Ok(U256::ZERO);
-        }
-        let value_bytes = value_bytes.unwrap();
-        let value_array: [u8; U256::BYTES] = value_bytes.as_slice().try_into().unwrap();
-        let value = U256::from_le_bytes(value_array);
-        Ok(value)
-    }
-
     fn read_account(&self, address: H160) -> Result<Option<NewAccount>, Error> {
         let address_to_account_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
-        let address_bytes = address.as_ref().as_bytes();
+        let address_bytes = address.as_bytes();
         let raw_account_bytes = self.db.get_cf(address_to_account_cf, address_bytes)?;
         if raw_account_bytes.is_none() {
             return Ok(None);
@@ -143,22 +96,73 @@ impl StateDBRead for DataBase {
         };
         Ok(Some(account))
     }
+
+    fn read_storage(&self, address: H160, key: U256) -> Result<U256, Error> {
+        let address_to_storage_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let address_bytes = address.as_bytes();
+        let key_bytes: [u8; 32] = key.into();
+        let value_bytes = self.db.get_cf(
+            address_to_storage_cf,
+            [address_bytes, trim_left_zero_bytes(&key_bytes)].concat(),
+        )?;
+        if value_bytes.is_none() {
+            return Ok(U256::zero());
+        }
+        let value_bytes = value_bytes.unwrap();
+        let value = U256::from_little_endian(value_bytes.as_slice());
+        Ok(value)
+    }
+
+    fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
+        let address_to_code_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::HashToCode.to_str())
+            .unwrap();
+        let code_hash_bytes = code_hash.as_bytes();
+        let code = self.db.get_cf(address_to_code_cf, code_hash_bytes)?;
+        if code.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Bytes::from(code.unwrap())))
+    }
+
+    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+        let latest_block_hash_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        let block_hash_bytes = self.db.get_cf(latest_block_hash_cf, [1u8].to_vec())?;
+        if block_hash_bytes.is_none() {
+            return Ok(H256::zero());
+        }
+        let block_hash_bytes = block_hash_bytes.unwrap();
+        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
+        Ok(block_hash)
+    }
 }
 
 impl StateDBWrite for DataBase {
     type Error = Error;
-    fn prepare_write_batch(&self) -> Result<(), Self::Error> {
-        *self.write_batch.lock().unwrap() = Some(WriteBatch::default());
-        Ok(())
+    type DBWriteBatch = WriteBatch;
+    fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
+        Ok(WriteBatch::default())
     }
-    fn write_block_num(&self, block_num: U256, block_hash: H256) -> Result<(), Self::Error> {
+    fn write_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_num: U256,
+        block_hash: H256,
+    ) -> Result<(), Self::Error> {
         let block_num_to_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
-        let block_hash_bytes = block_hash.as_ref().as_bytes();
-        let block_num_bytes = block_num.as_le_bytes();
-        self.write_batch.lock().unwrap().as_mut().unwrap().put_cf(
+        let block_hash_bytes = block_hash.as_bytes();
+        let block_num_bytes: [u8; 32] = block_num.into();
+        batch.put_cf(
             block_num_to_block_hash_cf,
             block_num_bytes,
             block_hash_bytes,
@@ -166,16 +170,20 @@ impl StateDBWrite for DataBase {
         Ok(())
     }
 
-    fn write_block_info(&self, block_info: BlockInfo) -> Result<(), Error> {
+    fn write_block_info(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_info: BlockInfo,
+    ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
 
-        let block_hash_bytes = block_info.hash.as_ref().as_bytes();
+        let block_hash_bytes = block_info.hash.as_bytes();
         let mut block_info_bytes = Vec::new();
         block_info.encode(&mut block_info_bytes);
-        self.write_batch.lock().unwrap().as_mut().unwrap().put_cf(
+        batch.put_cf(
             block_hash_to_block_info_cf,
             block_hash_bytes,
             block_info_bytes,
@@ -183,80 +191,80 @@ impl StateDBWrite for DataBase {
         Ok(())
     }
 
-    fn write_account(&self, address: H160, raw_account: Option<NewAccount>) -> Result<(), Error> {
+    fn write_account(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H160,
+        raw_account: Option<NewAccount>,
+    ) -> Result<(), Error> {
         let address_to_account_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
-        let address_bytes = address.as_ref().as_bytes();
+        let address_bytes = address.as_bytes();
         if let Some(raw_account) = raw_account {
             let raw_account: SlimAccount = raw_account.into();
             let mut raw_account_bytes = Vec::new();
             raw_account.encode(&mut raw_account_bytes);
-            self.write_batch.lock().unwrap().as_mut().unwrap().put_cf(
-                address_to_account_cf,
-                address_bytes,
-                raw_account_bytes,
-            );
+            batch.put_cf(address_to_account_cf, address_bytes, raw_account_bytes);
         } else {
-            self.write_batch
-                .lock()
-                .unwrap()
-                .as_mut()
-                .unwrap()
-                .delete_cf(address_to_account_cf, address_bytes);
+            batch.delete_cf(address_to_account_cf, address_bytes);
         }
         Ok(())
     }
 
-    fn write_storage(&self, address: H160, key: U256, value: U256) -> Result<(), Error> {
+    fn write_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H160,
+        key: U256,
+        value: U256,
+    ) -> Result<(), Error> {
         let address_to_storage_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
             .unwrap();
-        let address_bytes = address.as_ref().as_bytes();
-        let key_bytes = key.as_le_slice();
-        let key_bytes = [address_bytes, key_bytes].concat();
-        let value_bytes = value.as_le_bytes_trimmed();
-        self.write_batch.lock().unwrap().as_mut().unwrap().put_cf(
+        let address_bytes = address.as_bytes();
+        let key_bytes: [u8; 32] = key.into();
+        let value_bytes: [u8; 32] = value.into();
+        batch.put_cf(
             address_to_storage_cf,
-            key_bytes,
+            [address_bytes, &key_bytes].concat(),
             value_bytes,
         );
         Ok(())
     }
 
-    fn write_code(&self, code_hash: H256, code: Bytes) -> Result<(), Error> {
+    fn write_code(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        code_hash: H256,
+        code: Bytes,
+    ) -> Result<(), Error> {
         let address_to_code_cf = self
             .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
-        let code_hash_bytes = code_hash.as_ref().as_bytes();
-        self.write_batch.lock().unwrap().as_mut().unwrap().put_cf(
-            address_to_code_cf,
-            code_hash_bytes,
-            code,
-        );
+        let code_hash_bytes = code_hash.as_bytes();
+        batch.put_cf(address_to_code_cf, code_hash_bytes, code);
         Ok(())
     }
 
-    fn write_latest_block_hash(&self, block_hash: H256) -> Result<(), Error> {
+    fn write_latest_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_hash: H256,
+    ) -> Result<(), Error> {
         let latest_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        self.write_batch.lock().unwrap().as_mut().unwrap().put_cf(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            block_hash.as_ref().as_bytes(),
-        );
+        batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_bytes());
         Ok(())
     }
 
-    fn commit(&self) -> Result<(), Self::Error> {
-        if let Some(write_batch) = self.write_batch.lock().unwrap().take() {
-            self.db.write(write_batch)?;
-        }
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
+        self.db.write(batch)?;
         Ok(())
     }
 }
@@ -307,9 +315,6 @@ impl DataBase {
             hash_to_code_cf,
         ];
         let db = DB::open_cf_descriptors(&db_opts, path, cfs).unwrap();
-        Self {
-            db,
-            write_batch: Mutex::new(None),
-        }
+        Self { db }
     }
 }

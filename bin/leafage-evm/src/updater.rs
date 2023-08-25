@@ -1,9 +1,9 @@
-use alloy_rlp::Decodable;
 use anyhow::{bail, Result};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::LeafAgeApiClient;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite, SnapshotTree, StateDB};
-use leafage_evm_types::{BlockId, BlockNumber, BlockStorageDiff, U256};
+use leafage_evm_types::{BlockId, BlockNumber, BlockStorageDiff};
+use open_fastrlp::Decodable;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -31,7 +31,8 @@ where
 
     async fn update(&self) -> Result<()> {
         let current_block_info = self.snaps.block_info()?;
-        let next_block_number = BlockNumber::Number(current_block_info.number + U256::from(1));
+        let next_block_number =
+            BlockNumber::Number((current_block_info.number.as_u64() + 1).into());
         let mut next_block_infos = self
             .rpc_client
             .block_info(BlockId::Number(next_block_number), 1)
@@ -47,7 +48,7 @@ where
                 .rpc_client
                 .block_info(
                     BlockId::Number(BlockNumber::Number(
-                        next_block_infos[0].number - U256::from(128),
+                        (next_block_infos[0].number.as_u64() - 128).into(),
                     )),
                     128,
                 )

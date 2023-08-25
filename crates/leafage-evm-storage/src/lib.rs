@@ -1,5 +1,5 @@
-mod implementation;
-pub use implementation::*;
+mod db_impl;
+pub use db_impl::*;
 
 mod interface;
 pub use interface::{
@@ -9,5 +9,8 @@ pub use interface::{
 mod snapshot;
 pub use snapshot::SnapshotTree;
 
-mod scheme;
-pub use scheme::{DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};
+mod db;
+pub use db::{DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};
+
+mod migrate;
+pub use migrate::{FileSource, MigateStat};

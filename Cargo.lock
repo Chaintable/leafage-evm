@@ -49,17 +49,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloy-rlp-derive"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aa5bb468bc7c46e0c5074d418f575262ff79451242e5ac1380121ed4e23c4fd"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.28",
-]
-
-[[package]]
 name = "android-tzdata"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -541,15 +530,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2da6da31387c7e4ef160ffab6d5e7f00c42626fe39aea70a7b0f1773f7dd6c1b"
 
 [[package]]
-name = "cmake"
-version = "0.1.50"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31c789563b815f77f4250caee12365734369f942439b7defd71e18a48197130"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,12 +852,6 @@ dependencies = [
  "rand_core",
  "subtle",
 ]
-
-[[package]]
-name = "ffi-opaque"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec54ac60a7f2ee9a97cad9946f9bf629a3bc6a7ae59e68983dc9318f5a54b81a"
 
 [[package]]
 name = "fixed-hash"
@@ -1543,13 +1517,13 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 name = "leafage-evm"
 version = "0.0.1"
 dependencies = [
- "alloy-rlp",
  "anyhow",
  "clap",
  "jsonrpsee",
  "leafage-evm-rpc",
  "leafage-evm-storage",
  "leafage-evm-types",
+ "open-fastrlp",
  "revm",
  "serde_json",
  "tokio",
@@ -1563,7 +1537,6 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "ethers-core",
- "hex",
  "jsonrpsee",
  "leafage-evm-storage",
  "leafage-evm-types",
@@ -1574,16 +1547,18 @@ dependencies = [
 name = "leafage-evm-storage"
 version = "0.0.1"
 dependencies = [
- "alloy-rlp",
- "alloy-rlp-derive",
+ "anyhow",
  "arc-swap",
+ "async-trait",
  "auto_impl",
  "dashmap",
  "leafage-evm-types",
- "leveldb-rs",
+ "open-fastrlp",
+ "open-fastrlp-derive",
  "revm",
  "rocksdb",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
@@ -1591,37 +1566,11 @@ dependencies = [
 name = "leafage-evm-types"
 version = "0.0.1"
 dependencies = [
- "alloy-rlp",
- "alloy-rlp-derive",
- "bytes",
  "ethers-core",
- "hex",
+ "open-fastrlp",
+ "open-fastrlp-derive",
  "revm",
- "ruint",
- "rustc-hex",
  "serde",
-]
-
-[[package]]
-name = "leveldb-rs"
-version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f36afe09512aea8fa9e4f1e59f5cedfb79e631bbfa050c26ff2c1f5f3e398a2"
-dependencies = [
- "leveldb-sys",
- "libc",
-]
-
-[[package]]
-name = "leveldb-sys"
-version = "2.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd94a4d0242a437e5e41a27c782b69a624469ca1c4d1e5cb3c337f74a8031d4"
-dependencies = [
- "cmake",
- "ffi-opaque",
- "libc",
- "num_cpus",
 ]
 
 [[package]]

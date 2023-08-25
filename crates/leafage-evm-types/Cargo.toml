@@ -9,12 +9,8 @@ exclude.workspace = true
 
 
 [dependencies]
-ruint.workspace = true
 revm.workspace = true
-bytes.workspace = true
-alloy-rlp.workspace = true
-alloy-rlp-derive.workspace = true
 serde.workspace = true
-rustc-hex.workspace = true
-hex.workspace = true
 ethers-core.workspace = true
+open-fastrlp.workspace = true 
+open-fastrlp-derive.workspace  = true

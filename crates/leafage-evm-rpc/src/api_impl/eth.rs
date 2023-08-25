@@ -1,9 +1,9 @@
 use crate::api::EthApiServer;
+use crate::api_impl::utils::{create_txn_env, decode_revert_reason};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
-use crate::implementation::utils::{create_txn_env, decode_revert_reason};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
-use leafage_evm_types::{BlockId, CallRequest, RpcBytes};
+use leafage_evm_types::{BlockId, Bytes, CallRequest};
 use revm::primitives::{CfgEnv, Env, ExecutionResult};
 use revm::EVM;
 
@@ -17,7 +17,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         Self { db, cfg }
     }
 
-    pub async fn call_impl(&self, request: CallRequest, block_id: BlockId) -> RpcResult<RpcBytes> {
+    pub async fn call_impl(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
         let mut cfg = self.cfg.clone();
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
@@ -61,7 +61,7 @@ impl<DB> EthApiServer for EthApiImpl<DB>
 where
     DB: EvmStorageRead + Send + Sync + 'static,
 {
-    async fn call(&self, request: CallRequest, block_id: BlockId) -> RpcResult<RpcBytes> {
+    async fn call(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
         self.call_impl(request, block_id).await
     }
 }
