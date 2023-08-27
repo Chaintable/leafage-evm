@@ -1541,6 +1541,7 @@ dependencies = [
  "leafage-evm-storage",
  "leafage-evm-types",
  "revm",
+ "serde_json",
 ]
 
 [[package]]
@@ -1552,11 +1553,13 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "dashmap",
+ "ethers-core",
  "leafage-evm-types",
  "open-fastrlp",
  "open-fastrlp-derive",
  "revm",
  "rocksdb",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

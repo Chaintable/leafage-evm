@@ -9,31 +9,29 @@ use serde_json::from_str;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::info;
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
 pub struct Command {
     /// The path to Cfg config to use for this node.
     ///
-    /// If not specified, the default config will be used.
+    /// If not specified, the default config [eth] will be used.
     #[arg(long, value_name = "PATH")]
     chain_cfg_path: Option<PathBuf>,
 
     /// The path to the database to use for this node.
-    ///
-    /// current support rocksdb and memorydb
     #[arg(long, value_name = "PATH")]
     db_path: PathBuf,
 
     /// The type of database to use for this node.
     /// Default: rocksdb
-    /// current support rocksdb
     #[arg(long, default_value = "rocksdb")]
     db_type: String,
 
     /// The address for rpc client.
     #[arg(long, value_name = "URL")]
-    rpc_addr: String,
+    rpc_addr: Option<String>,
 
     /// addr to listen on
     /// Default: 8545  
@@ -55,12 +53,15 @@ impl Command {
             "rocksdb" => {
                 let db = StateDBWrapper(RocksDBStorage::open(self.db_path.as_path()));
                 let snaps = Arc::new(SnapshotTree::new(db)?);
-                let updater = Updater::new(snaps.clone(), self.rpc_addr.clone())?;
-                let updater_handle = updater.start();
                 let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
                     .build_and_run(&self.listen_addr)
                     .await?;
-                Ok((updater_handle, rpc_handle))
+                if let Some(rpc_address) = self.rpc_addr.clone() {
+                    let updater = Updater::new(snaps.clone(), rpc_address)?;
+                    let updater_handle = updater.start();
+                    return Ok((updater_handle, rpc_handle));
+                }
+                Ok((tokio::sync::watch::channel(()).0, rpc_handle))
             }
             _ => bail!("only support rocksdb"),
         }
@@ -73,6 +74,7 @@ impl Command {
         }
         let (updater_handle, rpc_handle) = self.start(chain_cfg).await?;
         run_until_ctrl_c(async move {
+            info!("Stopping RPC server...");
             let _ = updater_handle.send(());
             let _ = rpc_handle.stop();
             Ok(())

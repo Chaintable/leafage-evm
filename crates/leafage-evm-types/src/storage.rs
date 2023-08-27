@@ -1,44 +1,22 @@
 use crate::primitives::{AccountInfo, BlockEnv, Bytecode, Bytes, H160, H256, U256};
+use ethers_core::types::{Block, Transaction};
+use ethers_core::utils::keccak256;
 use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
-use serde::{Deserialize, Serialize};
-#[derive(Debug, PartialEq, RlpDecodable, RlpEncodable, Clone, Serialize, Deserialize)]
-pub struct BlockInfo {
-    /// Block number.
-    pub number: U256,
-    /// Block hash.
-    pub hash: H256,
-    /// Parent block hash.
-    pub parent_hash: H256,
-    /// Coinbase or miner or address that created and signed the block.
-    /// Address where we are going to send gas spend
-    pub coinbase: H160,
-    /// Timestamp of block.
-    pub timestamp: u64,
-    /// Difficulty is removed and not used after Paris (aka TheMerge). Value is replaced with prevrandao.
-    pub difficulty: U256,
-    /// Basefee is added in EIP1559 London upgrade
-    pub base_fee: U256,
-    /// Gas limit of block.
-    pub gas_limit: u64,
-    /// Prevrandao is used after Paris (aka TheMerge) instead of the difficulty value.
-    pub prevrandao: H256,
-}
+use revm::primitives::U256 as RU256;
 
-impl Into<BlockEnv> for BlockInfo {
-    fn into(self) -> BlockEnv {
-        BlockEnv {
-            number: self.number.into(),
-            coinbase: self.coinbase.into(),
-            timestamp: U256::from(self.timestamp).into(),
-            difficulty: self.difficulty.into(),
-            basefee: self.base_fee.into(),
-            gas_limit: U256::from(self.gas_limit).into(),
-            prevrandao: if self.difficulty.is_zero() {
-                Some(self.prevrandao.into())
-            } else {
-                None
-            },
-        }
+pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
+    BlockEnv {
+        number: RU256::from(block.number.unwrap_or_default().as_u64()),
+        coinbase: block.author.unwrap_or_default().into(),
+        timestamp: block.timestamp.into(),
+        difficulty: block.difficulty.into(),
+        basefee: block.base_fee_per_gas.unwrap_or_default().into(),
+        gas_limit: block.gas_limit.into(),
+        prevrandao: if block.difficulty.is_zero() {
+            Some(block.mix_hash.unwrap_or_default().into())
+        } else {
+            None
+        },
     }
 }
 
@@ -51,7 +29,7 @@ pub struct BlockStorageDiff {
     /// New accounts
     pub new_accounts: Vec<NewAccount>,
     /// Deleted accounts
-    pub deleted_accounts: Vec<H160>,
+    pub deleted_accounts: Vec<H256>,
     /// Account storage diff
     pub storage_diff: Vec<AccountStorageDiff>,
 }
@@ -59,7 +37,7 @@ pub struct BlockStorageDiff {
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct NewAccount {
     /// Account address
-    pub address: H160,
+    pub address: H256,
     /// Account balance
     pub balance: U256,
     /// Account nonce
@@ -93,7 +71,22 @@ impl Into<AccountInfo> for NewAccount {
 impl From<(H160, AccountInfo)> for NewAccount {
     fn from((address, account_info): (H160, AccountInfo)) -> Self {
         Self {
-            address: address.into(),
+            address: keccak256(address.as_bytes()).into(),
+            balance: account_info.balance.into(),
+            nonce: account_info.nonce,
+            code_hash: account_info.code_hash.into(),
+            code: account_info
+                .code
+                .map(|code| code.original_bytes().into())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<(H256, AccountInfo)> for NewAccount {
+    fn from((address, account_info): (H256, AccountInfo)) -> Self {
+        Self {
+            address,
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.into(),
@@ -107,12 +100,53 @@ impl From<(H160, AccountInfo)> for NewAccount {
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct AccountStorageDiff {
-    pub account_addr: H160,
+    pub account_addr: H256,
     pub value: Vec<IndexValuePair>,
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct IndexValuePair {
-    pub index: U256,
+    pub index: H256,
     pub value: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct SlimAccount {
+    /// Account balance
+    pub balance: U256,
+    /// Account nonce
+    pub nonce: u64,
+    /// code hash
+    pub code_hash: H256,
+}
+
+impl From<NewAccount> for SlimAccount {
+    fn from(account: NewAccount) -> Self {
+        SlimAccount {
+            balance: account.balance,
+            nonce: account.nonce,
+            code_hash: account.code_hash,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use open_fastrlp::Encodable;
+
+    #[test]
+    fn test_slim_account() {
+        let account = NewAccount {
+            address: H256::zero(),
+            balance: U256::from(100),
+            nonce: 0,
+            code_hash: H256::zero(),
+            code: Bytes::new(),
+        };
+        let slim_account = SlimAccount::from(account.clone());
+        let mut buf = Vec::new();
+        slim_account.encode(&mut buf);
+        dbg!(buf.len());
+    }
 }

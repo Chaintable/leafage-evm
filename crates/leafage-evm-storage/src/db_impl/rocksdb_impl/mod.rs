@@ -1,8 +1,20 @@
-use crate::db::{SlimAccount, StateDBRead, StateDBWrite};
-use leafage_evm_types::{trim_left_zero_bytes, BlockInfo, Bytes, NewAccount, H160, H256, U256};
+use crate::db::{StateDBRead, StateDBWrite};
+use leafage_evm_types::{
+    trim_left_zero_bytes, Block, Bytes, NewAccount, SlimAccount, Transaction, H256, U256,
+};
 use open_fastrlp::{Decodable, Encodable};
-use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Error, Options, WriteBatch, DB};
+use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use serde_json::{from_slice, to_vec};
 use std::path::Path;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("rocksdb error, {0}")]
+    RocksDB(#[from] rocksdb::Error),
+    #[error("serde_json error, {0}")]
+    SerdeJson(#[from] serde_json::Error),
+}
 
 #[repr(u16)]
 #[derive(Debug)]
@@ -56,7 +68,7 @@ impl StateDBRead for DataBase {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
         let block_hash_to_block_info_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
@@ -69,12 +81,12 @@ impl StateDBRead for DataBase {
             return Ok(None);
         }
         let block_info_bytes = block_info_bytes.unwrap();
-        let mut block_info_slice = block_info_bytes.as_slice();
-        let block_info = BlockInfo::decode(&mut block_info_slice).unwrap();
+        let block_info_slice = block_info_bytes.as_slice();
+        let block_info = from_slice::<Block<Transaction>>(block_info_slice)?;
         Ok(Some(block_info))
     }
 
-    fn read_account(&self, address: H160) -> Result<Option<NewAccount>, Error> {
+    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let address_to_account_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -97,7 +109,7 @@ impl StateDBRead for DataBase {
         Ok(Some(account))
     }
 
-    fn read_storage(&self, address: H160, key: U256) -> Result<U256, Error> {
+    fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
         let address_to_storage_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
@@ -112,7 +124,7 @@ impl StateDBRead for DataBase {
             return Ok(U256::zero());
         }
         let value_bytes = value_bytes.unwrap();
-        let value = U256::from_little_endian(value_bytes.as_slice());
+        let value = U256::from_big_endian(value_bytes.as_slice());
         Ok(value)
     }
 
@@ -173,19 +185,18 @@ impl StateDBWrite for DataBase {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: BlockInfo,
+        block_info: Block<Transaction>,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
 
-        let block_hash_bytes = block_info.hash.as_bytes();
-        let mut block_info_bytes = Vec::new();
-        block_info.encode(&mut block_info_bytes);
+        let block_info_bytes = to_vec(&block_info)?;
+        let block_hash = block_info.hash.unwrap();
         batch.put_cf(
             block_hash_to_block_info_cf,
-            block_hash_bytes,
+            block_hash.as_bytes(),
             block_info_bytes,
         );
         Ok(())
@@ -194,7 +205,7 @@ impl StateDBWrite for DataBase {
     fn write_account(
         &self,
         batch: &mut Self::DBWriteBatch,
-        address: H160,
+        address: H256,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
         let address_to_account_cf = self
@@ -216,8 +227,8 @@ impl StateDBWrite for DataBase {
     fn write_storage(
         &self,
         batch: &mut Self::DBWriteBatch,
-        address: H160,
-        key: U256,
+        address: H256,
+        key: H256,
         value: U256,
     ) -> Result<(), Error> {
         let address_to_storage_cf = self

@@ -2,7 +2,10 @@ mod primitives;
 pub use primitives::*;
 
 mod storage;
-pub use storage::{AccountStorageDiff, BlockInfo, BlockStorageDiff, IndexValuePair, NewAccount};
+pub use storage::{
+    block_env_from_block, AccountStorageDiff, BlockStorageDiff, IndexValuePair, NewAccount,
+    SlimAccount,
+};
 
 mod rpc;
-pub use rpc::{BlockId, BlockNumber, CallRequest};
+pub use rpc::{Block, BlockId, BlockNumber, CallRequest, JsonStorageKey, Transaction, TxHash};

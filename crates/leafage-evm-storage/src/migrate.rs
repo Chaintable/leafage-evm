@@ -1,5 +1,5 @@
 use crate::db::StateDBWrite;
-use leafage_evm_types::{BlockInfo, Bytes, NewAccount, H160, H256, U256};
+use leafage_evm_types::{Block, Bytes, NewAccount, Transaction, H256, U256};
 use open_fastrlp::Decodable;
 use open_fastrlp_derive::RlpDecodable;
 use std::fs::DirEntry;
@@ -12,7 +12,7 @@ use std::sync::{
 #[derive(Debug, Clone, PartialEq, RlpDecodable)]
 struct SlimAccountWithAddress {
     /// Account address
-    address: H160,
+    address: H256,
     /// Account balance
     balance: U256,
     /// Account nonce
@@ -75,7 +75,7 @@ fn bytes_to_accounts(mut buf: &[u8]) -> Result<Vec<SlimAccountWithAddress>, std:
     Ok(accounts)
 }
 
-async fn read_file_to_storage(entry: DirEntry) -> Result<Vec<(H160, U256, U256)>, std::io::Error> {
+async fn read_file_to_storage(entry: DirEntry) -> Result<Vec<(H256, H256, U256)>, std::io::Error> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(entry.path()).await?;
     let mut buf = Vec::new();
@@ -85,12 +85,12 @@ async fn read_file_to_storage(entry: DirEntry) -> Result<Vec<(H160, U256, U256)>
 
 #[derive(RlpDecodable)]
 struct KeyValue {
-    address: H160,
-    index: U256,
+    address: H256,
+    index: H256,
     val: U256,
 }
 
-fn bytes_to_storages(mut buf: &[u8]) -> Result<Vec<(H160, U256, U256)>, std::io::Error> {
+fn bytes_to_storages(mut buf: &[u8]) -> Result<Vec<(H256, H256, U256)>, std::io::Error> {
     let storages: Vec<KeyValue> = Decodable::decode(&mut buf).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to decode storages")
     })?;
@@ -101,7 +101,7 @@ fn bytes_to_storages(mut buf: &[u8]) -> Result<Vec<(H160, U256, U256)>, std::io:
     Ok(storages)
 }
 
-async fn read_file_to_block_info(entry: DirEntry) -> Result<BlockInfo, std::io::Error> {
+async fn read_file_to_block_info(entry: DirEntry) -> Result<Block<Transaction>, std::io::Error> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(entry.path()).await?;
     let mut buf = Vec::new();
@@ -109,13 +109,14 @@ async fn read_file_to_block_info(entry: DirEntry) -> Result<BlockInfo, std::io::
     bytes_to_block_info(&buf)
 }
 
-fn bytes_to_block_info(mut buf: &[u8]) -> Result<BlockInfo, std::io::Error> {
-    BlockInfo::decode(&mut buf).map_err(|e| {
+fn bytes_to_block_info(buf: &[u8]) -> Result<Block<Transaction>, std::io::Error> {
+    let block_info = serde_json::from_slice(buf).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Failed to decode block info,err {}", e),
+            "Failed to decode block info",
         )
-    })
+    })?;
+    Ok(block_info)
 }
 
 #[derive(Debug, Default)]
@@ -197,11 +198,30 @@ impl FileSource {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;
             let block_info = read_file_to_block_info(file).await?;
-            db.write_latest_block_hash(&mut batch, block_info.hash)?;
-            db.write_block_hash(&mut batch, block_info.number, block_info.hash)?;
+            db.write_latest_block_hash(&mut batch, block_info.hash.unwrap())?;
+            db.write_block_hash(
+                &mut batch,
+                block_info.number.unwrap().as_u64().into(),
+                block_info.hash.unwrap(),
+            )?;
             db.write_block_info(&mut batch, block_info)?;
             db.commit(batch)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_account_read() {
+        use std::io::Read;
+        let mut file = std::fs::File::open("/data/nodex/accounts/99900000.rlp").unwrap();
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).unwrap();
+        let accounts = bytes_to_accounts(&buf).unwrap();
+        dbg!(&accounts[1]);
     }
 }

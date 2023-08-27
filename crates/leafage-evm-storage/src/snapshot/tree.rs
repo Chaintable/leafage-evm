@@ -2,7 +2,7 @@ use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
 use arc_swap::ArcSwap;
-use leafage_evm_types::{BlockId, BlockInfo, BlockNumber, BlockStorageDiff, H256, U256};
+use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction, H256, U64};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
@@ -25,7 +25,7 @@ pub struct SnapshotTree<DB> {
 }
 
 impl<DB> SnapshotTree<DB> {
-    fn clear_diff_map(&self, bottom_height: U256) {
+    fn clear_diff_map(&self, bottom_height: U64) {
         if bottom_height.is_zero() {
             return;
         }
@@ -34,9 +34,9 @@ impl<DB> SnapshotTree<DB> {
         let mut remvoe_nums = Vec::new();
         for (hash, layer) in diff_map.iter() {
             if let Some(layer) = layer.diff_layer() {
-                if layer.block_info.number.0 < bottom_height.0 {
+                if layer.block_info.number.unwrap() < bottom_height {
                     remove_hashes.push(hash.clone());
-                    remvoe_nums.push(layer.block_info.number.as_u64());
+                    remvoe_nums.push(layer.block_info.number.unwrap().as_u64());
                 }
             }
         }
@@ -62,8 +62,8 @@ where
         let mut num_diffs = HashMap::new();
         let info = db.block_info()?;
         let cache_layer = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(db)));
-        hash_diffs.insert(info.hash, cache_layer.clone());
-        num_diffs.insert(info.number.as_u64(), cache_layer.clone());
+        hash_diffs.insert(info.hash.unwrap(), cache_layer.clone());
+        num_diffs.insert(info.number.unwrap().as_u64(), cache_layer.clone());
         Ok(Self {
             latest: ArcSwap::new(cache_layer),
             hash_diff_map: RwLock::new(hash_diffs),
@@ -79,10 +79,15 @@ where
     type Error = Error<<DB as EvmStorageWrite>::Error>;
     fn update_block(
         &self,
-        block_info: BlockInfo,
+        block_info: Block<Transaction>,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
-        if let Some(_) = self.hash_diff_map.read().unwrap().get(&block_info.hash) {
+        if let Some(_) = self
+            .hash_diff_map
+            .read()
+            .unwrap()
+            .get(&block_info.hash.unwrap())
+        {
             debug!(target:"storage", "block {:?} already exists", block_info.hash);
             return Ok(());
         }
@@ -100,13 +105,13 @@ where
             self.hash_diff_map
                 .write()
                 .unwrap()
-                .insert(block_info.hash, new_diff_layer.clone());
+                .insert(block_info.hash.unwrap(), new_diff_layer.clone());
 
             let latest = self.latest.load().clone();
             let latest_block_info = latest.block_info()?;
             // import reorg block
-            if block_info.number.0 < latest_block_info.number.0 {
-                info!(target:"storage", "reorg block {:?} -> {:?}", block_info.number, latest_block_info.number);
+            if block_info.number.unwrap() < latest_block_info.number.unwrap() {
+                info!(target:"storage", "reorg block {:?} -> {:?}", block_info.number.unwrap(), latest_block_info.number.unwrap());
                 return Ok(());
             }
             self.latest.store(new_diff_layer.clone());
@@ -122,8 +127,12 @@ where
 
 impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
     type Error = Error<DB::Error>;
-    fn block_info(&self) -> Result<BlockInfo, Self::Error> {
+    fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
         self.latest.load().block_info()
+    }
+
+    fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
+        self.latest.load().block_info_arc()
     }
 }
 

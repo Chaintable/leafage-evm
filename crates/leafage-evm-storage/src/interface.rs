@@ -1,20 +1,22 @@
 use auto_impl::auto_impl;
+use ethers_core::utils::keccak256;
 use leafage_evm_types::{
-    AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, H160, H256, U256,
+    AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Transaction, H256, U256,
 };
 use revm::db::DatabaseRef;
 use revm::primitives::{B160, B256, U256 as RU256};
+use std::sync::Arc;
 
 /// [`StateDB`] is a trait that provides access to the state of the EVM at a specific block height.
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
     type Error: std::error::Error + Send + Sync + 'static;
     /// Get basic account information.
-    fn basic(&self, address: H160) -> Result<Option<AccountInfo>, Self::Error>;
+    fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error>;
     /// Get account code by its hash
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error>;
     /// Get storage value of address at index.
-    fn storage(&self, address: H160, index: U256) -> Result<U256, Self::Error>;
+    fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error>;
     // History related
     fn block_hash(&self, number: U256) -> Result<H256, Self::Error>;
 }
@@ -24,7 +26,13 @@ pub trait StateDB {
 pub trait BlockContext {
     type Error: std::error::Error + Send + Sync + 'static;
     // Block ctx related
-    fn block_info(&self) -> Result<BlockInfo, Self::Error>;
+    fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
+        Ok(self.block_info_arc()?.as_ref().clone())
+    }
+
+    fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
+        Ok(Arc::new(self.block_info()?))
+    }
 }
 
 /// [`WrapDB`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
@@ -33,12 +41,15 @@ pub struct WrapDB<T>(pub T);
 impl<T: StateDB> DatabaseRef for WrapDB<T> {
     type Error = T::Error;
     fn basic(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
+        let address = keccak256(address.as_bytes());
         self.0.basic(address.into())
     }
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         self.0.code_by_hash(code_hash.into())
     }
     fn storage(&self, address: B160, index: RU256) -> Result<RU256, Self::Error> {
+        let address = keccak256(address.as_bytes());
+        let index = keccak256::<[u8; 32]>(index.to_be_bytes());
         self.0
             .storage(address.into(), index.into())
             .map(|n| n.into())
@@ -62,7 +73,7 @@ pub trait EvmStorageWrite {
     type Error: std::error::Error + Send + Sync + 'static;
     fn update_block(
         &self,
-        block_info: BlockInfo,
+        block_info: Block<Transaction>,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error>;
 }
