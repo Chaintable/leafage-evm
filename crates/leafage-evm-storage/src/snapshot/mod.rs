@@ -4,4 +4,4 @@ pub use error::Error;
 mod layer;
 
 mod tree;
-pub use tree::SnapshotTree;
+pub use tree::{Config, SnapshotTree};

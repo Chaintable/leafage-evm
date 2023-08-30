@@ -1,3 +1,21 @@
+//! RocksDB implementation of the database.
+//!
+//! Data is stored in the following format:
+//! ```text
+//! +-------------------------+-------------------------+-------------------------+
+//! |  LatestBlockHash        |  BlockHashToBlockInfo   |  BlockNumToBlockHash    |
+//! +-------------------------+-------------------------+-------------------------+
+//! |  AddressToAccount       |  AddressToStorage       |  HashToCode             |
+//! +-------------------------+-------------------------+-------------------------+
+//! ```
+//! The `LatestBlockHash` column family stores the latest block hash.
+//! The `BlockHashToBlockInfo` column family stores the block hash to block info maps.
+//! The `BlockNumToBlockHash` column family stores the block number to block hash maps.
+//! The `AddressToAccount` column family stores the address to account maps.
+//! The `AddressToStorage` column family stores the (address,index) to storage maps.
+//! The `HashToCode` column family stores the code hash to code maps.
+//! All [`U256`] are big-endian encoded.
+
 use crate::db::{StateDBRead, StateDBWrite};
 use leafage_evm_types::{
     trim_left_zero_bytes, Block, Bytes, NewAccount, SlimAccount, Transaction, H256, U256,
@@ -104,7 +122,6 @@ impl StateDBRead for DataBase {
             balance: account.balance,
             nonce: account.nonce,
             code_hash: account.code_hash,
-            code: Bytes::default(),
         };
         Ok(Some(account))
     }

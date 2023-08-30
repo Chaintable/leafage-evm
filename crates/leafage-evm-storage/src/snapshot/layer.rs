@@ -4,46 +4,60 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use leafage_evm_types::{
     AccountInfo, AccountStorageDiff, Block, BlockStorageDiff, Bytecode, IndexValuePair, NewAccount,
-    Transaction, H256, U256, U64,
+    NewCode, Transaction, H256, U256, U64,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+/// [`LinkedDiffLayer`] is a single linked list that stores the state of the EVM.
+///
+/// two cases:
+/// 1. bottom [`CacheDiskLayer`] (when init).
+/// 2. top [`DiffLayer`] -> (top-1) [`DiffLayer`] -> ... -> bottom [`CacheDiskLayer`].
 pub enum LinkedDiffLayer<DB> {
     CacheDiskLayer(CacheDiskLayer<DB>),
     DiffLayer(DiffLayer<DB>),
 }
 
-impl<DB> LinkedDiffLayer<DB>
+impl<DB, E> LinkedDiffLayer<DB>
 where
-    DB: EvmStorageWrite,
+    DB: EvmStorageWrite<Error = E> + BlockContext<Error = E>,
 {
+    /// commit the diff layer to the db and return the bottom block number.
     pub fn cap_diff_to_db(
         self: Arc<Self>,
         depth_limit: usize,
-        max_items: usize,
-    ) -> Result<U64, DB::Error> {
+        cache_depth_limit: usize,
+    ) -> Result<U64, Error<E>> {
         let cur = self;
-        let mut diffs = VecDeque::new();
-        diffs.push_back(cur);
+        let mut diff_layers = VecDeque::new();
+        diff_layers.push_back(cur);
         loop {
-            let cur = diffs.back().unwrap();
+            let cur = diff_layers.back().unwrap();
             if cur.is_cache_layer() {
                 break;
             }
             let next = cur.unwrap_diff_layer().next.load().clone();
-            diffs.push_back(next);
+            diff_layers.push_back(next);
         }
-        let cache_layer = diffs.pop_back().unwrap();
+        let cache_layer = diff_layers.pop_back().unwrap();
         let mut bottom_num = U64::zero();
-        while diffs.len() > depth_limit {
-            let diff_layer = diffs.pop_back().unwrap();
-            if diff_layer.unwrap_diff_layer().block_info.number.unwrap() > bottom_num {
-                bottom_num = diff_layer.unwrap_diff_layer().block_info.number.unwrap();
-            }
-            cache_layer.unwrap_cache_layer().update(diff_layer)?;
-            cache_layer.unwrap_cache_layer().pop(max_items);
+        while diff_layers.len() > depth_limit {
+            let diff_layer = diff_layers.pop_back().unwrap();
+            // commit the diff layer to the db
+            bottom_num = diff_layer.unwrap_diff_layer().block_info.number.unwrap();
+            cache_layer.unwrap_cache_layer().commit(diff_layer)?;
+            let next_diff_layer = diff_layers.back().unwrap();
+            next_diff_layer
+                .unwrap_diff_layer()
+                .next
+                .store(cache_layer.clone());
+        }
+        // pop the oldest cache layer
+        cache_layer.unwrap_cache_layer().pop(cache_depth_limit);
+        if bottom_num == U64::zero() {
+            bottom_num = cache_layer.block_info_arc()?.number.unwrap();
         }
         Ok(bottom_num)
     }
@@ -99,30 +113,27 @@ impl<DB> LinkedDiffLayer<DB> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DashDbAccount {
-    pub info: AccountInfo,
-    /// storage slots
-    pub storage: DashMap<U256, U256>,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ValueWithBlockHash<T> {
+pub struct ValueWithBlockNumber<T> {
     value: T,
-    block_hash: H256,
+    block_num: u64,
 }
 
-impl<T> ValueWithBlockHash<T> {
-    pub fn new(value: T, block_hash: H256) -> Self {
-        Self { value, block_hash }
+impl<T> ValueWithBlockNumber<T> {
+    pub fn new(value: T, block_num: u64) -> Self {
+        Self { value, block_num }
     }
 }
 
+/// [`CacheDiskLayer`] is the bottom layer of the linked list.
+/// It stores the on-disk db of the EVM
+/// It is also a cache layer, which caches the
+/// (top-diff_tree_depth_limit,top-diff_tree_depth_limit-cache_tree_depth_limit] diff layers.
 pub struct CacheDiskLayer<DB> {
-    pub accounts: DashMap<H256, ValueWithBlockHash<Option<AccountInfo>>>,
-    pub storage: DashMap<(H256, H256), ValueWithBlockHash<U256>>,
-    pub contracts: DashMap<H256, ValueWithBlockHash<Bytecode>>,
-    pub block_hashes: DashMap<U64, ValueWithBlockHash<H256>>,
+    pub accounts: DashMap<H256, ValueWithBlockNumber<Option<AccountInfo>>>,
+    pub storage: DashMap<(H256, H256), ValueWithBlockNumber<U256>>,
+    pub contracts: DashMap<H256, ValueWithBlockNumber<Bytecode>>,
+    pub block_hashes: DashMap<U64, ValueWithBlockNumber<H256>>,
     /// The diff layer list is sorted from the newest to the oldest
     pub diff_layer_list: Mutex<VecDeque<Arc<LinkedDiffLayer<DB>>>>,
     pub db: DB,
@@ -140,13 +151,9 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.accounts.len() + self.storage.len() + self.contracts.len() + self.block_hashes.len()
-    }
-
-    pub fn pop(&self, max_items: usize) {
+    pub fn pop(&self, max_cache_layers: usize) {
         loop {
-            if self.len() <= max_items {
+            if self.diff_layer_list.lock().unwrap().len() <= max_cache_layers {
                 break;
             }
             let linked_diff_layer = self.diff_layer_list.lock().unwrap().pop_back().unwrap();
@@ -156,35 +163,35 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
                 diff_layer.block_info.number.unwrap(), diff_layer.block_info.hash.unwrap()
             );
             for (key, _) in diff_layer.accounts.iter() {
-                let accout_hash = self.accounts.get(key).map(|v| v.block_hash);
-                if let Some(accout_hash) = accout_hash {
-                    if accout_hash == diff_layer.block_info.hash.unwrap() {
+                let accout_block_num = self.accounts.get(key).map(|v| v.block_num);
+                if let Some(accout_block_num) = accout_block_num {
+                    if accout_block_num == diff_layer.block_info.number.unwrap().as_u64() {
                         self.accounts.remove(key);
                     }
                 }
             }
             for (key, _) in diff_layer.storage.iter() {
-                let storage_hash = self.storage.get(key).map(|v| v.block_hash);
-                if let Some(storage_hash) = storage_hash {
-                    if storage_hash == diff_layer.block_info.hash.unwrap() {
+                let storage_block_num = self.storage.get(key).map(|v| v.block_num);
+                if let Some(storage_block_num) = storage_block_num {
+                    if storage_block_num == diff_layer.block_info.number.unwrap().as_u64() {
                         self.storage.remove(key);
                     }
                 }
             }
             for (key, _) in diff_layer.contracts.iter() {
-                let contract_hash = self.contracts.get(key).map(|v| v.block_hash);
-                if let Some(contract_hash) = contract_hash {
-                    if contract_hash == diff_layer.block_info.hash.unwrap() {
+                let contract_block_num = self.contracts.get(key).map(|v| v.block_num);
+                if let Some(contract_block_num) = contract_block_num {
+                    if contract_block_num == diff_layer.block_info.number.unwrap().as_u64() {
                         self.contracts.remove(key);
                     }
                 }
             }
-            let block_hash = self
+            let block_hash_block_num = self
                 .block_hashes
                 .get(&diff_layer.block_info.number.unwrap())
-                .map(|v| v.block_hash);
-            if let Some(block_hash) = block_hash {
-                if block_hash == diff_layer.block_info.hash.unwrap() {
+                .map(|v| v.block_num);
+            if let Some(block_hash_block_num) = block_hash_block_num {
+                if block_hash_block_num == diff_layer.block_info.number.unwrap().as_u64() {
                     self.block_hashes
                         .remove(&diff_layer.block_info.number.unwrap());
                 }
@@ -192,29 +199,40 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
         }
     }
 
-    pub fn update(&self, linked_layer: Arc<LinkedDiffLayer<DB>>) -> Result<(), DB::Error> {
+    pub fn commit(&self, diff_layer: Arc<LinkedDiffLayer<DB>>) -> Result<(), DB::Error> {
         self.diff_layer_list
             .lock()
             .unwrap()
-            .push_front(linked_layer.clone());
-        let diff_layer = linked_layer.unwrap_diff_layer();
+            .push_front(diff_layer.clone());
+        let diff_layer = diff_layer.unwrap_diff_layer();
         for (key, value) in diff_layer.accounts.iter() {
-            let value = ValueWithBlockHash::new(value.clone(), diff_layer.block_info.hash.unwrap());
+            let value = ValueWithBlockNumber::new(
+                value.clone(),
+                diff_layer.block_info.number.unwrap().as_u64(),
+            );
             self.accounts.insert(key.clone(), value);
         }
         for (key, value) in diff_layer.storage.iter() {
-            let value = ValueWithBlockHash::new(value.clone(), diff_layer.block_info.hash.unwrap());
+            let value = ValueWithBlockNumber::new(
+                value.clone(),
+                diff_layer.block_info.number.unwrap().as_u64(),
+            );
             self.storage.insert(key.clone(), value);
         }
         for (key, value) in diff_layer.contracts.iter() {
-            let value = ValueWithBlockHash::new(value.clone(), diff_layer.block_info.hash.unwrap());
+            let value = ValueWithBlockNumber::new(
+                value.clone(),
+                diff_layer.block_info.number.unwrap().as_u64(),
+            );
             self.contracts.insert(key.clone(), value);
         }
-        let (block_info, block_diff) = diff_layer.get_info_diff();
+        let (block_info, block_diff) = diff_layer.storage_diff();
         self.db.update_block(block_info, block_diff)
     }
 }
 
+/// [`DiffLayer`] is the top layer of the linked list.
+/// It stores the diff of the EVM.
 pub struct DiffLayer<DB> {
     pub block_info: Arc<Block<Transaction>>,
     pub accounts: HashMap<H256, Option<AccountInfo>>,
@@ -243,7 +261,7 @@ impl<DB>
 
 impl<DB> Into<(Block<Transaction>, BlockStorageDiff)> for &DiffLayer<DB> {
     fn into(self) -> (Block<Transaction>, BlockStorageDiff) {
-        self.get_info_diff()
+        self.storage_diff()
     }
 }
 
@@ -259,16 +277,19 @@ impl<DB> DiffLayer<DB> {
         for new_account in block_diff.new_accounts {
             let address = new_account.address;
             let account_info: AccountInfo = new_account.into();
-            if let Some(code) = account_info.code.as_ref() {
-                contracts.insert(account_info.code_hash.into(), code.clone());
-            }
             accounts.insert(address, Some(account_info));
         }
-        for account_diff in block_diff.storage_diff {
-            let address = account_diff.account_addr;
-            for index_value in account_diff.value {
+        for account_diff in block_diff.storage_diffs {
+            let address = account_diff.address;
+            for index_value in account_diff.diffs {
                 storage.insert((address, index_value.index), index_value.value);
             }
+        }
+        for new_code in block_diff.new_codes {
+            let code_hash = new_code.code_hash;
+            let code = Bytecode::new_raw(new_code.code.0);
+            assert_eq!(code_hash, code.hash().into());
+            contracts.insert(code_hash, code);
         }
         Self {
             block_info: Arc::new(block_info),
@@ -279,10 +300,11 @@ impl<DB> DiffLayer<DB> {
         }
     }
 
-    fn get_info_diff(&self) -> (Block<Transaction>, BlockStorageDiff) {
+    fn storage_diff(&self) -> (Block<Transaction>, BlockStorageDiff) {
         let mut new_accounts = Vec::new();
         let mut deleted_accounts = Vec::new();
-        let mut storage_diff = Vec::new();
+        let mut storage_diffs = Vec::new();
+        let mut new_codes = Vec::new();
         for (address, account) in self.accounts.iter() {
             if let Some(account) = account {
                 new_accounts.push(NewAccount::from((*address, account.clone())));
@@ -292,14 +314,20 @@ impl<DB> DiffLayer<DB> {
         }
         for ((address, index), value) in self.storage.iter() {
             let mut account_diff = AccountStorageDiff {
-                account_addr: *address,
-                value: Vec::new(),
+                address: *address,
+                diffs: Vec::new(),
             };
-            account_diff.value.push(IndexValuePair {
+            account_diff.diffs.push(IndexValuePair {
                 index: *index,
                 value: *value,
             });
-            storage_diff.push(account_diff);
+            storage_diffs.push(account_diff);
+        }
+        for (code_hash, code) in self.contracts.iter() {
+            new_codes.push(NewCode {
+                code_hash: *code_hash,
+                code: code.bytecode.clone().into(),
+            });
         }
         let block_info = self.block_info.clone();
         let block_diff = BlockStorageDiff {
@@ -307,7 +335,8 @@ impl<DB> DiffLayer<DB> {
             parent_hash: self.block_info.parent_hash,
             new_accounts,
             deleted_accounts,
-            storage_diff,
+            storage_diffs,
+            new_codes,
         };
         (block_info.as_ref().clone(), block_diff)
     }

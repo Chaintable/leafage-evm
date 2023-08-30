@@ -5,13 +5,35 @@ use arc_swap::ArcSwap;
 use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction, H256, U64};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tracing::{debug, info};
+use tracing::info;
 
-const DEFAULT_DIFF_TREE_DEPTH_LIMIT: usize = 128;
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// diff_tree_depth_limit is the max depth of the uncommitted diff tree.
+    pub diff_tree_depth_limit: usize,
+    /// cache_tree_depth_limit is the max depth of the cache committed diff tree.
+    pub cache_tree_depth_limit: usize,
+}
 
-const DEFAULT_ITEM_NUMS: usize = 1 << 20;
+impl Config {
+    pub fn new(diff_tree_depth_limit: usize, cache_tree_depth_limit: usize) -> Self {
+        Self {
+            diff_tree_depth_limit,
+            cache_tree_depth_limit,
+        }
+    }
+}
 
-/// SnapshotTree is a tree structure that stores the state of the EVM.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            diff_tree_depth_limit: 64,
+            cache_tree_depth_limit: 512,
+        }
+    }
+}
+
+/// [`SnapshotTree`] is a tree structure that stores the state of the EVM.
 pub struct SnapshotTree<DB> {
     /// latest is a single linked list that stores the latest state of the EVM.
     /// two cases:
@@ -22,42 +44,39 @@ pub struct SnapshotTree<DB> {
     hash_diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer<DB>>>>,
     /// blocknum-> node, num_diff_map stores all the diff layer of the EVM.
     num_diff_map: RwLock<HashMap<u64, Arc<LinkedDiffLayer<DB>>>>,
+    /// config stores the config of the SnapshotTree.
+    config: Config,
 }
 
 impl<DB> SnapshotTree<DB> {
+    /// clear_diff_map removes the diff layer that is lower than bottom_height.
     fn clear_diff_map(&self, bottom_height: U64) {
         if bottom_height.is_zero() {
             return;
         }
-        let diff_map = self.hash_diff_map.read().unwrap();
-        let mut remove_hashes = Vec::new();
-        let mut remvoe_nums = Vec::new();
-        for (hash, layer) in diff_map.iter() {
-            if let Some(layer) = layer.diff_layer() {
-                if layer.block_info.number.unwrap() < bottom_height {
-                    remove_hashes.push(hash.clone());
-                    remvoe_nums.push(layer.block_info.number.unwrap().as_u64());
+        self.hash_diff_map.write().unwrap().retain(|_, v| {
+            if let Some(diff_layer) = v.diff_layer() {
+                if diff_layer.block_info.number.unwrap() > bottom_height {
+                    return true;
+                } else {
+                    false
                 }
+            } else {
+                true
             }
-        }
-        let mut diff_map = self.hash_diff_map.write().unwrap();
-        for key in remove_hashes {
-            diff_map.remove(&key);
-        }
-        let mut diff_map = self.num_diff_map.write().unwrap();
-        for key in remvoe_nums {
-            diff_map.remove(&key);
-        }
+        });
+        self.num_diff_map
+            .write()
+            .unwrap()
+            .retain(|num, v| v.is_cache_layer() || *num > bottom_height.as_u64());
     }
 }
 
-impl<DB> SnapshotTree<DB>
+impl<DB, E> SnapshotTree<DB>
 where
-    DB: StateDB
-        + EvmStorageWrite<Error = <DB as StateDB>::Error>
-        + BlockContext<Error = <DB as StateDB>::Error>,
+    DB: StateDB<Error = E> + EvmStorageWrite<Error = E> + BlockContext<Error = E>,
 {
-    pub fn new(db: DB) -> Result<Self, <DB as StateDB>::Error> {
+    pub fn new(db: DB, config: Config) -> Result<Self, E> {
         let mut hash_diffs = HashMap::new();
         let mut num_diffs = HashMap::new();
         let info = db.block_info()?;
@@ -68,15 +87,19 @@ where
             latest: ArcSwap::new(cache_layer),
             hash_diff_map: RwLock::new(hash_diffs),
             num_diff_map: RwLock::new(num_diffs),
+            config,
         })
     }
 }
 
-impl<DB> EvmStorageWrite for SnapshotTree<DB>
+impl<DB, E> EvmStorageWrite for SnapshotTree<DB>
 where
-    DB: EvmStorageWrite + BlockContext<Error = <DB as EvmStorageWrite>::Error>,
+    DB: EvmStorageWrite<Error = E> + BlockContext<Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    type Error = Error<<DB as EvmStorageWrite>::Error>;
+    type Error = Error<E>;
+    /// update_block updates the state of the SnapshotTree.
+    ///
     fn update_block(
         &self,
         block_info: Block<Transaction>,
@@ -88,15 +111,16 @@ where
             .unwrap()
             .get(&block_info.hash.unwrap())
         {
-            debug!(target:"storage", "block {:?} already exists", block_info.hash);
+            info!(target:"storage", "block {:?} already exists", block_info.hash);
             return Ok(());
         }
-        if let Some(parent_layer) = self
+        let res = self
             .hash_diff_map
             .read()
             .unwrap()
             .get(&block_info.parent_hash)
-        {
+            .cloned();
+        if let Some(parent_layer) = res {
             let new_diff_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
                 block_info.clone(),
                 block_diff.clone(),
@@ -111,12 +135,14 @@ where
             let latest_block_info = latest.block_info()?;
             // import reorg block
             if block_info.number.unwrap() < latest_block_info.number.unwrap() {
-                info!(target:"storage", "reorg block {:?} -> {:?}", block_info.number.unwrap(), latest_block_info.number.unwrap());
+                info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.number.unwrap(), latest_block_info.number.unwrap());
                 return Ok(());
             }
             self.latest.store(new_diff_layer.clone());
-            let bottom_height =
-                new_diff_layer.cap_diff_to_db(DEFAULT_DIFF_TREE_DEPTH_LIMIT, DEFAULT_ITEM_NUMS)?;
+            let bottom_height = new_diff_layer.cap_diff_to_db(
+                self.config.diff_tree_depth_limit,
+                self.config.cache_tree_depth_limit,
+            )?;
             self.clear_diff_map(bottom_height);
             Ok(())
         } else {
@@ -136,11 +162,12 @@ impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
     }
 }
 
-impl<DB> EvmStorageRead for SnapshotTree<DB>
+impl<DB, E> EvmStorageRead for SnapshotTree<DB>
 where
-    DB: StateDB + BlockContext<Error = <DB as StateDB>::Error> + Send + Sync,
+    DB: StateDB<Error = E> + BlockContext<Error = E> + Send + Sync,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    type Error = Error<<DB as StateDB>::Error>;
+    type Error = Error<E>;
     type StateDB = Arc<LinkedDiffLayer<DB>>;
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
         match block_arg {

@@ -1,3 +1,5 @@
+//! Database implementation for EVM storage.
+
 #[cfg(feature = "with-rocksdb")]
 mod rocksdb_impl;
 #[cfg(feature = "with-rocksdb")]

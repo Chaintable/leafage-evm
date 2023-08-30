@@ -3,7 +3,7 @@ use crate::updater::Updater;
 use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
-use leafage_evm_storage::{RocksDBStorage, SnapshotTree, StateDBWrapper};
+use leafage_evm_storage::{RocksDBStorage, SnapshotTree, SnapshotTreeConfig, StateDBWrapper};
 use revm::primitives::CfgEnv;
 use serde_json::from_str;
 use std::fs;
@@ -39,6 +39,20 @@ pub struct Command {
     /// This addr is used for the HTTP-RPC server
     #[arg(long, default_value = "0.0.0.0:8545")]
     listen_addr: String,
+
+    /// The depth limit of the diff tree.
+    /// Default: 64 for eth mainnet
+    ///
+    /// This limit is finalized block number - current block number.
+    #[arg(long, default_value = "64")]
+    diff_tree_depth_limit: usize,
+
+    /// The depth limit of the cache tree.
+    /// Default: 512 for eth mainnet
+    ///
+    /// This limit is determined by the number of blocks that can be cached in memory.
+    #[arg(long, default_value = "512")]
+    cache_tree_depth_limit: usize,
 }
 
 impl Command {
@@ -52,7 +66,13 @@ impl Command {
         match self.db_type.as_str() {
             "rocksdb" => {
                 let db = StateDBWrapper(RocksDBStorage::open(self.db_path.as_path()));
-                let snaps = Arc::new(SnapshotTree::new(db)?);
+                let snaps = Arc::new(SnapshotTree::new(
+                    db,
+                    SnapshotTreeConfig::new(
+                        self.diff_tree_depth_limit,
+                        self.cache_tree_depth_limit,
+                    ),
+                )?);
                 let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
                     .build_and_run(&self.listen_addr)
                     .await?;

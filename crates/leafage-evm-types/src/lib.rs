@@ -4,7 +4,7 @@ pub use primitives::*;
 mod storage;
 pub use storage::{
     block_env_from_block, AccountStorageDiff, BlockStorageDiff, IndexValuePair, NewAccount,
-    SlimAccount,
+    NewCode, SlimAccount,
 };
 
 mod rpc;

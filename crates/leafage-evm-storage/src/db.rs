@@ -151,25 +151,25 @@ where
         let hash = block_info.hash.unwrap();
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.new_accounts {
-            if !account.code_hash.is_zero() {
-                self.0
-                    .write_code(&mut batch, account.code_hash, account.code.clone())?;
-            }
             self.0
                 .write_account(&mut batch, account.address, Some(account))?;
         }
         for account in block_diff.deleted_accounts {
             self.0.write_account(&mut batch, account, None)?;
         }
-        for account_diff in block_diff.storage_diff {
-            for index_value_pair in account_diff.value {
+        for account_diff in block_diff.storage_diffs {
+            for index_value_pair in account_diff.diffs {
                 self.0.write_storage(
                     &mut batch,
-                    account_diff.account_addr,
+                    account_diff.address,
                     index_value_pair.index,
                     index_value_pair.value,
                 )?;
             }
+        }
+        for new_code in block_diff.new_codes {
+            self.0
+                .write_code(&mut batch, new_code.code_hash, new_code.code)?;
         }
         self.0.write_latest_block_hash(&mut batch, hash)?;
         self.0.commit(batch)?;

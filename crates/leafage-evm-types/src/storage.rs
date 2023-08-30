@@ -1,4 +1,4 @@
-use crate::primitives::{AccountInfo, BlockEnv, Bytecode, Bytes, H160, H256, U256};
+use crate::primitives::{AccountInfo, BlockEnv, Bytes, H160, H256, U256};
 use ethers_core::types::{Block, Transaction};
 use ethers_core::utils::keccak256;
 use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
@@ -31,7 +31,15 @@ pub struct BlockStorageDiff {
     /// Deleted accounts
     pub deleted_accounts: Vec<H256>,
     /// Account storage diff
-    pub storage_diff: Vec<AccountStorageDiff>,
+    pub storage_diffs: Vec<AccountStorageDiff>,
+    /// New codes
+    pub new_codes: Vec<NewCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct NewCode {
+    pub code_hash: H256,
+    pub code: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
@@ -44,8 +52,6 @@ pub struct NewAccount {
     pub nonce: u64,
     /// code hash
     pub code_hash: H256,
-    /// code
-    pub code: Bytes,
 }
 
 impl Into<AccountInfo> for NewAccount {
@@ -54,16 +60,7 @@ impl Into<AccountInfo> for NewAccount {
             balance: self.balance.into(),
             nonce: self.nonce,
             code_hash: self.code_hash.into(),
-            code: if self.code.is_empty() {
-                None
-            } else {
-                unsafe {
-                    Some(Bytecode::new_raw_with_hash(
-                        self.code.0,
-                        self.code_hash.into(),
-                    ))
-                }
-            },
+            code: None,
         }
     }
 }
@@ -75,10 +72,6 @@ impl From<(H160, AccountInfo)> for NewAccount {
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.into(),
-            code: account_info
-                .code
-                .map(|code| code.original_bytes().into())
-                .unwrap_or_default(),
         }
     }
 }
@@ -90,18 +83,14 @@ impl From<(H256, AccountInfo)> for NewAccount {
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.into(),
-            code: account_info
-                .code
-                .map(|code| code.original_bytes().into())
-                .unwrap_or_default(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct AccountStorageDiff {
-    pub account_addr: H256,
-    pub value: Vec<IndexValuePair>,
+    pub address: H256,
+    pub diffs: Vec<IndexValuePair>,
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
@@ -142,7 +131,6 @@ mod tests {
             balance: U256::from(100),
             nonce: 0,
             code_hash: H256::zero(),
-            code: Bytes::new(),
         };
         let slim_account = SlimAccount::from(account.clone());
         let mut buf = Vec::new();

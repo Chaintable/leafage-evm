@@ -28,7 +28,6 @@ impl Into<NewAccount> for SlimAccountWithAddress {
             balance: self.balance,
             nonce: self.nonce,
             code_hash: self.code_hash,
-            code: Bytes::default(),
         }
     }
 }
