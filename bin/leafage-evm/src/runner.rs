@@ -40,7 +40,7 @@ impl Commands {
 
 /// Runs the future to completion or until:
 /// - `ctrl-c` is received.
-/// - `SIGTERM` is received (unix only).
+/// - `SIGTERM` is received.
 pub(crate) async fn run_until_ctrl_c<F>(fut: F) -> Result<()>
 where
     F: Future<Output = Result<()>>,

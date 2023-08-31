@@ -34,3 +34,6 @@ The method returns bytes of  rlp encoded `StorageDiff` object.
 #### NewCode
 - `code_hash`: HASH - code hash
 - `code`: Bytes - code
+
+# implementation
+see **leafage-patch Geth** ([GitHub Link](https://github.com/DeBankDeFi/go-ethereum-debank/tree/leafage)):

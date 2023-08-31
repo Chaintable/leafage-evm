@@ -1,3 +1,4 @@
+use leafage_evm_types::BlockId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -6,6 +7,8 @@ pub enum Error<DBError> {
     DBError(DBError),
     #[error("Block not found")]
     ParentBlockHashNotFound,
+    #[error("BlockId: {0:?} not supported")]
+    UnsupportedBlockId(BlockId),
 }
 
 impl<DBError> From<DBError> for Error<DBError> {

@@ -9,29 +9,6 @@ use std::sync::{
     Arc,
 };
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable)]
-struct SlimAccountWithAddress {
-    /// Account address
-    address: H256,
-    /// Account balance
-    balance: U256,
-    /// Account nonce
-    nonce: u64,
-    /// code hash
-    code_hash: H256,
-}
-
-impl Into<NewAccount> for SlimAccountWithAddress {
-    fn into(self) -> NewAccount {
-        NewAccount {
-            address: self.address,
-            balance: self.balance,
-            nonce: self.nonce,
-            code_hash: self.code_hash,
-        }
-    }
-}
-
 async fn read_file_to_code(entry: DirEntry) -> Result<Vec<(H256, Bytes)>, std::io::Error> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(entry.path()).await?;
@@ -57,9 +34,7 @@ fn bytes_to_codes(mut buf: &[u8]) -> Result<Vec<(H256, Bytes)>, std::io::Error> 
     Ok(codes)
 }
 
-async fn read_file_to_account(
-    entry: DirEntry,
-) -> Result<Vec<SlimAccountWithAddress>, std::io::Error> {
+async fn read_file_to_account(entry: DirEntry) -> Result<Vec<NewAccount>, std::io::Error> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(entry.path()).await?;
     let mut buf = Vec::new();
@@ -67,8 +42,8 @@ async fn read_file_to_account(
     bytes_to_accounts(&buf)
 }
 
-fn bytes_to_accounts(mut buf: &[u8]) -> Result<Vec<SlimAccountWithAddress>, std::io::Error> {
-    let accounts: Vec<SlimAccountWithAddress> = Decodable::decode(&mut buf).map_err(|_| {
+fn bytes_to_accounts(mut buf: &[u8]) -> Result<Vec<NewAccount>, std::io::Error> {
+    let accounts: Vec<NewAccount> = Decodable::decode(&mut buf).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to decode accounts")
     })?;
     Ok(accounts)
@@ -118,6 +93,7 @@ fn bytes_to_block_info(buf: &[u8]) -> Result<Block<Transaction>, std::io::Error>
     Ok(block_info)
 }
 
+/// [`MigateStat`] is used to record the number of migrated data.
 #[derive(Debug, Default)]
 pub struct MigateStat {
     pub code_count: AtomicU64,
@@ -125,6 +101,7 @@ pub struct MigateStat {
     pub storage_count: AtomicU64,
 }
 
+/// [`FileSource`] is used to read data from files.
 pub struct FileSource {
     files: Vec<DirEntry>,
     stat: Arc<MigateStat>,
@@ -154,6 +131,7 @@ impl FileSource {
         Ok(Self { files, stat })
     }
 
+    /// Migrate code from files to db.
     pub async fn migrate_code<DB: StateDBWrite>(self, db: DB) -> anyhow::Result<()> {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;
@@ -167,12 +145,13 @@ impl FileSource {
         Ok(())
     }
 
+    /// Migrate account from files to db.
     pub async fn migrate_account<DB: StateDBWrite>(self, db: DB) -> anyhow::Result<()> {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;
             let accounts = read_file_to_account(file).await?;
             for account in accounts {
-                db.write_account(&mut batch, account.address, Some(account.into()))?;
+                db.write_account(&mut batch, account.address, Some(account))?;
                 self.stat.account_count.fetch_add(1, Ordering::SeqCst);
             }
             db.commit(batch)?;
@@ -180,6 +159,7 @@ impl FileSource {
         Ok(())
     }
 
+    /// Migrate storage from files to db.
     pub async fn migrate_storage<DB: StateDBWrite>(self, db: DB) -> anyhow::Result<()> {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;
@@ -193,6 +173,7 @@ impl FileSource {
         Ok(())
     }
 
+    /// Migrate block info from files to db.
     pub async fn migrate_block_info<DB: StateDBWrite>(self, db: DB) -> anyhow::Result<()> {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;

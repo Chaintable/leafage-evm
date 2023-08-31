@@ -6,6 +6,7 @@ use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transacti
 use open_fastrlp::Decodable;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{debug, error, info};
@@ -15,6 +16,7 @@ pub struct Updater<DB> {
     rpc_client: HttpClient,
     snap_tree: Arc<SnapshotTree<DB>>,
     block_queue: VecDeque<Block<Transaction>>,
+    update_interval: Duration,
 }
 
 impl<DB> Updater<DB>
@@ -26,12 +28,17 @@ where
         + Sync
         + 'static,
 {
-    pub fn new(snap_tree: Arc<SnapshotTree<DB>>, rpc_url: impl AsRef<str>) -> Result<Self> {
+    pub fn new(
+        snap_tree: Arc<SnapshotTree<DB>>,
+        rpc_url: impl AsRef<str>,
+        update_interval: Duration,
+    ) -> Result<Self> {
         let rpc_client = HttpClientBuilder::default().build(rpc_url)?;
         Ok(Self {
             rpc_client,
             snap_tree,
             block_queue: VecDeque::new(),
+            update_interval,
         })
     }
 
@@ -105,7 +112,7 @@ where
 
     pub fn start(mut self) -> watch::Sender<()> {
         let (tx, mut rx) = watch::channel(());
-        let mut interval = interval(std::time::Duration::from_secs(5));
+        let mut interval = interval(self.update_interval);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -141,24 +148,20 @@ mod tests {
         let rpc_client = HttpClientBuilder::default()
             .build("http://127.0.0.1:3545")
             .unwrap();
-        for i in 0..100 {
+        for i in 0..1 {
             let res = rpc_client
                 .block_diff(
-                    BlockId::Number(BlockNumber::Number((18017515 + i).into())),
+                    BlockId::Number(BlockNumber::Number((18024701 + i).into())),
                     true,
                 )
                 .await
                 .unwrap();
             let block_diff: BlockStorageDiff = Decodable::decode(&mut res.as_ref()).unwrap();
-            let res = rpc_client
-                .get_block_by_number(BlockNumber::Number((18017515 + i).into()), false)
-                .await
-                .unwrap();
-            if !block_diff.new_codes.is_empty() {
-                println!("{:?}  new code, res {:?}", 18017515 + i, res.is_some());
-            } else {
-                println!("{:?} no new code, res {:?}", 18017515 + i, res.is_some());
-            }
+            // let res = rpc_client
+            //     .get_block_by_number(BlockNumber::Number((18017515 + i).into()), false)
+            //     .await
+            //     .unwrap();
+            println!("{:?}", block_diff.storage_diffs);
         }
     }
 }

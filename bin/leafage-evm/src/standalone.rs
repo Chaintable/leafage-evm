@@ -45,14 +45,26 @@ pub struct Command {
     ///
     /// This limit is finalized block number - current block number.
     #[arg(long, default_value = "64")]
-    diff_tree_depth_limit: usize,
+    diff_depth_limit: usize,
 
     /// The depth limit of the cache tree.
     /// Default: 512 for eth mainnet
     ///
     /// This limit is determined by the number of blocks that can be cached in memory.
     #[arg(long, default_value = "512")]
-    cache_tree_depth_limit: usize,
+    cache_depth_limit: usize,
+
+    /// The interval to fetch block and update the snapshot tree.
+    /// Default: 5 seconds
+    ///
+    /// This interval is used to fetch block from rpc client.
+    #[arg(long, value_parser = parse_duration, default_value = "5")]
+    update_interval: std::time::Duration,
+}
+
+fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
+    let seconds = arg.parse()?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 impl Command {
@@ -68,16 +80,13 @@ impl Command {
                 let db = StateDBWrapper(RocksDBStorage::open(self.db_path.as_path()));
                 let snaps = Arc::new(SnapshotTree::new(
                     db,
-                    SnapshotTreeConfig::new(
-                        self.diff_tree_depth_limit,
-                        self.cache_tree_depth_limit,
-                    ),
+                    SnapshotTreeConfig::new(self.diff_depth_limit, self.cache_depth_limit),
                 )?);
                 let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
                     .build_and_run(&self.listen_addr)
                     .await?;
                 if let Some(rpc_address) = self.rpc_addr.clone() {
-                    let updater = Updater::new(snaps.clone(), rpc_address)?;
+                    let updater = Updater::new(snaps.clone(), rpc_address, self.update_interval)?;
                     let updater_handle = updater.start();
                     return Ok((updater_handle, rpc_handle));
                 }
@@ -94,7 +103,7 @@ impl Command {
         }
         let (updater_handle, rpc_handle) = self.start(chain_cfg).await?;
         run_until_ctrl_c(async move {
-            info!("Stopping RPC server...");
+            info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = rpc_handle.stop();
             Ok(())

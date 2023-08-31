@@ -55,15 +55,7 @@ impl<DB> SnapshotTree<DB> {
             return;
         }
         self.hash_diff_map.write().unwrap().retain(|_, v| {
-            if let Some(diff_layer) = v.diff_layer() {
-                if diff_layer.block_info.number.unwrap() > bottom_height {
-                    return true;
-                } else {
-                    false
-                }
-            } else {
-                true
-            }
+            v.is_cache_layer() || v.unwrap_diff_layer().block_info.number.unwrap() > bottom_height
         });
         self.num_diff_map
             .write()
@@ -99,7 +91,6 @@ where
 {
     type Error = Error<E>;
     /// update_block updates the state of the SnapshotTree.
-    ///
     fn update_block(
         &self,
         block_info: Block<Transaction>,
@@ -143,6 +134,7 @@ where
                 self.config.diff_tree_depth_limit,
                 self.config.cache_tree_depth_limit,
             )?;
+            info!(target:"storage", "clear diff map bottom_height: {:?}", bottom_height);
             self.clear_diff_map(bottom_height);
             Ok(())
         } else {
@@ -180,7 +172,7 @@ where
                     .unwrap()
                     .get(&num.as_u64())
                     .cloned()),
-                _ => unreachable!(),
+                _ => Err(Error::UnsupportedBlockId(BlockId::Number(number))),
             },
         }
     }

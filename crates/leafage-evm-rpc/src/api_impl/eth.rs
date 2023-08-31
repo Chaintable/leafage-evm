@@ -12,6 +12,7 @@ use revm::primitives::{CfgEnv, Env, ExecutionResult};
 use revm::EVM;
 use serde_json::Value;
 
+/// [`EthApiImpl`] implements the EthApi trait.
 pub struct EthApiImpl<DB> {
     db: DB,
     cfg: CfgEnv,
@@ -45,7 +46,6 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             cfg,
             tx,
         };
-        // let state =
         let mut evm = EVM::with_env(env);
         evm.database(EvmStorageWrapper(state));
         let res = evm

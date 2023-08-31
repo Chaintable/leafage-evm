@@ -254,12 +254,17 @@ impl StateDBWrite for DataBase {
             .unwrap();
         let address_bytes = address.as_bytes();
         let key_bytes: [u8; 32] = key.into();
-        let value_bytes: [u8; 32] = value.into();
-        batch.put_cf(
-            address_to_storage_cf,
-            [address_bytes, &key_bytes].concat(),
-            value_bytes,
-        );
+        if value == U256::zero() {
+            batch.delete_cf(address_to_storage_cf, [address_bytes, &key_bytes].concat());
+            return Ok(());
+        } else {
+            let value_bytes: [u8; 32] = value.into();
+            batch.put_cf(
+                address_to_storage_cf,
+                [address_bytes, &key_bytes].concat(),
+                value_bytes,
+            );
+        }
         Ok(())
     }
 

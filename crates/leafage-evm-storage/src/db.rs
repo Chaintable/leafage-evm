@@ -4,7 +4,8 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256, U256,
 };
 
-#[auto_impl(&, Box)]
+/// [`StateDBRead`] offers read-only access to the state database.
+#[auto_impl(&, Box, Arc)]
 pub trait StateDBRead: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     /// latest block hash
@@ -26,11 +27,13 @@ pub trait StateDBRead: Send + Sync + 'static {
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Self::Error>;
 }
 
+/// [`StateDBWrite`] offers write-only access to the state database.
 #[auto_impl(& , Box, Arc)]
 pub trait StateDBWrite: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     type DBWriteBatch: Send;
 
+    /// prepare write batch for write
     fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Self::Error>;
 
     /// latest block hash
@@ -80,9 +83,11 @@ pub trait StateDBWrite: Send + Sync + 'static {
         value: U256,
     ) -> Result<(), Self::Error>;
 
+    /// commit write batch
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error>;
 }
 
+/// [`DBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
 pub struct DBWrapper<T>(pub T);
 
 impl<T> BlockContext for DBWrapper<T>
