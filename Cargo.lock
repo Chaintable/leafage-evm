@@ -1515,7 +1515,7 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "leafage-evm"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "leafage-evm-rpc"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "ethers-core",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "leafage-evm-storage"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "leafage-evm-types"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ethers-core",
  "open-fastrlp",

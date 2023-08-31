@@ -1,6 +1,6 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
-    Address, BlockId, BlockNumber, Bytes, CallRequest, JsonStorageKey, H256, U256,
+    Address, BlockId, BlockNumber, Bytes, CallRequest, JsonStorageKey, MultiCallResp, H256, U256,
 };
 use serde_json::Value;
 
@@ -10,6 +10,16 @@ pub trait EthApi {
     // Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "call")]
     async fn call(&self, request: CallRequest, block_number: BlockId) -> RpcResult<Bytes>;
+
+    #[method(name = "multiCall")]
+    async fn multi_call(
+        &self,
+        requests: Vec<CallRequest>,
+        block_number: BlockId,
+        fast_fail: bool,
+        use_parallel: bool,
+        disable_cache: bool,
+    ) -> RpcResult<MultiCallResp>;
 
     #[method(name = "blockNumber")]
     async fn block_number(&self) -> RpcResult<U256>;

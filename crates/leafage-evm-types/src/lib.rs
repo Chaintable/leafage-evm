@@ -8,4 +8,7 @@ pub use storage::{
 };
 
 mod rpc;
-pub use rpc::{Block, BlockId, BlockNumber, CallRequest, JsonStorageKey, Transaction, TxHash};
+pub use rpc::{
+    Block, BlockId, BlockNumber, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
+    MultiCallStats, SingleCallResult, Transaction, TxHash,
+};
