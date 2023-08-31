@@ -2,12 +2,18 @@
 
 leafage-evm is a light-weight evm excuter that only retains the state of the most recent 64 blocks, which can only be updated through a specific json-rpc interface.
 
-leafage-evm is designed as an eth client that only retains the  the most recent state. It doesn't support the complete eth json-rpc. Its core objective is to offer state-related RPCs like `eth_call` with minimal storage and computational resources. See [design.md](doc/design.md) for details.
+leafage-evm is designed as an eth client that only retains the  the most recent state. It doesn't support the complete eth json-rpc. Its core objective is to offer state-related RPCs like `eth_call` with minimal storage and computational resources.
+
+## Design
+See [design.md](doc/design.md) for details.
 
 ## Features
 
+- Only Need ~60GB storage for eth mainnet
+
 - Support JSON-RPC 
     - [x] eth_call
+    - [x] eth_multiCall
     - [x] eth_blockNumber
     - [x] eth_getBalance
     - [x] eth_getBlockByHash
@@ -22,3 +28,6 @@ leafage-evm is designed as an eth client that only retains the  the most recent 
 - Support Migrate data from geth's state snapshot
 
 - Plan to support different database backends, including rocksdb, mdbx etc.
+
+## Usage
+See [usage.md](doc/usage.md) for details.

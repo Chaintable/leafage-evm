@@ -192,6 +192,13 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
     }
 
     pub fn commit(&self, diff_layer: Arc<LinkedDiffLayer<DB>>) -> Result<(), DB::Error> {
+        let old_head = self.diff_layer_list.lock().unwrap().front().cloned();
+        if let Some(old_head) = old_head {
+            assert_eq!(
+                old_head.unwrap_diff_layer().block_info.hash.unwrap(),
+                diff_layer.unwrap_diff_layer().block_info.parent_hash
+            );
+        }
         self.diff_layer_list
             .lock()
             .unwrap()
