@@ -151,16 +151,12 @@ mod tests {
         for i in 0..1 {
             let res = rpc_client
                 .block_diff(
-                    BlockId::Number(BlockNumber::Number((18024701 + i).into())),
+                    BlockId::Number(BlockNumber::Number((18022783 + i).into())),
                     true,
                 )
                 .await
                 .unwrap();
             let block_diff: BlockStorageDiff = Decodable::decode(&mut res.as_ref()).unwrap();
-            // let res = rpc_client
-            //     .get_block_by_number(BlockNumber::Number((18017515 + i).into()), false)
-            //     .await
-            //     .unwrap();
             println!("{:?}", block_diff.storage_diffs);
         }
     }
