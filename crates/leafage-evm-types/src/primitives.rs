@@ -1,6 +1,6 @@
 pub use ethers_core::types::{Address, Bytes, H160, H256, U256, U64};
 use revm::primitives::B160;
-pub use revm::primitives::{AccountInfo, BlockEnv, Bytecode, U256 as RU256};
+pub use revm::primitives::{AccountInfo, BlockEnv, Bytecode, KECCAK_EMPTY, U256 as RU256};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]

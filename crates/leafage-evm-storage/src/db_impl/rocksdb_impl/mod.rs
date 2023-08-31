@@ -18,7 +18,8 @@
 
 use crate::db::{StateDBRead, StateDBWrite};
 use leafage_evm_types::{
-    trim_left_zero_bytes, Block, Bytes, NewAccount, SlimAccount, Transaction, H256, U256,
+    trim_left_zero_bytes, Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK_EMPTY,
+    U256,
 };
 use open_fastrlp::{Decodable, Encodable};
 use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, WriteBatch, DB};
@@ -121,7 +122,11 @@ impl StateDBRead for DataBase {
             address,
             balance: account.balance,
             nonce: account.nonce,
-            code_hash: account.code_hash,
+            code_hash: if account.code_hash.is_zero() {
+                KECCAK_EMPTY.into()
+            } else {
+                account.code_hash
+            },
         };
         Ok(Some(account))
     }
