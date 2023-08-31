@@ -1,4 +1,4 @@
-**Background**
+**Background**  
 The currently running nodex1.0 is a synchronization solution based on the database. While it generally functions well, there are several issues:
 1. Complex components make maintenance challenging, often requiring manual intervention.
 2. Significant invasive modifications to the original geth, making patching during version updates labor-intensive.
@@ -13,7 +13,7 @@ To address these issues and drawing from the experience of maintaining nodex1.0,
 3. Minimal intrusion into geth for a straightforward implementation.
 4. High performance, low cost, and minimized storage and computational requirements.
 
-**Components**
+**Components**  
 1. **Leafage-evm** ([GitHub Link](https://github.com/DeBankDeFi/leafage-evm)): A rust-implemented execution client based on revm.
    - No p2p synchronization.
    - Serves as an RPC node, providing the necessary eth_* calls for state nodes.
@@ -23,21 +23,21 @@ To address these issues and drawing from the experience of maintaining nodex1.0,
    - Records storage state changes (storageDiff) for each block.
    - Modified version of geth that provides the leafage_storageDiff RPC method, returning storageDiff for each block.
 
-**Design**
-**EVM statedb Interface**
+**Design**  
+**EVM statedb Interface**  
 Based on the revm specification, the statedb interface is defined to:
 1. Access account details by address (balance, nonce, etc.).
 2. Access code by code hash.
 3. Access storage by address and storage index.
 4. Obtain block hash by block number.
 
-**Statedb Linkedlist**
+**Statedb Linkedlist**  
 Leafage-evm stores each block's storageDiff in a linked list similar to geth's snaptree. The top represents the latest block's storageDiff, with older data below, and the bottom layer being rockdb. Each state access is essentially accessing a node in the linked list. To retrieve a specific value, a downward search is performed, accessing all storageDiffs from the current node to the bottom node, until the base rockdb is accessed. For each update, the new block's storageDiff becomes the new linked list head, facilitating incremental updates.
 
-**Block Updates**
+**Block Updates**  
 Call eth_blockbynum(current num+1) to get the block for the current height +1.
   - If no reorg occurs (current+1 block.parent == current block.hash), call leafage_storageDiff to get storageDiff and update the linked list head.
   - If a reorg occurs (current+1 block.parent != current block.hash), call eth_blockbyhash to backtrack to the reorg's fork point. From there, re-synchronize by calling leafage_storageDiff to get the storageDiff.
 
-**Data Migration**
+**Data Migration**  
 Supports exporting geth's snapshot data in a format usable by leafage-evm. This is used during the first startup without a mirror to avoid starting updates from block num 0.
