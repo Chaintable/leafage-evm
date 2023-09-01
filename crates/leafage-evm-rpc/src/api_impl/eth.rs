@@ -5,8 +5,9 @@ use ethers_core::abi::AbiEncode;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, Address, Block, BlockId, BlockNumber, Bytes, CallRequest, JsonStorageKey,
-    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, TxHash, H256, RU256, U256,
+    block_env_from_block, calculate_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
+    BlockNumber, Bytes, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
+    MultiCallStats, SingleCallResult, TxHash, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
 use revm::primitives::{CfgEnv, Env, ExecutionResult};
@@ -24,6 +25,27 @@ pub struct EthApiImpl<DB> {
 impl<DB: EvmStorageRead> EthApiImpl<DB> {
     pub fn new(db: DB, cfg: CfgEnv) -> Self {
         Self { db, cfg }
+    }
+
+    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<U256> {
+        let state = self
+            .db
+            .state_at(block_id)
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        if state.is_none() {
+            return Err(invalid_params_rpc_err("Block not found".to_string()));
+        }
+        let block = state
+            .unwrap()
+            .block_info_arc()
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        let base_fee = calculate_next_block_base_fee(
+            block.gas_used.as_u64(),
+            block.gas_limit.as_u64(),
+            block.base_fee_per_gas.unwrap_or_default().as_u64(),
+            BaseFeeParams::ethereum(),
+        );
+        Ok(base_fee.into())
     }
 
     async fn call_impl(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
@@ -467,5 +489,10 @@ where
 
     async fn chain_id(&self) -> RpcResult<U256> {
         self.chain_id_impl()
+    }
+
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<U256> {
+        self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumber::Latest)))
+            .await
     }
 }

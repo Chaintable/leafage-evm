@@ -74,7 +74,7 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
     Ok(env)
 }
 
-pub fn decode_revert_reason(out: impl AsRef<[u8]>) -> Option<String> {
+pub(crate) fn decode_revert_reason(out: impl AsRef<[u8]>) -> Option<String> {
     use ethers_core::abi::AbiDecode;
     let out = out.as_ref();
     if out.len() < 4 {

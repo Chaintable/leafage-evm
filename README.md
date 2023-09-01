@@ -14,6 +14,7 @@ See [design.md](doc/design.md) for details.
 - Support JSON-RPC 
     - [x] eth_call
     - [x] eth_multiCall
+    - [x] eth_baseFee
     - [x] eth_blockNumber
     - [x] eth_getBalance
     - [x] eth_getBlockByHash

@@ -57,4 +57,7 @@ pub trait EthApi {
 
     #[method(name = "chainId")]
     async fn chain_id(&self) -> RpcResult<U256>;
+
+    #[method(name = "baseFee")]
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<U256>;
 }
