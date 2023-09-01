@@ -8,4 +8,4 @@ RUN cargo build --release
 FROM ubuntu:22.04
 WORKDIR /app
 COPY --from=builder /app/target/release/leafage-evm .
-CMD ["./app/leafage-evm"]
+ENTRYPOINT  ["/app/leafage-evm"]
