@@ -1,10 +1,10 @@
 # Rationale
-We want to request for a new rpc endpoint `leafage_storageDiff`, which provides the storage diff of a given block on the parent block's state. This rpc is designed to be used by leafage-evm to update its state.
+We want to request for a new rpc endpoint `trace_blockStorageDiff`, which provides the storage diff of a given block on the parent block's state. This rpc is designed to be used by leafage-evm to update its state.
 
 # Specification
 ## Request
 ### Method
-`leafage_storageDiff`
+`trace_blockStorageDiff`
 ### Parameters
 The method takes 2 parameters: 
 - `block_id`: BLOCKHASH|QUANTITY|TAG - block hash , integer block number, or the string "latest", "earliest" or "pending"

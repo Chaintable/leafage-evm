@@ -16,7 +16,7 @@ To migrate data from a Geth instance with snapshot enabled, follow these steps:
 
 **Start Geth with Leafage_storageDiff Support**    
 1. start a beacon node 
-2. start a **leafage-patch Geth** ([GitHub Link](https://github.com/DeBankDeFi/go-ethereum-debank/tree/leafage)) with snapshot and `leafage_*` rpc enabled
+2. start a **leafage-patch Geth** ([GitHub Link](https://github.com/DeBankDeFi/go-ethereum/tree/leafage-diff-storage)) with snapshot , statediff and `trace_*` rpc enabled 
 
 **Launch Leafage-evm Server**
    ```bash

@@ -17,11 +17,11 @@ To address these issues and drawing from the experience of maintaining nodex1.0,
 1. **Leafage-evm** ([GitHub Link](https://github.com/DeBankDeFi/leafage-evm)): A rust-implemented execution client based on revm.
    - No p2p synchronization.
    - Serves as an RPC node, providing the necessary eth_* calls for state nodes.
-   - Synchronizes using geth's leafage_storageDiff RPC method.
+   - Synchronizes using geth's trace_blockStorageDiff RPC method.
 2. **Geth** ([GitHub Link](https://github.com/DeBankDeFi/go-ethereum-debank/tree/leafage)):
    - Synchronizes via p2p.
    - Records storage state changes (storageDiff) for each block.
-   - Modified version of geth that provides the leafage_storageDiff RPC method, returning storageDiff for each block.
+   - Modified version of geth that provides the trace_blockStorageDiff RPC method, returning storageDiff for each block.
 
 **Design**  
 **EVM statedb Interface**  
@@ -36,8 +36,8 @@ Leafage-evm stores each block's storageDiff in a linked list similar to geth's s
 
 **Block Updates**  
 Call eth_blockbynum(current num+1) to get the block for the current height +1.
-  - If no reorg occurs (current+1 block.parent == current block.hash), call leafage_storageDiff to get storageDiff and update the linked list head.
-  - If a reorg occurs (current+1 block.parent != current block.hash), call eth_blockbyhash to backtrack to the reorg's fork point. From there, re-synchronize by calling leafage_storageDiff to get the storageDiff.
+  - If no reorg occurs (current+1 block.parent == current block.hash), call trace_blockStorageDiff to get storageDiff and update the linked list head.
+  - If a reorg occurs (current+1 block.parent != current block.hash), call eth_blockbyhash to backtrack to the reorg's fork point. From there, re-synchronize by calling trace_blockStorageDiff to get the storageDiff.
 
 **Data Migration**  
 Supports exporting geth's snapshot data in a format usable by leafage-evm. This is used during the first startup without a mirror to avoid starting updates from block num 0.

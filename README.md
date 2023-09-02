@@ -24,7 +24,7 @@ See [design.md](doc/design.md) for details.
     - [x] eth_getTransactionCount
     - [x] eth_chainId
 
-- Update by `leafage_blockDiff` RPC, which returns the storage diff of a given block on the parent block's state, See [leafage_blockDiff.md](doc/leafage_blockDiff.md) for details.
+- Update by `trace_blockStateDiff` RPC, which returns the storage diff of a given block on the parent block's state, See [trace_blockStateDiff.md](doc/trace_blockStateDiff.md) for details.
 
 - Support Migrate data from geth's state snapshot
 

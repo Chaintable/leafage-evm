@@ -1,6 +1,6 @@
 use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_rpc::{EthApiClient, LeafAgeApiClient};
+use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite, SnapshotTree, StateDB};
 use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction};
 use open_fastrlp::Decodable;
@@ -96,7 +96,7 @@ where
         while let Some(block_info) = self.block_queue.pop_front() {
             let diff = self
                 .rpc_client
-                .block_diff(BlockId::Hash(block_info.hash.unwrap()), true)
+                .block_state_diff(BlockId::Hash(block_info.hash.unwrap()), true)
                 .await?;
             let mut bytes = diff.as_ref();
             let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
@@ -150,7 +150,7 @@ mod tests {
             .unwrap();
         for i in 0..1 {
             let res = rpc_client
-                .block_diff(
+                .block_state_diff(
                     BlockId::Number(BlockNumber::Number((18022783 + i).into())),
                     true,
                 )

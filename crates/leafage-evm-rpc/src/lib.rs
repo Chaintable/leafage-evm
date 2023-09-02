@@ -1,5 +1,5 @@
 mod api;
-pub use api::{EthApiClient, EthApiServer, LeafAgeApiClient, LeafAgeApiServer};
+pub use api::{EthApiClient, EthApiServer, TraceApiClient, TraceApiServer};
 
 mod error;
 
