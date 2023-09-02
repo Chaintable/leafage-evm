@@ -6,6 +6,7 @@ RUN cargo build --release
 
 
 FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y ca-certificates wget
 WORKDIR /app
 COPY --from=builder /app/target/release/leafage-evm .
 ENTRYPOINT  ["/app/leafage-evm"]
