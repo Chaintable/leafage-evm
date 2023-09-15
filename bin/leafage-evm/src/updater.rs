@@ -17,6 +17,7 @@ pub struct Updater<DB> {
     snap_tree: Arc<SnapshotTree<DB>>,
     block_queue: VecDeque<Block<Transaction>>,
     update_interval: Duration,
+    max_diff_depth: usize,
 }
 
 impl<DB> Updater<DB>
@@ -34,11 +35,13 @@ where
         update_interval: Duration,
     ) -> Result<Self> {
         let rpc_client = HttpClientBuilder::default().build(rpc_url)?;
+        let max_diff_depth = snap_tree.get_config().diff_tree_depth_limit;
         Ok(Self {
             rpc_client,
             snap_tree,
             block_queue: VecDeque::new(),
             update_interval,
+            max_diff_depth,
         })
     }
 
@@ -47,6 +50,11 @@ where
     async fn update(&mut self) -> Result<bool> {
         if self.block_queue.is_empty() {
             let current_block_info = self.snap_tree.block_info()?;
+            let latest_block_num = self.rpc_client.block_number().await?;
+            if latest_block_num.as_u64() <= current_block_info.number.unwrap().as_u64() {
+                info!(target:"updater", "no new block");
+                return Ok(false);
+            }
             let next_block_number =
                 BlockNumber::Number((current_block_info.number.unwrap().as_u64() + 1).into());
             let next_block_info = self
@@ -66,8 +74,8 @@ where
         }
         // find the first block whose parent block is in the snapshot tree
         loop {
-            if self.block_queue.len() > 256 {
-                info!(target:"updater", "can't find parent block in 256 blocks");
+            if self.block_queue.len() > self.max_diff_depth {
+                info!(target:"updater", "can't find parent block before max diff depth, drop");
                 return Ok(false);
             }
             let first_block_info = self.block_queue.front().unwrap();

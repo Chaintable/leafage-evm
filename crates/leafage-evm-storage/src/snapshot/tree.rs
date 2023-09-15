@@ -62,6 +62,10 @@ impl<DB> SnapshotTree<DB> {
             .unwrap()
             .retain(|num, v| v.is_cache_layer() || *num > bottom_height.as_u64());
     }
+
+    pub fn get_config(&self) -> Config {
+        self.config.clone()
+    }
 }
 
 impl<DB, E> SnapshotTree<DB>

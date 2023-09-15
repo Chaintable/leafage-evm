@@ -12,7 +12,7 @@ exclude = ["benches/", "tests/"]
 
 
 [workspace.dependencies]
-revm = { version = "3.3.0", features = [
+revm = { git = "https://github.com/bluealloy/revm", branch = "release/v25", features = [
     "serde",
     "optional_eip3607",
     "optional_no_base_fee",
