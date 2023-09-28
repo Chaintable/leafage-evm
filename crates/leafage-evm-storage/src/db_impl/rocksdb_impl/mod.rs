@@ -213,7 +213,10 @@ impl StateDBWrite for DataBase {
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
-
+        batch.delete_cf(
+            block_hash_to_block_info_cf,
+            block_info.parent_hash.as_bytes(),
+        );
         let block_info_bytes = to_vec(&block_info)?;
         let block_hash = block_info.hash.unwrap();
         batch.put_cf(
@@ -337,13 +340,13 @@ impl DataBase {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_max_write_buffer_number(32);
+        db_opts.set_max_write_buffer_number(1);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_bloom_filter(10.0, false);
         let cache = Cache::new_lru_cache(1 << 30); // e.g., 1GB
         block_opts.set_block_cache(&cache);
         db_opts.set_block_based_table_factory(&block_opts);
-        db_opts.set_write_buffer_size(1 << 30); // e.g., 1GB
+        db_opts.set_write_buffer_size(1 << 26); // e.g., 128MB
         let cfs = vec![
             latest_block_hash_cf,
             block_hash_to_block_info_cf,
