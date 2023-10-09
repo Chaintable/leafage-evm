@@ -340,13 +340,13 @@ impl DataBase {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_max_write_buffer_number(1);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_bloom_filter(10.0, false);
         let cache = Cache::new_lru_cache(1 << 30); // e.g., 1GB
         block_opts.set_block_cache(&cache);
         db_opts.set_block_based_table_factory(&block_opts);
-        db_opts.set_write_buffer_size(1 << 26); // e.g., 128MB
+        db_opts.set_write_buffer_size(1 << 23); // e.g., 8MB
+        db_opts.set_max_total_wal_size(1 << 30);
         let cfs = vec![
             latest_block_hash_cf,
             block_hash_to_block_info_cf,
