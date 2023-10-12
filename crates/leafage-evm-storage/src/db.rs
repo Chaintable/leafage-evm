@@ -120,7 +120,7 @@ where
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         let code = self.0.read_code(code_hash.into())?;
         if let Some(code) = code {
-            Ok(Bytecode::new_raw(code.0))
+            Ok(Bytecode::new_raw(code.0.into()))
         } else {
             Ok(Bytecode::default())
         }

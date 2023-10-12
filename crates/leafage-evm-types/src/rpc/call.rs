@@ -1,4 +1,4 @@
-use crate::primitives::{AccessList, Bytes, H160, U256};
+use crate::primitives::{AccessList, Bytes, H160, H256, U256};
 use serde::{Deserialize, Serialize};
 
 /// Call request
@@ -30,4 +30,9 @@ pub struct CallRequest {
     pub chain_id: Option<U256>,
     /// AccessList
     pub access_list: Option<AccessList>,
+    /// Max Fee per Blob gas for EIP-4844 transactions
+    pub max_fee_per_blob_gas: Option<U256>,
+    /// Blob Versioned Hashes for EIP-4844 transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_versioned_hashes: Option<Vec<H256>>,
 }

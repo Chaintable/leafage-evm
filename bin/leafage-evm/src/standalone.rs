@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
 use leafage_evm_storage::{RocksDBStorage, SnapshotTree, SnapshotTreeConfig, StateDBWrapper};
-use revm::primitives::CfgEnv;
+use revm::primitives::{CfgEnv, SpecId};
 use serde_json::from_str;
 use std::fs;
 use std::path::PathBuf;
@@ -97,6 +97,7 @@ impl Command {
     }
     pub async fn run(&mut self) -> Result<()> {
         let mut chain_cfg = CfgEnv::default();
+        chain_cfg.spec_id = SpecId::SHANGHAI;
         if let Some(path) = self.chain_cfg_path.as_ref() {
             let data = fs::read_to_string(path.as_path())?;
             chain_cfg = from_str(&data)?;

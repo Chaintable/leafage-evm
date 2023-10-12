@@ -294,8 +294,7 @@ impl<DB> DiffLayer<DB> {
         }
         for new_code in block_diff.new_codes {
             let code_hash = new_code.code_hash;
-            let code = Bytecode::new_raw(new_code.code.0);
-            assert_eq!(code_hash, code.hash().into());
+            let code = Bytecode::new_raw(new_code.code.0.into());
             contracts.insert(code_hash, code);
         }
         Self {
@@ -333,7 +332,7 @@ impl<DB> DiffLayer<DB> {
         for (code_hash, code) in self.contracts.iter() {
             new_codes.push(NewCode {
                 code_hash: *code_hash,
-                code: code.bytecode.clone().into(),
+                code: code.bytecode.clone().0.into(),
             });
         }
         let block_info = self.block_info.clone();

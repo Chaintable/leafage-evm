@@ -12,7 +12,7 @@ exclude = ["benches/", "tests/"]
 
 
 [workspace.dependencies]
-revm = { git = "https://github.com/bluealloy/revm", branch = "release/v25", features = [
+revm = { git = "https://github.com/bluealloy/revm", tag = "v26", features = [
     "serde",
     "optional_eip3607",
     "optional_no_base_fee",
@@ -33,10 +33,11 @@ jsonrpsee = { version = "0.18", features = ["server", "client", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0.43"
 async-trait = "0.1.68"
-ethers-core = "2.0.8"
+ethers-core = "2.0.10"
 anyhow = "1.0.72"
 tokio = { version = "1.29", features = ["full"] }
 clap = { version = "4.3.21", features = ["derive"] }
 serde_json = "1.0"
 open-fastrlp = "0.1.4"
 open-fastrlp-derive = "0.1.1"
+ruint = { version = "1.10", features = ["primitive-types"] }

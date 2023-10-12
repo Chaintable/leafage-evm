@@ -1,23 +1,31 @@
 use crate::primitives::{AccountInfo, BlockEnv, Bytes, H160, H256, U256};
-use ethers_core::types::{Block, Transaction};
+use ethers_core::types::{Block, Transaction, U64};
 use ethers_core::utils::keccak256;
 use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
 use revm::primitives::U256 as RU256;
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
-    BlockEnv {
+    let mut block_env = BlockEnv {
         number: RU256::from(block.number.unwrap_or_default().as_u64()),
-        coinbase: block.author.unwrap_or_default().into(),
+        coinbase: block.author.unwrap_or_default().0.into(),
         timestamp: block.timestamp.into(),
         difficulty: block.difficulty.into(),
         basefee: block.base_fee_per_gas.unwrap_or_default().into(),
         gas_limit: block.gas_limit.into(),
         prevrandao: if block.difficulty.is_zero() {
-            Some(block.mix_hash.unwrap_or_default().into())
+            Some(block.mix_hash.unwrap_or_default().0.into())
         } else {
             None
         },
-    }
+        blob_excess_gas_and_price: None,
+    };
+    if block.other.contains_key("excessBlobGas") {
+        let excess_blob_gas: U64 =
+            serde_json::from_str(block.other.get("excessBlobGas").unwrap().as_str().unwrap())
+                .unwrap();
+        block_env.set_blob_excess_gas_and_price(excess_blob_gas.as_u64());
+    };
+    block_env
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
@@ -59,7 +67,7 @@ impl Into<AccountInfo> for NewAccount {
         AccountInfo {
             balance: self.balance.into(),
             nonce: self.nonce,
-            code_hash: self.code_hash.into(),
+            code_hash: self.code_hash.0.into(),
             code: None,
         }
     }
@@ -71,7 +79,7 @@ impl From<(H160, AccountInfo)> for NewAccount {
             address: keccak256(address.as_bytes()).into(),
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
-            code_hash: account_info.code_hash.into(),
+            code_hash: account_info.code_hash.0.into(),
         }
     }
 }
@@ -82,7 +90,7 @@ impl From<(H256, AccountInfo)> for NewAccount {
             address,
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
-            code_hash: account_info.code_hash.into(),
+            code_hash: account_info.code_hash.0.into(),
         }
     }
 }

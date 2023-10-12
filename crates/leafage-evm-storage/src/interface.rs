@@ -4,7 +4,7 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Transaction, H256, U256,
 };
 use revm::db::DatabaseRef;
-use revm::primitives::{B160, B256, U256 as RU256};
+use revm::primitives::{Address as B160, B256, U256 as RU256};
 use std::sync::Arc;
 
 /// [`StateDB`] is a trait that provides access to the state of the EVM at a specific block height.
@@ -41,21 +41,21 @@ pub struct WrapDB<T>(pub T);
 impl<T: StateDB> DatabaseRef for WrapDB<T> {
     type Error = T::Error;
     fn basic(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
-        let address = keccak256(address.as_bytes());
+        let address = keccak256(address.as_slice());
         self.0.basic(address.into())
     }
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.0.code_by_hash(code_hash.into())
+        self.0.code_by_hash(code_hash.0.into())
     }
     fn storage(&self, address: B160, index: RU256) -> Result<RU256, Self::Error> {
-        let address = keccak256(address.as_bytes());
+        let address = keccak256(address.as_slice());
         let index = keccak256::<[u8; 32]>(index.to_be_bytes());
         self.0
             .storage(address.into(), index.into())
             .map(|n| n.into())
     }
     fn block_hash(&self, number: RU256) -> Result<B256, Self::Error> {
-        self.0.block_hash(number.into()).map(|h| h.into())
+        self.0.block_hash(number.into()).map(|h| h.0.into())
     }
 }
 

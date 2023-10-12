@@ -11,6 +11,8 @@ exclude.workspace = true
 [dependencies]
 revm.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 ethers-core.workspace = true
-open-fastrlp.workspace = true 
-open-fastrlp-derive.workspace  = true
+open-fastrlp.workspace = true
+open-fastrlp-derive.workspace = true
+ruint = { workspace = true }

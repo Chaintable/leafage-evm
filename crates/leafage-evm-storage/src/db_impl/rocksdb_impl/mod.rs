@@ -123,7 +123,7 @@ impl StateDBRead for DataBase {
             balance: account.balance,
             nonce: account.nonce,
             code_hash: if account.code_hash.is_zero() {
-                KECCAK_EMPTY.into()
+                KECCAK_EMPTY.0.into()
             } else {
                 account.code_hash
             },
@@ -347,6 +347,7 @@ impl DataBase {
         db_opts.set_block_based_table_factory(&block_opts);
         db_opts.set_write_buffer_size(1 << 23); // e.g., 8MB
         db_opts.set_max_total_wal_size(1 << 30);
+        db_opts.set_keep_log_file_num(10);
         let cfs = vec![
             latest_block_hash_cf,
             block_hash_to_block_info_cf,

@@ -77,7 +77,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             .transact_ref()
             .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
         match res.result {
-            ExecutionResult::Success { output, .. } => Ok(output.into_data().into()),
+            ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
             ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
                 "Reverted: {:?}",
                 decode_revert_reason(output).unwrap_or("Reason Unknown".to_string())
@@ -261,7 +261,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     code: MultiCallErrorCode::Success as i32,
                     err: "".to_string(),
                     from_cache: false,
-                    result: output.into_data().into(),
+                    result: output.into_data().0.into(),
                     gas_used: gas_used as i64,
                     time_cost: 0.0,
                 },
@@ -320,7 +320,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let account = state
-            .basic(address.into())
+            .basic(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let balance = account.map(|a| a.balance);
         Ok(balance.unwrap_or_default().into())
@@ -357,7 +357,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let account = state
-            .basic(address.into())
+            .basic(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if account.is_none() {
             return Ok(Bytes::new());
@@ -369,7 +369,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             let code = state
                 .code_by_hash(account.code_hash)
                 .map_err(|e| internal_rpc_err(e.to_string()))?;
-            Ok(code.bytecode.into())
+            Ok(code.bytecode.0.into())
         }
     }
 
@@ -389,7 +389,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let storage = state
-            .storage(address.into(), RU256::from_be_bytes(index.into()))
+            .storage(address.0.into(), RU256::from_be_bytes(index.into()))
             .map_err(|e| {
                 internal_rpc_err(format!(
                     "Failed to get storage at {:?} {:?}: {:?}",
@@ -414,7 +414,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let account = state
-            .basic(address.into())
+            .basic(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let nonce = account.map(|a| a.nonce);
         Ok(nonce.unwrap_or_default().into())

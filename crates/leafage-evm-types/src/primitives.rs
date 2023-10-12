@@ -1,5 +1,5 @@
 pub use ethers_core::types::{Address, Bytes, H160, H256, U256, U64};
-use revm::primitives::B160;
+pub use revm::primitives::Address as B160;
 pub use revm::primitives::{AccountInfo, BlockEnv, Bytecode, KECCAK_EMPTY, U256 as RU256};
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +71,7 @@ pub fn access_list_flattened(access_list: AccessList) -> Vec<(B160, Vec<RU256>)>
         .into_iter()
         .map(|item| {
             (
-                item.address.into(),
+                item.address.as_fixed_bytes().into(),
                 item.storage_keys
                     .into_iter()
                     .map(|v| RU256::from_be_bytes(v.into()))
