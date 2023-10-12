@@ -27,7 +27,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         Self { db, cfg }
     }
 
-    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<U256> {
+    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
             .db
             .state_at(block_id)
@@ -45,7 +45,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             block.base_fee_per_gas.unwrap_or_default().as_u64(),
             BaseFeeParams::ethereum(),
         );
-        Ok(base_fee.into())
+        Ok(base_fee)
     }
 
     async fn call_impl(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
@@ -491,7 +491,7 @@ where
         self.chain_id_impl()
     }
 
-    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<U256> {
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumber::Latest)))
             .await
     }

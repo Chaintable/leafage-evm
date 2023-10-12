@@ -126,6 +126,11 @@ where
                 .unwrap()
                 .insert(block_info.hash.unwrap(), new_diff_layer.clone());
 
+            self.num_diff_map
+                .write()
+                .unwrap()
+                .insert(block_info.number.unwrap().as_u64(), new_diff_layer.clone());
+
             let latest = self.latest.load().clone();
             let latest_block_info = latest.block_info()?;
             // import reorg block
