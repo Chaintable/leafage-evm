@@ -107,7 +107,7 @@ impl Command {
         let stat = Arc::new(MigateStat::default());
         let block_info_source = FileSource::new(
             block_info_path,
-            |entry| entry.file_name().to_str().unwrap().ends_with(".rlp"),
+            |entry| entry.file_name().to_str().unwrap().ends_with(".json"),
             stat.clone(),
         )?;
         let storage_source = FileSource::new(
