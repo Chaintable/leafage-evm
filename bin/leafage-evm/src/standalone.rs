@@ -17,8 +17,8 @@ pub struct Command {
     /// The path to Cfg config to use for this node.
     ///
     /// If not specified, the default config [eth] will be used.
-    #[arg(long, value_name = "PATH")]
-    chain_cfg_path: Option<PathBuf>,
+    #[arg(long, value_parser = parse_chain_cfg, default_value = "eth")]
+    chain_cfg: CfgEnv,
 
     /// The path to the database to use for this node.
     #[arg(long, value_name = "PATH")]
@@ -67,6 +67,25 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntEr
     Ok(std::time::Duration::from_secs(seconds))
 }
 
+fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
+    let mut chain_cfg = CfgEnv::default();
+    chain_cfg.spec_id = SpecId::SHANGHAI;
+    if arg.is_empty() || arg == "eth" {
+        return Ok(chain_cfg);
+    }
+    if arg == "seth" {
+        chain_cfg.chain_id = 11155111;
+        return Ok(chain_cfg);
+    }
+    let path = PathBuf::from(arg);
+    if !path.exists() {
+        bail!("chain config file not exists");
+    }
+    let data = fs::read_to_string(path.as_path())?;
+    let chain_cfg = from_str(&data)?;
+    Ok(chain_cfg)
+}
+
 impl Command {
     async fn start(
         &self,
@@ -96,13 +115,7 @@ impl Command {
         }
     }
     pub async fn run(&mut self) -> Result<()> {
-        let mut chain_cfg = CfgEnv::default();
-        chain_cfg.spec_id = SpecId::SHANGHAI;
-        if let Some(path) = self.chain_cfg_path.as_ref() {
-            let data = fs::read_to_string(path.as_path())?;
-            chain_cfg = from_str(&data)?;
-        }
-        let (updater_handle, rpc_handle) = self.start(chain_cfg).await?;
+        let (updater_handle, rpc_handle) = self.start(self.chain_cfg.clone()).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
