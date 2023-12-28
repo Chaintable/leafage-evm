@@ -3,8 +3,7 @@ use crate::snapshot::error::Error;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use leafage_evm_types::{
-    AccountInfo, AccountStorageDiff, Block, BlockStorageDiff, Bytecode, IndexValuePair, NewAccount,
-    NewCode, Transaction, H256, U256, U64,
+    AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256, U64,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -242,6 +241,7 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
 /// It stores the diff of the EVM.
 pub struct DiffLayer<DB> {
     pub block_info: Arc<Block<Transaction>>,
+    pub block_diff: Arc<BlockStorageDiff>,
     pub accounts: HashMap<H256, Option<AccountInfo>>,
     pub storage: HashMap<(H256, H256), U256>,
     pub contracts: HashMap<H256, Bytecode>,
@@ -281,24 +281,28 @@ impl<DB> DiffLayer<DB> {
         let mut accounts = HashMap::new();
         let mut storage = HashMap::new();
         let mut contracts = HashMap::new();
-        for new_account in block_diff.new_accounts {
+        for del_account in block_diff.deleted_accounts.iter() {
+            accounts.insert(del_account.clone(), None);
+        }
+        for new_account in block_diff.new_accounts.iter() {
             let address = new_account.address;
-            let account_info: AccountInfo = new_account.into();
+            let account_info: AccountInfo = new_account.clone().into();
             accounts.insert(address, Some(account_info));
         }
-        for account_diff in block_diff.storage_diffs {
+        for account_diff in block_diff.storage_diffs.iter() {
             let address = account_diff.address;
-            for index_value in account_diff.diffs {
+            for index_value in account_diff.diffs.iter() {
                 storage.insert((address, index_value.index), index_value.value);
             }
         }
-        for new_code in block_diff.new_codes {
+        for new_code in block_diff.new_codes.iter() {
             let code_hash = new_code.code_hash;
-            let code = Bytecode::new_raw(new_code.code.0.into());
+            let code = Bytecode::new_raw(new_code.code.0.clone().into());
             contracts.insert(code_hash, code);
         }
         Self {
             block_info: Arc::new(block_info),
+            block_diff: Arc::new(block_diff),
             accounts,
             storage,
             contracts,
@@ -307,44 +311,10 @@ impl<DB> DiffLayer<DB> {
     }
 
     fn storage_diff(&self) -> (Block<Transaction>, BlockStorageDiff) {
-        let mut new_accounts = Vec::new();
-        let mut deleted_accounts = Vec::new();
-        let mut storage_diffs = Vec::new();
-        let mut new_codes = Vec::new();
-        for (address, account) in self.accounts.iter() {
-            if let Some(account) = account {
-                new_accounts.push(NewAccount::from((*address, account.clone())));
-            } else {
-                deleted_accounts.push(*address);
-            }
-        }
-        for ((address, index), value) in self.storage.iter() {
-            let mut account_diff = AccountStorageDiff {
-                address: *address,
-                diffs: Vec::new(),
-            };
-            account_diff.diffs.push(IndexValuePair {
-                index: *index,
-                value: *value,
-            });
-            storage_diffs.push(account_diff);
-        }
-        for (code_hash, code) in self.contracts.iter() {
-            new_codes.push(NewCode {
-                code_hash: *code_hash,
-                code: code.bytecode.clone().0.into(),
-            });
-        }
-        let block_info = self.block_info.clone();
-        let block_diff = BlockStorageDiff {
-            hash: self.block_info.hash.unwrap(),
-            parent_hash: self.block_info.parent_hash,
-            new_accounts,
-            deleted_accounts,
-            storage_diffs,
-            new_codes,
-        };
-        (block_info.as_ref().clone(), block_diff)
+        (
+            self.block_info.as_ref().clone(),
+            self.block_diff.as_ref().clone(),
+        )
     }
 }
 

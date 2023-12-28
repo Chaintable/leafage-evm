@@ -155,12 +155,12 @@ where
         )?;
         let hash = block_info.hash.unwrap();
         self.0.write_block_info(&mut batch, block_info)?;
+        for account in block_diff.deleted_accounts {
+            self.0.write_account(&mut batch, account, None)?;
+        }
         for account in block_diff.new_accounts {
             self.0
                 .write_account(&mut batch, account.address, Some(account))?;
-        }
-        for account in block_diff.deleted_accounts {
-            self.0.write_account(&mut batch, account, None)?;
         }
         for account_diff in block_diff.storage_diffs {
             for index_value_pair in account_diff.diffs {
