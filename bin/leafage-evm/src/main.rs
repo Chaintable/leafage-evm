@@ -6,6 +6,10 @@ mod updater;
 use clap::Parser;
 use runner::Cli;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use jemallocator;
+
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
