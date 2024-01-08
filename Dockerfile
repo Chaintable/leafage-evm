@@ -2,7 +2,7 @@ FROM rust:1.70.0-bookworm as builder
 WORKDIR /app
 COPY . .
 RUN apt-get update -y && apt-get install -y libclang-dev
-ENV RUSTFLAGS=-C force-frame-pointers=yes -C debuginfo=1
+ENV RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=1"
 RUN cargo build --release
 
 
