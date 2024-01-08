@@ -14,7 +14,6 @@ use revm::primitives::{CfgEnv, Env, ExecutionResult};
 use revm::EVM;
 use serde_json::Value;
 use std::str::FromStr;
-use std::sync::Arc;
 
 /// [`EthApiImpl`] implements the EthApi trait.
 pub struct EthApiImpl<DB> {
@@ -206,7 +205,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        let state = Arc::new(state.unwrap());
+        let state = state.unwrap();
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;

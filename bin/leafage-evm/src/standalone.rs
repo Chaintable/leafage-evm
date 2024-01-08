@@ -40,6 +40,13 @@ pub struct Command {
     #[arg(long, default_value = "0.0.0.0:8545")]
     listen_addr: String,
 
+    /// The maximum number of concurrent connections.
+    /// Default: 5000
+    ///
+    /// This limit is used for the HTTP-RPC server
+    #[arg(long, default_value = "5000")]
+    max_connections: u32,
+
     /// The depth limit of the diff tree.
     /// Default: 64 for eth mainnet
     ///
@@ -101,8 +108,9 @@ impl Command {
                     db,
                     SnapshotTreeConfig::new(self.diff_depth_limit, self.cache_depth_limit),
                 )?);
+                info!(target:"updater", "start leafage server at {}, max_connections: {}", self.listen_addr, self.max_connections);
                 let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
-                    .build_and_run(&self.listen_addr)
+                    .build_and_run(&self.listen_addr, self.max_connections)
                     .await?;
                 if let Some(rpc_address) = self.rpc_addr.clone() {
                     let updater = Updater::new(snaps.clone(), rpc_address, self.update_interval)?;

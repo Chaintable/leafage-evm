@@ -63,7 +63,11 @@ impl<T: StateDB> DatabaseRef for WrapDB<T> {
 #[auto_impl(&, Box, Arc)]
 pub trait EvmStorageRead {
     type Error: std::error::Error + Send + Sync + 'static;
-    type StateDB: StateDB + BlockContext<Error = <Self::StateDB as StateDB>::Error> + Send + Sync;
+    type StateDB: StateDB
+        + BlockContext<Error = <Self::StateDB as StateDB>::Error>
+        + Send
+        + Sync
+        + Clone;
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error>;
 }
 

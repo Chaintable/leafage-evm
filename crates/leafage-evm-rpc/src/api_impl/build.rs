@@ -30,8 +30,12 @@ where
         rpc_module
     }
 
-    pub async fn build_and_run(self, addr: &str) -> Result<ServerHandle, Error> {
-        let server = ServerBuilder::default().build(addr).await?;
+    pub async fn build_and_run(self, addr: &str, max_connects: u32) -> Result<ServerHandle, Error> {
+        let server = ServerBuilder::default()
+            .max_connections(max_connects)
+            .max_response_body_size(u32::MAX)
+            .build(addr)
+            .await?;
         let handle = server.start(self.build_rpc())?;
         Ok(handle)
     }
