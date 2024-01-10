@@ -23,13 +23,11 @@ leafage-evm-storage = { path = "crates/leafage-evm-storage" }
 leafage-evm-types = { path = "crates/leafage-evm-types" }
 leafage-evm-rpc = { path = "crates/leafage-evm-rpc" }
 auto_impl = "1.1.0"
-arc-swap = "1.6.0"
 bytes = "1.4.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dashmap = "5.5.0"
-rocksdb = "0.21.0"
-jsonrpsee = { version = "0.18", features = ["server", "client", "macros"] }
+rocksdb = { version = "0.21.0", features = ["jemalloc"] }
+jsonrpsee = { version = "0.21", features = ["server", "client", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0.43"
 async-trait = "0.1.68"
@@ -41,3 +39,13 @@ serde_json = "1.0"
 open-fastrlp = "0.1.4"
 open-fastrlp-derive = "0.1.1"
 ruint = { version = "1.10", features = ["primitive-types"] }
+tikv-jemallocator = "0.5.4"
+tikv-jemalloc-ctl = "0.5.4"
+tikv-jemalloc-sys = { version = "0.5.4", features = [
+    "stats",
+    "profiling",
+    "unprefixed_malloc_on_supported_platforms",
+] }
+tower = { version = "0.4.13", features = ["full"] }
+console-subscriber = "0.2.0"
+quick_cache = "0.4.0"

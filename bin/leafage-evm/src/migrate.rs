@@ -175,7 +175,7 @@ impl Command {
         });
         match self.db_type.as_str() {
             "rocksdb" => {
-                let db = Arc::new(RocksDBStorage::open(self.db_path.clone()));
+                let db = Arc::new(RocksDBStorage::open(self.db_path.clone(), 512));
                 db_migration(
                     block_info_source,
                     storage_source,

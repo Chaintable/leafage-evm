@@ -9,9 +9,7 @@ exclude.workspace = true
 
 
 [dependencies]
-leafage-evm-storage = { workspace = true, features = [
-    "with-rocksdb",
-] }
+leafage-evm-storage = { workspace = true, features = ["with-rocksdb"] }
 leafage-evm-types.workspace = true
 leafage-evm-rpc.workspace = true
 anyhow.workspace = true
@@ -22,10 +20,11 @@ tracing.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
-open-fastrlp.workspace = true 
-jemallocator = "0.5.4"
-jemalloc-ctl = "0.5.4"
-jemalloc-sys = {version = "0.5.4+5.3.0-patched", features = ["stats", "profiling", "unprefixed_malloc_on_supported_platforms"]}
+open-fastrlp.workspace = true
+tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true
+tikv-jemalloc-sys.workspace = true
+console-subscriber.workspace = true
 
 [profile.release]
 debug = true

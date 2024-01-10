@@ -29,6 +29,13 @@ pub struct Command {
     #[arg(long, default_value = "rocksdb")]
     db_type: String,
 
+    /// The size of the database cache in MB.
+    /// Default: 1024
+    ///
+    /// This limit is used for the rocksdb cache.
+    #[arg(long, default_value = "1024")]
+    db_cache: usize,
+
     /// The address for rpc client.
     #[arg(long, value_name = "URL")]
     rpc_addr: Option<String>,
@@ -54,12 +61,26 @@ pub struct Command {
     #[arg(long, default_value = "64")]
     diff_depth_limit: usize,
 
-    /// The depth limit of the cache tree.
-    /// Default: 512 for eth mainnet
+    /// The size of the account cache.
+    /// Default: 100000
     ///
-    /// This limit is determined by the number of blocks that can be cached in memory.
-    #[arg(long, default_value = "512")]
-    cache_depth_limit: usize,
+    /// This limit is used for the account cache.
+    #[arg(long, default_value = "100000")]
+    account_cache_size: usize,
+
+    /// The size of the storage cache.
+    /// Default: 2000000
+    ///
+    /// This limit is used for the storage cache.
+    #[arg(long, default_value = "2000000")]
+    storage_cache_size: usize,
+
+    /// The size of the code cache.
+    /// Default: 50000
+    ///
+    /// This limit is used for the code cache.
+    #[arg(long, default_value = "50000")]
+    code_cache_size: usize,
 
     /// The interval to fetch block and update the snapshot tree.
     /// Default: 5 seconds
@@ -67,6 +88,13 @@ pub struct Command {
     /// This interval is used to fetch block from rpc client.
     #[arg(long, value_parser = parse_duration, default_value = "5")]
     update_interval: std::time::Duration,
+
+    /// The timeout for rpc server.
+    /// Default: 10 seconds
+    ///
+    /// This timeout is used to set the timeout for rpc server.
+    #[arg(long, value_parser = parse_duration, default_value = "10")]
+    rpc_timeout: std::time::Duration,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -103,14 +131,20 @@ impl Command {
     )> {
         match self.db_type.as_str() {
             "rocksdb" => {
-                let db = StateDBWrapper(RocksDBStorage::open(self.db_path.as_path()));
+                let db =
+                    StateDBWrapper(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
                 let snaps = Arc::new(SnapshotTree::new(
                     db,
-                    SnapshotTreeConfig::new(self.diff_depth_limit, self.cache_depth_limit),
+                    SnapshotTreeConfig::new(
+                        self.diff_depth_limit,
+                        self.account_cache_size,
+                        self.storage_cache_size,
+                        self.code_cache_size,
+                    ),
                 )?);
                 info!(target:"updater", "start leafage server at {}, max_connections: {}", self.listen_addr, self.max_connections);
                 let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
-                    .build_and_run(&self.listen_addr, self.max_connections)
+                    .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
                     .await?;
                 if let Some(rpc_address) = self.rpc_addr.clone() {
                     let updater = Updater::new(snaps.clone(), rpc_address, self.update_interval)?;

@@ -1,12 +1,11 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
-use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use leafage_evm_types::{
     AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256, U64,
 };
+use quick_cache::sync::Cache;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
 
 /// [`LinkedDiffLayer`] is a single linked list that stores the state of the EVM.
@@ -24,11 +23,7 @@ where
     DB: EvmStorageWrite<Error = E> + BlockContext<Error = E>,
 {
     /// commit the diff layer to the db and return the bottom block number.
-    pub fn cap_diff_to_db(
-        self: Arc<Self>,
-        depth_limit: usize,
-        cache_depth_limit: usize,
-    ) -> Result<U64, Error<E>> {
+    pub fn cap_diff_to_db(self: Arc<Self>, depth_limit: usize) -> Result<U64, Error<E>> {
         let cur = self;
         let mut diff_layers = VecDeque::new();
         diff_layers.push_back(cur);
@@ -37,7 +32,7 @@ where
             if cur.is_cache_layer() {
                 break;
             }
-            let next = cur.unwrap_diff_layer().next.load().clone();
+            let next = cur.unwrap_diff_layer().next.read().unwrap().clone();
             diff_layers.push_back(next);
         }
         let cache_layer = diff_layers.pop_back().unwrap();
@@ -48,13 +43,8 @@ where
             bottom_num = diff_layer.unwrap_diff_layer().block_info.number.unwrap();
             cache_layer.unwrap_cache_layer().commit(diff_layer)?;
             let next_diff_layer = diff_layers.back().unwrap();
-            next_diff_layer
-                .unwrap_diff_layer()
-                .next
-                .store(cache_layer.clone());
+            *next_diff_layer.unwrap_diff_layer().next.write().unwrap() = cache_layer.clone();
         }
-        // pop the oldest cache layer
-        cache_layer.unwrap_cache_layer().pop(cache_depth_limit);
         if bottom_num == U64::zero() {
             bottom_num = cache_layer.block_info_arc()?.number.unwrap();
         }
@@ -112,117 +102,54 @@ impl<DB> LinkedDiffLayer<DB> {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct ValueWithBlockNumber<T> {
-    value: T,
-    block_num: u64,
-}
-
-impl<T> ValueWithBlockNumber<T> {
-    pub fn new(value: T, block_num: u64) -> Self {
-        Self { value, block_num }
-    }
-}
-
 /// [`CacheDiskLayer`] is the bottom layer of the linked list.
 /// It stores the on-disk db of the EVM
 /// It is also a cache layer, which caches the
 /// (top-diff_tree_depth_limit,top-diff_tree_depth_limit-cache_tree_depth_limit] diff layers.
 pub struct CacheDiskLayer<DB> {
-    accounts: DashMap<H256, ValueWithBlockNumber<Option<AccountInfo>>>,
-    storage: DashMap<(H256, H256), ValueWithBlockNumber<U256>>,
-    contracts: DashMap<H256, ValueWithBlockNumber<Bytecode>>,
-    block_hashes: DashMap<U64, H256>,
-    /// The diff layer list is sorted from the newest to the oldest
-    diff_layer_list: Mutex<VecDeque<Arc<LinkedDiffLayer<DB>>>>,
+    accounts: Cache<H256, Option<AccountInfo>>,
+    storages: Cache<(H256, H256), U256>,
+    contracts: Cache<H256, Bytecode>,
+    block_hashes: Cache<U64, H256>,
+    old_diff_layer: Mutex<Option<Arc<LinkedDiffLayer<DB>>>>,
     db: DB,
 }
 
 impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
-    pub fn new(db: DB) -> Self {
+    pub fn new(
+        db: DB,
+        accounts_cache_size: usize,
+        storage_cache_size: usize,
+        contract_cache_size: usize,
+    ) -> Self {
         Self {
-            accounts: DashMap::new(),
-            storage: DashMap::new(),
-            contracts: DashMap::new(),
-            block_hashes: DashMap::new(),
-            diff_layer_list: Mutex::new(VecDeque::new()),
+            accounts: Cache::new(accounts_cache_size),
+            storages: Cache::new(storage_cache_size),
+            contracts: Cache::new(contract_cache_size),
+            block_hashes: Cache::new(1_000),
+            old_diff_layer: Mutex::new(None),
             db,
         }
     }
 
-    pub fn pop(&self, max_cache_layers: usize) {
-        loop {
-            if self.diff_layer_list.lock().unwrap().len() <= max_cache_layers {
-                break;
-            }
-            let linked_diff_layer = self.diff_layer_list.lock().unwrap().pop_back().unwrap();
-            let diff_layer = linked_diff_layer.unwrap_diff_layer();
-            info!(target: "storage",
-                "cache pop diff layer, block number: {}, block hash: {}",
-                diff_layer.block_info.number.unwrap(), diff_layer.block_info.hash.unwrap()
-            );
-            for (key, _) in diff_layer.accounts.iter() {
-                let accout_block_num = self.accounts.get(key).map(|v| v.block_num);
-                if let Some(accout_block_num) = accout_block_num {
-                    if accout_block_num == diff_layer.block_info.number.unwrap().as_u64() {
-                        self.accounts.remove(key);
-                    }
-                }
-            }
-            for (key, _) in diff_layer.storage.iter() {
-                let storage_block_num = self.storage.get(key).map(|v| v.block_num);
-                if let Some(storage_block_num) = storage_block_num {
-                    if storage_block_num == diff_layer.block_info.number.unwrap().as_u64() {
-                        self.storage.remove(key);
-                    }
-                }
-            }
-            for (key, _) in diff_layer.contracts.iter() {
-                let contract_block_num = self.contracts.get(key).map(|v| v.block_num);
-                if let Some(contract_block_num) = contract_block_num {
-                    if contract_block_num == diff_layer.block_info.number.unwrap().as_u64() {
-                        self.contracts.remove(key);
-                    }
-                }
-            }
-            self.block_hashes
-                .remove(&diff_layer.block_info.number.unwrap());
-        }
-    }
-
     pub fn commit(&self, diff_layer: Arc<LinkedDiffLayer<DB>>) -> Result<(), DB::Error> {
-        let old_head = self.diff_layer_list.lock().unwrap().front().cloned();
+        let old_head = self.old_diff_layer.lock().unwrap().clone();
         if let Some(old_head) = old_head {
             assert_eq!(
                 old_head.unwrap_diff_layer().block_info.hash.unwrap(),
                 diff_layer.unwrap_diff_layer().block_info.parent_hash
             );
         }
-        self.diff_layer_list
-            .lock()
-            .unwrap()
-            .push_front(diff_layer.clone());
+        *self.old_diff_layer.lock().unwrap() = Some(diff_layer.clone());
         let diff_layer = diff_layer.unwrap_diff_layer();
-        for (key, value) in diff_layer.accounts.iter() {
-            let value = ValueWithBlockNumber::new(
-                value.clone(),
-                diff_layer.block_info.number.unwrap().as_u64(),
-            );
-            self.accounts.insert(key.clone(), value);
+        for (key, _value) in diff_layer.accounts.iter() {
+            self.accounts.remove(key);
         }
-        for (key, value) in diff_layer.storage.iter() {
-            let value = ValueWithBlockNumber::new(
-                value.clone(),
-                diff_layer.block_info.number.unwrap().as_u64(),
-            );
-            self.storage.insert(key.clone(), value);
+        for (key, _value) in diff_layer.storage.iter() {
+            self.storages.remove(key);
         }
-        for (key, value) in diff_layer.contracts.iter() {
-            let value = ValueWithBlockNumber::new(
-                value.clone(),
-                diff_layer.block_info.number.unwrap().as_u64(),
-            );
-            self.contracts.insert(key.clone(), value);
+        for (key, _value) in diff_layer.contracts.iter() {
+            self.contracts.remove(key);
         }
         self.block_hashes.insert(
             diff_layer.block_info.number.unwrap(),
@@ -230,8 +157,8 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
         );
         let (block_info, block_diff) = diff_layer.storage_diff();
         info!(target: "storage",
-            "commit diff layer to db, block number: {}, block hash: {}",
-            block_info.number.unwrap(), block_info.hash.unwrap()
+            "commit diff layer to db, block number: {}, block hash: {}, account cache size: {}, storage cache size: {}, contract cache size: {}",
+            block_info.number.unwrap(), block_info.hash.unwrap(), self.accounts.len(), self.storages.len(), self.contracts.len()
         );
         self.db.update_block(block_info, block_diff)
     }
@@ -245,7 +172,7 @@ pub struct DiffLayer<DB> {
     pub accounts: HashMap<H256, Option<AccountInfo>>,
     pub storage: HashMap<(H256, H256), U256>,
     pub contracts: HashMap<H256, Bytecode>,
-    pub next: ArcSwap<LinkedDiffLayer<DB>>,
+    pub next: RwLock<Arc<LinkedDiffLayer<DB>>>,
 }
 
 impl<DB>
@@ -306,7 +233,7 @@ impl<DB> DiffLayer<DB> {
             accounts,
             storage,
             contracts,
-            next: ArcSwap::new(next),
+            next: RwLock::new(next),
         }
     }
 
@@ -326,14 +253,15 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
             LinkedDiffLayer::DiffLayer(diff) => match diff.accounts.get(&address) {
                 Some(account) => Ok(account.clone()),
                 None => {
-                    let next = diff.next.load();
+                    let next = diff.next.read().unwrap().clone();
                     next.basic(address)
                 }
             },
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.accounts.get(&address) {
-                Some(account) => Ok(account.value.clone()),
+                Some(account) => Ok(account),
                 None => {
                     let res = cache.db.basic(address)?;
+                    cache.accounts.insert(address, res.clone());
                     Ok(res)
                 }
             },
@@ -345,14 +273,15 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
             LinkedDiffLayer::DiffLayer(diff) => match diff.storage.get(&(address, index)) {
                 Some(value) => Ok(*value),
                 None => {
-                    let next = diff.next.load();
+                    let next = diff.next.read().unwrap().clone();
                     next.storage(address, index)
                 }
             },
-            LinkedDiffLayer::CacheDiskLayer(cache) => match cache.storage.get(&(address, index)) {
-                Some(value) => Ok(value.value),
+            LinkedDiffLayer::CacheDiskLayer(cache) => match cache.storages.get(&(address, index)) {
+                Some(value) => Ok(value),
                 None => {
                     let res = cache.db.storage(address, index)?;
+                    cache.storages.insert((address, index), res);
                     Ok(res)
                 }
             },
@@ -363,12 +292,16 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => match diff.contracts.get(&code_hash) {
                 Some(entry) => Ok(entry.clone()),
-                None => diff.next.load().code_by_hash(code_hash),
+                None => {
+                    let next = diff.next.read().unwrap().clone();
+                    next.code_by_hash(code_hash)
+                }
             },
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.contracts.get(&code_hash) {
-                Some(entry) => Ok(entry.value.clone()),
+                Some(entry) => Ok(entry),
                 None => {
                     let res = cache.db.code_by_hash(code_hash)?;
+                    cache.contracts.insert(code_hash, res.clone());
                     Ok(res)
                 }
             },
@@ -381,12 +314,13 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
                 if number == U256::from(diff.block_info.number.unwrap().as_u64()) {
                     Ok(diff.block_info.hash.unwrap())
                 } else {
-                    diff.next.load().block_hash(number)
+                    let next = diff.next.read().unwrap().clone();
+                    next.block_hash(number)
                 }
             }
             LinkedDiffLayer::CacheDiskLayer(cache) => {
                 match cache.block_hashes.get(&U64::from(number.as_u64())) {
-                    Some(entry) => Ok(*entry),
+                    Some(entry) => Ok(entry),
                     None => {
                         let res = cache.db.block_hash(number)?;
                         Ok(res)
@@ -404,7 +338,7 @@ impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {
-                let last_diff = cache.diff_layer_list.lock().unwrap().front().cloned();
+                let last_diff = cache.old_diff_layer.lock().unwrap().clone();
                 if let Some(last_diff) = last_diff {
                     return Ok(last_diff.unwrap_diff_layer().block_info.clone());
                 }

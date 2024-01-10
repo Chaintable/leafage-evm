@@ -78,12 +78,12 @@ impl StateDBRead for DataBase {
         let block_num_bytes: [u8; 32] = block_num.into();
         let block_hash_bytes = self
             .db
-            .get_cf(block_num_to_block_hash_cf, block_num_bytes)?;
+            .get_pinned_cf(block_num_to_block_hash_cf, block_num_bytes)?;
         if block_hash_bytes.is_none() {
             return Ok(H256::zero());
         }
         let block_hash_bytes = block_hash_bytes.unwrap();
-        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
+        let block_hash = H256::from_slice(block_hash_bytes.as_ref());
         Ok(block_hash)
     }
 
@@ -95,12 +95,12 @@ impl StateDBRead for DataBase {
         let block_hash_bytes = block_hash.as_bytes();
         let block_info_bytes = self
             .db
-            .get_cf(block_hash_to_block_info_cf, block_hash_bytes)?;
+            .get_pinned_cf(block_hash_to_block_info_cf, block_hash_bytes)?;
         if block_info_bytes.is_none() {
             return Ok(None);
         }
         let block_info_bytes = block_info_bytes.unwrap();
-        let block_info_slice = block_info_bytes.as_slice();
+        let block_info_slice = block_info_bytes.as_ref();
         let block_info = from_slice::<Block<Transaction>>(block_info_slice)?;
         Ok(Some(block_info))
     }
@@ -111,12 +111,14 @@ impl StateDBRead for DataBase {
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
         let address_bytes = address.as_bytes();
-        let raw_account_bytes = self.db.get_cf(address_to_account_cf, address_bytes)?;
+        let raw_account_bytes = self
+            .db
+            .get_pinned_cf(address_to_account_cf, address_bytes)?;
         if raw_account_bytes.is_none() {
             return Ok(None);
         }
         let raw_account_bytes = raw_account_bytes.unwrap();
-        let mut raw_account_slice = raw_account_bytes.as_slice();
+        let mut raw_account_slice = raw_account_bytes.as_ref();
         let account = SlimAccount::decode(&mut raw_account_slice).unwrap();
         let account = NewAccount {
             address,
@@ -138,7 +140,7 @@ impl StateDBRead for DataBase {
             .unwrap();
         let address_bytes = address.as_bytes();
         let key_bytes: [u8; 32] = key.into();
-        let value_bytes = self.db.get_cf(
+        let value_bytes = self.db.get_pinned_cf(
             address_to_storage_cf,
             [address_bytes, trim_left_zero_bytes(&key_bytes)].concat(),
         )?;
@@ -146,7 +148,7 @@ impl StateDBRead for DataBase {
             return Ok(U256::zero());
         }
         let value_bytes = value_bytes.unwrap();
-        let value = U256::from_big_endian(value_bytes.as_slice());
+        let value = U256::from_big_endian(value_bytes.as_ref());
         Ok(value)
     }
 
@@ -311,10 +313,20 @@ impl StateDBWrite for DataBase {
 }
 
 impl DataBase {
-    pub fn open<P: AsRef<Path>>(path: P) -> Self {
+    pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
         let mut cf_opts = Options::default();
-        cf_opts.set_max_write_buffer_number(16);
         cf_opts.create_if_missing(true);
+        cf_opts.set_dump_malloc_stats(true);
+        cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
+        cf_opts.set_keep_log_file_num(2);
+        let mut block_opts = BlockBasedOptions::default();
+        let cache = Cache::new_lru_cache(1024 * 1024 * cache_size);
+        block_opts.set_block_cache(&cache);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        block_opts.set_pin_top_level_index_and_filter(true);
+        block_opts.set_bloom_filter(10.0, false);
+        cf_opts.set_block_based_table_factory(&block_opts);
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
             cf_opts.clone(),
@@ -340,14 +352,10 @@ impl DataBase {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_bloom_filter(10.0, false);
-        let cache = Cache::new_lru_cache(1 << 30); // e.g., 1GB
-        block_opts.set_block_cache(&cache);
         db_opts.set_block_based_table_factory(&block_opts);
-        db_opts.set_write_buffer_size(1 << 23); // e.g., 8MB
-        db_opts.set_max_total_wal_size(1 << 30);
-        db_opts.set_keep_log_file_num(10);
+        db_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
+        db_opts.set_keep_log_file_num(2);
+        db_opts.set_dump_malloc_stats(true);
         let cfs = vec![
             latest_block_hash_cf,
             block_hash_to_block_info_cf,

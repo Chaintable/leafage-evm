@@ -1,7 +1,6 @@
 use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
-use arc_swap::ArcSwap;
 use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction, H256, U64};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -11,15 +10,23 @@ use tracing::info;
 pub struct Config {
     /// diff_tree_depth_limit is the max depth of the uncommitted diff tree.
     pub diff_tree_depth_limit: usize,
-    /// cache_tree_depth_limit is the max depth of the cache committed diff tree.
-    pub cache_tree_depth_limit: usize,
+    pub account_cache_size: usize,
+    pub storage_cache_size: usize,
+    pub code_cache_size: usize,
 }
 
 impl Config {
-    pub fn new(diff_tree_depth_limit: usize, cache_tree_depth_limit: usize) -> Self {
+    pub fn new(
+        diff_tree_depth_limit: usize,
+        account_cache_size: usize,
+        storage_cache_size: usize,
+        code_cache_size: usize,
+    ) -> Self {
         Self {
             diff_tree_depth_limit,
-            cache_tree_depth_limit,
+            account_cache_size,
+            storage_cache_size,
+            code_cache_size,
         }
     }
 }
@@ -28,7 +35,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             diff_tree_depth_limit: 64,
-            cache_tree_depth_limit: 512,
+            account_cache_size: 100000,
+            storage_cache_size: 3000000,
+            code_cache_size: 100000,
         }
     }
 }
@@ -39,7 +48,7 @@ pub struct SnapshotTree<DB> {
     /// two cases:
     /// 1. bottom disk db (when init).
     /// 2. top diff -> (top-1) diif -> ... -> bottom disk db.
-    latest: ArcSwap<LinkedDiffLayer<DB>>,
+    latest: RwLock<Arc<LinkedDiffLayer<DB>>>,
     /// blockhash -> node, hash_diff_map stores all the diff layer of the EVM.
     hash_diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer<DB>>>>,
     /// blocknum-> node, num_diff_map stores all the diff layer of the EVM.
@@ -76,11 +85,16 @@ where
         let mut hash_diffs = HashMap::new();
         let mut num_diffs = HashMap::new();
         let info = db.block_info()?;
-        let cache_layer = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(db)));
+        let cache_layer = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(
+            db,
+            config.account_cache_size,
+            config.storage_cache_size,
+            config.code_cache_size,
+        )));
         hash_diffs.insert(info.hash.unwrap(), cache_layer.clone());
         num_diffs.insert(info.number.unwrap().as_u64(), cache_layer.clone());
         Ok(Self {
-            latest: ArcSwap::new(cache_layer),
+            latest: RwLock::new(cache_layer),
             hash_diff_map: RwLock::new(hash_diffs),
             num_diff_map: RwLock::new(num_diffs),
             config,
@@ -118,7 +132,7 @@ where
         if let Some(parent_layer) = res {
             let new_diff_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
                 block_info.clone(),
-                block_diff.clone(),
+                block_diff,
                 parent_layer.clone(),
             )));
             self.hash_diff_map
@@ -131,18 +145,14 @@ where
                 .unwrap()
                 .insert(block_info.number.unwrap().as_u64(), new_diff_layer.clone());
 
-            let latest = self.latest.load().clone();
-            let latest_block_info = latest.block_info()?;
+            let latest_block_info = self.latest.read().unwrap().block_info()?;
             // import reorg block
             if block_info.number.unwrap() < latest_block_info.number.unwrap() {
                 info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.number.unwrap(), latest_block_info.number.unwrap());
                 return Ok(());
             }
-            self.latest.store(new_diff_layer.clone());
-            let bottom_height = new_diff_layer.cap_diff_to_db(
-                self.config.diff_tree_depth_limit,
-                self.config.cache_tree_depth_limit,
-            )?;
+            *self.latest.write().unwrap() = new_diff_layer.clone();
+            let bottom_height = new_diff_layer.cap_diff_to_db(self.config.diff_tree_depth_limit)?;
             info!(target:"storage", "clear diff map bottom_height: {:?}", bottom_height);
             self.clear_diff_map(bottom_height);
             Ok(())
@@ -155,11 +165,11 @@ where
 impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
     type Error = Error<DB::Error>;
     fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
-        self.latest.load().block_info()
+        self.latest.read().unwrap().block_info()
     }
 
     fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
-        self.latest.load().block_info_arc()
+        self.latest.read().unwrap().block_info_arc()
     }
 }
 
@@ -174,7 +184,9 @@ where
         match block_arg {
             BlockId::Hash(hash) => Ok(self.hash_diff_map.read().unwrap().get(&hash).cloned()),
             BlockId::Number(number) => match number {
-                BlockNumber::Latest | BlockNumber::Pending => Ok(Some(self.latest.load().clone())),
+                BlockNumber::Latest | BlockNumber::Pending => {
+                    Ok(Some(self.latest.read().unwrap().clone()))
+                }
                 BlockNumber::Number(num) => Ok(self
                     .num_diff_map
                     .read()

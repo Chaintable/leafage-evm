@@ -1,13 +1,10 @@
 use crate::api::EthApiServer;
 use crate::api_impl::EthApiImpl;
-use jsonrpsee::{
-    core::Error,
-    server::{ServerBuilder, ServerHandle},
-    RpcModule,
-};
+use jsonrpsee::server::{ServerBuilder, ServerHandle};
 use leafage_evm_storage::EvmStorageRead;
 use revm::primitives::CfgEnv;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct ApiBuilder<DB> {
     db: Arc<DB>,
@@ -25,18 +22,21 @@ where
         }
     }
 
-    fn build_rpc(&self) -> RpcModule<EthApiImpl<Arc<DB>>> {
-        let rpc_module = EthApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc();
-        rpc_module
-    }
-
-    pub async fn build_and_run(self, addr: &str, max_connects: u32) -> Result<ServerHandle, Error> {
+    pub async fn build_and_run(
+        self,
+        addr: &str,
+        max_connects: u32,
+        rpc_timeout: Duration,
+    ) -> std::io::Result<ServerHandle> {
+        let service_builder = tower::ServiceBuilder::new().timeout(rpc_timeout);
         let server = ServerBuilder::default()
             .max_connections(max_connects)
+            .http_only()
             .max_response_body_size(u32::MAX)
+            .set_http_middleware(service_builder)
             .build(addr)
             .await?;
-        let handle = server.start(self.build_rpc())?;
+        let handle = server.start(EthApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc());
         Ok(handle)
     }
 }
