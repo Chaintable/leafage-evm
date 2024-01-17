@@ -1,3 +1,4 @@
+use crate::metrics;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::Updater;
 use anyhow::{bail, Result};
@@ -62,17 +63,17 @@ pub struct Command {
     diff_depth_limit: usize,
 
     /// The size of the account cache.
-    /// Default: 100000
+    /// Default: 200000
     ///
     /// This limit is used for the account cache.
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "200000")]
     account_cache_size: usize,
 
     /// The size of the storage cache.
-    /// Default: 2000000
+    /// Default: 5000000
     ///
     /// This limit is used for the storage cache.
-    #[arg(long, default_value = "2000000")]
+    #[arg(long, default_value = "5000000")]
     storage_cache_size: usize,
 
     /// The size of the code cache.
@@ -95,6 +96,13 @@ pub struct Command {
     /// This timeout is used to set the timeout for rpc server.
     #[arg(long, value_parser = parse_duration, default_value = "10")]
     rpc_timeout: std::time::Duration,
+
+    /// The address for prometheus server.
+    /// Default: ""
+    ///
+    /// This address is used for the prometheus server.
+    #[arg(long, default_value = "")]
+    prometheus_addr: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -128,11 +136,17 @@ impl Command {
     ) -> Result<(
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
+        tokio::sync::watch::Sender<()>,
     )> {
         match self.db_type.as_str() {
             "rocksdb" => {
-                let db =
-                    StateDBWrapper(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
+                let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
+                let mut metrics_handle = tokio::sync::watch::channel(()).0;
+                if self.prometheus_addr.len() > 0 {
+                    metrics_handle =
+                        metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
+                }
+                let db = StateDBWrapper(db);
                 let snaps = Arc::new(SnapshotTree::new(
                     db,
                     SnapshotTreeConfig::new(
@@ -149,19 +163,25 @@ impl Command {
                 if let Some(rpc_address) = self.rpc_addr.clone() {
                     let updater = Updater::new(snaps.clone(), rpc_address, self.update_interval)?;
                     let updater_handle = updater.start();
-                    return Ok((updater_handle, rpc_handle));
+                    return Ok((updater_handle, rpc_handle, metrics_handle));
                 }
-                Ok((tokio::sync::watch::channel(()).0, rpc_handle))
+                Ok((
+                    tokio::sync::watch::channel(()).0,
+                    rpc_handle,
+                    metrics_handle,
+                ))
             }
             _ => bail!("only support rocksdb"),
         }
     }
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle) = self.start(self.chain_cfg.clone()).await?;
+        let (updater_handle, rpc_handle, metrics_handle) =
+            self.start(self.chain_cfg.clone()).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = rpc_handle.stop();
+            let _ = metrics_handle.send(());
             Ok(())
         })
         .await?;

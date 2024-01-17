@@ -17,3 +17,6 @@ async-trait.workspace = true
 ethers-core.workspace = true
 serde_json.workspace = true
 tower.workspace = true
+prometheus.workspace = true
+once_cell.workspace = true
+futures.workspace = true

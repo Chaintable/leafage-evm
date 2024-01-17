@@ -1,6 +1,7 @@
 use crate::api::EthApiServer;
 use crate::api_impl::EthApiImpl;
-use jsonrpsee::server::{ServerBuilder, ServerHandle};
+use crate::metrics::RpcMetric;
+use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use leafage_evm_storage::EvmStorageRead;
 use revm::primitives::CfgEnv;
 use std::sync::Arc;
@@ -28,12 +29,14 @@ where
         max_connects: u32,
         rpc_timeout: Duration,
     ) -> std::io::Result<ServerHandle> {
-        let service_builder = tower::ServiceBuilder::new().timeout(rpc_timeout);
+        let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
+        let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
         let server = ServerBuilder::default()
             .max_connections(max_connects)
             .http_only()
             .max_response_body_size(u32::MAX)
-            .set_http_middleware(service_builder)
+            .set_http_middleware(http_middleware)
+            .set_rpc_middleware(rpc_middleware)
             .build(addr)
             .await?;
         let handle = server.start(EthApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc());

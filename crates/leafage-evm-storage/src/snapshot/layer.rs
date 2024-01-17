@@ -1,4 +1,8 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
+use crate::metrics::{
+    ACCOUNT_CACHE_HIT, ACCOUNT_CACHE_MISS, CODE_CACHE_HIT, CODE_CACHE_MISS, STORAGE_CACHE_HIT,
+    STORAGE_CACHE_MISS,
+};
 use crate::snapshot::error::Error;
 use leafage_evm_types::{
     AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256, U64,
@@ -258,8 +262,12 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
                 }
             },
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.accounts.get(&address) {
-                Some(account) => Ok(account),
+                Some(account) => {
+                    ACCOUNT_CACHE_HIT.inc();
+                    Ok(account)
+                }
                 None => {
+                    ACCOUNT_CACHE_MISS.inc();
                     let res = cache.db.basic(address)?;
                     cache.accounts.insert(address, res.clone());
                     Ok(res)
@@ -278,8 +286,12 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
                 }
             },
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.storages.get(&(address, index)) {
-                Some(value) => Ok(value),
+                Some(value) => {
+                    STORAGE_CACHE_HIT.inc();
+                    Ok(value)
+                }
                 None => {
+                    STORAGE_CACHE_MISS.inc();
                     let res = cache.db.storage(address, index)?;
                     cache.storages.insert((address, index), res);
                     Ok(res)
@@ -298,8 +310,12 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
                 }
             },
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.contracts.get(&code_hash) {
-                Some(entry) => Ok(entry),
+                Some(entry) => {
+                    CODE_CACHE_HIT.inc();
+                    Ok(entry)
+                }
                 None => {
+                    CODE_CACHE_MISS.inc();
                     let res = cache.db.code_by_hash(code_hash)?;
                     cache.contracts.insert(code_hash, res.clone());
                     Ok(res)

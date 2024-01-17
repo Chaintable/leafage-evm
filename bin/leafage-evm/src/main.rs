@@ -1,3 +1,4 @@
+mod metrics;
 mod migrate;
 mod runner;
 mod standalone;

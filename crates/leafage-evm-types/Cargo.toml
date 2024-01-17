@@ -15,4 +15,5 @@ serde_json.workspace = true
 ethers-core.workspace = true
 open-fastrlp.workspace = true
 open-fastrlp-derive.workspace = true
-ruint = { workspace = true }
+ruint.workspace = true
+prometheus.workspace = true

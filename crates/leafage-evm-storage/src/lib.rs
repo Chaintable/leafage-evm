@@ -14,3 +14,5 @@ pub use db::{DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};
 
 mod migrate;
 pub use migrate::{FileSource, MigateStat};
+
+mod metrics;

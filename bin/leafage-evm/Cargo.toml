@@ -25,6 +25,8 @@ tikv-jemallocator.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemalloc-sys.workspace = true
 console-subscriber.workspace = true
+hyper.workspace = true
+prometheus.workspace = true
 
 [profile.release]
 debug = true

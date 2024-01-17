@@ -5,3 +5,5 @@ mod error;
 
 mod api_impl;
 pub use api_impl::{ApiBuilder, EthApiImpl};
+
+mod metrics;

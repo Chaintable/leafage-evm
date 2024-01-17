@@ -1,4 +1,5 @@
 use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
+use crate::metrics::BLOCK_PRODUCED_TOTAL;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
 use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction, H256, U64};
@@ -155,6 +156,7 @@ where
             let bottom_height = new_diff_layer.cap_diff_to_db(self.config.diff_tree_depth_limit)?;
             info!(target:"storage", "clear diff map bottom_height: {:?}", bottom_height);
             self.clear_diff_map(bottom_height);
+            BLOCK_PRODUCED_TOTAL.inc();
             Ok(())
         } else {
             Err(Error::ParentBlockHashNotFound)

@@ -1116,6 +1116,7 @@ checksum = "645c6916888f6cb6350d2550b80fb63e734897a8498abe35cfb732b6487804b0"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -1137,6 +1138,17 @@ name = "futures-core"
 version = "0.3.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfc6580bb841c5a68e9ef15c77ccc837b40a7504914d52e47b8b0e9bbda25a1d"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a576fc72ae164fca6b9db127eaa9a9dda0d61316034f33a0a0d4eda41f02b01d"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"
@@ -1780,11 +1792,13 @@ dependencies = [
  "anyhow",
  "clap",
  "console-subscriber",
+ "hyper",
  "jsonrpsee",
  "leafage-evm-rpc",
  "leafage-evm-storage",
  "leafage-evm-types",
  "open-fastrlp",
+ "prometheus",
  "revm",
  "serde_json",
  "tikv-jemalloc-ctl",
@@ -1801,9 +1815,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ethers-core",
+ "futures",
  "jsonrpsee",
  "leafage-evm-storage",
  "leafage-evm-types",
+ "once_cell",
+ "prometheus",
  "revm",
  "serde_json",
  "tower",
@@ -1818,8 +1835,10 @@ dependencies = [
  "auto_impl",
  "ethers-core",
  "leafage-evm-types",
+ "once_cell",
  "open-fastrlp",
  "open-fastrlp-derive",
+ "prometheus",
  "quick_cache",
  "revm",
  "rocksdb",
@@ -1836,6 +1855,7 @@ dependencies = [
  "ethers-core",
  "open-fastrlp",
  "open-fastrlp-derive",
+ "prometheus",
  "revm",
  "ruint",
  "serde",
@@ -2379,6 +2399,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "449811d15fbdf5ceb5c1144416066429cf82316e2ec8ce0c1f6f8a02e7bbcf8c"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "protobuf",
+ "thiserror",
+]
+
+[[package]]
 name = "proptest"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2425,6 +2460,12 @@ checksum = "193898f59edcf43c26227dcd4c8427f00d99d61e95dcde58dabd49fa291d470e"
 dependencies = [
  "prost",
 ]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "quick_cache"
