@@ -1797,6 +1797,7 @@ dependencies = [
  "leafage-evm-rpc",
  "leafage-evm-storage",
  "leafage-evm-types",
+ "num_cpus",
  "open-fastrlp",
  "prometheus",
  "revm",
@@ -1823,7 +1824,9 @@ dependencies = [
  "prometheus",
  "revm",
  "serde_json",
+ "tokio",
  "tower",
+ "tracing",
 ]
 
 [[package]]

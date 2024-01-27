@@ -7,13 +7,16 @@ use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calculate_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
     BlockNumber, Bytes, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
-    MultiCallStats, SingleCallResult, TxHash, H256, RU256, U256,
+    MultiCallStats, SingleCallResult, Transaction, TxHash, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
 use revm::primitives::{CfgEnv, Env, ExecutionResult};
 use revm::EVM;
 use serde_json::Value;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+use tracing::error;
 
 /// [`EthApiImpl`] implements the EthApi trait.
 pub struct EthApiImpl<DB> {
@@ -88,7 +91,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
     }
 
-    async fn eth_erc20_handle(&self, request: CallRequest, block_id: BlockId) -> SingleCallResult {
+    fn eth_erc20_handle(state: DB::StateDB, request: CallRequest) -> SingleCallResult {
         if let Some(data) = request.data {
             if data.len() < 4 {
                 return SingleCallResult {
@@ -119,8 +122,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                 let user_addr = Address::from(h160_bytes);
 
                 // get address's native balance
-                let res = self
-                    .get_balance_impl(user_addr, block_id)
+                let res = Self::get_balance_from_state(state, user_addr)
                     .map(|u256| u256)
                     .unwrap_or_default();
 
@@ -209,13 +211,35 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
+
+        let (tx, rx) = oneshot::channel();
+
+        tokio::task::spawn_blocking(move || {
+            let rsp = Self::multi_call_from_state(requests, cfg, state, block, fast_fail);
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send multi_call result: {:?}", e);
+            }
+        });
+        let rsp = rx
+            .await
+            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
+        rsp
+    }
+
+    fn multi_call_from_state(
+        requests: Vec<CallRequest>,
+        cfg: CfgEnv,
+        state: DB::StateDB,
+        block: Arc<Block<Transaction>>,
+        fast_fail: bool,
+    ) -> RpcResult<MultiCallResp> {
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
             block_num: block.number.unwrap().as_u64(),
             block_time: block.timestamp.as_u64(),
             block_hash: block.hash.unwrap(),
             success: true,
-            cache_enabled: !_disable_cache,
+            cache_enabled: false,
         };
         // run in sequence
         let mut results: Vec<SingleCallResult> = vec![];
@@ -233,7 +257,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             if let Some(addres) = request.to {
                 if addres == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
                 {
-                    let mut res = self.eth_erc20_handle(request, block_id).await;
+                    let mut res = Self::eth_erc20_handle(state.clone(), request);
                     if res.code != MultiCallErrorCode::Success as i32 {
                         stats.success = false;
                     }
@@ -317,7 +341,11 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        let state = EvmStorageWrapper(state.unwrap());
+        Self::get_balance_from_state(state.unwrap(), address)
+    }
+
+    fn get_balance_from_state(state: DB::StateDB, address: Address) -> RpcResult<U256> {
+        let state = EvmStorageWrapper(state);
         let account = state
             .basic(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;

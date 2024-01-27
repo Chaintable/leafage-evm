@@ -177,7 +177,7 @@ impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
 
 impl<DB, E> EvmStorageRead for SnapshotTree<DB>
 where
-    DB: StateDB<Error = E> + BlockContext<Error = E> + Send + Sync,
+    DB: StateDB<Error = E> + BlockContext<Error = E> + Send + Sync + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = Error<E>;

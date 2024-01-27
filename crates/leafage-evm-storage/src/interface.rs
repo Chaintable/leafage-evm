@@ -67,7 +67,8 @@ pub trait EvmStorageRead {
         + BlockContext<Error = <Self::StateDB as StateDB>::Error>
         + Send
         + Sync
-        + Clone;
+        + Clone
+        + 'static;
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error>;
 }
 

@@ -27,6 +27,7 @@ tikv-jemalloc-sys.workspace = true
 console-subscriber.workspace = true
 hyper.workspace = true
 prometheus.workspace = true
+num_cpus.workspace = true
 
 [profile.release]
 debug = true

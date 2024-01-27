@@ -20,3 +20,5 @@ tower.workspace = true
 prometheus.workspace = true
 once_cell.workspace = true
 futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true

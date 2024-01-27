@@ -409,6 +409,7 @@ fn rocksdb_options() -> Options {
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
     opts.enable_statistics();
+    opts.increase_parallelism(2);
     // Disabling dumping stats to files because the stats are exported to
     // Prometheus.
     opts.set_stats_persist_period_sec(0);
