@@ -19,8 +19,7 @@
 use crate::db::{StateDBRead, StateDBWrite};
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
 use leafage_evm_types::{
-    trim_left_zero_bytes, Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK_EMPTY,
-    U256,
+    Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK_EMPTY, U256,
 };
 use open_fastrlp::{Decodable, Encodable};
 use rocksdb::{
@@ -189,7 +188,7 @@ impl StateDBRead for DataBase {
         let key_bytes: [u8; 32] = key.into();
         let value_bytes = self.db.get_pinned_cf_opt(
             address_to_storage_cf,
-            [address_bytes, trim_left_zero_bytes(&key_bytes)].concat(),
+            [address_bytes, &key_bytes].concat(),
             &rocksdb_read_options(),
         )?;
         timer.observe_duration();
