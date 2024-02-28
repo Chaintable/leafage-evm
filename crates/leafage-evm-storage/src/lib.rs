@@ -7,7 +7,7 @@ pub use interface::{
 };
 
 mod snapshot;
-pub use snapshot::{Config as SnapshotTreeConfig, SnapshotTree};
+pub use snapshot::{Config as SnapshotTreeConfig, Error, SnapshotTree};
 
 mod db;
 pub use db::{DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};

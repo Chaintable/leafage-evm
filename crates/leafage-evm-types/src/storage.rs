@@ -1,11 +1,12 @@
 use crate::primitives::{AccountInfo, BlockEnv, Bytes, H160, H256, U256};
-use ethers_core::types::{Block, Transaction, U64};
+use ethers_core::types::{Block, Transaction};
 use ethers_core::utils::keccak256;
 use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
+use revm::primitives::BlobExcessGasAndPrice;
 use revm::primitives::U256 as RU256;
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
-    let mut block_env = BlockEnv {
+    let block_env = BlockEnv {
         number: RU256::from(block.number.unwrap_or_default().as_u64()),
         coinbase: block.author.unwrap_or_default().0.into(),
         timestamp: block.timestamp.into(),
@@ -17,13 +18,9 @@ pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
         } else {
             None
         },
-        blob_excess_gas_and_price: None,
-    };
-    if block.other.contains_key("excessBlobGas") {
-        let excess_blob_gas: U64 =
-            serde_json::from_str(block.other.get("excessBlobGas").unwrap().as_str().unwrap())
-                .unwrap();
-        block_env.set_blob_excess_gas_and_price(excess_blob_gas.as_u64());
+        blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
+            block.excess_blob_gas.unwrap_or_default().as_u64(),
+        )),
     };
     block_env
 }

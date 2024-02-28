@@ -12,7 +12,7 @@ exclude = ["benches/", "tests/"]
 
 
 [workspace.dependencies]
-revm = { git = "https://github.com/bluealloy/revm", tag = "v26", features = [
+revm = { git = "https://github.com/bluealloy/revm", tag = "v30", features = [
     "serde",
     "optional_eip3607",
     "optional_no_base_fee",
@@ -22,19 +22,19 @@ revm = { git = "https://github.com/bluealloy/revm", tag = "v26", features = [
 leafage-evm-storage = { path = "crates/leafage-evm-storage" }
 leafage-evm-types = { path = "crates/leafage-evm-types" }
 leafage-evm-rpc = { path = "crates/leafage-evm-rpc" }
-auto_impl = "1.1.0"
-bytes = "1.4.0"
+auto_impl = "1.1.2"
+bytes = "1.5.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rocksdb = { version = "0.21.0", features = ["jemalloc"] }
-jsonrpsee = { version = "0.21", features = ["server", "client", "macros"] }
+jsonrpsee = { version = "0.22", features = ["server", "client", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "1.0.43"
-async-trait = "0.1.68"
-ethers-core = "2.0.10"
-anyhow = "1.0.72"
-tokio = { version = "1.35", features = ["full"] }
-clap = { version = "4.3.21", features = ["derive"] }
+thiserror = "1.0"
+async-trait = "0.1"
+ethers-core = "2.0.13"
+anyhow = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+clap = { version = "4.3", features = ["derive"] }
 serde_json = "1.0"
 open-fastrlp = "0.1.4"
 open-fastrlp-derive = "0.1.1"

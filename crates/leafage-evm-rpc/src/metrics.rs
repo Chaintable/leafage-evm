@@ -49,8 +49,8 @@ where
             let rsp = service.call(req).await;
             timer.observe_duration();
             let mut return_code = 0;
-            if rsp.success_or_error.as_error_code().is_some() {
-                return_code = rsp.success_or_error.as_error_code().unwrap();
+            if let Some(code) = rsp.as_error_code() {
+                return_code = code
             }
             RPC_REQUEST_COUNT
                 .with_label_values(&[method_name.as_str(), return_code.to_string().as_str()])

@@ -40,21 +40,21 @@ pub struct WrapDB<T>(pub T);
 
 impl<T: StateDB> DatabaseRef for WrapDB<T> {
     type Error = T::Error;
-    fn basic(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic_ref(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
         let address = keccak256(address.as_slice());
         self.0.basic(address.into())
     }
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         self.0.code_by_hash(code_hash.0.into())
     }
-    fn storage(&self, address: B160, index: RU256) -> Result<RU256, Self::Error> {
+    fn storage_ref(&self, address: B160, index: RU256) -> Result<RU256, Self::Error> {
         let address = keccak256(address.as_slice());
         let index = keccak256::<[u8; 32]>(index.to_be_bytes());
         self.0
             .storage(address.into(), index.into())
             .map(|n| n.into())
     }
-    fn block_hash(&self, number: RU256) -> Result<B256, Self::Error> {
+    fn block_hash_ref(&self, number: RU256) -> Result<B256, Self::Error> {
         self.0.block_hash(number.into()).map(|h| h.0.into())
     }
 }

@@ -10,8 +10,8 @@ use leafage_evm_types::{
     MultiCallStats, SingleCallResult, Transaction, TxHash, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
-use revm::primitives::{CfgEnv, Env, ExecutionResult};
-use revm::EVM;
+use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ExecutionResult, SpecId};
+use revm::Evm;
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -55,6 +55,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.disable_block_gas_limit = true;
+        let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg, SpecId::LATEST);
         let state = self
             .db
             .state_at(block_id)
@@ -68,15 +69,13 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
         let tx = create_txn_env(&block_env, request)?;
-        let env = Env {
-            block: block_env,
-            cfg,
-            tx,
-        };
-        let mut evm = EVM::with_env(env);
-        evm.database(EvmStorageWrapper(state));
+        let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx);
+        let mut evm = Evm::builder()
+            .with_ref_db(EvmStorageWrapper(state))
+            .with_env_with_handler_cfg(env)
+            .build();
         let res = evm
-            .transact_ref()
+            .transact()
             .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
         match res.result {
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
@@ -266,16 +265,15 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     continue;
                 }
             }
+            let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg.clone(), SpecId::LATEST);
             let tx = create_txn_env(&block_env, request)?;
-            let env = Env {
-                block: block_env.clone(),
-                cfg: cfg.clone(),
-                tx,
-            };
-            let mut evm = EVM::with_env(env);
-            evm.database(EvmStorageWrapper(state.clone()));
+            let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env.clone(), tx);
+            let mut evm = Evm::builder()
+                .with_ref_db(EvmStorageWrapper(state.clone()))
+                .with_env_with_handler_cfg(env)
+                .build();
             let res = evm
-                .transact_ref()
+                .transact()
                 .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
             let mut res = match res.result {
                 ExecutionResult::Success {
@@ -347,7 +345,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
     fn get_balance_from_state(state: DB::StateDB, address: Address) -> RpcResult<U256> {
         let state = EvmStorageWrapper(state);
         let account = state
-            .basic(address.0.into())
+            .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let balance = account.map(|a| a.balance);
         Ok(balance.unwrap_or_default().into())
@@ -384,7 +382,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let account = state
-            .basic(address.0.into())
+            .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if account.is_none() {
             return Ok(Bytes::new());
@@ -394,7 +392,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                 return Ok(Bytes::new());
             }
             let code = state
-                .code_by_hash(account.code_hash)
+                .code_by_hash_ref(account.code_hash)
                 .map_err(|e| internal_rpc_err(e.to_string()))?;
             Ok(code.bytecode.0.into())
         }
@@ -416,7 +414,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let storage = state
-            .storage(address.0.into(), RU256::from_be_bytes(index.into()))
+            .storage_ref(address.0.into(), RU256::from_be_bytes(index.into()))
             .map_err(|e| {
                 internal_rpc_err(format!(
                     "Failed to get storage at {:?} {:?}: {:?}",
@@ -441,7 +439,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let account = state
-            .basic(address.0.into())
+            .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let nonce = account.map(|a| a.nonce);
         Ok(nonce.unwrap_or_default().into())

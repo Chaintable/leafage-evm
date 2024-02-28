@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
 use leafage_evm_storage::{RocksDBStorage, SnapshotTree, SnapshotTreeConfig, StateDBWrapper};
-use revm::primitives::{CfgEnv, SpecId};
+use revm::primitives::CfgEnv;
 use serde_json::from_str;
 use std::fs;
 use std::path::PathBuf;
@@ -112,7 +112,6 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntEr
 
 fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
     let mut chain_cfg = CfgEnv::default();
-    chain_cfg.spec_id = SpecId::SHANGHAI;
     if arg.is_empty() || arg == "eth" {
         return Ok(chain_cfg);
     }
