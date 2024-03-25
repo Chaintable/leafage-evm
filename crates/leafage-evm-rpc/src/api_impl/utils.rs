@@ -107,7 +107,7 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
     )
     .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
 
-    let gas_limit = gas.unwrap_or(block_env.gas_limit.into());
+    let gas_limit = gas.unwrap_or(U256::from(u64::MAX / 2));
 
     let env = TxEnv {
         gas_limit: gas_limit.as_u64(),
