@@ -13,6 +13,7 @@ use revm::db::DatabaseRef;
 use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ExecutionResult, SpecId};
 use revm::Evm;
 use serde_json::Value;
+use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -394,7 +395,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             let code = state
                 .code_by_hash_ref(account.code_hash)
                 .map_err(|e| internal_rpc_err(e.to_string()))?;
-            Ok(code.bytecode.0.into())
+            Ok(code.bytecode().0.clone().into())
         }
     }
 

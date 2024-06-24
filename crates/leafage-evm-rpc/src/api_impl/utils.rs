@@ -1,7 +1,7 @@
 use crate::error::invalid_params_rpc_err;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{access_list_flattened, CallRequest, H256, U256};
-use revm::primitives::{BlockEnv, TransactTo, TxEnv};
+use revm::primitives::{BlockEnv, TxKind, TxEnv};
 
 /// Helper type for representing the fees of a [CallRequest]
 pub(crate) struct CallFees {
@@ -116,8 +116,8 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         gas_price: gas_price.into(),
         gas_priority_fee: max_priority_fee_per_gas.map(|p| p.into()),
         transact_to: to
-            .map(|to| TransactTo::Call(to.0.into()))
-            .unwrap_or_else(TransactTo::create),
+            .map(|to| TxKind::Call(to.0.into()))
+            .unwrap_or_else(|| TxKind::Create),
         value: value.unwrap_or_default().into(),
         data: data.unwrap_or_default().0.into(),
         chain_id: chain_id.map(|c| c.as_u64()),
