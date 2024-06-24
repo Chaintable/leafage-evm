@@ -1,4 +1,4 @@
-FROM rust:1.70.0-bookworm as builder
+FROM rust:1.79.0-bookworm as builder
 WORKDIR /app
 COPY . .
 RUN apt-get update -y && apt-get install -y libclang-dev
