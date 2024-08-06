@@ -68,10 +68,9 @@ jobs:
 
       - name: Merge manifest
         run: |
-          docker pull ${REGISTRY}/leafage-evm:amd64-${REVISION}
-          docker pull ${REGISTRY}/leafage-evm:arm64-${REVISION}
-          docker buildx imagetools create ${REGISTRY}/leafage-evm:${REVISION} ${REGISTRY}/leafage-evm:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
-          docker manifest push ${REGISTRY}/leafage-evm:${REVISION}
+          docker pull --platform=linux/amd64 ${REGISTRY}/leafage-evm:amd64-${REVISION}
+          docker pull --platform=linux/arm64 ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/leafage-evm:${REVISION} ${REGISTRY}/leafage-evm:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
           docker manifest rm ${REGISTRY}/leafage-evm:${REVISION}
           
       - name: comment PR
