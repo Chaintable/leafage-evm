@@ -27,7 +27,7 @@ jobs:
 
       - name: Docker build and push
         run: |
-          docker buildx build --output type=oci --builder=container -t ${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION} -f Dockerfile .
+          docker buildx build --output type=oci --builder=container-for-build -t ${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION} -f Dockerfile .
           docker push ${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
           docker rmi ${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
           
