@@ -25,10 +25,25 @@ jobs:
         run: |
           echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Docker build and push
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+  
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Output tags
+        id: meta
         run: |
-          docker buildx build  -t ${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION} -f Dockerfile . --push
-          docker rmi ${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
+          echo ::set-output name=tags::${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+    
           
       - name: comment PR
         uses: unsplash/comment-on-pr@master
@@ -55,7 +70,7 @@ jobs:
         run: |
           docker pull ${REGISTRY}/leafage-evm:amd64-${REVISION}
           docker pull ${REGISTRY}/leafage-evm:arm64-${REVISION}
-          DOCKER_BUILDKIT=1 docker manifest create ${REGISTRY}/leafage-evm:${REVISION} ${REGISTRY}/leafage-evm:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          docker buildx imagetools create ${REGISTRY}/leafage-evm:${REVISION} ${REGISTRY}/leafage-evm:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
           docker manifest push ${REGISTRY}/leafage-evm:${REVISION}
           docker manifest rm ${REGISTRY}/leafage-evm:${REVISION}
           
