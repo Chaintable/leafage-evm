@@ -43,6 +43,7 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          provenance: false
     
           
       - name: comment PR
