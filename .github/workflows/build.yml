@@ -11,7 +11,10 @@ env:
 
 jobs:
   make-artifacts:
-    runs-on: [self-hosted, ops]
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: [self-hosted, ops, matrix.arch]
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -24,15 +27,44 @@ jobs:
 
       - name: Docker build and push
         run: |
-          DOCKER_BUILDKIT=1 docker build -t ${REGISTRY}/leafage-evm:${REVISION} -f Dockerfile .
-          docker push ${REGISTRY}/leafage-evm:${REVISION}
-          docker rmi ${REGISTRY}/leafage-evm:${REVISION}
+          DOCKER_BUILDKIT=1 docker build -t ${REGISTRY}/leafage-evm:${matrix.arch}-${REVISION} -f Dockerfile .
+          docker push ${REGISTRY}/leafage-evm:${matrix.arch}-${REVISION}
+          docker rmi ${REGISTRY}/leafage-evm:${matrix.arch}-${REVISION}
           
       - name: comment PR
         uses: unsplash/comment-on-pr@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm:${{ env.REVISION }}` were builded"
+          msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm:${matrix.arch}-${{ env.REVISION }}` were builded"
+          check_for_duplicate_msg: true
+        continue-on-error: true
+  merge-docker-manifest:
+    runs-on: [self-hosted, ops]
+    needs: make-artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set env
+        run: |
+          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Merge manifest
+        run: |
+          docker pull ${REGISTRY}/leafage-evm:amd64-${REVISION}
+          docker pull ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          DOCKER_BUILDKIT=1 docker manifest create ${REGISTRY}/leafage-evm:${REVISION} ${REGISTRY}/leafage-evm:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          docker manifest push ${REGISTRY}/leafage-evm:${REVISION}
+          docker manifest rm ${REGISTRY}/leafage-evm:${REVISION}
+          
+      - name: comment PR
+        uses: unsplash/comment-on-pr@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          msg: ":tada: Manifest `${{ env.REGISTRY }}/leafage-evm:${{ env.REVISION }}` were merged"
           check_for_duplicate_msg: true
         continue-on-error: true
