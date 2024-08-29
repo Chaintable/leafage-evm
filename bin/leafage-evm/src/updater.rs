@@ -1,9 +1,9 @@
+use alloy_rlp::Decodable;
 use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite, SnapshotTree, StateDB};
-use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction};
-use open_fastrlp::Decodable;
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,17 +51,18 @@ where
         if self.block_queue.is_empty() {
             let current_block_info = self.snap_tree.block_info()?;
             let latest_block_num = self.rpc_client.block_number().await?;
-            if latest_block_num.as_u64() <= current_block_info.number.unwrap().as_u64() {
+            let latest_block_num: u64 = latest_block_num.try_into()?;
+            if latest_block_num <= current_block_info.header.number.unwrap() {
                 info!(target:"updater", "no new block");
                 return Ok(false);
             }
             let next_block_number =
-                BlockNumber::Number((current_block_info.number.unwrap().as_u64() + 1).into());
+                BlockNumberOrTag::Number((current_block_info.header.number.unwrap() + 1).into());
             let next_block_info = self
                 .rpc_client
                 .get_block_by_number(next_block_number, true)
                 .await;
-            info!(target:"updater", "current block number {:?}", current_block_info.number);
+            info!(target:"updater", "current block number {:?}", current_block_info.header.number.unwrap());
             let next_block_info = next_block_info?;
             if next_block_info.is_none() {
                 info!(target:"updater", "no new block");
@@ -81,18 +82,18 @@ where
             let first_block_info = self.block_queue.front().unwrap();
             if self
                 .snap_tree
-                .state_at(BlockId::Hash(first_block_info.parent_hash))?
+                .state_at(BlockId::Hash(first_block_info.header.parent_hash.into()))?
                 .is_some()
             {
-                debug!(target:"updater", "find parent block {}", first_block_info.parent_hash);
+                debug!(target:"updater", "find parent block {}", first_block_info.header.parent_hash);
                 break;
             }
             let parent_block_info = self
                 .rpc_client
-                .get_block_by_hash(first_block_info.parent_hash, true)
+                .get_block_by_hash(first_block_info.header.parent_hash, true)
                 .await?;
             if parent_block_info.is_none() {
-                info!(target:"updater", "can't not find block {}", first_block_info.parent_hash);
+                info!(target:"updater", "can't not find block {}", first_block_info.header.parent_hash);
                 return Ok(false);
             } else {
                 let parent_block_info: Block<Transaction> =
@@ -104,15 +105,19 @@ where
         while let Some(block_info) = self.block_queue.pop_front() {
             let diff = self
                 .rpc_client
-                .block_state_diff(BlockId::Hash(block_info.hash.unwrap()), true)
+                .block_state_diff(BlockId::Hash(block_info.header.hash.unwrap().into()), true)
                 .await?;
             let mut bytes = diff.as_ref();
             let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
-            let block_hash = block_info.hash.unwrap();
-            let block_number = block_info.number.unwrap();
+            let block_hash = block_info.header.hash.unwrap();
+            let block_num = block_info.header.number.unwrap();
+            let new_accounts_num = block_storage_diff.new_accounts.len();
+            let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
+            let new_codes_num = block_storage_diff.new_codes.len();
             self.snap_tree
                 .update_block(block_info, block_storage_diff)?;
-            info!(target:"updater", "update block hash {}, block num {}", block_hash, block_number);
+            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}", 
+                                            block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
 
         Ok(true)
@@ -159,7 +164,7 @@ mod tests {
         for i in 0..1 {
             let res = rpc_client
                 .block_state_diff(
-                    BlockId::Number(BlockNumber::Number((18022783 + i).into())),
+                    BlockId::Number(BlockNumberOrTag::Number(18022783 + i)),
                     true,
                 )
                 .await

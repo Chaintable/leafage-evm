@@ -2,7 +2,7 @@ use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
 use crate::metrics::BLOCK_PRODUCED_TOTAL;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
-use leafage_evm_types::{Block, BlockId, BlockNumber, BlockStorageDiff, Transaction, H256, U64};
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction, H256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::info;
@@ -60,17 +60,18 @@ pub struct SnapshotTree<DB> {
 
 impl<DB> SnapshotTree<DB> {
     /// clear_diff_map removes the diff layer that is lower than bottom_height.
-    fn clear_diff_map(&self, bottom_height: U64) {
-        if bottom_height.is_zero() {
+    fn clear_diff_map(&self, bottom_height: u64) {
+        if bottom_height == 0 {
             return;
         }
         self.hash_diff_map.write().unwrap().retain(|_, v| {
-            v.is_cache_layer() || v.unwrap_diff_layer().block_info.number.unwrap() > bottom_height
+            v.is_cache_layer()
+                || v.unwrap_diff_layer().block_info.header.number.unwrap() > bottom_height
         });
         self.num_diff_map
             .write()
             .unwrap()
-            .retain(|num, v| v.is_cache_layer() || *num > bottom_height.as_u64());
+            .retain(|num, v| v.is_cache_layer() || *num > bottom_height);
     }
 
     pub fn get_config(&self) -> Config {
@@ -92,8 +93,8 @@ where
             config.storage_cache_size,
             config.code_cache_size,
         )));
-        hash_diffs.insert(info.hash.unwrap(), cache_layer.clone());
-        num_diffs.insert(info.number.unwrap().as_u64(), cache_layer.clone());
+        hash_diffs.insert(info.header.hash.unwrap(), cache_layer.clone());
+        num_diffs.insert(info.header.number.unwrap(), cache_layer.clone());
         Ok(Self {
             latest: RwLock::new(cache_layer),
             hash_diff_map: RwLock::new(hash_diffs),
@@ -119,16 +120,16 @@ where
             .hash_diff_map
             .read()
             .unwrap()
-            .get(&block_info.hash.unwrap())
+            .get(&block_info.header.hash.unwrap())
         {
-            info!(target:"storage", "block {:?} already exists", block_info.hash);
+            info!(target:"storage", "block {:?} already exists", block_info.header.hash);
             return Ok(());
         }
         let res = self
             .hash_diff_map
             .read()
             .unwrap()
-            .get(&block_info.parent_hash)
+            .get(&block_info.header.parent_hash)
             .cloned();
         if let Some(parent_layer) = res {
             let new_diff_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
@@ -139,17 +140,17 @@ where
             self.hash_diff_map
                 .write()
                 .unwrap()
-                .insert(block_info.hash.unwrap(), new_diff_layer.clone());
+                .insert(block_info.header.hash.unwrap(), new_diff_layer.clone());
 
             self.num_diff_map
                 .write()
                 .unwrap()
-                .insert(block_info.number.unwrap().as_u64(), new_diff_layer.clone());
+                .insert(block_info.header.number.unwrap(), new_diff_layer.clone());
 
             let latest_block_info = self.latest.read().unwrap().block_info()?;
             // import reorg block
-            if block_info.number.unwrap() < latest_block_info.number.unwrap() {
-                info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.number.unwrap(), latest_block_info.number.unwrap());
+            if block_info.header.number.unwrap() < latest_block_info.header.number.unwrap() {
+                info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.header.number.unwrap(), latest_block_info.header.number.unwrap());
                 return Ok(());
             }
             *self.latest.write().unwrap() = new_diff_layer.clone();
@@ -184,17 +185,19 @@ where
     type StateDB = Arc<LinkedDiffLayer<DB>>;
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
         match block_arg {
-            BlockId::Hash(hash) => Ok(self.hash_diff_map.read().unwrap().get(&hash).cloned()),
+            BlockId::Hash(hash) => Ok(self
+                .hash_diff_map
+                .read()
+                .unwrap()
+                .get(&hash.block_hash)
+                .cloned()),
             BlockId::Number(number) => match number {
-                BlockNumber::Latest | BlockNumber::Pending => {
+                BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
                     Ok(Some(self.latest.read().unwrap().clone()))
                 }
-                BlockNumber::Number(num) => Ok(self
-                    .num_diff_map
-                    .read()
-                    .unwrap()
-                    .get(&num.as_u64())
-                    .cloned()),
+                BlockNumberOrTag::Number(num) => {
+                    Ok(self.num_diff_map.read().unwrap().get(&num).cloned())
+                }
                 _ => Err(Error::UnsupportedBlockId(BlockId::Number(number))),
             },
         }

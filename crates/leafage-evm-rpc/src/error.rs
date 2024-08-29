@@ -1,4 +1,4 @@
-use ethers_core::utils::hex;
+use leafage_evm_types::hex;
 /// Constructs an invalid params JSON-RPC error.
 pub(crate) fn invalid_params_rpc_err(
     msg: impl Into<String>,

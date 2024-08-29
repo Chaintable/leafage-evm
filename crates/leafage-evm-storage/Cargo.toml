@@ -12,19 +12,19 @@ exclude.workspace = true
 thiserror.workspace = true
 leafage-evm-types.workspace = true
 revm.workspace = true
-open-fastrlp.workspace = true
-open-fastrlp-derive.workspace = true
 auto_impl.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-ethers-core.workspace = true
 serde_json.workspace = true
 rocksdb = { workspace = true, optional = true, features = ["jemalloc"] }
 quick_cache.workspace = true
 prometheus.workspace = true
 once_cell.workspace = true
+alloy-rlp.workspace = true
+alloy-rlp-derive.workspace = true
+alloy.workspace = true
 
 [features]
 default = []

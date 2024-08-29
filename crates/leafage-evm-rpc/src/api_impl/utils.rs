@@ -1,7 +1,7 @@
 use crate::error::invalid_params_rpc_err;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{access_list_flattened, CallRequest, H256, U256};
-use revm::primitives::{BlockEnv, TxKind, TxEnv};
+use leafage_evm_types::{CallRequest, H256, U256};
+use revm::primitives::{AccessListItem, BlockEnv, TxEnv, TxKind};
 
 /// Helper type for representing the fees of a [CallRequest]
 pub(crate) struct CallFees {
@@ -41,7 +41,7 @@ pub(crate) fn ensure_fees(
         (gas_price, None, None, None) => {
             // either legacy transaction or no fee fields are specified
             // when no fields are specified, set gas price to zero
-            let gas_price = gas_price.unwrap_or(U256::zero());
+            let gas_price = gas_price.unwrap_or(U256::ZERO);
             Some(CallFees {
                 gas_price,
                 max_priority_fee_per_gas: None,
@@ -83,7 +83,7 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         max_priority_fee_per_gas,
         gas,
         value,
-        data,
+        input,
         nonce,
         access_list,
         chain_id,
@@ -97,47 +97,55 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         gas_price,
         max_fee_per_blob_gas,
     } = ensure_fees(
-        gas_price,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
+        gas_price.map(U256::from),
+        max_fee_per_gas.map(U256::from),
+        max_priority_fee_per_gas.map(U256::from),
         block_env.basefee.into(),
         blob_versioned_hashes.as_deref(),
-        max_fee_per_blob_gas,
+        max_fee_per_blob_gas.map(U256::from),
         block_env.get_blob_gasprice().map(U256::from),
     )
     .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
 
-    let gas_limit = gas.unwrap_or(U256::from(250000000));
+    let gas_limit = gas.unwrap_or_else(|| block_env.gas_limit.min(U256::from(u64::MAX)).to());
 
     let env = TxEnv {
-        gas_limit: gas_limit.as_u64(),
-        nonce: nonce.map(|n| n.as_u64()),
-        caller: from.unwrap_or_default().0.into(),
-        gas_price: gas_price.into(),
-        gas_priority_fee: max_priority_fee_per_gas.map(|p| p.into()),
-        transact_to: to
-            .map(|to| TxKind::Call(to.0.into()))
-            .unwrap_or_else(|| TxKind::Create),
-        value: value.unwrap_or_default().into(),
-        data: data.unwrap_or_default().0.into(),
-        chain_id: chain_id.map(|c| c.as_u64()),
-        max_fee_per_blob_gas: max_fee_per_blob_gas.map(|g| g.into()),
-        blob_hashes: blob_versioned_hashes
+        gas_limit: gas_limit
+            .try_into()
+            .map_err(|_| invalid_params_rpc_err("Invalid gas parameters"))?,
+        nonce,
+        caller: from.unwrap_or_default(),
+        gas_price,
+        gas_priority_fee: max_priority_fee_per_gas,
+        transact_to: to.unwrap_or(TxKind::Create),
+        value: value.unwrap_or_default(),
+        data: input.into_input().unwrap_or_default(),
+        chain_id,
+        access_list: access_list
             .unwrap_or_default()
-            .into_iter()
-            .map(|h| h.0.into())
-            .collect(),
-        access_list: access_list.map(access_list_flattened).unwrap_or_default(),
+            .iter()
+            .map(|a| AccessListItem {
+                address: a.address,
+                storage_keys: a.storage_keys.clone(),
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        // EIP-4844 fields
+        blob_hashes: blob_versioned_hashes.unwrap_or_default(),
+        max_fee_per_blob_gas,
+        // EIP-7702 fields
+        // authorization_list: TODO
+        ..Default::default()
     };
 
     Ok(env)
 }
 
-pub(crate) fn decode_revert_reason(out: impl AsRef<[u8]>) -> Option<String> {
-    use ethers_core::abi::AbiDecode;
-    let out = out.as_ref();
-    if out.len() < 4 {
-        return None;
-    }
-    String::decode(&out[4..]).ok()
-}
+// pub(crate) fn decode_revert_reason(out: impl AsRef<[u8]>) -> Option<String> {
+//     let out = out.as_ref();
+//     if out.len() < 4 {
+//         return None;
+//     }
+//     error!("Decoding revert reason: {:?}", out);
+//     String::abi_decode(&out[4..], false).ok()
+// }

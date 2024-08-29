@@ -9,8 +9,8 @@ pub use storage::{
 
 mod rpc;
 pub use rpc::{
-    Block, BlockId, BlockNumber, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
-    MultiCallStats, SingleCallResult, Transaction, TxHash,
+    Block, BlockId, BlockNumberOrTag, CallRequest, JsonStorageKey, MultiCallErrorCode,
+    MultiCallResp, MultiCallStats, SingleCallResult, Transaction,
 };
 
 mod metrics;

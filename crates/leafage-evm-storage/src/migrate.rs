@@ -1,7 +1,7 @@
 use crate::db::StateDBWrite;
+use alloy_rlp::Decodable;
+use alloy_rlp_derive::RlpDecodable;
 use leafage_evm_types::{Block, Bytes, NewAccount, Transaction, H256, U256};
-use open_fastrlp::Decodable;
-use open_fastrlp_derive::RlpDecodable;
 use std::fs::DirEntry;
 use std::path::PathBuf;
 use std::sync::{
@@ -178,11 +178,11 @@ impl FileSource {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;
             let block_info = read_file_to_block_info(file).await?;
-            db.write_latest_block_hash(&mut batch, block_info.hash.unwrap())?;
+            db.write_latest_block_hash(&mut batch, block_info.header.hash.unwrap())?;
             db.write_block_hash(
                 &mut batch,
-                block_info.number.unwrap().as_u64().into(),
-                block_info.hash.unwrap(),
+                block_info.header.number.unwrap(),
+                block_info.header.hash.unwrap(),
             )?;
             db.write_block_info(&mut batch, block_info)?;
             db.commit(batch)?;

@@ -1,25 +1,24 @@
-use crate::primitives::{AccountInfo, BlockEnv, Bytes, H160, H256, U256};
-use ethers_core::types::{Block, Transaction};
-use ethers_core::utils::keccak256;
-use open_fastrlp_derive::{RlpDecodable, RlpEncodable};
+use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, RU256, U256};
+use alloy::primitives::keccak256;
+use alloy::rpc::types::{Block, Transaction};
+use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::primitives::BlobExcessGasAndPrice;
-use revm::primitives::U256 as RU256;
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
     let block_env = BlockEnv {
-        number: RU256::from(block.number.unwrap_or_default().as_u64()),
-        coinbase: block.author.unwrap_or_default().0.into(),
-        timestamp: block.timestamp.into(),
-        difficulty: block.difficulty.into(),
-        basefee: block.base_fee_per_gas.unwrap_or_default().into(),
-        gas_limit: block.gas_limit.into(),
-        prevrandao: if block.difficulty.is_zero() {
-            Some(block.mix_hash.unwrap_or_default().0.into())
+        number: RU256::from(block.header.number.unwrap_or_default()),
+        coinbase: block.header.miner,
+        timestamp: RU256::from(block.header.timestamp),
+        difficulty: RU256::from(block.header.difficulty),
+        basefee: RU256::from(block.header.base_fee_per_gas.unwrap_or_default()),
+        gas_limit: RU256::from(block.header.gas_limit),
+        prevrandao: if block.header.difficulty.is_zero() {
+            block.header.mix_hash
         } else {
             None
         },
         blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
-            block.excess_blob_gas.unwrap_or_default().as_u64(),
+            block.header.excess_blob_gas.unwrap_or_default() as u64,
         )),
     };
     block_env
@@ -70,10 +69,10 @@ impl Into<AccountInfo> for NewAccount {
     }
 }
 
-impl From<(H160, AccountInfo)> for NewAccount {
-    fn from((address, account_info): (H160, AccountInfo)) -> Self {
+impl From<(Address, AccountInfo)> for NewAccount {
+    fn from((address, account_info): (Address, AccountInfo)) -> Self {
         Self {
-            address: keccak256(address.as_bytes()).into(),
+            address: keccak256::<&[u8; 20]>(address.as_ref()).into(),
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.0.into(),
@@ -127,15 +126,14 @@ impl From<NewAccount> for SlimAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use open_fastrlp::Encodable;
-
+    use alloy_rlp::Encodable;
     #[test]
     fn test_slim_account() {
         let account = NewAccount {
-            address: H256::zero(),
+            address: H256::default(),
             balance: U256::from(100),
             nonce: 0,
-            code_hash: H256::zero(),
+            code_hash: H256::default(),
         };
         let slim_account = SlimAccount::from(account.clone());
         let mut buf = Vec::new();

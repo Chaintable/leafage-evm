@@ -20,7 +20,6 @@ tracing.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
-open-fastrlp.workspace = true
 tikv-jemallocator.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemalloc-sys.workspace = true
@@ -28,6 +27,4 @@ console-subscriber.workspace = true
 hyper.workspace = true
 prometheus.workspace = true
 num_cpus.workspace = true
-
-[profile.release]
-debug = true
+alloy-rlp.workspace = true

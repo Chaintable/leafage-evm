@@ -4,9 +4,7 @@ use crate::metrics::{
     STORAGE_CACHE_MISS,
 };
 use crate::snapshot::error::Error;
-use leafage_evm_types::{
-    AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256, U64,
-};
+use leafage_evm_types::{AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256};
 use quick_cache::sync::Cache;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -27,7 +25,7 @@ where
     DB: EvmStorageWrite<Error = E> + BlockContext<Error = E>,
 {
     /// commit the diff layer to the db and return the bottom block number.
-    pub fn cap_diff_to_db(self: Arc<Self>, depth_limit: usize) -> Result<U64, Error<E>> {
+    pub fn cap_diff_to_db(self: Arc<Self>, depth_limit: usize) -> Result<u64, Error<E>> {
         let cur = self;
         let mut diff_layers = VecDeque::new();
         diff_layers.push_back(cur);
@@ -40,17 +38,22 @@ where
             diff_layers.push_back(next);
         }
         let cache_layer = diff_layers.pop_back().unwrap();
-        let mut bottom_num = U64::zero();
+        let mut bottom_num: u64 = 0;
         while diff_layers.len() > depth_limit {
             let diff_layer = diff_layers.pop_back().unwrap();
             // commit the diff layer to the db
-            bottom_num = diff_layer.unwrap_diff_layer().block_info.number.unwrap();
+            bottom_num = diff_layer
+                .unwrap_diff_layer()
+                .block_info
+                .header
+                .number
+                .unwrap();
             cache_layer.unwrap_cache_layer().commit(diff_layer)?;
             let next_diff_layer = diff_layers.back().unwrap();
             *next_diff_layer.unwrap_diff_layer().next.write().unwrap() = cache_layer.clone();
         }
-        if bottom_num == U64::zero() {
-            bottom_num = cache_layer.block_info_arc()?.number.unwrap();
+        if bottom_num == 0 {
+            bottom_num = cache_layer.block_info_arc()?.header.number.unwrap();
         }
         Ok(bottom_num)
     }
@@ -114,7 +117,7 @@ pub struct CacheDiskLayer<DB> {
     accounts: Cache<H256, Option<AccountInfo>>,
     storages: Cache<(H256, H256), U256>,
     contracts: Cache<H256, Bytecode>,
-    block_hashes: Cache<U64, H256>,
+    block_hashes: Cache<u64, H256>,
     old_diff_layer: Mutex<Option<Arc<LinkedDiffLayer<DB>>>>,
     db: DB,
 }
@@ -140,8 +143,8 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
         let old_head = self.old_diff_layer.lock().unwrap().clone();
         if let Some(old_head) = old_head {
             assert_eq!(
-                old_head.unwrap_diff_layer().block_info.hash.unwrap(),
-                diff_layer.unwrap_diff_layer().block_info.parent_hash
+                old_head.unwrap_diff_layer().block_info.header.hash.unwrap(),
+                diff_layer.unwrap_diff_layer().block_info.header.parent_hash
             );
         }
         *self.old_diff_layer.lock().unwrap() = Some(diff_layer.clone());
@@ -156,13 +159,13 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
             self.contracts.remove(key);
         }
         self.block_hashes.insert(
-            diff_layer.block_info.number.unwrap(),
-            diff_layer.block_info.hash.unwrap(),
+            diff_layer.block_info.header.number.unwrap(),
+            diff_layer.block_info.header.hash.unwrap(),
         );
         let (block_info, block_diff) = diff_layer.storage_diff();
         info!(target: "storage",
             "commit diff layer to db, block number: {}, block hash: {}, account cache size: {}, storage cache size: {}, contract cache size: {}",
-            block_info.number.unwrap(), block_info.hash.unwrap(), self.accounts.len(), self.storages.len(), self.contracts.len()
+            block_info.header.number.unwrap(), block_info.header.hash.unwrap(), self.accounts.len(), self.storages.len(), self.contracts.len()
         );
         self.db.update_block(block_info, block_diff)
     }
@@ -324,25 +327,23 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
         }
     }
 
-    fn block_hash(&self, number: U256) -> Result<H256, Self::Error> {
+    fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => {
-                if number == U256::from(diff.block_info.number.unwrap().as_u64()) {
-                    Ok(diff.block_info.hash.unwrap())
+                if number == diff.block_info.header.number.unwrap() {
+                    Ok(diff.block_info.header.hash.unwrap())
                 } else {
                     let next = diff.next.read().unwrap().clone();
                     next.block_hash(number)
                 }
             }
-            LinkedDiffLayer::CacheDiskLayer(cache) => {
-                match cache.block_hashes.get(&U64::from(number.as_u64())) {
-                    Some(entry) => Ok(entry),
-                    None => {
-                        let res = cache.db.block_hash(number)?;
-                        Ok(res)
-                    }
+            LinkedDiffLayer::CacheDiskLayer(cache) => match cache.block_hashes.get(&number) {
+                Some(entry) => Ok(entry),
+                None => {
+                    let res = cache.db.block_hash(number)?;
+                    Ok(res)
                 }
-            }
+            },
         }
     }
 }

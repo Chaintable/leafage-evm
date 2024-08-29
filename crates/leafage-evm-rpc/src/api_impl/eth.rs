@@ -1,19 +1,18 @@
 use crate::api::EthApiServer;
-use crate::api_impl::utils::{create_txn_env, decode_revert_reason};
+use crate::api_impl::utils::create_txn_env;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
-use ethers_core::abi::AbiEncode;
+use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calculate_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumber, Bytes, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
-    MultiCallStats, SingleCallResult, Transaction, TxHash, H256, RU256, U256,
+    BlockNumberOrTag, Bytes, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
+    MultiCallStats, SingleCallResult, Transaction, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
 use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ExecutionResult, SpecId};
 use revm::Evm;
 use serde_json::Value;
-use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -30,7 +29,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         Self { db, cfg }
     }
 
-    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
+    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u128> {
         let state = self
             .db
             .state_at(block_id)
@@ -43,9 +42,9 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let base_fee = calculate_next_block_base_fee(
-            block.gas_used.as_u64(),
-            block.gas_limit.as_u64(),
-            block.base_fee_per_gas.unwrap_or_default().as_u64(),
+            block.header.gas_used,
+            block.header.gas_limit,
+            block.header.base_fee_per_gas.unwrap_or_default(),
             BaseFeeParams::ethereum(),
         );
         Ok(base_fee)
@@ -75,6 +74,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             .with_ref_db(EvmStorageWrapper(state))
             .with_env_with_handler_cfg(env)
             .build();
+
         let res = evm
             .transact()
             .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
@@ -82,7 +82,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
             ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
                 "Reverted: {:?}",
-                decode_revert_reason(output).unwrap_or("Reason Unknown".to_string())
+                decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string())
             ))
             .into()),
             ExecutionResult::Halt { reason, gas_used } => {
@@ -92,7 +92,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
     }
 
     fn eth_erc20_handle(state: DB::StateDB, request: CallRequest) -> SingleCallResult {
-        if let Some(data) = request.data {
+        if let Some(data) = request.input.input() {
             if data.len() < 4 {
                 return SingleCallResult {
                     code: MultiCallErrorCode::CodeTxArgs as i32, // tx arg error
@@ -130,7 +130,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     code: MultiCallErrorCode::Success as i32,
                     err: "".to_string(),
                     from_cache: false,
-                    result: Bytes::from(res.encode()),
+                    result: Bytes::from(res.abi_encode()),
                     gas_used: 0,
                     time_cost: 0.0,
                 };
@@ -140,7 +140,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     code: 0,
                     err: "".to_string(),
                     from_cache: false,
-                    result: Bytes::from(U256::from(1u32).encode()),
+                    result: Bytes::from(U256::from(1u32).abi_encode()),
                     gas_used: 0,
                     time_cost: 0.0,
                 };
@@ -150,7 +150,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     code: 0,
                     err: "".to_string(),
                     from_cache: false,
-                    result: Bytes::from(U256::from(18u32).encode()),
+                    result: Bytes::from(U256::from(18u32).abi_encode()),
                     gas_used: 0,
                     time_cost: 0.0,
                 };
@@ -162,7 +162,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     code: 0,
                     err: "".to_string(),
                     from_cache: false,
-                    result: Bytes::from("ETH".encode()),
+                    result: Bytes::from("ETH".abi_encode()),
                     gas_used: 0,
                     time_cost: 0.0,
                 };
@@ -235,9 +235,9 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
     ) -> RpcResult<MultiCallResp> {
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
-            block_num: block.number.unwrap().as_u64(),
-            block_time: block.timestamp.as_u64(),
-            block_hash: block.hash.unwrap(),
+            block_num: block.header.number.unwrap(),
+            block_time: block.header.timestamp,
+            block_hash: block.header.hash.unwrap(),
             success: true,
             cache_enabled: false,
         };
@@ -254,16 +254,19 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                 results.push(res);
                 continue;
             }
-            if let Some(addres) = request.to {
-                if addres == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
-                {
-                    let mut res = Self::eth_erc20_handle(state.clone(), request);
-                    if res.code != MultiCallErrorCode::Success as i32 {
-                        stats.success = false;
+            if let Some(txkind) = request.to {
+                if let Some(address) = txkind.to() {
+                    if *address
+                        == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
+                    {
+                        let mut res = Self::eth_erc20_handle(state.clone(), request);
+                        if res.code != MultiCallErrorCode::Success as i32 {
+                            stats.success = false;
+                        }
+                        res.time_cost = start.elapsed().as_secs_f64();
+                        results.push(res);
+                        continue;
                     }
-                    res.time_cost = start.elapsed().as_secs_f64();
-                    results.push(res);
-                    continue;
                 }
             }
             let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg.clone(), SpecId::LATEST);
@@ -291,7 +294,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
                     output, gas_used, ..
                 } => SingleCallResult {
                     code: MultiCallErrorCode::EVMReverted as i32,
-                    err: decode_revert_reason(output).unwrap_or("Reason Unknown".to_string()),
+                    err: decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string()),
                     from_cache: false,
                     result: Bytes::default(),
                     gas_used: gas_used as i64,
@@ -320,7 +323,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
     fn block_number_impl(&self) -> RpcResult<U256> {
         let state = self
             .db
-            .state_at(BlockId::Number(BlockNumber::Latest))
+            .state_at(BlockId::Number(BlockNumberOrTag::Latest))
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
@@ -329,7 +332,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        Ok(block.number.unwrap().as_u64().into())
+        Ok(U256::from(block.header.number.unwrap()))
     }
 
     fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
@@ -365,7 +368,8 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let value = if !full {
-            let block: Block<TxHash> = block.as_ref().clone().into();
+            let mut block: Block = block.as_ref().clone().into();
+            block.transactions.convert_to_hashes();
             serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
         } else {
             serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
@@ -443,11 +447,11 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
             .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let nonce = account.map(|a| a.nonce);
-        Ok(nonce.unwrap_or_default().into())
+        Ok(U256::from(nonce.unwrap_or_default()))
     }
 
     fn chain_id_impl(&self) -> RpcResult<U256> {
-        Ok(self.cfg.chain_id.into())
+        Ok(U256::from(self.cfg.chain_id))
     }
 }
 
@@ -482,14 +486,14 @@ where
 
     async fn get_block_by_number(
         &self,
-        block_number: BlockNumber,
+        block_number: BlockNumberOrTag,
         full: bool,
     ) -> RpcResult<Option<Value>> {
         self.get_block_by_id_impl(BlockId::Number(block_number), full)
     }
 
     async fn get_block_by_hash(&self, block_hash: H256, full: bool) -> RpcResult<Option<Value>> {
-        self.get_block_by_id_impl(BlockId::Hash(block_hash), full)
+        self.get_block_by_id_impl(BlockId::Hash(block_hash.into()), full)
     }
 
     async fn get_code(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
@@ -517,8 +521,8 @@ where
         self.chain_id_impl()
     }
 
-    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64> {
-        self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumber::Latest)))
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128> {
+        self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .await
     }
 }

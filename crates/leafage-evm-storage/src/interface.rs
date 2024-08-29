@@ -1,5 +1,5 @@
+use alloy::primitives::keccak256;
 use auto_impl::auto_impl;
-use ethers_core::utils::keccak256;
 use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Transaction, H256, U256,
 };
@@ -18,7 +18,7 @@ pub trait StateDB {
     /// Get storage value of address at index.
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error>;
     // History related
-    fn block_hash(&self, number: U256) -> Result<H256, Self::Error>;
+    fn block_hash(&self, number: u64) -> Result<H256, Self::Error>;
 }
 
 /// [`BlockContext`] is a trait that provides access to the block information at a specific block height.
@@ -54,8 +54,8 @@ impl<T: StateDB> DatabaseRef for WrapDB<T> {
             .storage(address.into(), index.into())
             .map(|n| n.into())
     }
-    fn block_hash_ref(&self, number: RU256) -> Result<B256, Self::Error> {
-        self.0.block_hash(number.into()).map(|h| h.0.into())
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.0.block_hash(number).map(|h| h.0.into())
     }
 }
 

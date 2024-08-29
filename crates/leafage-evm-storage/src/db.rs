@@ -15,7 +15,7 @@ pub trait StateDBRead: Send + Sync + 'static {
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Self::Error>;
 
     /// block num -> block hash
-    fn read_block_hash(&self, block_num: U256) -> Result<H256, Self::Error>;
+    fn read_block_hash(&self, block_num: u64) -> Result<H256, Self::Error>;
 
     /// account address -> raw account
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Self::Error>;
@@ -54,7 +54,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
     fn write_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_num: U256,
+        block_num: u64,
         block_hash: H256,
     ) -> Result<(), Self::Error>;
 
@@ -131,7 +131,7 @@ where
     }
 
     // History related
-    fn block_hash(&self, number: U256) -> Result<H256, Self::Error> {
+    fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         Ok(self.0.read_block_hash(number)?.into())
     }
 }
@@ -150,10 +150,10 @@ where
         let mut batch = self.0.prepare_write_batch()?;
         self.0.write_block_hash(
             &mut batch,
-            block_info.number.unwrap().as_u64().into(),
-            block_info.hash.unwrap(),
+            block_info.header.number.unwrap(),
+            block_info.header.hash.unwrap(),
         )?;
-        let hash = block_info.hash.unwrap();
+        let hash = block_info.header.hash.unwrap();
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
             self.0.write_account(&mut batch, account, None)?;
