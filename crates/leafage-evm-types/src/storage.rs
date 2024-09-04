@@ -15,7 +15,7 @@ pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
         prevrandao: if block.header.difficulty.is_zero() {
             block.header.mix_hash
         } else {
-            None
+            Some(H256::ZERO)
         },
         blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
             block.header.excess_blob_gas.unwrap_or_default() as u64,

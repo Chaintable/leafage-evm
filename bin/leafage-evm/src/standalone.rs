@@ -119,6 +119,10 @@ fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
         chain_cfg.chain_id = 11155111;
         return Ok(chain_cfg);
     }
+    if arg == "polygon" {
+        chain_cfg.chain_id = 137;
+        return Ok(chain_cfg);
+    }
     let path = PathBuf::from(arg);
     if !path.exists() {
         bail!("chain config file not exists");
