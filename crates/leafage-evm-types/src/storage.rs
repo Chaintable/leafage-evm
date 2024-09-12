@@ -6,7 +6,7 @@ use revm::primitives::BlobExcessGasAndPrice;
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
     let block_env = BlockEnv {
-        number: RU256::from(block.header.number.unwrap_or_default()),
+        number: RU256::from(block.header.number),
         coinbase: block.header.miner,
         timestamp: RU256::from(block.header.timestamp),
         difficulty: RU256::from(block.header.difficulty),

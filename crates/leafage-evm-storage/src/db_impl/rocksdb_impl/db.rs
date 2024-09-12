@@ -282,7 +282,7 @@ impl StateDBWrite for DataBase {
             block_info.header.parent_hash.as_slice(),
         );
         let block_info_bytes = to_vec(&block_info)?;
-        let block_hash = block_info.header.hash.unwrap();
+        let block_hash = block_info.header.hash;
         batch.put_cf(
             block_hash_to_block_info_cf,
             block_hash.as_slice(),

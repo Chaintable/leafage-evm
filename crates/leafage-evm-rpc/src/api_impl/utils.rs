@@ -81,14 +81,15 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         gas_price,
         max_fee_per_gas,
         max_priority_fee_per_gas,
+        max_fee_per_blob_gas,
         gas,
         value,
         input,
         nonce,
-        access_list,
         chain_id,
+        access_list,
         blob_versioned_hashes,
-        max_fee_per_blob_gas,
+        authorization_list,
         ..
     } = request;
 
@@ -110,17 +111,17 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
     let gas_limit = gas.unwrap_or_else(|| block_env.gas_limit.min(U256::from(u64::MAX)).to());
 
     let env = TxEnv {
+        caller: from.unwrap_or_default(),
         gas_limit: gas_limit
             .try_into()
             .map_err(|_| invalid_params_rpc_err("Invalid gas parameters"))?,
-        nonce,
-        caller: from.unwrap_or_default(),
         gas_price,
         gas_priority_fee: max_priority_fee_per_gas,
         transact_to: to.unwrap_or(TxKind::Create),
         value: value.unwrap_or_default(),
         data: input.into_input().unwrap_or_default(),
         chain_id,
+        nonce,
         access_list: access_list
             .unwrap_or_default()
             .iter()
@@ -134,18 +135,9 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         blob_hashes: blob_versioned_hashes.unwrap_or_default(),
         max_fee_per_blob_gas,
         // EIP-7702 fields
-        // authorization_list: TODO
+        authorization_list: authorization_list.map(Into::into),
         ..Default::default()
     };
 
     Ok(env)
 }
-
-// pub(crate) fn decode_revert_reason(out: impl AsRef<[u8]>) -> Option<String> {
-//     let out = out.as_ref();
-//     if out.len() < 4 {
-//         return None;
-//     }
-//     error!("Decoding revert reason: {:?}", out);
-//     String::abi_decode(&out[4..], false).ok()
-// }

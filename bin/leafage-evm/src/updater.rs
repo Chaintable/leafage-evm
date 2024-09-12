@@ -52,17 +52,17 @@ where
             let current_block_info = self.snap_tree.block_info()?;
             let latest_block_num = self.rpc_client.block_number().await?;
             let latest_block_num: u64 = latest_block_num.try_into()?;
-            if latest_block_num <= current_block_info.header.number.unwrap() {
+            if latest_block_num <= current_block_info.header.number {
                 info!(target:"updater", "no new block");
                 return Ok(false);
             }
             let next_block_number =
-                BlockNumberOrTag::Number((current_block_info.header.number.unwrap() + 1).into());
+                BlockNumberOrTag::Number((current_block_info.header.number + 1).into());
             let next_block_info = self
                 .rpc_client
                 .get_block_by_number(next_block_number, true)
                 .await;
-            info!(target:"updater", "current block number {:?}", current_block_info.header.number.unwrap());
+            info!(target:"updater", "current block number {:?}", current_block_info.header.number);
             let next_block_info = next_block_info?;
             if next_block_info.is_none() {
                 info!(target:"updater", "no new block");
@@ -105,12 +105,12 @@ where
         while let Some(block_info) = self.block_queue.pop_front() {
             let diff = self
                 .rpc_client
-                .block_state_diff(BlockId::Hash(block_info.header.hash.unwrap().into()), true)
+                .block_state_diff(BlockId::Hash(block_info.header.hash.into()), true)
                 .await?;
             let mut bytes = diff.as_ref();
             let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
-            let block_hash = block_info.header.hash.unwrap();
-            let block_num = block_info.header.number.unwrap();
+            let block_hash = block_info.header.hash;
+            let block_num = block_info.header.number;
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();

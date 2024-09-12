@@ -178,12 +178,8 @@ impl FileSource {
         for file in self.files.into_iter() {
             let mut batch = db.prepare_write_batch()?;
             let block_info = read_file_to_block_info(file).await?;
-            db.write_latest_block_hash(&mut batch, block_info.header.hash.unwrap())?;
-            db.write_block_hash(
-                &mut batch,
-                block_info.header.number.unwrap(),
-                block_info.header.hash.unwrap(),
-            )?;
+            db.write_latest_block_hash(&mut batch, block_info.header.hash)?;
+            db.write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
             db.write_block_info(&mut batch, block_info)?;
             db.commit(batch)?;
         }

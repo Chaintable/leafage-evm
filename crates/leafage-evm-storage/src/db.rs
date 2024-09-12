@@ -148,12 +148,9 @@ where
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         let mut batch = self.0.prepare_write_batch()?;
-        self.0.write_block_hash(
-            &mut batch,
-            block_info.header.number.unwrap(),
-            block_info.header.hash.unwrap(),
-        )?;
-        let hash = block_info.header.hash.unwrap();
+        self.0
+            .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
+        let hash = block_info.header.hash;
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
             self.0.write_account(&mut batch, account, None)?;

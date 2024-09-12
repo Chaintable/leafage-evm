@@ -3,7 +3,8 @@ pub use db_impl::*;
 
 mod interface;
 pub use interface::{
-    BlockContext, EvmStorageRead, EvmStorageWrite, StateDB, WrapDB as EvmStorageWrapper,
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex,
+    TxContext, WrapDB as EvmStorageWrapper,
 };
 
 mod snapshot;

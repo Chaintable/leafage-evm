@@ -1,8 +1,9 @@
-use crate::api::EthApiServer;
-use crate::api_impl::EthApiImpl;
+use crate::api::{EthApiServer, TraceApiServer};
+use crate::api_impl::{EthApiImpl, TraceApiImpl};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
-use leafage_evm_storage::EvmStorageRead;
+use jsonrpsee::RpcModule;
+use leafage_evm_storage::{BlockIndex, EvmStorageRead, TransactionIndex};
 use revm::primitives::CfgEnv;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ pub struct ApiBuilder<DB> {
 
 impl<DB> ApiBuilder<DB>
 where
-    DB: EvmStorageRead + Sync + Send + 'static,
+    DB: EvmStorageRead + BlockIndex + TransactionIndex + Sync + Send + 'static,
 {
     pub fn new(db: DB, cfg: CfgEnv) -> Self {
         Self {
@@ -39,7 +40,24 @@ where
             .set_rpc_middleware(rpc_middleware)
             .build(addr)
             .await?;
-        let handle = server.start(EthApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc());
+        let mut rpc_module = RpcModule::new(());
+        rpc_module
+            .merge(EthApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to merge rpc module: {}", e),
+                )
+            })?;
+        rpc_module
+            .merge(TraceApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to merge rpc module: {}", e),
+                )
+            })?;
+        let handle = server.start(rpc_module);
         Ok(handle)
     }
 }

@@ -1,4 +1,6 @@
-use crate::interface::{BlockContext, EvmStorageRead, EvmStorageWrite, StateDB};
+use crate::interface::{
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex, TxContext,
+};
 use crate::metrics::BLOCK_PRODUCED_TOTAL;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
@@ -54,6 +56,8 @@ pub struct SnapshotTree<DB> {
     hash_diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer<DB>>>>,
     /// blocknum-> node, num_diff_map stores all the diff layer of the EVM.
     num_diff_map: RwLock<HashMap<u64, Arc<LinkedDiffLayer<DB>>>>,
+    /// tx_hash -> tx_context, tx_hash_map stores the tx info.
+    tx_hash_map: RwLock<HashMap<H256, TxContext>>,
     /// config stores the config of the SnapshotTree.
     config: Config,
 }
@@ -65,13 +69,16 @@ impl<DB> SnapshotTree<DB> {
             return;
         }
         self.hash_diff_map.write().unwrap().retain(|_, v| {
-            v.is_cache_layer()
-                || v.unwrap_diff_layer().block_info.header.number.unwrap() > bottom_height
+            v.is_cache_layer() || v.unwrap_diff_layer().block_info.header.number > bottom_height
         });
         self.num_diff_map
             .write()
             .unwrap()
             .retain(|num, v| v.is_cache_layer() || *num > bottom_height);
+        self.tx_hash_map
+            .write()
+            .unwrap()
+            .retain(|_, v| v.block_number > bottom_height);
     }
 
     pub fn get_config(&self) -> Config {
@@ -86,6 +93,7 @@ where
     pub fn new(db: DB, config: Config) -> Result<Self, E> {
         let mut hash_diffs = HashMap::new();
         let mut num_diffs = HashMap::new();
+        let mut tx_hash_map = HashMap::new();
         let info = db.block_info()?;
         let cache_layer = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(
             db,
@@ -93,12 +101,24 @@ where
             config.storage_cache_size,
             config.code_cache_size,
         )));
-        hash_diffs.insert(info.header.hash.unwrap(), cache_layer.clone());
-        num_diffs.insert(info.header.number.unwrap(), cache_layer.clone());
+        hash_diffs.insert(info.header.hash, cache_layer.clone());
+        num_diffs.insert(info.header.number, cache_layer.clone());
+        for tx in info.transactions.txns() {
+            tx_hash_map.insert(
+                tx.hash,
+                TxContext {
+                    block_hash: info.header.hash,
+                    block_number: info.header.number,
+                    transaction_index: tx.transaction_index.unwrap(),
+                    transaction_hash: tx.hash,
+                },
+            );
+        }
         Ok(Self {
             latest: RwLock::new(cache_layer),
             hash_diff_map: RwLock::new(hash_diffs),
             num_diff_map: RwLock::new(num_diffs),
+            tx_hash_map: RwLock::new(tx_hash_map),
             config,
         })
     }
@@ -120,7 +140,7 @@ where
             .hash_diff_map
             .read()
             .unwrap()
-            .get(&block_info.header.hash.unwrap())
+            .get(&block_info.header.hash)
         {
             info!(target:"storage", "block {:?} already exists", block_info.header.hash);
             return Ok(());
@@ -140,17 +160,30 @@ where
             self.hash_diff_map
                 .write()
                 .unwrap()
-                .insert(block_info.header.hash.unwrap(), new_diff_layer.clone());
+                .insert(block_info.header.hash, new_diff_layer.clone());
 
             self.num_diff_map
                 .write()
                 .unwrap()
-                .insert(block_info.header.number.unwrap(), new_diff_layer.clone());
+                .insert(block_info.header.number, new_diff_layer.clone());
+
+            let txs = block_info.transactions.txns().map(|tx| {
+                (
+                    tx.hash,
+                    TxContext {
+                        block_hash: block_info.header.hash,
+                        block_number: block_info.header.number,
+                        transaction_index: tx.transaction_index.unwrap(),
+                        transaction_hash: tx.hash,
+                    },
+                )
+            });
+            self.tx_hash_map.write().unwrap().extend(txs);
 
             let latest_block_info = self.latest.read().unwrap().block_info()?;
             // import reorg block
-            if block_info.header.number.unwrap() < latest_block_info.header.number.unwrap() {
-                info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.header.number.unwrap(), latest_block_info.header.number.unwrap());
+            if block_info.header.number < latest_block_info.header.number {
+                info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.header.number, latest_block_info.header.number);
                 return Ok(());
             }
             *self.latest.write().unwrap() = new_diff_layer.clone();
@@ -173,6 +206,82 @@ impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
 
     fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
         self.latest.read().unwrap().block_info_arc()
+    }
+}
+
+impl<DB: BlockContext> BlockIndex for SnapshotTree<DB> {
+    type Error = Error<DB::Error>;
+
+    fn get_block_by_hash_arc(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
+        if let Some(block) = self.hash_diff_map.read().unwrap().get(&block_hash).cloned() {
+            let block = block.block_info_arc()?;
+            Ok(Some(block))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_block_by_number_arc(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
+        if let Some(block) = self
+            .num_diff_map
+            .read()
+            .unwrap()
+            .get(&block_number)
+            .cloned()
+        {
+            let block = block.block_info_arc()?;
+            Ok(Some(block))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<DB: BlockContext> TransactionIndex for SnapshotTree<DB> {
+    type Error = Error<DB::Error>;
+
+    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
+        if let Some(tx_context) = self.tx_hash_map.read().unwrap().get(&tx_hash) {
+            if let Some(block) = self
+                .hash_diff_map
+                .read()
+                .unwrap()
+                .get(&tx_context.block_hash)
+                .cloned()
+            {
+                return block.get_transaction_by_context(tx_context);
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_transaction_by_context(
+        &self,
+        tx_context: &TxContext,
+    ) -> Result<Option<Transaction>, Self::Error> {
+        if let Some(tx_context) = self
+            .tx_hash_map
+            .read()
+            .unwrap()
+            .get(&tx_context.transaction_hash)
+        {
+            if let Some(block) = self
+                .hash_diff_map
+                .read()
+                .unwrap()
+                .get(&tx_context.block_hash)
+                .cloned()
+            {
+                return block.get_transaction_by_context(tx_context);
+            }
+        }
+        Ok(None)
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
+use crate::interface::{BlockContext, EvmStorageWrite, StateDB, TransactionIndex, TxContext};
 use crate::metrics::{
     ACCOUNT_CACHE_HIT, ACCOUNT_CACHE_MISS, CODE_CACHE_HIT, CODE_CACHE_MISS, STORAGE_CACHE_HIT,
     STORAGE_CACHE_MISS,
@@ -42,18 +42,13 @@ where
         while diff_layers.len() > depth_limit {
             let diff_layer = diff_layers.pop_back().unwrap();
             // commit the diff layer to the db
-            bottom_num = diff_layer
-                .unwrap_diff_layer()
-                .block_info
-                .header
-                .number
-                .unwrap();
+            bottom_num = diff_layer.unwrap_diff_layer().block_info.header.number;
             cache_layer.unwrap_cache_layer().commit(diff_layer)?;
             let next_diff_layer = diff_layers.back().unwrap();
             *next_diff_layer.unwrap_diff_layer().next.write().unwrap() = cache_layer.clone();
         }
         if bottom_num == 0 {
-            bottom_num = cache_layer.block_info_arc()?.header.number.unwrap();
+            bottom_num = cache_layer.block_info_arc()?.header.number;
         }
         Ok(bottom_num)
     }
@@ -143,7 +138,7 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
         let old_head = self.old_diff_layer.lock().unwrap().clone();
         if let Some(old_head) = old_head {
             assert_eq!(
-                old_head.unwrap_diff_layer().block_info.header.hash.unwrap(),
+                old_head.unwrap_diff_layer().block_info.header.hash,
                 diff_layer.unwrap_diff_layer().block_info.header.parent_hash
             );
         }
@@ -159,13 +154,13 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
             self.contracts.remove(key);
         }
         self.block_hashes.insert(
-            diff_layer.block_info.header.number.unwrap(),
-            diff_layer.block_info.header.hash.unwrap(),
+            diff_layer.block_info.header.number,
+            diff_layer.block_info.header.hash,
         );
         let (block_info, block_diff) = diff_layer.storage_diff();
         info!(target: "storage",
             "commit diff layer to db, block number: {}, block hash: {}, account cache size: {}, storage cache size: {}, contract cache size: {}",
-            block_info.header.number.unwrap(), block_info.header.hash.unwrap(), self.accounts.len(), self.storages.len(), self.contracts.len()
+            block_info.header.number, block_info.header.hash, self.accounts.len(), self.storages.len(), self.contracts.len()
         );
         self.db.update_block(block_info, block_diff)
     }
@@ -330,8 +325,8 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => {
-                if number == diff.block_info.header.number.unwrap() {
-                    Ok(diff.block_info.header.hash.unwrap())
+                if number == diff.block_info.header.number {
+                    Ok(diff.block_info.header.hash)
                 } else {
                     let next = diff.next.read().unwrap().clone();
                     next.block_hash(number)
@@ -363,5 +358,38 @@ impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
                 Ok(res)
             }
         }
+    }
+}
+
+impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
+    type Error = Error<DB::Error>;
+
+    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
+        let block_info = self.block_info_arc()?;
+        for tx in block_info.transactions.txns() {
+            if tx.hash == tx_hash {
+                return Ok(Some(tx.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_transaction_by_context(
+        &self,
+        tx_context: &TxContext,
+    ) -> Result<Option<Transaction>, Self::Error> {
+        let block_info = self.block_info_arc()?;
+        if let Some(txns) = block_info.transactions.as_transactions() {
+            let tx = txns.get(tx_context.transaction_index as usize).cloned();
+            if tx.is_some() {
+                return Ok(tx);
+            }
+            for tx in txns {
+                if tx.hash == tx_context.transaction_hash {
+                    return Ok(Some(tx.clone()));
+                }
+            }
+        }
+        Ok(None)
     }
 }

@@ -35,6 +35,57 @@ pub trait BlockContext {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TxContext {
+    pub block_hash: H256,
+    pub block_number: u64,
+    pub transaction_index: u64,
+    pub transaction_hash: H256,
+}
+
+/// [`TransactionIndex`] is a trait that provides access to the tx by hash or context.
+#[auto_impl(&, Box, Arc)]
+pub trait TransactionIndex {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error>;
+
+    fn get_transaction_by_context(
+        &self,
+        tx_context: &TxContext,
+    ) -> Result<Option<Transaction>, Self::Error>;
+}
+
+/// [`BlockIndex`] is a trait that provides access to the block information at a specific block height.
+#[auto_impl(&, Box, Arc)]
+pub trait BlockIndex {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn get_block_by_hash(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<Block<Transaction>>, Self::Error> {
+        self.get_block_by_hash_arc(block_hash)
+            .map(|b| b.map(|b| b.as_ref().clone()))
+    }
+
+    fn get_block_by_hash_arc(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error>;
+
+    fn get_block_by_number(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<Block<Transaction>>, Self::Error> {
+        self.get_block_by_number_arc(block_number)
+            .map(|b| b.map(|b| b.as_ref().clone()))
+    }
+
+    fn get_block_by_number_arc(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error>;
+}
+
 /// [`WrapDB`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
 pub struct WrapDB<T>(pub T);
 

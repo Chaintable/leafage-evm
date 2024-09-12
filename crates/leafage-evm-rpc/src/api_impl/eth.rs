@@ -235,9 +235,9 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
     ) -> RpcResult<MultiCallResp> {
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
-            block_num: block.header.number.unwrap(),
+            block_num: block.header.number,
             block_time: block.header.timestamp,
-            block_hash: block.header.hash.unwrap(),
+            block_hash: block.header.hash,
             success: true,
             cache_enabled: false,
         };
@@ -332,7 +332,7 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        Ok(U256::from(block.header.number.unwrap()))
+        Ok(U256::from(block.header.number))
     }
 
     fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
