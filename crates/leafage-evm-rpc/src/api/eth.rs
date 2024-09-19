@@ -1,7 +1,7 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
-    Address, BlockId, BlockNumberOrTag, Bytes, CallRequest, JsonStorageKey, MultiCallResp, H256,
-    U256,
+    Address, BlockId, BlockNumberOrTag, Bytes, CallRequest, Index, JsonStorageKey, MultiCallResp,
+    Transaction, H256, U256,
 };
 use serde_json::Value;
 
@@ -61,4 +61,14 @@ pub trait EthApi {
 
     #[method(name = "baseFee")]
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128>;
+
+    #[method(name = "getTransactionByHash")]
+    async fn transaction_by_hash(&self, hash: H256) -> RpcResult<Option<Transaction>>;
+
+    #[method(name = "getTransactionByBlockHashAndIndex")]
+    async fn transaction_by_block_hash_and_index(
+        &self,
+        hash: H256,
+        index: Index,
+    ) -> RpcResult<Option<Transaction>>;
 }

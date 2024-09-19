@@ -1,5 +1,5 @@
-use crate::api::{EthApiServer, TraceApiServer};
-use crate::api_impl::{EthApiImpl, TraceApiImpl};
+use crate::api::{EthApiServer, PreApiServer, TraceApiServer};
+use crate::api_impl::{EthApiImpl, PreApiImpl, TraceApiImpl};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
@@ -51,6 +51,14 @@ where
             })?;
         rpc_module
             .merge(TraceApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to merge rpc module: {}", e),
+                )
+            })?;
+        rpc_module
+            .merge(PreApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,

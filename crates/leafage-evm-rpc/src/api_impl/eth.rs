@@ -3,10 +3,12 @@ use crate::api_impl::utils::create_txn_env;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex,
+};
 use leafage_evm_types::{
     block_env_from_block, calculate_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumberOrTag, Bytes, CallRequest, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
+    BlockNumberOrTag, Bytes, CallRequest, Index, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
     MultiCallStats, SingleCallResult, Transaction, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
@@ -24,7 +26,7 @@ pub struct EthApiImpl<DB> {
     cfg: CfgEnv,
 }
 
-impl<DB: EvmStorageRead> EthApiImpl<DB> {
+impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
     pub fn new(db: DB, cfg: CfgEnv) -> Self {
         Self { db, cfg }
     }
@@ -355,18 +357,15 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
         Ok(balance.unwrap_or_default().into())
     }
 
-    fn get_block_by_id_impl(&self, block_number: BlockId, full: bool) -> RpcResult<Option<Value>> {
-        let state = self
+    fn get_block_by_id_impl(&self, block_id: BlockId, full: bool) -> RpcResult<Option<Value>> {
+        let block = self
             .db
-            .state_at(block_number)
+            .get_block_by_id_arc(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
+        if block.is_none() {
             return Ok(None);
         }
-        let state = state.unwrap();
-        let block = state
-            .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        let block = block.unwrap();
         let value = if !full {
             let mut block: Block = block.as_ref().clone().into();
             block.transactions.convert_to_hashes();
@@ -453,12 +452,44 @@ impl<DB: EvmStorageRead> EthApiImpl<DB> {
     fn chain_id_impl(&self) -> RpcResult<U256> {
         Ok(U256::from(self.cfg.chain_id))
     }
+
+    async fn transaction_by_hash_impl(&self, hash: H256) -> RpcResult<Option<Transaction>> {
+        let txn = self
+            .db
+            .get_transaction_by_hash(hash)
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        Ok(txn)
+    }
+
+    async fn transaction_by_block_hash_and_index_impl(
+        &self,
+        hash: H256,
+        index: Index,
+    ) -> RpcResult<Option<Transaction>> {
+        let block = self
+            .db
+            .get_block_by_id_arc(hash.into())
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        if block.is_none() {
+            return Ok(None);
+        }
+        let block = block.unwrap();
+        let txns = block.transactions.as_transactions();
+        if txns.is_none() {
+            return Ok(None);
+        }
+        let txns = txns.unwrap();
+        if index.0 >= txns.len() {
+            return Ok(None);
+        }
+        Ok(Some(txns[index.0].clone()))
+    }
 }
 
 #[async_trait::async_trait]
 impl<DB> EthApiServer for EthApiImpl<DB>
 where
-    DB: EvmStorageRead + Send + Sync + 'static,
+    DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static,
 {
     async fn call(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
         self.call_impl(request, block_id).await
@@ -523,6 +554,19 @@ where
 
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
+            .await
+    }
+
+    async fn transaction_by_hash(&self, hash: H256) -> RpcResult<Option<Transaction>> {
+        self.transaction_by_hash_impl(hash).await
+    }
+
+    async fn transaction_by_block_hash_and_index(
+        &self,
+        hash: H256,
+        index: Index,
+    ) -> RpcResult<Option<Transaction>> {
+        self.transaction_by_block_hash_and_index_impl(hash, index)
             .await
     }
 }

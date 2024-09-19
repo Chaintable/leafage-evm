@@ -59,31 +59,22 @@ pub trait TransactionIndex {
 #[auto_impl(&, Box, Arc)]
 pub trait BlockIndex {
     type Error: std::error::Error + Send + Sync + 'static;
-    fn get_block_by_hash(
+
+    fn get_block_by_id(
         &self,
-        block_hash: H256,
+        block_id: BlockId,
     ) -> Result<Option<Block<Transaction>>, Self::Error> {
-        self.get_block_by_hash_arc(block_hash)
+        self.get_block_by_id_arc(block_id)
             .map(|b| b.map(|b| b.as_ref().clone()))
     }
 
-    fn get_block_by_hash_arc(
+    fn get_block_by_id_arc(
         &self,
-        block_hash: H256,
-    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error>;
-
-    fn get_block_by_number(
-        &self,
-        block_number: u64,
-    ) -> Result<Option<Block<Transaction>>, Self::Error> {
-        self.get_block_by_number_arc(block_number)
-            .map(|b| b.map(|b| b.as_ref().clone()))
+        block_id: BlockId,
+    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
+        self.get_block_by_id(block_id)
+            .map(|b| b.map(|b| Arc::new(b)))
     }
-
-    fn get_block_by_number_arc(
-        &self,
-        block_number: u64,
-    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error>;
 }
 
 /// [`WrapDB`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].

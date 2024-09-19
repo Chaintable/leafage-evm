@@ -9,7 +9,7 @@ exclude.workspace = true
 
 
 [dependencies]
-alloy = { workspace = true, features = ["rpc-types-trace"] }
+alloy = { workspace = true, features = ["rpc-types-trace", "getrandom"] }
 revm.workspace = true
 serde.workspace = true
 serde_json.workspace = true

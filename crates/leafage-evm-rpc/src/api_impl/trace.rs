@@ -4,8 +4,8 @@ use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex};
 use leafage_evm_types::{
-    block_env_from_block, Block, BlockId, BlockNumberOrTag, Bytes, CallRequest,
-    LocalizedTransactionTrace, Transaction, TransactionInfo, H256,
+    block_env_from_block, Block, BlockId, Bytes, CallRequest, LocalizedTransactionTrace,
+    Transaction, TransactionInfo, H256,
 };
 use revm::db::CacheDB;
 use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, SpecId};
@@ -38,7 +38,7 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
             .ok_or_else(|| invalid_params_rpc_err("Transaction not found"))?;
         let block = self
             .db
-            .get_block_by_hash_arc(txn.block_hash.unwrap())
+            .get_block_by_id_arc(txn.block_hash.unwrap().into())
             .map_err(|e| {
                 internal_rpc_err(format!("Failed to get block by hash: {}", e.to_string()))
             })?;

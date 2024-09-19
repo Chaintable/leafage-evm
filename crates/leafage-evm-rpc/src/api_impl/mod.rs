@@ -8,3 +8,6 @@ pub use build::ApiBuilder;
 
 mod trace;
 pub use trace::TraceApiImpl;
+
+mod pre;
+pub use pre::PreApiImpl;

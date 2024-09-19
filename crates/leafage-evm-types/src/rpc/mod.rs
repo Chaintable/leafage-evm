@@ -11,4 +11,9 @@ pub use alloy::rpc::types::trace::parity::{
     Action, CallAction, CallOutput, CallType, CreateAction, CreateOutput,
     LocalizedTransactionTrace, RewardAction, SelfdestructAction, TraceOutput, TransactionTrace,
 };
-pub use alloy::rpc::types::{Block, BlockId, BlockNumberOrTag, Transaction, TransactionInfo};
+pub use alloy::rpc::types::{
+    Block, BlockId, BlockNumberOrTag, Index, Log, Transaction, TransactionInfo,
+};
+
+mod pre;
+pub use pre::{PreError, PreErrorCode, PreResult};

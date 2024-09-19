@@ -212,33 +212,31 @@ impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
 impl<DB: BlockContext> BlockIndex for SnapshotTree<DB> {
     type Error = Error<DB::Error>;
 
-    fn get_block_by_hash_arc(
+    fn get_block_by_id_arc(
         &self,
-        block_hash: H256,
+        block_id: BlockId,
     ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
-        if let Some(block) = self.hash_diff_map.read().unwrap().get(&block_hash).cloned() {
-            let block = block.block_info_arc()?;
-            Ok(Some(block))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn get_block_by_number_arc(
-        &self,
-        block_number: u64,
-    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
-        if let Some(block) = self
-            .num_diff_map
-            .read()
-            .unwrap()
-            .get(&block_number)
-            .cloned()
-        {
-            let block = block.block_info_arc()?;
-            Ok(Some(block))
-        } else {
-            Ok(None)
+        match block_id {
+            BlockId::Hash(hash) => {
+                if let Some(res) = self.hash_diff_map.read().unwrap().get(&hash.block_hash) {
+                    let block = res.block_info_arc()?;
+                    return Ok(Some(block));
+                }
+                Ok(None)
+            }
+            BlockId::Number(number) => match number {
+                BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
+                    Ok(Some(self.latest.read().unwrap().block_info_arc()?))
+                }
+                BlockNumberOrTag::Number(num) => {
+                    if let Some(res) = self.num_diff_map.read().unwrap().get(&num) {
+                        let block = res.block_info_arc()?;
+                        return Ok(Some(block));
+                    }
+                    Ok(None)
+                }
+                _ => Ok(None),
+            },
         }
     }
 }
