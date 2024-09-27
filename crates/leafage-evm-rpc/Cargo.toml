@@ -23,3 +23,12 @@ futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 alloy.workspace = true
+alloy-rlp.workspace = true
+
+[features]
+default = []
+optimism = [
+    "leafage-evm-types/optimism",
+    "leafage-evm-storage/optimism",
+    "revm/optimism",
+]

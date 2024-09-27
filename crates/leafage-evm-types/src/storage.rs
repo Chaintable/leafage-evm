@@ -1,6 +1,6 @@
 use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, RU256, U256};
+use crate::rpc::{Block, Transaction};
 use alloy::primitives::keccak256;
-use alloy::rpc::types::{Block, Transaction};
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::primitives::BlobExcessGasAndPrice;
 

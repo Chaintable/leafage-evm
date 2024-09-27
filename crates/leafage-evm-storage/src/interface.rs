@@ -33,6 +33,14 @@ pub trait BlockContext {
     fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
         Ok(Arc::new(self.block_info()?))
     }
+
+    fn state_diff(&self) -> Result<BlockStorageDiff, Self::Error> {
+        Ok(self.state_diff_arc()?.as_ref().clone())
+    }
+
+    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+        Ok(Arc::new(self.state_diff()?))
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,5 @@
 use crate::api::EthApiServer;
-use crate::api_impl::utils::create_txn_env;
+use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
@@ -7,12 +7,12 @@ use leafage_evm_storage::{
     BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex,
 };
 use leafage_evm_types::{
-    block_env_from_block, calculate_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
+    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
     BlockNumberOrTag, Bytes, CallRequest, Index, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
     MultiCallStats, SingleCallResult, Transaction, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
-use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ExecutionResult, SpecId};
+use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult};
 use revm::Evm;
 use serde_json::Value;
 use std::str::FromStr;
@@ -43,7 +43,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
             .unwrap()
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        let base_fee = calculate_next_block_base_fee(
+        let base_fee = calc_next_block_base_fee(
             block.header.gas_used,
             block.header.gas_limit,
             block.header.base_fee_per_gas.unwrap_or_default(),
@@ -57,7 +57,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.disable_block_gas_limit = true;
-        let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg, SpecId::LATEST);
+        let cfg = get_handler_cfg(cfg);
         let state = self
             .db
             .state_at(block_id)
@@ -271,7 +271,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
                     }
                 }
             }
-            let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg.clone(), SpecId::LATEST);
+            let cfg = get_handler_cfg(cfg.clone());
             let tx = create_txn_env(&block_env, request)?;
             let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env.clone(), tx);
             let mut evm = Evm::builder()
@@ -367,7 +367,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         }
         let block = block.unwrap();
         let value = if !full {
-            let mut block: Block = block.as_ref().clone().into();
+            let mut block: Block<Transaction> = block.as_ref().clone().into();
             block.transactions.convert_to_hashes();
             serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
         } else {

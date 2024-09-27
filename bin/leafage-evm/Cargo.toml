@@ -9,7 +9,7 @@ exclude.workspace = true
 
 
 [dependencies]
-leafage-evm-storage = { workspace = true, features = ["with-rocksdb"] }
+leafage-evm-storage.workspace = true
 leafage-evm-types.workspace = true
 leafage-evm-rpc.workspace = true
 anyhow.workspace = true
@@ -28,3 +28,8 @@ hyper.workspace = true
 prometheus.workspace = true
 num_cpus.workspace = true
 alloy-rlp.workspace = true
+
+[features]
+default = ["with-rocksdb"]
+with-rocksdb = ["leafage-evm-storage/with-rocksdb"]
+optimism = ["with-rocksdb", "leafage-evm-storage/optimism"]

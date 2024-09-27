@@ -1,0 +1,85 @@
+name: "Release new artifacts"
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com
+
+jobs:
+  make-artifacts:
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set env
+        run: |
+          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+  
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Output tags
+        id: meta
+        run: |
+          echo ::set-output name=tags::${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
+
+      - name: Clean 
+        run: |
+          docker system prune -a -f
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: false
+    
+          
+      - name: comment PR
+        uses: unsplash/comment-on-pr@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm:${{ matrix.arch }}-${{ env.REVISION }}` were builded"
+          check_for_duplicate_msg: true
+        continue-on-error: true
+        
+  merge-docker-manifest:
+    runs-on: [self-hosted, ops]
+    needs: make-artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set env
+        run: |
+          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Merge manifest
+        run: |
+          docker pull --platform=linux/amd64 ${REGISTRY}/leafage-evm:amd64-${REVISION}
+          docker pull --platform=linux/arm64 ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/leafage-evm:${REVISION} ${REGISTRY}/leafage-evm:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          
+      - name: comment PR
+        uses: unsplash/comment-on-pr@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          msg: ":tada: Manifest `${{ env.REGISTRY }}/leafage-evm:${{ env.REVISION }}` were merged"
+          check_for_duplicate_msg: true
+        continue-on-error: true

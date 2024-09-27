@@ -359,6 +359,20 @@ impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
             }
         }
     }
+
+    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+        match self {
+            LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_diff.clone()),
+            LinkedDiffLayer::CacheDiskLayer(cache) => {
+                let last_diff = cache.old_diff_layer.lock().unwrap().clone();
+                if let Some(last_diff) = last_diff {
+                    return Ok(last_diff.unwrap_diff_layer().block_diff.clone());
+                }
+                let res = cache.db.state_diff_arc()?;
+                Ok(res)
+            }
+        }
+    }
 }
 
 impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
@@ -367,7 +381,12 @@ impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
     fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
         let block_info = self.block_info_arc()?;
         for tx in block_info.transactions.txns() {
+            #[cfg(not(feature = "optimism"))]
             if tx.hash == tx_hash {
+                return Ok(Some(tx.clone()));
+            }
+            #[cfg(feature = "optimism")]
+            if tx.inner.hash == tx_hash {
                 return Ok(Some(tx.clone()));
             }
         }
@@ -385,7 +404,12 @@ impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
                 return Ok(tx);
             }
             for tx in txns {
+                #[cfg(not(feature = "optimism"))]
                 if tx.hash == tx_context.transaction_hash {
+                    return Ok(Some(tx.clone()));
+                }
+                #[cfg(feature = "optimism")]
+                if tx.inner.hash == tx_context.transaction_hash {
                     return Ok(Some(tx.clone()));
                 }
             }

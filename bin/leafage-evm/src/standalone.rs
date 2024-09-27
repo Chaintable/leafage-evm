@@ -6,8 +6,6 @@ use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
 use leafage_evm_storage::{RocksDBStorage, SnapshotTree, SnapshotTreeConfig, StateDBWrapper};
 use revm::primitives::CfgEnv;
-use serde_json::from_str;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -127,13 +125,30 @@ fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
         chain_cfg.chain_id = 59144;
         return Ok(chain_cfg);
     }
-    let path = PathBuf::from(arg);
-    if !path.exists() {
-        bail!("chain config file not exists");
+    #[cfg(feature = "optimism")]
+    {
+        if arg == "op" {
+            chain_cfg.chain_id = 10;
+            return Ok(chain_cfg);
+        } else {
+            // for opstack chains
+            let chain_id = arg.parse::<u64>()?;
+            chain_cfg.chain_id = chain_id;
+            return Ok(chain_cfg);
+        }
     }
-    let data = fs::read_to_string(path.as_path())?;
-    let chain_cfg = from_str(&data)?;
-    Ok(chain_cfg)
+    #[cfg(not(feature = "optimism"))]
+    {
+        use serde_json::from_str;
+        use std::fs;
+        let path = PathBuf::from(arg);
+        if !path.exists() {
+            bail!("chain config file not exists");
+        }
+        let data = fs::read_to_string(path.as_path())?;
+        let chain_cfg = from_str(&data)?;
+        Ok(chain_cfg)
+    }
 }
 
 impl Command {

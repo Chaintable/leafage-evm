@@ -104,6 +104,7 @@ where
         hash_diffs.insert(info.header.hash, cache_layer.clone());
         num_diffs.insert(info.header.number, cache_layer.clone());
         for tx in info.transactions.txns() {
+            #[cfg(not(feature = "optimism"))]
             tx_hash_map.insert(
                 tx.hash,
                 TxContext {
@@ -111,6 +112,16 @@ where
                     block_number: info.header.number,
                     transaction_index: tx.transaction_index.unwrap(),
                     transaction_hash: tx.hash,
+                },
+            );
+            #[cfg(feature = "optimism")]
+            tx_hash_map.insert(
+                tx.inner.hash,
+                TxContext {
+                    block_hash: info.header.hash,
+                    block_number: info.header.number,
+                    transaction_index: tx.inner.transaction_index.unwrap(),
+                    transaction_hash: tx.inner.hash,
                 },
             );
         }
@@ -166,7 +177,7 @@ where
                 .write()
                 .unwrap()
                 .insert(block_info.header.number, new_diff_layer.clone());
-
+            #[cfg(not(feature = "optimism"))]
             let txs = block_info.transactions.txns().map(|tx| {
                 (
                     tx.hash,
@@ -175,6 +186,18 @@ where
                         block_number: block_info.header.number,
                         transaction_index: tx.transaction_index.unwrap(),
                         transaction_hash: tx.hash,
+                    },
+                )
+            });
+            #[cfg(feature = "optimism")]
+            let txs = block_info.transactions.txns().map(|tx| {
+                (
+                    tx.inner.hash,
+                    TxContext {
+                        block_hash: block_info.header.hash,
+                        block_number: block_info.header.number,
+                        transaction_index: tx.inner.transaction_index.unwrap(),
+                        transaction_hash: tx.inner.hash,
                     },
                 )
             });
@@ -206,6 +229,14 @@ impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
 
     fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
         self.latest.read().unwrap().block_info_arc()
+    }
+
+    fn state_diff(&self) -> Result<BlockStorageDiff, Self::Error> {
+        self.latest.read().unwrap().state_diff()
+    }
+
+    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+        self.latest.read().unwrap().state_diff_arc()
     }
 }
 

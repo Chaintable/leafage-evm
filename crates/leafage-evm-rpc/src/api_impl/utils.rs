@@ -1,7 +1,10 @@
 use crate::error::invalid_params_rpc_err;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, H256, U256};
-use revm::primitives::{AccessListItem, BlockEnv, TxEnv, TxKind};
+use leafage_evm_types::{CallRequest, Transaction, H256, U256};
+use revm::primitives::{
+    env::{CfgEnv, CfgEnvWithHandlerCfg},
+    AccessListItem, BlockEnv, SpecId, TxEnv, TxKind,
+};
 
 /// Helper type for representing the fees of a [CallRequest]
 pub(crate) struct CallFees {
@@ -136,8 +139,66 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         max_fee_per_blob_gas,
         // EIP-7702 fields
         authorization_list: authorization_list.map(Into::into),
+        #[cfg(feature = "optimism")]
+        optimism: revm::primitives::OptimismFields {
+            enveloped_tx: Some(Default::default()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     Ok(env)
+}
+
+pub(crate) fn rebuild_txn_env(block_env: &BlockEnv, tx: &Transaction) -> RpcResult<TxEnv> {
+    #[cfg(not(feature = "optimism"))]
+    let request = tx.clone().into_request();
+    #[cfg(feature = "optimism")]
+    let request = tx.inner.clone().into_request();
+
+    let env = create_txn_env(block_env, request)?;
+
+    #[cfg(feature = "optimism")]
+    return Ok(set_op_txn_env(env, tx));
+
+    #[cfg(not(feature = "optimism"))]
+    Ok(env)
+}
+
+#[cfg(feature = "optimism")]
+fn set_op_txn_env(mut tx_env: TxEnv, tx: &Transaction) -> TxEnv {
+    use alloy::eips::eip2718::Encodable2718;
+    use leafage_evm_types::{OpTxEnvelope, OpTxType, TxDeposit, TxEnvelope};
+    if tx.inner.transaction_type.unwrap_or_default() == OpTxType::Deposit as u8 {
+        let deposit_tx = TxDeposit {
+            source_hash: tx.source_hash.unwrap_or_default(),
+            from: tx.inner.from,
+            to: tx.inner.to.into(),
+            mint: tx.mint,
+            value: tx.inner.value,
+            gas_limit: tx.inner.gas,
+            is_system_transaction: tx.is_system_tx.unwrap_or_default(),
+            input: tx.inner.input.clone(),
+        };
+        let op_tx_env: OpTxEnvelope = deposit_tx.into();
+        tx_env.optimism.enveloped_tx = Some(op_tx_env.encoded_2718().into());
+    } else {
+        let op_tx_env: TxEnvelope = tx.inner.clone().try_into().expect("Invalid transaction");
+        tx_env.optimism.enveloped_tx = Some(op_tx_env.encoded_2718().into());
+    }
+    tx_env.optimism.is_system_transaction = tx.is_system_tx;
+    tx_env.optimism.mint = tx.mint;
+    tx_env.optimism.source_hash = tx.source_hash;
+    tx_env
+}
+
+pub(crate) fn get_handler_cfg(cfg_env: CfgEnv) -> CfgEnvWithHandlerCfg {
+    #[allow(unused_mut)]
+    let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, SpecId::LATEST);
+    #[cfg(feature = "optimism")]
+    {
+        cfg.disable_base_fee = true;
+        cfg.enable_optimism();
+    }
+    cfg
 }

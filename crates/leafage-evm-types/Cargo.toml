@@ -16,3 +16,9 @@ serde_json.workspace = true
 prometheus.workspace = true
 alloy-rlp.workspace = true
 alloy-rlp-derive.workspace = true
+op-alloy-rpc-types = { workspace = true, optional = true }
+op-alloy-consensus = { workspace = true, optional = true }
+
+[features]
+default = []
+optimism = ["op-alloy-rpc-types", "op-alloy-consensus"]

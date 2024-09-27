@@ -13,8 +13,11 @@ pub use rpc::{
     CreateAction, CreateOutput, Index, JsonStorageKey, LocalizedTransactionTrace, Log,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, PreError, PreErrorCode, PreResult,
     RewardAction, SelfdestructAction, SingleCallResult, TraceOutput, Transaction, TransactionInfo,
-    TransactionTrace,
+    TransactionTrace, TxEnvelope,
 };
+
+#[cfg(feature = "optimism")]
+pub use rpc::{OpTxEnvelope, OpTxType, TxDeposit};
 
 mod metrics;
 pub use metrics::{

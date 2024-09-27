@@ -1,14 +1,17 @@
 use crate::api::TraceApiServer;
-use crate::api_impl::utils::create_txn_env;
+use crate::api_impl::utils::{get_handler_cfg, rebuild_txn_env};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use alloy_rlp::{BytesMut, Encodable};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex};
+use leafage_evm_storage::{
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex,
+};
 use leafage_evm_types::{
-    block_env_from_block, Block, BlockId, Bytes, CallRequest, LocalizedTransactionTrace,
-    Transaction, TransactionInfo, H256,
+    block_env_from_block, Block, BlockId, Bytes, LocalizedTransactionTrace, Transaction,
+    TransactionInfo, H256,
 };
 use revm::db::CacheDB;
-use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, SpecId};
+use revm::primitives::{CfgEnv, EnvWithHandlerCfg};
 use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -31,14 +34,23 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
         hash: H256,
     ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
         let cfg = self.cfg.clone();
-        let txn = self
+        let tx = self
             .db
             .get_transaction_by_hash(hash)
             .map_err(|e| internal_rpc_err(e.to_string()))?
             .ok_or_else(|| invalid_params_rpc_err("Transaction not found"))?;
+        #[cfg(not(feature = "optimism"))]
         let block = self
             .db
-            .get_block_by_id_arc(txn.block_hash.unwrap().into())
+            .get_block_by_id_arc(tx.block_hash.unwrap().into())
+            .map_err(|e| {
+                internal_rpc_err(format!("Failed to get block by hash: {}", e.to_string()))
+            })?;
+
+        #[cfg(feature = "optimism")]
+        let block = self
+            .db
+            .get_block_by_id_arc(tx.inner.block_hash.unwrap().into())
             .map_err(|e| {
                 internal_rpc_err(format!("Failed to get block by hash: {}", e.to_string()))
             })?;
@@ -57,28 +69,34 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
         let state = state.unwrap();
         let mut txs_before = Vec::new();
         for tx in block.transactions.txns() {
+            #[cfg(not(feature = "optimism"))]
             if tx.hash == hash {
                 break;
             }
-            txs_before.push(tx.clone().into_request());
+            #[cfg(feature = "optimism")]
+            if tx.inner.hash == hash {
+                break;
+            }
+            txs_before.push(tx.clone());
         }
-        let (tx, rx) = oneshot::channel();
+
+        let (sender, receiver) = oneshot::channel();
 
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::call_and_trace(txs_before, txn, cfg, state, block);
-            if let Err(e) = tx.send(rsp) {
+            let rsp = Self::call_and_trace(txs_before, tx, cfg, state, block);
+            if let Err(e) = sender.send(rsp) {
                 error!("Failed to call_and_trace, result: {:?}", e);
             }
         });
 
-        let rsp = rx
+        let rsp = receiver
             .await
             .map_err(|_| internal_rpc_err("trace failed".to_string()))?;
         rsp.map(Some)
     }
 
     fn call_and_trace(
-        brefore_txs: Vec<CallRequest>,
+        brefore_txs: Vec<Transaction>,
         trace_tx: Transaction,
         cfg: CfgEnv,
         state: DB::StateDB,
@@ -86,10 +104,10 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
     ) -> RpcResult<Vec<LocalizedTransactionTrace>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
-        let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg.clone(), SpecId::LATEST);
+        let cfg = get_handler_cfg(cfg.clone());
         for tx in brefore_txs {
-            let tx = create_txn_env(&block_env, tx)?;
-            let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx);
+            let tx_env = rebuild_txn_env(&block_env, &tx)?;
+            let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx_env);
             let mut evm = Evm::builder()
                 .with_db(&mut memory_db)
                 .with_env_with_handler_cfg(env)
@@ -98,9 +116,15 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
                 .transact_commit()
                 .map_err(|e| internal_rpc_err(e.to_string()))?;
         }
+
+        #[cfg(not(feature = "optimism"))]
         let tx_info = TransactionInfo::from(&trace_tx);
-        let tx = create_txn_env(&block_env, trace_tx.into_request())?;
-        let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx);
+        #[cfg(feature = "optimism")]
+        let tx_info = TransactionInfo::from(&trace_tx.inner);
+
+        let tx_env = rebuild_txn_env(&block_env, &trace_tx)?;
+
+        let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx_env);
 
         let trace_cfg = TracingInspectorConfig::default_parity();
         let mut inspector = TracingInspector::new(trace_cfg);
@@ -122,6 +146,23 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
             .into_localized_transaction_traces(tx_info);
         Ok(res)
     }
+
+    async fn block_state_diff_impl(&self, block_id: BlockId, _re_exec: bool) -> RpcResult<Bytes> {
+        let state = self
+            .db
+            .state_at(block_id)
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        if state.is_none() {
+            return Err(invalid_params_rpc_err("Block not found".to_string()));
+        }
+        let state = state.unwrap();
+        let diff = state
+            .state_diff_arc()
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        let mut buffer = BytesMut::new();
+        diff.as_ref().encode(&mut buffer);
+        Ok(buffer.freeze().into())
+    }
 }
 
 #[async_trait::async_trait]
@@ -137,6 +178,6 @@ where
     }
 
     async fn block_state_diff(&self, _block_id: BlockId, _re_exec: bool) -> RpcResult<Bytes> {
-        unimplemented!()
+        self.block_state_diff_impl(_block_id, _re_exec).await
     }
 }

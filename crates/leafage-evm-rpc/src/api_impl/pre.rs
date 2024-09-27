@@ -1,5 +1,5 @@
 use crate::api::PreApiServer;
-use crate::api_impl::utils::create_txn_env;
+use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::sol_types::decode_revert_reason;
 use jsonrpsee::core::RpcResult;
@@ -9,7 +9,7 @@ use leafage_evm_types::{
     HaltReason, Log, PreError, PreErrorCode, PreResult, Transaction, TransactionInfo, H256,
 };
 use revm::db::CacheDB;
-use revm::primitives::{CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, SpecId};
+use revm::primitives::{CfgEnv, EnvWithHandlerCfg};
 use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -68,7 +68,7 @@ impl<DB: EvmStorageRead> PreApiImpl<DB> {
     ) -> RpcResult<Vec<PreResult>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
-        let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg, SpecId::LATEST);
+        let cfg = get_handler_cfg(cfg);
         let mut tx_index: u64 = 0;
         let mut log_index = 0;
         let mut pre_results: Vec<PreResult> = Vec::new();

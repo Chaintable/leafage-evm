@@ -61,6 +61,8 @@ alloy-chains = "0.1.18"
 alloy = { version = "0.3", features = ["full"] }
 alloy-rlp = "0.3"
 alloy-rlp-derive = "0.3"
+op-alloy-rpc-types = "0.2.12"
+op-alloy-consensus = "0.2.12"
 
 [profile.release]
 opt-level = 3
