@@ -66,7 +66,7 @@ jobs:
 
       - name: Set env
         run: |
-          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
 
       - name: Merge manifest
         run: |
