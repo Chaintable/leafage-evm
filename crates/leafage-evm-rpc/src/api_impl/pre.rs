@@ -78,7 +78,7 @@ impl<DB: EvmStorageRead> PreApiImpl<DB> {
                 index: Some(tx_index),
                 block_hash: Some(block.header.hash),
                 block_number: Some(block.header.number),
-                base_fee: block.header.base_fee_per_gas,
+                base_fee: block.header.base_fee_per_gas.map(|x| x as u128),
             };
             tx_index += 1;
             if let Some(last_res) = pre_results.last() {

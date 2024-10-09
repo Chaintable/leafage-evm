@@ -31,7 +31,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         Self { db, cfg }
     }
 
-    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u128> {
+    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
             .db
             .state_at(block_id)
@@ -194,9 +194,9 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         &self,
         requests: Vec<CallRequest>,
         block_id: BlockId,
-        fast_fail: bool,
-        _use_parallel: bool,
-        _disable_cache: bool,
+        fast_fail: Option<bool>,
+        _use_parallel: Option<bool>,
+        _disable_cache: Option<bool>,
     ) -> RpcResult<MultiCallResp> {
         let mut cfg = self.cfg.clone();
         cfg.disable_eip3607 = true;
@@ -217,7 +217,13 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         let (tx, rx) = oneshot::channel();
 
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::multi_call_from_state(requests, cfg, state, block, fast_fail);
+            let rsp = Self::multi_call_from_state(
+                requests,
+                cfg,
+                state,
+                block,
+                fast_fail.unwrap_or_default(),
+            );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
             }
@@ -499,9 +505,9 @@ where
         &self,
         requests: Vec<CallRequest>,
         block_id: BlockId,
-        fast_fail: bool,
-        use_parallel: bool,
-        disable_cache: bool,
+        fast_fail: Option<bool>,
+        use_parallel: Option<bool>,
+        disable_cache: Option<bool>,
     ) -> RpcResult<MultiCallResp> {
         self.multi_call_impl(requests, block_id, fast_fail, use_parallel, disable_cache)
             .await
@@ -552,7 +558,7 @@ where
         self.chain_id_impl()
     }
 
-    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128> {
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .await
     }

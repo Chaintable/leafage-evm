@@ -17,9 +17,9 @@ pub trait EthApi {
         &self,
         requests: Vec<CallRequest>,
         block_number: BlockId,
-        fast_fail: bool,
-        use_parallel: bool,
-        disable_cache: bool,
+        fast_fail: Option<bool>,
+        use_parallel: Option<bool>,
+        disable_cache: Option<bool>,
     ) -> RpcResult<MultiCallResp>;
 
     #[method(name = "blockNumber")]
@@ -60,7 +60,7 @@ pub trait EthApi {
     async fn chain_id(&self) -> RpcResult<U256>;
 
     #[method(name = "baseFee")]
-    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128>;
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64>;
 
     #[method(name = "getTransactionByHash")]
     async fn transaction_by_hash(&self, hash: H256) -> RpcResult<Option<Transaction>>;
