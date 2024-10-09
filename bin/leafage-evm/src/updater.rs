@@ -53,7 +53,7 @@ where
             let latest_block_num = self.rpc_client.block_number().await?;
             let latest_block_num: u64 = latest_block_num.try_into()?;
             if latest_block_num <= current_block_info.header.number {
-                info!(target:"updater", "no new block");
+                debug!(target:"updater", "no new block");
                 return Ok(false);
             }
             let next_block_number =

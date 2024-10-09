@@ -85,7 +85,7 @@ pub struct Command {
     /// Default: 5 seconds
     ///
     /// This interval is used to fetch block from rpc client.
-    #[arg(long, value_parser = parse_duration, default_value = "5")]
+    #[arg(long, value_parser = parse_duration, default_value = "100")]
     update_interval: std::time::Duration,
 
     /// The timeout for rpc server.
@@ -104,8 +104,8 @@ pub struct Command {
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
-    let seconds = arg.parse()?;
-    Ok(std::time::Duration::from_secs(seconds))
+    let millis = arg.parse()?;
+    Ok(std::time::Duration::from_millis(millis))
 }
 
 fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
