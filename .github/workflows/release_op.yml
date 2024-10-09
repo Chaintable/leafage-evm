@@ -74,7 +74,7 @@ jobs:
         run: |
           docker pull --platform=linux/amd64 ${REGISTRY}/leafage-evm-op:amd64-${REVISION}
           docker pull --platform=linux/arm64 ${REGISTRY}/leafage-evm-op:arm64-${REVISION}
-          docker buildx imagetools create --tag ${REGISTRY}/leafage-evm-op:${REVISION} ${REGISTRY}/leafage-evm-op:amd64-${REVISION} ${REGISTRY}/leafage-evm:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/leafage-evm-op:${REVISION} ${REGISTRY}/leafage-evm-op:amd64-${REVISION} ${REGISTRY}/leafage-evm-op:arm64-${REVISION}
           
       - name: comment PR
         uses: unsplash/comment-on-pr@master
