@@ -82,7 +82,7 @@ pub struct Command {
     code_cache_size: usize,
 
     /// The interval to fetch block and update the snapshot tree.
-    /// Default: 5 seconds
+    /// Default: 100 milliseconds
     ///
     /// This interval is used to fetch block from rpc client.
     #[arg(long, value_parser = parse_duration, default_value = "100")]
@@ -92,7 +92,7 @@ pub struct Command {
     /// Default: 10 seconds
     ///
     /// This timeout is used to set the timeout for rpc server.
-    #[arg(long, value_parser = parse_duration, default_value = "10")]
+    #[arg(long, value_parser = parse_duration, default_value = "10000")]
     rpc_timeout: std::time::Duration,
 
     /// The address for prometheus server.
@@ -178,7 +178,7 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-                info!(target:"updater", "start leafage server at {}, max_connections: {}", self.listen_addr, self.max_connections);
+                info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
                 let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
                     .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
                     .await?;
