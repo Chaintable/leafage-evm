@@ -27,9 +27,11 @@ use rocksdb::{
     ReadOptions, WriteBatch, DB,
 };
 use serde_json::{from_slice, to_vec};
+use std::env;
 use std::path::Path;
 use std::ptr::NonNull;
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -409,6 +411,23 @@ fn rocksdb_options() -> Options {
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
     opts.enable_statistics();
     opts.increase_parallelism(2);
+
+    if let Ok(max_open_file_string) = env::var("ROCKSDB_MAX_OPEN_FILE") {
+        if let Ok(max_open_file) = max_open_file_string.parse::<i32>() {
+            opts.set_max_open_files(max_open_file);
+            info!(
+                target = "rocksdb",
+                "set rocksdb max open file to {}", max_open_file
+            );
+        }
+    }
+
+    if let Ok(set_direct_io) = env::var("ROCKSDB_DIRECT_IO") {
+        if set_direct_io == "1" || set_direct_io == "true" || set_direct_io == "TRUE" {
+            opts.set_use_direct_reads(true);
+            info!(target = "rocksdb", "set rocksdb use direct reads");
+        }
+    }
     // Disabling dumping stats to files because the stats are exported to
     // Prometheus.
     opts.set_stats_persist_period_sec(0);
