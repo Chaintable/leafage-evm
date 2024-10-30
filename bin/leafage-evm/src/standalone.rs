@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
 use leafage_evm_storage::{RocksDBStorage, SnapshotTree, SnapshotTreeConfig, StateDBWrapper};
-use revm::primitives::CfgEnv;
+use revm::primitives::{CfgEnv, SpecId};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -18,6 +18,12 @@ pub struct Command {
     /// If not specified, the default config [eth] will be used.
     #[arg(long, value_parser = parse_chain_cfg, default_value = "eth")]
     chain_cfg: CfgEnv,
+
+    /// The Ethereum Execution Specification ID for the chain.
+    ///
+    /// if not specified, the default spec_id is u8::MAX
+    #[arg(long, default_value = "255")]
+    spec_id: u8,
 
     /// The path to the database to use for this node.
     #[arg(long, value_name = "PATH")]
@@ -125,36 +131,23 @@ fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
         chain_cfg.chain_id = 59144;
         return Ok(chain_cfg);
     }
-    #[cfg(feature = "optimism")]
-    {
-        if arg == "op" {
-            chain_cfg.chain_id = 10;
-            return Ok(chain_cfg);
-        } else {
-            // for opstack chains
-            let chain_id = arg.parse::<u64>()?;
-            chain_cfg.chain_id = chain_id;
-            return Ok(chain_cfg);
-        }
+    if arg == "op" {
+        chain_cfg.chain_id = 10;
+        return Ok(chain_cfg);
     }
-    #[cfg(not(feature = "optimism"))]
-    {
-        use serde_json::from_str;
-        use std::fs;
-        let path = PathBuf::from(arg);
-        if !path.exists() {
-            bail!("chain config file not exists");
-        }
-        let data = fs::read_to_string(path.as_path())?;
-        let chain_cfg = from_str(&data)?;
-        Ok(chain_cfg)
+    if arg.parse::<u64>().is_ok() {
+        chain_cfg.chain_id = arg.parse().unwrap();
+        return Ok(chain_cfg);
     }
+    let chain_cfg = serde_json::from_str(arg)?;
+    Ok(chain_cfg)
 }
 
 impl Command {
     async fn start(
         &self,
         chain_cfg: CfgEnv,
+        spec_id: SpecId,
     ) -> Result<(
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
@@ -178,8 +171,9 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
+                info!(target:"updater", "chain cfg: {:?}, spec_id: {:?}", chain_cfg, spec_id);
                 info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
-                let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone())
+                let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone(), spec_id)
                     .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
                     .await?;
                 if let Some(rpc_address) = self.rpc_addr.clone() {
@@ -197,8 +191,12 @@ impl Command {
         }
     }
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, metrics_handle) =
-            self.start(self.chain_cfg.clone()).await?;
+        let (updater_handle, rpc_handle, metrics_handle) = self
+            .start(
+                self.chain_cfg.clone(),
+                SpecId::try_from_u8(self.spec_id).unwrap_or(SpecId::LATEST),
+            )
+            .await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());

@@ -12,7 +12,7 @@ use leafage_evm_types::{
     MultiCallStats, SingleCallResult, Transaction, H256, RU256, U256,
 };
 use revm::db::DatabaseRef;
-use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult};
+use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult, SpecId};
 use revm::Evm;
 use serde_json::Value;
 use std::str::FromStr;
@@ -24,11 +24,12 @@ use tracing::error;
 pub struct EthApiImpl<DB> {
     db: DB,
     cfg: CfgEnv,
+    spec_id: SpecId,
 }
 
 impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
-    pub fn new(db: DB, cfg: CfgEnv) -> Self {
-        Self { db, cfg }
+    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
+        Self { db, cfg, spec_id }
     }
 
     async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
@@ -57,7 +58,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.disable_block_gas_limit = true;
-        let cfg = get_handler_cfg(cfg);
+        let cfg = get_handler_cfg(cfg, self.spec_id);
         let state = self
             .db
             .state_at(block_id)
@@ -202,6 +203,9 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.disable_block_gas_limit = true;
+
+        let spec_id = self.spec_id;
+
         let state = self
             .db
             .state_at(block_id)
@@ -220,6 +224,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
             let rsp = Self::multi_call_from_state(
                 requests,
                 cfg,
+                spec_id,
                 state,
                 block,
                 fast_fail.unwrap_or_default(),
@@ -237,6 +242,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
     fn multi_call_from_state(
         requests: Vec<CallRequest>,
         cfg: CfgEnv,
+        spec_id: SpecId,
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
         fast_fail: bool,
@@ -277,7 +283,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
                     }
                 }
             }
-            let cfg = get_handler_cfg(cfg.clone());
+            let cfg = get_handler_cfg(cfg.clone(), spec_id);
             let tx = create_txn_env(&block_env, request)?;
             let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env.clone(), tx);
             let mut evm = Evm::builder()

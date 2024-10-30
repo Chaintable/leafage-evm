@@ -11,7 +11,7 @@ use leafage_evm_types::{
     TransactionInfo, H256,
 };
 use revm::db::CacheDB;
-use revm::primitives::{CfgEnv, EnvWithHandlerCfg};
+use revm::primitives::{CfgEnv, EnvWithHandlerCfg, SpecId};
 use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -22,11 +22,12 @@ use tracing::error;
 pub struct TraceApiImpl<DB> {
     db: DB,
     cfg: CfgEnv,
+    spec_id: SpecId,
 }
 
 impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
-    pub fn new(db: DB, cfg: CfgEnv) -> Self {
-        Self { db, cfg }
+    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
+        Self { db, cfg, spec_id }
     }
 
     async fn trace_transaction_impl(
@@ -34,6 +35,9 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
         hash: H256,
     ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
         let cfg = self.cfg.clone();
+
+        let spec_id = self.spec_id;
+
         let tx = self
             .db
             .get_transaction_by_hash(hash)
@@ -83,7 +87,7 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
         let (sender, receiver) = oneshot::channel();
 
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::call_and_trace(txs_before, tx, cfg, state, block);
+            let rsp = Self::call_and_trace(txs_before, tx, cfg, spec_id, state, block);
             if let Err(e) = sender.send(rsp) {
                 error!("Failed to call_and_trace, result: {:?}", e);
             }
@@ -99,12 +103,13 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
         brefore_txs: Vec<Transaction>,
         trace_tx: Transaction,
         cfg: CfgEnv,
+        spec_id: SpecId,
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
     ) -> RpcResult<Vec<LocalizedTransactionTrace>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
-        let cfg = get_handler_cfg(cfg.clone());
+        let cfg = get_handler_cfg(cfg.clone(), spec_id);
         for tx in brefore_txs {
             let tx_env = rebuild_txn_env(&block_env, &tx)?;
             let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx_env);

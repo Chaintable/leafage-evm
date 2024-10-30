@@ -9,7 +9,7 @@ use leafage_evm_types::{
     HaltReason, Log, PreError, PreErrorCode, PreResult, Transaction, TransactionInfo, H256,
 };
 use revm::db::CacheDB;
-use revm::primitives::{CfgEnv, EnvWithHandlerCfg};
+use revm::primitives::{CfgEnv, EnvWithHandlerCfg, SpecId};
 use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -20,11 +20,12 @@ use tracing::error;
 pub struct PreApiImpl<DB> {
     db: DB,
     cfg: CfgEnv,
+    spec_id: SpecId,
 }
 
 impl<DB: EvmStorageRead> PreApiImpl<DB> {
-    pub fn new(db: DB, cfg: CfgEnv) -> Self {
-        Self { db, cfg }
+    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
+        Self { db, cfg, spec_id }
     }
 
     async fn pre_trace_many_impl(
@@ -36,6 +37,9 @@ impl<DB: EvmStorageRead> PreApiImpl<DB> {
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.disable_block_gas_limit = true;
+
+        let spec_id = self.spec_id;
+
         let state = self
             .db
             .state_at(block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
@@ -49,7 +53,7 @@ impl<DB: EvmStorageRead> PreApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let (tx, rx) = oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::call_many_and_trace(requests, cfg, state, block);
+            let rsp = Self::call_many_and_trace(requests, cfg, spec_id, state, block);
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
             }
@@ -63,12 +67,13 @@ impl<DB: EvmStorageRead> PreApiImpl<DB> {
     fn call_many_and_trace(
         txs: Vec<CallRequest>,
         cfg: CfgEnv,
+        spec_id: SpecId,
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
     ) -> RpcResult<Vec<PreResult>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
-        let cfg = get_handler_cfg(cfg);
+        let cfg = get_handler_cfg(cfg, spec_id);
         let mut tx_index: u64 = 0;
         let mut log_index = 0;
         let mut pre_results: Vec<PreResult> = Vec::new();

@@ -192,9 +192,9 @@ fn set_op_txn_env(mut tx_env: TxEnv, tx: &Transaction) -> TxEnv {
     tx_env
 }
 
-pub(crate) fn get_handler_cfg(cfg_env: CfgEnv) -> CfgEnvWithHandlerCfg {
+pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHandlerCfg {
     #[allow(unused_mut)]
-    let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, SpecId::LATEST);
+    let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, spec_id);
     #[cfg(feature = "optimism")]
     {
         cfg.disable_base_fee = true;

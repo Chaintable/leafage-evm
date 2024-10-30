@@ -4,23 +4,25 @@ use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, TransactionIndex};
-use revm::primitives::CfgEnv;
+use revm::primitives::{CfgEnv, SpecId};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct ApiBuilder<DB> {
     db: Arc<DB>,
     cfg: CfgEnv,
+    spec_id: SpecId,
 }
 
 impl<DB> ApiBuilder<DB>
 where
     DB: EvmStorageRead + BlockIndex + TransactionIndex + Sync + Send + 'static,
 {
-    pub fn new(db: DB, cfg: CfgEnv) -> Self {
+    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
         Self {
             db: Arc::new(db),
             cfg,
+            spec_id,
         }
     }
 
@@ -42,7 +44,7 @@ where
             .await?;
         let mut rpc_module = RpcModule::new(());
         rpc_module
-            .merge(EthApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
+            .merge(EthApiImpl::new(self.db.clone(), self.cfg.clone(), self.spec_id).into_rpc())
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -50,7 +52,7 @@ where
                 )
             })?;
         rpc_module
-            .merge(TraceApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
+            .merge(TraceApiImpl::new(self.db.clone(), self.cfg.clone(), self.spec_id).into_rpc())
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -58,7 +60,7 @@ where
                 )
             })?;
         rpc_module
-            .merge(PreApiImpl::new(self.db.clone(), self.cfg.clone()).into_rpc())
+            .merge(PreApiImpl::new(self.db.clone(), self.cfg.clone(), self.spec_id).into_rpc())
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
