@@ -1,7 +1,8 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Block, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256, U256,
+    block_env_from_block, AccountInfo, Block, BlockEnv, BlockStorageDiff, Bytecode, Bytes,
+    NewAccount, Transaction, H256, U256,
 };
 
 /// [`StateDBRead`] offers read-only access to the state database.
@@ -11,8 +12,19 @@ pub trait StateDBRead: Send + Sync + 'static {
     /// latest block hash
     fn read_latest_block_hash(&self) -> Result<H256, Self::Error>;
 
-    /// block hash -> block info
+    /// block hash -> block info/env
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Self::Error>;
+
+    /// block hash -> block info/env
+    fn read_block_env(&self, block_hash: H256) -> Result<Option<BlockEnv>, Self::Error> {
+        let block_info = self.read_block_info(block_hash)?;
+        if let Some(block_info) = block_info {
+            let block_env = block_env_from_block(&block_info);
+            Ok(Some(block_env))
+        } else {
+            Ok(None)
+        }
+    }
 
     /// block num -> block hash
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Self::Error>;

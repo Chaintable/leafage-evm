@@ -1,10 +1,11 @@
 use alloy::primitives::keccak256;
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Transaction, H256, U256,
+    block_env_from_block, AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Transaction,
+    H256, U256,
 };
 use revm::db::DatabaseRef;
-use revm::primitives::{Address as B160, B256, U256 as RU256};
+use revm::primitives::{Address as B160, BlockEnv, B256, U256 as RU256};
 use std::sync::Arc;
 
 /// [`StateDB`] is a trait that provides access to the state of the EVM at a specific block height.
@@ -40,6 +41,10 @@ pub trait BlockContext {
 
     fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
         Ok(Arc::new(self.state_diff()?))
+    }
+
+    fn block_env(&self) -> Result<BlockEnv, Self::Error> {
+        self.block_info_arc().map(|b| block_env_from_block(&b))
     }
 }
 
