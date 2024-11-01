@@ -151,7 +151,7 @@ impl FileSource {
             let mut batch = db.prepare_write_batch()?;
             let accounts = read_file_to_account(file).await?;
             for account in accounts {
-                db.write_account(&mut batch, account.address, Some(account))?;
+                db.write_account(&mut batch, account.address, 0, Some(account))?;
                 self.stat.account_count.fetch_add(1, Ordering::SeqCst);
             }
             db.commit(batch)?;
@@ -165,7 +165,7 @@ impl FileSource {
             let mut batch = db.prepare_write_batch()?;
             let storages = read_file_to_storage(file).await?;
             for (address, key, value) in storages {
-                db.write_storage(&mut batch, address, key, value)?;
+                db.write_storage(&mut batch, address, key, 0, value)?;
                 self.stat.storage_count.fetch_add(1, Ordering::SeqCst);
             }
             db.commit(batch)?;

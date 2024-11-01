@@ -294,10 +294,20 @@ impl StateDBWrite for DataBase {
         Ok(())
     }
 
+    fn write_block_env(
+        &self,
+        _batch: &mut Self::DBWriteBatch,
+        _block_hash: H256,
+        _block_env: leafage_evm_types::BlockEnv,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn write_account(
         &self,
         batch: &mut Self::DBWriteBatch,
         address: H256,
+        _block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
         let address_to_account_cf = self
@@ -321,6 +331,7 @@ impl StateDBWrite for DataBase {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         key: H256,
+        _block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
         let address_to_storage_cf = self
