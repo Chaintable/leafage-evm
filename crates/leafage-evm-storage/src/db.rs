@@ -62,11 +62,19 @@ pub trait StateDBWrite: Send + Sync + 'static {
         block_info: Block<Transaction>,
     ) -> Result<(), Self::Error>;
 
+    /// block hash -> block env, for archive db
+    fn write_block_env(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_hash: H256,
+        block_env: BlockEnv,
+    ) -> Result<(), Self::Error>;
+
     /// block num -> block hash
     fn write_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_num: u64,
+        block_num: u64, // only for archive db
         block_hash: H256,
     ) -> Result<(), Self::Error>;
 
@@ -75,6 +83,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         &self,
         batch: &mut Self::DBWriteBatch,
         address: H256,
+        block_num: u64, // only for archive db
         raw_account: Option<NewAccount>,
     ) -> Result<(), Self::Error>;
 
@@ -92,6 +101,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         key: H256,
+        block_num: u64,
         value: U256,
     ) -> Result<(), Self::Error>;
 
@@ -160,16 +170,20 @@ where
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         let mut batch = self.0.prepare_write_batch()?;
+        let block_number = block_info.header.number;
         self.0
             .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
         let hash = block_info.header.hash;
+        self.0
+            .write_block_env(&mut batch, hash, block_env_from_block(&block_info))?;
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
-            self.0.write_account(&mut batch, account, None)?;
+            self.0
+                .write_account(&mut batch, account, block_number, None)?;
         }
         for account in block_diff.new_accounts {
             self.0
-                .write_account(&mut batch, account.address, Some(account))?;
+                .write_account(&mut batch, account.address, block_number, Some(account))?;
         }
         for account_diff in block_diff.storage_diffs {
             for index_value_pair in account_diff.diffs {
@@ -177,6 +191,7 @@ where
                     &mut batch,
                     account_diff.address,
                     index_value_pair.index,
+                    block_number,
                     index_value_pair.value,
                 )?;
             }

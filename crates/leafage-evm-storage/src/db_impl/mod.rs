@@ -7,6 +7,7 @@ pub use rocksdb_impl::DataBase as RocksDBStorage;
 
 #[cfg(feature = "with-rocksdb")]
 mod archive_rocksdb_db_impl;
+#[cfg(feature = "with-rocksdb")]
 pub use archive_rocksdb_db_impl::{
-    init_database, report_cache_usage, StateDataBase as ArchiveStateDataBase,
+    DataBase as ArchiveDataBase, StateDataBase as ArchiveStateDataBase,
 };

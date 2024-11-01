@@ -125,8 +125,6 @@ impl From<NewAccount> for SlimAccount {
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
 pub struct SlimBlockEnv {
-    pub hash: H256,
-
     /// The number of ancestor blocks of this block (block height).
     pub number: U256,
     /// Coinbase or miner or address that created and signed the block.
@@ -164,7 +162,7 @@ pub struct SlimBlockEnv {
     pub blob_excess_gas_and_price: SlimBlobExcessGasAndPrice,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
 pub struct SlimBlobExcessGasAndPrice {
     /// The excess blob gas of the block.
     pub excess_blob_gas: u64,
@@ -185,6 +183,27 @@ impl Into<BlockEnv> for SlimBlockEnv {
             blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
                 self.blob_excess_gas_and_price.excess_blob_gas,
             )),
+        }
+    }
+}
+
+impl From<BlockEnv> for SlimBlockEnv {
+    fn from(block_env: BlockEnv) -> Self {
+        SlimBlockEnv {
+            number: block_env.number,
+            coinbase: block_env.coinbase,
+            timestamp: block_env.timestamp,
+            difficulty: block_env.difficulty,
+            basefee: block_env.basefee,
+            gas_limit: block_env.gas_limit,
+            prevrandao: block_env.prevrandao.unwrap_or_default(),
+            blob_excess_gas_and_price: block_env
+                .blob_excess_gas_and_price
+                .map(|blob_excess_gas_and_price| SlimBlobExcessGasAndPrice {
+                    excess_blob_gas: blob_excess_gas_and_price.excess_blob_gas as u64,
+                    blob_gasprice: blob_excess_gas_and_price.blob_gasprice,
+                })
+                .unwrap_or_default(),
         }
     }
 }
