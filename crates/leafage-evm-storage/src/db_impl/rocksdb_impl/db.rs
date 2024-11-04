@@ -294,15 +294,6 @@ impl StateDBWrite for DataBase {
         Ok(())
     }
 
-    fn write_block_env(
-        &self,
-        _batch: &mut Self::DBWriteBatch,
-        _block_hash: H256,
-        _block_env: leafage_evm_types::BlockEnv,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     fn write_account(
         &self,
         batch: &mut Self::DBWriteBatch,

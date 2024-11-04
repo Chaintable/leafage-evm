@@ -7,12 +7,14 @@ pub use key::JsonStorageKey;
 mod multi_call;
 pub use multi_call::{MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult};
 
-pub use alloy::consensus::TxEnvelope;
+pub use alloy::consensus::{Header as RawHeader, TxEnvelope};
 pub use alloy::rpc::types::trace::parity::{
     Action, CallAction, CallOutput, CallType, CreateAction, CreateOutput,
     LocalizedTransactionTrace, RewardAction, SelfdestructAction, TraceOutput, TransactionTrace,
 };
-pub use alloy::rpc::types::{Block, BlockId, BlockNumberOrTag, Index, Log, TransactionInfo};
+pub use alloy::rpc::types::{
+    Block, BlockId, BlockNumberOrTag, Header, Index, Log, TransactionInfo,
+};
 
 #[cfg(not(feature = "optimism"))]
 pub use alloy::rpc::types::Transaction;
