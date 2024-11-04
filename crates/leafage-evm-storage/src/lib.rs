@@ -13,6 +13,8 @@ pub use snapshot::{Config as SnapshotTreeConfig, Error, SnapshotTree};
 mod db;
 pub use db::{DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};
 
+mod archive_tree;
+
 mod migrate;
 pub use migrate::{FileSource, MigateStat};
 

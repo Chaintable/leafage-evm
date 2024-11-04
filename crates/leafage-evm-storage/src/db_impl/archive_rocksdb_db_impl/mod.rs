@@ -1,2 +1,2 @@
 mod db;
-pub use db::{DataBase, StateDataBase};
+pub use db::{DataBase, StateDB};

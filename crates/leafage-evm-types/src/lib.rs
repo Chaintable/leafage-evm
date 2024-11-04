@@ -4,16 +4,16 @@ pub use primitives::*;
 mod storage;
 pub use storage::{
     block_env_from_block, AccountStorageDiff, BlockStorageDiff, IndexValuePair, NewAccount,
-    NewCode, SlimAccount, SlimBlockEnv,
+    NewCode, SlimAccount,
 };
 
 mod rpc;
 pub use rpc::{
     Action, Block, BlockId, BlockNumberOrTag, CallAction, CallOutput, CallRequest, CallType,
-    CreateAction, CreateOutput, Index, JsonStorageKey, LocalizedTransactionTrace, Log,
+    CreateAction, CreateOutput, Header, Index, JsonStorageKey, LocalizedTransactionTrace, Log,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, PreError, PreErrorCode, PreResult,
-    RewardAction, SelfdestructAction, SingleCallResult, TraceOutput, Transaction, TransactionInfo,
-    TransactionTrace, TxEnvelope,
+    RawHeader, RewardAction, SelfdestructAction, SingleCallResult, TraceOutput, Transaction,
+    TransactionInfo, TransactionTrace, TxEnvelope,
 };
 
 #[cfg(feature = "optimism")]

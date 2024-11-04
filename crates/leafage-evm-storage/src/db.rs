@@ -1,7 +1,10 @@
-use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
+use crate::{
+    interface::{BlockContext, EvmStorageWrite, StateDB},
+    EvmStorageRead,
+};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    block_env_from_block, AccountInfo, Block, BlockEnv, BlockStorageDiff, Bytecode, Bytes,
+    block_env_from_block, AccountInfo, Block, BlockEnv, BlockId, BlockStorageDiff, Bytecode, Bytes,
     NewAccount, Transaction, H256, U256,
 };
 
@@ -62,14 +65,6 @@ pub trait StateDBWrite: Send + Sync + 'static {
         block_info: Block<Transaction>,
     ) -> Result<(), Self::Error>;
 
-    /// block hash -> block env, for archive db
-    fn write_block_env(
-        &self,
-        batch: &mut Self::DBWriteBatch,
-        block_hash: H256,
-        block_env: BlockEnv,
-    ) -> Result<(), Self::Error>;
-
     /// block num -> block hash
     fn write_block_hash(
         &self,
@@ -111,6 +106,15 @@ pub trait StateDBWrite: Send + Sync + 'static {
 
 /// [`DBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
 pub struct DBWrapper<T>(pub T);
+
+impl<T> Clone for DBWrapper<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl<T> BlockContext for DBWrapper<T>
 where
@@ -174,8 +178,6 @@ where
         self.0
             .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
         let hash = block_info.header.hash;
-        self.0
-            .write_block_env(&mut batch, hash, block_env_from_block(&block_info))?;
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
             self.0
@@ -203,5 +205,37 @@ where
         self.0.write_latest_block_hash(&mut batch, hash)?;
         self.0.commit(batch)?;
         Ok(())
+    }
+}
+
+/// [`ArchiveDBProvider`] offers read-only access to the archive database.
+#[auto_impl(&, Box, Arc)]
+pub trait ArchiveDBProvider: Send + Sync + 'static {
+    type StateDB: StateDBRead
+        + BlockContext<Error = <Self::StateDB as StateDBRead>::Error>
+        + StateDBWrite<Error = <Self::StateDB as StateDBRead>::Error>
+        + Send
+        + Sync
+        + Clone
+        + 'static;
+    fn db_at(
+        &self,
+        block_arg: BlockId,
+    ) -> Result<Option<Self::StateDB>, <Self::StateDB as StateDBRead>::Error>;
+}
+
+pub struct ArchiveDBWrapper<T>(pub T);
+
+impl<T> EvmStorageRead for ArchiveDBWrapper<T>
+where
+    T: ArchiveDBProvider,
+{
+    type Error = <<T as ArchiveDBProvider>::StateDB as StateDBRead>::Error;
+
+    type StateDB = DBWrapper<<T as ArchiveDBProvider>::StateDB>;
+
+    fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
+        let db = self.0.db_at(block_arg)?;
+        Ok(db.map(|db| DBWrapper(db)))
     }
 }
