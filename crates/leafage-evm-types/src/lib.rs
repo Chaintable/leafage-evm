@@ -26,3 +26,6 @@ pub use metrics::{
     try_create_histogram_with_buckets, try_create_int_counter, try_create_int_counter_vec,
     try_create_int_gauge, try_create_int_gauge_vec,
 };
+
+mod kafka;
+pub use kafka::{KafkaBlockChangeNotification, KafkaBlockContext};

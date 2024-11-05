@@ -1,3 +1,4 @@
+mod initializer;
 mod metrics;
 mod migrate;
 mod runner;
@@ -5,10 +6,8 @@ mod standalone;
 mod updater;
 
 use clap::Parser;
-use console_subscriber::ConsoleLayer;
 use num_cpus;
 use runner::Cli;
-use std::time::Duration;
 use tikv_jemallocator;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -28,12 +27,7 @@ fn main() -> anyhow::Result<()> {
         .build()
         .unwrap()
         .block_on(async {
-            let layer = ConsoleLayer::builder()
-                .retention(Duration::from_secs(1800))
-                .with_default_env()
-                .spawn();
             tracing_subscriber::registry()
-                .with(layer)
                 .with(fmt::layer().pretty())
                 .with(EnvFilter::from_default_env())
                 .init();

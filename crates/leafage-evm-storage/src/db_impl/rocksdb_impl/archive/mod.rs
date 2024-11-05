@@ -22,6 +22,7 @@
 //! - `get_transaction_by_context`
 
 use crate::db::{ArchiveDBProvider, StateDBRead, StateDBWrite};
+use crate::interface::MetricsReport;
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
 use crate::BlockContext;
 use alloy_rlp::{Decodable, Encodable};
@@ -35,7 +36,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::{env, u64};
 use thiserror::Error;
 use tracing::info;
@@ -432,7 +433,6 @@ impl DataBase {
 
     pub fn statedb_at(&self, block_id: BlockId) -> Result<Option<StateDB>, Error> {
         let block_num: u64;
-        let block_hash: H256;
         let block_header: Header;
         match block_id {
             BlockId::Hash(hash) => {
@@ -442,12 +442,11 @@ impl DataBase {
                 }
                 block_header = header.unwrap().header;
                 block_num = block_header.number;
-                block_hash = hash.block_hash;
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
                     block_num = u64::MAX;
-                    block_hash = self.read_latest_block_hash()?;
+                    let block_hash = self.read_latest_block_hash()?;
                     if block_hash == H256::ZERO {
                         return Ok(None);
                     }
@@ -459,7 +458,7 @@ impl DataBase {
                 }
                 BlockNumberOrTag::Number(num) => {
                     block_num = num;
-                    block_hash = self.read_block_hash(num)?;
+                    let block_hash = self.read_block_hash(num)?;
                     if block_hash == H256::ZERO {
                         return Ok(None);
                     }
@@ -498,7 +497,7 @@ impl DataBase {
         }))
     }
 
-    fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
+    pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
             .start_timer();
@@ -521,7 +520,7 @@ impl DataBase {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::BlockHashToBlockInfo.to_display()])
             .start_timer();
@@ -572,7 +571,7 @@ impl DataBase {
         Ok(Some(block))
     }
 
-    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+    pub fn read_latest_block_hash(&self) -> Result<H256, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
             .start_timer();
@@ -594,7 +593,13 @@ impl DataBase {
         Ok(block_hash)
     }
 
-    pub fn report_cache_usage(&self) {
+    fn get_inner_ref(&self) -> &DataBaseInner {
+        unsafe { DATA_BASE.as_ref().unwrap() }
+    }
+}
+
+impl MetricsReport for DataBase {
+    fn report_cache_usage(&self) {
         for (col, column_family) in self.get_inner_ref().cols.iter() {
             let handle = unsafe { column_family.as_ref() };
             let prop = self
@@ -608,13 +613,76 @@ impl DataBase {
             }
         }
     }
-
-    fn get_inner_ref(&self) -> &DataBaseInner {
-        unsafe { DATA_BASE.as_ref().unwrap() }
-    }
 }
 
 impl StateDBWrite for StateDB {
+    type Error = Error;
+    type DBWriteBatch = WriteBatch;
+    fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
+        self.db.prepare_write_batch()
+    }
+    fn write_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_num: u64,
+        block_hash: H256,
+    ) -> Result<(), Self::Error> {
+        self.db.write_block_hash(batch, block_num, block_hash)
+    }
+
+    fn write_block_info(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_info: Block<Transaction>,
+    ) -> Result<(), Error> {
+        self.db.write_block_info(batch, block_info)
+    }
+
+    fn write_account(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+        raw_account: Option<NewAccount>,
+    ) -> Result<(), Error> {
+        self.db
+            .write_account(batch, address, block_num, raw_account)
+    }
+
+    fn write_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        key: H256,
+        block_num: u64,
+        value: U256,
+    ) -> Result<(), Error> {
+        self.db.write_storage(batch, address, key, block_num, value)
+    }
+
+    fn write_code(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        code_hash: H256,
+        code: Bytes,
+    ) -> Result<(), Error> {
+        self.db.write_code(batch, code_hash, code)
+    }
+
+    fn write_latest_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_hash: H256,
+    ) -> Result<(), Error> {
+        self.db.write_latest_block_hash(batch, block_hash)
+    }
+
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
+        self.db.commit(batch)
+    }
+}
+
+impl StateDBWrite for DataBase {
     type Error = Error;
     type DBWriteBatch = WriteBatch;
     fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
@@ -627,7 +695,6 @@ impl StateDBWrite for StateDB {
         block_hash: H256,
     ) -> Result<(), Self::Error> {
         let block_num_to_block_hash_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
@@ -647,7 +714,6 @@ impl StateDBWrite for StateDB {
         block_info: Block<Transaction>,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
@@ -671,7 +737,6 @@ impl StateDBWrite for StateDB {
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
         let address_to_account_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
@@ -705,7 +770,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_storage_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
             .unwrap();
         let address_bytes = address.as_slice();
@@ -736,7 +800,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_code_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
         let code_hash_bytes = code_hash.as_slice();
@@ -751,7 +814,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let latest_block_hash_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
         batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_slice());
@@ -762,7 +824,7 @@ impl StateDBWrite for StateDB {
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["write", "all"])
             .start_timer();
-        self.db.db.write(batch)?;
+        self.db.write(batch)?;
         timer.observe_duration();
         Ok(())
     }

@@ -1,0 +1,279 @@
+use alloy_rlp::Decodable;
+use anyhow::Result;
+use aws_sdk_s3::Client;
+use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite, SnapshotTree, StateDB};
+use leafage_evm_types::{
+    Block, BlockId, BlockStorageDiff, KafkaBlockChangeNotification, Transaction, H256,
+};
+use rdkafka::{
+    consumer::{Consumer, StreamConsumer},
+    message::BorrowedMessage,
+    ClientConfig, Message, Offset, TopicPartitionList,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
+use tracing::{debug, error, info};
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct KafkaS3Config {
+    pub topic: String,
+    pub brokers: String,
+    pub partition: i32,
+    pub bucket_name: String,
+    pub offset_dir: String,
+}
+
+pub fn read_offset(offset_dir: &str) -> Result<i64> {
+    let offset = std::fs::read_to_string(format!("{}/offset", offset_dir))?;
+    let offset = offset.trim().parse()?;
+    Ok(offset)
+}
+
+pub fn write_offset(offset_dir: &str, offset: i64) -> Result<()> {
+    std::fs::write(format!("{}/offset.tmp", offset_dir), offset.to_string())?;
+    std::fs::rename(
+        format!("{}/offset.tmp", offset_dir),
+        format!("{}/offset", offset_dir),
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BlockContextWithOffset {
+    block_diff: BlockStorageDiff,
+    block_info: Block<Transaction>,
+    offset: i64,
+}
+
+/// [`Updater`] is used to update the snapshot tree to the latest block
+pub struct Updater<DB> {
+    kafka_s3_cfg: KafkaS3Config,
+    consumer: StreamConsumer,
+    s3_client: Client,
+    snap_tree: Arc<SnapshotTree<DB>>,
+    max_diff_depth: usize,
+    hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
+}
+
+impl<DB> Updater<DB>
+where
+    DB: StateDB
+        + EvmStorageWrite<Error = <DB as StateDB>::Error>
+        + BlockContext<Error = <DB as StateDB>::Error>
+        + Send
+        + Sync
+        + 'static,
+{
+    pub async fn new(
+        snap_tree: Arc<SnapshotTree<DB>>,
+        kafka_s3_cfg: KafkaS3Config,
+    ) -> Result<Self> {
+        let offset = read_offset(&kafka_s3_cfg.offset_dir)?;
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &kafka_s3_cfg.brokers)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .create()?;
+        let mut tpl = TopicPartitionList::with_capacity(1);
+        tpl.add_partition_offset(
+            &kafka_s3_cfg.topic,
+            kafka_s3_cfg.partition,
+            Offset::Offset(offset),
+        )?;
+        consumer.assign(&tpl)?;
+
+        let s3_config = aws_config::load_from_env().await;
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+
+        let max_diff_depth = snap_tree.get_config().diff_tree_depth_limit;
+        Ok(Self {
+            kafka_s3_cfg,
+            consumer,
+            s3_client,
+            snap_tree,
+            max_diff_depth,
+            hash_to_blockctx: Mutex::new(HashMap::default()),
+        })
+    }
+
+    async fn get_block_diff(&self, block_hash: H256) -> Result<BlockStorageDiff> {
+        let s3_key = format!("{}/stateDiff", block_hash);
+        let s3_obj = self
+            .s3_client
+            .get_object()
+            .bucket(&self.kafka_s3_cfg.bucket_name)
+            .key(&s3_key)
+            .send()
+            .await?;
+        let mut bytes = s3_obj
+            .body
+            .bytes()
+            .expect(&format!("Failed to get object {}", s3_key));
+        let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
+        Ok(block_storage_diff)
+    }
+
+    async fn get_block_info(&self, block_hash: H256) -> Result<Block<Transaction>> {
+        let s3_key = format!("{}/block", block_hash);
+        let s3_obj = self
+            .s3_client
+            .get_object()
+            .bucket(&self.kafka_s3_cfg.bucket_name)
+            .key(&s3_key)
+            .send()
+            .await?;
+        let bytes = s3_obj
+            .body
+            .bytes()
+            .expect(&format!("Failed to get object {}", s3_key));
+        let block = serde_json::from_slice(&bytes)?;
+        Ok(block)
+    }
+
+    fn get_update_path(
+        &self,
+        latest_remote_block: BlockContextWithOffset,
+    ) -> VecDeque<BlockContextWithOffset> {
+        let mut update_path = VecDeque::new();
+        update_path.push_back(latest_remote_block);
+        loop {
+            if update_path.len() > self.max_diff_depth {
+                error!(target:"updater", "can't find parent block before max diff depth, drop");
+                return Default::default();
+            }
+            let first_block_info = update_path.front().unwrap();
+            if self
+                .snap_tree
+                .state_at(BlockId::Hash(
+                    first_block_info.block_info.header.parent_hash.into(),
+                ))
+                .is_ok()
+            {
+                debug!(target:"updater", "find parent block {}", first_block_info.block_info.header.parent_hash);
+                break;
+            }
+            let parent_block_info = self
+                .hash_to_blockctx
+                .lock()
+                .unwrap()
+                .get(&first_block_info.block_info.header.parent_hash)
+                .cloned();
+            if parent_block_info.is_none() {
+                error!(target:"updater", "can't not find block {}", first_block_info.block_info.header.parent_hash);
+                return Default::default();
+            } else {
+                update_path.push_front(parent_block_info.unwrap().clone());
+            }
+        }
+        update_path
+    }
+
+    fn clear(
+        &self,
+        presist_block_num: u64,
+        presist_block_hash: H256,
+    ) -> Option<BlockContextWithOffset> {
+        let presist_block = self
+            .hash_to_blockctx
+            .lock()
+            .unwrap()
+            .remove(&presist_block_hash);
+
+        self.hash_to_blockctx
+            .lock()
+            .unwrap()
+            .retain(|_, block| block.block_info.header.number >= presist_block_num);
+
+        presist_block
+    }
+
+    async fn update(&self, message: BorrowedMessage<'_>) -> Result<()> {
+        let offset = message.offset();
+        let block_change_notification: KafkaBlockChangeNotification =
+            serde_json::from_slice(message.payload().unwrap())?;
+
+        for new_block in block_change_notification.new_blocks.iter() {
+            let block_diff = self.get_block_diff(new_block.hash).await?;
+            let block_info = self.get_block_info(new_block.hash).await?;
+
+            let block_ctx_with_offset = BlockContextWithOffset {
+                block_diff,
+                block_info,
+                offset,
+            };
+
+            self.hash_to_blockctx
+                .lock()
+                .unwrap()
+                .insert(new_block.hash, block_ctx_with_offset);
+        }
+
+        let latest_remote_block_ctx = block_change_notification
+            .new_blocks
+            .last()
+            .expect("Empty new block change notification");
+        let latest_remote_block = self
+            .hash_to_blockctx
+            .lock()
+            .unwrap()
+            .get(&latest_remote_block_ctx.hash)
+            .expect("Empty latest remote block")
+            .clone();
+        let mut update_path = self.get_update_path(latest_remote_block);
+        for block in update_path.drain(..) {
+            let block_storage_diff = block.block_diff;
+            let block_info = block.block_info;
+            let block_hash = block_info.header.hash;
+            let block_num = block_info.header.number;
+            let new_accounts_num = block_storage_diff.new_accounts.len();
+            let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
+            let new_codes_num = block_storage_diff.new_codes.len();
+            self.snap_tree
+                .update_block(block_info, block_storage_diff)?;
+            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}", 
+                                        block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
+        }
+        let disk_layer = self.snap_tree.get_disk_layer();
+        let presist_block = disk_layer.block_info_arc()?;
+        let presist_block_num = presist_block.header.number;
+        let presist_block_hash = presist_block.header.hash;
+        // clear block context before presist block
+        let presist_block = self.clear(presist_block_num, presist_block_hash);
+        if let Some(presist_block) = presist_block {
+            info!(target:"updater", "clear block hash {}, block num {}", presist_block.block_info.header.hash, presist_block.block_info.header.number);
+            write_offset(&self.kafka_s3_cfg.offset_dir, presist_block.offset + 1)?;
+        }
+        Ok(())
+    }
+
+    pub fn start(self) -> watch::Sender<()> {
+        let (tx, mut rx) = watch::channel(());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = rx.changed() => {
+                        info!(target:"updater", "stop updater");
+                        break;
+                    }
+                    message = self.consumer.recv() => {
+                        match message {
+                            Ok(msg) => {
+                                if let Err(e) = self.update(msg).await {
+                                    error!(target:"updater", "Failed to update: {:?}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!(target:"updater", "Failed to receive message: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        tx
+    }
+}
