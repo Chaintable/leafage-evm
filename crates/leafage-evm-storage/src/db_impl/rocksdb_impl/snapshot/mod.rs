@@ -17,6 +17,7 @@
 //! All [`U256`] are big-endian encoded.
 
 use crate::db::{StateDBRead, StateDBWrite};
+use crate::interface::MetricsReport;
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
@@ -527,8 +528,10 @@ impl DataBase {
         ];
         Self { db, cols }
     }
+}
 
-    pub fn report_cache_usage(&self) {
+impl MetricsReport for DataBase {
+    fn report_cache_usage(&self) {
         for (col, column_family) in self.cols.iter() {
             let handle = unsafe { column_family.as_ref() };
             let prop = self

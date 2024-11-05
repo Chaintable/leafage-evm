@@ -18,7 +18,7 @@ pub struct ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    snapshot_tree: SnapshotTree<DBWrapper<DB::StateDB>>,
+    snapshot_tree: Arc<SnapshotTree<DBWrapper<DB::StateDB>>>,
     history_tree: ArchiveDBWrapper<DB>,
 }
 
@@ -26,16 +26,23 @@ impl<DB> ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    pub fn new(db: DB, config: Config) -> Result<Self, Error<<DB::StateDB as StateDBRead>::Error>> {
+    pub fn new(
+        db: DB,
+        config: Config,
+    ) -> Result<
+        (Self, Arc<SnapshotTree<DBWrapper<DB::StateDB>>>),
+        Error<<DB::StateDB as StateDBRead>::Error>,
+    > {
         let latest_db = db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
         let latest_db = latest_db.expect("latest db should exist");
         let latest_statedb = DBWrapper(latest_db);
-        let snapshot_tree = SnapshotTree::new(latest_statedb, config)?;
+        let snapshot_tree = Arc::new(SnapshotTree::new(latest_statedb, config)?);
         let history_tree = ArchiveDBWrapper(db);
-        Ok(Self {
-            snapshot_tree,
+        let tree = Self {
+            snapshot_tree: snapshot_tree.clone(),
             history_tree,
-        })
+        };
+        Ok((tree, snapshot_tree))
     }
 }
 

@@ -3,9 +3,8 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server,
 };
-use leafage_evm_storage::RocksDBStorage;
+use leafage_evm_storage::MetricsReport;
 use prometheus::{gather, Encoder, TextEncoder};
-use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{error, info};
@@ -23,7 +22,10 @@ async fn prometheus_handle(_req: Request<Body>) -> Result<Response<Body>, hyper:
     Ok(response)
 }
 
-pub fn prometheus_build(db: Arc<RocksDBStorage>, addr: String) -> watch::Sender<()> {
+pub fn prometheus_build<DB: MetricsReport + Send + Sync + 'static>(
+    db: DB,
+    addr: String,
+) -> watch::Sender<()> {
     let (tx, mut rx) = watch::channel(());
     let mut interval = interval(std::time::Duration::from_secs(60));
     let mut rx1 = rx.clone();
