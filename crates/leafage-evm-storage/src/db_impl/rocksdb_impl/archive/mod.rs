@@ -24,6 +24,7 @@
 use crate::db::{ArchiveDBProvider, BlockRead, StateDBRead, StateDBWrite};
 use crate::interface::MetricsReport;
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
+use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
     Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
@@ -52,6 +53,8 @@ pub enum Error {
     UnSupported(String),
     #[error("unsupported block id, {0}")]
     UnsupportedBlockId(BlockId),
+    #[error("conversion error, {0}")]
+    Conversion(#[from] ConversionError),
 }
 
 #[repr(u16)]
@@ -547,7 +550,7 @@ impl StateDBWrite for DataBase {
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_info.header.hash.into();
         let mut block_info_bytes = Vec::new();
-        let block_header: RawHeader = block_info.header.try_into().unwrap();
+        let block_header: RawHeader = block_info.header.try_into()?;
         block_header.encode(&mut block_info_bytes);
         batch.put_cf(
             block_hash_to_block_info_cf,
