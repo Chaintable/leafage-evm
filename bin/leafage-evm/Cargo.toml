@@ -31,6 +31,7 @@ alloy-rlp.workspace = true
 rdkafka.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
+flate2.workspace = true
 
 [features]
 default = ["with-rocksdb"]

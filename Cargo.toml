@@ -45,7 +45,7 @@ num_cpus = "1.16.0"
 rdkafka = "0.36.2"
 aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
-
+flate2 = "1.0.34"
 
 # eth
 
