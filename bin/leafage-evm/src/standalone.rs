@@ -1,7 +1,8 @@
 use crate::initializer::initialize_check;
 use crate::metrics;
 use crate::runner::run_until_ctrl_c;
-use crate::updater::{updater_build, KafkaS3Config};
+use crate::updater::updater_build;
+use crate::utils::KafkaS3Config;
 use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;

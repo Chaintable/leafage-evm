@@ -1,4 +1,4 @@
-use alloy_rlp::Decodable;
+use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
@@ -10,20 +10,10 @@ use rdkafka::{
     message::BorrowedMessage,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct KafkaS3Config {
-    pub topic: String,
-    pub brokers: String,
-    pub partition: i32,
-    pub bucket_name: String,
-    pub offset_dir: String,
-}
 
 pub fn read_offset(offset_dir: &str) -> Result<i64> {
     let offset = std::fs::read_to_string(format!("{}/offset", offset_dir))?;
@@ -95,38 +85,14 @@ where
         })
     }
 
+    #[inline]
     async fn get_block_diff(&self, block_hash: H256) -> Result<BlockStorageDiff> {
-        let s3_key = format!("{}/stateDiff", block_hash);
-        let s3_obj = self
-            .s3_client
-            .get_object()
-            .bucket(&self.kafka_s3_cfg.bucket_name)
-            .key(&s3_key)
-            .send()
-            .await?;
-        let mut bytes = s3_obj
-            .body
-            .bytes()
-            .expect(&format!("Failed to get object {}", s3_key));
-        let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
-        Ok(block_storage_diff)
+        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
     }
 
+    #[inline]
     async fn get_block_info(&self, block_hash: H256) -> Result<Block<Transaction>> {
-        let s3_key = format!("{}/block", block_hash);
-        let s3_obj = self
-            .s3_client
-            .get_object()
-            .bucket(&self.kafka_s3_cfg.bucket_name)
-            .key(&s3_key)
-            .send()
-            .await?;
-        let bytes = s3_obj
-            .body
-            .bytes()
-            .expect(&format!("Failed to get object {}", s3_key));
-        let block = serde_json::from_slice(&bytes)?;
-        Ok(block)
+        s3_get_block_info(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
     }
 
     fn get_update_path(
