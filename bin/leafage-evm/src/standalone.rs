@@ -120,11 +120,11 @@ pub struct Command {
     #[arg(long, default_value_t = false)]
     archive: bool,
 
-    /// The kafka s3 config
+    /// The kafka s3 config path
     /// Default: None
     ///
     /// This config is used to set the kafka s3 config.
-    #[arg(long, value_parser = parse_kafka_s3_config)]
+    #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
 }
 
@@ -163,8 +163,13 @@ fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
 }
 
 fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
-    let file = std::fs::File::open(arg)?;
-    let kafka_s3_config: KafkaS3Config = serde_json::from_reader(file)?;
+    let kafka_s3_config: KafkaS3Config;
+    if arg.starts_with("/") {
+        let file = std::fs::File::open(arg)?;
+        kafka_s3_config = serde_json::from_reader(file)?;
+    } else {
+        kafka_s3_config = serde_json::from_str(arg)?;
+    }
     Ok(kafka_s3_config)
 }
 
@@ -208,7 +213,10 @@ impl Command {
                 Ok((updater_handle, rpc_handle, metrics_handle))
             }
             "rocksdb" if self.archive => {
-                let db = ArchiveRocksDBStorage::open(self.db_path.as_path(), self.db_cache);
+                let db = Arc::new(ArchiveRocksDBStorage::open(
+                    self.db_path.as_path(),
+                    self.db_cache,
+                ));
                 let metrics_handle =
                     metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
                 // check if db shoud be initialized

@@ -155,7 +155,7 @@ where
     async fn update(&self, message: BorrowedMessage<'_>) -> Result<()> {
         let offset = message.offset();
         let block_change_notification: KafkaBlockChangeNotification =
-            serde_json::from_slice(message.payload().unwrap())?;
+            message.payload().unwrap().try_into()?;
 
         for new_block in block_change_notification.new_blocks.iter() {
             let block_diff = self.get_block_diff(new_block.hash).await?;

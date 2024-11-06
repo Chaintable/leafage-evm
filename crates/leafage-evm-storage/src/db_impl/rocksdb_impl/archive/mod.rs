@@ -36,7 +36,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{env, u64};
 use thiserror::Error;
 use tracing::info;
@@ -111,16 +111,25 @@ struct DataBaseInner {
     db: DB,
 }
 
-#[derive(Debug, Clone)]
-pub struct DataBase {
+#[derive(Debug)]
+pub struct DataBaseRef {
     db: &'static DB,
+}
+
+impl Drop for DataBaseRef {
+    fn drop(&mut self) {
+        unsafe {
+            DATA_BASE.as_mut().unwrap().db.flush().unwrap();
+            DATA_BASE = None;
+        }
+    }
 }
 
 unsafe impl Send for DataBaseInner {}
 unsafe impl Sync for DataBaseInner {}
 
 pub struct StateDB {
-    db: DataBase,
+    db: Arc<DataBaseRef>,
     block_num: u64,
     block_header: Header,
     account_iterator: Mutex<DBRawIteratorWithThreadMode<'static, DB>>,
@@ -324,7 +333,7 @@ fn rocksdb_options() -> Options {
     opts
 }
 
-impl DataBase {
+impl DataBaseRef {
     pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
@@ -421,7 +430,7 @@ impl DataBase {
     }
 }
 
-impl MetricsReport for DataBase {
+impl MetricsReport for DataBaseRef {
     fn report_cache_usage(&self) {
         for (col, column_family) in self.get_inner_ref().cols.iter() {
             let handle = unsafe { column_family.as_ref() };
@@ -513,7 +522,7 @@ impl StateDBWrite for StateDB {
     }
 }
 
-impl StateDBWrite for DataBase {
+impl StateDBWrite for DataBaseRef {
     type Error = Error;
     type DBWriteBatch = WriteBatch;
     fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
@@ -661,16 +670,7 @@ impl StateDBWrite for DataBase {
     }
 }
 
-impl Drop for DataBase {
-    fn drop(&mut self) {
-        unsafe {
-            DATA_BASE.as_mut().unwrap().db.flush().unwrap();
-            DATA_BASE = None;
-        }
-    }
-}
-
-impl BlockRead for DataBase {
+impl BlockRead for DataBaseRef {
     type Error = Error;
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
@@ -770,7 +770,7 @@ impl BlockRead for DataBase {
     }
 }
 
-impl ArchiveDBProvider for DataBase {
+impl ArchiveDBProvider for Arc<DataBaseRef> {
     type StateDBReadWrite = StateDB;
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;

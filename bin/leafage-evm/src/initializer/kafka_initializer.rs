@@ -59,7 +59,7 @@ where
     pub async fn init(&mut self) -> Result<()> {
         let first_message = self.consumer.recv().await?;
         let block_change_notification: KafkaBlockChangeNotification =
-            serde_json::from_slice(first_message.payload().unwrap())?;
+            first_message.payload().unwrap().try_into()?;
         let first_block_hash = block_change_notification.new_blocks[0].hash;
         let first_block_info = self.get_block_info(first_block_hash).await?;
         let first_block_diff = self.get_block_diff(first_block_hash).await?;
