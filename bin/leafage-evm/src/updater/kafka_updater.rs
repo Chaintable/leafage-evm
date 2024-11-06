@@ -55,7 +55,11 @@ where
         + Sync
         + 'static,
 {
-    pub async fn new(tree: Tree, kafka_s3_cfg: KafkaS3Config) -> Result<Self> {
+    pub async fn new(
+        tree: Tree,
+        kafka_s3_cfg: KafkaS3Config,
+        max_diff_depth: usize,
+    ) -> Result<Self> {
         let offset = read_offset(&kafka_s3_cfg.offset_dir)?;
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", &kafka_s3_cfg.brokers)
@@ -74,7 +78,6 @@ where
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
-        let max_diff_depth = 0;
         Ok(Self {
             kafka_s3_cfg,
             consumer,

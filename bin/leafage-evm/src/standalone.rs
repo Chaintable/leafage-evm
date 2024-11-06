@@ -208,6 +208,7 @@ impl Command {
                     self.rpc_addr.clone(),
                     self.kafka_s3_config.clone(),
                     self.update_interval,
+                    self.diff_depth_limit,
                 )
                 .await?;
                 Ok((updater_handle, rpc_handle, metrics_handle))
@@ -245,6 +246,7 @@ impl Command {
                     self.rpc_addr.clone(),
                     self.kafka_s3_config.clone(),
                     self.update_interval,
+                    self.diff_depth_limit,
                 )
                 .await?;
                 Ok((updater_handle, rpc_handle, metrics_handle))
