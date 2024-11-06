@@ -1,7 +1,7 @@
-use crate::initializer::{HttpInitializer, KafkaInitializer};
+use crate::initializer::initialize_check;
 use crate::metrics;
 use crate::runner::run_until_ctrl_c;
-use crate::updater::{HttpUpdater, KafkaS3Config, KafkaUpdater};
+use crate::updater::{updater_build, KafkaS3Config};
 use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
@@ -9,7 +9,6 @@ use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
 };
-use leafage_evm_types::H256;
 use revm::primitives::{CfgEnv, SpecId};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -183,13 +182,43 @@ impl Command {
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
-                let mut metrics_handle = tokio::sync::watch::channel(()).0;
-                if self.prometheus_addr.len() > 0 {
-                    metrics_handle =
-                        metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
-                }
-                let db = StateDBWrapper(db);
-                let snaps = Arc::new(SnapshotTree::new(
+                let metrics_handle =
+                    metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
+                let tree = Arc::new(SnapshotTree::new(
+                    StateDBWrapper(db),
+                    SnapshotTreeConfig::new(
+                        self.diff_depth_limit,
+                        self.account_cache_size,
+                        self.storage_cache_size,
+                        self.code_cache_size,
+                    ),
+                )?);
+                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone(), spec_id)
+                    .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
+                    .await?;
+
+                let updater_handle = updater_build(
+                    tree.clone(),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.update_interval,
+                )
+                .await?;
+                Ok((updater_handle, rpc_handle, metrics_handle))
+            }
+            "rocksdb" if self.archive => {
+                let db = ArchiveRocksDBStorage::open(self.db_path.as_path(), self.db_cache);
+                let metrics_handle =
+                    metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
+                // check if db shoud be initialized
+                initialize_check(
+                    StateDBWrapper(db.clone()),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                )
+                .await?;
+
+                let tree = Arc::new(ArchiveTree::new(
                     db,
                     SnapshotTreeConfig::new(
                         self.diff_depth_limit,
@@ -198,73 +227,18 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-                let rpc_handle = ApiBuilder::new(snaps.clone(), chain_cfg.clone(), spec_id)
+                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone(), spec_id)
                     .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
                     .await?;
-                if let Some(rpc_address) = self.rpc_addr.clone() {
-                    let updater =
-                        HttpUpdater::new(snaps.clone(), rpc_address, self.update_interval)?;
-                    let updater_handle = updater.start();
-                    return Ok((updater_handle, rpc_handle, metrics_handle));
-                }
-                if let Some(kafka_s3_config) = self.kafka_s3_config.clone() {
-                    let updater = KafkaUpdater::new(snaps.clone(), kafka_s3_config).await?;
-                    let updater_handle = updater.start();
-                    return Ok((updater_handle, rpc_handle, metrics_handle));
-                }
-                Ok((
-                    tokio::sync::watch::channel(()).0,
-                    rpc_handle,
-                    metrics_handle,
-                ))
-            }
-            "rocksdb" if self.archive => {
-                let db = ArchiveRocksDBStorage::open(self.db_path.as_path(), self.db_cache);
-                let mut metrics_handle = tokio::sync::watch::channel(()).0;
-                if self.prometheus_addr.len() > 0 {
-                    metrics_handle =
-                        metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
-                }
-                // check if db shoud be initialized
-                if db.read_latest_block_hash()? == H256::ZERO {
-                    if let Some(rpc_address) = self.rpc_addr.clone() {
-                        let mut initializer =
-                            HttpInitializer::new(StateDBWrapper(db.clone()), rpc_address)?;
-                        initializer.init().await?;
-                    } else if let Some(kafka_s3_config) = self.kafka_s3_config.clone() {
-                        let mut initializer =
-                            KafkaInitializer::new(StateDBWrapper(db.clone()), kafka_s3_config)
-                                .await?;
-                        initializer.init().await?;
-                    }
-                }
-                let (tree, snaps) = ArchiveTree::new(
-                    db,
-                    SnapshotTreeConfig::new(
-                        self.diff_depth_limit,
-                        self.account_cache_size,
-                        self.storage_cache_size,
-                        self.code_cache_size,
-                    ),
-                )?;
-                let rpc_handle = ApiBuilder::new(tree, chain_cfg.clone(), spec_id)
-                    .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
-                    .await?;
-                if let Some(rpc_address) = self.rpc_addr.clone() {
-                    let updater = HttpUpdater::new(snaps, rpc_address, self.update_interval)?;
-                    let updater_handle = updater.start();
-                    return Ok((updater_handle, rpc_handle, metrics_handle));
-                }
-                if let Some(kafka_s3_config) = self.kafka_s3_config.clone() {
-                    let updater = KafkaUpdater::new(snaps.clone(), kafka_s3_config).await?;
-                    let updater_handle = updater.start();
-                    return Ok((updater_handle, rpc_handle, metrics_handle));
-                }
-                Ok((
-                    tokio::sync::watch::channel(()).0,
-                    rpc_handle,
-                    metrics_handle,
-                ))
+
+                let updater_handle = updater_build(
+                    tree.clone(),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.update_interval,
+                )
+                .await?;
+                Ok((updater_handle, rpc_handle, metrics_handle))
             }
             _ => bail!("only support rocksdb"),
         }

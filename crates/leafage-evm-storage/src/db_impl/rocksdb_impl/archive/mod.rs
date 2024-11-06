@@ -21,14 +21,13 @@
 //! - `get_transaction_by_hash`
 //! - `get_transaction_by_context`
 
-use crate::db::{ArchiveDBProvider, StateDBRead, StateDBWrite};
+use crate::db::{ArchiveDBProvider, BlockRead, StateDBRead, StateDBWrite};
 use crate::interface::MetricsReport;
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
-use crate::BlockContext;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Bytes, Header, NewAccount, RawHeader,
-    SlimAccount, Transaction, H256, KECCAK_EMPTY, U256,
+    Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
+    Transaction, H256, KECCAK_EMPTY, U256,
 };
 use rocksdb::{
     properties, BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor,
@@ -36,7 +35,7 @@ use rocksdb::{
 };
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::{env, u64};
 use thiserror::Error;
 use tracing::info;
@@ -157,48 +156,11 @@ impl Clone for StateDB {
     }
 }
 
-impl BlockContext for StateDB {
-    type Error = Error;
-
-    fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
-        Err(Error::UnSupported("block_info".to_string()))
-    }
-
-    fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
-        Err(Error::UnSupported("block_info_arc".to_string()))
-    }
-
-    fn state_diff(&self) -> Result<BlockStorageDiff, Self::Error> {
-        Err(Error::UnSupported("state_diff".to_string()))
-    }
-
-    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
-        Err(Error::UnSupported("state_diff_arc".to_string()))
-    }
-}
-
 unsafe impl Send for StateDB {}
 unsafe impl Sync for StateDB {}
 
 impl StateDBRead for StateDB {
     type Error = Error;
-
-    fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        if block_num == self.block_num {
-            return Ok(self.block_header.hash);
-        }
-        self.db.read_block_hash(block_num)
-    }
-
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
-        if block_hash == self.block_header.hash {
-            return Ok(Some(Block {
-                header: self.block_header.clone(),
-                ..Default::default()
-            }));
-        }
-        self.db.read_block_info(block_hash)
-    }
 
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
@@ -277,7 +239,27 @@ impl StateDBRead for StateDB {
         }
         Ok(Some(Bytes::from(code.unwrap())))
     }
+}
 
+impl BlockRead for StateDB {
+    type Error = Error;
+
+    fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
+        if block_num == self.block_num {
+            return Ok(self.block_header.hash);
+        }
+        self.db.read_block_hash(block_num)
+    }
+
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+        if block_hash == self.block_header.hash {
+            return Ok(Some(Block {
+                header: self.block_header.clone(),
+                ..Default::default()
+            }));
+        }
+        self.db.read_block_info(block_hash)
+    }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
         self.db.read_latest_block_hash()
     }
@@ -495,102 +477,6 @@ impl DataBase {
             account_iterator: Mutex::new(account_iterator),
             storage_iterator: Mutex::new(storage_iterator),
         }))
-    }
-
-    pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
-            .start_timer();
-        let block_num_to_block_hash_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
-            .unwrap();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-        let block_hash_bytes = self.db.get_pinned_cf_opt(
-            block_num_to_block_hash_cf,
-            block_num_bytes,
-            &rocksdb_read_options(),
-        )?;
-        timer.observe_duration();
-        if block_hash_bytes.is_none() {
-            return Ok(H256::ZERO);
-        }
-        let block_hash_bytes = block_hash_bytes.unwrap();
-        let block_hash = H256::from_slice(block_hash_bytes.as_ref());
-        Ok(block_hash)
-    }
-
-    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::BlockHashToBlockInfo.to_display()])
-            .start_timer();
-        let block_hash_to_block_info_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
-            .unwrap();
-        let block_hash_bytes: [u8; 32] = block_hash.into();
-        let block_info_bytes = self.db.get_pinned_cf_opt(
-            block_hash_to_block_info_cf,
-            block_hash_bytes,
-            &rocksdb_read_options(),
-        )?;
-        timer.observe_duration();
-        if block_info_bytes.is_none() {
-            return Ok(None);
-        }
-        let block_info_bytes = block_info_bytes.unwrap();
-        let block_header: RawHeader = RawHeader::decode(&mut block_info_bytes.as_ref()).unwrap();
-        let block = Block {
-            header: Header {
-                hash: block_hash,
-                parent_hash: block_header.parent_hash,
-                uncles_hash: block_header.ommers_hash,
-                miner: block_header.beneficiary,
-                state_root: block_header.state_root,
-                transactions_root: block_header.transactions_root,
-                receipts_root: block_header.receipts_root,
-                withdrawals_root: block_header.withdrawals_root,
-                logs_bloom: block_header.logs_bloom,
-                difficulty: block_header.difficulty,
-                number: block_header.number,
-                gas_limit: block_header.gas_limit,
-                gas_used: block_header.gas_used,
-                timestamp: block_header.timestamp,
-                mix_hash: Some(block_header.mix_hash),
-                nonce: Some(block_header.nonce),
-                base_fee_per_gas: block_header.base_fee_per_gas,
-                blob_gas_used: block_header.blob_gas_used,
-                excess_blob_gas: block_header.excess_blob_gas,
-                parent_beacon_block_root: block_header.parent_beacon_block_root,
-                requests_hash: block_header.requests_hash,
-                extra_data: block_header.extra_data,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Ok(Some(block))
-    }
-
-    pub fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
-            .start_timer();
-        let latest_block_hash_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
-            .unwrap();
-        let block_hash_bytes = self.db.get_cf_opt(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            &rocksdb_read_options(),
-        )?;
-        timer.observe_duration();
-        if block_hash_bytes.is_none() {
-            return Ok(H256::ZERO);
-        }
-        let block_hash_bytes = block_hash_bytes.unwrap();
-        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
-        Ok(block_hash)
     }
 
     fn get_inner_ref(&self) -> &DataBaseInner {
@@ -839,9 +725,109 @@ impl Drop for DataBase {
     }
 }
 
+impl BlockRead for DataBase {
+    type Error = Error;
+
+    fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
+        let timer = DATABASE_OP_LATENCY_HIST
+            .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
+            .start_timer();
+        let block_num_to_block_hash_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
+            .unwrap();
+        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let block_hash_bytes = self.db.get_pinned_cf_opt(
+            block_num_to_block_hash_cf,
+            block_num_bytes,
+            &rocksdb_read_options(),
+        )?;
+        timer.observe_duration();
+        if block_hash_bytes.is_none() {
+            return Ok(H256::ZERO);
+        }
+        let block_hash_bytes = block_hash_bytes.unwrap();
+        let block_hash = H256::from_slice(block_hash_bytes.as_ref());
+        Ok(block_hash)
+    }
+
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+        let timer = DATABASE_OP_LATENCY_HIST
+            .with_label_values(&["read", StorageTypeColumn::BlockHashToBlockInfo.to_display()])
+            .start_timer();
+        let block_hash_to_block_info_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+            .unwrap();
+        let block_hash_bytes: [u8; 32] = block_hash.into();
+        let block_info_bytes = self.db.get_pinned_cf_opt(
+            block_hash_to_block_info_cf,
+            block_hash_bytes,
+            &rocksdb_read_options(),
+        )?;
+        timer.observe_duration();
+        if block_info_bytes.is_none() {
+            return Ok(None);
+        }
+        let block_info_bytes = block_info_bytes.unwrap();
+        let block_header: RawHeader = RawHeader::decode(&mut block_info_bytes.as_ref()).unwrap();
+        let block = Block {
+            header: Header {
+                hash: block_hash,
+                parent_hash: block_header.parent_hash,
+                uncles_hash: block_header.ommers_hash,
+                miner: block_header.beneficiary,
+                state_root: block_header.state_root,
+                transactions_root: block_header.transactions_root,
+                receipts_root: block_header.receipts_root,
+                withdrawals_root: block_header.withdrawals_root,
+                logs_bloom: block_header.logs_bloom,
+                difficulty: block_header.difficulty,
+                number: block_header.number,
+                gas_limit: block_header.gas_limit,
+                gas_used: block_header.gas_used,
+                timestamp: block_header.timestamp,
+                mix_hash: Some(block_header.mix_hash),
+                nonce: Some(block_header.nonce),
+                base_fee_per_gas: block_header.base_fee_per_gas,
+                blob_gas_used: block_header.blob_gas_used,
+                excess_blob_gas: block_header.excess_blob_gas,
+                parent_beacon_block_root: block_header.parent_beacon_block_root,
+                requests_hash: block_header.requests_hash,
+                extra_data: block_header.extra_data,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Ok(Some(block))
+    }
+
+    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+        let timer = DATABASE_OP_LATENCY_HIST
+            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
+            .start_timer();
+        let latest_block_hash_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        let block_hash_bytes = self.db.get_cf_opt(
+            latest_block_hash_cf,
+            [1u8].to_vec(),
+            &rocksdb_read_options(),
+        )?;
+        timer.observe_duration();
+        if block_hash_bytes.is_none() {
+            return Ok(H256::ZERO);
+        }
+        let block_hash_bytes = block_hash_bytes.unwrap();
+        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
+        Ok(block_hash)
+    }
+}
+
 impl ArchiveDBProvider for DataBase {
-    type StateDB = StateDB;
-    fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDB>, Error> {
+    type StateDBReadWrite = StateDB;
+    fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         self.statedb_at(block_id)
     }
 }

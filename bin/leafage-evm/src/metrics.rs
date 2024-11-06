@@ -27,6 +27,9 @@ pub fn prometheus_build<DB: MetricsReport + Send + Sync + 'static>(
     addr: String,
 ) -> watch::Sender<()> {
     let (tx, mut rx) = watch::channel(());
+    if addr.is_empty() {
+        return tx;
+    }
     let mut interval = interval(std::time::Duration::from_secs(60));
     let mut rx1 = rx.clone();
     tokio::spawn(async move {

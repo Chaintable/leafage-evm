@@ -18,7 +18,7 @@ pub struct ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    snapshot_tree: Arc<SnapshotTree<DBWrapper<DB::StateDB>>>,
+    snapshot_tree: Arc<SnapshotTree<DBWrapper<DB::StateDBReadWrite>>>,
     history_tree: ArchiveDBWrapper<DB>,
 }
 
@@ -29,10 +29,7 @@ where
     pub fn new(
         db: DB,
         config: Config,
-    ) -> Result<
-        (Self, Arc<SnapshotTree<DBWrapper<DB::StateDB>>>),
-        Error<<DB::StateDB as StateDBRead>::Error>,
-    > {
+    ) -> Result<Self, Error<<DB::StateDBReadWrite as StateDBRead>::Error>> {
         let latest_db = db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
         let latest_db = latest_db.expect("latest db should exist");
         let latest_statedb = DBWrapper(latest_db);
@@ -42,7 +39,7 @@ where
             snapshot_tree: snapshot_tree.clone(),
             history_tree,
         };
-        Ok((tree, snapshot_tree))
+        Ok(tree)
     }
 }
 
@@ -58,8 +55,8 @@ pub enum MultiStateDB<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    Snapshot(Arc<LinkedDiffLayer<DBWrapper<DB::StateDB>>>),
-    Archive(DBWrapper<DB::StateDB>),
+    Snapshot(Arc<LinkedDiffLayer<DBWrapper<DB::StateDBReadWrite>>>),
+    Archive(DBWrapper<DB::StateDBReadWrite>),
 }
 
 impl<DB> Clone for MultiStateDB<DB>
@@ -78,7 +75,7 @@ impl<DB> BlockContext for MultiStateDB<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    type Error = Error<<DB::StateDB as StateDBRead>::Error>;
+    type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
 
     fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
         match self {
@@ -113,7 +110,7 @@ impl<DB> StateDB for MultiStateDB<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    type Error = Error<<DB::StateDB as StateDBRead>::Error>;
+    type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
 
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
         match self {
@@ -148,7 +145,7 @@ impl<DB> EvmStorageRead for ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    type Error = Error<<DB::StateDB as StateDBRead>::Error>;
+    type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
     type StateDB = MultiStateDB<DB>;
 
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
@@ -175,7 +172,7 @@ impl<DB> EvmStorageWrite for ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    type Error = Error<<DB::StateDB as StateDBWrite>::Error>;
+    type Error = Error<<DB::StateDBReadWrite as StateDBWrite>::Error>;
     fn update_block(
         &self,
         block_info: Block<Transaction>,
@@ -186,13 +183,18 @@ where
             .update_block(block_info.clone(), block_diff.clone())?;
         Ok(res)
     }
+
+    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+        let res = self.snapshot_tree.last_committed_block()?;
+        Ok(res)
+    }
 }
 
 impl<DB> BlockIndex for ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    type Error = Error<<DB::StateDB as StateDBWrite>::Error>;
+    type Error = Error<<DB::StateDBReadWrite as StateDBWrite>::Error>;
     fn get_block_by_id(
         &self,
         block_id: BlockId,
@@ -214,7 +216,7 @@ impl<DB> TransactionIndex for ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    type Error = Error<<DB::StateDB as StateDBWrite>::Error>;
+    type Error = Error<<DB::StateDBReadWrite as StateDBWrite>::Error>;
 
     fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
         let res = self.snapshot_tree.get_transaction_by_hash(tx_hash)?;

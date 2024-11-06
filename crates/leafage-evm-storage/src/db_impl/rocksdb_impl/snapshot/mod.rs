@@ -16,7 +16,7 @@
 //! The `HashToCode` column family stores the code hash to code maps.
 //! All [`U256`] are big-endian encoded.
 
-use crate::db::{StateDBRead, StateDBWrite};
+use crate::db::{BlockRead, StateDBRead, StateDBWrite};
 use crate::interface::MetricsReport;
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
 use alloy_rlp::{Decodable, Encodable};
@@ -97,8 +97,9 @@ pub struct DataBase {
 unsafe impl Send for DataBase {}
 unsafe impl Sync for DataBase {}
 
-impl StateDBRead for DataBase {
+impl BlockRead for DataBase {
     type Error = Error;
+
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
@@ -145,6 +146,32 @@ impl StateDBRead for DataBase {
         let block_info = from_slice::<Block<Transaction>>(block_info_slice)?;
         Ok(Some(block_info))
     }
+
+    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+        let timer = DATABASE_OP_LATENCY_HIST
+            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
+            .start_timer();
+        let latest_block_hash_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        let block_hash_bytes = self.db.get_cf_opt(
+            latest_block_hash_cf,
+            [1u8].to_vec(),
+            &rocksdb_read_options(),
+        )?;
+        timer.observe_duration();
+        if block_hash_bytes.is_none() {
+            return Ok(H256::ZERO);
+        }
+        let block_hash_bytes = block_hash_bytes.unwrap();
+        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
+        Ok(block_hash)
+    }
+}
+
+impl StateDBRead for DataBase {
+    type Error = Error;
 
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
@@ -221,28 +248,6 @@ impl StateDBRead for DataBase {
             return Ok(None);
         }
         Ok(Some(Bytes::from(code.unwrap())))
-    }
-
-    fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
-            .start_timer();
-        let latest_block_hash_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
-            .unwrap();
-        let block_hash_bytes = self.db.get_cf_opt(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            &rocksdb_read_options(),
-        )?;
-        timer.observe_duration();
-        if block_hash_bytes.is_none() {
-            return Ok(H256::ZERO);
-        }
-        let block_hash_bytes = block_hash_bytes.unwrap();
-        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
-        Ok(block_hash)
     }
 }
 
