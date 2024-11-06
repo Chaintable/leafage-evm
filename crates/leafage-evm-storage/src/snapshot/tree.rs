@@ -226,6 +226,12 @@ where
             Err(Error::ParentBlockHashNotFound)
         }
     }
+
+    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+        self.disk_layer
+            .block_info_arc()
+            .map(|b| Some(b.as_ref().clone()))
+    }
 }
 
 impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {

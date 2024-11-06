@@ -4,34 +4,27 @@ use crate::{
 };
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    block_env_from_block, AccountInfo, Block, BlockEnv, BlockId, BlockStorageDiff, Bytecode, Bytes,
-    NewAccount, Transaction, H256, U256,
+    AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256,
+    U256,
 };
 
-/// [`StateDBRead`] offers read-only access to the state database.
 #[auto_impl(&, Box, Arc)]
-pub trait StateDBRead: Send + Sync + 'static {
+pub trait BlockRead: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     /// latest block hash
     fn read_latest_block_hash(&self) -> Result<H256, Self::Error>;
 
-    /// block hash -> block info/env
+    /// block hash -> block info
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Self::Error>;
-
-    /// block hash -> block info/env
-    fn read_block_env(&self, block_hash: H256) -> Result<Option<BlockEnv>, Self::Error> {
-        let block_info = self.read_block_info(block_hash)?;
-        if let Some(block_info) = block_info {
-            let block_env = block_env_from_block(&block_info);
-            Ok(Some(block_env))
-        } else {
-            Ok(None)
-        }
-    }
 
     /// block num -> block hash
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Self::Error>;
+}
 
+/// [`StateDBRead`] offers read-only access to the state database.
+#[auto_impl(&, Box, Arc)]
+pub trait StateDBRead {
+    type Error: std::error::Error + Send + Sync + 'static;
     /// account address -> raw account
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Self::Error>;
 
@@ -118,7 +111,7 @@ where
 
 impl<T> BlockContext for DBWrapper<T>
 where
-    T: StateDBRead,
+    T: BlockRead,
 {
     type Error = T::Error;
 
@@ -128,11 +121,12 @@ where
     }
 }
 
-impl<T> StateDB for DBWrapper<T>
+impl<T, E> StateDB for DBWrapper<T>
 where
-    T: StateDBRead,
+    T: StateDBRead<Error = E> + BlockRead<Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
         let raw_account_info = self.0.read_account(address.into())?;
@@ -162,11 +156,12 @@ where
     }
 }
 
-impl<T> EvmStorageWrite for DBWrapper<T>
+impl<T, E> EvmStorageWrite for DBWrapper<T>
 where
-    T: StateDBWrite,
+    T: StateDBWrite<Error = E> + BlockRead<Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn update_block(
         &self,
@@ -206,14 +201,19 @@ where
         self.0.commit(batch)?;
         Ok(())
     }
+
+    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+        let latest_block_hash = self.0.read_latest_block_hash()?;
+        Ok(self.0.read_block_info(latest_block_hash)?)
+    }
 }
 
 /// [`ArchiveDBProvider`] offers read-only access to the archive database.
 #[auto_impl(&, Box, Arc)]
 pub trait ArchiveDBProvider: Send + Sync + 'static {
-    type StateDB: StateDBRead
-        + BlockContext<Error = <Self::StateDB as StateDBRead>::Error>
-        + StateDBWrite<Error = <Self::StateDB as StateDBRead>::Error>
+    type StateDBReadWrite: StateDBRead
+        + BlockRead<Error = <Self::StateDBReadWrite as StateDBRead>::Error>
+        + StateDBWrite<Error = <Self::StateDBReadWrite as StateDBRead>::Error>
         + Send
         + Sync
         + Clone
@@ -221,7 +221,7 @@ pub trait ArchiveDBProvider: Send + Sync + 'static {
     fn db_at(
         &self,
         block_arg: BlockId,
-    ) -> Result<Option<Self::StateDB>, <Self::StateDB as StateDBRead>::Error>;
+    ) -> Result<Option<Self::StateDBReadWrite>, <Self::StateDBReadWrite as StateDBRead>::Error>;
 }
 
 pub struct ArchiveDBWrapper<T>(pub T);
@@ -230,9 +230,9 @@ impl<T> EvmStorageRead for ArchiveDBWrapper<T>
 where
     T: ArchiveDBProvider,
 {
-    type Error = <<T as ArchiveDBProvider>::StateDB as StateDBRead>::Error;
+    type Error = <<T as ArchiveDBProvider>::StateDBReadWrite as StateDBRead>::Error;
 
-    type StateDB = DBWrapper<<T as ArchiveDBProvider>::StateDB>;
+    type StateDB = DBWrapper<<T as ArchiveDBProvider>::StateDBReadWrite>;
 
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
         let db = self.0.db_at(block_arg)?;

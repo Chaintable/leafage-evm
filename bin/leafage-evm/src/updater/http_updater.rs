@@ -2,43 +2,41 @@ use alloy_rlp::Decodable;
 use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite, SnapshotTree, StateDB};
+use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction};
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{debug, error, info};
 
 /// [`Updater`] is used to update the snapshot tree to the latest block
-pub struct Updater<DB> {
+pub struct Updater<Tree> {
     rpc_client: HttpClient,
-    snap_tree: Arc<SnapshotTree<DB>>,
+    tree: Tree,
     block_queue: VecDeque<Block<Transaction>>,
     update_interval: Duration,
     max_diff_depth: usize,
 }
 
-impl<DB> Updater<DB>
+impl<Tree> Updater<Tree>
 where
-    DB: StateDB
-        + EvmStorageWrite<Error = <DB as StateDB>::Error>
-        + BlockContext<Error = <DB as StateDB>::Error>
+    Tree: EvmStorageRead
+        + EvmStorageWrite<Error = <Tree as EvmStorageRead>::Error>
         + Send
         + Sync
         + 'static,
 {
     pub fn new(
-        snap_tree: Arc<SnapshotTree<DB>>,
+        snap_tree: Tree,
         rpc_url: impl AsRef<str>,
         update_interval: Duration,
     ) -> Result<Self> {
         let rpc_client = HttpClientBuilder::default().build(rpc_url)?;
-        let max_diff_depth = snap_tree.get_config().diff_tree_depth_limit;
+        let max_diff_depth = 0;
         Ok(Self {
             rpc_client,
-            snap_tree,
+            tree: snap_tree,
             block_queue: VecDeque::new(),
             update_interval,
             max_diff_depth,
@@ -49,7 +47,11 @@ where
     /// Return true if the snapshot tree is updated
     async fn update(&mut self) -> Result<bool> {
         if self.block_queue.is_empty() {
-            let current_block_info = self.snap_tree.block_info()?;
+            let current_block_info = self
+                .tree
+                .state_at(BlockId::latest())?
+                .unwrap()
+                .block_info_arc()?;
             let latest_block_num = self.rpc_client.block_number().await?;
             let latest_block_num: u64 = latest_block_num.try_into()?;
             if latest_block_num <= current_block_info.header.number {
@@ -81,7 +83,7 @@ where
             }
             let first_block_info = self.block_queue.front().unwrap();
             if self
-                .snap_tree
+                .tree
                 .state_at(BlockId::Hash(first_block_info.header.parent_hash.into()))?
                 .is_some()
             {
@@ -114,8 +116,7 @@ where
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
-            self.snap_tree
-                .update_block(block_info, block_storage_diff)?;
+            self.tree.update_block(block_info, block_storage_diff)?;
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}", 
                                             block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }

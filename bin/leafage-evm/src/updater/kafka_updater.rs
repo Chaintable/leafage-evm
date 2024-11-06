@@ -1,7 +1,7 @@
 use alloy_rlp::Decodable;
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite, SnapshotTree, StateDB};
+use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
     Block, BlockId, BlockStorageDiff, KafkaBlockChangeNotification, Transaction, H256,
 };
@@ -12,7 +12,7 @@ use rdkafka::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
 
@@ -48,28 +48,24 @@ struct BlockContextWithOffset {
 }
 
 /// [`Updater`] is used to update the snapshot tree to the latest block
-pub struct Updater<DB> {
+pub struct Updater<Tree> {
     kafka_s3_cfg: KafkaS3Config,
     consumer: StreamConsumer,
     s3_client: Client,
-    snap_tree: Arc<SnapshotTree<DB>>,
+    tree: Tree,
     max_diff_depth: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
 }
 
-impl<DB> Updater<DB>
+impl<Tree> Updater<Tree>
 where
-    DB: StateDB
-        + EvmStorageWrite<Error = <DB as StateDB>::Error>
-        + BlockContext<Error = <DB as StateDB>::Error>
+    Tree: EvmStorageRead
+        + EvmStorageWrite<Error = <Tree as EvmStorageRead>::Error>
         + Send
         + Sync
         + 'static,
 {
-    pub async fn new(
-        snap_tree: Arc<SnapshotTree<DB>>,
-        kafka_s3_cfg: KafkaS3Config,
-    ) -> Result<Self> {
+    pub async fn new(tree: Tree, kafka_s3_cfg: KafkaS3Config) -> Result<Self> {
         let offset = read_offset(&kafka_s3_cfg.offset_dir)?;
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", &kafka_s3_cfg.brokers)
@@ -88,12 +84,12 @@ where
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
-        let max_diff_depth = snap_tree.get_config().diff_tree_depth_limit;
+        let max_diff_depth = 0;
         Ok(Self {
             kafka_s3_cfg,
             consumer,
             s3_client,
-            snap_tree,
+            tree,
             max_diff_depth,
             hash_to_blockctx: Mutex::new(HashMap::default()),
         })
@@ -146,7 +142,7 @@ where
             }
             let first_block_info = update_path.front().unwrap();
             if self
-                .snap_tree
+                .tree
                 .state_at(BlockId::Hash(
                     first_block_info.block_info.header.parent_hash.into(),
                 ))
@@ -231,13 +227,11 @@ where
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
-            self.snap_tree
-                .update_block(block_info, block_storage_diff)?;
+            self.tree.update_block(block_info, block_storage_diff)?;
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}", 
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
-        let disk_layer = self.snap_tree.get_disk_layer();
-        let presist_block = disk_layer.block_info_arc()?;
+        let presist_block = self.tree.last_committed_block()?.unwrap();
         let presist_block_num = presist_block.header.number;
         let presist_block_hash = presist_block.header.hash;
         // clear block context before presist block
