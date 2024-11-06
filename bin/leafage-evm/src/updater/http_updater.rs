@@ -31,9 +31,9 @@ where
         snap_tree: Tree,
         rpc_url: impl AsRef<str>,
         update_interval: Duration,
+        max_diff_depth: usize,
     ) -> Result<Self> {
         let rpc_client = HttpClientBuilder::default().build(rpc_url)?;
-        let max_diff_depth = 0;
         Ok(Self {
             rpc_client,
             tree: snap_tree,
