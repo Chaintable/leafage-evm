@@ -4,6 +4,7 @@ mod migrate;
 mod runner;
 mod standalone;
 mod updater;
+mod utils;
 
 use clap::Parser;
 use num_cpus;

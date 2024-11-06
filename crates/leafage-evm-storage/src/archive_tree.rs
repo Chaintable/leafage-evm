@@ -30,9 +30,9 @@ where
         db: DB,
         config: Config,
     ) -> Result<Self, Error<<DB::StateDBReadWrite as StateDBRead>::Error>> {
-        let latest_db = db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
-        let latest_db = latest_db.expect("latest db should exist");
-        let latest_statedb = DBWrapper(latest_db);
+        let latest_readwrite_db = db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
+        let latest_readwrite_db = latest_readwrite_db.expect("latest db should exist");
+        let latest_statedb = DBWrapper(latest_readwrite_db);
         let snapshot_tree = Arc::new(SnapshotTree::new(latest_statedb, config)?);
         let history_tree = ArchiveDBWrapper(db);
         let tree = Self {

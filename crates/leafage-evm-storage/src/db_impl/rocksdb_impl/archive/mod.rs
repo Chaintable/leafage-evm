@@ -413,72 +413,6 @@ impl DataBase {
         }
     }
 
-    pub fn statedb_at(&self, block_id: BlockId) -> Result<Option<StateDB>, Error> {
-        let block_num: u64;
-        let block_header: Header;
-        match block_id {
-            BlockId::Hash(hash) => {
-                let header = self.read_block_info(hash.block_hash)?;
-                if header.is_none() {
-                    return Ok(None);
-                }
-                block_header = header.unwrap().header;
-                block_num = block_header.number;
-            }
-            BlockId::Number(block_number_or_tag) => match block_number_or_tag {
-                BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    block_num = u64::MAX;
-                    let block_hash = self.read_latest_block_hash()?;
-                    if block_hash == H256::ZERO {
-                        return Ok(None);
-                    }
-                    let header = self.read_block_info(block_hash)?;
-                    if header.is_none() {
-                        return Ok(None);
-                    }
-                    block_header = header.unwrap().header;
-                }
-                BlockNumberOrTag::Number(num) => {
-                    block_num = num;
-                    let block_hash = self.read_block_hash(num)?;
-                    if block_hash == H256::ZERO {
-                        return Ok(None);
-                    }
-                    let header = self.read_block_info(block_hash)?;
-                    if header.is_none() {
-                        return Ok(None);
-                    }
-                    block_header = header.unwrap().header;
-                }
-                _ => return Err(Error::UnsupportedBlockId(block_id)),
-            },
-        }
-
-        let address_to_account_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-            .unwrap();
-        let account_iterator = self
-            .db
-            .raw_iterator_cf_opt(address_to_account_cf, rocksdb_read_options());
-
-        let address_to_storage_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-
-        let storage_iterator = self
-            .db
-            .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
-        Ok(Some(StateDB {
-            db: self.clone(),
-            block_num,
-            block_header,
-            account_iterator: Mutex::new(account_iterator),
-            storage_iterator: Mutex::new(storage_iterator),
-        }))
-    }
-
     fn get_inner_ref(&self) -> &DataBaseInner {
         unsafe { DATA_BASE.as_ref().unwrap() }
     }
@@ -507,6 +441,8 @@ impl StateDBWrite for StateDB {
     fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
         self.db.prepare_write_batch()
     }
+
+    #[inline]
     fn write_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -516,6 +452,7 @@ impl StateDBWrite for StateDB {
         self.db.write_block_hash(batch, block_num, block_hash)
     }
 
+    #[inline]
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -524,6 +461,7 @@ impl StateDBWrite for StateDB {
         self.db.write_block_info(batch, block_info)
     }
 
+    #[inline]
     fn write_account(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -535,6 +473,7 @@ impl StateDBWrite for StateDB {
             .write_account(batch, address, block_num, raw_account)
     }
 
+    #[inline]
     fn write_storage(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -546,6 +485,7 @@ impl StateDBWrite for StateDB {
         self.db.write_storage(batch, address, key, block_num, value)
     }
 
+    #[inline]
     fn write_code(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -555,6 +495,7 @@ impl StateDBWrite for StateDB {
         self.db.write_code(batch, code_hash, code)
     }
 
+    #[inline]
     fn write_latest_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -563,6 +504,7 @@ impl StateDBWrite for StateDB {
         self.db.write_latest_block_hash(batch, block_hash)
     }
 
+    #[inline]
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
         self.db.commit(batch)
     }
@@ -828,6 +770,68 @@ impl BlockRead for DataBase {
 impl ArchiveDBProvider for DataBase {
     type StateDBReadWrite = StateDB;
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
-        self.statedb_at(block_id)
+        let block_num: u64;
+        let block_header: Header;
+        match block_id {
+            BlockId::Hash(hash) => {
+                let header = self.read_block_info(hash.block_hash)?;
+                if header.is_none() {
+                    return Ok(None);
+                }
+                block_header = header.unwrap().header;
+                block_num = block_header.number;
+            }
+            BlockId::Number(block_number_or_tag) => match block_number_or_tag {
+                BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
+                    block_num = u64::MAX;
+                    let block_hash = self.read_latest_block_hash()?;
+                    if block_hash == H256::ZERO {
+                        return Ok(None);
+                    }
+                    let header = self.read_block_info(block_hash)?;
+                    if header.is_none() {
+                        return Ok(None);
+                    }
+                    block_header = header.unwrap().header;
+                }
+                BlockNumberOrTag::Number(num) => {
+                    block_num = num;
+                    let block_hash = self.read_block_hash(num)?;
+                    if block_hash == H256::ZERO {
+                        return Ok(None);
+                    }
+                    let header = self.read_block_info(block_hash)?;
+                    if header.is_none() {
+                        return Ok(None);
+                    }
+                    block_header = header.unwrap().header;
+                }
+                _ => return Err(Error::UnsupportedBlockId(block_id)),
+            },
+        }
+
+        let address_to_account_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+            .unwrap();
+        let account_iterator = self
+            .db
+            .raw_iterator_cf_opt(address_to_account_cf, rocksdb_read_options());
+
+        let address_to_storage_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+
+        let storage_iterator = self
+            .db
+            .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
+        Ok(Some(StateDB {
+            db: self.clone(),
+            block_num,
+            block_header,
+            account_iterator: Mutex::new(account_iterator),
+            storage_iterator: Mutex::new(storage_iterator),
+        }))
     }
 }

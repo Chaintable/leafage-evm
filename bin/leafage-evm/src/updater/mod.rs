@@ -2,8 +2,9 @@ mod http_updater;
 pub use http_updater::Updater as HttpUpdater;
 
 mod kafka_updater;
-pub use kafka_updater::{write_offset, KafkaS3Config, Updater as KafkaUpdater};
+pub use kafka_updater::{write_offset, Updater as KafkaUpdater};
 
+use crate::utils::KafkaS3Config;
 use anyhow::Result;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use std::time::Duration;

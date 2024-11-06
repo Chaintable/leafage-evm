@@ -1,0 +1,54 @@
+use alloy_rlp::Decodable;
+use anyhow::Result;
+use aws_sdk_s3::Client;
+use leafage_evm_types::{Block, BlockStorageDiff, Transaction, H256};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct KafkaS3Config {
+    pub topic: String,
+    pub brokers: String,
+    pub partition: i32,
+    pub bucket_name: String,
+    pub offset_dir: String,
+}
+
+pub async fn s3_get_block_diff(
+    s3_client: &Client,
+    bucket_name: &str,
+    block_hash: H256,
+) -> Result<BlockStorageDiff> {
+    let s3_key = format!("{}/stateDiff", block_hash);
+    let s3_obj = s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&s3_key)
+        .send()
+        .await?;
+    let mut bytes = s3_obj
+        .body
+        .bytes()
+        .expect(&format!("Failed to get object {}", s3_key));
+    let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
+    Ok(block_storage_diff)
+}
+
+pub async fn s3_get_block_info(
+    s3_client: &Client,
+    bucket_name: &str,
+    block_hash: H256,
+) -> Result<Block<Transaction>> {
+    let s3_key = format!("{}/block", block_hash);
+    let s3_obj = s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&s3_key)
+        .send()
+        .await?;
+    let bytes = s3_obj
+        .body
+        .bytes()
+        .expect(&format!("Failed to get object {}", s3_key));
+    let block = serde_json::from_slice(&bytes)?;
+    Ok(block)
+}
