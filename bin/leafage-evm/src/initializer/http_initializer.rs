@@ -39,7 +39,7 @@ where
             BlockStorageDiff::decode(&mut laest_block_diff.as_ref())?;
         self.db
             .update_block(latest_block_info.clone(), laest_block_diff)?;
-        info!(target: "initializer", "initialized to block, num {}, hash {}", latest_block_info.header.number,latest_block_info.header.hash);
+        info!(target: "initializer", "initialized genesis block, num {}, hash {}", latest_block_info.header.number,latest_block_info.header.hash);
         Ok(())
     }
 }

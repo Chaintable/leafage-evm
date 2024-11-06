@@ -65,7 +65,7 @@ where
         let first_block_diff = self.get_block_diff(first_block_hash).await?;
         self.db
             .update_block(first_block_info.clone(), first_block_diff)?;
-        info!(target: "initializer", "initialized to block, num {}, hash {}", first_block_info.header.number,first_block_info.header.hash);
+        info!(target: "initializer", "initialized genesis block, num {}, hash {}", first_block_info.header.number,first_block_info.header.hash);
         write_offset(&self.kafka_s3_cfg.offset_dir, first_message.offset() + 1)?;
         Ok(())
     }
