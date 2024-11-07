@@ -89,12 +89,15 @@ where
     }
 
     #[inline]
-    async fn get_block_diff(&self, block_hash: H256) -> Result<BlockStorageDiff> {
-        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
+    async fn get_block_diff(&self, block_root: H256) -> Result<BlockStorageDiff> {
+        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_root).await
     }
 
     #[inline]
     async fn get_block_info(&self, block_hash: H256) -> Result<Block<Transaction>> {
+        if let Some(block_ctx) = self.hash_to_blockctx.lock().unwrap().get(&block_hash) {
+            return Ok(block_ctx.block_info.clone());
+        }
         s3_get_block_info(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
     }
 
@@ -161,8 +164,18 @@ where
             message.payload().unwrap().try_into()?;
 
         for new_block in block_change_notification.new_blocks.iter() {
-            let block_diff = self.get_block_diff(new_block.hash).await?;
+            let parent_block_info = self.get_block_info(new_block.parent_hash).await?;
             let block_info = self.get_block_info(new_block.hash).await?;
+
+            let block_diff = if parent_block_info.header.state_root == block_info.header.state_root
+            {
+                let mut diff = BlockStorageDiff::default();
+                diff.hash = block_info.header.state_root;
+                diff.parent_hash = parent_block_info.header.state_root;
+                diff
+            } else {
+                self.get_block_diff(block_info.header.state_root).await?
+            };
 
             let block_ctx_with_offset = BlockContextWithOffset {
                 block_diff,

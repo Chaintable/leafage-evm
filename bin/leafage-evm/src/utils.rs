@@ -18,9 +18,9 @@ pub struct KafkaS3Config {
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,
-    block_hash: H256,
+    block_root: H256,
 ) -> Result<BlockStorageDiff> {
-    let s3_key = format!("{}/stateDiff", block_hash);
+    let s3_key = format!("{}/stateDiff", block_root);
     let s3_obj = s3_client
         .get_object()
         .bucket(bucket_name)
