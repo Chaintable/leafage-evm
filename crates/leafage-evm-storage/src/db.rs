@@ -7,7 +7,6 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256,
     U256,
 };
-use tracing::info;
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockRead: Send + Sync + 'static {
@@ -197,7 +196,6 @@ where
         for new_code in block_diff.new_codes {
             self.0
                 .write_code(&mut batch, new_code.code_hash, new_code.code)?;
-            info!(target: "storge", "write code hash: {:?}", new_code.code_hash.to_string());
         }
         self.0.write_latest_block_hash(&mut batch, hash)?;
         self.0.commit(batch)?;

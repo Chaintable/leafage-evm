@@ -222,7 +222,7 @@ impl Command {
                     metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
                 // check if db shoud be initialized
                 initialize_check(
-                    StateDBWrapper(db.clone()),
+                    db.clone(),
                     self.rpc_addr.clone(),
                     self.kafka_s3_config.clone(),
                 )

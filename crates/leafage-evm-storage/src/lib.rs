@@ -11,7 +11,7 @@ mod snapshot;
 pub use snapshot::{Config as SnapshotTreeConfig, Error, SnapshotTree};
 
 mod db;
-pub use db::{DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};
+pub use db::{ArchiveDBProvider, DBWrapper as StateDBWrapper, StateDBRead, StateDBWrite};
 
 mod archive_tree;
 pub use archive_tree::ArchiveTree;
