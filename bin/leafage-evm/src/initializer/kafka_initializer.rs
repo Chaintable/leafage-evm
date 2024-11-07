@@ -47,8 +47,8 @@ where
     }
 
     #[inline]
-    async fn get_block_diff(&self, block_hash: H256) -> Result<BlockStorageDiff> {
-        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
+    async fn get_block_diff(&self, block_root: H256) -> Result<BlockStorageDiff> {
+        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_root).await
     }
 
     #[inline]
@@ -62,7 +62,9 @@ where
             first_message.payload().unwrap().try_into()?;
         let first_block_hash = block_change_notification.new_blocks[0].hash;
         let first_block_info = self.get_block_info(first_block_hash).await?;
-        let first_block_diff = self.get_block_diff(first_block_hash).await?;
+        let first_block_diff = self
+            .get_block_diff(first_block_info.header.state_root)
+            .await?;
         self.db
             .update_block(first_block_info.clone(), first_block_diff)?;
         info!(target: "initializer", "initialized genesis block, num {}, hash {}", first_block_info.header.number,first_block_info.header.hash);

@@ -24,7 +24,7 @@ pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
     block_env
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
 pub struct BlockStorageDiff {
     /// Block root hash.
     pub hash: H256,
