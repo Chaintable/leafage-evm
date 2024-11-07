@@ -787,30 +787,25 @@ impl StateDBWrite for StateDB {
         let key_bytes: [u8; 32] = key.into();
         let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
         let max_block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
+        let value_bytes: [u8; 32] = value.to_be_bytes();
         if value == U256::ZERO {
-            batch.put_cf(
-                address_to_storage_cf,
-                [address_bytes, &key_bytes, &block_num_bytes].concat(),
-                &[],
-            );
             batch.delete_cf(
                 address_to_storage_cf,
                 [address_bytes, &key_bytes, &max_block_num_bytes].concat(),
             );
             return Ok(());
         } else {
-            let value_bytes: [u8; 32] = value.to_be_bytes();
-            batch.put_cf(
-                address_to_storage_cf,
-                [address_bytes, &key_bytes, &block_num_bytes].concat(),
-                value_bytes,
-            );
             batch.put_cf(
                 address_to_storage_cf,
                 [address_bytes, &key_bytes, &max_block_num_bytes].concat(),
                 value_bytes,
             );
         }
+        batch.put_cf(
+            address_to_storage_cf,
+            [address_bytes, &key_bytes, &block_num_bytes].concat(),
+            value_bytes,
+        );
         Ok(())
     }
 
