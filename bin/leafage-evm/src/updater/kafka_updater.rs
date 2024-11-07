@@ -66,6 +66,7 @@ where
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
+            .set("group.id", "")
             .create()?;
         let mut tpl = TopicPartitionList::with_capacity(1);
         tpl.add_partition_offset(
