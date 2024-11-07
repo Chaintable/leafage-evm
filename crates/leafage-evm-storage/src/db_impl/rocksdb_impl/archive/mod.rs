@@ -565,6 +565,9 @@ impl StateDBRead for StateDB {
                 return Ok(None);
             }
             let mut raw_val_bytes = account_iter.value().unwrap();
+            if raw_val_bytes.is_empty() {
+                return Ok(None);
+            }
             let account = SlimAccount::decode(&mut raw_val_bytes).unwrap();
             let account = NewAccount {
                 address,
@@ -620,6 +623,9 @@ impl StateDBRead for StateDB {
                 return Ok(U256::ZERO);
             }
             let raw_val_bytes = storage_iter.value().unwrap();
+            if raw_val_bytes.is_empty() {
+                return Ok(U256::ZERO);
+            }
             let value = U256::from_be_slice(&raw_val_bytes);
             Ok(value)
         } else {
@@ -751,9 +757,10 @@ impl StateDBWrite for StateDB {
                 &raw_account_bytes,
             );
         } else {
-            batch.delete_cf(
+            batch.put_cf(
                 address_to_account_cf,
                 [address_bytes, &block_num_bytes].concat(),
+                &[],
             );
             batch.delete_cf(
                 address_to_account_cf,
@@ -781,9 +788,10 @@ impl StateDBWrite for StateDB {
         let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
         let max_block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
         if value == U256::ZERO {
-            batch.delete_cf(
+            batch.put_cf(
                 address_to_storage_cf,
                 [address_bytes, &key_bytes, &block_num_bytes].concat(),
+                &[],
             );
             batch.delete_cf(
                 address_to_storage_cf,
