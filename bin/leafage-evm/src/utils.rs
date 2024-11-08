@@ -29,10 +29,7 @@ pub async fn s3_get_block_diff(
         .key(&s3_key)
         .send()
         .await?;
-    let bytes = s3_obj
-        .body
-        .bytes()
-        .expect(&format!("Failed to get object {}", s3_key));
+    let bytes = s3_obj.body.collect().await?.into_bytes();
     let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
     Ok(block_storage_diff)
 }
@@ -50,10 +47,7 @@ pub async fn s3_get_block_info(
         .key(&s3_key)
         .send()
         .await?;
-    let bytes = s3_obj
-        .body
-        .bytes()
-        .expect(&format!("Failed to get object {}", s3_key));
+    let bytes = s3_obj.body.collect().await?.into_bytes();
     let mut gz = read::GzDecoder::new(&bytes[..]);
     let mut bytes = Vec::new();
     gz.read_to_end(&mut bytes)?;

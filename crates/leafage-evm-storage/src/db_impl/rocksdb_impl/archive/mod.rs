@@ -554,6 +554,7 @@ impl StateDBRead for StateDB {
                 } else {
                     account.code_hash
                 },
+                root_hash: H256::ZERO,
             };
             return Ok(Some(account));
         }
@@ -578,6 +579,7 @@ impl StateDBRead for StateDB {
                 } else {
                     account.code_hash
                 },
+                root_hash: H256::ZERO,
             };
             Ok(Some(account))
         } else {

@@ -1,11 +1,12 @@
 use crate::updater::write_offset;
 use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use aws_sdk_s3::Client;
 use leafage_evm_storage::EvmStorageWrite;
 use leafage_evm_types::{Block, BlockStorageDiff, KafkaBlockChangeNotification, Transaction, H256};
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
+    util::Timeout,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
 use tracing::info;
@@ -30,14 +31,18 @@ where
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
-            .set("group.id", "")
+            .set("group.id", H256::random().to_string())
             .create()?;
+        let meta = consumer.fetch_metadata(Some(&kafka_s3_cfg.topic), Timeout::Never)?;
         let mut tpl = TopicPartitionList::with_capacity(1);
-        tpl.add_partition_offset(
-            &kafka_s3_cfg.topic,
-            kafka_s3_cfg.partition,
-            Offset::Beginning,
-        )?;
+        for topic in meta.topics() {
+            if topic.name() == kafka_s3_cfg.topic {
+                for p in topic.partitions() {
+                    tpl.add_partition_offset(&kafka_s3_cfg.topic, p.id(), Offset::Beginning)?;
+                }
+            }
+        }
+        consumer.subscribe(&[&kafka_s3_cfg.topic])?;
         consumer.assign(&tpl)?;
         Ok(Self {
             s3_client,

@@ -1,5 +1,5 @@
 use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
@@ -8,11 +8,12 @@ use leafage_evm_types::{
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     message::BorrowedMessage,
+    util::Timeout,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use tokio::sync::watch;
+use tokio::{sync::watch, time};
 use tracing::{debug, error, info};
 
 pub fn read_offset(offset_dir: &str) -> Result<i64> {
@@ -22,6 +23,7 @@ pub fn read_offset(offset_dir: &str) -> Result<i64> {
 }
 
 pub fn write_offset(offset_dir: &str, offset: i64) -> Result<()> {
+    std::fs::create_dir_all(offset_dir)?;
     std::fs::write(format!("{}/offset.tmp", offset_dir), offset.to_string())?;
     std::fs::rename(
         format!("{}/offset.tmp", offset_dir),
@@ -66,15 +68,32 @@ where
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
-            .set("group.id", "")
+            .set("group.id", H256::random().to_string())
             .create()?;
+        let meta = consumer.fetch_metadata(Some(&kafka_s3_cfg.topic), Timeout::Never)?;
         let mut tpl = TopicPartitionList::with_capacity(1);
-        tpl.add_partition_offset(
+        for topic in meta.topics() {
+            if topic.name() == kafka_s3_cfg.topic {
+                for p in topic.partitions() {
+                    if p.id() != kafka_s3_cfg.partition {
+                        tpl.add_partition_offset(&kafka_s3_cfg.topic, p.id(), Offset::Beginning)?;
+                    } else {
+                        tpl.add_partition_offset(
+                            &kafka_s3_cfg.topic,
+                            p.id(),
+                            Offset::Offset(offset),
+                        )?;
+                    }
+                }
+            }
+        }
+        consumer.assign(&tpl)?;
+        consumer.seek(
             &kafka_s3_cfg.topic,
             kafka_s3_cfg.partition,
             Offset::Offset(offset),
+            Timeout::Never,
         )?;
-        consumer.assign(&tpl)?;
 
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
@@ -98,6 +117,7 @@ where
             block_root,
         )
         .await
+        .context("s3 get block diff failed")
     }
 
     #[inline]
@@ -112,6 +132,7 @@ where
             block_hash,
         )
         .await
+        .context("s3 get block info failed")
     }
 
     fn get_update_path(
@@ -171,11 +192,12 @@ where
         presist_block
     }
 
-    async fn update(&self, message: BorrowedMessage<'_>) -> Result<()> {
+    async fn update(&self, message: &BorrowedMessage<'_>) -> Result<()> {
         let offset = message.offset();
         let block_change_notification: KafkaBlockChangeNotification =
             message.payload().unwrap().try_into()?;
 
+        info!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
         for new_block in block_change_notification.new_blocks.iter() {
             let parent_block_info = self.get_block_info(new_block.parent_hash).await?;
             let block_info = self.get_block_info(new_block.hash).await?;
@@ -250,8 +272,13 @@ where
                     message = self.consumer.recv() => {
                         match message {
                             Ok(msg) => {
-                                if let Err(e) = self.update(msg).await {
-                                    error!(target:"updater", "Failed to update: {:?}", e);
+                                loop {
+                                    if let Err(e) = self.update(&msg).await {
+                                        error!(target:"updater", "Failed to update: {:?}", e);
+                                        time::sleep(time::Duration::from_secs(1)).await
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {

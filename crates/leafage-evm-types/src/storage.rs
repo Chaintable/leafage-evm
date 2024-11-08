@@ -56,6 +56,8 @@ pub struct NewAccount {
     pub nonce: u64,
     /// code hash
     pub code_hash: H256,
+    /// root hash
+    pub root_hash: H256,
 }
 
 impl Into<AccountInfo> for NewAccount {
@@ -76,6 +78,7 @@ impl From<(Address, AccountInfo)> for NewAccount {
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.0.into(),
+            root_hash: H256::ZERO,
         }
     }
 }
@@ -87,6 +90,7 @@ impl From<(H256, AccountInfo)> for NewAccount {
             balance: account_info.balance.into(),
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.0.into(),
+            root_hash: H256::ZERO,
         }
     }
 }
@@ -134,6 +138,7 @@ mod tests {
             balance: U256::from(100),
             nonce: 0,
             code_hash: H256::default(),
+            root_hash: H256::ZERO,
         };
         let slim_account = SlimAccount::from(account.clone());
         let mut buf = Vec::new();

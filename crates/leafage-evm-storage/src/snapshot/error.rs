@@ -5,7 +5,7 @@ use thiserror::Error;
 pub enum Error<DBError> {
     #[error("DB error: {0}")]
     DBError(DBError),
-    #[error("Block not found")]
+    #[error("Parent Block not found")]
     ParentBlockHashNotFound,
     #[error("BlockId: {0:?} not supported")]
     UnsupportedBlockId(BlockId),
