@@ -13,7 +13,7 @@ jobs:
   make-artifacts:
     strategy:
       matrix:
-        arch: [amd64, arm64]
+        arch: [amd64]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
     steps:
       - name: Checkout code
@@ -80,7 +80,7 @@ jobs:
 
 
   merge-docker-manifest:
-    runs-on: [self-hosted, ops]
+    runs-on: [self-hosted]
     needs: make-artifacts
     steps:
       - name: Checkout code
