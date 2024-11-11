@@ -13,7 +13,7 @@ jobs:
   make-artifacts:
     strategy:
       matrix:
-        arch: [amd64, arm64]
+        arch: [amd64]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
     steps:
       - name: Checkout code
