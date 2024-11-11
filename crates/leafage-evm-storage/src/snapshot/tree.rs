@@ -60,6 +60,8 @@ pub struct SnapshotTree<DB> {
     tx_hash_map: RwLock<HashMap<H256, TxContext>>,
     /// config stores the config of the SnapshotTree.
     config: Config,
+    /// disk_layer is the bottom layer of the SnapshotTree.
+    disk_layer: Arc<LinkedDiffLayer<DB>>,
 }
 
 impl<DB> SnapshotTree<DB> {
@@ -83,6 +85,10 @@ impl<DB> SnapshotTree<DB> {
 
     pub fn get_config(&self) -> Config {
         self.config.clone()
+    }
+
+    pub fn get_disk_layer(&self) -> Arc<LinkedDiffLayer<DB>> {
+        self.disk_layer.clone()
     }
 }
 
@@ -126,10 +132,11 @@ where
             );
         }
         Ok(Self {
-            latest: RwLock::new(cache_layer),
+            latest: RwLock::new(cache_layer.clone()),
             hash_diff_map: RwLock::new(hash_diffs),
             num_diff_map: RwLock::new(num_diffs),
             tx_hash_map: RwLock::new(tx_hash_map),
+            disk_layer: cache_layer,
             config,
         })
     }
@@ -218,6 +225,12 @@ where
         } else {
             Err(Error::ParentBlockHashNotFound)
         }
+    }
+
+    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+        self.disk_layer
+            .block_info_arc()
+            .map(|b| Some(b.as_ref().clone()))
     }
 }
 

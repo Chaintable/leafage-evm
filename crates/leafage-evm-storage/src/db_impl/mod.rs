@@ -3,4 +3,4 @@
 #[cfg(feature = "with-rocksdb")]
 mod rocksdb_impl;
 #[cfg(feature = "with-rocksdb")]
-pub use rocksdb_impl::DataBase as RocksDBStorage;
+pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, RocksDBStorage};

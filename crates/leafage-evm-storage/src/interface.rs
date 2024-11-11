@@ -123,7 +123,7 @@ pub trait EvmStorageRead {
 }
 
 /// [`EvmStorageWrite`] is a trait that provides write access to the undering storage.
-#[auto_impl(&, Box)]
+#[auto_impl(&, Box, Arc)]
 pub trait EvmStorageWrite {
     type Error: std::error::Error + Send + Sync + 'static;
     fn update_block(
@@ -131,4 +131,12 @@ pub trait EvmStorageWrite {
         block_info: Block<Transaction>,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error>;
+
+    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error>;
+}
+
+/// [`MetricsReport`] is a trait that provides a way to report cache usage.
+#[auto_impl(&, Box, Arc)]
+pub trait MetricsReport {
+    fn report_cache_usage(&self);
 }

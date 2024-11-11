@@ -16,7 +16,8 @@
 //! The `HashToCode` column family stores the code hash to code maps.
 //! All [`U256`] are big-endian encoded.
 
-use crate::db::{StateDBRead, StateDBWrite};
+use crate::db::{BlockRead, StateDBRead, StateDBWrite};
+use crate::interface::MetricsReport;
 use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
@@ -56,6 +57,7 @@ enum StorageTypeColumn {
     // code hash -> code
     HashToCode = 6,
 }
+
 #[inline]
 fn rocksdb_read_options() -> ReadOptions {
     let mut read_options = ReadOptions::default();
@@ -95,8 +97,9 @@ pub struct DataBase {
 unsafe impl Send for DataBase {}
 unsafe impl Sync for DataBase {}
 
-impl StateDBRead for DataBase {
+impl BlockRead for DataBase {
     type Error = Error;
+
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
@@ -143,6 +146,32 @@ impl StateDBRead for DataBase {
         let block_info = from_slice::<Block<Transaction>>(block_info_slice)?;
         Ok(Some(block_info))
     }
+
+    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+        let timer = DATABASE_OP_LATENCY_HIST
+            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
+            .start_timer();
+        let latest_block_hash_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        let block_hash_bytes = self.db.get_cf_opt(
+            latest_block_hash_cf,
+            [1u8].to_vec(),
+            &rocksdb_read_options(),
+        )?;
+        timer.observe_duration();
+        if block_hash_bytes.is_none() {
+            return Ok(H256::ZERO);
+        }
+        let block_hash_bytes = block_hash_bytes.unwrap();
+        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
+        Ok(block_hash)
+    }
+}
+
+impl StateDBRead for DataBase {
+    type Error = Error;
 
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let timer = DATABASE_OP_LATENCY_HIST
@@ -220,28 +249,6 @@ impl StateDBRead for DataBase {
         }
         Ok(Some(Bytes::from(code.unwrap())))
     }
-
-    fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
-            .start_timer();
-        let latest_block_hash_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
-            .unwrap();
-        let block_hash_bytes = self.db.get_cf_opt(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            &rocksdb_read_options(),
-        )?;
-        timer.observe_duration();
-        if block_hash_bytes.is_none() {
-            return Ok(H256::ZERO);
-        }
-        let block_hash_bytes = block_hash_bytes.unwrap();
-        let block_hash = H256::from_slice(block_hash_bytes.as_slice());
-        Ok(block_hash)
-    }
 }
 
 impl StateDBWrite for DataBase {
@@ -297,6 +304,7 @@ impl StateDBWrite for DataBase {
         &self,
         batch: &mut Self::DBWriteBatch,
         address: H256,
+        _block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
         let address_to_account_cf = self
@@ -320,6 +328,7 @@ impl StateDBWrite for DataBase {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         key: H256,
+        _block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
         let address_to_storage_cf = self
@@ -524,8 +533,10 @@ impl DataBase {
         ];
         Self { db, cols }
     }
+}
 
-    pub fn report_cache_usage(&self) {
+impl MetricsReport for DataBase {
+    fn report_cache_usage(&self) {
         for (col, column_family) in self.cols.iter() {
             let handle = unsafe { column_family.as_ref() };
             let prop = self

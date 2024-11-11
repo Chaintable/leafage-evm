@@ -19,15 +19,19 @@ tokio.workspace = true
 tracing.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tracing-subscriber.workspace = true
 tikv-jemallocator.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemalloc-sys.workspace = true
-console-subscriber.workspace = true
 hyper.workspace = true
 prometheus.workspace = true
 num_cpus.workspace = true
 alloy-rlp.workspace = true
+rdkafka.workspace = true
+aws-sdk-s3.workspace = true
+aws-config.workspace = true
+flate2.workspace = true
 
 [features]
 default = ["with-rocksdb"]

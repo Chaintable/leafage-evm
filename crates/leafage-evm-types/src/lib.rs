@@ -10,10 +10,10 @@ pub use storage::{
 mod rpc;
 pub use rpc::{
     Action, Block, BlockId, BlockNumberOrTag, CallAction, CallOutput, CallRequest, CallType,
-    CreateAction, CreateOutput, Index, JsonStorageKey, LocalizedTransactionTrace, Log,
+    CreateAction, CreateOutput, Header, Index, JsonStorageKey, LocalizedTransactionTrace, Log,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, PreError, PreErrorCode, PreResult,
-    RewardAction, SelfdestructAction, SingleCallResult, TraceOutput, Transaction, TransactionInfo,
-    TransactionTrace, TxEnvelope,
+    RawHeader, RewardAction, SelfdestructAction, SingleCallResult, TraceOutput, Transaction,
+    TransactionInfo, TransactionTrace, TxEnvelope,
 };
 
 #[cfg(feature = "optimism")]
@@ -26,3 +26,6 @@ pub use metrics::{
     try_create_histogram_with_buckets, try_create_int_counter, try_create_int_counter_vec,
     try_create_int_gauge, try_create_int_gauge_vec,
 };
+
+mod kafka;
+pub use kafka::{KafkaBlockChangeNotification, KafkaBlockContext};

@@ -1,12 +1,15 @@
-use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
+use crate::{
+    interface::{BlockContext, EvmStorageWrite, StateDB},
+    EvmStorageRead,
+};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Block, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256, U256,
+    AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256,
+    U256,
 };
 
-/// [`StateDBRead`] offers read-only access to the state database.
 #[auto_impl(&, Box, Arc)]
-pub trait StateDBRead: Send + Sync + 'static {
+pub trait BlockRead: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     /// latest block hash
     fn read_latest_block_hash(&self) -> Result<H256, Self::Error>;
@@ -16,7 +19,12 @@ pub trait StateDBRead: Send + Sync + 'static {
 
     /// block num -> block hash
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Self::Error>;
+}
 
+/// [`StateDBRead`] offers read-only access to the state database.
+#[auto_impl(&, Box, Arc)]
+pub trait StateDBRead {
+    type Error: std::error::Error + Send + Sync + 'static;
     /// account address -> raw account
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Self::Error>;
 
@@ -54,7 +62,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
     fn write_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_num: u64,
+        block_num: u64, // only for archive db
         block_hash: H256,
     ) -> Result<(), Self::Error>;
 
@@ -63,6 +71,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         &self,
         batch: &mut Self::DBWriteBatch,
         address: H256,
+        block_num: u64, // only for archive db
         raw_account: Option<NewAccount>,
     ) -> Result<(), Self::Error>;
 
@@ -80,6 +89,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         key: H256,
+        block_num: u64,
         value: U256,
     ) -> Result<(), Self::Error>;
 
@@ -90,9 +100,18 @@ pub trait StateDBWrite: Send + Sync + 'static {
 /// [`DBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
 pub struct DBWrapper<T>(pub T);
 
+impl<T> Clone for DBWrapper<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl<T> BlockContext for DBWrapper<T>
 where
-    T: StateDBRead,
+    T: BlockRead,
 {
     type Error = T::Error;
 
@@ -102,11 +121,12 @@ where
     }
 }
 
-impl<T> StateDB for DBWrapper<T>
+impl<T, E> StateDB for DBWrapper<T>
 where
-    T: StateDBRead,
+    T: StateDBRead<Error = E> + BlockRead<Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
         let raw_account_info = self.0.read_account(address.into())?;
@@ -136,11 +156,12 @@ where
     }
 }
 
-impl<T> EvmStorageWrite for DBWrapper<T>
+impl<T, E> EvmStorageWrite for DBWrapper<T>
 where
-    T: StateDBWrite,
+    T: StateDBWrite<Error = E> + BlockRead<Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn update_block(
         &self,
@@ -148,16 +169,18 @@ where
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         let mut batch = self.0.prepare_write_batch()?;
+        let block_number = block_info.header.number;
         self.0
             .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
         let hash = block_info.header.hash;
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
-            self.0.write_account(&mut batch, account, None)?;
+            self.0
+                .write_account(&mut batch, account, block_number, None)?;
         }
         for account in block_diff.new_accounts {
             self.0
-                .write_account(&mut batch, account.address, Some(account))?;
+                .write_account(&mut batch, account.address, block_number, Some(account))?;
         }
         for account_diff in block_diff.storage_diffs {
             for index_value_pair in account_diff.diffs {
@@ -165,6 +188,7 @@ where
                     &mut batch,
                     account_diff.address,
                     index_value_pair.index,
+                    block_number,
                     index_value_pair.value,
                 )?;
             }
@@ -176,5 +200,42 @@ where
         self.0.write_latest_block_hash(&mut batch, hash)?;
         self.0.commit(batch)?;
         Ok(())
+    }
+
+    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+        let latest_block_hash = self.0.read_latest_block_hash()?;
+        Ok(self.0.read_block_info(latest_block_hash)?)
+    }
+}
+
+/// [`ArchiveDBProvider`] offers read-only access to the archive database.
+#[auto_impl(&, Box, Arc)]
+pub trait ArchiveDBProvider: Send + Sync + 'static {
+    type StateDBReadWrite: StateDBRead
+        + BlockRead<Error = <Self::StateDBReadWrite as StateDBRead>::Error>
+        + StateDBWrite<Error = <Self::StateDBReadWrite as StateDBRead>::Error>
+        + Send
+        + Sync
+        + Clone
+        + 'static;
+    fn db_at(
+        &self,
+        block_arg: BlockId,
+    ) -> Result<Option<Self::StateDBReadWrite>, <Self::StateDBReadWrite as StateDBRead>::Error>;
+}
+
+pub struct ArchiveDBWrapper<T>(pub T);
+
+impl<T> EvmStorageRead for ArchiveDBWrapper<T>
+where
+    T: ArchiveDBProvider,
+{
+    type Error = <<T as ArchiveDBProvider>::StateDBReadWrite as StateDBRead>::Error;
+
+    type StateDB = DBWrapper<<T as ArchiveDBProvider>::StateDBReadWrite>;
+
+    fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
+        let db = self.0.db_at(block_arg)?;
+        Ok(db.map(|db| DBWrapper(db)))
     }
 }
