@@ -539,7 +539,7 @@ where
         position: JsonStorageKey,
         block_number: BlockId,
     ) -> RpcResult<H256> {
-        self.get_storage_at_impl(address, position.0, block_number)
+        self.get_storage_at_impl(address, position.as_b256(), block_number)
     }
 
     async fn get_transaction_count(

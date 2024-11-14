@@ -7,13 +7,13 @@ use revm::primitives::BlobExcessGasAndPrice;
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
     let block_env = BlockEnv {
         number: RU256::from(block.header.number),
-        coinbase: block.header.miner,
+        coinbase: block.header.beneficiary,
         timestamp: RU256::from(block.header.timestamp),
         difficulty: RU256::from(block.header.difficulty),
         basefee: RU256::from(block.header.base_fee_per_gas.unwrap_or_default()),
         gas_limit: RU256::from(block.header.gas_limit),
         prevrandao: if block.header.difficulty.is_zero() {
-            block.header.mix_hash
+            Some(block.header.mix_hash)
         } else {
             Some(H256::ZERO)
         },

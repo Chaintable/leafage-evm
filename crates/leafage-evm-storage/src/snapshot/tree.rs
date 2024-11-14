@@ -4,6 +4,7 @@ use crate::interface::{
 use crate::metrics::BLOCK_PRODUCED_TOTAL;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
+use alloy::network::TransactionResponse;
 use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction, H256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -110,24 +111,13 @@ where
         hash_diffs.insert(info.header.hash, cache_layer.clone());
         num_diffs.insert(info.header.number, cache_layer.clone());
         for tx in info.transactions.txns() {
-            #[cfg(not(feature = "optimism"))]
             tx_hash_map.insert(
-                tx.hash,
+                tx.tx_hash(),
                 TxContext {
                     block_hash: info.header.hash,
                     block_number: info.header.number,
                     transaction_index: tx.transaction_index.unwrap(),
-                    transaction_hash: tx.hash,
-                },
-            );
-            #[cfg(feature = "optimism")]
-            tx_hash_map.insert(
-                tx.inner.hash,
-                TxContext {
-                    block_hash: info.header.hash,
-                    block_number: info.header.number,
-                    transaction_index: tx.inner.transaction_index.unwrap(),
-                    transaction_hash: tx.inner.hash,
+                    transaction_hash: tx.tx_hash(),
                 },
             );
         }
@@ -184,27 +174,14 @@ where
                 .write()
                 .unwrap()
                 .insert(block_info.header.number, new_diff_layer.clone());
-            #[cfg(not(feature = "optimism"))]
             let txs = block_info.transactions.txns().map(|tx| {
                 (
-                    tx.hash,
+                    tx.tx_hash(),
                     TxContext {
                         block_hash: block_info.header.hash,
                         block_number: block_info.header.number,
                         transaction_index: tx.transaction_index.unwrap(),
-                        transaction_hash: tx.hash,
-                    },
-                )
-            });
-            #[cfg(feature = "optimism")]
-            let txs = block_info.transactions.txns().map(|tx| {
-                (
-                    tx.inner.hash,
-                    TxContext {
-                        block_hash: block_info.header.hash,
-                        block_number: block_info.header.number,
-                        transaction_index: tx.inner.transaction_index.unwrap(),
-                        transaction_hash: tx.inner.hash,
+                        transaction_hash: tx.tx_hash(),
                     },
                 )
             });

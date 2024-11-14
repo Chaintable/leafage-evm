@@ -2,6 +2,7 @@ use super::ApiImpl;
 use crate::api::TraceApiServer;
 use crate::api_impl::utils::{get_handler_cfg, rebuild_txn_env};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use alloy::network::TransactionResponse;
 use alloy_rlp::{BytesMut, Encodable};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{
@@ -63,12 +64,7 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> ApiImpl<DB> {
         let state = state.unwrap();
         let mut txs_before = Vec::new();
         for tx in block.transactions.txns() {
-            #[cfg(not(feature = "optimism"))]
-            if tx.hash == hash {
-                break;
-            }
-            #[cfg(feature = "optimism")]
-            if tx.inner.hash == hash {
+            if tx.tx_hash() == hash {
                 break;
             }
             txs_before.push(tx.clone());
@@ -101,7 +97,7 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> ApiImpl<DB> {
         let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
         let cfg = get_handler_cfg(cfg.clone(), spec_id);
         for tx in brefore_txs {
-            let tx_env = rebuild_txn_env(&block_env, &tx)?;
+            let tx_env = rebuild_txn_env(&tx);
             let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx_env);
             let mut evm = Evm::builder()
                 .with_db(&mut memory_db)
@@ -115,9 +111,15 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> ApiImpl<DB> {
         #[cfg(not(feature = "optimism"))]
         let tx_info = TransactionInfo::from(&trace_tx);
         #[cfg(feature = "optimism")]
-        let tx_info = TransactionInfo::from(&trace_tx.inner);
+        let tx_info = TransactionInfo {
+            hash: Some(trace_tx.tx_hash()),
+            block_hash: trace_tx.block_hash(),
+            block_number: trace_tx.block_number(),
+            index: trace_tx.transaction_index(),
+            base_fee: None,
+        };
 
-        let tx_env = rebuild_txn_env(&block_env, &trace_tx)?;
+        let tx_env = rebuild_txn_env(&trace_tx);
 
         let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx_env);
 

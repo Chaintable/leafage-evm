@@ -347,27 +347,7 @@ impl BlockRead for DataBaseRef {
         let block = Block {
             header: Header {
                 hash: block_hash,
-                parent_hash: block_header.parent_hash,
-                uncles_hash: block_header.ommers_hash,
-                miner: block_header.beneficiary,
-                state_root: block_header.state_root,
-                transactions_root: block_header.transactions_root,
-                receipts_root: block_header.receipts_root,
-                withdrawals_root: block_header.withdrawals_root,
-                logs_bloom: block_header.logs_bloom,
-                difficulty: block_header.difficulty,
-                number: block_header.number,
-                gas_limit: block_header.gas_limit,
-                gas_used: block_header.gas_used,
-                timestamp: block_header.timestamp,
-                mix_hash: Some(block_header.mix_hash),
-                nonce: Some(block_header.nonce),
-                base_fee_per_gas: block_header.base_fee_per_gas,
-                blob_gas_used: block_header.blob_gas_used,
-                excess_blob_gas: block_header.excess_blob_gas,
-                parent_beacon_block_root: block_header.parent_beacon_block_root,
-                requests_hash: block_header.requests_hash,
-                extra_data: block_header.extra_data,
+                inner: block_header,
                 ..Default::default()
             },
             ..Default::default()
@@ -720,7 +700,7 @@ impl StateDBWrite for StateDB {
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_info.header.hash.into();
         let mut block_info_bytes = Vec::new();
-        let block_header: RawHeader = block_info.header.try_into()?;
+        let block_header: RawHeader = block_info.header.inner;
         block_header.encode(&mut block_info_bytes);
         batch.put_cf(
             block_hash_to_block_info_cf,
