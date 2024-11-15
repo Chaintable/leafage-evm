@@ -38,8 +38,8 @@ jobs:
       - name: Output tags
         id: meta
         run: |
-          echo ::set-output name=tags::${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
-          echo ::set-output name=optags::${REGISTRY}/leafage-evm-op:${{ matrix.arch }}-${REVISION}
+          echo ::set-output name=tags::${REGISTRY}/leafage-evm-x:${{ matrix.arch }}-${REVISION}
+          echo ::set-output name=optags::${REGISTRY}/leafage-evm-op-x:${{ matrix.arch }}-${REVISION}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -74,6 +74,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm:${{ matrix.arch }}-${{ env.REVISION }}`, Image `${{ env.REGISTRY }}/leafage-evm-op:${{ matrix.arch }}-${{ env.REVISION }} were builded"
+          msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm-x:${{ matrix.arch }}-${{ env.REVISION }}`, Image `${{ env.REGISTRY }}/leafage-evm-op-x:${{ matrix.arch }}-${{ env.REVISION }} were builded"
           check_for_duplicate_msg: true
         continue-on-error: true

@@ -36,8 +36,8 @@ jobs:
       - name: Output tags
         id: meta
         run: |
-          echo ::set-output name=tags::${REGISTRY}/leafage-evm:${{ matrix.arch }}-${REVISION}
-          echo ::set-output name=optags::${REGISTRY}/leafage-evm-op:${{ matrix.arch }}-${REVISION}
+          echo ::set-output name=tags::${REGISTRY}/leafage-evm-x:${{ matrix.arch }}-${REVISION}
+          echo ::set-output name=optags::${REGISTRY}/leafage-evm-op-x:${{ matrix.arch }}-${REVISION}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
