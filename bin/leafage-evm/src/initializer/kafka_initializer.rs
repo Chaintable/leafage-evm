@@ -42,7 +42,6 @@ where
                 }
             }
         }
-        consumer.subscribe(&[&kafka_s3_cfg.topic])?;
         consumer.assign(&tpl)?;
         Ok(Self {
             s3_client,
