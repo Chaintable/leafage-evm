@@ -13,14 +13,16 @@ pub struct KafkaS3Config {
     pub partition: i32,
     pub bucket_name: String,
     pub offset_dir: String,
+    pub s3_chain_id: String,
 }
 
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,
+    s3_chain_id: &str,
     block_root: H256,
 ) -> Result<BlockStorageDiff> {
-    let s3_key = format!("{}/stateDiff", block_root);
+    let s3_key = format!("{}/{}/stateDiff", s3_chain_id, block_root);
     let s3_obj = s3_client
         .get_object()
         .bucket(bucket_name)
@@ -38,9 +40,10 @@ pub async fn s3_get_block_diff(
 pub async fn s3_get_block_info(
     s3_client: &Client,
     bucket_name: &str,
+    s3_chain_id: &str,
     block_hash: H256,
 ) -> Result<Block<Transaction>> {
-    let s3_key = format!("{}/block", block_hash);
+    let s3_key = format!("{}/{}/block", s3_chain_id, block_hash);
     let s3_obj = s3_client
         .get_object()
         .bucket(bucket_name)

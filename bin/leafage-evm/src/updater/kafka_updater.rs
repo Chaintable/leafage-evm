@@ -91,7 +91,13 @@ where
 
     #[inline]
     async fn get_block_diff(&self, block_root: H256) -> Result<BlockStorageDiff> {
-        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_root).await
+        s3_get_block_diff(
+            &self.s3_client,
+            &self.kafka_s3_cfg.bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            block_root,
+        )
+        .await
     }
 
     #[inline]
@@ -99,7 +105,13 @@ where
         if let Some(block_ctx) = self.hash_to_blockctx.lock().unwrap().get(&block_hash) {
             return Ok(block_ctx.block_info.clone());
         }
-        s3_get_block_info(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
+        s3_get_block_info(
+            &self.s3_client,
+            &self.kafka_s3_cfg.bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            block_hash,
+        )
+        .await
     }
 
     fn get_update_path(

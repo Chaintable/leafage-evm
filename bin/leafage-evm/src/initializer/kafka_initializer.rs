@@ -49,12 +49,24 @@ where
 
     #[inline]
     async fn get_block_diff(&self, block_root: H256) -> Result<BlockStorageDiff> {
-        s3_get_block_diff(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_root).await
+        s3_get_block_diff(
+            &self.s3_client,
+            &self.kafka_s3_cfg.bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            block_root,
+        )
+        .await
     }
 
     #[inline]
     async fn get_block_info(&self, block_hash: H256) -> Result<Block<Transaction>> {
-        s3_get_block_info(&self.s3_client, &self.kafka_s3_cfg.bucket_name, block_hash).await
+        s3_get_block_info(
+            &self.s3_client,
+            &self.kafka_s3_cfg.bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            block_hash,
+        )
+        .await
     }
 
     pub async fn init(&mut self) -> Result<()> {
