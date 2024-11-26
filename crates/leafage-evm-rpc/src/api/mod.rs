@@ -6,3 +6,5 @@ pub use trace::{TraceApiClient, TraceApiServer};
 
 mod pre;
 pub use pre::PreApiServer;
+
+mod debank;
