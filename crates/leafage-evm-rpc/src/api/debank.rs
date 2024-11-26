@@ -1,7 +1,7 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
-    Address, BlockContext, BlockOverrides, Bytes, CallRequest, DebankBlock, DebankMultiCallResp,
-    DebankSimulateResp, H256, U256,
+    Address, BlockOverrides, Bytes, CallRequest, DebankBlock, DebankBlockContext,
+    DebankMultiCallResp, DebankSimulateResp, H256, U256,
 };
 
 #[rpc(server, client)]
@@ -11,28 +11,28 @@ pub trait DebankApi {
     async fn get_address_nonce(
         &self,
         address: Address,
-        block_ctx: Option<BlockContext>,
+        block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256>;
 
     #[method(name = "getAddressBalance")]
     async fn get_address_balance(
         &self,
         address: Address,
-        block_ctx: Option<BlockContext>,
+        block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256>;
 
     #[method(name = "getAddressCode")]
     async fn get_address_code(
         &self,
         address: Address,
-        block_ctx: Option<BlockContext>,
+        block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes>;
 
     #[method(name = "contractMultiCall")]
     async fn contract_multi_call(
         &self,
         requests: Vec<CallRequest>,
-        block_ctx: Option<BlockContext>,
+        block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
         fast_fail: Option<bool>,
         use_parallel: Option<bool>,
@@ -43,7 +43,7 @@ pub trait DebankApi {
     async fn simulate_transactions(
         &self,
         requests: Vec<CallRequest>,
-        block_ctx: Option<BlockContext>,
+        block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp>;
 
@@ -55,4 +55,7 @@ pub trait DebankApi {
 
     #[method(name = "getBlockById")]
     async fn get_block_by_id(&self, id: H256) -> RpcResult<DebankBlock>;
+
+    #[method(name = "blockIsValid")]
+    async fn block_is_valid(&self, id: H256) -> RpcResult<bool>;
 }

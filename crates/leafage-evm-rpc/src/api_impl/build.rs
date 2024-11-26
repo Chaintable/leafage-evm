@@ -1,5 +1,5 @@
-use crate::api::{EthApiServer, PreApiServer, TraceApiServer};
-use crate::api_impl::{EthApiImpl, PreApiImpl, TraceApiImpl};
+use super::ApiImpl;
+use crate::api::{DebankApiServer, EthApiServer, PreApiServer, TraceApiServer};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
@@ -44,7 +44,11 @@ where
             .await?;
         let mut rpc_module = RpcModule::new(());
         rpc_module
-            .merge(EthApiImpl::new(self.db.clone(), self.cfg.clone(), self.spec_id).into_rpc())
+            .merge(EthApiServer::into_rpc(ApiImpl::new(
+                self.db.clone(),
+                self.cfg.clone(),
+                self.spec_id,
+            )))
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -52,7 +56,11 @@ where
                 )
             })?;
         rpc_module
-            .merge(TraceApiImpl::new(self.db.clone(), self.cfg.clone(), self.spec_id).into_rpc())
+            .merge(PreApiServer::into_rpc(ApiImpl::new(
+                self.db.clone(),
+                self.cfg.clone(),
+                self.spec_id,
+            )))
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -60,7 +68,24 @@ where
                 )
             })?;
         rpc_module
-            .merge(PreApiImpl::new(self.db.clone(), self.cfg.clone(), self.spec_id).into_rpc())
+            .merge(TraceApiServer::into_rpc(ApiImpl::new(
+                self.db.clone(),
+                self.cfg.clone(),
+                self.spec_id,
+            )))
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to merge rpc module: {}", e),
+                )
+            })?;
+
+        rpc_module
+            .merge(DebankApiServer::into_rpc(ApiImpl::new(
+                self.db.clone(),
+                self.cfg.clone(),
+                self.spec_id,
+            )))
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,

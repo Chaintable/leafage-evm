@@ -5,13 +5,13 @@ use super::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct BlockContext {
-    block_id: BlockId,
+pub struct DebankBlockContext {
+    pub block_id: BlockId,
     #[serde(rename = "type")]
-    block_type: BlockType,
+    pub block_type: BlockType,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum BlockType {
     Contains,
     #[default]
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn test_block_context() {
         let block_id = BlockId::Number(BlockNumberOrTag::Latest);
-        let block_context = BlockContext {
+        let block_context = DebankBlockContext {
             block_id,
             block_type: BlockType::Contains,
         };

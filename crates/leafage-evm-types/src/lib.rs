@@ -9,7 +9,7 @@ pub use storage::{
 
 mod rpc;
 pub use rpc::{
-    Action, Block, BlockContext, BlockId, BlockNumberOrTag, BlockOverrides, BlockType, CallAction,
+    Action, Block, DebankBlockContext, BlockId, BlockNumberOrTag, BlockOverrides, BlockType, CallAction,
     CallOutput, CallRequest, CallType, CreateAction, CreateOutput, DebankBlock,
     DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
     DebankSingleCallResult, DebankSingleSimulateResult, Event, Header, Index, JsonStorageKey,

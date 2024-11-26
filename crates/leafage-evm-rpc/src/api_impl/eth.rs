@@ -1,3 +1,4 @@
+use super::ApiImpl;
 use crate::api::EthApiServer;
 use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
@@ -20,18 +21,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-/// [`EthApiImpl`] implements the EthApi trait.
-pub struct EthApiImpl<DB> {
-    db: DB,
-    cfg: CfgEnv,
-    spec_id: SpecId,
-}
-
-impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
-    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
-        Self { db, cfg, spec_id }
-    }
-
+impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
     async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
             .db
@@ -360,7 +350,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
         Self::get_balance_from_state(state.unwrap(), address)
     }
 
-    fn get_balance_from_state(state: DB::StateDB, address: Address) -> RpcResult<U256> {
+    pub fn get_balance_from_state(state: DB::StateDB, address: Address) -> RpcResult<U256> {
         let state = EvmStorageWrapper(state);
         let account = state
             .basic_ref(address.0.into())
@@ -499,7 +489,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> EthApiImpl<DB> {
 }
 
 #[async_trait::async_trait]
-impl<DB> EthApiServer for EthApiImpl<DB>
+impl<DB> EthApiServer for ApiImpl<DB>
 where
     DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static,
 {
