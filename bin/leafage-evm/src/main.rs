@@ -1,6 +1,7 @@
 mod initializer;
 mod metrics;
 mod migrate;
+mod register;
 mod runner;
 mod standalone;
 mod updater;
