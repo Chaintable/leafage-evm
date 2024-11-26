@@ -1,7 +1,7 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
-    Address, BlockContext, BlockId, BlockOverrides, BlockType, Bytes, CallRequest, MultiCallResp,
-    U256,
+    Address, BlockContext, BlockOverrides, Bytes, CallRequest, DebankBlock, DebankMultiCallResp,
+    DebankSimulateResp, H256, U256,
 };
 
 #[rpc(server, client)]
@@ -37,7 +37,7 @@ pub trait DebankApi {
         fast_fail: Option<bool>,
         use_parallel: Option<bool>,
         disable_cache: Option<bool>,
-    ) -> RpcResult<MultiCallResp>;
+    ) -> RpcResult<DebankMultiCallResp>;
 
     #[method(name = "simulateTransactions")]
     async fn simulate_transactions(
@@ -45,5 +45,14 @@ pub trait DebankApi {
         requests: Vec<CallRequest>,
         block_ctx: Option<BlockContext>,
         block_overrides: Option<BlockOverrides>,
-    ) -> RpcResult<()>;
+    ) -> RpcResult<DebankSimulateResp>;
+
+    #[method(name = "getLatestBlock")]
+    async fn get_latest_block(&self) -> RpcResult<DebankBlock>;
+
+    #[method(name = "getBlockByHeight")]
+    async fn get_block_by_height(&self, height: U256) -> RpcResult<DebankBlock>;
+
+    #[method(name = "getBlockById")]
+    async fn get_block_by_id(&self, id: H256) -> RpcResult<DebankBlock>;
 }

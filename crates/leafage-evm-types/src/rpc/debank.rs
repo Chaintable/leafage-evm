@@ -88,6 +88,40 @@ pub struct DebankMultiCallResp {
     pub stats: DebankMultiCallStats,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DebankSimulateStats {
+    /// blockNum
+    pub block_num: u64,
+    /// blockHash
+    pub block_hash: H256,
+    /// blockTime
+    pub block_time: u64,
+    /// success
+    pub success: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DebankSingleSimulateResult {
+    pub traces: Vec<Trace>,
+    pub events: Vec<Event>,
+    pub code: i32,
+    pub err: String,
+    pub gas_used: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DebankSimulateResp {
+    pub results: Vec<DebankSingleSimulateResult>,
+    pub stats: DebankSimulateStats,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DebankBlock {
+    pub block_id: H256,
+    pub block_height: u64,
+    pub block_timestamp: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::BlockNumberOrTag;
