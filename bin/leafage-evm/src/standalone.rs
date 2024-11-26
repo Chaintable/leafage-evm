@@ -1,8 +1,9 @@
 use crate::initializer::initialize_check;
 use crate::metrics;
+use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::KafkaS3Config;
+use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
 use anyhow::{bail, Result};
 use clap::Parser;
 use leafage_evm_rpc::ApiBuilder;
@@ -126,6 +127,13 @@ pub struct Command {
     /// This config is used to set the kafka s3 config.
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
+
+    /// The etcd register config path
+    /// Default: None
+    ///
+    /// This config is used to set the etcd register config.
+    #[arg(long, value_parser = parse_etcd_config, value_name = "ETCD_CONFIG_PATH")]
+    etcd_config: Option<EtcdRegisterConfig>,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -173,6 +181,17 @@ fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
     Ok(kafka_s3_config)
 }
 
+fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
+    let etcd_config: EtcdRegisterConfig;
+    if arg.starts_with("/") {
+        let file = std::fs::File::open(arg)?;
+        etcd_config = serde_json::from_reader(file)?;
+    } else {
+        etcd_config = serde_json::from_str(arg)?;
+    }
+    Ok(etcd_config)
+}
+
 impl Command {
     async fn start(
         &self,
@@ -182,9 +201,12 @@ impl Command {
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
+        tokio::sync::watch::Sender<()>,
     )> {
         info!(target:"updater", "chain cfg: {:?}, spec_id: {:?}, archive: {:?}", chain_cfg, spec_id, self.archive);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
+
+        let resgitry_handle = register_build(chain_cfg.chain_id, self.etcd_config.clone()).await?;
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
@@ -211,7 +233,7 @@ impl Command {
                     self.diff_depth_limit,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, metrics_handle))
+                Ok((updater_handle, rpc_handle, metrics_handle, resgitry_handle))
             }
             "rocksdb" if self.archive => {
                 let db = Arc::new(ArchiveRocksDBStorage::open(
@@ -249,13 +271,13 @@ impl Command {
                     self.diff_depth_limit,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, metrics_handle))
+                Ok((updater_handle, rpc_handle, metrics_handle, resgitry_handle))
             }
             _ => bail!("only support rocksdb"),
         }
     }
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, metrics_handle) = self
+        let (updater_handle, rpc_handle, metrics_handle, resgitry_handle) = self
             .start(
                 self.chain_cfg.clone(),
                 SpecId::try_from_u8(self.spec_id).unwrap_or(SpecId::LATEST),
@@ -266,6 +288,7 @@ impl Command {
             let _ = updater_handle.send(());
             let _ = rpc_handle.stop();
             let _ = metrics_handle.send(());
+            let _ = resgitry_handle.send(());
             Ok(())
         })
         .await?;

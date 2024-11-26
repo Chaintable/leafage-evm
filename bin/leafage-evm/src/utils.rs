@@ -54,3 +54,11 @@ pub async fn s3_get_block_info(
     let block = serde_json::from_slice(&bytes)?;
     Ok(block)
 }
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct EtcdRegisterConfig {
+    pub endpoints: Vec<String>,
+    pub keep_alive_interval_ms: u64,
+    pub lease_ttl_s: i64,
+    pub meta: String,
+}
