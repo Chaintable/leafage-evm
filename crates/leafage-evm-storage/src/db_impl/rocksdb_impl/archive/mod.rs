@@ -302,6 +302,7 @@ impl BlockRead for DataBaseRef {
     type Error = Error;
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
+        info!("read block hash {block_num}");
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
             .start_timer();
@@ -325,6 +326,7 @@ impl BlockRead for DataBaseRef {
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+        info!("read block info: {:?}", block_hash);
         let timer = DATABASE_OP_LATENCY_HIST
             .with_label_values(&["read", StorageTypeColumn::BlockHashToBlockInfo.to_display()])
             .start_timer();
@@ -675,7 +677,10 @@ impl BlockRead for StateDB {
         self.db.read_block_info(block_hash)
     }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        self.db.read_latest_block_hash()
+        if self.block_num == u64::MAX {
+            return Ok(self.block_header.as_ref().unwrap().hash);
+        }
+        Ok(self.block_header.as_ref().unwrap().hash)
     }
 }
 impl StateDBWrite for StateDB {

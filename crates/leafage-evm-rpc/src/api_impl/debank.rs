@@ -77,11 +77,15 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
     }
 
     fn debank_get_block_by_height_impl(&self, height: U256) -> RpcResult<DebankBlock> {
+        let number: u64 = height.try_into().map_err(|_| {
+            rpc_error_with_code(
+                DebankErrorCode::InvalidParams as i32,
+                "block height out of range".to_string(),
+            )
+        })?;
         let block = self
             .db
-            .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Number(
-                height.try_into().unwrap(),
-            )))
+            .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Number(number)))
             .map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
