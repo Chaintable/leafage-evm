@@ -200,6 +200,12 @@ where
         block_id: BlockId,
     ) -> Result<Option<Block<Transaction>>, Self::Error> {
         let res = self.snapshot_tree.get_block_by_id(block_id)?;
+        if res.is_none() {
+            let res = self.history_tree.state_at(block_id)?;
+            if let Some(res) = res {
+                return Ok(Some(res.block_info().map_err(Error::Archive)?));
+            }
+        }
         Ok(res)
     }
 
@@ -208,6 +214,12 @@ where
         block_id: BlockId,
     ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
         let res = self.snapshot_tree.get_block_by_id_arc(block_id)?;
+        if res.is_none() {
+            let res = self.history_tree.state_at(block_id)?;
+            if let Some(res) = res {
+                return Ok(Some(res.block_info_arc().map_err(Error::Archive)?));
+            }
+        }
         Ok(res)
     }
 }
