@@ -678,7 +678,7 @@ impl BlockRead for StateDB {
     }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
         if self.block_num == u64::MAX {
-            return Ok(self.block_header.as_ref().unwrap().hash);
+            return Ok(self.db.read_latest_block_hash()?);
         }
         Ok(self.block_header.as_ref().unwrap().hash)
     }
