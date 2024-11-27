@@ -13,7 +13,7 @@ pub use alloy::rpc::types::trace::parity::{
     LocalizedTransactionTrace, RewardAction, SelfdestructAction, TraceOutput, TransactionTrace,
 };
 pub use alloy::rpc::types::{
-    Block, BlockId, BlockNumberOrTag, Header, Index, Log, TransactionInfo,
+    Block, BlockId, BlockNumberOrTag, BlockOverrides, Header, Index, Log, TransactionInfo,
 };
 
 #[cfg(not(feature = "optimism"))]
@@ -27,3 +27,10 @@ pub use op_alloy_consensus::{OpTxEnvelope, OpTxType, TxDeposit};
 
 mod pre;
 pub use pre::{PreError, PreErrorCode, PreResult};
+
+mod debank;
+pub use debank::{
+    BlockType, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
+    DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
+    Event, Trace,
+};

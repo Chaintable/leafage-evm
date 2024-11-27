@@ -50,3 +50,22 @@ pub(crate) fn rpc_err(
         }),
     )
 }
+
+#[repr(i32)]
+pub enum DebankErrorCode {
+    #[allow(dead_code)]
+    InvalidJson = -32700,
+    #[allow(dead_code)]
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InvalidParams = -32602,
+    EvmRevert = -39000,
+    GasExhausted = -39001,
+    BalanceExhausted = -39002,
+    NonceError = -39003,
+    EvmFailed = -39004,
+    DataBaseFailed = -39005,
+    BlockNotFound = -39006,
+    #[allow(dead_code)]
+    InternalError = -32603,
+}

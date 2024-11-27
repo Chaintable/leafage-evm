@@ -9,11 +9,13 @@ pub use storage::{
 
 mod rpc;
 pub use rpc::{
-    Action, Block, BlockId, BlockNumberOrTag, CallAction, CallOutput, CallRequest, CallType,
-    CreateAction, CreateOutput, Header, Index, JsonStorageKey, LocalizedTransactionTrace, Log,
-    MultiCallErrorCode, MultiCallResp, MultiCallStats, PreError, PreErrorCode, PreResult,
-    RawHeader, RewardAction, SelfdestructAction, SingleCallResult, TraceOutput, Transaction,
-    TransactionInfo, TransactionTrace, TxEnvelope,
+    Action, Block, DebankBlockContext, BlockId, BlockNumberOrTag, BlockOverrides, BlockType, CallAction,
+    CallOutput, CallRequest, CallType, CreateAction, CreateOutput, DebankBlock,
+    DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
+    DebankSingleCallResult, DebankSingleSimulateResult, Event, Header, Index, JsonStorageKey,
+    LocalizedTransactionTrace, Log, MultiCallErrorCode, MultiCallResp, MultiCallStats, PreError,
+    PreErrorCode, PreResult, RawHeader, RewardAction, SelfdestructAction, SingleCallResult, Trace,
+    TraceOutput, Transaction, TransactionInfo, TransactionTrace, TxEnvelope,
 };
 
 #[cfg(feature = "optimism")]

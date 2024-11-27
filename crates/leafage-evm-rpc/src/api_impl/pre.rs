@@ -1,3 +1,4 @@
+use super::ApiImpl;
 use crate::api::PreApiServer;
 use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
@@ -16,18 +17,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-/// [`PreApiImpl`] implements the EthApi trait.
-pub struct PreApiImpl<DB> {
-    db: DB,
-    cfg: CfgEnv,
-    spec_id: SpecId,
-}
-
-impl<DB: EvmStorageRead> PreApiImpl<DB> {
-    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
-        Self { db, cfg, spec_id }
-    }
-
+impl<DB: EvmStorageRead> ApiImpl<DB> {
     async fn pre_trace_many_impl(
         &self,
         requests: Vec<CallRequest>,
@@ -170,7 +160,7 @@ impl<DB: EvmStorageRead> PreApiImpl<DB> {
 }
 
 #[async_trait::async_trait]
-impl<DB> PreApiServer for PreApiImpl<DB>
+impl<DB> PreApiServer for ApiImpl<DB>
 where
     DB: EvmStorageRead + Send + Sync + 'static,
 {

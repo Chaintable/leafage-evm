@@ -1,5 +1,7 @@
+mod api_impl;
+pub(crate) use api_impl::ApiImpl;
+
 mod eth;
-pub use eth::EthApiImpl;
 
 mod utils;
 
@@ -7,7 +9,7 @@ mod build;
 pub use build::ApiBuilder;
 
 mod trace;
-pub use trace::TraceApiImpl;
 
 mod pre;
-pub use pre::PreApiImpl;
+
+mod debank;

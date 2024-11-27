@@ -1,5 +1,5 @@
 use crate::{
-    db::{ArchiveDBProvider, ArchiveDBWrapper, DBWrapper},
+    db::{ArchiveDBProvider, ArchiveDBWrapper, BlockRead, DBWrapper},
     interface::{
         BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex,
         TxContext,
@@ -200,6 +200,30 @@ where
         block_id: BlockId,
     ) -> Result<Option<Block<Transaction>>, Self::Error> {
         let res = self.snapshot_tree.get_block_by_id(block_id)?;
+        if res.is_none() {
+            let db = self
+                .history_tree
+                .0
+                .db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
+            if let Some(db) = db {
+                match block_id {
+                    BlockId::Hash(hash) => {
+                        return Ok(db.read_block_info(hash.block_hash)?);
+                    }
+                    BlockId::Number(number) => match number {
+                        BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
+                            return Ok(db.read_block_info(db.read_latest_block_hash()?)?);
+                        }
+                        BlockNumberOrTag::Number(number) => {
+                            return Ok(db.read_block_info(db.read_block_hash(number)?)?);
+                        }
+                        _ => {
+                            return Ok(None);
+                        }
+                    },
+                }
+            }
+        }
         Ok(res)
     }
 
@@ -208,6 +232,34 @@ where
         block_id: BlockId,
     ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
         let res = self.snapshot_tree.get_block_by_id_arc(block_id)?;
+        if res.is_none() {
+            let db = self
+                .history_tree
+                .0
+                .db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
+            if let Some(db) = db {
+                match block_id {
+                    BlockId::Hash(hash) => {
+                        return Ok(db.read_block_info(hash.block_hash)?.map(Arc::new));
+                    }
+                    BlockId::Number(number) => match number {
+                        BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
+                            return Ok(db
+                                .read_block_info(db.read_latest_block_hash()?)?
+                                .map(Arc::new));
+                        }
+                        BlockNumberOrTag::Number(number) => {
+                            return Ok(db
+                                .read_block_info(db.read_block_hash(number)?)?
+                                .map(Arc::new));
+                        }
+                        _ => {
+                            return Ok(None);
+                        }
+                    },
+                }
+            }
+        }
         Ok(res)
     }
 }

@@ -1,6 +1,7 @@
 use crate::error::invalid_params_rpc_err;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, Transaction, H256, U256};
+use leafage_evm_types::{BlockOverrides, CallRequest, Transaction, H256, U256};
+use revm::db::CacheDB;
 use revm::primitives::{
     env::{CfgEnv, CfgEnvWithHandlerCfg},
     AccessListItem, BlockEnv, SpecId, TxEnv, TxKind,
@@ -201,4 +202,52 @@ pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHan
         cfg.enable_optimism();
     }
     cfg
+}
+
+pub(crate) fn apply_block_overrides<DB>(
+    overrides: BlockOverrides,
+    db: &mut CacheDB<DB>,
+    env: &mut BlockEnv,
+) {
+    let BlockOverrides {
+        number,
+        difficulty,
+        time,
+        gas_limit,
+        coinbase,
+        random,
+        base_fee,
+        block_hash,
+    } = overrides;
+
+    if let Some(block_hashes) = block_hash {
+        // override block hashes
+        db.block_hashes.extend(
+            block_hashes
+                .into_iter()
+                .map(|(num, hash)| (U256::from(num), hash)),
+        )
+    }
+
+    if let Some(number) = number {
+        env.number = number;
+    }
+    if let Some(difficulty) = difficulty {
+        env.difficulty = difficulty;
+    }
+    if let Some(time) = time {
+        env.timestamp = U256::from(time);
+    }
+    if let Some(gas_limit) = gas_limit {
+        env.gas_limit = U256::from(gas_limit);
+    }
+    if let Some(coinbase) = coinbase {
+        env.coinbase = coinbase;
+    }
+    if let Some(random) = random {
+        env.prevrandao = Some(random);
+    }
+    if let Some(base_fee) = base_fee {
+        env.basefee = base_fee;
+    }
 }

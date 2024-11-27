@@ -1,3 +1,4 @@
+use super::ApiImpl;
 use crate::api::TraceApiServer;
 use crate::api_impl::utils::{get_handler_cfg, rebuild_txn_env};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
@@ -18,18 +19,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-/// [`TraceApiImpl`] implements the EthApi trait.
-pub struct TraceApiImpl<DB> {
-    db: DB,
-    cfg: CfgEnv,
-    spec_id: SpecId,
-}
-
-impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
-    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
-        Self { db, cfg, spec_id }
-    }
-
+impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> ApiImpl<DB> {
     async fn trace_transaction_impl(
         &self,
         hash: H256,
@@ -171,7 +161,7 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> TraceApiImpl<DB> {
 }
 
 #[async_trait::async_trait]
-impl<DB> TraceApiServer for TraceApiImpl<DB>
+impl<DB> TraceApiServer for ApiImpl<DB>
 where
     DB: EvmStorageRead + TransactionIndex + BlockIndex + Send + Sync + 'static,
 {
