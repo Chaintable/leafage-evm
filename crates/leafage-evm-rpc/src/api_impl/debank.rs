@@ -450,7 +450,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         &self,
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
-        _block_overrides: Option<BlockOverrides>,
+        block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
         let mut cfg = self.cfg.clone();
         cfg.disable_eip3607 = true;
@@ -467,7 +467,14 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         let (tx, rx) = oneshot::channel();
 
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::debank_call_many_and_trace(requests, cfg, spec_id, state, block);
+            let rsp = Self::debank_call_many_and_trace(
+                requests,
+                cfg,
+                spec_id,
+                state,
+                block,
+                block_overrides,
+            );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
             }
@@ -487,8 +494,9 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         spec_id: SpecId,
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
+        block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
-        let block_env = block_env_from_block(&block);
+        let mut block_env = block_env_from_block(&block);
         let mut stats = DebankSimulateStats {
             block_num: block.header.number,
             block_time: block.header.timestamp,
@@ -497,6 +505,9 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         };
         let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
         let cfg = get_handler_cfg(cfg, spec_id);
+        if let Some(overrides) = block_overrides.clone() {
+            super::utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
+        }
         let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
         for tx in txs {

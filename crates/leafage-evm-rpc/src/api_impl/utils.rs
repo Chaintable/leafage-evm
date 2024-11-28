@@ -213,7 +213,7 @@ pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHan
 pub(crate) fn apply_block_overrides<DB>(
     overrides: BlockOverrides,
     db: &mut CacheDB<DB>,
-    env: &mut BlockEnv,
+    block_env: &mut BlockEnv,
 ) {
     let BlockOverrides {
         number,
@@ -236,25 +236,25 @@ pub(crate) fn apply_block_overrides<DB>(
     }
 
     if let Some(number) = number {
-        env.number = number;
+        block_env.number = number;
     }
     if let Some(difficulty) = difficulty {
-        env.difficulty = difficulty;
+        block_env.difficulty = difficulty;
     }
     if let Some(time) = time {
-        env.timestamp = U256::from(time);
+        block_env.timestamp = U256::from(time);
     }
     if let Some(gas_limit) = gas_limit {
-        env.gas_limit = U256::from(gas_limit);
+        block_env.gas_limit = U256::from(gas_limit);
     }
     if let Some(coinbase) = coinbase {
-        env.coinbase = coinbase;
+        block_env.coinbase = coinbase;
     }
     if let Some(random) = random {
-        env.prevrandao = Some(random);
+        block_env.prevrandao = Some(random);
     }
     if let Some(base_fee) = base_fee {
-        env.basefee = base_fee;
+        block_env.basefee = base_fee;
     }
 }
 
