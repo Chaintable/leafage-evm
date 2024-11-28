@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use tracing::info;
 
 #[derive(Clone, Debug)]
-pub struct Config {
+pub struct SnapshotTreeConfig {
     /// diff_tree_depth_limit is the max depth of the uncommitted diff tree.
     pub diff_tree_depth_limit: usize,
     pub account_cache_size: usize,
@@ -18,7 +18,7 @@ pub struct Config {
     pub code_cache_size: usize,
 }
 
-impl Config {
+impl SnapshotTreeConfig {
     pub fn new(
         diff_tree_depth_limit: usize,
         account_cache_size: usize,
@@ -34,7 +34,7 @@ impl Config {
     }
 }
 
-impl Default for Config {
+impl Default for SnapshotTreeConfig {
     fn default() -> Self {
         Self {
             diff_tree_depth_limit: 64,
@@ -59,7 +59,7 @@ pub struct SnapshotTree<DB> {
     /// tx_hash -> tx_context, tx_hash_map stores the tx info.
     tx_hash_map: RwLock<HashMap<H256, TxContext>>,
     /// config stores the config of the SnapshotTree.
-    config: Config,
+    config: SnapshotTreeConfig,
     /// disk_layer is the bottom layer of the SnapshotTree.
     disk_layer: Arc<LinkedDiffLayer<DB>>,
 }
@@ -83,7 +83,7 @@ impl<DB> SnapshotTree<DB> {
             .retain(|_, v| v.block_number > bottom_height);
     }
 
-    pub fn get_config(&self) -> Config {
+    pub fn get_config(&self) -> SnapshotTreeConfig {
         self.config.clone()
     }
 
@@ -96,7 +96,7 @@ impl<DB, E> SnapshotTree<DB>
 where
     DB: StateDB<Error = E> + EvmStorageWrite<Error = E> + BlockContext<Error = E>,
 {
-    pub fn new(db: DB, config: Config) -> Result<Self, E> {
+    pub fn new(db: DB, config: SnapshotTreeConfig) -> Result<Self, E> {
         let mut hash_diffs = HashMap::new();
         let mut num_diffs = HashMap::new();
         let mut tx_hash_map = HashMap::new();

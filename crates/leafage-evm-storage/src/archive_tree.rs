@@ -1,10 +1,10 @@
 use crate::{
-    db::{ArchiveDBProvider, ArchiveDBWrapper, BlockRead, DBWrapper},
+    db::{ArchiveDBProvider, ArchiveDBWrapper, BlockRead, StateDBWrapper},
     interface::{
         BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex,
         TxContext,
     },
-    snapshot::{self, Config, LinkedDiffLayer, SnapshotTree},
+    snapshot::{self, LinkedDiffLayer, SnapshotTree, SnapshotTreeConfig},
     StateDBRead, StateDBWrite,
 };
 use leafage_evm_types::{
@@ -18,7 +18,7 @@ pub struct ArchiveTree<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    snapshot_tree: Arc<SnapshotTree<DBWrapper<DB::StateDBReadWrite>>>,
+    snapshot_tree: Arc<SnapshotTree<StateDBWrapper<DB::StateDBReadWrite>>>,
     history_tree: ArchiveDBWrapper<DB>,
 }
 
@@ -28,11 +28,11 @@ where
 {
     pub fn new(
         db: DB,
-        config: Config,
+        config: SnapshotTreeConfig,
     ) -> Result<Self, Error<<DB::StateDBReadWrite as StateDBRead>::Error>> {
         let latest_readwrite_db = db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?;
         let latest_readwrite_db = latest_readwrite_db.expect("latest db should exist");
-        let latest_statedb = DBWrapper(latest_readwrite_db);
+        let latest_statedb = StateDBWrapper(latest_readwrite_db);
         let snapshot_tree = Arc::new(SnapshotTree::new(latest_statedb, config)?);
         let history_tree = ArchiveDBWrapper(db);
         let tree = Self {
@@ -55,8 +55,8 @@ pub enum MultiStateDB<DB>
 where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
-    Snapshot(Arc<LinkedDiffLayer<DBWrapper<DB::StateDBReadWrite>>>),
-    Archive(DBWrapper<DB::StateDBReadWrite>),
+    Snapshot(Arc<LinkedDiffLayer<StateDBWrapper<DB::StateDBReadWrite>>>),
+    Archive(StateDBWrapper<DB::StateDBReadWrite>),
 }
 
 impl<DB> Clone for MultiStateDB<DB>
