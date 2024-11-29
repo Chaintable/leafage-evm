@@ -20,6 +20,8 @@ op-alloy-rpc-types = { workspace = true, optional = true }
 op-alloy-consensus = { workspace = true, optional = true }
 thiserror.workspace = true
 flate2.workspace = true
+md-5.workspace = true
+revm-inspectors.workspace = true
 
 [features]
 default = []

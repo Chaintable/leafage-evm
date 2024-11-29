@@ -5,4 +5,4 @@ mod layer;
 pub use layer::LinkedDiffLayer;
 
 mod tree;
-pub use tree::{Config, SnapshotTree};
+pub use tree::{SnapshotTreeConfig, SnapshotTree};

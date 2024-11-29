@@ -85,10 +85,10 @@ pub trait BlockIndex {
     }
 }
 
-/// [`WrapDB`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
-pub struct WrapDB<T>(pub T);
+/// [`EvmStorageWrapper`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
+pub struct EvmStorageWrapper<T>(pub T);
 
-impl<T: StateDB> DatabaseRef for WrapDB<T> {
+impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     type Error = T::Error;
     fn basic_ref(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
         let address = keccak256(address.as_slice());

@@ -52,6 +52,7 @@ pub(crate) fn rpc_err(
 }
 
 #[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DebankErrorCode {
     #[allow(dead_code)]
     InvalidJson = -32700,

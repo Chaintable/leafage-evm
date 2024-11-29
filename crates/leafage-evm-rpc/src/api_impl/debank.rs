@@ -1,6 +1,6 @@
 use super::ApiImpl;
 use crate::api::DebankApiServer;
-use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
+use crate::api_impl::utils::{build_debank_traces, create_txn_env, get_handler_cfg};
 use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
@@ -10,12 +10,13 @@ use leafage_evm_storage::{
 use leafage_evm_types::{
     block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
     Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
-    DebankSimulateResp, DebankSingleCallResult, HaltReason, MultiCallErrorCode, Transaction, H256,
-    U256,
+    DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
+    HaltReason, MultiCallErrorCode, Transaction, TransactionInfo, H256, U256,
 };
 use revm::db::{CacheDB, DatabaseRef};
 use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult, SpecId};
-use revm::Evm;
+use revm::{inspector_handle_register, Evm};
+use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -444,6 +445,146 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         }
         Ok(block.header.hash == canonical_block.unwrap().header.hash)
     }
+
+    async fn debank_simulate_transactions_impl(
+        &self,
+        requests: Vec<CallRequest>,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<DebankSimulateResp> {
+        let mut cfg = self.cfg.clone();
+        cfg.disable_eip3607 = true;
+        cfg.disable_base_fee = true;
+        cfg.disable_block_gas_limit = true;
+
+        let spec_id = self.spec_id;
+
+        let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
+        let block = state.block_info_arc().map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+
+        let (tx, rx) = oneshot::channel();
+
+        tokio::task::spawn_blocking(move || {
+            let rsp = Self::debank_call_many_and_trace(
+                requests,
+                cfg,
+                spec_id,
+                state,
+                block,
+                block_overrides,
+            );
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send multi_call result: {:?}", e);
+            }
+        });
+        let rsp = rx.await.map_err(|_| {
+            rpc_error_with_code(
+                DebankErrorCode::InternalError as i32,
+                "receive simulate rsp failed".to_string(),
+            )
+        })?;
+        rsp
+    }
+
+    fn debank_call_many_and_trace(
+        txs: Vec<CallRequest>,
+        cfg: CfgEnv,
+        spec_id: SpecId,
+        state: DB::StateDB,
+        block: Arc<Block<Transaction>>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<DebankSimulateResp> {
+        let mut block_env = block_env_from_block(&block);
+        let mut stats = DebankSimulateStats {
+            block_num: block.header.number,
+            block_time: block.header.timestamp,
+            block_hash: block.header.hash,
+            success: true,
+        };
+        let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
+        let cfg = get_handler_cfg(cfg, spec_id);
+        if let Some(overrides) = block_overrides.clone() {
+            super::utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
+        }
+        let mut tx_index: u64 = 0;
+        let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
+        for tx in txs {
+            let tx_info = TransactionInfo {
+                hash: Some(H256::random()),
+                index: Some(tx_index),
+                block_hash: Some(block.header.hash),
+                block_number: Some(block.header.number),
+                base_fee: block.header.base_fee_per_gas.map(|x| x as u128),
+            };
+            tx_index += 1;
+            if let Some(last_res) = results.last() {
+                if last_res.code != 0 {
+                    results.push(last_res.clone());
+                    continue;
+                }
+            }
+            let tx = create_txn_env(&block_env, tx)?;
+            let trace_cfg = TracingInspectorConfig::default_parity();
+            let mut inspector = TracingInspector::new(trace_cfg);
+            let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx);
+            let mut evm = Evm::builder()
+                .with_db(&mut memory_db)
+                .with_external_context(&mut inspector)
+                .with_env_with_handler_cfg(env)
+                .append_handler_register(inspector_handle_register)
+                .build();
+            let exec_res = evm
+                .transact_commit()
+                .map_err(|e| internal_rpc_err(e.to_string()))?;
+            drop(evm);
+            match exec_res {
+                ExecutionResult::Revert { gas_used, output } => {
+                    let reason =
+                        decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
+                    let pre_res = DebankSingleSimulateResult {
+                        code: DebankErrorCode::EvmRevert as i32,
+                        err: reason,
+                        gas_used,
+                        ..Default::default()
+                    };
+                    stats.success = false;
+                    results.push(pre_res);
+                }
+                ExecutionResult::Halt { reason, gas_used } => {
+                    let code = match reason {
+                        HaltReason::OutOfFunds => DebankErrorCode::BalanceExhausted,
+                        HaltReason::NonceOverflow => DebankErrorCode::NonceError,
+                        HaltReason::OutOfGas(_) => DebankErrorCode::GasExhausted,
+                        _ => DebankErrorCode::EvmFailed,
+                    };
+                    let pre_res = DebankSingleSimulateResult {
+                        code: code as i32,
+                        err: format!("Halted: {:?}", reason),
+                        gas_used,
+                        ..Default::default()
+                    };
+                    stats.success = false;
+                    results.push(pre_res);
+                }
+                ExecutionResult::Success { gas_used, .. } => {
+                    let call_traces = inspector.into_traces();
+
+                    let (traces, events) = build_debank_traces(tx_info.hash.unwrap(), call_traces);
+
+                    let pre_res = DebankSingleSimulateResult {
+                        gas_used,
+                        traces,
+                        events,
+                        ..Default::default()
+                    };
+                    results.push(pre_res);
+                }
+            }
+        }
+        Ok(DebankSimulateResp { stats, results })
+    }
 }
 
 #[async_trait::async_trait]
@@ -496,11 +637,12 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static>
 
     async fn simulate_transactions(
         &self,
-        _requests: Vec<CallRequest>,
-        _block_ctx: Option<DebankBlockContext>,
-        _block_overrides: Option<BlockOverrides>,
+        requests: Vec<CallRequest>,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
-        Ok(DebankSimulateResp::default())
+        self.debank_simulate_transactions_impl(requests, block_ctx, block_overrides)
+            .await
     }
 
     async fn get_latest_block(&self) -> RpcResult<DebankBlock> {

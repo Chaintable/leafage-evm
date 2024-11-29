@@ -97,10 +97,10 @@ pub trait StateDBWrite: Send + Sync + 'static {
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error>;
 }
 
-/// [`DBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
-pub struct DBWrapper<T>(pub T);
+/// [`StateDBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
+pub struct StateDBWrapper<T>(pub T);
 
-impl<T> Clone for DBWrapper<T>
+impl<T> Clone for StateDBWrapper<T>
 where
     T: Clone,
 {
@@ -109,7 +109,7 @@ where
     }
 }
 
-impl<T> BlockContext for DBWrapper<T>
+impl<T> BlockContext for StateDBWrapper<T>
 where
     T: BlockRead,
 {
@@ -121,7 +121,7 @@ where
     }
 }
 
-impl<T, E> StateDB for DBWrapper<T>
+impl<T, E> StateDB for StateDBWrapper<T>
 where
     T: StateDBRead<Error = E> + BlockRead<Error = E>,
     E: std::error::Error + Send + Sync + 'static,
@@ -156,7 +156,7 @@ where
     }
 }
 
-impl<T, E> EvmStorageWrite for DBWrapper<T>
+impl<T, E> EvmStorageWrite for StateDBWrapper<T>
 where
     T: StateDBWrite<Error = E> + BlockRead<Error = E>,
     E: std::error::Error + Send + Sync + 'static,
@@ -232,10 +232,10 @@ where
 {
     type Error = <<T as ArchiveDBProvider>::StateDBReadWrite as StateDBRead>::Error;
 
-    type StateDB = DBWrapper<<T as ArchiveDBProvider>::StateDBReadWrite>;
+    type StateDB = StateDBWrapper<<T as ArchiveDBProvider>::StateDBReadWrite>;
 
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
         let db = self.0.db_at(block_arg)?;
-        Ok(db.map(|db| DBWrapper(db)))
+        Ok(db.map(|db| StateDBWrapper(db)))
     }
 }

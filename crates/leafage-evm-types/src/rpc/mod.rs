@@ -30,7 +30,7 @@ pub use pre::{PreError, PreErrorCode, PreResult};
 
 mod debank;
 pub use debank::{
-    BlockType, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
-    DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
-    Event, Trace,
+    BlockType, DebankBlock, DebankBlockContext, DebankEvent, DebankID, DebankMultiCallResp,
+    DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult,
+    DebankSingleSimulateResult, DebankTrace,
 };

@@ -1,10 +1,16 @@
 use crate::error::invalid_params_rpc_err;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{BlockOverrides, CallRequest, Transaction, H256, U256};
+use leafage_evm_types::{
+    BlockOverrides, CallRequest, DebankEvent, DebankID, DebankTrace, Transaction, H256, U256,
+};
 use revm::db::CacheDB;
 use revm::primitives::{
     env::{CfgEnv, CfgEnvWithHandlerCfg},
     AccessListItem, BlockEnv, SpecId, TxEnv, TxKind,
+};
+use revm_inspectors::tracing::{
+    types::{CallTraceNode, TraceMemberOrder},
+    CallTraceArena,
 };
 
 /// Helper type for representing the fees of a [CallRequest]
@@ -207,7 +213,7 @@ pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHan
 pub(crate) fn apply_block_overrides<DB>(
     overrides: BlockOverrides,
     db: &mut CacheDB<DB>,
-    env: &mut BlockEnv,
+    block_env: &mut BlockEnv,
 ) {
     let BlockOverrides {
         number,
@@ -230,24 +236,126 @@ pub(crate) fn apply_block_overrides<DB>(
     }
 
     if let Some(number) = number {
-        env.number = number;
+        block_env.number = number;
     }
     if let Some(difficulty) = difficulty {
-        env.difficulty = difficulty;
+        block_env.difficulty = difficulty;
     }
     if let Some(time) = time {
-        env.timestamp = U256::from(time);
+        block_env.timestamp = U256::from(time);
     }
     if let Some(gas_limit) = gas_limit {
-        env.gas_limit = U256::from(gas_limit);
+        block_env.gas_limit = U256::from(gas_limit);
     }
     if let Some(coinbase) = coinbase {
-        env.coinbase = coinbase;
+        block_env.coinbase = coinbase;
     }
     if let Some(random) = random {
-        env.prevrandao = Some(random);
+        block_env.prevrandao = Some(random);
     }
     if let Some(base_fee) = base_fee {
-        env.basefee = base_fee;
+        block_env.basefee = base_fee;
     }
+}
+
+enum DebankTraceOrLog {
+    Trace(DebankTraceNode),
+    Log(DebankEvent),
+}
+
+struct DebankTraceNode {
+    trace: DebankTrace,
+    children: Vec<DebankTraceOrLog>,
+}
+
+fn build_trace_node(
+    tx_id: H256,
+    parent_trace_id: String,
+    pos_in_parent_trace: usize,
+    node: &CallTraceNode,
+    nodes: &Vec<CallTraceNode>,
+) -> DebankTraceNode {
+    let mut debank_node = DebankTraceNode {
+        trace: node.into(),
+        children: Vec::new(),
+    };
+
+    debank_node.trace.parent_trace_id = parent_trace_id;
+    debank_node.trace.pos_in_parent_trace = pos_in_parent_trace;
+    debank_node.trace.tx_id = tx_id;
+    debank_node.trace.id = debank_node.trace.debank_id();
+
+    let id = debank_node.trace.id.clone();
+    let contract_id = node.execution_address();
+
+    for pos in node.ordering.iter() {
+        match &pos {
+            TraceMemberOrder::Call(i) => {
+                let child_node = &nodes[node.children[*i]];
+                if !child_node.trace.success {
+                    continue;
+                }
+                let child_trace = build_trace_node(
+                    tx_id,
+                    id.clone(),
+                    debank_node.children.len(),
+                    child_node,
+                    nodes,
+                );
+                if child_trace.trace.storage_change {
+                    debank_node.trace.storage_change = true;
+                }
+                debank_node
+                    .children
+                    .push(DebankTraceOrLog::Trace(child_trace));
+            }
+            TraceMemberOrder::Log(i) => {
+                let mut child_event: DebankEvent = (&node.logs[*i]).into();
+                child_event.pos_in_parent_trace = debank_node.children.len();
+                child_event.contract_id = contract_id;
+                child_event.tx_id = tx_id;
+                child_event.parent_trace_id = id.clone();
+                child_event.id = child_event.debank_id();
+                debank_node
+                    .children
+                    .push(DebankTraceOrLog::Log(child_event));
+            }
+            _ => {}
+        }
+    }
+    debank_node
+}
+
+fn finish_build_traces(
+    node: &mut DebankTraceNode,
+    traces: &mut Vec<DebankTrace>,
+    events: &mut Vec<DebankEvent>,
+) {
+    traces.push(node.trace.clone());
+    for child in node.children.iter_mut() {
+        match child {
+            DebankTraceOrLog::Trace(trace) => {
+                trace.trace.parent_trace_id = node.trace.id.clone();
+                finish_build_traces(trace, traces, events);
+            }
+            DebankTraceOrLog::Log(log) => {
+                events.push(log.clone());
+            }
+        }
+    }
+}
+
+pub(crate) fn build_debank_traces(
+    tx_id: H256,
+    traces: CallTraceArena,
+) -> (Vec<DebankTrace>, Vec<DebankEvent>) {
+    let nodes = traces.into_nodes();
+    if nodes.is_empty() {
+        return (vec![], vec![]);
+    }
+    let mut top = build_trace_node(tx_id, "".to_string(), 0, &nodes[0], &nodes);
+    let mut traces = vec![];
+    let mut events = vec![];
+    finish_build_traces(&mut top, &mut traces, &mut events);
+    return (traces, events);
 }
