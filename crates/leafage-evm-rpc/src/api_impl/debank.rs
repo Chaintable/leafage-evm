@@ -720,12 +720,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
                             .with_db(&mut memory_db)
                             .with_env_with_handler_cfg(env)
                             .build();
-                        let exec_res = evm.transact().map_err(|e| {
-                            rpc_error_with_code(
-                                DebankErrorCode::InternalError as i32,
-                                e.to_string(),
-                            )
-                        })?;
+                        let exec_res = evm.transact().map_err(|e| Self::evm_to_debank_error(e))?;
                         if exec_res.result.is_success() {
                             return Ok(U256::from(MIN_TRANSACTION_GAS));
                         }
@@ -831,9 +826,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
                 .with_env_with_handler_cfg(env.clone())
                 .build()
                 .transact()
-                .map_err(|e| {
-                    rpc_error_with_code(DebankErrorCode::InternalError as i32, e.to_string())
-                })?;
+                .map_err(|e| Self::evm_to_debank_error(e))?;
             gas_used = res.result.gas_used();
             update_estimated_gas_range(
                 &res.result,
