@@ -634,7 +634,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         Ok(DebankSimulateResp { stats, results })
     }
 
-    async fn estimate_gas(
+    async fn debank_estimate_gas_impl(
         &self,
         request: CallRequest,
         block_ctx: Option<DebankBlockContext>,
@@ -993,6 +993,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static>
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
-        self.estimate_gas(request, block_ctx, block_overrides).await
+        self.debank_estimate_gas_impl(request, block_ctx, block_overrides)
+            .await
     }
 }
