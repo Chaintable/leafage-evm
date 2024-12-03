@@ -58,4 +58,12 @@ pub trait DebankApi {
 
     #[method(name = "blockIsValid")]
     async fn block_is_valid(&self, id: H256) -> RpcResult<bool>;
+
+    #[method(name = "estimateGas")]
+    async fn estimate_gas(
+        &self,
+        request: CallRequest,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<U256>;
 }
