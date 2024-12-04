@@ -4,6 +4,7 @@ use crate::metrics::{
     STORAGE_CACHE_MISS,
 };
 use crate::snapshot::error::Error;
+use alloy::network::TransactionResponse;
 use leafage_evm_types::{AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256};
 use quick_cache::sync::Cache;
 use std::collections::{HashMap, VecDeque};
@@ -381,12 +382,7 @@ impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
     fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
         let block_info = self.block_info_arc()?;
         for tx in block_info.transactions.txns() {
-            #[cfg(not(feature = "optimism"))]
-            if tx.hash == tx_hash {
-                return Ok(Some(tx.clone()));
-            }
-            #[cfg(feature = "optimism")]
-            if tx.inner.hash == tx_hash {
+            if tx.tx_hash() == tx_hash {
                 return Ok(Some(tx.clone()));
             }
         }
@@ -404,12 +400,7 @@ impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
                 return Ok(tx);
             }
             for tx in txns {
-                #[cfg(not(feature = "optimism"))]
-                if tx.hash == tx_context.transaction_hash {
-                    return Ok(Some(tx.clone()));
-                }
-                #[cfg(feature = "optimism")]
-                if tx.inner.hash == tx_context.transaction_hash {
+                if tx.tx_hash() == tx_context.transaction_hash {
                     return Ok(Some(tx.clone()));
                 }
             }

@@ -5,7 +5,7 @@ use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex,
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, StateDB, TransactionIndex,
 };
 use leafage_evm_types::{
     block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
@@ -14,7 +14,9 @@ use leafage_evm_types::{
     HaltReason, MultiCallErrorCode, Transaction, TransactionInfo, H256, U256,
 };
 use revm::db::{CacheDB, DatabaseRef};
-use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult, SpecId};
+use revm::primitives::{
+    CfgEnv, EVMError, EnvWithHandlerCfg, ExecutionResult, InvalidTransaction, SpecId, TransactTo,
+};
 use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
@@ -22,7 +24,55 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
+pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
+
+pub const CALL_STIPEND_GAS: u64 = 2_300;
+
+pub const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
+
 impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
+    pub fn evm_to_debank_error(
+        res: EVMError<<<DB as EvmStorageRead>::StateDB as StateDB>::Error>,
+    ) -> jsonrpsee::types::ErrorObjectOwned {
+        match res {
+            e => match e {
+                EVMError::Database(e) => {
+                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+                }
+                EVMError::Header(e) => {
+                    rpc_error_with_code(DebankErrorCode::InvalidParams as i32, e.to_string())
+                }
+                EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { .. }) => {
+                    rpc_error_with_code(
+                        DebankErrorCode::BalanceExhausted as i32,
+                        "Insufficient funds".to_string(),
+                    )
+                }
+                EVMError::Transaction(InvalidTransaction::CallerGasLimitMoreThanBlock) => {
+                    rpc_error_with_code(
+                        DebankErrorCode::InvalidParams as i32,
+                        "Caller gas limit more than block".to_string(),
+                    )
+                }
+                EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit) => {
+                    rpc_error_with_code(
+                        DebankErrorCode::GasExhausted as i32,
+                        "Invalid gas limit".to_string(),
+                    )
+                }
+                EVMError::Transaction(
+                    InvalidTransaction::NonceOverflowInTransaction
+                    | InvalidTransaction::NonceTooHigh { .. }
+                    | InvalidTransaction::NonceTooLow { .. },
+                ) => rpc_error_with_code(
+                    DebankErrorCode::NonceError as i32,
+                    "Invalid nonce".to_string(),
+                ),
+                e => rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e.to_string()),
+            },
+        }
+    }
+
     fn debank_get_state_by_ctx_impl(
         &self,
         block_ctx: Option<DebankBlockContext>,
@@ -274,9 +324,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
                 .with_ref_db(db)
                 .with_env_with_handler_cfg(env)
                 .build();
-            let res = evm.transact().map_err(|e| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-            })?;
+            let res = evm.transact().map_err(|e| Self::evm_to_debank_error(e))?;
             let mut res = match res.result {
                 ExecutionResult::Success {
                     output, gas_used, ..
@@ -537,7 +585,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
                 .build();
             let exec_res = evm
                 .transact_commit()
-                .map_err(|e| internal_rpc_err(e.to_string()))?;
+                .map_err(|e| Self::evm_to_debank_error(e))?;
             drop(evm);
             match exec_res {
                 ExecutionResult::Revert { gas_used, output } => {
@@ -584,6 +632,277 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
             }
         }
         Ok(DebankSimulateResp { stats, results })
+    }
+
+    async fn debank_estimate_gas_impl(
+        &self,
+        request: CallRequest,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<U256> {
+        let mut cfg = self.cfg.clone();
+        cfg.disable_eip3607 = true;
+        cfg.disable_base_fee = true;
+        cfg.disable_block_gas_limit = true;
+
+        let spec_id = self.spec_id;
+
+        let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
+        let block = state.block_info_arc().map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+
+        let (tx, rx) = oneshot::channel();
+
+        tokio::task::spawn_blocking(move || {
+            let rsp = Self::debank_estimate_gas_many(
+                request,
+                cfg,
+                spec_id,
+                state,
+                block,
+                block_overrides,
+            );
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send multi_call result: {:?}", e);
+            }
+        });
+
+        let rsp = rx
+            .await
+            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
+        rsp
+    }
+
+    fn debank_estimate_gas_many(
+        mut request: CallRequest,
+        cfg: CfgEnv,
+        spec_id: SpecId,
+        state: DB::StateDB,
+        block: Arc<Block<Transaction>>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<U256> {
+        // set nonce to None so that the correct nonce is chosen by the EVM
+        request.nonce = None;
+        let mut block_env = block_env_from_block(&block);
+        // Keep a copy of gas related request values
+        let tx_request_gas_limit = request.gas;
+        // the gas limit of the corresponding block
+        let block_env_gas_limit = block.header.gas_limit;
+        let mut highest_gas_limit = tx_request_gas_limit
+            .map(|tx_gas_limit| {
+                if tx_gas_limit > block_env_gas_limit {
+                    tx_gas_limit
+                } else {
+                    block_env_gas_limit
+                }
+            })
+            .unwrap_or(block_env_gas_limit);
+        let mut memory_db = CacheDB::new(EvmStorageWrapper(state));
+        let cfg = get_handler_cfg(cfg, spec_id);
+        if let Some(overrides) = block_overrides.clone() {
+            super::utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
+        }
+        let tx = create_txn_env(&block_env, request)?;
+        let mut env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx);
+        if env.tx.data.is_empty() {
+            if let TransactTo::Call(to) = env.tx.transact_to {
+                if let Ok(account) = memory_db.basic_ref(to) {
+                    let no_code_callee = account
+                        .map(|account| {
+                            account.is_empty_code_hash() || account.code_hash().is_zero()
+                        })
+                        .unwrap_or(true);
+                    if no_code_callee {
+                        let mut env = env.clone();
+                        env.tx.gas_limit = MIN_TRANSACTION_GAS;
+                        let mut evm = Evm::builder()
+                            .with_db(&mut memory_db)
+                            .with_env_with_handler_cfg(env)
+                            .build();
+                        let exec_res = evm.transact().map_err(|e| Self::evm_to_debank_error(e))?;
+                        if exec_res.result.is_success() {
+                            return Ok(U256::from(MIN_TRANSACTION_GAS));
+                        }
+                    }
+                }
+            }
+        }
+        if env.tx.gas_price > U256::ZERO {
+            let caller = memory_db.basic_ref(env.tx.caller).map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+            })?;
+            let balance = caller
+                .map(|acc| acc.balance)
+                .unwrap_or_default()
+                .checked_sub(env.tx.value)
+                .ok_or_else(|| {
+                    rpc_error_with_code(
+                        DebankErrorCode::BalanceExhausted as i32,
+                        "Insufficient funds".to_string(),
+                    )
+                })?;
+            let gas_limit: u64 = balance
+                .checked_div(env.tx.gas_price)
+                .unwrap_or_default()
+                .try_into()
+                .unwrap();
+            highest_gas_limit = highest_gas_limit.min(gas_limit);
+        }
+
+        env.tx.gas_limit = env.tx.gas_limit.min(highest_gas_limit);
+
+        let res = Evm::builder()
+            .with_db(&mut memory_db)
+            .with_env_with_handler_cfg(env.clone())
+            .build()
+            .transact()
+            .map_err(|e| Self::evm_to_debank_error(e))?;
+
+        let gas_refund = match res.result {
+            ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
+            ExecutionResult::Halt { reason, .. } => {
+                let code = match reason {
+                    HaltReason::OutOfFunds => DebankErrorCode::BalanceExhausted,
+                    HaltReason::NonceOverflow => DebankErrorCode::NonceError,
+                    HaltReason::OutOfGas(_) => DebankErrorCode::GasExhausted,
+                    _ => DebankErrorCode::EvmFailed,
+                };
+                return Err(rpc_error_with_code(
+                    code as i32,
+                    format!("Halted: {:?}", reason),
+                ));
+            }
+            ExecutionResult::Revert { output, .. } => {
+                let reason = decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::EvmRevert as i32,
+                    reason,
+                ));
+            }
+        };
+
+        highest_gas_limit = env.tx.gas_limit;
+        let mut gas_used = res.result.gas_used();
+        let mut lowest_gas_limit = gas_used.saturating_sub(1);
+
+        let optimistic_gas_limit = (gas_used + gas_refund + CALL_STIPEND_GAS) * 64 / 63;
+
+        fn update_estimated_gas_range(
+            result: &ExecutionResult,
+            tx_gas_limit: u64,
+            highest_gas_limit: &mut u64,
+            lowest_gas_limit: &mut u64,
+        ) -> RpcResult<()> {
+            match result {
+                ExecutionResult::Success { .. } => {
+                    // Cap the highest gas limit with the succeeding gas limit.
+                    *highest_gas_limit = tx_gas_limit;
+                }
+                ExecutionResult::Revert { .. } => {
+                    // Increase the lowest gas limit.
+                    *lowest_gas_limit = tx_gas_limit;
+                }
+                ExecutionResult::Halt { reason, .. } => match reason {
+                    HaltReason::OutOfGas(_) | HaltReason::InvalidFEOpcode => {
+                        *lowest_gas_limit = tx_gas_limit;
+                    }
+                    err => {
+                        return Err(rpc_error_with_code(
+                            DebankErrorCode::InternalError as i32,
+                            format!("Halted: {:?}", err),
+                        ))
+                    }
+                },
+            };
+
+            Ok(())
+        }
+
+        if optimistic_gas_limit < highest_gas_limit {
+            env.tx.gas_limit = optimistic_gas_limit;
+            let res = Evm::builder()
+                .with_db(&mut memory_db)
+                .with_env_with_handler_cfg(env.clone())
+                .build()
+                .transact()
+                .map_err(|e| Self::evm_to_debank_error(e))?;
+            gas_used = res.result.gas_used();
+            update_estimated_gas_range(
+                &res.result,
+                optimistic_gas_limit,
+                &mut highest_gas_limit,
+                &mut lowest_gas_limit,
+            )?;
+        };
+
+        // Pick a point that's close to the estimated gas
+        let mut mid_gas_limit = std::cmp::min(
+            gas_used * 3,
+            ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
+        );
+
+        while (highest_gas_limit - lowest_gas_limit) > 1 {
+            if (highest_gas_limit - lowest_gas_limit) as f64 / (highest_gas_limit as f64)
+                < ESTIMATE_GAS_ERROR_RATIO
+            {
+                break;
+            };
+
+            env.tx.gas_limit = mid_gas_limit;
+
+            let res = Evm::builder()
+                .with_db(&mut memory_db)
+                .with_env_with_handler_cfg(env.clone())
+                .build()
+                .transact();
+
+            match res {
+                Err(EVMError::Transaction(invaild_tx_err)) => match invaild_tx_err {
+                    InvalidTransaction::CallerGasLimitMoreThanBlock => {
+                        highest_gas_limit = mid_gas_limit;
+                    }
+                    InvalidTransaction::CallGasCostMoreThanGasLimit => {
+                        lowest_gas_limit = mid_gas_limit;
+                    }
+                    e => {
+                        return Err(rpc_error_with_code(
+                            DebankErrorCode::EvmFailed as i32,
+                            format!("Invalid transaction: {:?}", e),
+                        ))
+                    }
+                },
+                Err(EVMError::Database(e)) => {
+                    return Err(rpc_error_with_code(
+                        DebankErrorCode::DataBaseFailed as i32,
+                        e.to_string(),
+                    ))
+                }
+                Err(EVMError::Header(e)) => {
+                    return Err(rpc_error_with_code(
+                        DebankErrorCode::InvalidParams as i32,
+                        e.to_string(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(rpc_error_with_code(
+                        DebankErrorCode::InternalError as i32,
+                        e.to_string(),
+                    ))
+                }
+                Ok(res) => {
+                    update_estimated_gas_range(
+                        &res.result,
+                        mid_gas_limit,
+                        &mut highest_gas_limit,
+                        &mut lowest_gas_limit,
+                    )?;
+                }
+            };
+
+            mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
+        }
+        Ok(U256::from(highest_gas_limit))
     }
 }
 
@@ -659,5 +978,15 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static>
 
     async fn block_is_valid(&self, id: H256) -> RpcResult<bool> {
         self.block_is_valid_impl(id)
+    }
+
+    async fn estimate_gas(
+        &self,
+        request: CallRequest,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<U256> {
+        self.debank_estimate_gas_impl(request, block_ctx, block_overrides)
+            .await
     }
 }
