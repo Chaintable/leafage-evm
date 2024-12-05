@@ -62,3 +62,10 @@ pub struct EtcdRegisterConfig {
     pub lease_ttl_s: i64,
     pub meta: String,
 }
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeInfo {
+    pub meta: String,
+    pub node_type: u64,
+}

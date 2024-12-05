@@ -1,4 +1,4 @@
-use super::utils::EtcdRegisterConfig;
+use super::utils::{EtcdRegisterConfig, NodeInfo};
 use anyhow::{bail, Ok, Result};
 use etcd_client::{Client, PutOptions};
 use std::time::Duration;
@@ -13,7 +13,11 @@ pub struct Register {
 }
 
 impl Register {
-    pub async fn new(chain_id: u64, etcd_cfg: EtcdRegisterConfig) -> Result<Self> {
+    pub async fn new(
+        chain_id: u64,
+        etcd_cfg: EtcdRegisterConfig,
+        is_archive: bool,
+    ) -> Result<Self> {
         let mut etcd_client = etcd_client::Client::connect(&etcd_cfg.endpoints, None).await?;
         let lease = etcd_client.lease_grant(etcd_cfg.lease_ttl_s, None).await?;
         let lease_id = lease.id();
@@ -22,10 +26,14 @@ impl Register {
             bail!("meta is empty");
         }
         let key = format!("replicaState/{chain_id}/node/{meta}");
+        let value = serde_json::to_string(&NodeInfo {
+            meta,
+            node_type: if is_archive { 2 } else { 1 },
+        })?;
         etcd_client
             .put(
                 key.clone(),
-                meta,
+                value,
                 Some(PutOptions::new().with_lease(lease_id)),
             )
             .await?;
@@ -66,9 +74,10 @@ impl Register {
 pub async fn register_build(
     chain_id: u64,
     etcd_cfg: Option<EtcdRegisterConfig>,
+    is_archive: bool,
 ) -> Result<watch::Sender<()>> {
     if let Some(etcd_cfg) = etcd_cfg {
-        let register = Register::new(chain_id, etcd_cfg).await?;
+        let register = Register::new(chain_id, etcd_cfg, is_archive).await?;
         let register_handle = register.start().await;
         Ok(register_handle)
     } else {
