@@ -206,7 +206,8 @@ impl Command {
         info!(target:"updater", "chain cfg: {:?}, spec_id: {:?}, archive: {:?}", chain_cfg, spec_id, self.archive);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
 
-        let resgitry_handle = register_build(chain_cfg.chain_id, self.etcd_config.clone()).await?;
+        let resgitry_handle =
+            register_build(chain_cfg.chain_id, self.etcd_config.clone(), self.archive).await?;
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
