@@ -1,4 +1,4 @@
-use super::utils::{EtcdRegisterConfig, NodeInfo};
+use super::utils::{EtcdRegisterConfig, NodeInfo, NodeType, StateType};
 use anyhow::{bail, Ok, Result};
 use etcd_client::{Client, PutOptions};
 use std::time::Duration;
@@ -25,10 +25,23 @@ impl Register {
         if meta.is_empty() {
             bail!("meta is empty");
         }
-        let key = format!("replicaState/{chain_id}/node/{meta}");
+        let ip_host = meta.split(":").collect::<Vec<&str>>();
+        if ip_host.len() != 2 {
+            bail!("meta format error");
+        }
+        let ip = ip_host[0];
+        let port = ip_host[1].parse::<u64>()?;
+        let chain_id_hex = format!("0x{:x}", chain_id);
+        let key = format!("{chain_id_hex}/nodes/{ip}_{port}");
         let value = serde_json::to_string(&NodeInfo {
-            meta,
-            node_type: if is_archive { 2 } else { 1 },
+            state_type: StateType::Delay as u64,
+            address: ip.to_string(),
+            port,
+            node_type: if is_archive {
+                NodeType::Archive
+            } else {
+                NodeType::State
+            } as u64,
         })?;
         etcd_client
             .put(
