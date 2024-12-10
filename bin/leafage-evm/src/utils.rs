@@ -66,6 +66,23 @@ pub struct EtcdRegisterConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
-    pub meta: String,
+    pub state_type: u64,
+    pub address: String,
+    pub port: u64,
     pub node_type: u64,
+}
+
+#[derive(Debug, Clone)]
+#[repr(u64)]
+pub enum StateType {
+    Latest = 1,
+    Delay = 2,
+    Offline = 3,
+}
+
+#[derive(Debug, Clone)]
+#[repr(u64)]
+pub enum NodeType {
+    State = 1,
+    Archive = 2,
 }
