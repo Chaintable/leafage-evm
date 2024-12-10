@@ -31,7 +31,8 @@ impl Register {
         }
         let ip = ip_host[0];
         let port = ip_host[1].parse::<u64>()?;
-        let key = format!("replicaState/{chain_id}/node/{ip}_{port}");
+        let chain_id_hex = format!("0x{:x}", chain_id);
+        let key = format!("{chain_id_hex}/nodes/{ip}_{port}");
         let value = serde_json::to_string(&NodeInfo {
             state_type: StateType::Delay as u64,
             address: ip.to_string(),

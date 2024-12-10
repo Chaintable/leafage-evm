@@ -74,6 +74,7 @@ pub struct NodeInfo {
 
 #[derive(Debug, Clone)]
 #[repr(u64)]
+#[allow(dead_code)]
 pub enum StateType {
     Latest = 1,
     Delay = 2,
