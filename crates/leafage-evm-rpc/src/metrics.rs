@@ -14,7 +14,7 @@ pub static RPC_PROCESSING_TIME: Lazy<HistogramVec> = Lazy::new(|| {
         "leafage_rpc_processing_time",
         "Time taken to process rpc queries",
         &["method"],
-        Some(exponential_buckets(0.0001, 1.5, 32).unwrap()),
+        Some(exponential_buckets(0.001, 1.5, 16).unwrap()),
     )
     .unwrap()
 });
