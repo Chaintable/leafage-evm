@@ -50,7 +50,7 @@ impl Register {
                 Some(PutOptions::new().with_lease(lease_id)),
             )
             .await?;
-        info!(target: "register", "register {key} success");
+        info!(target: "register", "register key:{key}, lease_id: {lease_id} success");
         Ok(Self {
             etcd_cfg,
             etcd_client,
