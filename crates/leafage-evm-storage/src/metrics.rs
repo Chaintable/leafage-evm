@@ -9,7 +9,7 @@ pub(crate) static DATABASE_OP_LATENCY_HIST: Lazy<HistogramVec> = Lazy::new(|| {
         "leafage_database_op_latency_by_op_and_column",
         "Database operations latency by operation and column.",
         &["op", "column"],
-        Some(exponential_buckets(0.00005, 1.5, 20).unwrap()),
+        Some(exponential_buckets(0.00002, 1.5, 24).unwrap()),
     )
     .unwrap()
 });
