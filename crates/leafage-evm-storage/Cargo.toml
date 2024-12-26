@@ -20,11 +20,12 @@ anyhow.workspace = true
 serde_json.workspace = true
 rocksdb = { workspace = true, optional = true, features = ["jemalloc"] }
 quick_cache.workspace = true
-prometheus.workspace = true
 once_cell.workspace = true
 alloy-rlp.workspace = true
 alloy-rlp-derive.workspace = true
 alloy.workspace = true
+metrics.workspace = true
+metrics-derive.workspace = true
 
 [features]
 default = []

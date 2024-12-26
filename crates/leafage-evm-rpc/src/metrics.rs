@@ -3,30 +3,7 @@ use futures::FutureExt;
 use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::server::MethodResponse;
 use jsonrpsee::types::Request;
-use leafage_evm_types::{
-    exponential_buckets, try_create_histogram_vec, try_create_int_counter_vec,
-};
-use once_cell::sync::Lazy;
-use prometheus::{HistogramVec, IntCounterVec};
-
-pub static RPC_PROCESSING_TIME: Lazy<HistogramVec> = Lazy::new(|| {
-    try_create_histogram_vec(
-        "leafage_rpc_processing_time",
-        "Time taken to process rpc queries",
-        &["method"],
-        Some(exponential_buckets(0.001, 1.5, 24).unwrap()),
-    )
-    .unwrap()
-});
-
-pub static RPC_REQUEST_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    try_create_int_counter_vec(
-        "leafage_rpc_total_count",
-        "Total count of HTTP RPC requests received, by method",
-        &["method", "status"],
-    )
-    .unwrap()
-});
+use metrics::{counter, histogram};
 
 #[derive(Debug)]
 pub struct RpcMetric<S> {
@@ -43,18 +20,26 @@ where
         let service = self.service.clone();
         async move {
             let method_name = req.method_name().to_string();
-            let timer = RPC_PROCESSING_TIME
-                .with_label_values(&[method_name.as_str()])
-                .start_timer();
+            let start = std::time::Instant::now();
+            let call_time_metric = histogram!(
+                "leafage_rpc_call_time",
+                &[("method_name", method_name.clone())]
+            );
             let rsp = service.call(req).await;
-            timer.observe_duration();
+            let duration = start.elapsed().as_secs_f64();
+            call_time_metric.record(duration);
             let mut return_code = 0;
             if let Some(code) = rsp.as_error_code() {
                 return_code = code
-            }
-            RPC_REQUEST_COUNT
-                .with_label_values(&[method_name.as_str(), return_code.to_string().as_str()])
-                .inc();
+            };
+            let call_status_metric = counter!(
+                "leafage_rpc_call_status",
+                &[
+                    ("method_name", method_name.clone()),
+                    ("return_code", format!("{}", return_code))
+                ]
+            );
+            call_status_metric.increment(1);
             rsp
         }
         .boxed()

@@ -17,13 +17,14 @@ jsonrpsee.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tower.workspace = true
-prometheus.workspace = true
 once_cell.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 alloy.workspace = true
 alloy-rlp.workspace = true
+metrics.workspace = true
+metrics-derive.workspace = true
 
 [features]
 default = []

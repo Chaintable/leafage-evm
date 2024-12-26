@@ -22,8 +22,7 @@
 //! - `get_transaction_by_context`
 
 use crate::db::{ArchiveDBProvider, BlockRead, StateDBRead, StateDBWrite};
-use crate::interface::MetricsReport;
-use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
+use crate::metrics::STORAGE_METRICS;
 use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
@@ -31,9 +30,10 @@ use leafage_evm_types::{
     Transaction, H256, KECCAK_EMPTY, U256,
 };
 use rocksdb::{
-    properties, BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor,
-    DBRawIteratorWithThreadMode, Options, ReadOptions, WriteBatch, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRawIteratorWithThreadMode,
+    Options, ReadOptions, WriteBatch, DB,
 };
+use std::fmt::Display;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -105,9 +105,15 @@ impl StorageTypeColumn {
     }
 }
 
+impl Display for StorageTypeColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_display())
+    }
+}
+
 #[derive(Debug)]
 struct DataBaseInner {
-    cols: Vec<(StorageTypeColumn, NonNull<ColumnFamily>)>,
+    _cols: Vec<(StorageTypeColumn, NonNull<ColumnFamily>)>,
     db: DB,
 }
 
@@ -270,30 +276,9 @@ impl DataBaseRef {
                 .unwrap(),
             ),
         ];
-        unsafe { DATA_BASE = Some(DataBaseInner { cols, db }) }
+        unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
         Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
-        }
-    }
-
-    fn get_inner_ref(&self) -> &DataBaseInner {
-        unsafe { DATA_BASE.as_ref().unwrap() }
-    }
-}
-
-impl MetricsReport for DataBaseRef {
-    fn report_cache_usage(&self) {
-        for (col, column_family) in self.get_inner_ref().cols.iter() {
-            let handle = unsafe { column_family.as_ref() };
-            let prop = self
-                .get_inner_ref()
-                .db
-                .property_int_value_cf(handle, properties::BLOCK_CACHE_USAGE);
-            if let Ok(Some(prop)) = prop {
-                DATABASE_CACHE_USAGE
-                    .with_label_values(&[col.to_display()])
-                    .set(prop as i64);
-            }
         }
     }
 }
@@ -302,9 +287,7 @@ impl BlockRead for DataBaseRef {
     type Error = Error;
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
@@ -315,7 +298,9 @@ impl BlockRead for DataBaseRef {
             block_num_bytes,
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_block_hash_latency
+            .record(start.elapsed().as_secs_f64());
         if block_hash_bytes.is_none() {
             return Ok(H256::ZERO);
         }
@@ -325,9 +310,7 @@ impl BlockRead for DataBaseRef {
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::BlockHashToBlockInfo.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
@@ -338,7 +321,9 @@ impl BlockRead for DataBaseRef {
             block_hash_bytes,
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_block_latency
+            .record(start.elapsed().as_secs_f64());
         if block_info_bytes.is_none() {
             return Ok(None);
         }
@@ -356,9 +341,7 @@ impl BlockRead for DataBaseRef {
     }
 
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let latest_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -368,7 +351,9 @@ impl BlockRead for DataBaseRef {
             [1u8].to_vec(),
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_latest_block_hash_latency
+            .record(start.elapsed().as_secs_f64());
         if block_hash_bytes.is_none() {
             return Ok(H256::ZERO);
         }
@@ -502,9 +487,7 @@ impl StateDBRead for StateDB {
     type Error = Error;
 
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::AddressToAccount.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
         if self.block_num == u64::MAX {
@@ -518,7 +501,9 @@ impl StateDBRead for StateDB {
                 [address_bytes.as_ref(), &block_num_bytes].concat(),
                 &rocksdb_read_options(),
             )?;
-            timer.observe_duration();
+            STORAGE_METRICS
+                .read_account_latency
+                .record(start.elapsed().as_secs_f64());
             if raw_account_bytes.is_none() {
                 return Ok(None);
             }
@@ -539,7 +524,9 @@ impl StateDBRead for StateDB {
         }
         let mut account_iter = self.account_iterator.as_ref().unwrap().lock().unwrap();
         account_iter.seek_for_prev([address_bytes.as_ref(), &block_num_bytes].concat());
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_account_latency
+            .record(start.elapsed().as_secs_f64());
         if let Some(raw_key_bytes) = account_iter.key() {
             if address_bytes != raw_key_bytes[..32] {
                 return Ok(None);
@@ -566,9 +553,7 @@ impl StateDBRead for StateDB {
     }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::AddressToStorage.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let key_bytes: [u8; 32] = key.into();
         let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
@@ -583,7 +568,9 @@ impl StateDBRead for StateDB {
                 [address_bytes.as_ref(), &key_bytes, &block_num_bytes].concat(),
                 &rocksdb_read_options(),
             )?;
-            timer.observe_duration();
+            STORAGE_METRICS
+                .read_storage_latency
+                .record(start.elapsed().as_secs_f64());
             if value_bytes.is_none() {
                 return Ok(U256::ZERO);
             }
@@ -594,7 +581,9 @@ impl StateDBRead for StateDB {
         let mut storage_iter = self.storage_iterator.as_ref().unwrap().lock().unwrap();
         storage_iter
             .seek_for_prev([address_bytes.as_ref(), key_bytes.as_ref(), &block_num_bytes].concat());
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_storage_latency
+            .record(start.elapsed().as_secs_f64());
         if let Some(raw_key_bytes) = storage_iter.key() {
             if address_bytes != raw_key_bytes[..32] {
                 return Ok(U256::ZERO);
@@ -614,9 +603,7 @@ impl StateDBRead for StateDB {
     }
 
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::HashToCode.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let address_to_code_cf = self
             .db
             .db
@@ -627,7 +614,9 @@ impl StateDBRead for StateDB {
             self.db
                 .db
                 .get_cf_opt(address_to_code_cf, code_hash_bytes, &rocksdb_read_options())?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_code_latency
+            .record(start.elapsed().as_secs_f64());
         if code.is_none() {
             return Ok(None);
         }
@@ -823,11 +812,7 @@ impl StateDBWrite for StateDB {
     }
 
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["write", "all"])
-            .start_timer();
         self.db.db.write(batch)?;
-        timer.observe_duration();
         Ok(())
     }
 }

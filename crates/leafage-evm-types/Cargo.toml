@@ -13,7 +13,6 @@ alloy = { workspace = true, features = ["rpc-types-trace", "getrandom"] }
 revm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-prometheus.workspace = true
 alloy-rlp.workspace = true
 alloy-rlp-derive.workspace = true
 op-alloy-rpc-types = { workspace = true, optional = true }
