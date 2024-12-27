@@ -25,4 +25,6 @@ pub struct StorageMetrics {
     pub commit_block_latency: Histogram,
     /// latest commit block.
     pub latest_commit_block: Gauge,
+    /// latest memory block.
+    pub latest_memory_block: Gauge,
 }
