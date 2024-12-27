@@ -1,5 +1,4 @@
 use crate::initializer::initialize_check;
-use crate::metrics;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
@@ -201,18 +200,19 @@ impl Command {
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
-        tokio::sync::watch::Sender<()>,
     )> {
         info!(target:"updater", "chain cfg: {:?}, spec_id: {:?}, archive: {:?}", chain_cfg, spec_id, self.archive);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
-
+        if !self.prometheus_addr.is_empty() {
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
+                .install()?;
+        }
         let resgitry_handle =
             register_build(chain_cfg.chain_id, self.etcd_config.clone(), self.archive).await?;
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
-                let metrics_handle =
-                    metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
                 let tree = Arc::new(SnapshotTree::new(
                     StateDBWrapper(db),
                     SnapshotTreeConfig::new(
@@ -234,15 +234,13 @@ impl Command {
                     self.diff_depth_limit,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, metrics_handle, resgitry_handle))
+                Ok((updater_handle, rpc_handle, resgitry_handle))
             }
             "rocksdb" if self.archive => {
                 let db = Arc::new(ArchiveRocksDBStorage::open(
                     self.db_path.as_path(),
                     self.db_cache,
                 ));
-                let metrics_handle =
-                    metrics::prometheus_build(db.clone(), self.prometheus_addr.clone());
                 // check if db shoud be initialized
                 initialize_check(
                     db.clone(),
@@ -272,13 +270,13 @@ impl Command {
                     self.diff_depth_limit,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, metrics_handle, resgitry_handle))
+                Ok((updater_handle, rpc_handle, resgitry_handle))
             }
             _ => bail!("only support rocksdb"),
         }
     }
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, metrics_handle, resgitry_handle) = self
+        let (updater_handle, rpc_handle, resgitry_handle) = self
             .start(
                 self.chain_cfg.clone(),
                 SpecId::try_from_u8(self.spec_id).unwrap_or(SpecId::LATEST),
@@ -288,7 +286,6 @@ impl Command {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = rpc_handle.stop();
-            let _ = metrics_handle.send(());
             let _ = resgitry_handle.send(());
             Ok(())
         })

@@ -37,7 +37,6 @@ tikv-jemalloc-sys = { version = "0.5.4", features = [
 ] }
 tower = { version = "0.4.13", features = ["full"] }
 quick_cache = "0.4.0"
-prometheus = "0.13.1"
 once_cell = "1.19.0"
 futures = "0.3.30"
 hyper = "0.14.28"
@@ -46,9 +45,10 @@ rdkafka = "0.36.2"
 aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
 flate2 = "1.0.34"
+etcd-client = "0.14"
+md-5 = "0.10.6"
 
-# eth
-
+# revm
 revm = { version = "18.0.0", features = [
     "std",
     "secp256k1",
@@ -60,14 +60,21 @@ revm = { version = "18.0.0", features = [
     "optional_block_gas_limit",
 ] }
 revm-inspectors = "0.11"
+
+# alloy
 alloy-chains = "0.1.23"
 alloy = { version = "0.6", features = ["full"] }
 alloy-rlp = "0.3"
 alloy-rlp-derive = "0.3"
-etcd-client = "0.14"
-md-5 = "0.10.6"
+
+# op
 op-alloy-rpc-types = "0.6"
 op-alloy-consensus = "0.6"
+
+# metrics
+metrics = "0.24.0"
+metrics-derive = "0.1"
+metrics-exporter-prometheus = { version = "0.16.0", default-features = false }
 
 [profile.release]
 opt-level = 3

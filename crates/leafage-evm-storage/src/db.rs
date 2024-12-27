@@ -1,3 +1,4 @@
+use crate::metrics::STORAGE_METRICS;
 use crate::{
     interface::{BlockContext, EvmStorageWrite, StateDB},
     EvmStorageRead,
@@ -168,6 +169,7 @@ where
         block_info: Block<Transaction>,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
+        let start = std::time::Instant::now();
         let mut batch = self.0.prepare_write_batch()?;
         let block_number = block_info.header.number;
         self.0
@@ -199,6 +201,10 @@ where
         }
         self.0.write_latest_block_hash(&mut batch, hash)?;
         self.0.commit(batch)?;
+        STORAGE_METRICS
+            .commit_block_latency
+            .record(start.elapsed().as_secs_f64());
+        STORAGE_METRICS.latest_commit_block.set(block_number as f64);
         Ok(())
     }
 

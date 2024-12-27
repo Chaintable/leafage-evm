@@ -1,58 +1,30 @@
-use leafage_evm_types::{
-    try_create_histogram_vec, try_create_int_counter, try_create_int_gauge_vec,
-};
-use once_cell::sync::Lazy;
-use prometheus::{HistogramVec, IntCounter, IntGaugeVec};
+use metrics::{Gauge, Histogram};
+use metrics_derive::Metrics;
+use std::sync::LazyLock;
 
-pub(crate) static DATABASE_OP_LATENCY_HIST: Lazy<HistogramVec> = Lazy::new(|| {
-    try_create_histogram_vec(
-        "leafage_database_op_latency_by_op_and_column",
-        "Database operations latency by operation and column.",
-        &["op", "column"],
-        Some(vec![
-            0.00002, 0.0001, 0.0002, 0.0005, 0.0008, 0.001, 0.002, 0.004, 0.008, 0.1,
-        ]),
-    )
-    .unwrap()
-});
+/// The metrics for the EVM storage.
+pub(crate) static STORAGE_METRICS: LazyLock<StorageMetrics> =
+    LazyLock::new(|| StorageMetrics::default());
 
-pub(crate) static BLOCK_PRODUCED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter(
-        "leafage_block_produced_total",
-        "Total number of blocks produced since starting this node",
-    )
-    .unwrap()
-});
-
-pub(crate) static DATABASE_CACHE_USAGE: Lazy<IntGaugeVec> = Lazy::new(|| {
-    try_create_int_gauge_vec(
-        "leafage_database_cache_usage",
-        "Database cache usage by column.",
-        &["column"],
-    )
-    .unwrap()
-});
-
-pub(crate) static ACCOUNT_CACHE_HIT: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter("leafage_account_cache_hit", "Account cache hit count.").unwrap()
-});
-
-pub(crate) static ACCOUNT_CACHE_MISS: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter("leafage_account_cache_miss", "Account cache miss count.").unwrap()
-});
-
-pub(crate) static STORAGE_CACHE_HIT: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter("leafage_storage_cache_hit", "Storage cache hit count.").unwrap()
-});
-
-pub(crate) static STORAGE_CACHE_MISS: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter("leafage_storage_cache_miss", "Storage cache miss count.").unwrap()
-});
-
-pub(crate) static CODE_CACHE_HIT: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter("leafage_code_cache_hit", "Code cache hit count.").unwrap()
-});
-
-pub(crate) static CODE_CACHE_MISS: Lazy<IntCounter> = Lazy::new(|| {
-    try_create_int_counter("leafage_code_cache_miss", "Code cache miss count.").unwrap()
-});
+#[derive(Metrics, Clone)]
+#[metrics(scope = "leafage_storage")]
+pub struct StorageMetrics {
+    /// Read block hash latency.
+    pub read_block_hash_latency: Histogram,
+    /// Read block latency.
+    pub read_block_latency: Histogram,
+    /// Read latest block hash latency.
+    pub read_latest_block_hash_latency: Histogram,
+    /// Read account latency.
+    pub read_account_latency: Histogram,
+    /// Read storage latency.
+    pub read_storage_latency: Histogram,
+    /// Read code latency.
+    pub read_code_latency: Histogram,
+    /// Commit block latency.
+    pub commit_block_latency: Histogram,
+    /// latest commit block.
+    pub latest_commit_block: Gauge,
+    /// latest memory block.
+    pub latest_memory_block: Gauge,
+}

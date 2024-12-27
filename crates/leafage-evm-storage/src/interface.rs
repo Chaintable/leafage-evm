@@ -134,9 +134,3 @@ pub trait EvmStorageWrite {
 
     fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error>;
 }
-
-/// [`MetricsReport`] is a trait that provides a way to report cache usage.
-#[auto_impl(&, Box, Arc)]
-pub trait MetricsReport {
-    fn report_cache_usage(&self);
-}

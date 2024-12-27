@@ -17,18 +17,18 @@
 //! All [`U256`] are big-endian encoded.
 
 use crate::db::{BlockRead, StateDBRead, StateDBWrite};
-use crate::interface::MetricsReport;
-use crate::metrics::{DATABASE_CACHE_USAGE, DATABASE_OP_LATENCY_HIST};
+use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
     Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK_EMPTY, U256,
 };
 use rocksdb::{
-    properties, BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options,
-    ReadOptions, WriteBatch, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
+    WriteBatch, DB,
 };
 use serde_json::{from_slice, to_vec};
 use std::env;
+use std::fmt::Display;
 use std::path::Path;
 use std::ptr::NonNull;
 use thiserror::Error;
@@ -89,9 +89,15 @@ impl StorageTypeColumn {
     }
 }
 
+impl Display for StorageTypeColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_display())
+    }
+}
+
 pub struct DataBase {
     db: DB,
-    cols: Vec<(StorageTypeColumn, NonNull<ColumnFamily>)>,
+    _cols: Vec<(StorageTypeColumn, NonNull<ColumnFamily>)>,
 }
 
 unsafe impl Send for DataBase {}
@@ -101,9 +107,7 @@ impl BlockRead for DataBase {
     type Error = Error;
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::BlockNumToBlockHash.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
@@ -114,7 +118,9 @@ impl BlockRead for DataBase {
             block_num_bytes,
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_block_hash_latency
+            .record(start.elapsed().as_secs_f64());
         if block_hash_bytes.is_none() {
             return Ok(H256::ZERO);
         }
@@ -124,9 +130,7 @@ impl BlockRead for DataBase {
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::BlockHashToBlockInfo.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
@@ -137,7 +141,9 @@ impl BlockRead for DataBase {
             block_hash_bytes,
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_block_latency
+            .record(start.elapsed().as_secs_f64());
         if block_info_bytes.is_none() {
             return Ok(None);
         }
@@ -148,9 +154,7 @@ impl BlockRead for DataBase {
     }
 
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::LatestBlockHash.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let latest_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -160,7 +164,9 @@ impl BlockRead for DataBase {
             [1u8].to_vec(),
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_latest_block_hash_latency
+            .record(start.elapsed().as_secs_f64());
         if block_hash_bytes.is_none() {
             return Ok(H256::ZERO);
         }
@@ -174,9 +180,7 @@ impl StateDBRead for DataBase {
     type Error = Error;
 
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::AddressToAccount.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let address_to_account_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -187,7 +191,9 @@ impl StateDBRead for DataBase {
             address_bytes,
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_account_latency
+            .record(start.elapsed().as_secs_f64());
         if raw_account_bytes.is_none() {
             return Ok(None);
         }
@@ -208,9 +214,7 @@ impl StateDBRead for DataBase {
     }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::AddressToStorage.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let address_to_storage_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
@@ -222,7 +226,9 @@ impl StateDBRead for DataBase {
             [address_bytes.as_ref(), &key_bytes].concat(),
             &rocksdb_read_options(),
         )?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_storage_latency
+            .record(start.elapsed().as_secs_f64());
         if value_bytes.is_none() {
             return Ok(U256::ZERO);
         }
@@ -232,9 +238,7 @@ impl StateDBRead for DataBase {
     }
 
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["read", StorageTypeColumn::HashToCode.to_display()])
-            .start_timer();
+        let start = std::time::Instant::now();
         let address_to_code_cf = self
             .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
@@ -243,7 +247,9 @@ impl StateDBRead for DataBase {
         let code =
             self.db
                 .get_cf_opt(address_to_code_cf, code_hash_bytes, &rocksdb_read_options())?;
-        timer.observe_duration();
+        STORAGE_METRICS
+            .read_code_latency
+            .record(start.elapsed().as_secs_f64());
         if code.is_none() {
             return Ok(None);
         }
@@ -380,11 +386,7 @@ impl StateDBWrite for DataBase {
     }
 
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
-        let timer = DATABASE_OP_LATENCY_HIST
-            .with_label_values(&["write", "all"])
-            .start_timer();
         self.db.write(batch)?;
-        timer.observe_duration();
         Ok(())
     }
 }
@@ -531,22 +533,6 @@ impl DataBase {
                 .unwrap(),
             ),
         ];
-        Self { db, cols }
-    }
-}
-
-impl MetricsReport for DataBase {
-    fn report_cache_usage(&self) {
-        for (col, column_family) in self.cols.iter() {
-            let handle = unsafe { column_family.as_ref() };
-            let prop = self
-                .db
-                .property_int_value_cf(handle, properties::BLOCK_CACHE_USAGE);
-            if let Ok(Some(prop)) = prop {
-                DATABASE_CACHE_USAGE
-                    .with_label_values(&[col.to_display()])
-                    .set(prop as i64);
-            }
-        }
+        Self { db, _cols: cols }
     }
 }
