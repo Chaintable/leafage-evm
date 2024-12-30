@@ -10,6 +10,7 @@ use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
 };
+use metrics::gauge;
 use revm::primitives::{CfgEnv, SpecId};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -207,6 +208,12 @@ impl Command {
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
                 .install()?;
+            let labels = [
+                ("chain_id", format!("{}", chain_cfg.chain_id)),
+                ("role", "replica".to_string()),
+            ];
+            let gauge = gauge!("pipeline_node_info", &labels);
+            gauge.set(1.0);
         }
         let resgitry_handle =
             register_build(chain_cfg.chain_id, self.etcd_config.clone(), self.archive).await?;
