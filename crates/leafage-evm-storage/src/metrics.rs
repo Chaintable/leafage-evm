@@ -27,4 +27,6 @@ pub struct StorageMetrics {
     pub latest_commit_block: Gauge,
     /// latest memory block.
     pub latest_memory_block: Gauge,
+    /// latest memory block timestamp
+    pub latest_memory_block_timestamp: Gauge,
 }
