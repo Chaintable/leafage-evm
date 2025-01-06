@@ -207,11 +207,9 @@ impl Command {
         if !self.prometheus_addr.is_empty() {
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
+                .add_global_label("chain_id", format!("{}", chain_cfg.chain_id))
                 .install()?;
-            let labels = [
-                ("chain_id", format!("{}", chain_cfg.chain_id)),
-                ("role", "replica".to_string()),
-            ];
+            let labels = [("role", "replica".to_string())];
             let gauge = gauge!("pipeline_node_info", &labels);
             gauge.set(1.0);
         }
