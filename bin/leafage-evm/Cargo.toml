@@ -33,6 +33,7 @@ aws-config.workspace = true
 flate2.workspace = true
 etcd-client.workspace = true
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
+metrics.workspace = true
 
 [features]
 default = ["with-rocksdb"]

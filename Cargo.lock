@@ -3097,6 +3097,7 @@ dependencies = [
  "leafage-evm-rpc",
  "leafage-evm-storage",
  "leafage-evm-types",
+ "metrics",
  "metrics-exporter-prometheus",
  "num_cpus",
  "rdkafka",
