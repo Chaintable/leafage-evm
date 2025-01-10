@@ -6,6 +6,9 @@ use std::sync::LazyLock;
 pub(crate) static STORAGE_METRICS: LazyLock<StorageMetrics> =
     LazyLock::new(|| StorageMetrics::default());
 
+/// The metrics for the latest block
+pub(crate) static BLOCK_METRICS: LazyLock<BlockMetrics> = LazyLock::new(|| BlockMetrics::default());
+
 #[derive(Metrics, Clone)]
 #[metrics(scope = "leafage_storage")]
 pub struct StorageMetrics {
@@ -25,8 +28,13 @@ pub struct StorageMetrics {
     pub commit_block_latency: Histogram,
     /// latest commit block.
     pub latest_commit_block: Gauge,
+}
+
+#[derive(Metrics, Clone)]
+#[metrics(scope = "pipeline")]
+pub struct BlockMetrics {
     /// latest memory block.
-    pub latest_memory_block: Gauge,
+    pub block_num: Gauge,
     /// latest memory block timestamp
-    pub latest_memory_block_timestamp: Gauge,
+    pub block_time: Gauge,
 }

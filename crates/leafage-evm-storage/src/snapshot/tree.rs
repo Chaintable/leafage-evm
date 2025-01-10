@@ -1,7 +1,7 @@
 use crate::interface::{
     BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex, TxContext,
 };
-use crate::metrics::STORAGE_METRICS;
+use crate::metrics::{BLOCK_METRICS, STORAGE_METRICS};
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
 use alloy::network::TransactionResponse;
@@ -193,11 +193,9 @@ where
                 info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.header.number, latest_block_info.header.number);
                 return Ok(());
             }
-            STORAGE_METRICS
-                .latest_memory_block
-                .set(block_info.header.number as f64);
-            STORAGE_METRICS
-                .latest_memory_block_timestamp
+            BLOCK_METRICS.block_num.set(block_info.header.number as f64);
+            BLOCK_METRICS
+                .block_time
                 .set(block_info.header.timestamp as f64);
             *self.latest.write().unwrap() = new_diff_layer.clone();
             let bottom_height = new_diff_layer.cap_diff_to_db(self.config.diff_tree_depth_limit)?;
