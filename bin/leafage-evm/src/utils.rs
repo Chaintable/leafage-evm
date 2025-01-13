@@ -60,6 +60,7 @@ pub struct EtcdRegisterConfig {
     pub endpoints: Vec<String>,
     pub keep_alive_interval_ms: u64,
     pub lease_ttl_s: i64,
+    #[serde(default)]
     pub meta: String,
 }
 

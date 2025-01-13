@@ -134,6 +134,13 @@ pub struct Command {
     /// This config is used to set the etcd register config.
     #[arg(long, value_parser = parse_etcd_config, value_name = "ETCD_CONFIG_PATH")]
     etcd_config: Option<EtcdRegisterConfig>,
+
+    /// The meta for node self
+    /// Default: None
+    ///
+    /// This meta is used to set the meta for node self.
+    #[arg(long, default_value = "")]
+    meta: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -213,8 +220,12 @@ impl Command {
             let gauge = gauge!("pipeline_node_info", &labels);
             gauge.set(1.0);
         }
+        let mut etcd_config = self.etcd_config.clone();
+        if etcd_config.is_some() && !self.meta.is_empty() {
+            etcd_config.as_mut().unwrap().meta = self.meta.clone();
+        }
         let resgitry_handle =
-            register_build(chain_cfg.chain_id, self.etcd_config.clone(), self.archive).await?;
+            register_build(chain_cfg.chain_id, etcd_config.clone(), self.archive).await?;
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
