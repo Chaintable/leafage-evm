@@ -8,7 +8,7 @@ use alloy::network::TransactionResponse;
 use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction, H256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Clone, Debug)]
 pub struct SnapshotTreeConfig {
@@ -199,7 +199,7 @@ where
                 .set(block_info.header.timestamp as f64);
             *self.latest.write().unwrap() = new_diff_layer.clone();
             let bottom_height = new_diff_layer.cap_diff_to_db(self.config.diff_tree_depth_limit)?;
-            info!(target:"storage", "clear diff map bottom_height: {:?}", bottom_height);
+            debug!(target:"storage", "clear diff map bottom_height: {:?}", bottom_height);
             self.clear_diff_map(bottom_height);
             Ok(())
         } else {

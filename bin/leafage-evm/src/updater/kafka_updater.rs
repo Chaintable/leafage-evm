@@ -197,7 +197,7 @@ where
         let block_change_notification: KafkaBlockChangeNotification =
             message.payload().unwrap().try_into()?;
 
-        info!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
+        debug!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
         for new_block in block_change_notification.new_blocks.iter() {
             let parent_block_info = self.get_block_info(new_block.parent_hash).await?;
             let block_info = self.get_block_info(new_block.hash).await?;
@@ -254,7 +254,7 @@ where
         // clear block context before presist block
         let presist_block = self.clear(presist_block_num, presist_block_hash);
         if let Some(presist_block) = presist_block {
-            info!(target:"updater", "clear block hash {}, block num {}", presist_block.block_info.header.hash, presist_block.block_info.header.number);
+            debug!(target:"updater", "clear block hash {}, block num {}", presist_block.block_info.header.hash, presist_block.block_info.header.number);
             write_offset(&self.kafka_s3_cfg.offset_dir, presist_block.offset + 1)?;
         }
         Ok(())
