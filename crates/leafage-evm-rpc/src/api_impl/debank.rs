@@ -268,7 +268,12 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
 
         let rsp = timeout(self.time_out, rx)
             .await
-            .map_err(|_| internal_rpc_err("MultiCall timed out".to_string()))? // 超时错误
+            .map_err(|_| {
+                rpc_error_with_code(
+                    DebankErrorCode::TimeOut as i32,
+                    "MultiCall timed out".to_string(),
+                )
+            })? // 超时错误
             .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?; // 发送失败错误
 
         rsp
