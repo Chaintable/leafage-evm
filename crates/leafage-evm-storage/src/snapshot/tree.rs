@@ -1,7 +1,7 @@
 use crate::interface::{
     BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex, TxContext,
 };
-use crate::metrics::{BLOCK_METRICS, STORAGE_METRICS};
+use crate::metrics::BLOCK_METRICS;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
 use alloy::network::TransactionResponse;

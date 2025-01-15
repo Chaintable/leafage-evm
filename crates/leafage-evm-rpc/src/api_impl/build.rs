@@ -48,6 +48,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 self.spec_id,
+                rpc_timeout / 2,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -60,6 +61,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 self.spec_id,
+                rpc_timeout / 2,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -72,6 +74,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 self.spec_id,
+                rpc_timeout / 2,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -85,6 +88,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 self.spec_id,
+                rpc_timeout / 2,
             )))
             .map_err(|e| {
                 std::io::Error::new(

@@ -69,4 +69,5 @@ pub enum DebankErrorCode {
     BlockNotFound = -39006,
     #[allow(dead_code)]
     InternalError = -32603,
+    TimeOut = -41002,
 }
