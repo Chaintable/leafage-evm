@@ -1,6 +1,6 @@
 use super::utils::{EtcdRegisterConfig, NodeInfo, NodeType, StateType};
 use anyhow::{bail, Ok, Result};
-use etcd_client::{Client, PutOptions};
+use etcd_client::{Client, LeaseKeepAliveStream, LeaseKeeper, PutOptions};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::interval;
@@ -15,6 +15,25 @@ pub struct Register {
 }
 
 impl Register {
+    async fn register(&mut self) -> Result<(LeaseKeeper, LeaseKeepAliveStream)> {
+        let lease = self
+            .etcd_client
+            .lease_grant(self.etcd_cfg.lease_ttl_s, None)
+            .await?;
+        let lease_id = lease.id();
+        self.lease_id = lease_id;
+        self.etcd_client
+            .put(
+                self.key.clone(),
+                self.value.clone(),
+                Some(PutOptions::new().with_lease(lease_id)),
+            )
+            .await?;
+        info!(target: "register", "register key:{}, lease_id: {} success",self.key,self.lease_id);
+        let (keeper, stream) = self.etcd_client.lease_keep_alive(self.lease_id).await?;
+        Ok((keeper, stream))
+    }
+
     pub async fn new(
         chain_id: u64,
         etcd_cfg: EtcdRegisterConfig,
@@ -44,14 +63,7 @@ impl Register {
                 NodeType::State
             } as u64,
         })?;
-        etcd_client
-            .put(
-                key.clone(),
-                value.clone(),
-                Some(PutOptions::new().with_lease(lease_id)),
-            )
-            .await?;
-        info!(target: "register", "register key:{key}, lease_id: {lease_id} success");
+
         Ok(Self {
             etcd_cfg,
             etcd_client,
@@ -65,48 +77,43 @@ impl Register {
         let (tx, mut rx) = watch::channel(());
         let keep_alive_interval = Duration::from_millis(self.etcd_cfg.keep_alive_interval_ms);
         let mut interval = interval(keep_alive_interval);
-        let (mut keeper, mut stream) = self.etcd_client.lease_keep_alive(self.lease_id).await?;
+        let (mut keeper, mut stream) = self.register().await?;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = rx.changed() => {
                         break;
                     }
+                    resp = stream.message() => {
+                        match resp {
+                            Result::Ok(Some(rsp)) => {
+                                debug!(target: "register", "lease {:?} keep alive, new ttl {:?}", rsp.id(), rsp.ttl());
+                            }
+                            Result::Ok(None) => {
+                                error!(target: "register", "lease {:?} keep alive, new ttl None", self.lease_id);
+                            }
+                            Result::Err(e) => {
+                                error!(target: "register", "lease {:?} keep alive error: {e}", self.lease_id);
+                            }
+                        }
+                    }
                     _ = interval.tick() => {
                         let res = keeper.keep_alive().await;
-                        if let Err(e) = res {
-                            error!(target: "register", "keep alive error: {e}");
-                            let lease = self.etcd_client.lease_grant(self.etcd_cfg.lease_ttl_s, None).await.unwrap();
-                            let lease_id = lease.id();
-                            self.etcd_client
-                            .put(
-                                self.key.clone(),
-                                self.value.clone(),
-                                Some(PutOptions::new().with_lease(lease_id)),
-                            )
-                            .await.unwrap();
-                            self.lease_id = lease_id;
-                            info!(target: "register", "reregister key:{}, lease_id: {} success", self.key, self.lease_id);
-                            (keeper, stream) = self.etcd_client.lease_keep_alive(self.lease_id).await.unwrap();
+                        if let Err(_) = res {
+                            let rsp = self.register().await;
+                            if rsp.is_err() {
+                                continue;
+                            }
+                            (keeper, stream) = rsp.unwrap();
                         }
-                        let res = stream.message().await;
-                        if let Result::Ok(Some(rsp)) = res {
-                            debug!(target: "register", "lease {:?} keep alive, new ttl {:?}", rsp.id(), rsp.ttl());
-                        } else {
-                            let lease = self.etcd_client.lease_grant(self.etcd_cfg.lease_ttl_s, None).await.unwrap();
-                            let lease_id = lease.id();
-                            self.etcd_client
-                            .put(
-                                self.key.clone(),
-                                self.value.clone(),
-                                Some(PutOptions::new().with_lease(lease_id)),
-                            )
-                            .await.unwrap();
-                            self.lease_id = lease_id;
-                            info!(target: "register", "reregister key:{}, lease_id: {} success", self.key, self.lease_id);
-                            (keeper, stream) = self.etcd_client.lease_keep_alive(self.lease_id).await.unwrap();
+                        let rsp = self.etcd_client.lease_time_to_live(self.lease_id, None).await;
+                        if rsp.is_err()  || rsp.unwrap().ttl() == 0{
+                            let rsp = self.register().await;
+                            if rsp.is_err() {
+                                continue;
+                            }
+                            (keeper, stream) = rsp.unwrap();
                         }
-
                     }
                 }
             }
