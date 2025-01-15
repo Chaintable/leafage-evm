@@ -4,7 +4,7 @@ use etcd_client::{Client, LeaseKeepAliveStream, LeaseKeeper, PutOptions};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::interval;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 pub struct Register {
     etcd_cfg: EtcdRegisterConfig,
@@ -87,10 +87,22 @@ impl Register {
                     resp = stream.message() => {
                         match resp {
                             Result::Ok(Some(rsp)) => {
-                                debug!(target: "register", "lease {:?} keep alive, new ttl {:?}", rsp.id(), rsp.ttl());
+                                if rsp.ttl() <= 0 {
+                                    error!(target: "register", "lease {:?} ttl <= 0", self.lease_id);
+                                    let rsp = self.register().await;
+                                    if rsp.is_err() {
+                                        continue;
+                                    }
+                                    (keeper, stream) = rsp.unwrap();
+                                }
                             }
                             Result::Ok(None) => {
-                                error!(target: "register", "lease {:?} keep alive, new ttl None", self.lease_id);
+                                error!(target: "register", "lease {:?} is none", self.lease_id);
+                                let rsp = self.register().await;
+                                if rsp.is_err() {
+                                    continue;
+                                }
+                                (keeper, stream) = rsp.unwrap();
                             }
                             Result::Err(e) => {
                                 error!(target: "register", "lease {:?} keep alive error: {e}", self.lease_id);
@@ -100,14 +112,6 @@ impl Register {
                     _ = interval.tick() => {
                         let res = keeper.keep_alive().await;
                         if let Err(_) = res {
-                            let rsp = self.register().await;
-                            if rsp.is_err() {
-                                continue;
-                            }
-                            (keeper, stream) = rsp.unwrap();
-                        }
-                        let rsp = self.etcd_client.lease_time_to_live(self.lease_id, None).await;
-                        if rsp.is_err()  || rsp.unwrap().ttl() == 0{
                             let rsp = self.register().await;
                             if rsp.is_err() {
                                 continue;
