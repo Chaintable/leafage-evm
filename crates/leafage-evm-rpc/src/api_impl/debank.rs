@@ -21,7 +21,7 @@ use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::timeout};
 use tracing::error;
 
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
@@ -266,9 +266,11 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
             }
         });
 
-        let rsp = rx
+        let rsp = timeout(self.time_out, rx)
             .await
-            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
+            .map_err(|_| internal_rpc_err("MultiCall timed out".to_string()))? // 超时错误
+            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?; // 发送失败错误
+
         rsp
     }
 
