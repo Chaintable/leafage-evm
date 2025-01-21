@@ -89,23 +89,25 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
 
         let block_ctx = block_ctx.unwrap();
 
-        let mut state = self.db.state_at(block_ctx.block_id).map_err(|e| {
-            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-        })?;
+        let state;
+
+        if block_ctx.block_type == BlockType::Equals {
+            state = self.db.state_at(block_ctx.block_id).map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+            })?;
+        } else {
+            state = self
+                .db
+                .state_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .map_err(|e| {
+                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+                })?;
+        }
         if state.is_none() {
-            if block_ctx.block_type == BlockType::Equals {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    "block not found".to_string(),
-                ));
-            } else {
-                state = self
-                    .db
-                    .state_at(BlockId::Number(BlockNumberOrTag::Latest))
-                    .map_err(|e| {
-                        rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-                    })?;
-            }
+            return Err(rpc_error_with_code(
+                DebankErrorCode::BlockNotFound as i32,
+                "block not found".to_string(),
+            ));
         }
         let state = state.unwrap();
         Ok(state)
