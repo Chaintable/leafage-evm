@@ -135,44 +135,6 @@ where
         .context("s3 get block info failed")
     }
 
-    fn get_update_path(
-        &self,
-        latest_remote_block: BlockContextWithOffset,
-    ) -> VecDeque<BlockContextWithOffset> {
-        let mut update_path = VecDeque::new();
-        update_path.push_back(latest_remote_block);
-        loop {
-            if update_path.len() > self.max_diff_depth {
-                error!(target:"updater", "can't find parent block before max diff depth, drop");
-                return Default::default();
-            }
-            let first_block_info = update_path.front().unwrap();
-            if self
-                .tree
-                .state_at(BlockId::Hash(
-                    first_block_info.block_info.header.parent_hash.into(),
-                ))
-                .is_ok()
-            {
-                debug!(target:"updater", "find parent block {}", first_block_info.block_info.header.parent_hash);
-                break;
-            }
-            let parent_block_info = self
-                .hash_to_blockctx
-                .lock()
-                .unwrap()
-                .get(&first_block_info.block_info.header.parent_hash)
-                .cloned();
-            if parent_block_info.is_none() {
-                error!(target:"updater", "can't not find block {}", first_block_info.block_info.header.parent_hash);
-                return Default::default();
-            } else {
-                update_path.push_front(parent_block_info.unwrap().clone());
-            }
-        }
-        update_path
-    }
-
     fn clear(
         &self,
         presist_block_num: u64,
@@ -224,18 +186,18 @@ where
                 .insert(new_block.hash, block_ctx_with_offset);
         }
 
-        let latest_remote_block_ctx = block_change_notification
+        let mut update_path = block_change_notification
             .new_blocks
-            .last()
-            .expect("Empty new block change notification");
-        let latest_remote_block = self
-            .hash_to_blockctx
-            .lock()
-            .unwrap()
-            .get(&latest_remote_block_ctx.hash)
-            .expect("Empty latest remote block")
-            .clone();
-        let mut update_path = self.get_update_path(latest_remote_block);
+            .iter()
+            .map(|new_block| {
+                self.hash_to_blockctx
+                    .lock()
+                    .unwrap()
+                    .get(&new_block.hash)
+                    .cloned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         for block in update_path.drain(..) {
             let block_storage_diff = block.block_diff;
             let block_info = block.block_info;
