@@ -3092,6 +3092,7 @@ dependencies = [
  "clap",
  "etcd-client",
  "flate2",
+ "futures",
  "hyper 0.14.31",
  "jsonrpsee",
  "leafage-evm-rpc",

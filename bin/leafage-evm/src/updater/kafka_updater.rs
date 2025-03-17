@@ -1,9 +1,10 @@
 use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use futures::stream::StreamExt;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
-    Block, BlockId, BlockStorageDiff, KafkaBlockChangeNotification, Transaction, H256,
+    Block, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, Transaction, H256,
 };
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
@@ -11,9 +12,9 @@ use rdkafka::{
     util::Timeout,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
-use tokio::{sync::watch, time};
+use tokio::{sync::watch, task::JoinSet, time};
 use tracing::{debug, error, info};
 
 pub fn read_offset(offset_dir: &str) -> Result<i64> {
@@ -109,18 +110,6 @@ where
     }
 
     #[inline]
-    async fn get_block_diff(&self, block_root: H256) -> Result<BlockStorageDiff> {
-        s3_get_block_diff(
-            &self.s3_client,
-            &self.kafka_s3_cfg.bucket_name,
-            &self.kafka_s3_cfg.s3_chain_id,
-            block_root,
-        )
-        .await
-        .context("s3 get block diff failed")
-    }
-
-    #[inline]
     async fn get_block_info(&self, block_hash: H256) -> Result<Block<Transaction>> {
         if let Some(block_ctx) = self.hash_to_blockctx.lock().unwrap().get(&block_hash) {
             return Ok(block_ctx.block_info.clone());
@@ -154,40 +143,102 @@ where
         presist_block
     }
 
-    async fn update(&self, message: &BorrowedMessage<'_>) -> Result<()> {
-        let offset = message.offset();
-        let block_change_notification: KafkaBlockChangeNotification =
-            message.payload().unwrap().try_into()?;
+    async fn prepare_update(
+        &self,
+        messages: &Vec<BorrowedMessage<'_>>,
+    ) -> Result<Vec<KafkaBlockContext>> {
+        let mut msgs: Vec<(i64, KafkaBlockChangeNotification)> = vec![];
+        let mut new_blocks = vec![];
+        let mut get_block_info_join_set = JoinSet::new();
+        let mut get_block_diff_join_set = JoinSet::new();
 
-        debug!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
-        for new_block in block_change_notification.new_blocks.iter() {
-            let parent_block_info = self.get_block_info(new_block.parent_hash).await?;
-            let block_info = self.get_block_info(new_block.hash).await?;
-
-            let block_diff = if parent_block_info.header.state_root == block_info.header.state_root
-            {
-                let mut diff = BlockStorageDiff::default();
-                diff.hash = block_info.header.state_root;
-                diff.parent_hash = parent_block_info.header.state_root;
-                diff
-            } else {
-                self.get_block_diff(block_info.header.state_root).await?
-            };
-
-            let block_ctx_with_offset = BlockContextWithOffset {
-                block_diff,
-                block_info,
-                offset,
-            };
-
-            self.hash_to_blockctx
-                .lock()
-                .unwrap()
-                .insert(new_block.hash, block_ctx_with_offset);
+        // decode messages
+        for msg in messages {
+            let offset = msg.offset();
+            let block_change_notification: KafkaBlockChangeNotification =
+                msg.payload().unwrap().try_into()?;
+            for new_block in block_change_notification.new_blocks.iter() {
+                let client = self.s3_client.clone();
+                let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
+                let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                let hash = new_block.hash;
+                get_block_info_join_set.spawn(async move {
+                    s3_get_block_info(&client, &bucket_name, &s3_chain_id, hash).await
+                });
+            }
+            msgs.push((offset, block_change_notification));
         }
 
-        let mut update_path = block_change_notification
-            .new_blocks
+        let mut blockhash_to_block_info = HashMap::new();
+        let mut roothash_to_block_info = HashMap::new();
+
+        // get block info first
+        while let Some(res) = get_block_info_join_set.join_next().await {
+            let block_info = res??;
+            let hash = block_info.header.hash;
+            blockhash_to_block_info.insert(hash, block_info.clone());
+            let parent_hash = block_info.header.parent_hash;
+            let parent_block_info =
+                if let Some(parent_block_info) = blockhash_to_block_info.get(&parent_hash) {
+                    parent_block_info.clone()
+                } else {
+                    let parent_block_info = self.get_block_info(parent_hash).await?;
+                    blockhash_to_block_info.insert(parent_hash, parent_block_info.clone());
+                    parent_block_info
+                };
+            if parent_block_info.header.state_root != block_info.header.state_root {
+                let client = self.s3_client.clone();
+                let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
+                let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                let block_root = block_info.header.state_root;
+                get_block_diff_join_set.spawn(async move {
+                    s3_get_block_diff(&client, &bucket_name, &s3_chain_id, block_root).await
+                });
+            };
+        }
+
+        // get block diff
+        while let Some(res) = get_block_diff_join_set.join_next().await {
+            let block_diff = res??;
+            roothash_to_block_info.insert(block_diff.hash, block_diff);
+        }
+
+        for (offset, mut block_change_notification) in msgs.drain(..) {
+            debug!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
+            for new_block in block_change_notification.new_blocks.drain(..) {
+                let parent_block_info = &blockhash_to_block_info[&new_block.parent_hash];
+                let block_info = blockhash_to_block_info[&new_block.hash].clone();
+
+                let block_diff =
+                    if parent_block_info.header.state_root == block_info.header.state_root {
+                        let mut diff = BlockStorageDiff::default();
+                        diff.hash = block_info.header.state_root;
+                        diff.parent_hash = parent_block_info.header.state_root;
+                        diff
+                    } else {
+                        roothash_to_block_info[&block_info.header.state_root].clone()
+                    };
+
+                let block_ctx_with_offset = BlockContextWithOffset {
+                    block_diff,
+                    block_info,
+                    offset,
+                };
+
+                self.hash_to_blockctx
+                    .lock()
+                    .unwrap()
+                    .insert(new_block.hash, block_ctx_with_offset);
+
+                new_blocks.push(new_block);
+            }
+        }
+        Ok(new_blocks)
+    }
+
+    async fn update(&self, messages: &Vec<BorrowedMessage<'_>>) -> Result<()> {
+        let new_blocks = self.prepare_update(messages).await?;
+        let mut update_path = new_blocks
             .iter()
             .map(|new_block| {
                 self.hash_to_blockctx
@@ -207,7 +258,7 @@ where
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
             self.tree.update_block(block_info, block_storage_diff)?;
-            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}", 
+            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
         let presist_block = self.tree.last_committed_block()?.unwrap();
@@ -225,26 +276,33 @@ where
     pub fn start(self) -> watch::Sender<()> {
         let (tx, mut rx) = watch::channel(());
         tokio::spawn(async move {
+            let stream = self.consumer.stream();
+            let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
             loop {
                 tokio::select! {
                     _ = rx.changed() => {
                         info!(target:"updater", "stop updater");
                         break;
                     }
-                    message = self.consumer.recv() => {
-                        match message {
-                            Ok(msg) => {
-                                loop {
-                                    if let Err(e) = self.update(&msg).await {
-                                        error!(target:"updater", "Failed to update: {:?}", e);
-                                        time::sleep(time::Duration::from_secs(1)).await
-                                    } else {
-                                        break;
-                                    }
-                                }
+                    messages = chunk.next() => {
+                        let messages = messages.expect("kafka stream next failed");
+                        let mut msgs = vec![];
+                        for message in messages {
+                           if message.is_err() {
+                                error!(target:"updater", "Failed to receive message: {:?}", message.err());
+                                break;
                             }
-                            Err(e) => {
-                                error!(target:"updater", "Failed to receive message: {:?}", e);
+                            msgs.push(message.unwrap());
+                        }
+                        if msgs.is_empty() {
+                            continue
+                        }
+                        loop {
+                            if let Err(e) = self.update(&msgs).await {
+                                error!(target:"updater", "Failed to update: {:?}", e);
+                                time::sleep(time::Duration::from_secs(1)).await
+                            } else {
+                                break;
                             }
                         }
                     }
