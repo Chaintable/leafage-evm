@@ -3,6 +3,7 @@ use crate::rpc::{Block, Transaction};
 use alloy::primitives::keccak256;
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::primitives::BlobExcessGasAndPrice;
+use serde::{Deserialize, Serialize};
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
     let block_env = BlockEnv {
@@ -24,7 +25,7 @@ pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
     block_env
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default, Deserialize, Serialize)]
 pub struct BlockStorageDiff {
     /// Block root hash.
     pub hash: H256,
@@ -40,13 +41,13 @@ pub struct BlockStorageDiff {
     pub new_codes: Vec<NewCode>,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Deserialize, Serialize )]
 pub struct NewCode {
     pub code_hash: H256,
     pub code: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Deserialize, Serialize)]
 pub struct NewAccount {
     /// Account address
     pub address: H256,
@@ -91,19 +92,19 @@ impl From<(H256, AccountInfo)> for NewAccount {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Deserialize, Serialize)]
 pub struct AccountStorageDiff {
     pub address: H256,
     pub diffs: Vec<IndexValuePair>,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Deserialize, Serialize)]
 pub struct IndexValuePair {
     pub index: H256,
     pub value: U256,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Deserialize, Serialize)]
 pub struct SlimAccount {
     /// Account balance
     pub balance: U256,
