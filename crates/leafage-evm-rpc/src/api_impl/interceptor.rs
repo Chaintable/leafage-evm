@@ -1,14 +1,15 @@
 use futures::TryFutureExt;
-use hyper::Response;
-use hyper::{body::Bytes, StatusCode};
+use hyper::{body::Bytes, Response, StatusCode};
 use jsonrpsee::server::{HttpBody, HttpRequest};
 use procfs::process::{Process, Stat};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc,
+};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -160,6 +161,10 @@ impl InterceptorWorker {
             };
             self.load_status
                 .store(status, std::sync::atomic::Ordering::SeqCst);
+            info!(
+                target = "interceptor",
+                "Load status updated: {} (usage: {:.2}%, cpu_time_diff: {}, ticks_per_second: {}, total_core_num: {}  )", status, usage,cpu_time_diff, clk_tck, self.total_core_num
+            );
         }
         self.latest_stat = Some(stat);
     }
