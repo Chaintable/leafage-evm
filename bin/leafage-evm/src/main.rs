@@ -7,7 +7,6 @@ mod updater;
 mod utils;
 
 use clap::Parser;
-use num_cpus;
 use runner::Cli;
 use tikv_jemallocator;
 use tracing::info;
@@ -17,7 +16,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> anyhow::Result<()> {
-    let mut core_num = num_cpus::get();
+    let mut core_num = std::thread::available_parallelism()?.get();
     if core_num <= 1 {
         core_num = 4;
     }

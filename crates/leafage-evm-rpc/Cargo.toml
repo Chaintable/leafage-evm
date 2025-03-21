@@ -25,6 +25,12 @@ alloy.workspace = true
 alloy-rlp.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true
+hyper.workspace = true
+http-body-util.workspace = true
+http-body.workspace = true
+http.workspace = true
+thiserror.workspace = true
+procfs.workspace = true
 
 [features]
 default = []
