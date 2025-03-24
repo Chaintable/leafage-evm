@@ -2,8 +2,12 @@ use futures::TryFutureExt;
 use hyper::{body::Bytes, Response, StatusCode};
 use jsonrpsee::server::{HttpBody, HttpRequest};
 use procfs::process::{Process, Stat};
+use procfs::{Current, WithCurrentSystemInfo};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fs;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{
@@ -17,7 +21,39 @@ use tokio::time::interval;
 use tower::BoxError;
 use tower::Layer;
 use tower::Service;
-use tracing::info;
+use tracing::{debug, info};
+
+fn default_cpu_threshold() -> Vec<f64> {
+    vec![45.0, 65.0, 85.0]
+}
+
+fn default_max_retries() -> u64 {
+    5
+}
+
+fn default_window() -> u64 {
+    180
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InterceptorConfig {
+    #[serde(default = "default_cpu_threshold")]
+    pub cpu_threshold: Vec<f64>,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u64,
+    #[serde(default = "default_window")]
+    pub window: u64,
+}
+
+impl Default for InterceptorConfig {
+    fn default() -> Self {
+        InterceptorConfig {
+            cpu_threshold: default_cpu_threshold(),
+            max_retries: default_max_retries(),
+            window: default_window(),
+        }
+    }
+}
 
 struct RetryEntry {
     timestamp: Instant,
@@ -68,6 +104,45 @@ impl RetryHistogram {
     }
 }
 
+fn get_max_memory() -> Result<u64, Box<dyn std::error::Error>> {
+    let cgroup_content = fs::read_to_string("/proc/self/cgroup")?;
+    let cgroup_lines: Vec<&str> = cgroup_content.lines().collect();
+
+    // 查找 memory 控制器路径
+    let mut cgroup_path = PathBuf::from("/sys/fs/cgroup");
+    for line in cgroup_lines {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 3 && parts[1].contains("memory") {
+            cgroup_path.push(parts[2].trim_start_matches('/'));
+            break;
+        }
+    }
+
+    // 检查 cgroups v2
+    let v2_max = cgroup_path.join("memory.max");
+    if v2_max.exists() {
+        let content = fs::read_to_string(&v2_max)?;
+        let trimmed = content.trim();
+        if trimmed == "max" {
+            let meminfo = procfs::Meminfo::current()?;
+            return Ok(meminfo.mem_total);
+        } else {
+            return Ok(trimmed.parse()?);
+        }
+    }
+
+    // 检查 cgroups v1
+    let v1_max = cgroup_path.join("memory.limit_in_bytes");
+    if v1_max.exists() {
+        let content = fs::read_to_string(&v1_max)?;
+        let max_bytes: u64 = content.trim().parse()?;
+        return Ok(max_bytes);
+    }
+
+    let meminfo = procfs::Meminfo::current()?;
+    Ok(meminfo.mem_total)
+}
+
 pub struct InterceptorLayer {
     load_status: Arc<AtomicU64>,          // 记录当前的负载状态 百分比
     other_overloaded: Arc<AtomicBool>,    // 其他服务是否过载
@@ -75,9 +150,12 @@ pub struct InterceptorLayer {
 }
 
 impl InterceptorLayer {
-    pub fn new(max_retries: u64, window: Duration) -> Self {
-        let (worker, retries_sender, load_status, other_overloaded) =
-            InterceptorWorker::new(max_retries, window);
+    pub fn new(cfg: &InterceptorConfig) -> Self {
+        let (worker, retries_sender, load_status, other_overloaded) = InterceptorWorker::new(
+            cfg.max_retries,
+            Duration::from_secs(cfg.window),
+            cfg.cpu_threshold.clone(),
+        );
         let layer = InterceptorLayer {
             load_status,
             other_overloaded,
@@ -107,31 +185,47 @@ struct InterceptorWorker {
     other_overloaded: Arc<AtomicBool>,
     retries_receiver: UnboundedReceiver<u64>,
     process: Process,
-    latest_stat: Option<Stat>,
+    latest_stat: Stat,
     total_core_num: usize,
-    stat_interval: u64, // 采样间隔 (单位: ms)
+    total_mem_size: u64,
+    stat_interval: u64,      // 采样间隔 (单位: ms)
+    cpu_threshold: Vec<f64>, // CPU 使用率阈值, 例如 [45.0, 65.0, 85.0]
 }
 
 impl InterceptorWorker {
     fn new(
         max_retries: u64,
         window: Duration,
+        cpu_threshold: Vec<f64>,
     ) -> (Self, UnboundedSender<u64>, Arc<AtomicU64>, Arc<AtomicBool>) {
+        if cpu_threshold.len() != 3 {
+            panic!("cpu_threshold must have exactly 3 values");
+        }
+        for threshold in &cpu_threshold {
+            if *threshold < 0.0 || *threshold > 100.0 {
+                panic!("cpu_threshold values must be between 0.0 and 100.0");
+            }
+        }
         let (retries_sender, retries_receiver) = unbounded_channel();
         let load_status = Arc::new(AtomicU64::new(0));
         let other_overloaded = Arc::new(AtomicBool::new(false));
         let total_core_num = std::thread::available_parallelism().unwrap().get();
+        let process = Process::myself().unwrap();
+        let latest_stat = process.stat().unwrap();
+        let total_mem_size = get_max_memory().unwrap_or(0);
         let worker = InterceptorWorker {
             retry_histogram: RetryHistogram::new(max_retries, window),
             load_status: load_status.clone(),
             other_overloaded: other_overloaded.clone(),
             retries_receiver,
-            process: Process::myself().unwrap(),
-            latest_stat: None,
+            process,
+            latest_stat,
             total_core_num,
+            total_mem_size,
             stat_interval: 1000, // 采样间隔设置为1秒
+            cpu_threshold,
         };
-        info!(
+        debug!(
             target = "interceptor",
             "InterceptorWorker initialized with max_retries: {}, window: {:?}, total_core_num: {}",
             max_retries,
@@ -141,32 +235,35 @@ impl InterceptorWorker {
         (worker, retries_sender, load_status, other_overloaded)
     }
 
+    fn check_load_status(&self, cpu_usage: f64, _mem_usage: f64) -> u64 {
+        if cpu_usage <= self.cpu_threshold[0] {
+            0 // NoRefused
+        } else if cpu_usage <= self.cpu_threshold[1] {
+            1 // LowRefused
+        } else if cpu_usage <= self.cpu_threshold[2] {
+            2 // MiddleRefused
+        } else {
+            3 // AllRefused
+        }
+    }
+
     fn set_load_status(&mut self) {
         let stat = self.process.stat().unwrap();
-        if let Some(latest_stat) = self.latest_stat.clone() {
-            let cpu_time_diff = stat.utime + stat.stime - latest_stat.utime - latest_stat.stime;
-            let clk_tck = procfs::ticks_per_second();
-            let usage = (cpu_time_diff as f64
-                / (clk_tck as f64 * self.total_core_num as f64 * self.stat_interval as f64
-                    / 1000.0))
-                * 100.0;
-            let status = if usage <= 45.0 {
-                0 // NoRefused
-            } else if usage <= 65.0 {
-                1 // LowRefused
-            } else if usage <= 85.0 {
-                2 // MiddleRefused
-            } else {
-                3 // AllRefused
-            };
-            self.load_status
-                .store(status, std::sync::atomic::Ordering::SeqCst);
-            info!(
-                target = "interceptor",
-                "Load status updated: {} (usage: {:.2}%, cpu_time_diff: {}, ticks_per_second: {}, total_core_num: {}  )", status, usage,cpu_time_diff, clk_tck, self.total_core_num
-            );
-        }
-        self.latest_stat = Some(stat);
+        let latest_stat = self.latest_stat.clone();
+        let cpu_time_diff = stat.utime + stat.stime - latest_stat.utime - latest_stat.stime;
+        let clk_tck = procfs::ticks_per_second();
+        let cpu_usage = (cpu_time_diff as f64
+            / (clk_tck as f64 * self.total_core_num as f64 * self.stat_interval as f64 / 1000.0))
+            * 100.0;
+        let mem_usage = stat.rss_bytes().get() as f64 / self.total_mem_size as f64 * 100.0;
+        let status = self.check_load_status(cpu_usage, mem_usage);
+        self.load_status
+            .store(status, std::sync::atomic::Ordering::SeqCst);
+        info!(
+            target = "interceptor",
+            "Load status updated: {status} (usage: {cpu_usage:.2}%, total_core_num: {}, mem_usage: {mem_usage:.2}%, total_mem_size: {})",
+            self.total_core_num, self.total_mem_size);
+        self.latest_stat = stat;
     }
 
     fn set_other_overloaded(&self) {
@@ -372,5 +469,19 @@ where
             return Box::pin(async move { Ok(response) });
         }
         Box::pin(self.inner.call(request).map_err(Into::into))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_max_memory() {
+        let a = get_max_memory();
+        assert!(a.is_ok(), "Failed to get max memory: {:?}", a.err());
+        let max_memory = a.unwrap();
+        assert!(max_memory > 0, "Max memory should be greater than 0");
+        dbg!("Max memory: {max_memory}");
     }
 }

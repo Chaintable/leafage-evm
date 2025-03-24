@@ -1,4 +1,4 @@
-use super::{ApiImpl, InterceptorLayer};
+use super::{ApiImpl, InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer, TraceApiServer};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
@@ -31,10 +31,11 @@ where
         addr: &str,
         max_connects: u32,
         rpc_timeout: Duration,
+        interceptor_cfg: Option<InterceptorConfig>,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new()
             .timeout(rpc_timeout)
-            .layer(InterceptorLayer::new(6, Duration::from_secs(180)));
+            .layer(InterceptorLayer::new(&interceptor_cfg.unwrap_or_default()));
         let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
         let server = ServerBuilder::default()
             .max_connections(max_connects)

@@ -3427,6 +3427,7 @@ dependencies = [
  "procfs",
  "revm",
  "revm-inspectors",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

@@ -15,4 +15,4 @@ mod pre;
 mod debank;
 
 mod interceptor;
-pub use interceptor::InterceptorLayer;
+pub use interceptor::{InterceptorConfig, InterceptorLayer};
