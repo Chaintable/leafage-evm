@@ -35,6 +35,10 @@ fn default_window() -> u64 {
     180
 }
 
+fn default_stat_interval() -> u64 {
+    1000
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InterceptorConfig {
     #[serde(default = "default_cpu_threshold")]
@@ -43,6 +47,8 @@ pub struct InterceptorConfig {
     pub max_retries: u64,
     #[serde(default = "default_window")]
     pub window: u64,
+    #[serde(default = "default_stat_interval")]
+    pub stat_interval: u64, // 采样间隔 (单位: ms)
 }
 
 impl Default for InterceptorConfig {
@@ -51,6 +57,7 @@ impl Default for InterceptorConfig {
             cpu_threshold: default_cpu_threshold(),
             max_retries: default_max_retries(),
             window: default_window(),
+            stat_interval: default_stat_interval(),
         }
     }
 }
@@ -155,6 +162,7 @@ impl InterceptorLayer {
             cfg.max_retries,
             Duration::from_secs(cfg.window),
             cfg.cpu_threshold.clone(),
+            cfg.stat_interval,
         );
         let layer = InterceptorLayer {
             load_status,
@@ -197,6 +205,7 @@ impl InterceptorWorker {
         max_retries: u64,
         window: Duration,
         cpu_threshold: Vec<f64>,
+        stat_interval: u64,
     ) -> (Self, UnboundedSender<u64>, Arc<AtomicU64>, Arc<AtomicBool>) {
         if cpu_threshold.len() != 3 {
             panic!("cpu_threshold must have exactly 3 values");
@@ -222,7 +231,7 @@ impl InterceptorWorker {
             latest_stat,
             total_core_num,
             total_mem_size,
-            stat_interval: 1000, // 采样间隔设置为1秒
+            stat_interval,
             cpu_threshold,
         };
         info!(
