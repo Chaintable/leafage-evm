@@ -227,10 +227,11 @@ impl InterceptorWorker {
         };
         info!(
             target = "interceptor",
-            "InterceptorWorker initialized with max_retries: {}, window: {:?}, total_core_num: {}",
+            "InterceptorWorker initialized with max_retries: {}, window: {:?}, total_core_num: {}, total_mem_size: {}",
             max_retries,
             window,
-            total_core_num
+            total_core_num,
+            total_mem_size
         );
         (worker, retries_sender, load_status, other_overloaded)
     }
