@@ -225,7 +225,7 @@ impl InterceptorWorker {
             stat_interval: 1000, // 采样间隔设置为1秒
             cpu_threshold,
         };
-        debug!(
+        info!(
             target = "interceptor",
             "InterceptorWorker initialized with max_retries: {}, window: {:?}, total_core_num: {}",
             max_retries,
@@ -259,7 +259,7 @@ impl InterceptorWorker {
         let status = self.check_load_status(cpu_usage, mem_usage);
         self.load_status
             .store(status, std::sync::atomic::Ordering::SeqCst);
-        info!(
+        debug!(
             target = "interceptor",
             "Load status updated: {status} (usage: {cpu_usage:.2}%, total_core_num: {}, mem_usage: {mem_usage:.2}%, total_mem_size: {})",
             self.total_core_num, self.total_mem_size);
