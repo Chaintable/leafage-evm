@@ -25,7 +25,6 @@ tikv-jemallocator.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemalloc-sys.workspace = true
 hyper.workspace = true
-num_cpus.workspace = true
 alloy-rlp.workspace = true
 rdkafka.workspace = true
 aws-sdk-s3.workspace = true

@@ -13,3 +13,6 @@ mod trace;
 mod pre;
 
 mod debank;
+
+mod interceptor;
+pub use interceptor::{InterceptorConfig, InterceptorLayer};

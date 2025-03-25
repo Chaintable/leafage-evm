@@ -5,7 +5,7 @@ use crate::updater::updater_build;
 use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
 use anyhow::{bail, Result};
 use clap::Parser;
-use leafage_evm_rpc::ApiBuilder;
+use leafage_evm_rpc::{ApiBuilder, InterceptorConfig};
 use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
@@ -141,6 +141,13 @@ pub struct Command {
     /// This meta is used to set the meta for node self.
     #[arg(long, default_value = "")]
     meta: String,
+
+    /// The interceptor config path
+    /// Default: None
+    ///
+    /// This config is used to set the interceptor config.
+    #[arg(long, value_parser = parse_interceptor_config, value_name = "INTERCEPTOR_CONFIG_PATH")]
+    interceptor_config: Option<InterceptorConfig>,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -199,6 +206,17 @@ fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
     Ok(etcd_config)
 }
 
+fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
+    let interceptor_config: InterceptorConfig;
+    if arg.starts_with("/") {
+        let file = std::fs::File::open(arg)?;
+        interceptor_config = serde_json::from_reader(file)?;
+    } else {
+        interceptor_config = serde_json::from_str(arg)?;
+    }
+    Ok(interceptor_config)
+}
+
 impl Command {
     async fn start(
         &self,
@@ -239,7 +257,12 @@ impl Command {
                     ),
                 )?);
                 let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone(), spec_id)
-                    .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
+                    .build_and_run(
+                        &self.listen_addr,
+                        self.max_connections,
+                        self.rpc_timeout,
+                        self.interceptor_config.clone(),
+                    )
                     .await?;
 
                 let updater_handle = updater_build(
@@ -275,7 +298,12 @@ impl Command {
                     ),
                 )?);
                 let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone(), spec_id)
-                    .build_and_run(&self.listen_addr, self.max_connections, self.rpc_timeout)
+                    .build_and_run(
+                        &self.listen_addr,
+                        self.max_connections,
+                        self.rpc_timeout,
+                        self.interceptor_config.clone(),
+                    )
                     .await?;
 
                 let updater_handle = updater_build(
