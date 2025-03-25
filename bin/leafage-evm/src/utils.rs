@@ -1,5 +1,5 @@
 use alloy_rlp::Decodable;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use flate2::read;
 use leafage_evm_types::{Block, BlockStorageDiff, Transaction, H256};
@@ -46,7 +46,8 @@ pub async fn s3_get_block_info(
         .bucket(bucket_name)
         .key(&s3_key)
         .send()
-        .await?;
+        .await
+        .context(format!("{bucket_name}: {s3_key}"))?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
     let mut gz = read::GzDecoder::new(&bytes[..]);
     let mut bytes = Vec::new();
