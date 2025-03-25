@@ -346,9 +346,11 @@ impl<T> Interceptor<T> {
 
     // 规则1: 检查x-load-deadline
     fn check_load_deadline(&self, load_shedding: &LoadShedding) -> (bool, bool) {
-        let now = SystemTime::now();
-        if load_shedding.load_deadline < now {
-            return (true, false);
+        if let Some(deadline) = load_shedding.load_deadline {
+            let now = SystemTime::now();
+            if deadline < now {
+                return (true, false);
+            }
         }
         (false, false)
     }
@@ -413,30 +415,35 @@ impl FromStr for LoadPriority {
 #[derive(Debug, Clone)]
 struct LoadShedding {
     load_priority: LoadPriority,
-    load_deadline: SystemTime,
+    load_deadline: Option<SystemTime>,
     load_retries: u64,
 }
 
-impl LoadShedding {
-    fn get(headers: &http::header::HeaderMap) -> Option<Self> {
+impl From<&http::header::HeaderMap> for LoadShedding {
+    fn from(headers: &http::header::HeaderMap) -> Self {
         let load_priority = headers
             .get("x-load-priority")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| LoadPriority::from_str(s).ok())?;
+            .and_then(|s| LoadPriority::from_str(s).ok())
+            .unwrap_or(LoadPriority::High);
+
         let load_deadline = headers
             .get("x-load-deadline")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| u64::from_str(s).ok())
-            .map(|v| SystemTime::now() + Duration::from_secs(v))?;
+            .map(|v| SystemTime::now() + Duration::from_secs(v));
+
         let load_retries = headers
             .get("x-load-retries")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| u64::from_str(s).ok())?;
-        Some(LoadShedding {
+            .and_then(|s| u64::from_str(s).ok())
+            .unwrap_or(0);
+
+        LoadShedding {
             load_priority,
             load_deadline,
             load_retries,
-        })
+        }
     }
 }
 
@@ -460,12 +467,8 @@ where
     }
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
-        let load_shedding = LoadShedding::get(request.headers());
-        let (reject, retryable) = if let Some(load_shedding) = load_shedding {
-            self.check(&load_shedding)
-        } else {
-            (false, false)
-        };
+        let load_shedding = LoadShedding::from(request.headers());
+        let (reject, retryable) = self.check(&load_shedding);
         if reject {
             let mut response = http::response::Builder::new()
                 .status(StatusCode::TOO_MANY_REQUESTS)
