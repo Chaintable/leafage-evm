@@ -69,13 +69,14 @@ impl Default for InterceptorConfig {
     }
 }
 
+#[derive(Debug, Clone)]
 struct RetryEntry {
     minute: u64,                  // 分钟数
     request_counts: usize,        // 请求总数
     retry_weighted_counts: usize, // 重试请求总数
 }
 
-// 重试次数直方图
+#[derive(Debug, Clone)]
 struct RetryRecorder {
     entries: VecDeque<RetryEntry>,
     window: u64, // 窗口大小 (单位: 分钟)
@@ -89,26 +90,21 @@ impl RetryRecorder {
         }
     }
 
-    fn add(&mut self, retries: u64) {
-        let now_minue = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / 60;
+    fn add(&mut self, now_minute: u64, retries: u64) {
         if let Some(entry) = self.entries.back_mut() {
-            if entry.minute == now_minue {
+            if entry.minute == now_minute {
                 entry.request_counts += 1;
                 entry.retry_weighted_counts += retries as usize;
             } else {
                 self.entries.push_back(RetryEntry {
-                    minute: now_minue,
+                    minute: now_minute,
                     request_counts: 1,
                     retry_weighted_counts: retries as usize,
                 });
             }
         } else {
             self.entries.push_back(RetryEntry {
-                minute: now_minue,
+                minute: now_minute,
                 request_counts: 1,
                 retry_weighted_counts: retries as usize,
             });
@@ -116,14 +112,9 @@ impl RetryRecorder {
     }
 
     // 清理旧数据
-    fn clear(&mut self) {
-        let now_minue = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / 60;
+    fn clear(&mut self, now_minute: u64) {
         while let Some(entry) = self.entries.front() {
-            if now_minue > self.window + entry.minute {
+            if now_minute >= self.window + entry.minute {
                 self.entries.pop_front();
             } else {
                 break;
@@ -315,7 +306,6 @@ impl InterceptorWorker {
     }
 
     fn set_other_overloaded(&mut self) {
-        self.retry_recorder.clear();
         let stat = self.retry_recorder.stat();
         self.other_overloaded.store(
             stat >= self.not_retry_threshold,
@@ -333,11 +323,16 @@ impl InterceptorWorker {
 
     async fn run(mut self) {
         let mut interval = interval(Duration::from_millis(self.stat_interval));
+        let mut now_minute = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 60;
         loop {
             tokio::select! {
                 msg = self.retries_receiver.recv() => {
                     if let Some(retries) = msg {
-                        self.retry_recorder.add(retries);
+                        self.retry_recorder.add(now_minute, retries);
                     } else {
                         break;
                     }
@@ -345,6 +340,12 @@ impl InterceptorWorker {
                 _ = interval.tick() => {
                     self.set_load_status();
                     self.set_other_overloaded();
+                    now_minute = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        / 60;
+                    self.retry_recorder.clear(now_minute);
                 }
             }
         }
@@ -549,12 +550,42 @@ where
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_max_memory() {
+    #[test]
+    fn test_max_memory() {
         let a = get_max_memory();
         assert!(a.is_ok(), "Failed to get max memory: {:?}", a.err());
         let max_memory = a.unwrap();
         assert!(max_memory > 0, "Max memory should be greater than 0");
         dbg!("Max memory: {max_memory}");
+    }
+
+    #[test]
+    fn test_load_priority() {
+        assert_eq!(LoadPriority::from_str("high").unwrap(), LoadPriority::High);
+        assert_eq!(
+            LoadPriority::from_str("medium").unwrap(),
+            LoadPriority::Medium
+        );
+        assert_eq!(LoadPriority::from_str("low").unwrap(), LoadPriority::Low);
+        assert!(LoadPriority::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_retry_recorder() {
+        let mut recorder = RetryRecorder::new(3);
+        recorder.add(1, 1);
+        recorder.add(1, 2);
+        recorder.clear(1);
+        assert_eq!(recorder.stat(), 1.5);
+
+        recorder.add(2, 0);
+        assert_eq!(recorder.stat(), 1.0);
+        recorder.add(3, 3);
+        assert_eq!(recorder.stat(), 1.5);
+        recorder.add(4, 0);
+        assert_eq!(recorder.stat(), 1.2);
+        recorder.clear(4);
+        dbg!(&recorder.entries);
+        assert_eq!(recorder.stat(), 1.0);
     }
 }
