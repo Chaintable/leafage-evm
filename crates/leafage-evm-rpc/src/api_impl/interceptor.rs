@@ -32,7 +32,7 @@ fn default_max_retries() -> u64 {
 }
 
 fn default_window() -> u64 {
-    180
+    3
 }
 
 fn default_stat_interval() -> u64 {
@@ -50,7 +50,7 @@ pub struct InterceptorConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: u64,
     #[serde(default = "default_window")]
-    pub window: u64,
+    pub window: u64, // 窗口大小 (单位: 分钟)
     #[serde(default = "default_stat_interval")]
     pub stat_interval: u64, // 采样间隔 (单位: ms)
     #[serde(default = "default_not_retry_threshold")]
