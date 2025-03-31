@@ -1,6 +1,6 @@
 use crate::updater::write_offset;
 use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
-use anyhow::{Ok, Result};
+use anyhow::{Context, Ok, Result};
 use aws_sdk_s3::Client;
 use leafage_evm_storage::EvmStorageWrite;
 use leafage_evm_types::{Block, BlockStorageDiff, KafkaBlockChangeNotification, Transaction, H256};
@@ -9,7 +9,7 @@ use rdkafka::{
     util::Timeout,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
 pub struct Initializer<DB> {
@@ -60,6 +60,7 @@ where
             block_root,
         )
         .await
+        .context(format!("Failed to get block diff for root {}", block_root))
     }
 
     #[inline]
@@ -71,6 +72,7 @@ where
             block_hash,
         )
         .await
+        .context(format!("Failed to get block info for hash {}", block_hash))
     }
 
     pub async fn init(&mut self) -> Result<()> {
@@ -79,6 +81,13 @@ where
             first_message.payload().unwrap().try_into()?;
         let first_block_hash = block_change_notification.new_blocks[0].hash;
         let first_block_info = self.get_block_info(first_block_hash).await?;
+        debug!(
+            target: "initializer",
+            "first block info: number {}, hash {}, parent_hash {}",
+            first_block_info.header.number,
+            first_block_info.header.hash,
+            first_block_info.header.parent_hash
+        );
         let first_block_diff = self
             .get_block_diff(first_block_info.header.state_root)
             .await?;
