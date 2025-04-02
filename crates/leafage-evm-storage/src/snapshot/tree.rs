@@ -1,5 +1,5 @@
 use crate::interface::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex, TxContext,
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TxContext,
 };
 use crate::metrics::BLOCK_METRICS;
 use crate::snapshot::error::Error;
@@ -262,48 +262,6 @@ impl<DB: BlockContext> BlockIndex for SnapshotTree<DB> {
                 _ => Ok(None),
             },
         }
-    }
-}
-
-impl<DB: BlockContext> TransactionIndex for SnapshotTree<DB> {
-    type Error = Error<DB::Error>;
-
-    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
-        if let Some(tx_context) = self.tx_hash_map.read().unwrap().get(&tx_hash) {
-            if let Some(block) = self
-                .hash_diff_map
-                .read()
-                .unwrap()
-                .get(&tx_context.block_hash)
-                .cloned()
-            {
-                return block.get_transaction_by_context(tx_context);
-            }
-        }
-        Ok(None)
-    }
-
-    fn get_transaction_by_context(
-        &self,
-        tx_context: &TxContext,
-    ) -> Result<Option<Transaction>, Self::Error> {
-        if let Some(tx_context) = self
-            .tx_hash_map
-            .read()
-            .unwrap()
-            .get(&tx_context.transaction_hash)
-        {
-            if let Some(block) = self
-                .hash_diff_map
-                .read()
-                .unwrap()
-                .get(&tx_context.block_hash)
-                .cloned()
-            {
-                return block.get_transaction_by_context(tx_context);
-            }
-        }
-        Ok(None)
     }
 }
 

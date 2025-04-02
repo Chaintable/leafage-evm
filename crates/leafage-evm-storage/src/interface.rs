@@ -51,18 +51,6 @@ pub struct TxContext {
     pub transaction_hash: H256,
 }
 
-/// [`TransactionIndex`] is a trait that provides access to the tx by hash or context.
-#[auto_impl(&, Box, Arc)]
-pub trait TransactionIndex {
-    type Error: std::error::Error + Send + Sync + 'static;
-    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error>;
-
-    fn get_transaction_by_context(
-        &self,
-        tx_context: &TxContext,
-    ) -> Result<Option<Transaction>, Self::Error>;
-}
-
 /// [`BlockIndex`] is a trait that provides access to the block information at a specific block height.
 #[auto_impl(&, Box, Arc)]
 pub trait BlockIndex {

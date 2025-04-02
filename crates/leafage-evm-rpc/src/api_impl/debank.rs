@@ -5,7 +5,7 @@ use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, StateDB, TransactionIndex,
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, StateDB
 };
 use leafage_evm_types::{
     block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
@@ -30,7 +30,7 @@ pub const CALL_STIPEND_GAS: u64 = 2_300;
 
 pub const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
 
-impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
+impl<DB: EvmStorageRead + BlockIndex > ApiImpl<DB> {
     pub fn evm_to_debank_error(
         res: EVMError<<<DB as EvmStorageRead>::StateDB as StateDB>::Error>,
     ) -> jsonrpsee::types::ErrorObjectOwned {
@@ -916,7 +916,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
 }
 
 #[async_trait::async_trait]
-impl<DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static> DebankApiServer
+impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer
     for ApiImpl<DB>
 {
     async fn get_address_nonce(

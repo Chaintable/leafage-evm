@@ -62,9 +62,6 @@ pub trait EthApi {
     #[method(name = "baseFee")]
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64>;
 
-    #[method(name = "getTransactionByHash")]
-    async fn transaction_by_hash(&self, hash: H256) -> RpcResult<Option<Transaction>>;
-
     #[method(name = "getTransactionByBlockHashAndIndex")]
     async fn transaction_by_block_hash_and_index(
         &self,

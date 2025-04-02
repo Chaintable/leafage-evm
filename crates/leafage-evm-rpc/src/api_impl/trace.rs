@@ -6,7 +6,7 @@ use alloy::network::TransactionResponse;
 use alloy_rlp::{BytesMut, Encodable};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex,
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper,
 };
 use leafage_evm_types::{
     block_env_from_block, Block, BlockId, Bytes, LocalizedTransactionTrace, Transaction,
@@ -20,70 +20,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> ApiImpl<DB> {
-    async fn trace_transaction_impl(
-        &self,
-        hash: H256,
-    ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
-        let cfg = self.cfg.clone();
-
-        let spec_id = self.spec_id;
-
-        let tx = self
-            .db
-            .get_transaction_by_hash(hash)
-            .map_err(|e| internal_rpc_err(e.to_string()))?
-            .ok_or_else(|| invalid_params_rpc_err("Transaction not found"))?;
-        #[cfg(not(feature = "optimism"))]
-        let block = self
-            .db
-            .get_block_by_id_arc(tx.block_hash.unwrap().into())
-            .map_err(|e| {
-                internal_rpc_err(format!("Failed to get block by hash: {}", e.to_string()))
-            })?;
-
-        #[cfg(feature = "optimism")]
-        let block = self
-            .db
-            .get_block_by_id_arc(tx.inner.block_hash.unwrap().into())
-            .map_err(|e| {
-                internal_rpc_err(format!("Failed to get block by hash: {}", e.to_string()))
-            })?;
-        if block.is_none() {
-            return Ok(None);
-        }
-        let block = block.unwrap();
-        let block_id = BlockId::Hash(block.header.parent_hash.into());
-        let state = self
-            .db
-            .state_at(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
-        }
-        let state = state.unwrap();
-        let mut txs_before = Vec::new();
-        for tx in block.transactions.txns() {
-            if tx.tx_hash() == hash {
-                break;
-            }
-            txs_before.push(tx.clone());
-        }
-
-        let (sender, receiver) = oneshot::channel();
-
-        tokio::task::spawn_blocking(move || {
-            let rsp = Self::call_and_trace(txs_before, tx, cfg, spec_id, state, block);
-            if let Err(e) = sender.send(rsp) {
-                error!("Failed to call_and_trace, result: {:?}", e);
-            }
-        });
-
-        let rsp = receiver
-            .await
-            .map_err(|_| internal_rpc_err("trace failed".to_string()))?;
-        rsp.map(Some)
-    }
+impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn call_and_trace(
         brefore_txs: Vec<Transaction>,
@@ -165,15 +102,8 @@ impl<DB: EvmStorageRead + TransactionIndex + BlockIndex> ApiImpl<DB> {
 #[async_trait::async_trait]
 impl<DB> TraceApiServer for ApiImpl<DB>
 where
-    DB: EvmStorageRead + TransactionIndex + BlockIndex + Send + Sync + 'static,
+    DB: EvmStorageRead + BlockIndex + Send + Sync + 'static,
 {
-    async fn trace_transaction(
-        &self,
-        hash: H256,
-    ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
-        self.trace_transaction_impl(hash).await
-    }
-
     async fn block_state_diff(&self, _block_id: BlockId, _re_exec: bool) -> RpcResult<Bytes> {
         self.block_state_diff_impl(_block_id, _re_exec).await
     }
