@@ -1,5 +1,5 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use leafage_evm_types::{BlockId, Bytes, LocalizedTransactionTrace, H256};
+use leafage_evm_types::{BlockId, Bytes};
 
 #[rpc(server, client, namespace = "trace")]
 #[async_trait::async_trait]

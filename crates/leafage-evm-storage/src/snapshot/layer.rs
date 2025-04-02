@@ -11,7 +11,7 @@ use tracing::info;
 /// two cases:
 /// 1. bottom [`CacheDiskLayer`] (when init).
 /// 2. top [`DiffLayer`] -> (top-1) [`DiffLayer`] -> ... -> bottom [`CacheDiskLayer`].
-pub enum LinkedDiffLayer<DB> {
+pub enum LinkedDiffLayer<DB> {t
     CacheDiskLayer(CacheDiskLayer<DB>),
     DiffLayer(DiffLayer<DB>),
 }

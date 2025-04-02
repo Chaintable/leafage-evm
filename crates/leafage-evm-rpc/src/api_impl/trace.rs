@@ -10,18 +10,17 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{
     block_env_from_block, Block, BlockId, Bytes, LocalizedTransactionTrace, Transaction,
-    TransactionInfo, H256,
+    TransactionInfo,
 };
 use revm::db::CacheDB;
 use revm::primitives::{CfgEnv, EnvWithHandlerCfg, SpecId};
 use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
-use tokio::sync::oneshot;
-use tracing::error;
 
 impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
+    #[allow(dead_code)]
     fn call_and_trace(
         brefore_txs: Vec<Transaction>,
         trace_tx: Transaction,
