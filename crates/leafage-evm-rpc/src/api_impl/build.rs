@@ -3,7 +3,7 @@ use crate::api::{DebankApiServer, EthApiServer, PreApiServer, TraceApiServer};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
-use leafage_evm_storage::{BlockIndex, EvmStorageRead, TransactionIndex};
+use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use revm::primitives::{CfgEnv, SpecId};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ pub struct ApiBuilder<DB> {
 
 impl<DB> ApiBuilder<DB>
 where
-    DB: EvmStorageRead + BlockIndex + TransactionIndex + Sync + Send + 'static,
+    DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
 {
     pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
         Self {

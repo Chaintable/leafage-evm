@@ -1,6 +1,5 @@
-use crate::interface::{BlockContext, EvmStorageWrite, StateDB, TransactionIndex, TxContext};
+use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
-use alloy::network::TransactionResponse;
 use leafage_evm_types::{AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256};
 use quick_cache::sync::Cache;
 use std::collections::{HashMap, VecDeque};
@@ -357,38 +356,5 @@ impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
                 Ok(res)
             }
         }
-    }
-}
-
-impl<DB: BlockContext> TransactionIndex for LinkedDiffLayer<DB> {
-    type Error = Error<DB::Error>;
-
-    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
-        let block_info = self.block_info_arc()?;
-        for tx in block_info.transactions.txns() {
-            if tx.tx_hash() == tx_hash {
-                return Ok(Some(tx.clone()));
-            }
-        }
-        Ok(None)
-    }
-
-    fn get_transaction_by_context(
-        &self,
-        tx_context: &TxContext,
-    ) -> Result<Option<Transaction>, Self::Error> {
-        let block_info = self.block_info_arc()?;
-        if let Some(txns) = block_info.transactions.as_transactions() {
-            let tx = txns.get(tx_context.transaction_index as usize).cloned();
-            if tx.is_some() {
-                return Ok(tx);
-            }
-            for tx in txns {
-                if tx.tx_hash() == tx_context.transaction_hash {
-                    return Ok(Some(tx.clone()));
-                }
-            }
-        }
-        Ok(None)
     }
 }

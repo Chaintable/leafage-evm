@@ -5,7 +5,7 @@ use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, TransactionIndex,
+    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper,
 };
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
+impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
     async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
             .db
@@ -455,14 +455,6 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
         Ok(U256::from(self.cfg.chain_id))
     }
 
-    async fn transaction_by_hash_impl(&self, hash: H256) -> RpcResult<Option<Transaction>> {
-        let txn = self
-            .db
-            .get_transaction_by_hash(hash)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        Ok(txn)
-    }
-
     async fn transaction_by_block_hash_and_index_impl(
         &self,
         hash: H256,
@@ -491,7 +483,7 @@ impl<DB: EvmStorageRead + BlockIndex + TransactionIndex> ApiImpl<DB> {
 #[async_trait::async_trait]
 impl<DB> EthApiServer for ApiImpl<DB>
 where
-    DB: EvmStorageRead + BlockIndex + TransactionIndex + Send + Sync + 'static,
+    DB: EvmStorageRead + BlockIndex + Send + Sync + 'static,
 {
     async fn call(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
         self.call_impl(request, block_id).await
@@ -557,10 +549,6 @@ where
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .await
-    }
-
-    async fn transaction_by_hash(&self, hash: H256) -> RpcResult<Option<Transaction>> {
-        self.transaction_by_hash_impl(hash).await
     }
 
     async fn transaction_by_block_hash_and_index(

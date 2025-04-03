@@ -1,8 +1,7 @@
 use crate::{
     db::{ArchiveDBProvider, ArchiveDBWrapper, BlockRead, StateDBWrapper},
     interface::{
-        BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TransactionIndex,
-        TxContext,
+        BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB,
     },
     snapshot::{self, LinkedDiffLayer, SnapshotTree, SnapshotTreeConfig},
     StateDBRead, StateDBWrite,
@@ -260,26 +259,6 @@ where
                 }
             }
         }
-        Ok(res)
-    }
-}
-
-impl<DB> TransactionIndex for ArchiveTree<DB>
-where
-    DB: ArchiveDBProvider + Sync + Send + 'static,
-{
-    type Error = Error<<DB::StateDBReadWrite as StateDBWrite>::Error>;
-
-    fn get_transaction_by_hash(&self, tx_hash: H256) -> Result<Option<Transaction>, Self::Error> {
-        let res = self.snapshot_tree.get_transaction_by_hash(tx_hash)?;
-        Ok(res)
-    }
-
-    fn get_transaction_by_context(
-        &self,
-        tx_context: &TxContext,
-    ) -> Result<Option<Transaction>, Self::Error> {
-        let res = self.snapshot_tree.get_transaction_by_context(tx_context)?;
         Ok(res)
     }
 }
