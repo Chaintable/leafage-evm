@@ -1,8 +1,7 @@
-use crate::updater::write_offset;
 use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
 use anyhow::{Context, Ok, Result};
 use aws_sdk_s3::Client;
-use leafage_evm_storage::EvmStorageWrite;
+use leafage_evm_storage::{write_offset, EvmStorageWrite};
 use leafage_evm_types::{Block, BlockStorageDiff, KafkaBlockChangeNotification, Transaction, H256};
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},

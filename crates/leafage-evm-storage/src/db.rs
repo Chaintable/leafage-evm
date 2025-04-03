@@ -22,6 +22,16 @@ pub trait BlockRead: Send + Sync + 'static {
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Self::Error>;
 }
 
+#[auto_impl(&, Box, Arc)]
+pub trait BlockIterator: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    /// block num -> block info
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<Transaction>, Self::Error>>;
+
+    /// block num -> block hash
+    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Self::Error>>;
+}
+
 /// [`StateDBRead`] offers read-only access to the state database.
 #[auto_impl(&, Box, Arc)]
 pub trait StateDBRead {
@@ -34,6 +44,19 @@ pub trait StateDBRead {
 
     /// account address | storage index -> storage value
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Self::Error>;
+}
+
+#[auto_impl(&, Box, Arc)]
+pub trait StateDBIterator: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    /// account address -> raw account
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Self::Error>>;
+
+    /// code hash -> code
+    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Self::Error>>;
+
+    /// account address | storage index -> storage value
+    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Self::Error>>;
 }
 
 /// [`StateDBWrite`] offers write-only access to the state database.

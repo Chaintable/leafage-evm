@@ -2,7 +2,7 @@ use crate::utils::{s3_get_block_diff, s3_get_block_info, KafkaS3Config};
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
-use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
+use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
     Block, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, Transaction, H256,
 };
@@ -16,22 +16,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::{sync::watch, task::JoinSet, time};
 use tracing::{debug, error, info};
-
-pub fn read_offset(offset_dir: &str) -> Result<i64> {
-    let offset = std::fs::read_to_string(format!("{}/offset", offset_dir))?;
-    let offset = offset.trim().parse()?;
-    Ok(offset)
-}
-
-pub fn write_offset(offset_dir: &str, offset: i64) -> Result<()> {
-    std::fs::create_dir_all(offset_dir)?;
-    std::fs::write(format!("{}/offset.tmp", offset_dir), offset.to_string())?;
-    std::fs::rename(
-        format!("{}/offset.tmp", offset_dir),
-        format!("{}/offset", offset_dir),
-    )?;
-    Ok(())
-}
 
 #[derive(Debug, Clone)]
 struct BlockContextWithOffset {
