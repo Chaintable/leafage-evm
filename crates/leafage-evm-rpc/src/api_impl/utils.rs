@@ -1,5 +1,4 @@
 use crate::error::invalid_params_rpc_err;
-use alloy::consensus::Transaction as TransactionTrait;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
     BlockOverrides, CallRequest, DebankEvent, DebankID, DebankTrace, H256, U256,
