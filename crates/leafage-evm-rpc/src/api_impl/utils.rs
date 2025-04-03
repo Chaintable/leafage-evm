@@ -2,7 +2,7 @@ use crate::error::invalid_params_rpc_err;
 use alloy::consensus::Transaction as TransactionTrait;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
-    BlockOverrides, CallRequest, DebankEvent, DebankID, DebankTrace, Transaction, H256, U256,
+    BlockOverrides, CallRequest, DebankEvent, DebankID, DebankTrace, H256, U256,
 };
 use revm::db::CacheDB;
 use revm::primitives::{
@@ -156,66 +156,6 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
     };
 
     Ok(env)
-}
-
-pub(crate) fn rebuild_txn_env(tx: &Transaction) -> TxEnv {
-    let tx_env = TxEnv {
-        caller: tx.from,
-        gas_limit: tx.gas_limit(),
-        gas_price: U256::from(tx.gas_price().unwrap_or_default()),
-        gas_priority_fee: Some(U256::from(tx.max_fee_per_gas())),
-        transact_to: tx.kind(),
-        value: tx.value(),
-        data: tx.input().clone(),
-        chain_id: tx.chain_id(),
-        nonce: Some(tx.nonce()),
-        access_list: tx
-            .access_list()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|a| AccessListItem {
-                address: a.address,
-                storage_keys: a.storage_keys.clone(),
-            })
-            .collect::<Vec<_>>()
-            .into(),
-        // EIP-4844 fields
-        blob_hashes: tx
-            .blob_versioned_hashes()
-            .unwrap_or_default()
-            .iter()
-            .map(|h| *h)
-            .collect(),
-        max_fee_per_blob_gas: tx.max_fee_per_blob_gas().map(U256::from),
-        // EIP-7702 fields
-        authorization_list: tx.authorization_list().map(|l| {
-            let auth_list: Vec<_> = l.iter().map(|auth| auth.clone()).collect();
-            auth_list.into()
-        }),
-        #[cfg(feature = "optimism")]
-        optimism: revm::primitives::OptimismFields {
-            enveloped_tx: Some(Default::default()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    #[cfg(feature = "optimism")]
-    {
-        let mut tx_env = tx_env;
-        use alloy::eips::eip2718::Encodable2718;
-        tx_env.optimism.enveloped_tx = Some(tx.inner.inner.encoded_2718().into());
-        tx_env.optimism.is_system_transaction = Some(tx.inner.inner.is_system_transaction());
-        if let Some(deposit_tx) = tx.inner.inner.as_deposit() {
-            tx_env.optimism.mint = deposit_tx.mint;
-            tx_env.optimism.source_hash = Some(deposit_tx.source_hash);
-        }
-        return tx_env;
-    }
-    #[cfg(not(feature = "optimism"))]
-    {
-        return tx_env;
-    }
 }
 
 pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHandlerCfg {
