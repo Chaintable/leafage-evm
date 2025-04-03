@@ -1,5 +1,6 @@
+mod db_migrate;
+mod file_migrate;
 mod initializer;
-mod migrate;
 mod register;
 mod runner;
 mod standalone;

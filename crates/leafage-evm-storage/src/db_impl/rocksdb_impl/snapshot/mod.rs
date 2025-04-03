@@ -2,11 +2,11 @@
 //!
 //! Data is stored in the following format:
 //! ```text
-//! +-------------------------+-------------------------+-------------------------+
-//! |  LatestBlockHash        |  BlockHashToBlockInfo   |  BlockNumToBlockHash    |
-//! +-------------------------+-------------------------+-------------------------+
-//! |  AddressToAccount       |  AddressToStorage       |  HashToCode             |
-//! +-------------------------+-------------------------+-------------------------+
+//! +-------------------------+--------------------------------------+-------------------------+
+//! |  LatestBlockHash        |  BlockHashToBlockInfo (only latest)  |  BlockNumToBlockHash    |
+//! +-------------------------+--------------------------------------+-------------------------+
+//! |  AddressToAccount       |  AddressToStorage                    |  HashToCode             |
+//! +-------------------------+--------------------------------------+-------------------------+
 //! ```
 //! The `LatestBlockHash` column family stores the latest block hash.
 //! The `BlockHashToBlockInfo` column family stores the block hash to block info maps.

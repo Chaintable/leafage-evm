@@ -1,4 +1,4 @@
-use crate::{migrate, standalone};
+use crate::{db_migrate, file_migrate, standalone};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::future::Future;
@@ -25,15 +25,18 @@ pub(crate) enum Commands {
     /// Start the node
     #[command(name = "standalone")]
     Standalone(standalone::Command),
-    #[command(name = "migrate")]
-    Migrate(migrate::Command),
+    #[command(name = "file-migrate")]
+    FileMigrate(file_migrate::Command),
+    #[command(name = "db-migrate")]
+    DBMigrate(db_migrate::Command),
 }
 
 impl Commands {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
             Commands::Standalone(mut cmd) => cmd.run().await,
-            Commands::Migrate(mut cmd) => cmd.run().await,
+            Commands::FileMigrate(mut cmd) => cmd.run().await,
+            Commands::DBMigrate(mut cmd) => cmd.run().await,
         }
     }
 }

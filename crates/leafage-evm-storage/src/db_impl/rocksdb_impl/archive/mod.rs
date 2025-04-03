@@ -21,7 +21,9 @@
 //! - `get_transaction_by_hash`
 //! - `get_transaction_by_context`
 
-use crate::db::{ArchiveDBProvider, BlockRead, StateDBRead, StateDBWrite};
+use crate::db::{
+    ArchiveDBProvider, BlockIterator, BlockRead, StateDBIterator, StateDBRead, StateDBWrite,
+};
 use crate::metrics::STORAGE_METRICS;
 use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
@@ -31,7 +33,7 @@ use leafage_evm_types::{
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRawIteratorWithThreadMode,
-    Options, ReadOptions, SliceTransform, WriteBatch, DB,
+    IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, DB,
 };
 use std::fmt::Display;
 use std::path::Path;
@@ -366,6 +368,147 @@ impl BlockRead for DataBaseRef {
         let block_hash_bytes = block_hash_bytes.unwrap();
         let block_hash = H256::from_slice(block_hash_bytes.as_slice());
         Ok(block_hash)
+    }
+}
+
+impl StateDBIterator for DataBaseRef {
+    type Error = Error;
+    /// account address -> raw account
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Self::Error>> {
+        self.db
+            .iterator_cf_opt(
+                self.db
+                    .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                    .unwrap(),
+                rocksdb_read_options(),
+                IteratorMode::Start,
+            )
+            .filter_map(|item| {
+                if item.is_err() {
+                    return Some(Err(Error::RocksDB(item.unwrap_err())));
+                }
+                let (key, value) = item.unwrap();
+                let block_num_bytes = &key[32..];
+                let block_num = U256::from_be_slice(block_num_bytes);
+                if block_num != U256::from(u64::MAX) {
+                    return None;
+                }
+                let address_bytes = &key[..32];
+                let address = H256::from_slice(address_bytes);
+                let mut raw_account_slice = value.as_ref();
+                let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
+                let account = NewAccount {
+                    address,
+                    balance: raw_account.balance,
+                    nonce: raw_account.nonce,
+                    code_hash: if raw_account.code_hash.is_zero() {
+                        KECCAK_EMPTY.0.into()
+                    } else {
+                        raw_account.code_hash
+                    },
+                };
+                Some(Ok((address, account)))
+            })
+    }
+
+    /// code hash -> code
+    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Self::Error>> {
+        self.db
+            .iterator_cf_opt(
+                self.db
+                    .cf_handle(StorageTypeColumn::HashToCode.to_str())
+                    .unwrap(),
+                rocksdb_read_options(),
+                IteratorMode::Start,
+            )
+            .map(|item| {
+                if item.is_err() {
+                    return Err(Error::RocksDB(item.unwrap_err()));
+                }
+                let (key, value) = item.unwrap();
+                let code_hash = H256::from_slice(key.as_ref());
+                Ok((code_hash, Bytes::from(value)))
+            })
+    }
+
+    /// account address | storage index -> storage value
+    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Self::Error>> {
+        self.db
+            .iterator_cf_opt(
+                self.db
+                    .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                    .unwrap(),
+                rocksdb_read_options(),
+                IteratorMode::Start,
+            )
+            .filter_map(|item| {
+                if item.is_err() {
+                    return Some(Err(Error::RocksDB(item.unwrap_err())));
+                }
+                let (key, value) = item.unwrap();
+                let block_num_bytes = &key[64..];
+                let block_num = U256::from_be_slice(block_num_bytes);
+                if block_num != U256::from(u64::MAX) {
+                    return None;
+                }
+                let address_bytes = &key[..32];
+                let address = H256::from_slice(address_bytes);
+                let key_bytes = &key[32..64];
+                let key = H256::from_slice(key_bytes);
+                let value = U256::from_be_slice(value.as_ref());
+                Some(Ok((address, key, value)))
+            })
+    }
+}
+
+impl BlockIterator for DataBaseRef {
+    type Error = Error;
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<Transaction>, Self::Error>> {
+        self.db
+            .iterator_cf_opt(
+                self.db
+                    .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+                    .unwrap(),
+                rocksdb_read_options(),
+                IteratorMode::Start,
+            )
+            .map(|item| {
+                if item.is_err() {
+                    return Err(Error::RocksDB(item.unwrap_err()));
+                }
+                let (key, value) = item.unwrap();
+                let block_hash = H256::from_slice(key.as_ref());
+                let block_header: RawHeader = RawHeader::decode(&mut value.as_ref()).unwrap();
+                let block = Block {
+                    header: Header {
+                        hash: block_hash,
+                        inner: block_header,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                Ok(block)
+            })
+    }
+
+    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Self::Error>> {
+        self.db
+            .iterator_cf_opt(
+                self.db
+                    .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
+                    .unwrap(),
+                rocksdb_read_options(),
+                IteratorMode::Start,
+            )
+            .map(|item| {
+                if item.is_err() {
+                    return Err(Error::RocksDB(item.unwrap_err()));
+                }
+                let (key, value) = item.unwrap();
+                let block_num: u64 = U256::from_be_slice(key.as_ref()).try_into().unwrap();
+                let block_hash = H256::from_slice(value.as_ref());
+                Ok((block_num, block_hash))
+            })
     }
 }
 

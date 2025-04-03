@@ -2,7 +2,7 @@ mod http_updater;
 pub use http_updater::Updater as HttpUpdater;
 
 mod kafka_updater;
-pub use kafka_updater::{write_offset, Updater as KafkaUpdater};
+pub use kafka_updater::Updater as KafkaUpdater;
 
 use crate::utils::KafkaS3Config;
 use anyhow::Result;

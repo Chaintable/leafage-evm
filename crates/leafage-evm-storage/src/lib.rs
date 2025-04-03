@@ -17,3 +17,6 @@ mod migrate;
 pub use migrate::*;
 
 mod metrics;
+
+mod offset;
+pub use offset::*;
