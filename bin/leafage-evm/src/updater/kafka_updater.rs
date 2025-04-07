@@ -248,6 +248,10 @@ where
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
+        self.commit_offset()
+    }
+
+    fn commit_offset(&self) -> Result<()> {
         let presist_block = self.tree.last_committed_block()?.unwrap();
         let presist_block_num = presist_block.header.number;
         let presist_block_hash = presist_block.header.hash;
@@ -287,6 +291,7 @@ where
                         loop {
                             if let Err(e) = self.update(&msgs).await {
                                 error!(target:"updater", "Failed to update: {:?}", e);
+                                self.commit_offset().expect("Failed to commit offset");
                                 time::sleep(time::Duration::from_secs(1)).await
                             } else {
                                 break;
