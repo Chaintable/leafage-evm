@@ -24,7 +24,7 @@ use tower::Service;
 use tracing::{debug, info};
 
 fn default_cpu_threshold() -> Vec<f64> {
-    vec![45.0, 65.0, 85.0]
+    vec![65.0, 80.0, 95.0]
 }
 
 fn default_max_retries() -> u64 {
