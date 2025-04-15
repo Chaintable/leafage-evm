@@ -256,7 +256,12 @@ fn apply_account_override<DB>(
     };
 
     let storage_diff = match (account_override.state, account_override.state_diff) {
-        (Some(_), Some(_)) => return Err(invalid_params_rpc_err(format!("account {:?} has both 'state' and 'stateDiff'",account))),
+        (Some(_), Some(_)) => {
+            return Err(invalid_params_rpc_err(format!(
+                "account {:?} has both 'state' and 'stateDiff'",
+                account
+            )))
+        }
         (None, None) => None,
         // If we need to override the entire state, we firstly mark account as destroyed to clear
         // its storage, and then we mark it is "NewlyCreated" to make sure that old storage won't be
