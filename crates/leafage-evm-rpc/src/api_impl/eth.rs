@@ -2,17 +2,17 @@ use super::ApiImpl;
 use crate::api::EthApiServer;
 use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper,
-};
+use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumberOrTag, Bytes, CallRequest, Index, JsonStorageKey, MultiCallErrorCode, MultiCallResp,
-    MultiCallStats, SingleCallResult, Transaction, H256, RU256, U256,
+    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Index, JsonStorageKey,
+    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, RU256,
+    U256,
 };
-use revm::db::DatabaseRef;
+use revm::db::{CacheDB, DatabaseRef};
 use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult, SpecId};
 use revm::Evm;
 use serde_json::Value;
@@ -43,7 +43,13 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         Ok(base_fee)
     }
 
-    async fn call_impl(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
+    async fn call_impl(
+        &self,
+        request: CallRequest,
+        block_id: BlockId,
+        state_override: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<Bytes> {
         let mut cfg = self.cfg.clone();
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
@@ -62,9 +68,16 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
         let tx = create_txn_env(&block_env, request)?;
-        let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx);
+        let mut env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx);
+        let mut db = CacheDB::new(EvmStorageWrapper(state.clone()));
+        if let Some(overrides) = block_overrides {
+            super::utils::apply_block_overrides(overrides, &mut db, &mut env.block);
+        }
+        if let Some(state_override) = state_override {
+            super::utils::apply_state_overrides(state_override, &mut db)?;
+        }
         let mut evm = Evm::builder()
-            .with_ref_db(EvmStorageWrapper(state))
+            .with_ref_db(db)
             .with_env_with_handler_cfg(env)
             .build();
 
@@ -485,8 +498,15 @@ impl<DB> EthApiServer for ApiImpl<DB>
 where
     DB: EvmStorageRead + BlockIndex + Send + Sync + 'static,
 {
-    async fn call(&self, request: CallRequest, block_id: BlockId) -> RpcResult<Bytes> {
-        self.call_impl(request, block_id).await
+    async fn call(
+        &self,
+        request: CallRequest,
+        block_id: BlockId,
+        state_override: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<Bytes> {
+        self.call_impl(request, block_id, state_override, block_overrides)
+            .await
     }
 
     async fn multi_call(

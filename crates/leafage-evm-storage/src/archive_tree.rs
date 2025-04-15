@@ -1,8 +1,6 @@
 use crate::{
     db::{ArchiveDBProvider, ArchiveDBWrapper, BlockRead, StateDBWrapper},
-    interface::{
-        BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB,
-    },
+    interface::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB},
     snapshot::{self, LinkedDiffLayer, SnapshotTree, SnapshotTreeConfig},
     StateDBRead, StateDBWrite,
 };
