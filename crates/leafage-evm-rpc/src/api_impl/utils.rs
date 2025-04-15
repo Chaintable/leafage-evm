@@ -1,4 +1,4 @@
-use crate::error::invalid_params_rpc_err;
+use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::rpc::types::state::{AccountOverride, StateOverride};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
@@ -9,7 +9,7 @@ use revm::primitives::{
     env::{CfgEnv, CfgEnvWithHandlerCfg},
     AccessListItem, Account, AccountStatus, BlockEnv, EvmStorageSlot, SpecId, TxEnv, TxKind,
 };
-use revm::{Database, DatabaseCommit};
+use revm::{Database, DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{
     types::{CallTraceNode, TraceMemberOrder},
     CallTraceArena,
@@ -220,7 +220,10 @@ pub(crate) fn apply_block_overrides<DB>(
 }
 
 /// Applies the given state overrides (a set of [`AccountOverride`]) to the [`CacheDB`].
-pub fn apply_state_overrides<DB>(overrides: StateOverride, db: &mut CacheDB<DB>) -> RpcResult<()> {
+pub fn apply_state_overrides<DB>(overrides: StateOverride, db: &mut CacheDB<DB>) -> RpcResult<()>
+where
+    DB: DatabaseRef,
+{
     for (account, account_overrides) in overrides {
         apply_account_override(account, account_overrides, db)?;
     }
@@ -232,8 +235,14 @@ fn apply_account_override<DB>(
     account: Address,
     account_override: AccountOverride,
     db: &mut CacheDB<DB>,
-) -> RpcResult<()> {
-    let mut info = db.basic(account)?.unwrap_or_default();
+) -> RpcResult<()>
+where
+    DB: DatabaseRef,
+{
+    let mut info = db
+        .basic(account)
+        .map_err(|_| internal_rpc_err("Failed to get basic account info"))?
+        .unwrap_or_default();
 
     if let Some(nonce) = account_override.nonce {
         info.nonce = nonce;
