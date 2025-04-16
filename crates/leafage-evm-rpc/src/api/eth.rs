@@ -1,7 +1,8 @@
+use alloy::rpc::types::state::StateOverride;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
-    Address, BlockId, BlockNumberOrTag, Bytes, CallRequest, Index, JsonStorageKey, MultiCallResp,
-    Transaction, H256, U256,
+    Address, BlockId, BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Index, JsonStorageKey,
+    MultiCallResp, Transaction, H256, U256,
 };
 use serde_json::Value;
 
@@ -10,7 +11,13 @@ use serde_json::Value;
 pub trait EthApi {
     // Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "call")]
-    async fn call(&self, request: CallRequest, block_number: BlockId) -> RpcResult<Bytes>;
+    async fn call(
+        &self,
+        request: CallRequest,
+        block_number: BlockId,
+        state_override: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<Bytes>;
 
     #[method(name = "multiCall")]
     async fn multi_call(

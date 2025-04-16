@@ -1,17 +1,20 @@
-use crate::error::invalid_params_rpc_err;
+use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use alloy::rpc::types::state::{AccountOverride, StateOverride};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
-    BlockOverrides, CallRequest, DebankEvent, DebankID, DebankTrace, H256, U256,
+    Address, BlockOverrides, Bytecode, CallRequest, DebankEvent, DebankID, DebankTrace, H256, U256,
 };
 use revm::db::CacheDB;
 use revm::primitives::{
     env::{CfgEnv, CfgEnvWithHandlerCfg},
-    AccessListItem, BlockEnv, SpecId, TxEnv, TxKind,
+    AccessListItem, Account, AccountStatus, BlockEnv, EvmStorageSlot, SpecId, TxEnv, TxKind,
 };
+use revm::{Database, DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{
     types::{CallTraceNode, TraceMemberOrder},
     CallTraceArena,
 };
+use std::collections::HashMap;
 
 /// Helper type for representing the fees of a [CallRequest]
 pub(crate) struct CallFees {
@@ -214,6 +217,97 @@ pub(crate) fn apply_block_overrides<DB>(
     if let Some(base_fee) = base_fee {
         block_env.basefee = base_fee;
     }
+}
+
+/// Applies the given state overrides (a set of [`AccountOverride`]) to the [`CacheDB`].
+pub fn apply_state_overrides<DB>(overrides: StateOverride, db: &mut CacheDB<DB>) -> RpcResult<()>
+where
+    DB: DatabaseRef,
+{
+    for (account, account_overrides) in overrides {
+        apply_account_override(account, account_overrides, db)?;
+    }
+    Ok(())
+}
+
+/// Applies a single [`AccountOverride`] to the [`CacheDB`].
+fn apply_account_override<DB>(
+    account: Address,
+    account_override: AccountOverride,
+    db: &mut CacheDB<DB>,
+) -> RpcResult<()>
+where
+    DB: DatabaseRef,
+{
+    let mut info = db
+        .basic(account)
+        .map_err(|_| internal_rpc_err("Failed to get basic account info"))?
+        .unwrap_or_default();
+
+    if let Some(nonce) = account_override.nonce {
+        info.nonce = nonce;
+    }
+    if let Some(code) = account_override.code {
+        info.code = Some(
+            Bytecode::new_raw_checked(code)
+                .map_err(|err| invalid_params_rpc_err(format!("Invalid bytecode {}", err)))?,
+        );
+    }
+    if let Some(balance) = account_override.balance {
+        info.balance = balance;
+    }
+
+    // Create a new account marked as touched
+    let mut acc = Account {
+        info,
+        status: AccountStatus::Touched,
+        storage: HashMap::default(),
+    };
+
+    let storage_diff = match (account_override.state, account_override.state_diff) {
+        (Some(_), Some(_)) => {
+            return Err(invalid_params_rpc_err(format!(
+                "account {:?} has both 'state' and 'stateDiff'",
+                account
+            )))
+        }
+        (None, None) => None,
+        // If we need to override the entire state, we firstly mark account as destroyed to clear
+        // its storage, and then we mark it is "NewlyCreated" to make sure that old storage won't be
+        // used.
+        (Some(state), None) => {
+            // Destroy the account to ensure that its storage is cleared
+            db.commit(HashMap::from_iter([(
+                account,
+                Account {
+                    status: AccountStatus::SelfDestructed | AccountStatus::Touched,
+                    ..Default::default()
+                },
+            )]));
+            // Mark the account as created to ensure that old storage is not read
+            acc.mark_created();
+            Some(state)
+        }
+        (None, Some(state)) => Some(state),
+    };
+
+    if let Some(state) = storage_diff {
+        for (slot, value) in state {
+            acc.storage.insert(
+                slot.into(),
+                EvmStorageSlot {
+                    // we use inverted value here to ensure that storage is treated as changed
+                    original_value: (!value).into(),
+                    present_value: value.into(),
+                    is_cold: false,
+                },
+            );
+        }
+    }
+
+    db.commit(HashMap::from_iter([(account, acc)]));
+
+    Ok(())
 }
 
 enum DebankTraceOrLog {
