@@ -120,11 +120,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             })?;
 
         let block = block.unwrap();
-        Ok(DebankBlock {
-            block_id: block.header.hash,
-            block_height: block.header.number,
-            block_timestamp: block.header.timestamp,
-        })
+        Ok(block.into())
     }
 
     fn debank_get_block_by_height_impl(&self, height: U256) -> RpcResult<DebankBlock> {
@@ -148,11 +144,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
 
         let block = block.unwrap();
-        Ok(DebankBlock {
-            block_id: block.header.hash,
-            block_height: block.header.number,
-            block_timestamp: block.header.timestamp,
-        })
+        Ok(block.into())
     }
 
     fn debank_get_block_by_id_impl(&self, id: H256) -> RpcResult<DebankBlock> {
@@ -169,11 +161,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             ));
         }
         let block = block.unwrap();
-        Ok(DebankBlock {
-            block_id: block.header.hash,
-            block_height: block.header.number,
-            block_timestamp: block.header.timestamp,
-        })
+        Ok(block.into())
     }
 
     fn debank_get_address_nonce_impl(
