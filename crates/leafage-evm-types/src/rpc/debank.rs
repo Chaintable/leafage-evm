@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use super::{
     super::primitives::{Address, Bytes, H256, U256},
     BlockId,
@@ -150,8 +151,8 @@ pub struct DebankBlock {
     pub gas_used: u64,
 }
 
-impl From<Block> for DebankBlock {
-    fn from(block: Block) -> Self {
+impl From<Arc<Block>> for DebankBlock {
+    fn from(block: Arc<Block>) -> Self {
         DebankBlock {
             block_id: block.header.hash,
             block_height: block.header.number,
