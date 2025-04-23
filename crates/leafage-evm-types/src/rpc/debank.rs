@@ -1,4 +1,3 @@
-use alloy::primitives::B256;
 use super::{
     super::primitives::{Address, Bytes, H256, U256},
     BlockId,
