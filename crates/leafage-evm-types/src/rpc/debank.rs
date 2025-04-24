@@ -6,7 +6,7 @@ use super::{
 use revm::interpreter::OpCode;
 use revm_inspectors::tracing::types::{CallKind, CallLog, CallTraceNode};
 use serde::{Deserialize, Serialize};
-use crate::Block;
+use crate::{Block, Transaction};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DebankBlockContext {
@@ -152,7 +152,7 @@ pub struct DebankBlock {
 }
 
 impl From<Arc<Block>> for DebankBlock {
-    fn from(block: Arc<Block>) -> Self {
+    fn from(block: Arc<Block<Transaction>>) -> Self {
         DebankBlock {
             block_id: block.header.hash,
             block_height: block.header.number,
