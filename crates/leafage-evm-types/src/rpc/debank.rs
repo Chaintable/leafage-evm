@@ -151,7 +151,7 @@ pub struct DebankBlock {
     pub gas_used: u64,
 }
 
-impl From<Arc<Block>> for DebankBlock {
+impl From<Arc<Block<Transaction>>> for DebankBlock {
     fn from(block: Arc<Block<Transaction>>) -> Self {
         DebankBlock {
             block_id: block.header.hash,
