@@ -139,7 +139,7 @@ pub struct DebankSimulateResp {
 pub struct DebankBlock {
     pub id: H256,
     pub height: u64,
-    pub block_timestamp: u64,
+    pub timestamp: u64,
     pub parent_id: H256,
     pub base_fee_per_gas: u64,
     pub miner: Address,
@@ -152,7 +152,7 @@ impl From<Arc<Block<Transaction>>> for DebankBlock {
         DebankBlock {
             id: block.header.hash,
             height: block.header.number,
-            block_timestamp: block.header.timestamp,
+            timestamp: block.header.timestamp,
             parent_id: block.header.parent_hash,
             base_fee_per_gas: block.header.base_fee_per_gas.unwrap_or_default(),
             miner: block.header.beneficiary,
