@@ -1,12 +1,8 @@
-use std::sync::Arc;
-use super::{
-    super::primitives::{Address, Bytes, H256, U256},
-    BlockId,
-};
+use crate::{Address, Block, BlockId, Bytes, Transaction, H256, U256};
 use revm::interpreter::OpCode;
 use revm_inspectors::tracing::types::{CallKind, CallLog, CallTraceNode};
 use serde::{Deserialize, Serialize};
-use crate::{Block, Transaction};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DebankBlockContext {
@@ -141,10 +137,10 @@ pub struct DebankSimulateResp {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DebankBlock {
-    pub block_id: H256,
-    pub block_height: u64,
+    pub id: H256,
+    pub height: u64,
     pub block_timestamp: u64,
-    pub parent_hash: H256,
+    pub parent_id: H256,
     pub base_fee_per_gas: u64,
     pub miner: Address,
     pub gas_limit: u64,
@@ -154,10 +150,10 @@ pub struct DebankBlock {
 impl From<Arc<Block<Transaction>>> for DebankBlock {
     fn from(block: Arc<Block<Transaction>>) -> Self {
         DebankBlock {
-            block_id: block.header.hash,
-            block_height: block.header.number,
+            id: block.header.hash,
+            height: block.header.number,
             block_timestamp: block.header.timestamp,
-            parent_hash: block.header.parent_hash,
+            parent_id: block.header.parent_hash,
             base_fee_per_gas: block.header.base_fee_per_gas.unwrap_or_default(),
             miner: block.header.beneficiary,
             gas_limit: block.header.gas_limit,

@@ -9,7 +9,7 @@ use leafage_evm_types::{
     block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
     Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
     DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
-    HaltReason, MultiCallErrorCode, Transaction, TransactionInfo, H256, U256,
+    HaltReason, MultiCallErrorCode, Transaction, TransactionInfo, H256, KECCAK_EMPTY, U256,
 };
 use revm::db::{CacheDB, DatabaseRef};
 use revm::primitives::{
@@ -206,7 +206,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             return Ok(Bytes::new());
         } else {
             let account = account.unwrap();
-            if account.code_hash.is_zero() {
+            if account.code_hash.is_zero() || account.code_hash == KECCAK_EMPTY {
                 return Ok(Bytes::new());
             }
             let code = state.code_by_hash_ref(account.code_hash).map_err(|e| {
