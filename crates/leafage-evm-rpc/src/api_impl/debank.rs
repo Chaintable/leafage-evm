@@ -569,7 +569,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 }
             }
             let tx = create_txn_env(&block_env, tx)?;
-            let trace_cfg = TracingInspectorConfig::default_parity();
+            let trace_cfg = TracingInspectorConfig::default_parity().set_record_logs(true);
             let mut inspector = TracingInspector::new(trace_cfg);
             let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx);
             let mut evm = Evm::builder()
