@@ -9,7 +9,8 @@ use leafage_evm_types::{
     block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
     Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
     DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
-    HaltReason, MultiCallErrorCode, Transaction, TransactionInfo, H256, KECCAK_EMPTY, U256,
+    HaltReason, JsonStorageKey, MultiCallErrorCode, Transaction, TransactionInfo, H256,
+    KECCAK_EMPTY, RU256, U256,
 };
 use revm::db::{CacheDB, DatabaseRef};
 use revm::primitives::{
@@ -190,6 +191,26 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         })?;
         let balance = account.map(|a| a.balance);
         Ok(U256::from(balance.unwrap_or_default()))
+    }
+
+    fn debank_get_storage_at_impl(
+        &self,
+        address: Address,
+        index: H256,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<H256> {
+        let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
+        let state = EvmStorageWrapper(state);
+        let storage = state
+            .storage_ref(address.0.into(), RU256::from_be_bytes(index.into()))
+            .map_err(|e| {
+                internal_rpc_err(format!(
+                    "Failed to get storage at {:?} {:?}: {:?}",
+                    address, index, e
+                ))
+            })?;
+        let value: [u8; 32] = storage.to_be_bytes();
+        Ok(value.into())
     }
 
     fn debank_get_code_impl(
@@ -925,6 +946,15 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes> {
         self.debank_get_code_impl(address, block_ctx)
+    }
+
+    async fn get_storage_at(
+        &self,
+        address: Address,
+        position: JsonStorageKey,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<H256> {
+        self.debank_get_storage_at_impl(address, position.as_b256(), block_ctx)
     }
 
     async fn contract_multi_call(
