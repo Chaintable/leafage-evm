@@ -1,7 +1,7 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
     Address, BlockOverrides, Bytes, CallRequest, DebankBlock, DebankBlockContext,
-    DebankMultiCallResp, DebankSimulateResp, H256, U256,
+    DebankMultiCallResp, DebankSimulateResp, JsonStorageKey, H256, U256,
 };
 
 #[rpc(server, client)]
@@ -27,6 +27,14 @@ pub trait DebankApi {
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes>;
+
+    #[method(name = "getStorageAt")]
+    async fn get_storage_at(
+        &self,
+        address: Address,
+        position: JsonStorageKey,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<H256>;
 
     #[method(name = "contractMultiCall")]
     async fn contract_multi_call(
