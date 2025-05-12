@@ -1,3 +1,4 @@
+use alloy::rpc::types::state::StateOverride;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
     Address, BlockOverrides, Bytes, CallRequest, DebankBlock, DebankBlockContext,
@@ -42,6 +43,7 @@ pub trait DebankApi {
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
         fast_fail: Option<bool>,
         use_parallel: Option<bool>,
         disable_cache: Option<bool>,

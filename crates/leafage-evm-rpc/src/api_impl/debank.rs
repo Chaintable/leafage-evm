@@ -20,6 +20,7 @@ use revm::{inspector_handle_register, Evm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
+use alloy::rpc::types::state::StateOverride;
 use tokio::{sync::oneshot, time::timeout};
 use tracing::error;
 
@@ -242,6 +243,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
         fast_fail: Option<bool>,
         _use_parallel: Option<bool>,
         _disable_cache: Option<bool>,
@@ -268,6 +270,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 state,
                 block,
                 block_overrides,
+                state_override,
                 fast_fail.unwrap_or_default(),
             );
             if let Err(e) = tx.send(rsp) {
@@ -295,6 +298,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
         block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
         fast_fail: bool,
     ) -> RpcResult<DebankMultiCallResp> {
         let block_env = block_env_from_block(&block);
@@ -335,6 +339,9 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             let mut db = CacheDB::new(EvmStorageWrapper(state.clone()));
             if let Some(overrides) = block_overrides.clone() {
                 super::utils::apply_block_overrides(overrides, &mut db, &mut env.block);
+            }
+            if let Some(state_override) = state_override.clone() {
+                super::utils::apply_state_overrides(state_override, &mut db)?;
             }
             let mut evm = Evm::builder()
                 .with_ref_db(db)
@@ -962,6 +969,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
         fast_fail: Option<bool>,
         use_parallel: Option<bool>,
         disable_cache: Option<bool>,
@@ -970,6 +978,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             requests,
             block_ctx,
             block_overrides,
+            state_override,
             fast_fail,
             use_parallel,
             disable_cache,
