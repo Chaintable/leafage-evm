@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use super::utils::{EtcdRegisterConfig, NodeInfo, NodeType, StateType};
 use anyhow::{bail, Ok, Result};
 use etcd_client::{Client, LeaseKeepAliveStream, LeaseKeeper, PutOptions};
