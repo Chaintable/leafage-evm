@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . .
 RUN apt-get update -y && apt-get install -y libclang-dev protobuf-compiler
 ENV RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=1 --cfg tokio_unstable"
-RUN cargo build --features "$features"
+RUN cargo build --release --features "$features"
 
 
 FROM ubuntu:22.04
