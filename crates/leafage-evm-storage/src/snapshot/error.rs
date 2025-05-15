@@ -1,4 +1,5 @@
 use leafage_evm_types::BlockId;
+use revm::database_interface::DBErrorMarker;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,3 +17,5 @@ impl<DBError> From<DBError> for Error<DBError> {
         Error::DBError(e)
     }
 }
+
+impl<DBError> DBErrorMarker for Error<DBError> {}

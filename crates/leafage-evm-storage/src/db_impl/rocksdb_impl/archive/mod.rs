@@ -29,8 +29,9 @@ use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
     Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
-    Transaction, H256, KECCAK_EMPTY, U256,
+    Transaction, H256, KECCAK256_EMPTY, U256,
 };
+use revm::database_interface::DBErrorMarker;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRawIteratorWithThreadMode,
     IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, DB,
@@ -58,6 +59,7 @@ pub enum Error {
     #[error("conversion error, {0}")]
     Conversion(#[from] ConversionError),
 }
+impl DBErrorMarker for Error {}
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -402,7 +404,7 @@ impl StateDBIterator for DataBaseRef {
                     balance: raw_account.balance,
                     nonce: raw_account.nonce,
                     code_hash: if raw_account.code_hash.is_zero() {
-                        KECCAK_EMPTY.0.into()
+                        KECCAK256_EMPTY.0.into()
                     } else {
                         raw_account.code_hash
                     },
@@ -664,7 +666,7 @@ impl StateDBRead for StateDB {
                 balance: account.balance,
                 nonce: account.nonce,
                 code_hash: if account.code_hash.is_zero() {
-                    KECCAK_EMPTY.0.into()
+                    KECCAK256_EMPTY.0.into()
                 } else {
                     account.code_hash
                 },
@@ -690,7 +692,7 @@ impl StateDBRead for StateDB {
                 balance: account.balance,
                 nonce: account.nonce,
                 code_hash: if account.code_hash.is_zero() {
-                    KECCAK_EMPTY.0.into()
+                    KECCAK256_EMPTY.0.into()
                 } else {
                     account.code_hash
                 },

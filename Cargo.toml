@@ -3,7 +3,7 @@ members = ["bin/leafage-evm", "crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.79"
 authors = ["leafage-evm Contributors"]
@@ -15,7 +15,7 @@ exclude = ["benches/", "tests/"]
 leafage-evm-storage = { path = "crates/leafage-evm-storage" }
 leafage-evm-types = { path = "crates/leafage-evm-types" }
 leafage-evm-rpc = { path = "crates/leafage-evm-rpc" }
-auto_impl = "1.1.2"
+auto_impl = "1.3"
 bytes = "1.5.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -52,7 +52,7 @@ http-body = "1"
 procfs = "0.17"
 
 # revm
-revm = { version = "18.0.0", features = [
+revm = { version = "23.1.0", features = [
     "std",
     "secp256k1",
     "blst",
@@ -62,17 +62,28 @@ revm = { version = "18.0.0", features = [
     "optional_balance_check",
     "optional_block_gas_limit",
 ] }
-revm-inspectors = "0.11"
+op-revm = { version = "4.0.2", features = [
+    "std",
+    "secp256k1",
+    "blst",
+    "serde",
+    "optional_eip3607",
+    "optional_no_base_fee",
+    "optional_balance_check",
+    "optional_block_gas_limit",
+] }
+revm-inspectors = "0.21"
+revm-bytecode = "4.0"
 
 # alloy
 alloy-chains = "0.1.23"
-alloy = { version = "0.6", features = ["full"] }
+alloy = { version = "0.15", features = ["full"] }
 alloy-rlp = "0.3"
 alloy-rlp-derive = "0.3"
 
 # op
-op-alloy-rpc-types = "0.6"
-op-alloy-consensus = "0.6"
+op-alloy-rpc-types = "0.15"
+op-alloy-consensus = "0.15"
 
 # metrics
 metrics = "0.24.0"

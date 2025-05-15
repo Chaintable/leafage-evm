@@ -1,16 +1,16 @@
 use alloy::primitives::keccak256;
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Transaction, H256, U256,
+    AccountInfo, Address, Block, BlockId, BlockStorageDiff, Bytecode, Transaction, H256, U256,
 };
-use revm::db::DatabaseRef;
-use revm::primitives::{Address as B160, B256, U256 as RU256};
+use revm::database_interface::DBErrorMarker;
+use revm::DatabaseRef;
 use std::sync::Arc;
 
 /// [`StateDB`] is a trait that provides access to the state of the EVM at a specific block height.
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: std::error::Error + DBErrorMarker + Send + Sync + 'static;
     /// Get basic account information.
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error>;
     /// Get account code by its hash
@@ -74,25 +74,26 @@ pub trait BlockIndex {
 }
 
 /// [`EvmStorageWrapper`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
+#[derive(Clone, Debug)]
 pub struct EvmStorageWrapper<T>(pub T);
 
 impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     type Error = T::Error;
-    fn basic_ref(&self, address: B160) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let address = keccak256(address.as_slice());
         self.0.basic(address.into())
     }
-    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+    fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         self.0.code_by_hash(code_hash.0.into())
     }
-    fn storage_ref(&self, address: B160, index: RU256) -> Result<RU256, Self::Error> {
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let address = keccak256(address.as_slice());
         let index = keccak256::<[u8; 32]>(index.to_be_bytes());
         self.0
             .storage(address.into(), index.into())
             .map(|n| n.into())
     }
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+    fn block_hash_ref(&self, number: u64) -> Result<H256, Self::Error> {
         self.0.block_hash(number).map(|h| h.0.into())
     }
 }

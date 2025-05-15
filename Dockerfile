@@ -1,4 +1,4 @@
-FROM rust:1.81.0-bookworm AS builder
+FROM rust:1.85.0-bookworm AS builder
 
 ARG features
 ENV features=$features

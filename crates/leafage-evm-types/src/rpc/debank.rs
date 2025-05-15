@@ -1,5 +1,5 @@
 use crate::{Address, Block, BlockId, Bytes, Transaction, H256, U256};
-use revm::interpreter::OpCode;
+use revm_bytecode::opcode::OpCode;
 use revm_inspectors::tracing::types::{CallKind, CallLog, CallTraceNode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -216,25 +216,24 @@ impl From<&CallLog> for DebankEvent {
     fn from(log: &CallLog) -> Self {
         let selector = log
             .raw_log
-            .topics()
-            .get(0)
+            .topics().first()
             .map(|h| h.to_string())
             .unwrap_or_default();
         let topics = if log.raw_log.topics().len() > 1 {
             log.raw_log.topics()[1..]
-                .into_iter()
+                .iter()
                 .map(|h| h.to_string())
                 .collect()
         } else {
             vec![]
         };
-        let event = DebankEvent {
+        
+        DebankEvent {
             selector,
             topics,
             data: log.raw_log.data.clone(),
             ..Default::default()
-        };
-        event
+        }
     }
 }
 

@@ -20,8 +20,9 @@ use crate::db::{BlockRead, StateDBRead, StateDBWrite};
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK_EMPTY, U256,
+    Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK256_EMPTY, U256,
 };
+use revm::database_interface::DBErrorMarker;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
     WriteBatch, DB,
@@ -41,6 +42,8 @@ pub enum Error {
     #[error("serde_json error, {0}")]
     SerdeJson(#[from] serde_json::Error),
 }
+
+impl DBErrorMarker for Error {}
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -205,7 +208,7 @@ impl StateDBRead for DataBase {
             balance: account.balance,
             nonce: account.nonce,
             code_hash: if account.code_hash.is_zero() {
-                KECCAK_EMPTY.0.into()
+                KECCAK256_EMPTY.0.into()
             } else {
                 account.code_hash
             },

@@ -29,6 +29,7 @@ mod pre;
 pub use pre::{PreError, PreErrorCode, PreResult};
 
 mod debank;
+pub use alloy::rpc::types::state::{AccountOverride, StateOverride};
 pub use debank::{
     BlockType, DebankBlock, DebankBlockContext, DebankEvent, DebankID, DebankMultiCallResp,
     DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult,

@@ -1,6 +1,6 @@
-use super::ApiImpl;
+use super::{utils, ApiImpl};
 use crate::api::EthApiServer;
-use crate::api_impl::utils::{create_txn_env, get_handler_cfg};
+use crate::api_impl::utils::create_txn_env;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
@@ -9,13 +9,15 @@ use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWr
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
     BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Index, JsonStorageKey,
-    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, RU256,
-    U256,
+    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, U256,
 };
-use revm::db::{CacheDB, DatabaseRef};
-use revm::primitives::{CfgEnv, EnvWithHandlerCfg, ExecutionResult, SpecId};
-use revm::Evm;
+use leafage_evm_types::{CfgEnv, SpecId};
+use revm::context::result::ExecutionResult;
+use revm::database::{CacheDB, DatabaseRef};
+use revm::inspector::NoOpInspector;
+use revm::ExecuteEvm;
 use serde_json::Value;
+use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -50,11 +52,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         state_override: Option<StateOverride>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<Bytes> {
-        let mut cfg = self.cfg.clone();
-        cfg.disable_eip3607 = true;
-        cfg.disable_base_fee = true;
-        cfg.disable_block_gas_limit = true;
-        let cfg = get_handler_cfg(cfg, self.spec_id);
+        let cfg = self.cfg.clone();
         let state = self
             .db
             .state_at(block_id)
@@ -66,23 +64,18 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        let block_env = block_env_from_block(&block);
-        let tx = create_txn_env(&block_env, request)?;
-        let mut env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx);
+        let mut block_env = block_env_from_block(&block);
         let mut db = CacheDB::new(EvmStorageWrapper(state.clone()));
+        let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
-            super::utils::apply_block_overrides(overrides, &mut db, &mut env.block);
+            super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
         }
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
-        let mut evm = Evm::builder()
-            .with_ref_db(db)
-            .with_env_with_handler_cfg(env)
-            .build();
-
+        let mut evm = utils::create_evm_from_state(block_env, cfg, db, NoOpInspector {});
         let res = evm
-            .transact()
+            .transact(tx)
             .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
         match res.result {
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
@@ -97,7 +90,11 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
     }
 
-    fn eth_erc20_handle(state: DB::StateDB, request: CallRequest) -> SingleCallResult {
+    fn eth_erc20_handle<StateDB>(state: StateDB, request: CallRequest) -> SingleCallResult
+    where
+        StateDB: DatabaseRef,
+        StateDB::Error: Error,
+    {
         if let Some(data) = request.input.input() {
             if data.len() < 4 {
                 return SingleCallResult {
@@ -202,13 +199,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         _use_parallel: Option<bool>,
         _disable_cache: Option<bool>,
     ) -> RpcResult<MultiCallResp> {
-        let mut cfg = self.cfg.clone();
-        cfg.disable_eip3607 = true;
-        cfg.disable_base_fee = true;
-        cfg.disable_block_gas_limit = true;
-
-        let spec_id = self.spec_id;
-
+        let cfg = self.cfg.clone();
         let state = self
             .db
             .state_at(block_id)
@@ -227,8 +218,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             let rsp = Self::multi_call_from_state(
                 requests,
                 cfg,
-                spec_id,
-                state,
+                EvmStorageWrapper(state),
                 block,
                 fast_fail.unwrap_or_default(),
             );
@@ -244,9 +234,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn multi_call_from_state(
         requests: Vec<CallRequest>,
-        cfg: CfgEnv,
-        spec_id: SpecId,
-        state: DB::StateDB,
+        cfg: CfgEnv<SpecId>,
+        state: EvmStorageWrapper<<DB as EvmStorageRead>::StateDB>,
         block: Arc<Block<Transaction>>,
         fast_fail: bool,
     ) -> RpcResult<MultiCallResp> {
@@ -286,15 +275,16 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     }
                 }
             }
-            let cfg = get_handler_cfg(cfg.clone(), spec_id);
-            let tx = create_txn_env(&block_env, request)?;
-            let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env.clone(), tx);
-            let mut evm = Evm::builder()
-                .with_ref_db(EvmStorageWrapper(state.clone()))
-                .with_env_with_handler_cfg(env)
-                .build();
+            let tx = create_txn_env(&block_env, request, &state, &cfg)?;
+            let mut evm = utils::create_evm_from_state(
+                block_env.clone(),
+                cfg.clone(),
+                state.clone(),
+                NoOpInspector {},
+            );
+
             let res = evm
-                .transact()
+                .transact(tx)
                 .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
             let mut res = match res.result {
                 ExecutionResult::Success {
@@ -360,11 +350,14 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        Self::get_balance_from_state(state.unwrap(), address)
+        Self::get_balance_from_state(EvmStorageWrapper(state.unwrap()), address)
     }
 
-    pub fn get_balance_from_state(state: DB::StateDB, address: Address) -> RpcResult<U256> {
-        let state = EvmStorageWrapper(state);
+    pub fn get_balance_from_state<StateDB>(state: StateDB, address: Address) -> RpcResult<U256>
+    where
+        StateDB: DatabaseRef,
+        StateDB::Error: Error,
+    {
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
@@ -433,7 +426,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper(state.unwrap());
         let storage = state
-            .storage_ref(address.0.into(), RU256::from_be_bytes(index.into()))
+            .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
                 internal_rpc_err(format!(
                     "Failed to get storage at {:?} {:?}: {:?}",

@@ -11,6 +11,7 @@ exclude.workspace = true
 [dependencies]
 alloy = { workspace = true, features = ["rpc-types-trace", "getrandom"] }
 revm.workspace = true
+op-revm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 alloy-rlp.workspace = true
@@ -21,6 +22,7 @@ thiserror.workspace = true
 flate2.workspace = true
 md-5.workspace = true
 revm-inspectors.workspace = true
+revm-bytecode.workspace =  true
 
 [features]
 default = []

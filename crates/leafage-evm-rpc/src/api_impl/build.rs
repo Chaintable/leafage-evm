@@ -4,25 +4,23 @@ use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
-use revm::primitives::{CfgEnv, SpecId};
+use leafage_evm_types::{CfgEnv, SpecId};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct ApiBuilder<DB> {
     db: Arc<DB>,
-    cfg: CfgEnv,
-    spec_id: SpecId,
+    cfg: CfgEnv<SpecId>,
 }
 
 impl<DB> ApiBuilder<DB>
 where
     DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
 {
-    pub fn new(db: DB, cfg: CfgEnv, spec_id: SpecId) -> Self {
+    pub fn new(db: DB, cfg: CfgEnv<SpecId>) -> Self {
         Self {
             db: Arc::new(db),
             cfg,
-            spec_id,
         }
     }
 
@@ -50,7 +48,6 @@ where
             .merge(EthApiServer::into_rpc(ApiImpl::new(
                 self.db.clone(),
                 self.cfg.clone(),
-                self.spec_id,
                 rpc_timeout / 2,
             )))
             .map_err(|e| {
@@ -63,7 +60,6 @@ where
             .merge(PreApiServer::into_rpc(ApiImpl::new(
                 self.db.clone(),
                 self.cfg.clone(),
-                self.spec_id,
                 rpc_timeout / 2,
             )))
             .map_err(|e| {
@@ -76,7 +72,6 @@ where
             .merge(TraceApiServer::into_rpc(ApiImpl::new(
                 self.db.clone(),
                 self.cfg.clone(),
-                self.spec_id,
                 rpc_timeout / 2,
             )))
             .map_err(|e| {
@@ -90,7 +85,6 @@ where
             .merge(DebankApiServer::into_rpc(ApiImpl::new(
                 self.db.clone(),
                 self.cfg.clone(),
-                self.spec_id,
                 rpc_timeout / 2,
             )))
             .map_err(|e| {

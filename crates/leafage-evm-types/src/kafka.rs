@@ -41,7 +41,7 @@ impl TryFrom<&[u8]> for KafkaBlockChangeNotification {
     type Error = Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let mut gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut gz = flate2::read::GzDecoder::new(bytes);
         let mut bytes = Vec::new();
         gz.read_to_end(&mut bytes)?;
         let notification: KafkaBlockChangeNotification = serde_json::from_slice(&bytes)?;
