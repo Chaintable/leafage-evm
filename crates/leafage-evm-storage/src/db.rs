@@ -8,6 +8,7 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, Transaction, H256,
     U256,
 };
+use revm::database_interface::DBErrorMarker;
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockRead: Send + Sync + 'static {
@@ -35,7 +36,7 @@ pub trait BlockIterator: Send + Sync + 'static {
 /// [`StateDBRead`] offers read-only access to the state database.
 #[auto_impl(&, Box, Arc)]
 pub trait StateDBRead {
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: std::error::Error + DBErrorMarker + Send + Sync + 'static;
     /// account address -> raw account
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Self::Error>;
 
@@ -148,7 +149,7 @@ where
 impl<T, E> StateDB for StateDBWrapper<T>
 where
     T: StateDBRead<Error = E> + BlockRead<Error = E>,
-    E: std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + DBErrorMarker + Send + Sync + 'static,
 {
     type Error = E;
 

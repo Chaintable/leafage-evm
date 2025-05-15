@@ -8,6 +8,7 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Bytecode, Transaction, H256,
     U256,
 };
+use revm::database_interface::DBErrorMarker;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -47,6 +48,8 @@ pub enum Error<E> {
     #[error("Archive error: {0}")]
     Archive(#[from] E),
 }
+
+impl<E> DBErrorMarker for Error<E> {}
 
 pub enum MultiStateDB<DB>
 where

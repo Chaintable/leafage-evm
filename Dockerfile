@@ -1,4 +1,4 @@
-FROM rust:1.81.0-bookworm AS builder
+FROM rust:1.85.0-bookworm AS builder
 
 ARG features
 ENV features=$features
@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . .
 RUN apt-get update -y && apt-get install -y libclang-dev protobuf-compiler
 ENV RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=1 --cfg tokio_unstable"
-RUN cargo build --release --features "$features"
+RUN cargo build --features "$features"
 
 
 FROM ubuntu:22.04

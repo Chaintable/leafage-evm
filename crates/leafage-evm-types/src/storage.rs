@@ -1,27 +1,28 @@
-use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, RU256, U256};
+use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, U256};
 use crate::rpc::{Block, Transaction};
 use alloy::primitives::keccak256;
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
-use revm::primitives::BlobExcessGasAndPrice;
+use revm::context_interface::block::BlobExcessGasAndPrice;
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
-    let block_env = BlockEnv {
-        number: RU256::from(block.header.number),
-        coinbase: block.header.beneficiary,
-        timestamp: RU256::from(block.header.timestamp),
-        difficulty: RU256::from(block.header.difficulty),
-        basefee: RU256::from(block.header.base_fee_per_gas.unwrap_or_default()),
-        gas_limit: RU256::from(block.header.gas_limit),
+    
+    BlockEnv {
+        number: block.header.number,
+        beneficiary: block.header.beneficiary,
+        timestamp: block.header.timestamp,
+        difficulty: block.header.difficulty,
+        basefee: block.header.base_fee_per_gas.unwrap_or_default(),
+        gas_limit: block.header.gas_limit,
         prevrandao: if block.header.difficulty.is_zero() {
             Some(block.header.mix_hash)
         } else {
             Some(H256::ZERO)
         },
         blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
-            block.header.excess_blob_gas.unwrap_or_default() as u64,
+            block.header.excess_blob_gas.unwrap_or_default(),
+            true,
         )),
-    };
-    block_env
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
@@ -58,12 +59,12 @@ pub struct NewAccount {
     pub code_hash: H256,
 }
 
-impl Into<AccountInfo> for NewAccount {
-    fn into(self) -> AccountInfo {
+impl From<NewAccount> for AccountInfo {
+    fn from(val: NewAccount) -> Self {
         AccountInfo {
-            balance: self.balance.into(),
-            nonce: self.nonce,
-            code_hash: self.code_hash.0.into(),
+            balance: val.balance,
+            nonce: val.nonce,
+            code_hash: val.code_hash.0.into(),
             code: None,
         }
     }
@@ -72,8 +73,8 @@ impl Into<AccountInfo> for NewAccount {
 impl From<(Address, AccountInfo)> for NewAccount {
     fn from((address, account_info): (Address, AccountInfo)) -> Self {
         Self {
-            address: keccak256::<&[u8; 20]>(address.as_ref()).into(),
-            balance: account_info.balance.into(),
+            address: keccak256::<&[u8; 20]>(address.as_ref()),
+            balance: account_info.balance,
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.0.into(),
         }
@@ -84,7 +85,7 @@ impl From<(H256, AccountInfo)> for NewAccount {
     fn from((address, account_info): (H256, AccountInfo)) -> Self {
         Self {
             address,
-            balance: account_info.balance.into(),
+            balance: account_info.balance,
             nonce: account_info.nonce,
             code_hash: account_info.code_hash.0.into(),
         }

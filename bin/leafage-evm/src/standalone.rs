@@ -10,8 +10,8 @@ use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
 };
+use leafage_evm_types::{CfgEnv, SpecId};
 use metrics::gauge;
-use revm::primitives::{CfgEnv, SpecId};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -23,7 +23,7 @@ pub struct Command {
     ///
     /// If not specified, the default config [eth] will be used.
     #[arg(long, value_parser = parse_chain_cfg, default_value = "eth")]
-    chain_cfg: CfgEnv,
+    chain_cfg: CfgEnv<SpecId>,
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
@@ -155,8 +155,12 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntEr
     Ok(std::time::Duration::from_millis(millis))
 }
 
-fn parse_chain_cfg(arg: &str) -> Result<CfgEnv> {
+fn parse_chain_cfg(arg: &str) -> Result<CfgEnv<SpecId>> {
     let mut chain_cfg = CfgEnv::default();
+    chain_cfg.disable_balance_check = true;
+    chain_cfg.disable_eip3607 = true;
+    chain_cfg.disable_block_gas_limit = true;
+    chain_cfg.disable_base_fee = true;
     if arg.is_empty() || arg == "eth" {
         return Ok(chain_cfg);
     }
@@ -220,14 +224,13 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
 impl Command {
     async fn start(
         &self,
-        chain_cfg: CfgEnv,
-        spec_id: SpecId,
+        chain_cfg: CfgEnv<SpecId>,
     ) -> Result<(
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
     )> {
-        info!(target:"updater", "chain cfg: {:?}, spec_id: {:?}, archive: {:?}", chain_cfg, spec_id, self.archive);
+        info!(target:"updater", "chain cfg: {:?}, archive: {:?}", chain_cfg, self.archive);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
         if !self.prometheus_addr.is_empty() {
             metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -256,7 +259,7 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone(), spec_id)
+                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .build_and_run(
                         &self.listen_addr,
                         self.max_connections,
@@ -297,7 +300,7 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone(), spec_id)
+                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .build_and_run(
                         &self.listen_addr,
                         self.max_connections,
@@ -320,12 +323,8 @@ impl Command {
         }
     }
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, resgitry_handle) = self
-            .start(
-                self.chain_cfg.clone(),
-                SpecId::try_from_u8(self.spec_id).unwrap_or(SpecId::LATEST),
-            )
-            .await?;
+        let (updater_handle, rpc_handle, resgitry_handle) =
+            self.start(self.chain_cfg.clone()).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());

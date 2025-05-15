@@ -1,19 +1,27 @@
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
-use alloy::rpc::types::state::{AccountOverride, StateOverride};
+use alloy::consensus::TxType;
+use alloy::signers::Either;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
-    Address, BlockOverrides, Bytecode, CallRequest, DebankEvent, DebankID, DebankTrace, H256, U256,
+    AccountOverride, BlockOverrides, Bytecode, CallRequest, CfgEnv, DebankEvent, DebankID,
+    DebankTrace, SpecId, StateOverride, H256, U256,
 };
-use revm::db::CacheDB;
-use revm::primitives::{
-    env::{CfgEnv, CfgEnvWithHandlerCfg},
-    AccessListItem, Account, AccountStatus, BlockEnv, EvmStorageSlot, SpecId, TxEnv, TxKind,
+#[cfg(feature = "optimism")]
+use op_revm::{
+    precompiles::OpPrecompiles, DefaultOp, L1BlockInfo, OpBuilder, OpEvm, OpTransaction,
 };
-use revm::{Database, DatabaseCommit, DatabaseRef};
-use revm_inspectors::tracing::{
-    types::{CallTraceNode, TraceMemberOrder},
-    CallTraceArena,
-};
+use revm::context::{BlockEnv, TxEnv};
+use revm::context_interface::Block;
+use revm::database::{CacheDB, DatabaseRef, WrapDatabaseRef};
+use revm::handler::instructions::EthInstructions;
+use revm::interpreter::interpreter::EthInterpreter;
+use revm::primitives::{Address, TxKind};
+use revm::state::{Account, AccountStatus, EvmStorageSlot};
+#[cfg(not(feature = "optimism"))]
+use revm::{context::Evm, handler::EthPrecompiles, MainBuilder, MainContext};
+use revm::{Context, Database, DatabaseCommit};
+use revm_inspectors::tracing::types::{CallTraceNode, TraceMemberOrder};
+use revm_inspectors::tracing::CallTraceArena;
 use std::collections::HashMap;
 
 /// Helper type for representing the fees of a [CallRequest]
@@ -87,7 +95,25 @@ pub(crate) fn ensure_fees(
     }
 }
 
-pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcResult<TxEnv> {
+#[cfg(feature = "optimism")]
+pub(crate) fn create_txn_env<ODB: DatabaseRef>(
+    block_env: &BlockEnv,
+    request: CallRequest,
+    db: ODB,
+    cfg: &CfgEnv<SpecId>,
+) -> RpcResult<OpTransaction<TxEnv>> {
+    let tx_type = if request.authorization_list.is_some() {
+        TxType::Eip7702
+    } else if request.sidecar.is_some() || request.max_fee_per_blob_gas.is_some() {
+        TxType::Eip4844
+    } else if request.max_fee_per_gas.is_some() || request.max_priority_fee_per_gas.is_some() {
+        TxType::Eip1559
+    } else if request.access_list.is_some() {
+        TxType::Eip2930
+    } else {
+        TxType::Legacy
+    } as u8;
+
     let CallRequest {
         from,
         to,
@@ -99,7 +125,7 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         value,
         input,
         nonce,
-        chain_id,
+        mut chain_id,
         access_list,
         blob_versioned_hashes,
         authorization_list,
@@ -114,67 +140,180 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> RpcR
         gas_price.map(U256::from),
         max_fee_per_gas.map(U256::from),
         max_priority_fee_per_gas.map(U256::from),
-        block_env.basefee.into(),
+        U256::from(block_env.basefee),
         blob_versioned_hashes.as_deref(),
         max_fee_per_blob_gas.map(U256::from),
-        block_env.get_blob_gasprice().map(U256::from),
+        block_env.blob_gasprice().map(U256::from),
     )
     .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
 
-    let gas_limit = gas.unwrap_or_else(|| block_env.gas_limit.min(U256::from(u64::MAX)).to());
+    let gas_limit = gas.unwrap_or_else(|| block_env.gas_limit.min(u64::MAX));
 
-    let env = TxEnv {
-        caller: from.unwrap_or_default(),
+    let caller = from.unwrap_or_default();
+
+    if chain_id.is_none() {
+        chain_id = Some(cfg.chain_id);
+    }
+
+    let nonce = if let Some(nonce) = nonce {
+        nonce
+    } else {
+        db.basic_ref(caller)
+            .map_err(|_| internal_rpc_err("get nonce failed"))?
+            .map(|acc| acc.nonce)
+            .unwrap_or_default()
+    };
+
+    let base = TxEnv {
+        tx_type,
         gas_limit: gas_limit
             .try_into()
             .map_err(|_| invalid_params_rpc_err("Invalid gas parameters"))?,
-        gas_price,
-        gas_priority_fee: max_priority_fee_per_gas,
-        transact_to: to.unwrap_or(TxKind::Create),
+        nonce,
+        caller,
+        gas_price: gas_price.saturating_to(),
+        gas_priority_fee: max_priority_fee_per_gas.map(|v| v.saturating_to()),
+        kind: to.unwrap_or(TxKind::Create),
         value: value.unwrap_or_default(),
         data: input.into_input().unwrap_or_default(),
         chain_id,
-        nonce,
-        access_list: access_list
-            .unwrap_or_default()
-            .iter()
-            .map(|a| AccessListItem {
-                address: a.address,
-                storage_keys: a.storage_keys.clone(),
-            })
-            .collect::<Vec<_>>()
-            .into(),
+        access_list: access_list.unwrap_or_default(),
         // EIP-4844 fields
         blob_hashes: blob_versioned_hashes.unwrap_or_default(),
-        max_fee_per_blob_gas,
+        max_fee_per_blob_gas: max_fee_per_blob_gas
+            .map(|v| v.saturating_to())
+            .unwrap_or_default(),
         // EIP-7702 fields
-        authorization_list: authorization_list.map(Into::into),
-        #[cfg(feature = "optimism")]
-        optimism: revm::primitives::OptimismFields {
-            enveloped_tx: Some(Default::default()),
-            ..Default::default()
-        },
+        authorization_list: authorization_list
+            .unwrap_or_default()
+            .into_iter()
+            .map(Either::Left)
+            .collect(),
+        ..Default::default()
+    };
+
+    Ok(OpTransaction {
+        base,
+        enveloped_tx: Some(leafage_evm_types::Bytes::new()),
+        deposit: Default::default(),
+    })
+}
+
+#[cfg(not(feature = "optimism"))]
+pub(crate) fn create_txn_env<ODB: DatabaseRef>(
+    block_env: &BlockEnv,
+    request: CallRequest,
+    db: ODB,
+    cfg: &CfgEnv<SpecId>,
+) -> RpcResult<TxEnv> {
+    let tx_type = if request.authorization_list.is_some() {
+        TxType::Eip7702
+    } else if request.sidecar.is_some() || request.max_fee_per_blob_gas.is_some() {
+        TxType::Eip4844
+    } else if request.max_fee_per_gas.is_some() || request.max_priority_fee_per_gas.is_some() {
+        TxType::Eip1559
+    } else if request.access_list.is_some() {
+        TxType::Eip2930
+    } else {
+        TxType::Legacy
+    } as u8;
+
+    let CallRequest {
+        from,
+        to,
+        gas_price,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        max_fee_per_blob_gas,
+        gas,
+        value,
+        input,
+        nonce,
+        mut chain_id,
+        access_list,
+        blob_versioned_hashes,
+        authorization_list,
+        ..
+    } = request;
+
+    let CallFees {
+        max_priority_fee_per_gas,
+        gas_price,
+        max_fee_per_blob_gas,
+    } = ensure_fees(
+        gas_price.map(U256::from),
+        max_fee_per_gas.map(U256::from),
+        max_priority_fee_per_gas.map(U256::from),
+        U256::from(block_env.basefee),
+        blob_versioned_hashes.as_deref(),
+        max_fee_per_blob_gas.map(U256::from),
+        block_env.blob_gasprice().map(U256::from),
+    )
+    .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
+
+    let gas_limit = gas.unwrap_or_else(|| block_env.gas_limit.min(u64::MAX));
+
+    let caller = from.unwrap_or_default();
+
+    if chain_id.is_none() {
+        chain_id = Some(cfg.chain_id);
+    }
+
+    let nonce = if let Some(nonce) = nonce {
+        nonce
+    } else {
+        db.basic_ref(caller)
+            .map_err(|_| internal_rpc_err("get nonce failed"))?
+            .map(|acc| acc.nonce)
+            .unwrap_or_default()
+    };
+
+    let env = TxEnv {
+        tx_type,
+        gas_limit: gas_limit
+            .try_into()
+            .map_err(|_| invalid_params_rpc_err("Invalid gas parameters"))?,
+        nonce,
+        caller,
+        gas_price: gas_price.saturating_to(),
+        gas_priority_fee: max_priority_fee_per_gas.map(|v| v.saturating_to()),
+        kind: to.unwrap_or(TxKind::Create),
+        value: value.unwrap_or_default(),
+        data: input.into_input().unwrap_or_default(),
+        chain_id,
+        access_list: access_list.unwrap_or_default(),
+        // EIP-4844 fields
+        blob_hashes: blob_versioned_hashes.unwrap_or_default(),
+        max_fee_per_blob_gas: max_fee_per_blob_gas
+            .map(|v| v.saturating_to())
+            .unwrap_or_default(),
+        // EIP-7702 fields
+        authorization_list: authorization_list
+            .unwrap_or_default()
+            .into_iter()
+            .map(Either::Left)
+            .collect(),
         ..Default::default()
     };
 
     Ok(env)
 }
 
-pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHandlerCfg {
-    #[allow(unused_mut)]
-    let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, spec_id);
-    #[cfg(feature = "optimism")]
-    {
-        cfg.disable_base_fee = true;
-        cfg.enable_optimism();
-    }
-    cfg
-}
+// pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHandlerCfg {
+//     #[allow(unused_mut)]
+//     let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, spec_id);
+//     #[cfg(feature = "optimism")]
+//     {
+//         cfg.disable_base_fee = true;
+//         cfg.enable_optimism();
+//     }
+//     cfg
+// }
 
-pub(crate) fn apply_block_overrides<DB>(
+pub fn apply_block_overrides<DB>(
     overrides: BlockOverrides,
     db: &mut CacheDB<DB>,
-    block_env: &mut BlockEnv,
+    env: &mut BlockEnv,
 ) {
     let BlockOverrides {
         number,
@@ -189,7 +328,7 @@ pub(crate) fn apply_block_overrides<DB>(
 
     if let Some(block_hashes) = block_hash {
         // override block hashes
-        db.block_hashes.extend(
+        db.cache.block_hashes.extend(
             block_hashes
                 .into_iter()
                 .map(|(num, hash)| (U256::from(num), hash)),
@@ -197,25 +336,25 @@ pub(crate) fn apply_block_overrides<DB>(
     }
 
     if let Some(number) = number {
-        block_env.number = number;
+        env.number = number.saturating_to();
     }
     if let Some(difficulty) = difficulty {
-        block_env.difficulty = difficulty;
+        env.difficulty = difficulty;
     }
     if let Some(time) = time {
-        block_env.timestamp = U256::from(time);
+        env.timestamp = time;
     }
     if let Some(gas_limit) = gas_limit {
-        block_env.gas_limit = U256::from(gas_limit);
+        env.gas_limit = gas_limit;
     }
     if let Some(coinbase) = coinbase {
-        block_env.coinbase = coinbase;
+        env.beneficiary = coinbase;
     }
     if let Some(random) = random {
-        block_env.prevrandao = Some(random);
+        env.prevrandao = Some(random);
     }
     if let Some(base_fee) = base_fee {
-        block_env.basefee = base_fee;
+        env.basefee = base_fee.saturating_to();
     }
 }
 
@@ -409,5 +548,70 @@ pub(crate) fn build_debank_traces(
     let mut traces = vec![];
     let mut events = vec![];
     finish_build_traces(&mut top, &mut traces, &mut events);
-    return (traces, events);
+    (traces, events)
+}
+
+#[cfg(not(feature = "optimism"))]
+pub(crate) fn create_evm_from_state<StateDB, INSP>(
+    block_env: BlockEnv,
+    cfg: CfgEnv<SpecId>,
+    state: StateDB,
+    inspector: INSP,
+) -> Evm<
+    Context<BlockEnv, TxEnv, CfgEnv<SpecId>, WrapDatabaseRef<StateDB>>,
+    INSP,
+    EthInstructions<
+        EthInterpreter,
+        Context<BlockEnv, TxEnv, CfgEnv<SpecId>, WrapDatabaseRef<StateDB>>,
+    >,
+    EthPrecompiles,
+>
+where
+    StateDB: DatabaseRef,
+{
+    Context::mainnet()
+        .with_block(block_env)
+        .with_cfg(cfg)
+        .with_ref_db(state)
+        .build_mainnet_with_inspector(inspector)
+        .with_precompiles(EthPrecompiles::default())
+}
+
+#[cfg(feature = "optimism")]
+pub(crate) fn create_evm_from_state<StateDB, INSP>(
+    block_env: BlockEnv,
+    cfg: CfgEnv<SpecId>,
+    state: StateDB,
+    inspector: INSP,
+) -> OpEvm<
+    Context<
+        BlockEnv,
+        OpTransaction<TxEnv>,
+        CfgEnv<SpecId>,
+        WrapDatabaseRef<StateDB>,
+        revm::Journal<WrapDatabaseRef<StateDB>>,
+        L1BlockInfo,
+    >,
+    INSP,
+    EthInstructions<
+        EthInterpreter,
+        Context<
+            BlockEnv,
+            OpTransaction<TxEnv>,
+            CfgEnv<SpecId>,
+            WrapDatabaseRef<StateDB>,
+            revm::Journal<WrapDatabaseRef<StateDB>>,
+            L1BlockInfo,
+        >,
+    >,
+>
+where
+    StateDB: DatabaseRef,
+{
+    Context::op()
+        .with_block(block_env)
+        .with_cfg(cfg.clone())
+        .with_ref_db(state)
+        .build_op_with_inspector(inspector)
+        .with_precompiles(OpPrecompiles::default())
 }

@@ -1,8 +1,10 @@
 pub use alloy::eips::eip1559::{calc_next_block_base_fee, BaseFeeParams};
-pub use alloy::primitives::{Address, Bytes, B256 as H256, U256, U64};
-pub use revm::primitives::{
-    hex, AccountInfo, BlockEnv, Bytecode, ExecutionResult, HaltReason, KECCAK_EMPTY, U256 as RU256,
-};
-
+pub use alloy::primitives::{hex, Address, Bytes, B256 as H256, KECCAK256_EMPTY, U256, U64};
 #[cfg(feature = "optimism")]
-pub use revm::primitives::OptimismFields;
+pub use op_revm::OpSpecId as SpecId;
+#[cfg(not(feature = "optimism"))]
+pub use revm::primitives::hardfork::SpecId;
+
+pub use revm::context::{result::ExecutionResult, BlockEnv, CfgEnv};
+
+pub use revm::state::{AccountInfo, Bytecode};
