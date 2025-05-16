@@ -1,10 +1,7 @@
-use crate::interface::{
-    BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB, TxContext,
-};
+use crate::interface::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite, StateDB};
 use crate::metrics::BLOCK_METRICS;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
-use alloy::network::TransactionResponse;
 use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction, H256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -57,8 +54,6 @@ pub struct SnapshotTree<DB> {
     hash_diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer<DB>>>>,
     /// blocknum-> node, num_diff_map stores all the diff layer of the EVM.
     num_diff_map: RwLock<HashMap<u64, Arc<LinkedDiffLayer<DB>>>>,
-    /// tx_hash -> tx_context, tx_hash_map stores the tx info.
-    tx_hash_map: RwLock<HashMap<H256, TxContext>>,
     /// config stores the config of the SnapshotTree.
     config: SnapshotTreeConfig,
     /// disk_layer is the bottom layer of the SnapshotTree.
@@ -71,17 +66,14 @@ impl<DB> SnapshotTree<DB> {
         if bottom_height == 0 {
             return;
         }
-        self.hash_diff_map.write().unwrap().retain(|_, v| {
-            v.is_cache_layer() || v.unwrap_diff_layer().block_info.header.number > bottom_height
-        });
+        self.hash_diff_map
+            .write()
+            .unwrap()
+            .retain(|_, v| v.unwrap_diff_layer().block_info.header.number > bottom_height);
         self.num_diff_map
             .write()
             .unwrap()
-            .retain(|num, v| v.is_cache_layer() || *num > bottom_height);
-        self.tx_hash_map
-            .write()
-            .unwrap()
-            .retain(|_, v| v.block_number > bottom_height);
+            .retain(|num, _| *num > bottom_height);
     }
 
     pub fn get_config(&self) -> SnapshotTreeConfig {
@@ -100,7 +92,6 @@ where
     pub fn new(db: DB, config: SnapshotTreeConfig) -> Result<Self, E> {
         let mut hash_diffs = HashMap::new();
         let mut num_diffs = HashMap::new();
-        let mut tx_hash_map = HashMap::new();
         let info = db.block_info()?;
         let cache_layer = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(
             db,
@@ -108,24 +99,18 @@ where
             config.storage_cache_size,
             config.code_cache_size,
         )));
-        hash_diffs.insert(info.header.hash, cache_layer.clone());
-        num_diffs.insert(info.header.number, cache_layer.clone());
-        for tx in info.transactions.txns() {
-            tx_hash_map.insert(
-                tx.tx_hash(),
-                TxContext {
-                    block_hash: info.header.hash,
-                    block_number: info.header.number,
-                    transaction_index: tx.transaction_index.unwrap(),
-                    transaction_hash: tx.tx_hash(),
-                },
-            );
-        }
+        let bottom_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
+            info.clone(),
+            BlockStorageDiff::default(),
+            cache_layer.clone(),
+        )));
+        info!(target:"storage", "init block info: {:?}", info);
+        hash_diffs.insert(info.header.hash, bottom_layer.clone());
+        num_diffs.insert(info.header.number, bottom_layer.clone());
         Ok(Self {
             latest: RwLock::new(cache_layer.clone()),
             hash_diff_map: RwLock::new(hash_diffs),
             num_diff_map: RwLock::new(num_diffs),
-            tx_hash_map: RwLock::new(tx_hash_map),
             disk_layer: cache_layer,
             config,
         })
@@ -174,18 +159,6 @@ where
                 .write()
                 .unwrap()
                 .insert(block_info.header.number, new_diff_layer.clone());
-            let txs = block_info.transactions.txns().map(|tx| {
-                (
-                    tx.tx_hash(),
-                    TxContext {
-                        block_hash: block_info.header.hash,
-                        block_number: block_info.header.number,
-                        transaction_index: tx.transaction_index.unwrap(),
-                        transaction_hash: tx.tx_hash(),
-                    },
-                )
-            });
-            self.tx_hash_map.write().unwrap().extend(txs);
 
             let latest_block_info = self.latest.read().unwrap().block_info()?;
             // import reorg block
