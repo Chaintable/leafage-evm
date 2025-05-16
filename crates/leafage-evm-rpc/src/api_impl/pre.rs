@@ -11,7 +11,7 @@ use leafage_evm_types::{
 };
 use revm::context::result::HaltReason;
 use revm::database::CacheDB;
-use revm::ExecuteCommitEvm;
+use revm::{ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -83,8 +83,9 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
                 &mut memory_db,
                 &mut inspector,
             );
+            evm.set_tx(tx);
             let exec_res = evm
-                .transact_commit(tx)
+                .inspect_replay_commit()
                 .map_err(|e| internal_rpc_err(e.to_string()))?;
             drop(evm);
             match exec_res {
