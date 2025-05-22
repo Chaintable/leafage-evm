@@ -308,7 +308,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             let code = state.code_by_hash_ref(account.code_hash).map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
-            Ok(code.bytecode().0.clone().into())
+            Ok(code.original_bytes().0.clone().into())
         }
     }
 
