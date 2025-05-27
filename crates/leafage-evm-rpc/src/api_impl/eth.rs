@@ -8,7 +8,7 @@ use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Index, JsonStorageKey,
+    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, Index, JsonStorageKey,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, U256,
 };
 use leafage_evm_types::{CfgEnv, SpecId};
@@ -90,7 +90,11 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
     }
 
-    fn eth_erc20_handle<StateDB>(state: StateDB, request: CallRequest) -> SingleCallResult
+    fn eth_erc20_handle<StateDB>(
+        block_header: &Header,
+        state: StateDB,
+        request: CallRequest,
+    ) -> SingleCallResult
     where
         StateDB: DatabaseRef,
         StateDB::Error: Error,
@@ -166,6 +170,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     err: "".to_string(),
                     from_cache: false,
                     result: Bytes::from("ETH".abi_encode()),
+                    gas_used: 0,
+                    time_cost: 0.0,
+                };
+            } else if data[0..4] == [0x6c, 0x4b, 0x6e, 0x28] {
+                let block_num = U256::from(block_header.number);
+                let block_hash = block_header.hash;
+                return SingleCallResult {
+                    code: 0,
+                    err: "".to_string(),
+                    from_cache: false,
+                    result: Bytes::from((block_num, block_hash).abi_encode()),
                     gas_used: 0,
                     time_cost: 0.0,
                 };
@@ -265,7 +280,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     if *address
                         == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
                     {
-                        let mut res = Self::eth_erc20_handle(state.clone(), request);
+                        let mut res = Self::eth_erc20_handle(&block.header, state.clone(), request);
                         if res.code != MultiCallErrorCode::Success as i32 {
                             stats.success = false;
                         }

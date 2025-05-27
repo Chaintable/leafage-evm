@@ -10,7 +10,8 @@ use leafage_evm_types::{
     block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
     Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
     DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
-    JsonStorageKey, MultiCallErrorCode, Transaction, TransactionInfo, H256, KECCAK256_EMPTY, U256,
+    Header, JsonStorageKey, MultiCallErrorCode, Transaction, TransactionInfo, H256,
+    KECCAK256_EMPTY, U256,
 };
 use leafage_evm_types::{CfgEnv, SpecId};
 #[cfg(feature = "optimism")]
@@ -390,7 +391,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     if *address
                         == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
                     {
-                        let mut res = Self::debank_eth_erc20_handle(state.clone(), request);
+                        let mut res =
+                            Self::debank_eth_erc20_handle(&block.header, state.clone(), request);
                         if res.code != 0 as i32 {
                             stats.success = false;
                         }
@@ -452,7 +454,11 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         Ok(DebankMultiCallResp { stats, results })
     }
 
-    fn debank_eth_erc20_handle(state: DB::StateDB, request: CallRequest) -> DebankSingleCallResult {
+    fn debank_eth_erc20_handle(
+        block_header: &Header,
+        state: DB::StateDB,
+        request: CallRequest,
+    ) -> DebankSingleCallResult {
         if let Some(data) = request.input.input() {
             if data.len() < 4 {
                 return DebankSingleCallResult {
@@ -523,6 +529,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     err: "".to_string(),
                     from_cache: false,
                     result: Bytes::from("ETH".abi_encode()),
+                    gas_used: 0,
+                    time_cost: 0.0,
+                };
+            } else if data[0..4] == [0x6c, 0x4b, 0x6e, 0x28] {
+                let block_num = U256::from(block_header.number);
+                let block_hash = block_header.hash;
+                return DebankSingleCallResult {
+                    code: 0,
+                    err: "".to_string(),
+                    from_cache: false,
+                    result: Bytes::from((block_num, block_hash).abi_encode()),
                     gas_used: 0,
                     time_cost: 0.0,
                 };
