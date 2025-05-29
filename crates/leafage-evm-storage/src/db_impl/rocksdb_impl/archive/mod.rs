@@ -916,7 +916,6 @@ impl StateDBWrite for StateDB {
                 address_to_storage_cf,
                 [address_bytes, &key_bytes, &max_block_num_bytes].concat(),
             );
-            return Ok(());
         } else {
             batch.put_cf(
                 address_to_storage_cf,
