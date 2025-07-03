@@ -37,7 +37,10 @@ where
         for topic in meta.topics() {
             if topic.name() == kafka_s3_cfg.topic {
                 for p in topic.partitions() {
-                    tpl.add_partition_offset(&kafka_s3_cfg.topic, p.id(), Offset::Beginning)?;
+                    let offset = kafka_s3_cfg.start_offset
+                        .map(Offset::Offset)
+                        .unwrap_or(Offset::Beginning);
+                    tpl.add_partition_offset(&kafka_s3_cfg.topic, p.id(), offset)?;
                 }
             }
         }

@@ -11,6 +11,7 @@ pub struct KafkaS3Config {
     pub topic: String,
     pub brokers: String,
     pub partition: i32,
+    pub start_offset: Option<i64>,
     pub bucket_name: String,
     pub offset_dir: String,
     pub s3_chain_id: String,
