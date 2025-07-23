@@ -176,6 +176,32 @@ pub async fn s3_get_block_info_and_diff_by_number(
     Ok((block_info, block_diff))
 }
 
+pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
+    s3_client: &Client,
+    bucket_name: &str,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    number: u64,
+) -> Result<(Block<Transaction>, BlockStorageDiff)> {
+    let block_hash =
+        s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number).await?;
+    let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, block_hash)
+        .await
+        .context(format!("s3 get block info failed, {block_hash}"))?;
+    let block_diff = s3_get_block_diff(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        block_info.header.state_root,
+    )
+    .await
+    .context(format!(
+        "s3 get block diff failed, {}",
+        block_info.header.state_root
+    ))?;
+    Ok((block_info, block_diff))
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EtcdRegisterConfig {
     pub endpoints: Vec<String>,

@@ -1,4 +1,4 @@
-use crate::utils::{s3_get_block_info_and_diff_by_number, KafkaS3Config};
+use crate::utils::{s3_get_block_info_and_diff_by_number_for_genesis, KafkaS3Config};
 use anyhow::{Ok, Result};
 use aws_sdk_s3::Client;
 use leafage_evm_storage::EvmStorageWrite;
@@ -28,14 +28,15 @@ where
     }
 
     pub async fn init(&mut self) -> Result<()> {
-        let (first_block_info, first_block_diff) = s3_get_block_info_and_diff_by_number(
-            &self.s3_client,
-            &self.kafka_s3_cfg.bucket_name,
-            &self.kafka_s3_cfg.outer_bucket_name,
-            &self.kafka_s3_cfg.s3_chain_id,
-            self.genesis_number,
-        )
-        .await?;
+        let (first_block_info, first_block_diff) =
+            s3_get_block_info_and_diff_by_number_for_genesis(
+                &self.s3_client,
+                &self.kafka_s3_cfg.bucket_name,
+                &self.kafka_s3_cfg.outer_bucket_name,
+                &self.kafka_s3_cfg.s3_chain_id,
+                self.genesis_number,
+            )
+            .await?;
         self.db
             .update_block(first_block_info.clone(), first_block_diff)?;
         info!(target: "initializer", "initialized genesis block, num {}, hash {}", first_block_info.header.number,first_block_info.header.hash);
