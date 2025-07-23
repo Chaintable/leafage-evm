@@ -155,6 +155,12 @@ pub struct Command {
     /// For some forked chains , the genesis block number is not 0, e.g. op-bedrock.
     #[arg(long, default_value = "0")]
     genesis_number: u64,
+
+    /// The size of the task queue for the s3 updater.
+    /// Default: 256
+    ///
+    /// This size is used to limit the number of async tasks in the queue.
+    init_task_queue_size: usize,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -281,6 +287,7 @@ impl Command {
                     self.kafka_s3_config.clone(),
                     self.update_interval,
                     self.diff_depth_limit,
+                    self.init_task_queue_size,
                 )
                 .await?;
                 Ok((updater_handle, rpc_handle, resgitry_handle))
@@ -323,6 +330,7 @@ impl Command {
                     self.kafka_s3_config.clone(),
                     self.update_interval,
                     self.diff_depth_limit,
+                    self.init_task_queue_size,
                 )
                 .await?;
                 Ok((updater_handle, rpc_handle, resgitry_handle))

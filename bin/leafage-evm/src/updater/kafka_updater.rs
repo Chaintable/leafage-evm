@@ -36,6 +36,7 @@ pub struct Updater<Tree> {
     max_diff_depth: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
     read_from_kafka: bool,
+    init_task_queue_size: usize,
 }
 
 impl<Tree> Updater<Tree>
@@ -50,6 +51,7 @@ where
         tree: Tree,
         kafka_s3_cfg: KafkaS3Config,
         max_diff_depth: usize,
+        init_task_queue_size: usize,
     ) -> Result<Self> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", &kafka_s3_cfg.brokers)
@@ -73,6 +75,7 @@ where
             max_diff_depth,
             hash_to_blockctx: Mutex::new(HashMap::default()),
             read_from_kafka: true,
+            init_task_queue_size,
         })
     }
 
@@ -233,9 +236,9 @@ where
         info!(target:"updater", "update from s3, start block number {}, target block number {}", start_block_number, target_block_number);
         while start_block_number <= target_block_number {
             let mut get_block_info_diff_join_set = JoinSet::new();
-            let batch_num = 256;
+            let batch_size = self.init_task_queue_size as u64;
             let end_block_number =
-                std::cmp::min(start_block_number + batch_num - 1, target_block_number);
+                std::cmp::min(start_block_number + batch_size - 1, target_block_number);
             for block_number in start_block_number..=end_block_number {
                 let client = self.s3_client.clone();
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
@@ -270,7 +273,7 @@ where
             }
             info!(target:"updater", "update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
 
-            start_block_number += batch_num;
+            start_block_number += batch_size;
         }
 
         Ok(())
