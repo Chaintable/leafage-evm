@@ -34,6 +34,7 @@ etcd-client.workspace = true
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
 metrics.workspace = true
 futures.workspace = true
+lru.workspace = true
 
 [features]
 default = ["with-rocksdb"]
