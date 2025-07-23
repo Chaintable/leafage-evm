@@ -1,5 +1,5 @@
 use crate::utils::{
-    get_block_info_and_diff_by_number, s3_get_block_diff, s3_get_block_info, KafkaS3Config,
+    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -239,13 +239,15 @@ where
             for block_number in start_block_number..=end_block_number {
                 let client = self.s3_client.clone();
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
+                let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
                 get_block_info_diff_join_set.spawn(async move {
                     (
                         block_number,
-                        get_block_info_and_diff_by_number(
+                        s3_get_block_info_and_diff_by_number(
                             &client,
                             &bucket_name,
+                            &outer_bucket_name,
                             &s3_chain_id,
                             block_number,
                         )

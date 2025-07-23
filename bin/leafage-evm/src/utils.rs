@@ -12,6 +12,7 @@ pub struct KafkaS3Config {
     pub brokers: String,
     pub partition: i32,
     pub bucket_name: String,
+    pub outer_bucket_name: String,
     pub offset_dir: String,
     pub s3_chain_id: String,
 }
@@ -117,14 +118,15 @@ pub async fn s3_get_block_hash_by_number(
     ))
 }
 
-pub async fn get_block_info_and_diff_by_number(
+pub async fn s3_get_block_info_and_diff_by_number(
     s3_client: &Client,
     bucket_name: &str,
+    outer_bucket_name: &str,
     s3_chain_id: &str,
     number: u64,
 ) -> Result<(Block<Transaction>, BlockStorageDiff)> {
     let block_hash =
-        s3_get_block_hash_by_number(s3_client, bucket_name, s3_chain_id, number).await?;
+        s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number).await?;
     let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, block_hash)
         .await
         .context(format!("s3 get block info failed, {block_hash}"))?;
