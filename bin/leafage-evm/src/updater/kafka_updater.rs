@@ -228,10 +228,9 @@ where
             .first()
             .ok_or_else(|| anyhow::anyhow!("No new blocks in the message"))?
             .clone();
-        let target_block_number = target_block.block_number;
-        let target_hash = target_block.hash;
+        let target_block_number = target_block.block_number - 1;
         let mut start_block_number = self.tree.last_committed_block()?.unwrap().header.number + 1;
-        info!(target:"updater", "update from s3, start block number {}, target block number {}, target hash {}", start_block_number, target_block_number, target_hash);
+        info!(target:"updater", "update from s3, start block number {}, target block number {}", start_block_number, target_block_number);
         while start_block_number <= target_block_number {
             let mut get_block_info_diff_join_set = JoinSet::new();
             let batch_num = 256;
@@ -256,20 +255,10 @@ where
             }
             let mut all_results = get_block_info_diff_join_set.join_all().await;
             all_results.sort_by_key(|(i, _)| *i);
-            for (blocknumber, res) in all_results {
+            for (_, res) in all_results {
                 match res {
                     Ok((block_info, block_diff)) => {
                         self.tree.update_block(block_info.clone(), block_diff)?;
-                        if blocknumber == target_block_number {
-                            if block_info.header.hash != target_hash {
-                                return Err(anyhow::anyhow!(
-                                    "Block hash mismatch, may fork: expected {}, got {}, number {}",
-                                    target_hash,
-                                    block_info.header.hash,
-                                    blocknumber
-                                ));
-                            }
-                        }
                     }
                     Err(e) => {
                         tracing::error!(target: "etl", "Join error: {}", e);
@@ -385,7 +374,8 @@ where
                                     break;
                                 }
                             }
-                        } else {
+                        }
+                        if self.read_from_kafka {
                             loop {
                                 if let Err(e) = self.update_from_kafka(&msgs).await {
                                     error!(target:"updater", "Failed to update: {:?}", e);
@@ -396,6 +386,7 @@ where
                                 }
                             }
                         }
+
                     }
                 }
             }
