@@ -148,6 +148,13 @@ pub struct Command {
     /// This config is used to set the interceptor config.
     #[arg(long, value_parser = parse_interceptor_config, value_name = "INTERCEPTOR_CONFIG_PATH")]
     interceptor_config: Option<InterceptorConfig>,
+
+    /// The genesis number for the chain.
+    /// Default: 0
+    ///
+    /// For some forked chains , the genesis block number is not 0, e.g. op-bedrock.
+    #[arg(long, default_value = "0")]
+    genesis_number: u64,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -288,6 +295,7 @@ impl Command {
                     db.clone(),
                     self.rpc_addr.clone(),
                     self.kafka_s3_config.clone(),
+                    self.genesis_number,
                 )
                 .await?;
 

@@ -4,7 +4,7 @@ use aws_sdk_s3::Client;
 use flate2::read;
 use leafage_evm_types::{Block, BlockStorageDiff, Transaction, H256};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::{io::Read, str::FromStr};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct KafkaS3Config {
@@ -54,6 +54,92 @@ pub async fn s3_get_block_info(
     gz.read_to_end(&mut bytes)?;
     let block = serde_json::from_slice(&bytes)?;
     Ok(block)
+}
+
+pub async fn s3_get_block_hash_by_number(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    number: u64,
+) -> Result<H256> {
+    #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    struct BlockValidation {
+        pub validation_hash: i64,
+        pub is_fork: bool,
+    }
+    let prefix = format!("{}/{}/", s3_chain_id, number);
+    let list_output = s3_client
+        .list_objects_v2()
+        .bucket(bucket_name)
+        .prefix(&prefix)
+        .send()
+        .await
+        .context(format!(
+            "Failed to list objects in bucket {bucket_name} with prefix {prefix}"
+        ))?;
+    // 只有一个对象，肯定没有fork，直接返回
+    if list_output.contents().len() == 1 {
+        let hash_str = list_output.contents()[0]
+            .key()
+            .unwrap()
+            .strip_prefix(&prefix)
+            .ok_or_else(|| anyhow::anyhow!("Failed to strip prefix {prefix} from key"))?;
+        return H256::from_str(hash_str)
+            .context(format!("Failed to parse block hash from key {hash_str}"));
+    }
+    for object in list_output.contents() {
+        if let Some(key) = object.key() {
+            let s3_obj = s3_client
+                .get_object()
+                .bucket(bucket_name)
+                .key(key)
+                .send()
+                .await
+                .context(format!("{bucket_name}: {key}"))?;
+            let bytes = s3_obj.body.collect().await?.into_bytes();
+            let mut gz = read::GzDecoder::new(&bytes[..]);
+            let mut bytes = Vec::new();
+            gz.read_to_end(&mut bytes)?;
+            let block_validation: BlockValidation = serde_json::from_slice(&bytes)
+                .context(format!("Failed to parse block validation"))?;
+            if !block_validation.is_fork {
+                let hash_str = key.strip_prefix(&prefix).ok_or_else(|| {
+                    anyhow::anyhow!("Failed to strip prefix {prefix} from key {key}")
+                })?;
+                return H256::from_str(hash_str)
+                    .context(format!("Failed to parse block hash from key {hash_str}"));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "No valid block hash found for number {number} in chain {s3_chain_id}"
+    ))
+}
+
+pub async fn get_block_info_and_diff_by_number(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    number: u64,
+) -> Result<(Block<Transaction>, BlockStorageDiff)> {
+    let block_hash =
+        s3_get_block_hash_by_number(s3_client, bucket_name, s3_chain_id, number).await?;
+    let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, block_hash)
+        .await
+        .context(format!("s3 get block info failed, {block_hash}"))?;
+    let block_diff = s3_get_block_diff(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        block_info.header.state_root,
+    )
+    .await
+    .context(format!(
+        "s3 get block diff failed, {}",
+        block_info.header.state_root
+    ))?;
+    Ok((block_info, block_diff))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
