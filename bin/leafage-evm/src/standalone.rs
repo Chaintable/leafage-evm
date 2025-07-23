@@ -160,6 +160,7 @@ pub struct Command {
     /// Default: 256
     ///
     /// This size is used to limit the number of async tasks in the queue.
+    #[arg(long, default_value = "256")]
     init_task_queue_size: usize,
 }
 
