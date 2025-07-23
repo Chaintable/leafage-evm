@@ -22,6 +22,7 @@ pub async fn updater_build<
     kafka_s3_cfg: Option<KafkaS3Config>,
     update_interval: Duration,
     max_diff_depth: usize,
+    init_task_queue_size: usize,
 ) -> Result<watch::Sender<()>> {
     match (rpc_url, kafka_s3_cfg) {
         (Some(rpc_url), None) => {
@@ -30,7 +31,8 @@ pub async fn updater_build<
             Ok(updater_handle)
         }
         (None, Some(kafka_s3_cfg)) => {
-            let updater = KafkaUpdater::new(tree, kafka_s3_cfg, max_diff_depth).await?;
+            let updater =
+                KafkaUpdater::new(tree, kafka_s3_cfg, max_diff_depth, init_task_queue_size).await?;
             let updater_handle = updater.start();
             Ok(updater_handle)
         }

@@ -13,6 +13,7 @@ pub async fn initialize_check<DB: ArchiveDBProvider + Send + Sync + 'static>(
     db: DB,
     rpc_url: Option<String>,
     kafka_s3_cfg: Option<KafkaS3Config>,
+    genesis_number: u64,
 ) -> Result<()> {
     let db = db
         .db_at(BlockId::Number(BlockNumberOrTag::Latest))?
@@ -23,7 +24,8 @@ pub async fn initialize_check<DB: ArchiveDBProvider + Send + Sync + 'static>(
             let mut initializer = HttpInitializer::new(latest_db, rpc_address)?;
             initializer.init().await?;
         } else if let Some(kafka_s3_config) = kafka_s3_cfg {
-            let mut initializer = KafkaInitializer::new(latest_db, kafka_s3_config).await?;
+            let mut initializer =
+                KafkaInitializer::new(latest_db, kafka_s3_config, genesis_number).await?;
             initializer.init().await?;
         }
     }
