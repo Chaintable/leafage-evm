@@ -30,7 +30,10 @@ where
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
-            .set("group.id", H256::random().to_string())
+            .set(
+                "group.id",
+                format!("leafage-evm-group-{}", kafka_s3_cfg.s3_chain_id),
+            )
             .create()?;
         let meta = consumer.fetch_metadata(Some(&kafka_s3_cfg.topic), Timeout::Never)?;
         let mut tpl = TopicPartitionList::with_capacity(1);
