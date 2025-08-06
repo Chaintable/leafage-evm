@@ -1,4 +1,4 @@
-use leafage_evm_types::BlockId;
+use leafage_evm_types::{BlockId, H256};
 use revm::database_interface::DBErrorMarker;
 use thiserror::Error;
 
@@ -6,8 +6,8 @@ use thiserror::Error;
 pub enum Error<DBError> {
     #[error("DB error: {0}")]
     DBError(DBError),
-    #[error("Parent Block not found")]
-    ParentBlockHashNotFound,
+    #[error("Parent block hash not found: {0:?} at block number {1}, expected parent hash {2}")]
+    ParentBlockHashNotFound(H256, u64, H256),
     #[error("BlockId: {0:?} not supported")]
     UnsupportedBlockId(BlockId),
 }

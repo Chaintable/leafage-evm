@@ -176,7 +176,11 @@ where
             self.clear_diff_map(bottom_height);
             Ok(())
         } else {
-            Err(Error::ParentBlockHashNotFound)
+            Err(Error::ParentBlockHashNotFound(
+                block_info.header.hash,
+                block_info.header.number,
+                block_info.header.parent_hash,
+            ))
         }
     }
 
