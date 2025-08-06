@@ -237,7 +237,7 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
 
 impl Command {
     async fn start(
-        &self,
+        &mut self,
         chain_cfg: CfgEnv<SpecId>,
     ) -> Result<(
         tokio::sync::watch::Sender<()>,
@@ -298,6 +298,15 @@ impl Command {
                     self.db_path.as_path(),
                     self.db_cache,
                 ));
+                if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
+                    if kafka_s3_config.offset_dir.is_empty() {
+                        kafka_s3_config.offset_dir =
+                            format!("{}/offset", self.db_path.to_str().unwrap_or_default());
+                    }
+                    info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
+                } else {
+                    info!(target:"updater", "no kafka s3 config");
+                }
                 // check if db shoud be initialized
                 initialize_check(
                     db.clone(),
