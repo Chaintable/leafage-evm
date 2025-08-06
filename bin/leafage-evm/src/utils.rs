@@ -20,6 +20,7 @@ pub struct KafkaS3Config {
     pub partition: i32,
     pub bucket_name: String,
     pub outer_bucket_name: String,
+    #[serde(default)]
     pub offset_dir: String,
     pub s3_chain_id: String,
 }
