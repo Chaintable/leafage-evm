@@ -164,8 +164,8 @@ pub async fn s3_get_block_info_and_diff_by_number(
         )
         .await
         .context(format!(
-            "s3 get block diff failed, {}",
-            block_info.header.state_root
+            "s3 get block diff failed, root: {}, number: {}",
+            block_info.header.state_root, number
         ))?
     } else {
         let mut diff = BlockStorageDiff::default();
@@ -196,8 +196,8 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     )
     .await
     .context(format!(
-        "s3 get block diff failed, {}",
-        block_info.header.state_root
+        "s3 get block diff failed, root: {}, number: {}",
+        block_info.header.state_root, number
     ))?;
     Ok((block_info, block_diff))
 }
