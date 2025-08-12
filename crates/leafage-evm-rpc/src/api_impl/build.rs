@@ -2,7 +2,7 @@ use super::{ApiImpl, InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer, TraceApiServer};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
-use jsonrpsee::RpcModule;
+use jsonrpsee::{RpcModule, http_client::{HttpClient, HttpClientBuilder}};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, CfgEnv, SpecId};
 use std::sync::Arc;
@@ -11,6 +11,8 @@ use std::time::Duration;
 pub struct ApiBuilder<DB> {
     db: Arc<DB>,
     cfg: CfgEnv<SpecId>,
+    historical_client: Option<HttpClient>,
+    historical_height: Option<u64>,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -21,7 +23,25 @@ where
         Self {
             db: Arc::new(db),
             cfg,
+            historical_client: None,
+            historical_height: None,
         }
+    }
+
+    pub fn with_historical_config(
+        mut self,
+        historical_rpc: Option<String>,
+        historical_height: Option<u64>
+    ) -> Self {
+        if let Some(url) = historical_rpc {
+            if let Ok(http_client) = HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(30))
+                .build(&url) {
+                self.historical_client = Some(http_client);
+            }
+        }
+        self.historical_height = historical_height;
+        self
     }
 
     pub async fn build_and_run(
@@ -51,6 +71,8 @@ where
                 self.cfg.clone(),
                 rpc_timeout / 2,
                 ovm_address.clone(),
+                self.historical_client.clone(),
+                self.historical_height,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -64,6 +86,8 @@ where
                 self.cfg.clone(),
                 rpc_timeout / 2,
                 ovm_address.clone(),
+                self.historical_client.clone(),
+                self.historical_height,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -77,6 +101,8 @@ where
                 self.cfg.clone(),
                 rpc_timeout / 2,
                 ovm_address.clone(),
+                self.historical_client.clone(),
+                self.historical_height,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -91,6 +117,8 @@ where
                 self.cfg.clone(),
                 rpc_timeout / 2,
                 ovm_address.clone(),
+                self.historical_client.clone(),
+                self.historical_height,
             )))
             .map_err(|e| {
                 std::io::Error::new(
