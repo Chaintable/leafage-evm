@@ -10,9 +10,10 @@ use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
 };
-use leafage_evm_types::{CfgEnv, SpecId};
+use leafage_evm_types::{Address, CfgEnv, SpecId};
 use metrics::gauge;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::info;
 
@@ -162,6 +163,13 @@ pub struct Command {
     /// This size is used to limit the number of async tasks in the queue.
     #[arg(long, default_value = "256")]
     init_task_queue_size: usize,
+
+    /// Address for OVM
+    /// Default: None
+    ///
+    /// This address is used to set the OVM address for the node.
+    #[arg(long, value_parser = parse_ovm_address, value_name = "OVM_ADDRESS")]
+    ovm_address: Option<Address>,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -235,6 +243,14 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
     Ok(interceptor_config)
 }
 
+fn parse_ovm_address(arg: &str) -> Result<Address> {
+    if arg.is_empty() {
+        bail!("ovm address cannot be empty");
+    }
+    let address = Address::from_str(arg)?;
+    Ok(address)
+}
+
 impl Command {
     async fn start(
         &mut self,
@@ -244,7 +260,7 @@ impl Command {
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
     )> {
-        info!(target:"updater", "chain cfg: {:?}, archive: {:?}", chain_cfg, self.archive);
+        info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
         if !self.prometheus_addr.is_empty() {
             metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -279,6 +295,7 @@ impl Command {
                         self.max_connections,
                         self.rpc_timeout,
                         self.interceptor_config.clone(),
+                        self.ovm_address.clone(),
                     )
                     .await?;
 
@@ -331,6 +348,7 @@ impl Command {
                         self.max_connections,
                         self.rpc_timeout,
                         self.interceptor_config.clone(),
+                        self.ovm_address.clone(),
                     )
                     .await?;
 

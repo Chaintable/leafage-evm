@@ -65,7 +65,10 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let mut block_env = block_env_from_block(&block);
-        let mut db = CacheDB::new(EvmStorageWrapper(state.clone()));
+        let mut db = CacheDB::new(EvmStorageWrapper {
+            db: state.clone(),
+            ovm_address: self.ovm_address.clone(),
+        });
         let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
@@ -228,12 +231,15 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
 
         let (tx, rx) = oneshot::channel();
-
+        let ovm_address = self.ovm_address.clone();
         tokio::task::spawn_blocking(move || {
             let rsp = Self::multi_call_from_state(
                 requests,
                 cfg,
-                EvmStorageWrapper(state),
+                EvmStorageWrapper {
+                    db: state,
+                    ovm_address,
+                },
                 block,
                 fast_fail.unwrap_or_default(),
             );
@@ -365,7 +371,14 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        Self::get_balance_from_state(EvmStorageWrapper(state.unwrap()), address)
+        Self::get_balance_from_state(
+            EvmStorageWrapper {
+                db: state.unwrap(),
+                ovm_address: self.ovm_address.clone(),
+            },
+            address,
+        )
+        .map_err(|e| internal_rpc_err(e.to_string()))
     }
 
     pub fn get_balance_from_state<StateDB>(state: StateDB, address: Address) -> RpcResult<U256>
@@ -407,7 +420,10 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        let state = EvmStorageWrapper(state.unwrap());
+        let state = EvmStorageWrapper {
+            db: state.unwrap(),
+            ovm_address: self.ovm_address.clone(),
+        };
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
@@ -439,7 +455,10 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        let state = EvmStorageWrapper(state.unwrap());
+        let state = EvmStorageWrapper {
+            db: state.unwrap(),
+            ovm_address: self.ovm_address.clone(),
+        };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
@@ -464,7 +483,10 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         if state.is_none() {
             return Err(invalid_params_rpc_err("Block not found".to_string()));
         }
-        let state = EvmStorageWrapper(state.unwrap());
+        let state = EvmStorageWrapper {
+            db: state.unwrap(),
+            ovm_address: self.ovm_address.clone(),
+        };
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
