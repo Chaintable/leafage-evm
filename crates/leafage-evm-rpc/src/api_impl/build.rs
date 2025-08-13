@@ -4,7 +4,7 @@ use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::RpcModule;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
-use leafage_evm_types::{CfgEnv, SpecId};
+use leafage_evm_types::{Address, CfgEnv, SpecId};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ where
         max_connects: u32,
         rpc_timeout: Duration,
         interceptor_cfg: Option<InterceptorConfig>,
-        using_ovm: bool,
+        ovm_address: Option<Address>,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new()
             .timeout(rpc_timeout)
@@ -50,7 +50,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
-                using_ovm,
+                ovm_address.clone(),
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -63,7 +63,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
-                using_ovm,
+                ovm_address.clone(),
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -76,7 +76,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
-                using_ovm,
+                ovm_address.clone(),
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -90,7 +90,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
-                using_ovm,
+                ovm_address.clone(),
             )))
             .map_err(|e| {
                 std::io::Error::new(

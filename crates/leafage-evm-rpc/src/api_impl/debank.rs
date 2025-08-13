@@ -249,7 +249,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -266,7 +266,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -284,7 +284,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -306,7 +306,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -343,7 +343,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         })?;
 
         let (tx, rx) = oneshot::channel();
-        let using_ovm = self.using_ovm;
+        let using_ovm = self.ovm_address.clone();
         tokio::task::spawn_blocking(move || {
             let rsp = Self::debank_multi_call_from_state(
                 requests,
@@ -381,7 +381,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
         fast_fail: bool,
-        using_ovm: bool,
+        ovm_address: Option<H256>,
     ) -> RpcResult<DebankMultiCallResp> {
         let mut stats = DebankMultiCallStats {
             block_num: block.header.number,
@@ -409,7 +409,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                             &block.header,
                             state.clone(),
                             request,
-                            using_ovm,
+                            ovm_address.clone(),
                         );
                         if res.code != 0 as i32 {
                             stats.success = false;
@@ -423,7 +423,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             let cfg = cfg.clone();
             let mut db = CacheDB::new(EvmStorageWrapper {
                 db: state.clone(),
-                using_ovm,
+                ovm_address,
             });
             let tx = create_txn_env(&block_env, request, &db, &cfg)?;
             if let Some(overrides) = block_overrides.clone() {
@@ -479,7 +479,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         block_header: &Header,
         state: DB::StateDB,
         request: CallRequest,
-        using_ovm: bool,
+        ovm_address: Option<H256>,
     ) -> DebankSingleCallResult {
         if let Some(data) = request.input.input() {
             if data.len() < 4 {
@@ -513,7 +513,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 let res = Self::get_balance_from_state(
                     EvmStorageWrapper {
                         db: state,
-                        using_ovm,
+                        ovm_address,
                     },
                     user_addr,
                 )
@@ -635,7 +635,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         })?;
 
         let (tx, rx) = oneshot::channel();
-        let using_ovm = self.using_ovm;
+        let ovm_address = self.ovm_address.clone();
         tokio::task::spawn_blocking(move || {
             let rsp = Self::debank_call_many_and_trace(
                 requests,
@@ -643,7 +643,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 state,
                 block,
                 block_overrides,
-                using_ovm,
+                ovm_address,
             );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
@@ -664,7 +664,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
         block_overrides: Option<BlockOverrides>,
-        using_ovm: bool,
+        ovm_address: Option<H256>,
     ) -> RpcResult<DebankSimulateResp> {
         let mut block_env = block_env_from_block(&block);
         let mut stats = DebankSimulateStats {
@@ -675,7 +675,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         };
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
-            using_ovm,
+            ovm_address,
         });
         if let Some(overrides) = block_overrides.clone() {
             super::utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
@@ -767,7 +767,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         })?;
 
         let (tx, rx) = oneshot::channel();
-        let using_ovm = self.using_ovm;
+        let ovm_address = self.ovm_address.clone();
         tokio::task::spawn_blocking(move || {
             let rsp = Self::debank_estimate_gas_many(
                 request,
@@ -775,7 +775,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 state,
                 block,
                 block_overrides,
-                using_ovm,
+                ovm_address,
             );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
@@ -794,7 +794,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
         block_overrides: Option<BlockOverrides>,
-        using_ovm: bool,
+        ovm_address: Option<H256>,
     ) -> RpcResult<U256> {
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
@@ -814,7 +814,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .unwrap_or(block_env_gas_limit);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
-            using_ovm,
+            ovm_address,
         });
         if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);

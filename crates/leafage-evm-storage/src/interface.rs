@@ -77,18 +77,22 @@ pub trait BlockIndex {
 #[derive(Clone, Debug)]
 pub struct EvmStorageWrapper<T> {
     pub db: T,
-    pub using_ovm: bool,
+    pub ovm_address: Option<H256>,
 }
 
 impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     type Error = T::Error;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let address = if self.using_ovm {
-            get_ovm_balance_key(address)
-        } else {
-            keccak256(address.as_slice())
-        };
-        self.db.basic(address.into())
+        let account = self.db.basic(keccak256(address.as_slice()))?;
+        if account.is_none() {
+            return Ok(None);
+        }
+        let mut account = account.unwrap();
+        if let Some(ovm_address) = self.ovm_address {
+            let balance = self.db.storage(ovm_address, get_ovm_balance_key(address))?;
+            account.balance = balance;
+        }
+        Ok(Some(account))
     }
     fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         self.db.code_by_hash(code_hash.0.into())

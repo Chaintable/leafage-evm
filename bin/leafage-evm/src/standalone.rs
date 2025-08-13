@@ -10,9 +10,10 @@ use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
 };
-use leafage_evm_types::{CfgEnv, SpecId};
+use leafage_evm_types::{Address, CfgEnv, SpecId};
 use metrics::gauge;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::info;
 
@@ -163,12 +164,12 @@ pub struct Command {
     #[arg(long, default_value = "256")]
     init_task_queue_size: usize,
 
-    /// Whether to use OVM (Optimistic Virtual Machine).
-    /// Default: false
+    /// Address for OVM
+    /// Default: None
     ///
-    /// This flag is used to enable the OVM for the chain.
-    #[arg(long, default_value_t = false)]
-    using_ovm: bool,
+    /// This address is used to set the OVM address for the node.
+    #[arg(long, value_parser = parse_ovm_address, value_name = "OVM_ADDRESS")]
+    ovm_address: Option<Address>,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -242,6 +243,14 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
     Ok(interceptor_config)
 }
 
+fn parse_ovm_address(arg: &str) -> Result<Option<Address>> {
+    if arg.is_empty() {
+        return Ok(None);
+    }
+    let address = Address::from_str(arg)?;
+    Ok(Some(address))
+}
+
 impl Command {
     async fn start(
         &mut self,
@@ -286,7 +295,7 @@ impl Command {
                         self.max_connections,
                         self.rpc_timeout,
                         self.interceptor_config.clone(),
-                        self.using_ovm,
+                        self.ovm_address.clone(),
                     )
                     .await?;
 
@@ -339,7 +348,7 @@ impl Command {
                         self.max_connections,
                         self.rpc_timeout,
                         self.interceptor_config.clone(),
-                        self.using_ovm,
+                        self.ovm_address.clone(),
                     )
                     .await?;
 

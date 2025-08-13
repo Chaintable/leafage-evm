@@ -36,7 +36,7 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let (tx, rx) = oneshot::channel();
-        let using_ovm = self.using_ovm;
+        let using_ovm = self.ovm_address;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::call_many_and_trace(requests, cfg, state, block, using_ovm);
             if let Err(e) = tx.send(rsp) {
@@ -54,12 +54,12 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
         cfg: CfgEnv<SpecId>,
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
-        using_ovm: bool,
+        ovm_address: Option<H256>,
     ) -> RpcResult<Vec<PreResult>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
-            using_ovm,
+            ovm_address,
         });
         let mut tx_index: u64 = 0;
         let mut log_index = 0;

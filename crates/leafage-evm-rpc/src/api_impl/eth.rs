@@ -67,7 +67,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let mut block_env = block_env_from_block(&block);
         let mut db = CacheDB::new(EvmStorageWrapper {
             db: state.clone(),
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         });
         let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
@@ -231,14 +231,14 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
 
         let (tx, rx) = oneshot::channel();
-        let using_ovm = self.using_ovm;
+        let ovm_address = self.ovm_address.clone();
         tokio::task::spawn_blocking(move || {
             let rsp = Self::multi_call_from_state(
                 requests,
                 cfg,
                 EvmStorageWrapper {
                     db: state,
-                    using_ovm,
+                    ovm_address,
                 },
                 block,
                 fast_fail.unwrap_or_default(),
@@ -374,7 +374,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         Self::get_balance_from_state(
             EvmStorageWrapper {
                 db: state.unwrap(),
-                using_ovm: self.using_ovm,
+                ovm_address: self.ovm_address.clone(),
             },
             address,
         )
@@ -422,7 +422,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let account = state
             .basic_ref(address.0.into())
@@ -457,7 +457,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -485,7 +485,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
-            using_ovm: self.using_ovm,
+            ovm_address: self.ovm_address.clone(),
         };
         let account = state
             .basic_ref(address.0.into())
