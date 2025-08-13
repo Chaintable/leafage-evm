@@ -14,5 +14,7 @@ mod pre;
 
 mod debank;
 
+#[cfg(target_os = "linux")]
 mod interceptor;
+#[cfg(target_os = "linux")]
 pub use interceptor::{InterceptorConfig, InterceptorLayer};
