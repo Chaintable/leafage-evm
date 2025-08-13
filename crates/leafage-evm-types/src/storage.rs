@@ -5,11 +5,10 @@ use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 
 pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
-    
     BlockEnv {
-        number: block.header.number,
+        number: U256::from(block.header.number),
         beneficiary: block.header.beneficiary,
-        timestamp: block.header.timestamp,
+        timestamp: U256::from(block.header.timestamp),
         difficulty: block.header.difficulty,
         basefee: block.header.base_fee_per_gas.unwrap_or_default(),
         gas_limit: block.header.gas_limit,
@@ -18,10 +17,14 @@ pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
         } else {
             Some(H256::ZERO)
         },
-        blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
-            block.header.excess_blob_gas.unwrap_or_default(),
-            true,
-        )),
+        blob_excess_gas_and_price: block.header.excess_blob_gas.map(|excess_gas| {
+            let blob_gasprice =
+                alloy::eips::eip7840::BlobParams::cancun().calc_blob_fee(excess_gas);
+            BlobExcessGasAndPrice {
+                excess_blob_gas: excess_gas,
+                blob_gasprice,
+            }
+        }),
     }
 }
 
