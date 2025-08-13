@@ -30,6 +30,7 @@ where
         max_connects: u32,
         rpc_timeout: Duration,
         interceptor_cfg: Option<InterceptorConfig>,
+        using_ovm: bool,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new()
             .timeout(rpc_timeout)
@@ -49,6 +50,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
+                using_ovm,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -61,6 +63,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
+                using_ovm,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -73,6 +76,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
+                using_ovm,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -86,6 +90,7 @@ where
                 self.db.clone(),
                 self.cfg.clone(),
                 rpc_timeout / 2,
+                using_ovm,
             )))
             .map_err(|e| {
                 std::io::Error::new(

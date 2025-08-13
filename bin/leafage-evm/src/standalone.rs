@@ -162,6 +162,13 @@ pub struct Command {
     /// This size is used to limit the number of async tasks in the queue.
     #[arg(long, default_value = "256")]
     init_task_queue_size: usize,
+
+    /// Whether to use OVM (Optimistic Virtual Machine).
+    /// Default: false
+    ///
+    /// This flag is used to enable the OVM for the chain.
+    #[arg(long, default_value_t = false)]
+    using_ovm: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -279,6 +286,7 @@ impl Command {
                         self.max_connections,
                         self.rpc_timeout,
                         self.interceptor_config.clone(),
+                        self.using_ovm,
                     )
                     .await?;
 
@@ -331,6 +339,7 @@ impl Command {
                         self.max_connections,
                         self.rpc_timeout,
                         self.interceptor_config.clone(),
+                        self.using_ovm,
                     )
                     .await?;
 
