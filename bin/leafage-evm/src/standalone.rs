@@ -243,12 +243,12 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
     Ok(interceptor_config)
 }
 
-fn parse_ovm_address(arg: &str) -> Result<Option<Address>> {
+fn parse_ovm_address(arg: &str) -> Result<Address> {
     if arg.is_empty() {
-        return Ok(None);
+        bail!("ovm address cannot be empty");
     }
     let address = Address::from_str(arg)?;
-    Ok(Some(address))
+    Ok(address)
 }
 
 impl Command {
@@ -260,7 +260,7 @@ impl Command {
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
     )> {
-        info!(target:"updater", "chain cfg: {:?}, archive: {:?}", chain_cfg, self.archive);
+        info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
         if !self.prometheus_addr.is_empty() {
             metrics_exporter_prometheus::PrometheusBuilder::new()

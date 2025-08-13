@@ -89,7 +89,9 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
         }
         let mut account = account.unwrap();
         if let Some(ovm_address) = self.ovm_address {
-            let balance = self.db.storage(ovm_address, get_ovm_balance_key(address))?;
+            let balance = self
+                .db
+                .storage(ovm_address, keccak256(get_ovm_balance_key(address)))?;
             account.balance = balance;
         }
         Ok(Some(account))
@@ -179,9 +181,9 @@ mod tests {
 
     #[test]
     fn test_get_ovm_balance_key() {
-        let address = Address::from_str("0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97").unwrap();
+        let address = Address::from_str("0x455875815af7E846317D9E73e9Ea65d19EC58A82").unwrap();
         let expected_key =
-            H256::from_str("0x77a8c892f7ab5d424f9ebeccb8fdb4bac5c6eeca52b73ecd947e8d0dc1f81ad9")
+            H256::from_str("0x0f3a88bb217e688cf0fede2f015e98298b832dcc3e2e4aa014ec244f1c785da6")
                 .unwrap();
         assert_eq!(get_ovm_balance_key(address), expected_key);
     }
