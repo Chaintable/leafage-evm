@@ -8,4 +8,4 @@ mod pre;
 pub use pre::PreApiServer;
 
 mod debank;
-pub use debank::DebankApiServer;
+pub use debank::{DebankApiClient, DebankApiServer};

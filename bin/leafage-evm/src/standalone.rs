@@ -170,6 +170,14 @@ pub struct Command {
     /// This address is used to set the OVM address for the node.
     #[arg(long, value_parser = parse_ovm_address, value_name = "OVM_ADDRESS")]
     ovm_address: Option<Address>,
+
+    /// Historical RPC endpoint for forwarding pre-fork requests
+    #[arg(long, value_name = "URL")]
+    historical_rpc: Option<String>,
+
+    /// Fork height threshold for historical RPC forwarding
+    #[arg(long)]
+    historical_height: Option<u64>,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -290,6 +298,7 @@ impl Command {
                     ),
                 )?);
                 let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+                    .with_historical_config(self.historical_rpc.clone(), self.historical_height)
                     .build_and_run(
                         &self.listen_addr,
                         self.max_connections,
@@ -343,6 +352,7 @@ impl Command {
                     ),
                 )?);
                 let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+                    .with_historical_config(self.historical_rpc.clone(), self.historical_height)
                     .build_and_run(
                         &self.listen_addr,
                         self.max_connections,

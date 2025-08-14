@@ -1,5 +1,5 @@
 mod api;
-pub use api::{EthApiClient, EthApiServer, TraceApiClient, TraceApiServer};
+pub use api::{EthApiClient, EthApiServer, TraceApiClient, TraceApiServer, DebankApiClient, DebankApiServer};
 
 mod error;
 
