@@ -342,7 +342,7 @@ pub fn apply_block_overrides<DB>(
         env.difficulty = difficulty;
     }
     if let Some(time) = time {
-        env.timestamp = time;
+        env.timestamp = U256::from(time);
     }
     if let Some(gas_limit) = gas_limit {
         env.gas_limit = gas_limit;
@@ -401,6 +401,7 @@ where
         info,
         status: AccountStatus::Touched,
         storage: HashMap::default(),
+        transaction_id: 0,
     };
 
     let storage_diff = match (account_override.state, account_override.state_diff) {
@@ -438,6 +439,7 @@ where
                     // we use inverted value here to ensure that storage is treated as changed
                     original_value: (!value).into(),
                     present_value: value.into(),
+                    transaction_id: 0,
                     is_cold: false,
                 },
             );
@@ -565,6 +567,7 @@ pub(crate) fn create_evm_from_state<StateDB, INSP>(
         Context<BlockEnv, TxEnv, CfgEnv<SpecId>, WrapDatabaseRef<StateDB>>,
     >,
     EthPrecompiles,
+    revm::handler::EthFrame,
 >
 where
     StateDB: DatabaseRef,

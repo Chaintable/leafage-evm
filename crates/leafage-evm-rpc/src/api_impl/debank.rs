@@ -742,9 +742,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 &mut inspector,
             );
 
-            evm.set_tx(tx);
             let exec_res = evm
-                .inspect_replay_commit()
+                .inspect_tx_commit(tx)
                 .map_err(|e| Self::evm_to_debank_error(e))?;
             drop(evm);
             match exec_res {

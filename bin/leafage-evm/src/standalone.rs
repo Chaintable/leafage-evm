@@ -5,7 +5,9 @@ use crate::updater::updater_build;
 use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
 use anyhow::{bail, Result};
 use clap::Parser;
-use leafage_evm_rpc::{ApiBuilder, InterceptorConfig};
+use leafage_evm_rpc::ApiBuilder;
+#[cfg(target_os = "linux")]
+use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
@@ -143,10 +145,12 @@ pub struct Command {
     #[arg(long, default_value = "")]
     meta: String,
 
+    #[cfg(target_os = "linux")]
     /// The interceptor config path
     /// Default: None
     ///
     /// This config is used to set the interceptor config.
+    ///
     #[arg(long, value_parser = parse_interceptor_config, value_name = "INTERCEPTOR_CONFIG_PATH")]
     interceptor_config: Option<InterceptorConfig>,
 
@@ -240,6 +244,7 @@ fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
     Ok(etcd_config)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
     let interceptor_config: InterceptorConfig;
     if arg.starts_with("/") {
@@ -303,6 +308,7 @@ impl Command {
                         &self.listen_addr,
                         self.max_connections,
                         self.rpc_timeout,
+                        #[cfg(target_os = "linux")]
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
                     )
@@ -357,6 +363,7 @@ impl Command {
                         &self.listen_addr,
                         self.max_connections,
                         self.rpc_timeout,
+                        #[cfg(target_os = "linux")]
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
                     )

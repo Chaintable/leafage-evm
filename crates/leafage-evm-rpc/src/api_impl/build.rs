@@ -1,4 +1,6 @@
-use super::{ApiImpl, InterceptorConfig, InterceptorLayer};
+use super::ApiImpl;
+#[cfg(target_os = "linux")]
+use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer, TraceApiServer};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
@@ -49,12 +51,15 @@ where
         addr: &str,
         max_connects: u32,
         rpc_timeout: Duration,
+        #[cfg(target_os = "linux")]
         interceptor_cfg: Option<InterceptorConfig>,
         ovm_address: Option<Address>,
     ) -> std::io::Result<ServerHandle> {
-        let http_middleware = tower::ServiceBuilder::new()
-            .timeout(rpc_timeout)
-            .layer(InterceptorLayer::new(&interceptor_cfg.unwrap_or_default()));
+        let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
+        #[cfg(target_os = "linux")]
+        let http_middleware =
+            http_middleware.layer(InterceptorLayer::new(&interceptor_cfg.unwrap_or_default()));
+
         let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
         let server = ServerBuilder::default()
             .max_connections(max_connects)
