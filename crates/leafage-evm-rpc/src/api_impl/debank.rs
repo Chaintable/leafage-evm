@@ -21,7 +21,7 @@ use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef};
 use revm::inspector::NoOpInspector;
-use revm::{ExecuteEvm, InspectEvm};
+use revm::{ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -708,7 +708,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             );
 
             let exec_res = evm
-                .inspect_one_tx(tx)
+                .inspect_tx_commit(tx)
                 .map_err(|e| Self::evm_to_debank_error(e))?;
             drop(evm);
             match exec_res {
