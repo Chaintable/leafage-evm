@@ -23,7 +23,9 @@ use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef};
 use revm::inspector::NoOpInspector;
 use revm::{DatabaseCommit, ExecuteEvm, InspectEvm};
-use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{
+    OpcodeFilter, StackSnapshotType, TracingInspector, TracingInspectorConfig,
+};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::{sync::oneshot, time::timeout};
@@ -746,7 +748,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             let tx = create_txn_env(&block_env, tx, &memory_db, &cfg)?;
             let mut trace_cfg = TracingInspectorConfig::default_parity()
                 .set_record_logs(true)
-                .stack_snapshots()
+                .set_stack_snapshots(StackSnapshotType::Full)
                 .memory_snapshots()
                 .steps();
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::KECCAK256));
