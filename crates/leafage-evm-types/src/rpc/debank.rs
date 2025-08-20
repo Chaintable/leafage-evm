@@ -1,4 +1,5 @@
 use crate::{Address, Block, BlockId, Bytes, Transaction, H256, U256};
+use alloy::rpc::types::trace::geth::DiffMode;
 use revm_bytecode::opcode::OpCode;
 use revm_inspectors::tracing::types::{CallKind, CallLog, CallTraceNode};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,12 @@ pub enum BlockType {
     Contains,
     #[default]
     Equals,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DebankStorageDiff {
+    pub diff: DiffMode,
+    pub preimages: Vec<Bytes>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -124,6 +131,7 @@ pub struct DebankSimulateStats {
 pub struct DebankSingleSimulateResult {
     pub traces: Vec<DebankTrace>,
     pub events: Vec<DebankEvent>,
+    pub state_diff: DebankStorageDiff,
     pub code: i32,
     pub err: String,
     pub gas_used: u64,
@@ -194,7 +202,7 @@ impl From<&CallTraceNode> for DebankTrace {
                 | CallKind::CallCode
                 | CallKind::DelegateCall
                 | CallKind::AuthCall => "call".to_string(),
-                CallKind::Create | CallKind::Create2  => "create".to_string(),
+                CallKind::Create | CallKind::Create2 => "create".to_string(),
             },
             call_type: trace.kind.to_string(),
             ..Default::default()
@@ -216,7 +224,8 @@ impl From<&CallLog> for DebankEvent {
     fn from(log: &CallLog) -> Self {
         let selector = log
             .raw_log
-            .topics().first()
+            .topics()
+            .first()
             .map(|h| h.to_string())
             .unwrap_or_default();
         let topics = if log.raw_log.topics().len() > 1 {
@@ -227,7 +236,7 @@ impl From<&CallLog> for DebankEvent {
         } else {
             vec![]
         };
-        
+
         DebankEvent {
             selector,
             topics,

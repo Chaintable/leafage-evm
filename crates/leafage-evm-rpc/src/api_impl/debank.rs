@@ -1,6 +1,6 @@
 use super::{utils, ApiImpl};
-use crate::api::{DebankApiServer, DebankApiClient};
-use crate::api_impl::utils::{build_debank_traces, create_txn_env};
+use crate::api::{DebankApiClient, DebankApiServer};
+use crate::api_impl::utils::{create_txn_env, DebankTraceBuilder};
 use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
@@ -16,13 +16,14 @@ use leafage_evm_types::{
 use leafage_evm_types::{CfgEnv, SpecId};
 #[cfg(feature = "optimism")]
 use op_revm::OpTransactionError;
+use revm::bytecode::OpCode;
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef};
 use revm::inspector::NoOpInspector;
-use revm::{ExecuteEvm, InspectCommitEvm};
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use revm::{DatabaseCommit, ExecuteEvm, InspectEvm};
+use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::{sync::oneshot, time::timeout};
@@ -150,7 +151,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn should_try_historical(&self, block_ctx: &Option<DebankBlockContext>) -> Option<&HttpClient> {
         let client = self.historical_client.as_ref()?;
-        
+
         if let Some(ctx) = block_ctx {
             match &ctx.block_id {
                 BlockId::Hash(_) => Some(client),
@@ -168,20 +169,30 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
     }
 
-    fn combine_errors(&self, local_err: jsonrpsee::types::ErrorObjectOwned, historical_err: jsonrpsee::core::ClientError) -> jsonrpsee::types::ErrorObjectOwned {
+    fn combine_errors(
+        &self,
+        local_err: jsonrpsee::types::ErrorObjectOwned,
+        historical_err: jsonrpsee::core::ClientError,
+    ) -> jsonrpsee::types::ErrorObjectOwned {
         rpc_error_with_code(
             local_err.code(),
-            format!("Local error: {}; Historical RPC error: {}", local_err.message(), historical_err),
+            format!(
+                "Local error: {}; Historical RPC error: {}",
+                local_err.message(),
+                historical_err
+            ),
         )
     }
 
-    fn client_error_to_rpc_error(&self, client_error: jsonrpsee::core::ClientError) -> jsonrpsee::types::ErrorObjectOwned {
+    fn client_error_to_rpc_error(
+        &self,
+        client_error: jsonrpsee::core::ClientError,
+    ) -> jsonrpsee::types::ErrorObjectOwned {
         rpc_error_with_code(
             DebankErrorCode::InternalError as i32,
             format!("Historical RPC error: {}", client_error),
         )
     }
-
 
     fn debank_get_state_by_ctx_impl(
         &self,
@@ -733,7 +744,12 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 }
             }
             let tx = create_txn_env(&block_env, tx, &memory_db, &cfg)?;
-            let trace_cfg = TracingInspectorConfig::default_parity().set_record_logs(true);
+            let mut trace_cfg = TracingInspectorConfig::default_parity()
+                .set_record_logs(true)
+                .stack_snapshots()
+                .memory_snapshots()
+                .steps();
+            trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::KECCAK256));
             let mut inspector = TracingInspector::new(trace_cfg);
             let mut evm = utils::create_evm_from_state(
                 block_env.clone(),
@@ -741,12 +757,11 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 &mut memory_db,
                 &mut inspector,
             );
-
-            let exec_res = evm
-                .inspect_tx_commit(tx)
+            let res_and_state = evm
+                .inspect_tx(tx)
                 .map_err(|e| Self::evm_to_debank_error(e))?;
             drop(evm);
-            match exec_res {
+            match res_and_state.result {
                 ExecutionResult::Revert { gas_used, output } => {
                     let reason =
                         decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
@@ -773,17 +788,25 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 ExecutionResult::Success { gas_used, .. } => {
                     let call_traces = inspector.into_traces();
 
-                    let (traces, events) = build_debank_traces(tx_info.hash.unwrap(), call_traces);
+                    let debank_trace_builder =
+                        DebankTraceBuilder::new(tx_info.hash.unwrap(), call_traces);
+
+                    let (traces, events) = debank_trace_builder.debank_traces();
+
+                    let state_diff =
+                        debank_trace_builder.debank_state_diff(&res_and_state, &memory_db);
 
                     let pre_res = DebankSingleSimulateResult {
                         gas_used,
                         traces,
                         events,
+                        state_diff,
                         ..Default::default()
                     };
                     results.push(pre_res);
                 }
             }
+            memory_db.commit(res_and_state.state);
         }
         Ok(DebankSimulateResp { stats, results })
     }
@@ -1125,7 +1148,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
-                    match historical_client.get_address_nonce(address, block_ctx).await {
+                    match historical_client
+                        .get_address_nonce(address, block_ctx)
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(historical_err) => Err(self.combine_errors(err, historical_err)),
                     }
@@ -1145,7 +1171,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
-                    match historical_client.get_address_balance(address, block_ctx).await {
+                    match historical_client
+                        .get_address_balance(address, block_ctx)
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(historical_err) => Err(self.combine_errors(err, historical_err)),
                     }
@@ -1186,7 +1215,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
-                    match historical_client.get_storage_at(address, position, block_ctx).await {
+                    match historical_client
+                        .get_storage_at(address, position, block_ctx)
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(historical_err) => Err(self.combine_errors(err, historical_err)),
                     }
@@ -1222,15 +1254,18 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
-                    match historical_client.contract_multi_call(
-                        requests,
-                        block_ctx,
-                        block_overrides,
-                        state_override,
-                        fast_fail,
-                        use_parallel,
-                        disable_cache,
-                    ).await {
+                    match historical_client
+                        .contract_multi_call(
+                            requests,
+                            block_ctx,
+                            block_overrides,
+                            state_override,
+                            fast_fail,
+                            use_parallel,
+                            disable_cache,
+                        )
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(historical_err) => Err(self.combine_errors(err, historical_err)),
                     }
@@ -1258,7 +1293,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
-                    match historical_client.simulate_transactions(requests, block_ctx, block_overrides).await {
+                    match historical_client
+                        .simulate_transactions(requests, block_ctx, block_overrides)
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(historical_err) => Err(self.combine_errors(err, historical_err)),
                     }
@@ -1281,10 +1319,14 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             )
         })?;
 
-        if self.historical_client.is_some() && 
-           self.historical_height.map_or(false, |h| block_number < h) {
+        if self.historical_client.is_some()
+            && self.historical_height.map_or(false, |h| block_number < h)
+        {
             if let Some(historical_client) = &self.historical_client {
-                return historical_client.get_block_by_height(height).await.map_err(|e| self.client_error_to_rpc_error(e));
+                return historical_client
+                    .get_block_by_height(height)
+                    .await
+                    .map_err(|e| self.client_error_to_rpc_error(e));
             }
         }
 
@@ -1336,7 +1378,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
-                    match historical_client.estimate_gas(request, block_ctx, block_overrides).await {
+                    match historical_client
+                        .estimate_gas(request, block_ctx, block_overrides)
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(historical_err) => Err(self.combine_errors(err, historical_err)),
                     }

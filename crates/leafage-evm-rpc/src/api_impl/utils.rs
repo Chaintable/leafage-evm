@@ -1,15 +1,18 @@
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::consensus::TxType;
+use alloy::rpc::types::trace::geth::PreStateConfig;
 use alloy::signers::Either;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
-    AccountOverride, BlockOverrides, Bytecode, CallRequest, CfgEnv, DebankEvent, DebankID,
-    DebankTrace, SpecId, StateOverride, H256, U256,
+    AccountOverride, BlockOverrides, Bytecode, Bytes, CallRequest, CfgEnv, DebankEvent, DebankID,
+    DebankStorageDiff, DebankTrace, SpecId, StateOverride, H256, U256,
 };
 #[cfg(feature = "optimism")]
 use op_revm::{
     precompiles::OpPrecompiles, DefaultOp, L1BlockInfo, OpBuilder, OpEvm, OpTransaction,
 };
+use revm::bytecode::opcode;
+use revm::context::result::{ExecResultAndState, ExecutionResult};
 use revm::context::{BlockEnv, TxEnv};
 use revm::context_interface::Block;
 use revm::database::{CacheDB, DatabaseRef, WrapDatabaseRef};
@@ -21,7 +24,7 @@ use revm::state::{Account, AccountStatus, EvmStorageSlot};
 use revm::{context::Evm, handler::EthPrecompiles, MainBuilder, MainContext};
 use revm::{Context, Database, DatabaseCommit};
 use revm_inspectors::tracing::types::{CallTraceNode, TraceMemberOrder};
-use revm_inspectors::tracing::CallTraceArena;
+use revm_inspectors::tracing::{CallTraceArena, GethTraceBuilder};
 use std::collections::HashMap;
 
 /// Helper type for representing the fees of a [CallRequest]
@@ -466,7 +469,7 @@ fn build_trace_node(
     parent_trace_id: String,
     pos_in_parent_trace: usize,
     node: &CallTraceNode,
-    nodes: &Vec<CallTraceNode>,
+    nodes: &[CallTraceNode],
 ) -> DebankTraceNode {
     let mut debank_node = DebankTraceNode {
         trace: node.into(),
@@ -538,15 +541,85 @@ fn finish_build_traces(
     }
 }
 
-pub(crate) fn build_debank_traces(
+pub(crate) struct DebankTraceBuilder {
     tx_id: H256,
     traces: CallTraceArena,
+}
+
+impl DebankTraceBuilder {
+    pub(crate) fn new(tx_id: H256, traces: CallTraceArena) -> Self {
+        Self { tx_id, traces }
+    }
+
+    pub(crate) fn debank_traces(&self) -> (Vec<DebankTrace>, Vec<DebankEvent>) {
+        build_debank_traces(self.tx_id, &self.traces)
+    }
+
+    pub(crate) fn debank_state_diff<DB: DatabaseRef>(
+        &self,
+        res_and_state: &ExecResultAndState<ExecutionResult>,
+        db: DB,
+    ) -> DebankStorageDiff {
+        if self.traces.nodes().is_empty() {
+            return Default::default();
+        }
+        let geth_builder = GethTraceBuilder::new_borrowed(self.traces.nodes());
+
+        let pre_state_frame = geth_builder
+            .geth_prestate_traces(
+                &res_and_state,
+                &PreStateConfig {
+                    diff_mode: Some(true),
+                    ..Default::default()
+                },
+                db,
+            )
+            .unwrap();
+
+        let diff = pre_state_frame.as_diff().unwrap().clone();
+
+        let mut preimages = Vec::new();
+
+        for node in self.traces.nodes() {
+            let trace = &node.trace;
+            for step in &trace.steps {
+                let op = step.op.get();
+                // KECCAK preimages from returndata
+                if op == opcode::KECCAK256 {
+                    if let (Some(stack), Some(memory)) = (&step.stack, &step.memory) {
+                        if stack.len() >= 2 {
+                            let offset = stack[stack.len() - 1];
+                            let len = stack[stack.len() - 2];
+                            if let (Ok(offset), Ok(len)) =
+                                (usize::try_from(offset), usize::try_from(len))
+                            {
+                                let mut data = vec![0; len];
+                                if offset < memory.as_bytes().len() {
+                                    let end = (offset + len).min(memory.as_bytes().len());
+                                    let copy_len = end - offset;
+                                    data[..copy_len]
+                                        .copy_from_slice(&memory.as_bytes()[offset..end]);
+                                }
+                                preimages.push(Bytes::from(data));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        DebankStorageDiff { diff, preimages }
+    }
+}
+
+pub(crate) fn build_debank_traces(
+    tx_id: H256,
+    traces: &CallTraceArena,
 ) -> (Vec<DebankTrace>, Vec<DebankEvent>) {
-    let nodes = traces.into_nodes();
+    let nodes = traces.nodes();
     if nodes.is_empty() {
         return (vec![], vec![]);
     }
-    let mut top = build_trace_node(tx_id, "".to_string(), 0, &nodes[0], &nodes);
+    let mut top = build_trace_node(tx_id, "".to_string(), 0, &nodes[0], nodes);
     let mut traces = vec![];
     let mut events = vec![];
     finish_build_traces(&mut top, &mut traces, &mut events);
