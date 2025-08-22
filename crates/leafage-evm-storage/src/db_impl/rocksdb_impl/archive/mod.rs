@@ -25,6 +25,7 @@ use crate::db::{
     ArchiveDBProvider, BlockIterator, BlockRead, StateDBIterator, StateDBRead, StateDBWrite,
 };
 use crate::metrics::STORAGE_METRICS;
+use alloy::primitives::B64;
 use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
@@ -338,7 +339,34 @@ impl BlockRead for DataBaseRef {
             return Ok(None);
         }
         let block_info_bytes = block_info_bytes.unwrap();
-        let block_header: RawHeader = RawHeader::decode(&mut block_info_bytes.as_ref()).unwrap();
+        let mut block_header = RawHeader::decode(&mut block_info_bytes.as_ref());
+        if block_header.is_err() {
+            let buf = &mut block_info_bytes.as_ref();
+            let rlp_head = alloy_rlp::Header::decode(buf)?;
+            if !rlp_head.list {
+                Err(alloy_rlp::Error::NonCanonicalSingleByte)?;
+            }
+            let header = RawHeader {
+                parent_hash: Decodable::decode(buf)?,
+                ommers_hash: Decodable::decode(buf)?,
+                beneficiary: Decodable::decode(buf)?,
+                state_root: Decodable::decode(buf)?,
+                transactions_root: Decodable::decode(buf)?,
+                receipts_root: Decodable::decode(buf)?,
+                logs_bloom: Decodable::decode(buf)?,
+                difficulty: Decodable::decode(buf)?,
+                number: u64::decode(buf)?,
+                gas_limit: u64::decode(buf)?,
+                gas_used: u64::decode(buf)?,
+                timestamp: Decodable::decode(buf)?,
+                extra_data: Decodable::decode(buf)?,
+                mix_hash: Decodable::decode(buf)?,
+                nonce: B64::decode(buf)?,
+                ..Default::default()
+            };
+            block_header = Ok(header);
+        }
+        let block_header = block_header.unwrap();
         let block = Block {
             header: Header {
                 hash: block_hash,

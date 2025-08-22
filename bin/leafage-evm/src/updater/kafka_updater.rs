@@ -263,6 +263,7 @@ where
             for (_, res) in all_results {
                 match res {
                     Ok((block_info, block_diff)) => {
+                        info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
                         self.tree.update_block(block_info.clone(), block_diff)?;
                     }
                     Err(e) => {
@@ -374,6 +375,7 @@ where
                             loop {
                                 if let Err(e) = self.update_from_s3(&msgs).await {
                                     error!(target:"updater", "Failed to update from S3: {:?}", e);
+                                    time::sleep(time::Duration::from_secs(1)).await
                                 } else {
                                     self.read_from_kafka = true;
                                     break;
