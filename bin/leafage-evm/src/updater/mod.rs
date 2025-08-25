@@ -30,15 +30,18 @@ pub async fn updater_build<
             let updater_handle = updater.start();
             Ok(updater_handle)
         }
-        (None, Some(kafka_s3_cfg)) => {
-            let updater =
-                KafkaUpdater::new(tree, kafka_s3_cfg, max_diff_depth, init_task_queue_size).await?;
+        (rpc_url, Some(kafka_s3_cfg)) => {
+            let updater = KafkaUpdater::new(
+                tree,
+                rpc_url,
+                kafka_s3_cfg,
+                max_diff_depth,
+                init_task_queue_size,
+            )
+            .await?;
             let updater_handle = updater.start();
             Ok(updater_handle)
         }
         (None, None) => Ok(tokio::sync::watch::channel(()).0),
-        _ => {
-            panic!("either kafka_s3_cfg or rpc_url must be provided");
-        }
     }
 }

@@ -4,6 +4,7 @@ use crate::utils::{
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
+use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
     Block, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, Transaction, H256,
@@ -29,6 +30,7 @@ struct BlockContextWithOffset {
 
 /// [`Updater`] is used to update the snapshot tree to the latest block
 pub struct Updater<Tree> {
+    rpc_client: Option<HttpClient>,
     kafka_s3_cfg: KafkaS3Config,
     consumer: StreamConsumer,
     s3_client: Client,
@@ -49,10 +51,16 @@ where
 {
     pub async fn new(
         tree: Tree,
+        rpc_url: Option<impl AsRef<str>>,
         kafka_s3_cfg: KafkaS3Config,
         max_diff_depth: usize,
         init_task_queue_size: usize,
     ) -> Result<Self> {
+        let mut rpc_client = None;
+        if let Some(rpc_url) = rpc_url {
+            let client = HttpClientBuilder::default().build(rpc_url.as_ref())?;
+            rpc_client = Some(client);
+        }
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", &kafka_s3_cfg.brokers)
             .set("enable.partition.eof", "false")
@@ -68,6 +76,7 @@ where
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
         Ok(Self {
+            rpc_client,
             kafka_s3_cfg,
             consumer,
             s3_client,
@@ -240,6 +249,7 @@ where
             let end_block_number =
                 std::cmp::min(start_block_number + batch_size - 1, target_block_number);
             for block_number in start_block_number..=end_block_number {
+                let rpc_client = self.rpc_client.clone();
                 let client = self.s3_client.clone();
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
                 let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
@@ -248,6 +258,7 @@ where
                     (
                         block_number,
                         s3_get_block_info_and_diff_by_number(
+                            &rpc_client,
                             &client,
                             &bucket_name,
                             &outer_bucket_name,
