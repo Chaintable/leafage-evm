@@ -146,7 +146,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
     let block_info = match rpc_client {
         Some(rpc) => {
             let block = rpc
-                .get_block_by_number(number.into(), true)
+                .get_block_by_number(number.into(), false)
                 .await
                 .context(format!("rpc get block by hash failed, {number}"))?;
             if block.is_none() {
@@ -211,7 +211,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     let block_info = match rpc_client {
         Some(rpc) => {
             let block = rpc
-                .get_block_by_number(number.into(), true)
+                .get_block_by_number(number.into(), false)
                 .await
                 .context(format!("rpc get block by hash failed, {number}"))?;
             if block.is_none() {
