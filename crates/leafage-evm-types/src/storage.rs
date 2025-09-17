@@ -17,7 +17,7 @@ pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
         } else {
             Some(H256::ZERO)
         },
-        blob_excess_gas_and_price: block.header.excess_blob_gas.map(|excess_gas| {
+        blob_excess_gas_and_price: block.header.excess_blob_gas.or(Some(0)).map(|excess_gas| {
             let blob_gasprice =
                 alloy::eips::eip7840::BlobParams::cancun().calc_blob_fee(excess_gas);
             BlobExcessGasAndPrice {
