@@ -6,11 +6,7 @@ use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
-use leafage_evm_types::{
-    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, Index, JsonStorageKey,
-    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, U256,
-};
+use leafage_evm_types::{block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId, BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, Index, JsonStorageKey, MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, KECCAK256_EMPTY, U256};
 use leafage_evm_types::{CfgEnv, SpecId};
 use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
@@ -431,7 +427,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             return Ok(Bytes::new());
         } else {
             let account = account.unwrap();
-            if account.code_hash.is_zero() {
+            if account.code_hash.is_zero() || account.code_hash == KECCAK256_EMPTY{
                 return Ok(Bytes::new());
             }
             let code = state
