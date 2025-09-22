@@ -124,7 +124,6 @@ pub(crate) fn create_txn_env<ODB: DatabaseRef>(
         gas,
         value,
         input,
-        nonce,
         mut chain_id,
         access_list,
         blob_versioned_hashes,
@@ -155,14 +154,11 @@ pub(crate) fn create_txn_env<ODB: DatabaseRef>(
         chain_id = Some(cfg.chain_id);
     }
 
-    let nonce = if let Some(nonce) = nonce {
-        nonce
-    } else {
-        db.basic_ref(caller)
-            .map_err(|_| internal_rpc_err("get nonce failed"))?
-            .map(|acc| acc.nonce)
-            .unwrap_or_default()
-    };
+    let nonce = db
+        .basic_ref(caller)
+        .map_err(|_| internal_rpc_err("get nonce failed"))?
+        .map(|acc| acc.nonce)
+        .unwrap_or_default();
 
     let base = TxEnv {
         tx_type,
@@ -228,7 +224,6 @@ pub(crate) fn create_txn_env<ODB: DatabaseRef>(
         gas,
         value,
         input,
-        nonce,
         mut chain_id,
         access_list,
         blob_versioned_hashes,
@@ -295,17 +290,6 @@ pub(crate) fn create_txn_env<ODB: DatabaseRef>(
 
     Ok(env)
 }
-
-// pub(crate) fn get_handler_cfg(cfg_env: CfgEnv, spec_id: SpecId) -> CfgEnvWithHandlerCfg {
-//     #[allow(unused_mut)]
-//     let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, spec_id);
-//     #[cfg(feature = "optimism")]
-//     {
-//         cfg.disable_base_fee = true;
-//         cfg.enable_optimism();
-//     }
-//     cfg
-// }
 
 pub fn apply_block_overrides<DB>(
     overrides: BlockOverrides,
