@@ -259,14 +259,11 @@ pub(crate) fn create_txn_env<ODB: DatabaseRef>(
         chain_id = Some(cfg.chain_id);
     }
 
-    let nonce = if let Some(nonce) = nonce {
-        nonce
-    } else {
-        db.basic_ref(caller)
-            .map_err(|_| internal_rpc_err("get nonce failed"))?
-            .map(|acc| acc.nonce)
-            .unwrap_or_default()
-    };
+    let nonce = db
+        .basic_ref(caller)
+        .map_err(|_| internal_rpc_err("get nonce failed"))?
+        .map(|acc| acc.nonce)
+        .unwrap_or_default();
 
     let env = TxEnv {
         tx_type,
