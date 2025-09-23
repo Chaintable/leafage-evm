@@ -16,6 +16,7 @@ use leafage_evm_types::{Address, CfgEnv, SpecId};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
 use tracing::info;
@@ -198,6 +199,13 @@ pub struct Command {
     /// only avax chain need to enable this flag.
     #[arg(long, default_value_t = false)]
     normalize_state_key: bool,
+
+    /// The address for readiness probe server.
+    /// Default: ""
+    ///
+    /// This address is used for the readiness probe server.
+    #[arg(long, default_value = "")]
+    readiness_addr: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -300,13 +308,42 @@ impl Command {
             let gauge = gauge!("pipeline_node_info", &labels);
             gauge.set(1.0);
         }
+        let ready = Arc::new(AtomicBool::new(false));
+        if !self.readiness_addr.is_empty() {
+            let readiness_addr = self.readiness_addr.parse::<std::net::SocketAddr>()?;
+            info!(target: "etl", "starting readiness server on {}", readiness_addr);
+
+            let handle = ready.clone();
+
+            tokio::spawn(async move {
+                let app = axum::Router::new().route(
+                    "*",
+                    axum::routing::get(move || async move {
+                        if handle.load(std::sync::atomic::Ordering::SeqCst) {
+                            (axum::http::StatusCode::OK, "ready")
+                        } else {
+                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+                        }
+                    }),
+                );
+
+                let listener = tokio::net::TcpListener::bind(readiness_addr)
+                    .await
+                    .expect("Failed to bind readiness server");
+
+                axum::serve(listener, app)
+                    .await
+                    .expect("Failed to serve readiness");
+            });
+        }
+
         let mut etcd_config = self.etcd_config.clone();
         if etcd_config.is_some() && !self.meta.is_empty() {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
         let registry_handle =
             register_build(chain_cfg.chain_id, etcd_config.clone(), self.archive).await?;
-        match self.db_type.as_str() {
+        let res = match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
                 let tree = Arc::new(SnapshotTree::new(
@@ -401,7 +438,9 @@ impl Command {
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             _ => bail!("only support rocksdb"),
-        }
+        };
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        res
     }
     pub async fn run(&mut self) -> Result<()> {
         let (updater_handle, rpc_handle, resgitry_handle) =
