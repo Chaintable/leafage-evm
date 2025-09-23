@@ -183,6 +183,13 @@ pub struct Command {
     /// Fork height threshold for historical RPC forwarding
     #[arg(long)]
     historical_height: Option<u64>,
+
+    /// The wait timeout for stoping the server.
+    /// Default: 5 seconds
+    ///
+    /// This timeout is used to wait for the etcd unregister to complete.
+    #[arg(long, default_value = "5")]
+    stop_wait_timeout: u64,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -393,14 +400,15 @@ impl Command {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
-            if let Some(lease_timeout) = self.etcd_config.as_ref().map(|c| c.lease_ttl_s) {
-                // wait for lease to expire
-                info!(
-                    "waiting for etcd lease to expire in {} seconds...",
-                    lease_timeout
-                );
-                time::sleep(std::time::Duration::from_secs(lease_timeout as u64 + 1)).await;
-            }
+            // wait for lease to expire
+            info!(
+                "waiting for etcd lease to expire in {} seconds...",
+                self.stop_wait_timeout
+            );
+            time::sleep(std::time::Duration::from_secs(
+                self.stop_wait_timeout as u64,
+            ))
+            .await;
             let _ = rpc_handle.stop();
             Ok(())
         })
