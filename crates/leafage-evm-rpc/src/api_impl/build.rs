@@ -4,7 +4,10 @@ use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer, TraceApiServer};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
-use jsonrpsee::{RpcModule, http_client::{HttpClient, HttpClientBuilder}};
+use jsonrpsee::{
+    http_client::{HttpClient, HttpClientBuilder},
+    RpcModule,
+};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, CfgEnv, SpecId};
 use std::sync::Arc;
@@ -33,12 +36,13 @@ where
     pub fn with_historical_config(
         mut self,
         historical_rpc: Option<String>,
-        historical_height: Option<u64>
+        historical_height: Option<u64>,
     ) -> Self {
         if let Some(url) = historical_rpc {
             if let Ok(http_client) = HttpClientBuilder::default()
                 .request_timeout(Duration::from_secs(30))
-                .build(&url) {
+                .build(&url)
+            {
                 self.historical_client = Some(http_client);
             }
         }
@@ -51,9 +55,9 @@ where
         addr: &str,
         max_connects: u32,
         rpc_timeout: Duration,
-        #[cfg(target_os = "linux")]
-        interceptor_cfg: Option<InterceptorConfig>,
+        #[cfg(target_os = "linux")] interceptor_cfg: Option<InterceptorConfig>,
         ovm_address: Option<Address>,
+        is_archive: bool,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
@@ -78,6 +82,7 @@ where
                 ovm_address.clone(),
                 self.historical_client.clone(),
                 self.historical_height,
+                is_archive,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -93,6 +98,7 @@ where
                 ovm_address.clone(),
                 self.historical_client.clone(),
                 self.historical_height,
+                is_archive,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -108,6 +114,7 @@ where
                 ovm_address.clone(),
                 self.historical_client.clone(),
                 self.historical_height,
+                is_archive,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -124,6 +131,7 @@ where
                 ovm_address.clone(),
                 self.historical_client.clone(),
                 self.historical_height,
+                is_archive,
             )))
             .map_err(|e| {
                 std::io::Error::new(
