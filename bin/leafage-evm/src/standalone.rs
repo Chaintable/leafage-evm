@@ -17,6 +17,7 @@ use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time;
 use tracing::info;
 
 /// `leafage-evm standalone` command
@@ -390,9 +391,17 @@ impl Command {
             self.start(self.chain_cfg.clone()).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
-            let _ = updater_handle.send(());
-            let _ = rpc_handle.stop();
             let _ = resgitry_handle.send(());
+            let _ = updater_handle.send(());
+            if let Some(lease_timeout) = self.etcd_config.as_ref().map(|c| c.lease_ttl_s) {
+                // wait for lease to expire
+                info!(
+                    "waiting for etcd lease to expire in {} seconds...",
+                    lease_timeout
+                );
+                time::sleep(std::time::Duration::from_secs(lease_timeout as u64 + 1)).await;
+            }
+            let _ = rpc_handle.stop();
             Ok(())
         })
         .await?;
