@@ -400,7 +400,7 @@ impl Command {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
-            // wait for lease to expire
+            // wait for lease to unregist
             info!(
                 "waiting for etcd lease to expire in {} seconds...",
                 self.stop_wait_timeout
