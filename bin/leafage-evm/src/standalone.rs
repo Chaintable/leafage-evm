@@ -311,6 +311,7 @@ impl Command {
                         #[cfg(target_os = "linux")]
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
+                        self.archive,
                     )
                     .await?;
 
@@ -366,6 +367,7 @@ impl Command {
                         #[cfg(target_os = "linux")]
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
+                        self.archive,
                     )
                     .await?;
 

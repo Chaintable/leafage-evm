@@ -1,7 +1,7 @@
+use jsonrpsee::http_client::HttpClient;
 use leafage_evm_types::{Address, CfgEnv, SpecId, H256};
 use revm::primitives::keccak256;
 use std::time::Duration;
-use jsonrpsee::http_client::HttpClient;
 
 /// [`ApiImpl`] implements the EthApi trait.
 pub struct ApiImpl<DB> {
@@ -11,6 +11,7 @@ pub struct ApiImpl<DB> {
     pub ovm_address: Option<H256>,
     pub historical_client: Option<HttpClient>,
     pub historical_height: Option<u64>,
+    pub is_archive: bool,
 }
 
 impl<DB> ApiImpl<DB> {
@@ -21,6 +22,7 @@ impl<DB> ApiImpl<DB> {
         ovm_address: Option<Address>,
         historical_client: Option<HttpClient>,
         historical_height: Option<u64>,
+        is_archive: bool,
     ) -> Self {
         Self {
             db,
@@ -29,6 +31,7 @@ impl<DB> ApiImpl<DB> {
             ovm_address: ovm_address.map(|addr| keccak256(addr.as_slice())),
             historical_client,
             historical_height,
+            is_archive,
         }
     }
 }

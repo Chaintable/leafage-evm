@@ -67,6 +67,7 @@ pub enum DebankErrorCode {
     EvmFailed = -39004,
     DataBaseFailed = -39005,
     BlockNotFound = -39006,
+    InvalidBlockID = -39007,
     #[allow(dead_code)]
     InternalError = -32603,
     TimeOut = -41002,
