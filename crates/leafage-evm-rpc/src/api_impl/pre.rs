@@ -60,6 +60,7 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
             ovm_address,
+            normalize_state_key: false,
         });
         let mut tx_index: u64 = 0;
         let mut log_index = 0;

@@ -12,6 +12,7 @@ pub struct ApiImpl<DB> {
     pub historical_client: Option<HttpClient>,
     pub historical_height: Option<u64>,
     pub is_archive: bool,
+    pub is_normalize_state_key: bool,
 }
 
 impl<DB> ApiImpl<DB> {
@@ -23,6 +24,7 @@ impl<DB> ApiImpl<DB> {
         historical_client: Option<HttpClient>,
         historical_height: Option<u64>,
         is_archive: bool,
+        is_normalize_state_key: bool,
     ) -> Self {
         Self {
             db,
@@ -32,6 +34,7 @@ impl<DB> ApiImpl<DB> {
             historical_client,
             historical_height,
             is_archive,
+            is_normalize_state_key,
         }
     }
 }

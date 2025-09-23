@@ -190,6 +190,14 @@ pub struct Command {
     /// This timeout is used to wait for the etcd unregister to complete.
     #[arg(long, default_value = "5")]
     stop_wait_timeout: u64,
+
+    /// Whether to normalize the state key
+    /// Default: false
+    ///
+    /// This flag is used to enable the normalize state key.
+    /// only avax chain need to enable this flag.
+    #[arg(long, default_value_t = false)]
+    is_normalize_state_key: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -320,6 +328,7 @@ impl Command {
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
                         self.archive,
+                        self.is_normalize_state_key,
                     )
                     .await?;
 
@@ -376,6 +385,7 @@ impl Command {
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
                         self.archive,
+                        self.is_normalize_state_key,
                     )
                     .await?;
 

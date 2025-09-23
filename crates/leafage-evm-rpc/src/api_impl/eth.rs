@@ -64,6 +64,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let mut db = CacheDB::new(EvmStorageWrapper {
             db: state.clone(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: false,
         });
         let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
@@ -235,6 +236,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 EvmStorageWrapper {
                     db: state,
                     ovm_address,
+                    normalize_state_key: false,
                 },
                 block,
                 fast_fail.unwrap_or_default(),
@@ -371,6 +373,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             EvmStorageWrapper {
                 db: state.unwrap(),
                 ovm_address: self.ovm_address.clone(),
+                normalize_state_key: false,
             },
             address,
         )
@@ -419,6 +422,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: false,
         };
         let account = state
             .basic_ref(address.0.into())
@@ -454,6 +458,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: false,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -482,6 +487,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: false,
         };
         let account = state
             .basic_ref(address.0.into())

@@ -58,6 +58,7 @@ where
         #[cfg(target_os = "linux")] interceptor_cfg: Option<InterceptorConfig>,
         ovm_address: Option<Address>,
         is_archive: bool,
+        is_normalize_state_key: bool,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
@@ -83,6 +84,7 @@ where
                 self.historical_client.clone(),
                 self.historical_height,
                 is_archive,
+                is_normalize_state_key,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -99,6 +101,7 @@ where
                 self.historical_client.clone(),
                 self.historical_height,
                 is_archive,
+                is_normalize_state_key,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -115,6 +118,7 @@ where
                 self.historical_client.clone(),
                 self.historical_height,
                 is_archive,
+                is_normalize_state_key,
             )))
             .map_err(|e| {
                 std::io::Error::new(
@@ -132,6 +136,7 @@ where
                 self.historical_client.clone(),
                 self.historical_height,
                 is_archive,
+                is_normalize_state_key,
             )))
             .map_err(|e| {
                 std::io::Error::new(
