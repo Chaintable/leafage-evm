@@ -289,7 +289,7 @@ impl Command {
         if etcd_config.is_some() && !self.meta.is_empty() {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
-        let resgitry_handle =
+        let registry_handle =
             register_build(chain_cfg.chain_id, etcd_config.clone(), self.archive).await?;
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
@@ -325,7 +325,7 @@ impl Command {
                     self.init_task_queue_size,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, resgitry_handle))
+                Ok((updater_handle, rpc_handle, registry_handle))
             }
             "rocksdb" if self.archive => {
                 let db = Arc::new(ArchiveRocksDBStorage::open(
@@ -381,7 +381,7 @@ impl Command {
                     self.init_task_queue_size,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, resgitry_handle))
+                Ok((updater_handle, rpc_handle, registry_handle))
             }
             _ => bail!("only support rocksdb"),
         }
@@ -391,8 +391,8 @@ impl Command {
             self.start(self.chain_cfg.clone()).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
-            let _ = resgitry_handle.send(());
             let _ = updater_handle.send(());
+            let _ = resgitry_handle.send(());
             if let Some(lease_timeout) = self.etcd_config.as_ref().map(|c| c.lease_ttl_s) {
                 // wait for lease to expire
                 info!(
