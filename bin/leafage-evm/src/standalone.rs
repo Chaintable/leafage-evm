@@ -17,6 +17,7 @@ use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time;
 use tracing::info;
 
 /// `leafage-evm standalone` command
@@ -182,6 +183,13 @@ pub struct Command {
     /// Fork height threshold for historical RPC forwarding
     #[arg(long)]
     historical_height: Option<u64>,
+
+    /// The wait timeout for stoping the server.
+    /// Default: 5 seconds
+    ///
+    /// This timeout is used to wait for the etcd unregister to complete.
+    #[arg(long, default_value = "5")]
+    stop_wait_timeout: u64,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -288,7 +296,7 @@ impl Command {
         if etcd_config.is_some() && !self.meta.is_empty() {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
-        let resgitry_handle =
+        let registry_handle =
             register_build(chain_cfg.chain_id, etcd_config.clone(), self.archive).await?;
         match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
@@ -324,7 +332,7 @@ impl Command {
                     self.init_task_queue_size,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, resgitry_handle))
+                Ok((updater_handle, rpc_handle, registry_handle))
             }
             "rocksdb" if self.archive => {
                 let db = Arc::new(ArchiveRocksDBStorage::open(
@@ -380,7 +388,7 @@ impl Command {
                     self.init_task_queue_size,
                 )
                 .await?;
-                Ok((updater_handle, rpc_handle, resgitry_handle))
+                Ok((updater_handle, rpc_handle, registry_handle))
             }
             _ => bail!("only support rocksdb"),
         }
@@ -391,8 +399,17 @@ impl Command {
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
-            let _ = rpc_handle.stop();
             let _ = resgitry_handle.send(());
+            // wait for lease to unregist
+            info!(
+                "waiting for etcd lease to expire in {} seconds...",
+                self.stop_wait_timeout
+            );
+            time::sleep(std::time::Duration::from_secs(
+                self.stop_wait_timeout as u64,
+            ))
+            .await;
+            let _ = rpc_handle.stop();
             Ok(())
         })
         .await?;

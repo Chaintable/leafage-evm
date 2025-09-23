@@ -34,6 +34,12 @@ impl Register {
         Ok((keeper, stream))
     }
 
+    async fn unregister(&mut self) -> Result<()> {
+        self.etcd_client.lease_revoke(self.lease_id).await?;
+        info!(target: "register", "unregister key:{}, lease_id: {} success",self.key,self.lease_id);
+        Ok(())
+    }
+
     pub async fn new(
         chain_id: u64,
         etcd_cfg: EtcdRegisterConfig,
@@ -82,6 +88,10 @@ impl Register {
             loop {
                 tokio::select! {
                     _ = rx.changed() => {
+                        let err = self.unregister().await;
+                        if let Err(e) = err {
+                            error!(target: "register", "unregister lease {:?} error: {e}", self.lease_id);
+                        }
                         break;
                     }
                     resp = stream.message() => {
