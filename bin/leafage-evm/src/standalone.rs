@@ -311,13 +311,13 @@ impl Command {
         let ready = Arc::new(AtomicBool::new(false));
         if !self.readiness_addr.is_empty() {
             let readiness_addr = self.readiness_addr.parse::<std::net::SocketAddr>()?;
-            info!(target: "etl", "starting readiness server on {}", readiness_addr);
+            info!(target: "updater", "starting readiness server on {}", readiness_addr);
 
             let handle = ready.clone();
 
             tokio::spawn(async move {
                 let app = axum::Router::new().route(
-                    "*",
+                    "/",
                     axum::routing::get(move || async move {
                         if handle.load(std::sync::atomic::Ordering::SeqCst) {
                             (axum::http::StatusCode::OK, "ready")
@@ -440,6 +440,7 @@ impl Command {
             _ => bail!("only support rocksdb"),
         };
         ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        info!(target:"updater", "leafage server started");
         res
     }
     pub async fn run(&mut self) -> Result<()> {
