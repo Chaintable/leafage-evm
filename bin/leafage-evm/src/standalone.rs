@@ -197,7 +197,7 @@ pub struct Command {
     /// This flag is used to enable the normalize state key.
     /// only avax chain need to enable this flag.
     #[arg(long, default_value_t = false)]
-    is_normalize_state_key: bool,
+    normalize_state_key: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -328,7 +328,7 @@ impl Command {
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
                         self.archive,
-                        self.is_normalize_state_key,
+                        self.normalize_state_key,
                     )
                     .await?;
 
@@ -385,7 +385,7 @@ impl Command {
                         self.interceptor_config.clone(),
                         self.ovm_address.clone(),
                         self.archive,
-                        self.is_normalize_state_key,
+                        self.normalize_state_key,
                     )
                     .await?;
 

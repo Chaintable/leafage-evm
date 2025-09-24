@@ -316,7 +316,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state,
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -334,7 +334,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state,
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -353,7 +353,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state,
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -376,7 +376,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state,
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -414,7 +414,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
         let (tx, rx) = oneshot::channel();
         let using_ovm = self.ovm_address.clone();
-        let is_normalize_state_key = self.is_normalize_state_key;
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::debank_multi_call_from_state(
                 requests,
@@ -425,7 +425,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 state_override,
                 fast_fail.unwrap_or_default(),
                 using_ovm,
-                is_normalize_state_key,
+                normalize_state_key,
             );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
@@ -717,7 +717,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
         let (tx, rx) = oneshot::channel();
         let ovm_address = self.ovm_address.clone();
-        let is_normalize_state_key = self.is_normalize_state_key;
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::debank_call_many_and_trace(
                 requests,
@@ -726,7 +726,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 block,
                 block_overrides,
                 ovm_address,
-                is_normalize_state_key,
+                normalize_state_key,
             );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
@@ -852,7 +852,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
         let (tx, rx) = oneshot::channel();
         let ovm_address = self.ovm_address.clone();
-        let is_normalize_state_key = self.is_normalize_state_key;
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::debank_estimate_gas_many(
                 request,
@@ -861,7 +861,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 block,
                 block_overrides,
                 ovm_address,
-                is_normalize_state_key,
+                normalize_state_key,
             );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);

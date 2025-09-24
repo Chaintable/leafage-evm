@@ -37,7 +37,7 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let (tx, rx) = oneshot::channel();
         let using_ovm = self.ovm_address;
-        let is_normalize_state_key = self.is_normalize_state_key;
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::call_many_and_trace(
                 requests,
@@ -45,7 +45,7 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
                 state,
                 block,
                 using_ovm,
-                is_normalize_state_key,
+                normalize_state_key,
             );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);

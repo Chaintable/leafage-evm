@@ -69,7 +69,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let mut db = CacheDB::new(EvmStorageWrapper {
             db: state.clone(),
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         });
         let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
@@ -234,7 +234,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
         let (tx, rx) = oneshot::channel();
         let ovm_address = self.ovm_address.clone();
-        let normalize_state_key = self.is_normalize_state_key;
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::multi_call_from_state(
                 requests,
@@ -379,7 +379,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             EvmStorageWrapper {
                 db: state.unwrap(),
                 ovm_address: self.ovm_address.clone(),
-                normalize_state_key: self.is_normalize_state_key,
+                normalize_state_key: self.normalize_state_key,
             },
             address,
         )
@@ -428,7 +428,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
@@ -464,7 +464,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -493,7 +493,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.is_normalize_state_key,
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
