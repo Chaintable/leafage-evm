@@ -11,7 +11,7 @@ use leafage_evm_types::{
 };
 use revm::context::result::HaltReason;
 use revm::database::CacheDB;
-use revm::{InspectCommitEvm};
+use revm::InspectCommitEvm;
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -37,8 +37,16 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let (tx, rx) = oneshot::channel();
         let using_ovm = self.ovm_address;
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::call_many_and_trace(requests, cfg, state, block, using_ovm);
+            let rsp = Self::call_many_and_trace(
+                requests,
+                cfg,
+                state,
+                block,
+                using_ovm,
+                normalize_state_key,
+            );
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
             }
@@ -55,11 +63,13 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
         state: DB::StateDB,
         block: Arc<Block<Transaction>>,
         ovm_address: Option<H256>,
+        normalize_state_key: bool,
     ) -> RpcResult<Vec<PreResult>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
             ovm_address,
+            normalize_state_key,
         });
         let mut tx_index: u64 = 0;
         let mut log_index = 0;

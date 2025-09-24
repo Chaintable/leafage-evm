@@ -6,7 +6,12 @@ use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
-use leafage_evm_types::{block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId, BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, Index, JsonStorageKey, MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256, KECCAK256_EMPTY, U256};
+use leafage_evm_types::{
+    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
+    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, Index, JsonStorageKey,
+    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256,
+    KECCAK256_EMPTY, U256,
+};
 use leafage_evm_types::{CfgEnv, SpecId};
 use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
@@ -64,6 +69,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let mut db = CacheDB::new(EvmStorageWrapper {
             db: state.clone(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: self.normalize_state_key,
         });
         let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
@@ -228,6 +234,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
         let (tx, rx) = oneshot::channel();
         let ovm_address = self.ovm_address.clone();
+        let normalize_state_key = self.normalize_state_key;
         tokio::task::spawn_blocking(move || {
             let rsp = Self::multi_call_from_state(
                 requests,
@@ -235,6 +242,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 EvmStorageWrapper {
                     db: state,
                     ovm_address,
+                    normalize_state_key,
                 },
                 block,
                 fast_fail.unwrap_or_default(),
@@ -371,6 +379,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             EvmStorageWrapper {
                 db: state.unwrap(),
                 ovm_address: self.ovm_address.clone(),
+                normalize_state_key: self.normalize_state_key,
             },
             address,
         )
@@ -419,6 +428,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
@@ -427,7 +437,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             return Ok(Bytes::new());
         } else {
             let account = account.unwrap();
-            if account.code_hash.is_zero() || account.code_hash == KECCAK256_EMPTY{
+            if account.code_hash.is_zero() || account.code_hash == KECCAK256_EMPTY {
                 return Ok(Bytes::new());
             }
             let code = state
@@ -454,6 +464,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: self.normalize_state_key,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -482,6 +493,7 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = EvmStorageWrapper {
             db: state.unwrap(),
             ovm_address: self.ovm_address.clone(),
+            normalize_state_key: self.normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())

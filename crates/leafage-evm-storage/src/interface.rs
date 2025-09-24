@@ -78,6 +78,7 @@ pub trait BlockIndex {
 pub struct EvmStorageWrapper<T> {
     pub db: T,
     pub ovm_address: Option<H256>,
+    pub normalize_state_key: bool,
 }
 
 impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
@@ -101,7 +102,12 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let address = keccak256(address.as_slice());
-        let index = keccak256::<[u8; 32]>(index.to_be_bytes());
+        let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
+            to_normalize_state_key(index)
+        } else {
+            index.to_be_bytes()
+        });
+
         self.db
             .storage(address.into(), index.into())
             .map(|n| n.into())
@@ -109,6 +115,15 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     fn block_hash_ref(&self, number: u64) -> Result<H256, Self::Error> {
         self.db.block_hash(number).map(|h| h.0.into())
     }
+}
+
+/// NormalizeStateKey ANDs the 0th bit of the first byte in `key`,
+/// which ensures this bit will be 0 and all other bits are left the same.
+/// This partitions normal state storage from multicoin storage.
+pub fn to_normalize_state_key(index: U256) -> [u8; 32] {
+    let mut res = index.to_be_bytes();
+    res[0] &= 0xfe;
+    res
 }
 
 /// Calculates the OVM storage key for a balance, replicating the logic
@@ -175,7 +190,7 @@ pub trait EvmStorageWrite {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{io::Read, str::FromStr};
 
     use super::*;
 
@@ -186,5 +201,17 @@ mod tests {
             H256::from_str("0x0f3a88bb217e688cf0fede2f015e98298b832dcc3e2e4aa014ec244f1c785da6")
                 .unwrap();
         assert_eq!(get_ovm_balance_key(address), expected_key);
+    }
+
+    #[test]
+    fn test_normalize_state_key() {
+        let key =
+            H256::from_str("0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
+                .unwrap();
+
+        let key2 =
+            H256::from_str("0xb43127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
+                .unwrap();
+        assert_eq!(to_normalize_state_key(key.into()), key2);
     }
 }
