@@ -1,35 +1,60 @@
-use super::{utils, ApiImpl};
 use crate::api::PreApiServer;
-use crate::api_impl::utils::create_txn_env;
-use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
-use alloy::sol_types::decode_revert_reason;
+use crate::api_impl::core::{
+    Api, ApiCore, EvmExecuter, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+};
+use crate::error::{internal_rpc_err, rpc_error_with_code};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, Block, BlockId, BlockNumberOrTag, CallRequest, CfgEnv, ExecutionResult,
-    Log, PreError, PreErrorCode, PreResult, SpecId, Transaction, TransactionInfo, H256,
+    block_env_from_block, BlockId, BlockNumberOrTag, CallRequest, DebankErrorCode, PreErrorCode,
+    PreResult, TransactionInfo, H256,
 };
-use revm::context::result::HaltReason;
+use revm::context::Transaction as TransactionTrait;
 use revm::database::CacheDB;
-use revm::InspectCommitEvm;
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
-use std::sync::Arc;
+use revm_inspectors::tracing::TracingInspectorConfig;
 use tokio::sync::oneshot;
 use tracing::error;
 
-impl<DB: EvmStorageRead> ApiImpl<DB> {
+impl<C> Api<C>
+where
+    C: ApiCore,
+    C::DB: EvmStorageRead,
+    C::Tx: TransactionTrait + TxSetter + Clone,
+    C::TransactionError: ToJsonRpcError + GetTransactionError,
+    C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    PreErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+{
     async fn pre_trace_many_impl(
         &self,
         requests: Vec<CallRequest>,
         block_id: Option<BlockId>,
     ) -> RpcResult<Vec<PreResult>> {
-        let cfg = self.cfg.clone();
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let rsp = this.pre_trace_many_impl_inner(requests, block_id);
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send multi_call result: {:?}", e);
+            }
+        });
+        let rsp = rx
+            .await
+            .map_err(|_| internal_rpc_err("PreTraceMany failed".to_string()))?;
+        rsp
+    }
+
+    fn pre_trace_many_impl_inner(
+        &self,
+        txs: Vec<CallRequest>,
+        block_id: Option<BlockId>,
+    ) -> RpcResult<Vec<PreResult>> {
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_id),
@@ -45,41 +70,11 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        let (tx, rx) = oneshot::channel();
-        let using_ovm = self.ovm_address;
-        let normalize_state_key = self.normalize_state_key;
-        tokio::task::spawn_blocking(move || {
-            let rsp = Self::call_many_and_trace(
-                requests,
-                cfg,
-                state,
-                block,
-                using_ovm,
-                normalize_state_key,
-            );
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("PreTraceMany failed".to_string()))?;
-        rsp
-    }
-
-    fn call_many_and_trace(
-        txs: Vec<CallRequest>,
-        cfg: CfgEnv<SpecId>,
-        state: DB::StateDB,
-        block: Arc<Block<Transaction>>,
-        ovm_address: Option<H256>,
-        normalize_state_key: bool,
-    ) -> RpcResult<Vec<PreResult>> {
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
-            ovm_address,
-            normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address,
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
         let mut tx_index: u64 = 0;
         let mut log_index = 0;
@@ -99,91 +94,53 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
                     continue;
                 }
             }
-            let tx = create_txn_env(&block_env, tx, &memory_db, &cfg)?;
             let trace_cfg = TracingInspectorConfig::default_parity();
-            let mut inspector = TracingInspector::new(trace_cfg);
-            let mut evm = utils::create_evm_from_state(
-                block_env.clone(),
-                cfg.clone(),
-                &mut memory_db,
-                &mut inspector,
-            );
-            let exec_res = evm
-                .inspect_tx_commit(tx)
-                .map_err(|e| internal_rpc_err(e.to_string()))?;
-            drop(evm);
-            match exec_res {
-                ExecutionResult::Revert { gas_used, output } => {
-                    let reason =
-                        decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
-                    let pre_error = PreError {
-                        msg: reason,
-                        code: PreErrorCode::Reverted as i64,
-                    };
-                    let pre_res = PreResult {
-                        error: pre_error,
-                        gas_used,
-                        ..Default::default()
-                    };
-                    pre_results.push(pre_res);
-                }
-                ExecutionResult::Halt { reason, gas_used } => {
-                    #[cfg(feature = "optimism")]
-                    let reason = match reason {
-                        op_revm::OpHaltReason::Base(reason) => reason,
-                        _ => revm::context::result::HaltReason::OpcodeNotFound,
-                    };
-                    let code = match reason {
-                        HaltReason::OutOfFunds => PreErrorCode::InsufficientBalane as i64,
-                        _ => PreErrorCode::UnKnown as i64,
-                    };
-                    let pre_error = PreError {
-                        msg: format!("{:?}", reason),
-                        code,
-                    };
-                    let pre_res = PreResult {
-                        error: pre_error,
-                        gas_used,
-                        ..Default::default()
-                    };
-                    pre_results.push(pre_res);
-                }
-                ExecutionResult::Success { gas_used, logs, .. } => {
-                    let trace_res = inspector
-                        .into_parity_builder()
-                        .into_localized_transaction_traces(tx_info);
-                    let mut trace_logs = vec![];
-                    for log in logs {
-                        trace_logs.push(Log {
-                            inner: log,
-                            block_hash: Some(block.header.hash),
-                            block_number: Some(block.header.number),
-                            block_timestamp: Some(block.header.timestamp),
-                            transaction_hash: Some(tx_info.hash.unwrap()),
-                            transaction_index: Some(tx_info.index.unwrap()),
-                            log_index: Some(log_index),
-                            removed: false,
-                        });
-                        log_index += 1;
-                    }
-                    let pre_res = PreResult {
-                        gas_used,
-                        logs: trace_logs,
-                        trace: trace_res,
-                        ..Default::default()
-                    };
-                    pre_results.push(pre_res);
-                }
+            let tx = self.inner.create_txn_env(
+                &block_env,
+                tx,
+                &memory_db,
+                self.inner.evm_cfg().cfg.chain_id,
+            )?;
+            let (exec_res, traces) = self
+                .inner
+                .inspect_tx_commit(
+                    &block_env,
+                    &mut memory_db,
+                    trace_cfg,
+                    |inspector| {
+                        inspector
+                            .into_parity_builder()
+                            .into_localized_transaction_traces(tx_info)
+                    },
+                    tx,
+                )
+                .map_err(|e| e.to_rpc_error())?;
+            let mut pre_res: PreResult = exec_res.into();
+            for log in &mut pre_res.logs {
+                log.log_index = Some(log_index);
+                log.block_hash = Some(block.header.hash);
+                log.block_number = Some(block.header.number);
+                log.block_timestamp = Some(block.header.timestamp);
+                log.transaction_hash = Some(tx_info.hash.unwrap());
+                log.transaction_index = Some(tx_info.index.unwrap());
+                log_index += 1;
             }
+            pre_res.trace = traces;
+            pre_results.push(pre_res);
         }
         Ok(pre_results)
     }
 }
 
 #[async_trait::async_trait]
-impl<DB> PreApiServer for ApiImpl<DB>
+impl<C> PreApiServer for Api<C>
 where
-    DB: EvmStorageRead + Send + Sync + 'static,
+    C: ApiCore,
+    C::DB: EvmStorageRead,
+    C::Tx: TransactionTrait + TxSetter + Clone,
+    C::TransactionError: ToJsonRpcError + GetTransactionError,
+    C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    PreErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
 {
     async fn trace_many(
         &self,

@@ -5,14 +5,14 @@ use crate::updater::updater_build;
 use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
 use anyhow::{bail, Result};
 use clap::Parser;
-use leafage_evm_rpc::ApiBuilder;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
+use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv};
 use leafage_evm_storage::{
     ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
     StateDBWrapper,
 };
-use leafage_evm_types::{Address, CfgEnv, SpecId};
+use leafage_evm_types::Address;
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -27,8 +27,13 @@ pub struct Command {
     /// The path to Cfg config to use for this node.
     ///
     /// If not specified, the default config [eth] will be used.
-    #[arg(long, value_parser = parse_chain_cfg, default_value = "eth")]
-    chain_cfg: CfgEnv<SpecId>,
+    #[arg(long, value_parser = parse_chain_cfg, default_value = "1")]
+    chain_cfg: u64,
+
+    /// The type of evm to use for this node.
+    /// Default: mainnet
+    #[arg(long, default_value = "mainnet")]
+    evm_type: String,
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
@@ -213,37 +218,27 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntEr
     Ok(std::time::Duration::from_millis(millis))
 }
 
-fn parse_chain_cfg(arg: &str) -> Result<CfgEnv<SpecId>> {
-    let mut chain_cfg = CfgEnv::default();
-    chain_cfg.disable_balance_check = true;
-    chain_cfg.disable_eip3607 = true;
-    chain_cfg.disable_block_gas_limit = true;
-    chain_cfg.disable_base_fee = true;
+fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg.is_empty() || arg == "eth" {
-        return Ok(chain_cfg);
+        return Ok(1);
     }
     if arg == "seth" {
-        chain_cfg.chain_id = 11155111;
-        return Ok(chain_cfg);
+        return Ok(11155111);
     }
     if arg == "polygon" {
-        chain_cfg.chain_id = 137;
-        return Ok(chain_cfg);
+        return Ok(137);
     }
     if arg == "linea" {
-        chain_cfg.chain_id = 59144;
-        return Ok(chain_cfg);
+        return Ok(59144);
     }
     if arg == "op" {
-        chain_cfg.chain_id = 10;
-        return Ok(chain_cfg);
+        return Ok(10);
     }
     if arg.parse::<u64>().is_ok() {
-        chain_cfg.chain_id = arg.parse().unwrap();
-        return Ok(chain_cfg);
+        return Ok(arg.parse().unwrap());
+    } else {
+        bail!("invalid chain cfg: {}", arg);
     }
-    let chain_cfg = serde_json::from_str(arg)?;
-    Ok(chain_cfg)
 }
 
 fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
@@ -291,7 +286,7 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
 impl Command {
     async fn start(
         &mut self,
-        chain_cfg: CfgEnv<SpecId>,
+        chain_cfg: MultiChainCfgEnv,
     ) -> Result<(
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
@@ -302,7 +297,7 @@ impl Command {
         if !self.prometheus_addr.is_empty() {
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
-                .add_global_label("chain_id", format!("{}", chain_cfg.chain_id))
+                .add_global_label("chain_id", format!("{}", chain_cfg.chain_id()))
                 .install()?;
             let labels = [("role", "replica".to_string())];
             let gauge = gauge!("pipeline_node_info", &labels);
@@ -342,7 +337,19 @@ impl Command {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
         let registry_handle =
-            register_build(chain_cfg.chain_id, etcd_config.clone(), self.archive).await?;
+            register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
+
+        // set default offset dir if not set
+        if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
+            if kafka_s3_config.offset_dir.is_empty() {
+                kafka_s3_config.offset_dir =
+                    format!("{}/offset", self.db_path.to_str().unwrap_or_default());
+            }
+            info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
+        } else {
+            info!(target:"updater", "no kafka s3 config");
+        }
+
         let res = match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
@@ -385,15 +392,6 @@ impl Command {
                     self.db_path.as_path(),
                     self.db_cache,
                 ));
-                if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
-                    if kafka_s3_config.offset_dir.is_empty() {
-                        kafka_s3_config.offset_dir =
-                            format!("{}/offset", self.db_path.to_str().unwrap_or_default());
-                    }
-                    info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
-                } else {
-                    info!(target:"updater", "no kafka s3 config");
-                }
                 // check if db shoud be initialized
                 initialize_check(
                     db.clone(),
@@ -443,9 +441,11 @@ impl Command {
         info!(target:"updater", "leafage server started");
         res
     }
+
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, resgitry_handle) =
-            self.start(self.chain_cfg.clone()).await?;
+        let (updater_handle, rpc_handle, resgitry_handle) = self
+            .start((self.chain_cfg.clone(), self.evm_type.clone()).into())
+            .await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());

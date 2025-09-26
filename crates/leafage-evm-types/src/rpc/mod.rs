@@ -22,16 +22,13 @@ pub use alloy::rpc::types::Transaction;
 #[cfg(feature = "optimism")]
 pub use op_alloy_rpc_types::Transaction;
 
-#[cfg(feature = "optimism")]
-pub use op_alloy_consensus::{OpTxEnvelope, OpTxType, TxDeposit};
-
 mod pre;
 pub use pre::{PreError, PreErrorCode, PreResult};
 
 mod debank;
 pub use alloy::rpc::types::state::{AccountOverride, StateOverride};
 pub use debank::{
-    BlockType, DebankBlock, DebankBlockContext, DebankEvent, DebankID, DebankMultiCallResp,
-    DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult,
-    DebankSingleSimulateResult, DebankTrace,
+    BlockType, DebankBlock, DebankBlockContext, DebankErrorCode, DebankEvent, DebankID,
+    DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
+    DebankSingleCallResult, DebankSingleSimulateResult, DebankTrace,
 };

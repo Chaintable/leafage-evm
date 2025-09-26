@@ -1,7 +1,11 @@
 use crate::{Address, Block, BlockId, Bytes, Transaction, H256, U256};
+use alloy::sol_types::decode_revert_reason;
+use op_revm::OpHaltReason;
+use revm::context::result::{ExecutionResult, HaltReason};
 use revm_bytecode::opcode::OpCode;
 use revm_inspectors::tracing::types::{CallKind, CallLog, CallTraceNode};
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -100,6 +104,95 @@ pub struct DebankSingleCallResult {
     pub time_cost: f64,
 }
 
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DebankErrorCode {
+    #[allow(dead_code)]
+    InvalidJson = -32700,
+    #[allow(dead_code)]
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InvalidParams = -32602,
+    EvmRevert = -39000,
+    GasExhausted = -39001,
+    BalanceExhausted = -39002,
+    NonceError = -39003,
+    EvmFailed = -39004,
+    DataBaseFailed = -39005,
+    BlockNotFound = -39006,
+    InvalidBlockID = -39007,
+    #[allow(dead_code)]
+    InternalError = -32603,
+    TimeOut = -41002,
+}
+
+impl From<HaltReason> for DebankErrorCode {
+    fn from(reason: HaltReason) -> Self {
+        match reason {
+            HaltReason::OutOfFunds => DebankErrorCode::BalanceExhausted,
+            HaltReason::NonceOverflow => DebankErrorCode::NonceError,
+            HaltReason::OutOfGas(_) => DebankErrorCode::GasExhausted,
+            _ => DebankErrorCode::EvmFailed,
+        }
+    }
+}
+
+impl From<OpHaltReason> for DebankErrorCode {
+    fn from(err: OpHaltReason) -> Self {
+        match err {
+            op_revm::result::OpHaltReason::Base(HaltReason::OutOfFunds) => {
+                DebankErrorCode::BalanceExhausted
+            }
+            op_revm::result::OpHaltReason::Base(HaltReason::NonceOverflow) => {
+                DebankErrorCode::NonceError
+            }
+            op_revm::result::OpHaltReason::Base(HaltReason::OutOfGas(_)) => {
+                DebankErrorCode::GasExhausted
+            }
+            _ => DebankErrorCode::EvmFailed,
+        }
+    }
+}
+
+impl<T: Clone + Debug> From<ExecutionResult<T>> for DebankSingleCallResult
+where
+    DebankErrorCode: From<T>,
+{
+    fn from(exec_res: ExecutionResult<T>) -> Self {
+        let res = match exec_res {
+            ExecutionResult::Success {
+                output, gas_used, ..
+            } => DebankSingleCallResult {
+                code: 0,
+                err: "".to_string(),
+                from_cache: false,
+                result: output.into_data().0.into(),
+                gas_used: gas_used as i64,
+                time_cost: 0.0,
+            },
+            ExecutionResult::Revert {
+                output, gas_used, ..
+            } => DebankSingleCallResult {
+                code: DebankErrorCode::EvmRevert as i32,
+                err: decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string()),
+                from_cache: false,
+                result: Bytes::default(),
+                gas_used: gas_used as i64,
+                time_cost: 0.0,
+            },
+            ExecutionResult::Halt { reason, gas_used } => DebankSingleCallResult {
+                code: DebankErrorCode::from(reason.clone()) as i32,
+                err: format!("Halted: {:?}", reason),
+                from_cache: false,
+                result: Bytes::default(),
+                gas_used: gas_used as i64,
+                time_cost: 0.0,
+            },
+        };
+        res
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DebankMultiCallResp {
     /// results
@@ -127,6 +220,43 @@ pub struct DebankSingleSimulateResult {
     pub code: i32,
     pub err: String,
     pub gas_used: u64,
+}
+
+impl<T: Clone + Debug> From<ExecutionResult<T>> for DebankSingleSimulateResult
+where
+    DebankErrorCode: From<T>,
+{
+    fn from(exec_res: ExecutionResult<T>) -> Self {
+        match exec_res {
+            ExecutionResult::Revert { gas_used, output } => {
+                let reason = decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
+                let pre_res = DebankSingleSimulateResult {
+                    code: DebankErrorCode::EvmRevert as i32,
+                    err: reason,
+                    gas_used,
+                    ..Default::default()
+                };
+                pre_res
+            }
+            ExecutionResult::Halt { reason, gas_used } => {
+                let code = DebankErrorCode::from(reason.clone());
+                let pre_res = DebankSingleSimulateResult {
+                    code: code as i32,
+                    err: format!("Halted: {:?}", reason),
+                    gas_used,
+                    ..Default::default()
+                };
+                pre_res
+            }
+            ExecutionResult::Success { gas_used, .. } => {
+                let pre_res = DebankSingleSimulateResult {
+                    gas_used,
+                    ..Default::default()
+                };
+                pre_res
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -194,7 +324,7 @@ impl From<&CallTraceNode> for DebankTrace {
                 | CallKind::CallCode
                 | CallKind::DelegateCall
                 | CallKind::AuthCall => "call".to_string(),
-                CallKind::Create | CallKind::Create2  => "create".to_string(),
+                CallKind::Create | CallKind::Create2 => "create".to_string(),
             },
             call_type: trace.kind.to_string(),
             ..Default::default()
@@ -216,7 +346,8 @@ impl From<&CallLog> for DebankEvent {
     fn from(log: &CallLog) -> Self {
         let selector = log
             .raw_log
-            .topics().first()
+            .topics()
+            .first()
             .map(|h| h.to_string())
             .unwrap_or_default();
         let topics = if log.raw_log.topics().len() > 1 {
@@ -227,7 +358,7 @@ impl From<&CallLog> for DebankEvent {
         } else {
             vec![]
         };
-        
+
         DebankEvent {
             selector,
             topics,
