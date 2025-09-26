@@ -1,7 +1,7 @@
 use super::{utils, ApiImpl};
 use crate::api::PreApiServer;
 use crate::api_impl::utils::create_txn_env;
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
 use alloy::sol_types::decode_revert_reason;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
@@ -29,7 +29,17 @@ impl<DB: EvmStorageRead> ApiImpl<DB> {
             .state_at(block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_id),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_id),
+                ));
+            }
         }
         let state = state.unwrap();
         let block = state

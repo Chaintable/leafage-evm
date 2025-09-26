@@ -1,8 +1,8 @@
 use alloy::rpc::types::state::StateOverride;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use leafage_evm_types::{
-    Address, BlockId, BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Index, JsonStorageKey,
-    MultiCallResp, Transaction, H256, U256,
+    Address, BlockId, BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, JsonStorageKey,
+    MultiCallResp, H256, U256,
 };
 use serde_json::Value;
 
@@ -68,11 +68,4 @@ pub trait EthApi {
 
     #[method(name = "baseFee")]
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64>;
-
-    #[method(name = "getTransactionByBlockHashAndIndex")]
-    async fn transaction_by_block_hash_and_index(
-        &self,
-        hash: H256,
-        index: Index,
-    ) -> RpcResult<Option<Transaction>>;
 }

@@ -1,14 +1,16 @@
 use super::{utils, ApiImpl};
 use crate::api::EthApiServer;
 use crate::api_impl::utils::create_txn_env;
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::{
+    internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code, DebankErrorCode,
+};
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, Index, JsonStorageKey,
+    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, JsonStorageKey,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256,
     KECCAK256_EMPTY, U256,
 };
@@ -31,7 +33,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_id),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_id),
+                ));
+            }
         }
         let block = state
             .unwrap()
@@ -59,7 +71,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_id),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_id),
+                ));
+            }
         }
         let state = state.unwrap();
         let block = state
@@ -225,7 +247,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_id),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_id),
+                ));
+            }
         }
         let state = state.unwrap();
         let block = state
@@ -373,7 +405,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_id),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_id),
+                ));
+            }
         }
         Self::get_balance_from_state(
             EvmStorageWrapper {
@@ -404,7 +446,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .get_block_by_id_arc(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if block.is_none() {
-            return Ok(None);
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_id),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_id),
+                ));
+            }
         }
         let block = block.unwrap();
         let value = if !full {
@@ -423,7 +475,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .state_at(block_number)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_number),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_number),
+                ));
+            }
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
@@ -459,7 +521,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .map_err(|e| internal_rpc_err(e.to_string()))?;
 
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_number),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_number),
+                ));
+            }
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
@@ -488,7 +560,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             .state_at(block_number)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
+            if self.is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block block_id {:?} is invalid", block_number),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block block_id {:?} not found for state node", block_number),
+                ));
+            }
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
@@ -504,30 +586,6 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn chain_id_impl(&self) -> RpcResult<U256> {
         Ok(U256::from(self.cfg.chain_id))
-    }
-
-    async fn transaction_by_block_hash_and_index_impl(
-        &self,
-        hash: H256,
-        index: Index,
-    ) -> RpcResult<Option<Transaction>> {
-        let block = self
-            .db
-            .get_block_by_id_arc(hash.into())
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if block.is_none() {
-            return Ok(None);
-        }
-        let block = block.unwrap();
-        let txns = block.transactions.as_transactions();
-        if txns.is_none() {
-            return Ok(None);
-        }
-        let txns = txns.unwrap();
-        if index.0 >= txns.len() {
-            return Ok(None);
-        }
-        Ok(Some(txns[index.0].clone()))
     }
 }
 
@@ -606,15 +664,6 @@ where
 
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
-            .await
-    }
-
-    async fn transaction_by_block_hash_and_index(
-        &self,
-        hash: H256,
-        index: Index,
-    ) -> RpcResult<Option<Transaction>> {
-        self.transaction_by_block_hash_and_index_impl(hash, index)
             .await
     }
 }
