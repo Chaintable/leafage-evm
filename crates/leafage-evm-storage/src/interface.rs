@@ -190,7 +190,7 @@ pub trait EvmStorageWrite {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Read, str::FromStr};
+    use std::str::FromStr;
 
     use super::*;
 
