@@ -35,7 +35,3 @@ serde.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true
-
-[features]
-default = []
-optimism = ["leafage-evm-types/optimism", "leafage-evm-storage/optimism"]

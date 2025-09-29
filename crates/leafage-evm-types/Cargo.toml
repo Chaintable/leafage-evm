@@ -22,8 +22,4 @@ thiserror.workspace = true
 flate2.workspace = true
 md-5.workspace = true
 revm-inspectors.workspace = true
-revm-bytecode.workspace =  true
-
-[features]
-default = []
-optimism = ["op-alloy-rpc-types", "op-alloy-consensus"]
+revm-bytecode.workspace = true

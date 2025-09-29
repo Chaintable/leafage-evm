@@ -40,4 +40,3 @@ axum.workspace = true
 [features]
 default = ["with-rocksdb"]
 with-rocksdb = ["leafage-evm-storage/with-rocksdb"]
-optimism = ["with-rocksdb", "leafage-evm-storage/optimism"]
