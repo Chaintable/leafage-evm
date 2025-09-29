@@ -1,10 +1,10 @@
 use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, U256};
-use crate::rpc::{Block, Transaction};
+use crate::rpc::Block;
 use alloy::primitives::keccak256;
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 
-pub fn block_env_from_block(block: &Block<Transaction>) -> BlockEnv {
+pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
     BlockEnv {
         number: U256::from(block.header.number),
         beneficiary: block.header.beneficiary,

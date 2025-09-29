@@ -8,10 +8,10 @@ use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
+    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
     BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, DebankErrorCode, Header, JsonStorageKey,
-    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256,
-    KECCAK256_EMPTY, U256,
+    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, H256, KECCAK256_EMPTY,
+    U256,
 };
 use revm::context::result::ExecutionResult;
 use revm::context::Transaction as TransactionTrait;
@@ -393,7 +393,7 @@ where
         .map_err(|e| internal_rpc_err(e.to_string()))
     }
 
-    fn get_block_by_id_impl(&self, block_id: BlockId, full: bool) -> RpcResult<Option<Value>> {
+    fn get_block_by_id_impl(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
         let block = self
             .inner
             .db()
@@ -413,13 +413,7 @@ where
             }
         }
         let block = block.unwrap();
-        let value = if !full {
-            let mut block: Block<Transaction> = block.as_ref().clone().into();
-            block.transactions.convert_to_hashes();
-            serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
-        } else {
-            serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
-        };
+        let value = serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?;
         Ok(Some(value))
     }
 

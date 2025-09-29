@@ -2,7 +2,7 @@ use crate::interface::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite
 use crate::metrics::BLOCK_METRICS;
 use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction, H256};
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
@@ -126,7 +126,7 @@ where
     /// update_block updates the state of the SnapshotTree.
     fn update_block(
         &self,
-        block_info: Block<Transaction>,
+        block_info: Block<H256>,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         if let Some(_) = self
@@ -184,7 +184,7 @@ where
         }
     }
 
-    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+    fn last_committed_block(&self) -> Result<Option<Block<H256>>, Self::Error> {
         self.disk_layer
             .block_info_arc()
             .map(|b| Some(b.as_ref().clone()))
@@ -193,11 +193,11 @@ where
 
 impl<DB: BlockContext> BlockContext for SnapshotTree<DB> {
     type Error = Error<DB::Error>;
-    fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
+    fn block_info(&self) -> Result<Block<H256>, Self::Error> {
         self.latest.read().unwrap().block_info()
     }
 
-    fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
+    fn block_info_arc(&self) -> Result<Arc<Block<H256>>, Self::Error> {
         self.latest.read().unwrap().block_info_arc()
     }
 
@@ -216,7 +216,7 @@ impl<DB: BlockContext> BlockIndex for SnapshotTree<DB> {
     fn get_block_by_id_arc(
         &self,
         block_id: BlockId,
-    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
+    ) -> Result<Option<Arc<Block<H256>>>, Self::Error> {
         match block_id {
             BlockId::Hash(hash) => {
                 if let Some(res) = self.hash_diff_map.read().unwrap().get(&hash.block_hash) {

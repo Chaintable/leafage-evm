@@ -1,4 +1,4 @@
-use crate::{Address, Block, BlockId, Bytes, Transaction, H256, U256};
+use crate::{Address, Block, BlockId, Bytes, H256, U256};
 use alloy::sol_types::decode_revert_reason;
 use op_revm::OpHaltReason;
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -277,8 +277,8 @@ pub struct DebankBlock {
     pub gas_used: u64,
 }
 
-impl From<Arc<Block<Transaction>>> for DebankBlock {
-    fn from(block: Arc<Block<Transaction>>) -> Self {
+impl<T> From<Arc<Block<T>>> for DebankBlock {
+    fn from(block: Arc<Block<T>>) -> Self {
         DebankBlock {
             id: block.header.hash,
             height: block.header.number,

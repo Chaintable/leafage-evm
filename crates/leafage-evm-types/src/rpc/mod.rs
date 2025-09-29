@@ -16,12 +16,6 @@ pub use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, BlockOverrides, Header, Index, Log, TransactionInfo,
 };
 
-#[cfg(not(feature = "optimism"))]
-pub use alloy::rpc::types::Transaction;
-
-#[cfg(feature = "optimism")]
-pub use op_alloy_rpc_types::Transaction;
-
 mod pre;
 pub use pre::{PreError, PreErrorCode, PreResult};
 

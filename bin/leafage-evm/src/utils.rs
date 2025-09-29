@@ -4,7 +4,7 @@ use aws_sdk_s3::Client;
 use flate2::read;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_rpc::EthApiClient;
-use leafage_evm_types::{Block, BlockStorageDiff, Transaction, H256};
+use leafage_evm_types::{Block, BlockStorageDiff, H256};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::{io::Read, str::FromStr};
 
-static S3_BLOCK_CACHE: LazyLock<RwLock<LruCache<H256, Block<Transaction>>>> =
+static S3_BLOCK_CACHE: LazyLock<RwLock<LruCache<H256, Block<H256>>>> =
     LazyLock::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(1024).unwrap())));
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -50,7 +50,7 @@ pub async fn s3_get_block_info(
     bucket_name: &str,
     s3_chain_id: &str,
     block_hash: H256,
-) -> Result<Block<Transaction>> {
+) -> Result<Block<H256>> {
     if let Some(block) = S3_BLOCK_CACHE.read().unwrap().peek(&block_hash) {
         return Ok(block.clone());
     }
@@ -66,7 +66,7 @@ pub async fn s3_get_block_info(
     let mut gz = read::GzDecoder::new(&bytes[..]);
     let mut bytes = Vec::new();
     gz.read_to_end(&mut bytes)?;
-    let block: Block<Transaction> = serde_json::from_slice(&bytes)?;
+    let block: Block<H256> = serde_json::from_slice(&bytes)?;
     S3_BLOCK_CACHE
         .write()
         .unwrap()
@@ -142,7 +142,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
     outer_bucket_name: &str,
     s3_chain_id: &str,
     number: u64,
-) -> Result<(Block<Transaction>, BlockStorageDiff)> {
+) -> Result<(Block<H256>, BlockStorageDiff)> {
     let block_info = match rpc_client {
         Some(rpc) => {
             let block = rpc
@@ -154,7 +154,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: Block<Transaction> = serde_json::from_value(block.unwrap())
+            let block: Block<H256> = serde_json::from_value(block.unwrap())
                 .context("rpc get block by hash parse failed")?;
             block
         }
@@ -207,7 +207,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     outer_bucket_name: &str,
     s3_chain_id: &str,
     number: u64,
-) -> Result<(Block<Transaction>, BlockStorageDiff)> {
+) -> Result<(Block<H256>, BlockStorageDiff)> {
     let block_info = match rpc_client {
         Some(rpc) => {
             let block = rpc
@@ -219,7 +219,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: Block<Transaction> = serde_json::from_value(block.unwrap())
+            let block: Block<H256> = serde_json::from_value(block.unwrap())
                 .context("rpc get block by hash parse failed")?;
             block
         }

@@ -29,8 +29,8 @@ use alloy::primitives::B64;
 use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
-    Transaction, H256, KECCAK256_EMPTY, U256,
+    Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount, H256,
+    KECCAK256_EMPTY, U256,
 };
 use revm::database_interface::DBErrorMarker;
 use rocksdb::{
@@ -320,7 +320,7 @@ impl BlockRead for DataBaseRef {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -493,7 +493,7 @@ impl StateDBIterator for DataBaseRef {
 
 impl BlockIterator for DataBaseRef {
     type Error = Error;
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<Transaction>, Self::Error>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Self::Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -813,7 +813,7 @@ impl BlockRead for StateDB {
         self.db.read_block_hash(block_num)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
         if self.block_header.is_some() && block_hash == self.block_header.as_ref().unwrap().hash {
             return Ok(Some(Block {
                 header: self.block_header.as_ref().unwrap().clone(),
@@ -859,7 +859,7 @@ impl StateDBWrite for StateDB {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<Transaction>,
+        block_info: Block<H256>,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
             .db

@@ -3,7 +3,7 @@ use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::EvmStorageWrite;
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction};
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use tracing::info;
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
@@ -30,7 +30,7 @@ where
             return Err(anyhow::anyhow!("failed to get genesis block"));
         }
         let latest_block = latest_block.unwrap();
-        let latest_block_info: Block<Transaction> = serde_json::from_value(latest_block)?;
+        let latest_block_info: Block<H256> = serde_json::from_value(latest_block)?;
         let laest_block_diff = self
             .rpc_client
             .block_state_diff(BlockId::Hash(latest_block_info.header.hash.into()), false)

@@ -19,9 +19,7 @@
 use crate::db::{BlockRead, StateDBRead, StateDBWrite};
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
-use leafage_evm_types::{
-    Block, Bytes, NewAccount, SlimAccount, Transaction, H256, KECCAK256_EMPTY, U256,
-};
+use leafage_evm_types::{Block, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256};
 use revm::database_interface::DBErrorMarker;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
@@ -132,7 +130,7 @@ impl BlockRead for DataBase {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<Transaction>>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -152,7 +150,7 @@ impl BlockRead for DataBase {
         }
         let block_info_bytes = block_info_bytes.unwrap();
         let block_info_slice = block_info_bytes.as_ref();
-        let block_info = from_slice::<Block<Transaction>>(block_info_slice)?;
+        let block_info = from_slice::<Block<H256>>(block_info_slice)?;
         Ok(Some(block_info))
     }
 
@@ -289,7 +287,7 @@ impl StateDBWrite for DataBase {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<Transaction>,
+        block_info: Block<H256>,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
             .db
