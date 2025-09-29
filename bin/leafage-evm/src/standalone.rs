@@ -32,7 +32,7 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, default_value = "mainnet")]
+    #[arg(long, value_parser = ["mainnet", "op"], default_value = "mainnet")]
     evm_type: String,
 
     /// The Ethereum Execution Specification ID for the chain.
