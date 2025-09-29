@@ -805,7 +805,7 @@ where
 
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
-        unimplemented!()
+        Ok(U256::from(highest_gas_limit))
     }
 
     async fn debank_estimate_gas_impl(
