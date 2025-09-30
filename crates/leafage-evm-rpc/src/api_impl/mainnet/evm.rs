@@ -2,15 +2,14 @@ use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::consensus::TxType;
 use alloy::signers::Either;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, CfgEnv, MainnetSpecId, H256, U256};
-use revm::context::{BlockEnv, TxEnv};
+use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, H256, U256};
+use revm::context::{Evm, TxEnv};
 use revm::context_interface::Block;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
-use revm::handler::instructions::EthInstructions;
+use revm::handler::{instructions::EthInstructions, EthPrecompiles};
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::primitives::TxKind;
-use revm::Context;
-use revm::{context::Evm, handler::EthPrecompiles, MainBuilder, MainContext};
+use revm::{Context, MainBuilder, MainContext};
 
 /// Helper type for representing the fees of a [CallRequest]
 pub(crate) struct CallFees {

@@ -1,10 +1,10 @@
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, CfgEnv, OpSpecId};
+use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, OpSpecId};
 use op_revm::{
     precompiles::OpPrecompiles, DefaultOp, L1BlockInfo, OpBuilder, OpEvm, OpTransaction,
 };
-use revm::context::{BlockEnv, TxEnv};
+use revm::context::TxEnv;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
