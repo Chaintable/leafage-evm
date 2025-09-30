@@ -17,11 +17,12 @@ use leafage_evm_types::{
     DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo, H256, KECCAK256_EMPTY,
     U256,
 };
+use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef};
-use revm_inspectors::tracing::TracingInspectorConfig;
+use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::{sync::oneshot, time::timeout};
@@ -592,7 +593,11 @@ where
                     continue;
                 }
             }
-            let trace_cfg = TracingInspectorConfig::default_parity().set_record_logs(true);
+            let mut trace_cfg = TracingInspectorConfig::default_parity()
+                .set_steps(true)
+                .set_record_logs(true)
+                .set_exclude_precompile_calls(false);
+            trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
             // let mut inspector = TracingInspector::new(trace_cfg);
             let tx = self.inner.create_txn_env(
                 &block_env,

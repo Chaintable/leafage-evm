@@ -324,18 +324,19 @@ impl From<&CallTraceNode> for DebankTrace {
                 | CallKind::CallCode
                 | CallKind::DelegateCall
                 | CallKind::AuthCall => "call".to_string(),
-                CallKind::Create | CallKind::Create2 => "create".to_string(),
+                CallKind::Create => "create".to_string(),
+                CallKind::Create2 => "create2".to_string(),
             },
-            call_type: trace.kind.to_string(),
             ..Default::default()
         };
-        if call_trace.is_selfdestruct() {
-            debank_trace.call_create_type = "suicide".to_string();
+        if debank_trace.call_create_type == "call" {
+            debank_trace.call_type = trace.kind.to_string().to_lowercase();
         }
         for op in trace.steps.iter() {
             if op.op == OpCode::SSTORE {
                 debank_trace.self_storage_change = true;
                 debank_trace.storage_change = true;
+                break;
             }
         }
         debank_trace

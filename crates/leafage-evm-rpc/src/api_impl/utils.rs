@@ -219,6 +219,31 @@ fn build_trace_node(
             _ => {}
         }
     }
+    // selfdestructs are not recorded as individual call traces but are derived from
+    // the call trace and are added as additional `TransactionTrace` objects in the
+    // trace array
+    if node.is_selfdestruct() {
+        let mut selfdestruct_trace = DebankTrace {
+            from_addr: node.trace.selfdestruct_address.unwrap_or_default(),
+            to_addr: node.trace.selfdestruct_refund_target.unwrap_or_default(),
+            value: node
+                .trace
+                .selfdestruct_transferred_value
+                .unwrap_or_default(),
+            parent_trace_id: id.clone(),
+            pos_in_parent_trace: debank_node.children.len(),
+            tx_id,
+            call_create_type: "suicide".to_string(),
+            ..Default::default()
+        };
+        selfdestruct_trace.id = selfdestruct_trace.debank_id();
+        debank_node
+            .children
+            .push(DebankTraceOrLog::Trace(DebankTraceNode {
+                trace: selfdestruct_trace,
+                children: vec![],
+            }));
+    }
     debank_node
 }
 
