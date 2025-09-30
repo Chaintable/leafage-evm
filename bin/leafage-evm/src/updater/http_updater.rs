@@ -3,7 +3,7 @@ use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Transaction};
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 pub struct Updater<Tree> {
     rpc_client: HttpClient,
     tree: Tree,
-    block_queue: VecDeque<Block<Transaction>>,
+    block_queue: VecDeque<Block<H256>>,
     update_interval: Duration,
     max_diff_depth: usize,
 }
@@ -70,7 +70,7 @@ where
                 info!(target:"updater", "no new block");
                 return Ok(false);
             } else {
-                let next_block_info: Block<Transaction> =
+                let next_block_info: Block<H256> =
                     serde_json::from_value(next_block_info.unwrap())?;
                 self.block_queue.push_back(next_block_info);
             }
@@ -98,7 +98,7 @@ where
                 info!(target:"updater", "can't not find block {}", first_block_info.header.parent_hash);
                 return Ok(false);
             } else {
-                let parent_block_info: Block<Transaction> =
+                let parent_block_info: Block<H256> =
                     serde_json::from_value(parent_block_info.unwrap())?;
                 self.block_queue.push_front(parent_block_info);
             }

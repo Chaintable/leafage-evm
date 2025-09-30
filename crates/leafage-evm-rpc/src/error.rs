@@ -1,4 +1,5 @@
 use leafage_evm_types::hex;
+
 /// Constructs an invalid params JSON-RPC error.
 pub(crate) fn invalid_params_rpc_err(
     msg: impl Into<String>,
@@ -49,26 +50,4 @@ pub(crate) fn rpc_err(
                 .expect("serializing String does fail")
         }),
     )
-}
-
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DebankErrorCode {
-    #[allow(dead_code)]
-    InvalidJson = -32700,
-    #[allow(dead_code)]
-    InvalidRequest = -32600,
-    MethodNotFound = -32601,
-    InvalidParams = -32602,
-    EvmRevert = -39000,
-    GasExhausted = -39001,
-    BalanceExhausted = -39002,
-    NonceError = -39003,
-    EvmFailed = -39004,
-    DataBaseFailed = -39005,
-    BlockNotFound = -39006,
-    InvalidBlockID = -39007,
-    #[allow(dead_code)]
-    InternalError = -32603,
-    TimeOut = -41002,
 }

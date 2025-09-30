@@ -5,8 +5,7 @@ use crate::{
     StateDBRead, StateDBWrite,
 };
 use leafage_evm_types::{
-    AccountInfo, Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Bytecode, Transaction, H256,
-    U256,
+    AccountInfo, Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Bytecode, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
 use std::sync::Arc;
@@ -77,14 +76,14 @@ where
 {
     type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
 
-    fn block_info(&self) -> Result<Block<Transaction>, Self::Error> {
+    fn block_info(&self) -> Result<Block<H256>, Self::Error> {
         match self {
             MultiStateDB::Snapshot(s) => s.block_info().map_err(Error::Snapshot),
             MultiStateDB::Archive(s) => s.block_info().map_err(Error::Archive),
         }
     }
 
-    fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
+    fn block_info_arc(&self) -> Result<Arc<Block<H256>>, Self::Error> {
         match self {
             MultiStateDB::Snapshot(s) => s.block_info_arc().map_err(Error::Snapshot),
             MultiStateDB::Archive(s) => s.block_info_arc().map_err(Error::Archive),
@@ -175,7 +174,7 @@ where
     type Error = Error<<DB::StateDBReadWrite as StateDBWrite>::Error>;
     fn update_block(
         &self,
-        block_info: Block<Transaction>,
+        block_info: Block<H256>,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         let res = self
@@ -184,7 +183,7 @@ where
         Ok(res)
     }
 
-    fn last_committed_block(&self) -> Result<Option<Block<Transaction>>, Self::Error> {
+    fn last_committed_block(&self) -> Result<Option<Block<H256>>, Self::Error> {
         let res = self.snapshot_tree.last_committed_block()?;
         Ok(res)
     }
@@ -195,10 +194,7 @@ where
     DB: ArchiveDBProvider + Sync + Send + 'static,
 {
     type Error = Error<<DB::StateDBReadWrite as StateDBWrite>::Error>;
-    fn get_block_by_id(
-        &self,
-        block_id: BlockId,
-    ) -> Result<Option<Block<Transaction>>, Self::Error> {
+    fn get_block_by_id(&self, block_id: BlockId) -> Result<Option<Block<H256>>, Self::Error> {
         let res = self.snapshot_tree.get_block_by_id(block_id)?;
         if res.is_none() {
             let db = self
@@ -230,7 +226,7 @@ where
     fn get_block_by_id_arc(
         &self,
         block_id: BlockId,
-    ) -> Result<Option<Arc<Block<Transaction>>>, Self::Error> {
+    ) -> Result<Option<Arc<Block<H256>>>, Self::Error> {
         let res = self.snapshot_tree.get_block_by_id_arc(block_id)?;
         if res.is_none() {
             let db = self

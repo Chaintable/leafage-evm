@@ -1,28 +1,27 @@
-use super::{utils, ApiImpl};
+use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
-use crate::api_impl::utils::{build_debank_traces, create_txn_env};
-use crate::error::{internal_rpc_err, rpc_error_with_code, DebankErrorCode};
+use crate::api_impl::core::{
+    Api, ApiCore, EvmExecuter, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+};
+use crate::api_impl::utils::build_debank_traces;
+use crate::error::{internal_rpc_err, rpc_error_with_code};
+
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
-use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper, StateDB};
+use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, Address, Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockType,
-    Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankMultiCallResp, DebankMultiCallStats,
-    DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult, DebankSingleSimulateResult,
-    Header, JsonStorageKey, MultiCallErrorCode, Transaction, TransactionInfo, H256,
-    KECCAK256_EMPTY, U256,
+    block_env_from_block, Address, BlockId, BlockNumberOrTag, BlockOverrides, BlockType, Bytes,
+    CallRequest, DebankBlock, DebankBlockContext, DebankErrorCode, DebankMultiCallResp,
+    DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult,
+    DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo, H256, KECCAK256_EMPTY,
+    U256,
 };
-use leafage_evm_types::{CfgEnv, SpecId};
-#[cfg(feature = "optimism")]
-use op_revm::OpTransactionError;
-use revm::context::result::{EVMError, InvalidTransaction};
+use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef};
-use revm::inspector::NoOpInspector;
-use revm::{ExecuteEvm, InspectCommitEvm};
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::TracingInspectorConfig;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::{sync::oneshot, time::timeout};
@@ -34,128 +33,42 @@ pub const CALL_STIPEND_GAS: u64 = 2_300;
 
 pub const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
 
-impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
-    #[cfg(not(feature = "optimism"))]
-    pub fn evm_to_debank_error(
-        res: EVMError<<<DB as EvmStorageRead>::StateDB as StateDB>::Error>,
-    ) -> jsonrpsee::types::ErrorObjectOwned {
-        match res {
-            e => match e {
-                EVMError::Database(e) => {
-                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-                }
-                EVMError::Header(e) => {
-                    rpc_error_with_code(DebankErrorCode::InvalidParams as i32, e.to_string())
-                }
-                EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { .. }) => {
-                    rpc_error_with_code(
-                        DebankErrorCode::BalanceExhausted as i32,
-                        "Insufficient funds".to_string(),
-                    )
-                }
-                EVMError::Transaction(InvalidTransaction::CallerGasLimitMoreThanBlock) => {
-                    rpc_error_with_code(
-                        DebankErrorCode::InvalidParams as i32,
-                        "Caller gas limit more than block".to_string(),
-                    )
-                }
-                EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit {
-                    ..
-                }) => rpc_error_with_code(
-                    DebankErrorCode::GasExhausted as i32,
-                    "Invalid gas limit".to_string(),
-                ),
-                EVMError::Transaction(
-                    InvalidTransaction::NonceOverflowInTransaction
-                    | InvalidTransaction::NonceTooHigh { .. }
-                    | InvalidTransaction::NonceTooLow { .. },
-                ) => rpc_error_with_code(
-                    DebankErrorCode::NonceError as i32,
-                    "Invalid nonce".to_string(),
-                ),
-                e => rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e.to_string()),
-            },
+impl<C> Api<C> {
+    pub fn new(core: C) -> Self {
+        Self {
+            inner: Arc::new(core),
         }
     }
 
-    #[cfg(feature = "optimism")]
-    pub fn evm_to_debank_error(
-        res: EVMError<<<DB as EvmStorageRead>::StateDB as StateDB>::Error, OpTransactionError>,
-    ) -> jsonrpsee::types::ErrorObjectOwned {
-        match res {
-            e => match e {
-                EVMError::Database(e) => {
-                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-                }
-                EVMError::Header(e) => {
-                    rpc_error_with_code(DebankErrorCode::InvalidParams as i32, e.to_string())
-                }
-                EVMError::Transaction(OpTransactionError::Base(
-                    InvalidTransaction::LackOfFundForMaxFee { .. },
-                )) => rpc_error_with_code(
-                    DebankErrorCode::BalanceExhausted as i32,
-                    "Insufficient funds".to_string(),
-                ),
-                EVMError::Transaction(OpTransactionError::Base(
-                    InvalidTransaction::CallerGasLimitMoreThanBlock,
-                )) => rpc_error_with_code(
-                    DebankErrorCode::InvalidParams as i32,
-                    "Caller gas limit more than block".to_string(),
-                ),
-                EVMError::Transaction(OpTransactionError::Base(
-                    InvalidTransaction::CallGasCostMoreThanGasLimit { .. },
-                )) => rpc_error_with_code(
-                    DebankErrorCode::GasExhausted as i32,
-                    "Invalid gas limit".to_string(),
-                ),
-                EVMError::Transaction(
-                    OpTransactionError::Base(InvalidTransaction::NonceOverflowInTransaction)
-                    | OpTransactionError::Base(InvalidTransaction::NonceTooHigh { .. })
-                    | OpTransactionError::Base(InvalidTransaction::NonceTooLow { .. }),
-                ) => rpc_error_with_code(
-                    DebankErrorCode::NonceError as i32,
-                    "Invalid nonce".to_string(),
-                ),
-                e => rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e.to_string()),
-            },
-        }
+    pub fn get_balance_from_state<StateDB>(state: StateDB, address: Address) -> RpcResult<U256>
+    where
+        StateDB: DatabaseRef,
+    {
+        let account = state
+            .basic_ref(address.0.into())
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        let balance = account.map(|a| a.balance);
+        Ok(balance.unwrap_or_default().into())
     }
+}
 
-    pub fn haltreason_to_debank_code(
-        #[cfg(not(feature = "optimism"))] reason: &HaltReason,
-        #[cfg(feature = "optimism")] reason: &op_revm::result::OpHaltReason,
-    ) -> DebankErrorCode {
-        match reason {
-            #[cfg(not(feature = "optimism"))]
-            HaltReason::OutOfFunds => DebankErrorCode::BalanceExhausted,
-            #[cfg(not(feature = "optimism"))]
-            HaltReason::NonceOverflow => DebankErrorCode::NonceError,
-            #[cfg(not(feature = "optimism"))]
-            HaltReason::OutOfGas(_) => DebankErrorCode::GasExhausted,
-            #[cfg(feature = "optimism")]
-            op_revm::result::OpHaltReason::Base(HaltReason::OutOfFunds) => {
-                DebankErrorCode::BalanceExhausted
-            }
-            #[cfg(feature = "optimism")]
-            op_revm::result::OpHaltReason::Base(HaltReason::NonceOverflow) => {
-                DebankErrorCode::NonceError
-            }
-            #[cfg(feature = "optimism")]
-            op_revm::result::OpHaltReason::Base(HaltReason::OutOfGas(_)) => {
-                DebankErrorCode::GasExhausted
-            }
-            _ => DebankErrorCode::EvmFailed,
-        }
-    }
-
+impl<C> Api<C>
+where
+    C: ApiCore,
+    C::DB: EvmStorageRead + BlockIndex,
+    C::Tx: TransactionTrait + TxSetter + Clone,
+    C::TransactionError: ToJsonRpcError + GetTransactionError,
+    C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+{
     fn should_try_historical(&self, block_ctx: &Option<DebankBlockContext>) -> Option<&HttpClient> {
-        let client = self.historical_client.as_ref()?;
+        let client = self.inner.historical_client()?;
 
         if let Some(ctx) = block_ctx {
             match &ctx.block_id {
                 BlockId::Hash(_) => Some(client),
                 BlockId::Number(BlockNumberOrTag::Number(num)) => {
-                    if self.historical_height.map_or(false, |h| *num < h) {
+                    if self.inner.historical_height().map_or(false, |h| *num < h) {
                         Some(client)
                     } else {
                         None
@@ -167,39 +80,14 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             None
         }
     }
-
-    fn combine_errors(
-        &self,
-        local_err: jsonrpsee::types::ErrorObjectOwned,
-        historical_err: jsonrpsee::core::ClientError,
-    ) -> jsonrpsee::types::ErrorObjectOwned {
-        rpc_error_with_code(
-            local_err.code(),
-            format!(
-                "Local error: {}; Historical RPC error: {}",
-                local_err.message(),
-                historical_err
-            ),
-        )
-    }
-
-    fn client_error_to_rpc_error(
-        &self,
-        client_error: jsonrpsee::core::ClientError,
-    ) -> jsonrpsee::types::ErrorObjectOwned {
-        rpc_error_with_code(
-            DebankErrorCode::InternalError as i32,
-            format!("Historical RPC error: {}", client_error),
-        )
-    }
-
     fn debank_get_state_by_ctx_impl(
         &self,
         block_ctx: Option<DebankBlockContext>,
-    ) -> RpcResult<<DB as EvmStorageRead>::StateDB> {
+    ) -> RpcResult<<C::DB as EvmStorageRead>::StateDB> {
         if block_ctx.is_none() {
             let state = self
-                .db
+                .inner
+                .db()
                 .state_at(BlockId::Number(BlockNumberOrTag::Latest))
                 .map_err(|e| {
                     rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -212,19 +100,20 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state;
 
         if block_ctx.block_type == BlockType::Equals {
-            state = self.db.state_at(block_ctx.block_id).map_err(|e| {
+            state = self.inner.db().state_at(block_ctx.block_id).map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
         } else {
             state = self
-                .db
+                .inner
+                .db()
                 .state_at(BlockId::Number(BlockNumberOrTag::Latest))
                 .map_err(|e| {
                     rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
                 })?;
         }
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block {:?} is invalid", block_ctx.block_id),
@@ -242,7 +131,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn debank_get_latest_block_impl(&self) -> RpcResult<DebankBlock> {
         let block = self
-            .db
+            .inner
+            .db()
             .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Latest))
             .map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -260,13 +150,14 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             )
         })?;
         let block = self
-            .db
+            .inner
+            .db()
             .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Number(number)))
             .map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
         if block.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block height {:?} is invalid", height),
@@ -285,13 +176,14 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn debank_get_block_by_id_impl(&self, id: H256) -> RpcResult<DebankBlock> {
         let block = self
-            .db
+            .inner
+            .db()
             .get_block_by_id_arc(BlockId::Hash(id.into()))
             .map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
         if block.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block id {:?} is invalid", id),
@@ -315,8 +207,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -333,8 +225,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -352,8 +244,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -375,8 +267,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -395,168 +287,16 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
     }
 
-    async fn contract_multi_call_impl(
-        &self,
-        requests: Vec<CallRequest>,
-        block_ctx: Option<DebankBlockContext>,
-        block_overrides: Option<BlockOverrides>,
-        state_override: Option<StateOverride>,
-        fast_fail: Option<bool>,
-        _use_parallel: Option<bool>,
-        _disable_cache: Option<bool>,
-    ) -> RpcResult<DebankMultiCallResp> {
-        let cfg = self.cfg.clone();
-
-        let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let block = state.block_info_arc().map_err(|e| {
-            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-        })?;
-
-        let (tx, rx) = oneshot::channel();
-        let using_ovm = self.ovm_address.clone();
-        let normalize_state_key = self.normalize_state_key;
-        tokio::task::spawn_blocking(move || {
-            let rsp = Self::debank_multi_call_from_state(
-                requests,
-                cfg,
-                state,
-                block,
-                block_overrides,
-                state_override,
-                fast_fail.unwrap_or_default(),
-                using_ovm,
-                normalize_state_key,
-            );
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-
-        let rsp = timeout(self.time_out, rx)
-            .await
-            .map_err(|_| {
-                rpc_error_with_code(
-                    DebankErrorCode::TimeOut as i32,
-                    "MultiCall timed out".to_string(),
-                )
-            })? // 超时错误
-            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?; // 发送失败错误
-
-        rsp
-    }
-
-    fn debank_multi_call_from_state(
-        requests: Vec<CallRequest>,
-        cfg: CfgEnv<SpecId>,
-        state: DB::StateDB,
-        block: Arc<Block<Transaction>>,
-        block_overrides: Option<BlockOverrides>,
-        state_override: Option<StateOverride>,
-        fast_fail: bool,
-        ovm_address: Option<H256>,
-        normalize_state_key: bool,
-    ) -> RpcResult<DebankMultiCallResp> {
-        let mut stats = DebankMultiCallStats {
-            block_num: block.header.number,
-            block_time: block.header.timestamp,
-            block_hash: block.header.hash,
-            success: true,
-            cache_enabled: false,
-        };
-        // run in sequence
-        let mut results: Vec<DebankSingleCallResult> = vec![];
-        for request in requests {
-            let mut block_env = block_env_from_block(&block);
-            let start = std::time::Instant::now();
-            if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
-                let res = results.last().unwrap().clone();
-                results.push(res);
-                continue;
-            }
-            if let Some(txkind) = request.to {
-                if let Some(address) = txkind.to() {
-                    if *address
-                        == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
-                    {
-                        let mut res = Self::debank_eth_erc20_handle(
-                            &block.header,
-                            state.clone(),
-                            request,
-                            ovm_address.clone(),
-                            normalize_state_key,
-                        );
-                        if res.code != 0 as i32 {
-                            stats.success = false;
-                        }
-                        res.time_cost = start.elapsed().as_secs_f64();
-                        results.push(res);
-                        continue;
-                    }
-                }
-            }
-            let cfg = cfg.clone();
-            let mut db = CacheDB::new(EvmStorageWrapper {
-                db: state.clone(),
-                ovm_address,
-                normalize_state_key,
-            });
-            let tx = create_txn_env(&block_env, request, &db, &cfg)?;
-            if let Some(overrides) = block_overrides.clone() {
-                super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
-            }
-            if let Some(state_override) = state_override.clone() {
-                super::utils::apply_state_overrides(state_override, &mut db)?;
-            }
-            let mut evm =
-                utils::create_evm_from_state(block_env.clone(), cfg.clone(), db, NoOpInspector {});
-
-            let res = evm.transact(tx).map_err(|e| Self::evm_to_debank_error(e))?;
-            let mut res = match res.result {
-                ExecutionResult::Success {
-                    output, gas_used, ..
-                } => DebankSingleCallResult {
-                    code: 0,
-                    err: "".to_string(),
-                    from_cache: false,
-                    result: output.into_data().0.into(),
-                    gas_used: gas_used as i64,
-                    time_cost: 0.0,
-                },
-                ExecutionResult::Revert {
-                    output, gas_used, ..
-                } => DebankSingleCallResult {
-                    code: DebankErrorCode::EvmRevert as i32,
-                    err: decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string()),
-                    from_cache: false,
-                    result: Bytes::default(),
-                    gas_used: gas_used as i64,
-                    time_cost: 0.0,
-                },
-                ExecutionResult::Halt { reason, gas_used } => DebankSingleCallResult {
-                    code: Self::haltreason_to_debank_code(&reason) as i32,
-                    err: format!("Halted: {:?}", reason),
-                    from_cache: false,
-                    result: Bytes::default(),
-                    gas_used: gas_used as i64,
-                    time_cost: 0.0,
-                },
-            };
-            res.time_cost = start.elapsed().as_secs_f64();
-            if res.code != MultiCallErrorCode::Success as i32 {
-                stats.success = false;
-            }
-            results.push(res);
-        }
-        Ok(DebankMultiCallResp { stats, results })
-    }
-
-    fn debank_eth_erc20_handle(
+    fn debank_eth_erc20_handle<StateDB>(
         block_header: &Header,
-        state: DB::StateDB,
+        state: StateDB,
         request: CallRequest,
         ovm_address: Option<H256>,
         normalize_state_key: bool,
-    ) -> DebankSingleCallResult {
+    ) -> DebankSingleCallResult
+    where
+        StateDB: leafage_evm_storage::StateDB,
+    {
         if let Some(data) = request.input.input() {
             if data.len() < 4 {
                 return DebankSingleCallResult {
@@ -670,37 +410,123 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
     }
 
-    fn block_is_valid_impl(&self, id: H256) -> RpcResult<bool> {
-        let block = self
-            .db
-            .get_block_by_id_arc(BlockId::Hash(id.into()))
-            .map_err(|e| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-            })?;
-        if block.is_none() {
-            if self.is_archive {
-                return Ok(false);
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    "block not found".to_string(),
-                ));
+    fn debank_multi_call_from_state_impl_inner(
+        &self,
+        requests: Vec<CallRequest>,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
+        fast_fail: bool,
+    ) -> RpcResult<DebankMultiCallResp> {
+        let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
+        let block = state.block_info_arc().map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+        let mut stats = DebankMultiCallStats {
+            block_num: block.header.number,
+            block_time: block.header.timestamp,
+            block_hash: block.header.hash,
+            success: true,
+            cache_enabled: false,
+        };
+        // run in sequence
+        let mut results: Vec<DebankSingleCallResult> = vec![];
+        for request in requests {
+            let mut block_env = block_env_from_block(&block);
+            let start = std::time::Instant::now();
+            if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
+                let res = results.last().unwrap().clone();
+                results.push(res);
+                continue;
             }
+            if let Some(txkind) = request.to {
+                if let Some(address) = txkind.to() {
+                    if *address
+                        == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
+                    {
+                        let mut res = Self::debank_eth_erc20_handle(
+                            &block.header,
+                            state.clone(),
+                            request,
+                            self.inner.evm_cfg().ovm_address.clone(),
+                            self.inner.evm_cfg().normalize_state_key,
+                        );
+                        if res.code != 0 as i32 {
+                            stats.success = false;
+                        }
+                        res.time_cost = start.elapsed().as_secs_f64();
+                        results.push(res);
+                        continue;
+                    }
+                }
+            }
+            let mut db = CacheDB::new(EvmStorageWrapper {
+                db: state.clone(),
+                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
+            });
+            if let Some(overrides) = block_overrides.clone() {
+                super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
+            }
+            if let Some(state_override) = state_override.clone() {
+                super::utils::apply_state_overrides(state_override, &mut db)?;
+            }
+            let tx = self.inner.create_txn_env(
+                &block_env,
+                request,
+                &db,
+                self.inner.evm_cfg().cfg.chain_id,
+            )?;
+            let mut res: DebankSingleCallResult = self
+                .inner
+                .transact(&block_env, &db, tx)
+                .map_err(|e| e.to_rpc_error())?
+                .into();
+            res.time_cost = start.elapsed().as_secs_f64();
+            if res.code != 0 {
+                stats.success = false;
+            }
+            results.push(res);
         }
+        Ok(DebankMultiCallResp { stats, results })
+    }
 
-        let block = block.unwrap();
-        let canonical_block = self
-            .db
-            .get_block_by_id(BlockId::Number(BlockNumberOrTag::Number(
-                block.header.number,
-            )))
-            .map_err(|e| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-            })?;
-        if canonical_block.is_none() {
-            return Ok(false);
-        }
-        Ok(block.header.hash == canonical_block.unwrap().header.hash)
+    async fn contract_multi_call_impl(
+        &self,
+        requests: Vec<CallRequest>,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
+        fast_fail: Option<bool>,
+        _use_parallel: Option<bool>,
+        _disable_cache: Option<bool>,
+    ) -> RpcResult<DebankMultiCallResp> {
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let rsp = this.debank_multi_call_from_state_impl_inner(
+                requests,
+                block_ctx,
+                block_overrides,
+                state_override,
+                fast_fail.unwrap_or_default(),
+            );
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send multi_call result: {:?}", e);
+            }
+        });
+
+        let rsp = timeout(self.inner.evm_cfg().time_out, rx)
+            .await
+            .map_err(|_| {
+                rpc_error_with_code(
+                    DebankErrorCode::TimeOut as i32,
+                    "MultiCall timed out".to_string(),
+                )
+            })? // 超时错误
+            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?; // 发送失败错误
+
+        rsp
     }
 
     async fn debank_simulate_transactions_impl(
@@ -709,47 +535,31 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
-        let cfg = self.cfg.clone();
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let rsp =
+                this.debank_simulate_transactions_impl_inner(requests, block_ctx, block_overrides);
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send simulate_transactions result: {:?}", e);
+            }
+        });
+        let rsp = rx
+            .await
+            .map_err(|_| internal_rpc_err("simulate_transactions failed".to_string()))?;
+        rsp
+    }
+
+    fn debank_simulate_transactions_impl_inner(
+        &self,
+        txs: Vec<CallRequest>,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<DebankSimulateResp> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-
-        let (tx, rx) = oneshot::channel();
-        let ovm_address = self.ovm_address.clone();
-        let normalize_state_key = self.normalize_state_key;
-        tokio::task::spawn_blocking(move || {
-            let rsp = Self::debank_call_many_and_trace(
-                requests,
-                cfg,
-                state,
-                block,
-                block_overrides,
-                ovm_address,
-                normalize_state_key,
-            );
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-        let rsp = rx.await.map_err(|_| {
-            rpc_error_with_code(
-                DebankErrorCode::InternalError as i32,
-                "receive simulate rsp failed".to_string(),
-            )
-        })?;
-        rsp
-    }
-
-    fn debank_call_many_and_trace(
-        txs: Vec<CallRequest>,
-        cfg: CfgEnv<SpecId>,
-        state: DB::StateDB,
-        block: Arc<Block<Transaction>>,
-        block_overrides: Option<BlockOverrides>,
-        ovm_address: Option<H256>,
-        normalize_state_key: bool,
-    ) -> RpcResult<DebankSimulateResp> {
         let mut block_env = block_env_from_block(&block);
         let mut stats = DebankSimulateStats {
             block_num: block.header.number,
@@ -759,8 +569,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         };
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
-            ovm_address,
-            normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
         if let Some(overrides) = block_overrides.clone() {
             super::utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
@@ -782,114 +592,62 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     continue;
                 }
             }
-            let tx = create_txn_env(&block_env, tx, &memory_db, &cfg)?;
             let trace_cfg = TracingInspectorConfig::default_parity().set_record_logs(true);
-            let mut inspector = TracingInspector::new(trace_cfg);
-            let mut evm = utils::create_evm_from_state(
-                block_env.clone(),
-                cfg.clone(),
-                &mut memory_db,
-                &mut inspector,
-            );
-
-            let exec_res = evm
-                .inspect_tx_commit(tx)
-                .map_err(|e| Self::evm_to_debank_error(e))?;
-            drop(evm);
-            match exec_res {
-                ExecutionResult::Revert { gas_used, output } => {
-                    let reason =
-                        decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
-                    let pre_res = DebankSingleSimulateResult {
-                        code: DebankErrorCode::EvmRevert as i32,
-                        err: reason,
-                        gas_used,
-                        ..Default::default()
-                    };
-                    stats.success = false;
-                    results.push(pre_res);
-                }
-                ExecutionResult::Halt { reason, gas_used } => {
-                    let code = Self::haltreason_to_debank_code(&reason);
-                    let pre_res = DebankSingleSimulateResult {
-                        code: code as i32,
-                        err: format!("Halted: {:?}", reason),
-                        gas_used,
-                        ..Default::default()
-                    };
-                    stats.success = false;
-                    results.push(pre_res);
-                }
-                ExecutionResult::Success { gas_used, .. } => {
-                    let call_traces = inspector.into_traces();
-
-                    let (traces, events) = build_debank_traces(tx_info.hash.unwrap(), call_traces);
-
-                    let pre_res = DebankSingleSimulateResult {
-                        gas_used,
-                        traces,
-                        events,
-                        ..Default::default()
-                    };
-                    results.push(pre_res);
-                }
+            // let mut inspector = TracingInspector::new(trace_cfg);
+            let tx = self.inner.create_txn_env(
+                &block_env,
+                tx,
+                &memory_db,
+                self.inner.evm_cfg().cfg.chain_id,
+            )?;
+            let (exec_res, (traces, events)) = self
+                .inner
+                .inspect_tx_commit(
+                    &block_env,
+                    &mut memory_db,
+                    trace_cfg,
+                    |inspector| build_debank_traces(tx_info.hash.unwrap(), inspector.into_traces()),
+                    tx,
+                )
+                .map_err(|e| e.to_rpc_error())?;
+            let mut pre_res: DebankSingleSimulateResult = exec_res.into();
+            pre_res.traces = traces;
+            pre_res.events = events;
+            if pre_res.code != 0 {
+                stats.success = false;
+            } else {
+                stats.success = true;
             }
+            results.push(pre_res);
         }
         Ok(DebankSimulateResp { stats, results })
     }
 
-    async fn debank_estimate_gas_impl(
+    fn debank_estimate_gas_inner(
         &self,
-        request: CallRequest,
+        mut request: CallRequest,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
-        let cfg = self.cfg.clone();
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-
-        let (tx, rx) = oneshot::channel();
-        let ovm_address = self.ovm_address.clone();
-        let normalize_state_key = self.normalize_state_key;
-        tokio::task::spawn_blocking(move || {
-            let rsp = Self::debank_estimate_gas_many(
-                request,
-                cfg,
-                state,
-                block,
-                block_overrides,
-                ovm_address,
-                normalize_state_key,
-            );
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
-        rsp
-    }
-
-    fn debank_estimate_gas_many(
-        mut request: CallRequest,
-        cfg: CfgEnv<SpecId>,
-        state: DB::StateDB,
-        block: Arc<Block<Transaction>>,
-        block_overrides: Option<BlockOverrides>,
-        ovm_address: Option<H256>,
-        normalize_state_key: bool,
-    ) -> RpcResult<U256> {
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
+        let mut memory_db = CacheDB::new(EvmStorageWrapper {
+            db: state,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
+        });
+        if let Some(overrides) = block_overrides.clone() {
+            utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
+        }
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
-        let block_env_gas_limit = block.header.gas_limit;
+        let block_env_gas_limit = block_env.gas_limit;
         let mut highest_gas_limit = tx_request_gas_limit
             .map(|tx_gas_limit| {
                 if tx_gas_limit > block_env_gas_limit {
@@ -899,15 +657,12 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 }
             })
             .unwrap_or(block_env_gas_limit);
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address,
-            normalize_state_key,
-        });
-        if let Some(overrides) = block_overrides.clone() {
-            utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
-        }
-        let mut tx = create_txn_env(&block_env, request, &memory_db, &cfg)?;
+        let mut tx = self.inner.create_txn_env(
+            &block_env,
+            request.clone(),
+            &memory_db,
+            self.inner.evm_cfg().cfg.chain_id,
+        )?;
         if tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
@@ -918,24 +673,12 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                         .unwrap_or(true);
                     if no_code_callee {
                         let mut tx = tx.clone();
-                        #[cfg(not(feature = "optimism"))]
-                        {
-                            tx.gas_limit = crate::api_impl::debank::MIN_TRANSACTION_GAS;
-                        }
-                        #[cfg(feature = "optimism")]
-                        {
-                            tx.base.gas_limit = MIN_TRANSACTION_GAS;
-                        }
-                        let mut evm = utils::create_evm_from_state(
-                            block_env.clone(),
-                            cfg.clone(),
-                            memory_db.clone(),
-                            NoOpInspector {},
-                        );
-
-                        let exec_res =
-                            evm.transact(tx).map_err(|e| Self::evm_to_debank_error(e))?;
-                        if exec_res.result.is_success() {
+                        tx.set_gas_limit(MIN_TRANSACTION_GAS);
+                        let exec_res = self
+                            .inner
+                            .transact(&block_env, &memory_db, tx)
+                            .map_err(|e| e.to_rpc_error())?;
+                        if exec_res.is_success() {
                             return Ok(U256::from(MIN_TRANSACTION_GAS));
                         }
                     }
@@ -963,30 +706,17 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 .unwrap();
             highest_gas_limit = highest_gas_limit.min(gas_limit);
         }
+        tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));
 
-        #[cfg(not(feature = "optimism"))]
-        {
-            tx.gas_limit = tx.gas_limit().min(highest_gas_limit);
-        }
-        #[cfg(feature = "optimism")]
-        {
-            tx.base.gas_limit = tx.gas_limit().min(highest_gas_limit);
-        }
-        let mut evm = utils::create_evm_from_state(
-            block_env.clone(),
-            cfg.clone(),
-            memory_db.clone(),
-            NoOpInspector {},
-        );
+        let res = self
+            .inner
+            .transact(&block_env, &memory_db, tx.clone())
+            .map_err(|e| e.to_rpc_error())?;
 
-        let res = evm
-            .transact(tx.clone())
-            .map_err(|e| Self::evm_to_debank_error(e))?;
-
-        let gas_refund = match res.result {
+        let gas_refund = match res {
             ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
             ExecutionResult::Halt { reason, .. } => {
-                let code = Self::haltreason_to_debank_code(&reason);
+                let code = DebankErrorCode::from(reason.clone());
                 return Err(rpc_error_with_code(
                     code as i32,
                     format!("Halted: {:?}", reason),
@@ -1002,71 +732,20 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         };
 
         highest_gas_limit = tx.gas_limit();
-        let mut gas_used = res.result.gas_used();
+        let mut gas_used = res.gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
 
         let optimistic_gas_limit = (gas_used + gas_refund + CALL_STIPEND_GAS) * 64 / 63;
 
-        fn update_estimated_gas_range(
-            #[cfg(not(feature = "optimism"))] result: &ExecutionResult<HaltReason>,
-            #[cfg(feature = "optimism")] result: &ExecutionResult<op_revm::result::OpHaltReason>,
-            tx_gas_limit: u64,
-            highest_gas_limit: &mut u64,
-            lowest_gas_limit: &mut u64,
-        ) -> RpcResult<()> {
-            match result {
-                ExecutionResult::Success { .. } => {
-                    // Cap the highest gas limit with the succeeding gas limit.
-                    *highest_gas_limit = tx_gas_limit;
-                }
-                ExecutionResult::Revert { .. } => {
-                    // Increase the lowest gas limit.
-                    *lowest_gas_limit = tx_gas_limit;
-                }
-                ExecutionResult::Halt { reason, .. } => match reason {
-                    #[cfg(not(feature = "optimism"))]
-                    HaltReason::OutOfGas(_) | HaltReason::InvalidFEOpcode => {
-                        *lowest_gas_limit = tx_gas_limit;
-                    }
-                    #[cfg(feature = "optimism")]
-                    op_revm::result::OpHaltReason::Base(HaltReason::OutOfGas(_))
-                    | op_revm::result::OpHaltReason::Base(HaltReason::InvalidFEOpcode) => {
-                        *lowest_gas_limit = tx_gas_limit;
-                    }
-                    err => {
-                        return Err(rpc_error_with_code(
-                            DebankErrorCode::InternalError as i32,
-                            format!("Halted: {:?}", err),
-                        ))
-                    }
-                },
-            };
-
-            Ok(())
-        }
-
         if optimistic_gas_limit < highest_gas_limit {
-            #[cfg(not(feature = "optimism"))]
-            {
-                tx.gas_limit = optimistic_gas_limit;
-            }
-            #[cfg(feature = "optimism")]
-            {
-                tx.base.gas_limit = optimistic_gas_limit;
-            }
-            let mut evm = utils::create_evm_from_state(
-                block_env.clone(),
-                cfg.clone(),
-                memory_db.clone(),
-                NoOpInspector {},
-            );
-
-            let res = evm
-                .transact(tx.clone())
-                .map_err(|e| Self::evm_to_debank_error(e))?;
-            gas_used = res.result.gas_used();
+            tx.set_gas_limit(optimistic_gas_limit);
+            let exec_res = self
+                .inner
+                .transact(&block_env, &memory_db, tx.clone())
+                .map_err(|e| e.to_rpc_error())?;
+            gas_used = exec_res.gas_used();
             update_estimated_gas_range(
-                &res.result,
+                &res,
                 optimistic_gas_limit,
                 &mut highest_gas_limit,
                 &mut lowest_gas_limit,
@@ -1086,75 +765,37 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                 break;
             };
 
-            #[cfg(not(feature = "optimism"))]
-            {
-                tx.gas_limit = mid_gas_limit;
-            }
-            #[cfg(feature = "optimism")]
-            {
-                tx.base.gas_limit = mid_gas_limit;
-            }
+            tx.set_gas_limit(mid_gas_limit);
 
-            let mut evm = utils::create_evm_from_state(
-                block_env.clone(),
-                cfg.clone(),
-                memory_db.clone(),
-                NoOpInspector {},
-            );
-            let res = evm.transact(tx.clone());
+            let res = self.inner.transact(&block_env, &memory_db, tx.clone());
 
             match res {
-                Err(EVMError::Transaction(invaild_tx_err)) => match invaild_tx_err {
-                    #[cfg(not(feature = "optimism"))]
-                    InvalidTransaction::CallerGasLimitMoreThanBlock => {
-                        highest_gas_limit = mid_gas_limit;
-                    }
-                    #[cfg(not(feature = "optimism"))]
-                    InvalidTransaction::CallGasCostMoreThanGasLimit {
-                        initial_gas: _initial_gas,
-                        gas_limit: _gas_limit,
-                    } => {
-                        lowest_gas_limit = mid_gas_limit;
-                    }
-                    #[cfg(feature = "optimism")]
-                    OpTransactionError::Base(InvalidTransaction::CallerGasLimitMoreThanBlock) => {
-                        highest_gas_limit = mid_gas_limit;
-                    }
-                    #[cfg(feature = "optimism")]
-                    OpTransactionError::Base(InvalidTransaction::CallGasCostMoreThanGasLimit {
-                        initial_gas: _initial_gas,
-                        gas_limit: _gas_limit,
-                    }) => {
-                        lowest_gas_limit = mid_gas_limit;
-                    }
-                    e => {
-                        return Err(rpc_error_with_code(
-                            DebankErrorCode::EvmFailed as i32,
-                            format!("Invalid transaction: {:?}", e),
-                        ))
-                    }
-                },
-                Err(EVMError::Database(e)) => {
-                    return Err(rpc_error_with_code(
-                        DebankErrorCode::DataBaseFailed as i32,
-                        e.to_string(),
-                    ))
-                }
-                Err(EVMError::Header(e)) => {
-                    return Err(rpc_error_with_code(
-                        DebankErrorCode::InvalidParams as i32,
-                        e.to_string(),
-                    ))
-                }
                 Err(e) => {
-                    return Err(rpc_error_with_code(
-                        DebankErrorCode::InternalError as i32,
-                        e.to_string(),
-                    ))
+                    if let Some(invaild_tx_err) = e.get_transaction_error() {
+                        match invaild_tx_err {
+                            InvalidTransaction::CallerGasLimitMoreThanBlock => {
+                                highest_gas_limit = mid_gas_limit;
+                            }
+                            InvalidTransaction::CallGasCostMoreThanGasLimit {
+                                initial_gas: _initial_gas,
+                                gas_limit: _gas_limit,
+                            } => {
+                                lowest_gas_limit = mid_gas_limit;
+                            }
+                            e => {
+                                return Err(rpc_error_with_code(
+                                    DebankErrorCode::EvmFailed as i32,
+                                    format!("Invalid transaction: {:?}", e),
+                                ))
+                            }
+                        }
+                    } else {
+                        return Err(e.to_rpc_error());
+                    }
                 }
                 Ok(res) => {
                     update_estimated_gas_range(
-                        &res.result,
+                        &res,
                         mid_gas_limit,
                         &mut highest_gas_limit,
                         &mut lowest_gas_limit,
@@ -1166,10 +807,130 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         Ok(U256::from(highest_gas_limit))
     }
+
+    async fn debank_estimate_gas_impl(
+        &self,
+        request: CallRequest,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<U256> {
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let rsp = this.debank_estimate_gas_inner(request, block_ctx, block_overrides);
+            if let Err(e) = tx.send(rsp) {
+                error!("Failed to send multi_call result: {:?}", e);
+            }
+        });
+
+        let rsp = rx
+            .await
+            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
+        rsp
+    }
+
+    fn block_is_valid_impl(&self, id: H256) -> RpcResult<bool> {
+        let block = self
+            .inner
+            .db()
+            .get_block_by_id_arc(BlockId::Hash(id.into()))
+            .map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+            })?;
+        if block.is_none() {
+            if self.inner.evm_cfg().is_archive {
+                return Ok(false);
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    "block not found".to_string(),
+                ));
+            }
+        }
+
+        let block = block.unwrap();
+        let canonical_block = self
+            .inner
+            .db()
+            .get_block_by_id(BlockId::Number(BlockNumberOrTag::Number(
+                block.header.number,
+            )))
+            .map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+            })?;
+        if canonical_block.is_none() {
+            return Ok(false);
+        }
+        Ok(block.header.hash == canonical_block.unwrap().header.hash)
+    }
+}
+
+#[inline]
+fn update_estimated_gas_range<R: GetHaltReason + Clone>(
+    result: &ExecutionResult<R>,
+    tx_gas_limit: u64,
+    highest_gas_limit: &mut u64,
+    lowest_gas_limit: &mut u64,
+) -> RpcResult<()> {
+    match result {
+        ExecutionResult::Success { .. } => {
+            // Cap the highest gas limit with the succeeding gas limit.
+            *highest_gas_limit = tx_gas_limit;
+        }
+        ExecutionResult::Revert { .. } => {
+            // Increase the lowest gas limit.
+            *lowest_gas_limit = tx_gas_limit;
+        }
+        ExecutionResult::Halt { reason, .. } => {
+            let reason = reason.get_halt_reason();
+            match reason {
+                Some(HaltReason::OutOfGas(_)) | Some(HaltReason::InvalidFEOpcode) => {
+                    *lowest_gas_limit = tx_gas_limit;
+                }
+                Some(err) => {
+                    return Err(rpc_error_with_code(
+                        DebankErrorCode::InternalError as i32,
+                        format!("Halted: {:?}", err),
+                    ))
+                }
+                None => {
+                    return Err(rpc_error_with_code(
+                        DebankErrorCode::InternalError as i32,
+                        format!("Halted: UnKnown"),
+                    ))
+                }
+            }
+        }
+    };
+
+    Ok(())
+}
+
+#[inline]
+fn combine_errors(
+    local_err: jsonrpsee::types::ErrorObjectOwned,
+    historical_err: jsonrpsee::core::ClientError,
+) -> jsonrpsee::types::ErrorObjectOwned {
+    rpc_error_with_code(
+        local_err.code(),
+        format!(
+            "Local error: {}; Historical RPC error: {}",
+            local_err.message(),
+            historical_err
+        ),
+    )
 }
 
 #[async_trait::async_trait]
-impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer for ApiImpl<DB> {
+impl<C> DebankApiServer for Api<C>
+where
+    C: ApiCore,
+    C::DB: EvmStorageRead + BlockIndex,
+    C::Tx: TransactionTrait + TxSetter + Clone,
+    C::TransactionError: ToJsonRpcError + GetTransactionError,
+    C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+{
     async fn get_address_nonce(
         &self,
         address: Address,
@@ -1184,7 +945,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1207,7 +968,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1227,7 +988,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
                     match historical_client.get_address_code(address, block_ctx).await {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1251,7 +1012,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1298,7 +1059,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1329,7 +1090,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1350,14 +1111,22 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
             )
         })?;
 
-        if self.historical_client.is_some()
-            && self.historical_height.map_or(false, |h| block_number < h)
+        if self.inner.historical_client().is_some()
+            && self
+                .inner
+                .historical_height()
+                .map_or(false, |h| block_number < h)
         {
-            if let Some(historical_client) = &self.historical_client {
+            if let Some(historical_client) = self.inner.historical_client() {
                 return historical_client
                     .get_block_by_height(height)
                     .await
-                    .map_err(|e| self.client_error_to_rpc_error(e));
+                    .map_err(|e| {
+                        rpc_error_with_code(
+                            DebankErrorCode::InternalError as i32,
+                            format!("Historical RPC error: {}", e),
+                        )
+                    });
             }
         }
 
@@ -1368,10 +1137,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
         match self.debank_get_block_by_id_impl(id) {
             Ok(result) => Ok(result),
             Err(err) => {
-                if let Some(historical_client) = &self.historical_client {
+                if let Some(historical_client) = self.inner.historical_client() {
                     match historical_client.get_block_by_id(id).await {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1384,10 +1153,10 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
         match self.block_is_valid_impl(id) {
             Ok(result) => Ok(result),
             Err(err) => {
-                if let Some(historical_client) = &self.historical_client {
+                if let Some(historical_client) = self.inner.historical_client() {
                     match historical_client.block_is_valid(id).await {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1414,7 +1183,7 @@ impl<DB: EvmStorageRead + BlockIndex + Send + Sync + 'static> DebankApiServer fo
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(self.combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(combine_errors(err, historical_err)),
                     }
                 } else {
                     Err(err)

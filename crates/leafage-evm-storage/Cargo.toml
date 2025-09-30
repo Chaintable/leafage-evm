@@ -28,6 +28,5 @@ metrics.workspace = true
 metrics-derive.workspace = true
 
 [features]
-default = []
+default = ["with-rocksdb"]
 with-rocksdb = ["rocksdb"]
-optimism = ["leafage-evm-types/optimism"]

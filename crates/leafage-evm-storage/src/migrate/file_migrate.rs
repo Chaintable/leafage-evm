@@ -1,7 +1,7 @@
 use crate::db::StateDBWrite;
 use alloy_rlp::Decodable;
 use alloy_rlp_derive::RlpDecodable;
-use leafage_evm_types::{Block, Bytes, NewAccount, Transaction, H256, U256};
+use leafage_evm_types::{Block, Bytes, NewAccount, H256, U256};
 use std::fs::DirEntry;
 use std::path::PathBuf;
 use std::sync::{
@@ -75,7 +75,7 @@ fn bytes_to_storages(mut buf: &[u8]) -> Result<Vec<(H256, H256, U256)>, std::io:
     Ok(storages)
 }
 
-async fn read_file_to_block_info(entry: DirEntry) -> Result<Block<Transaction>, std::io::Error> {
+async fn read_file_to_block_info(entry: DirEntry) -> Result<Block<H256>, std::io::Error> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(entry.path()).await?;
     let mut buf = Vec::new();
@@ -83,7 +83,7 @@ async fn read_file_to_block_info(entry: DirEntry) -> Result<Block<Transaction>, 
     bytes_to_block_info(&buf)
 }
 
-fn bytes_to_block_info(buf: &[u8]) -> Result<Block<Transaction>, std::io::Error> {
+fn bytes_to_block_info(buf: &[u8]) -> Result<Block<H256>, std::io::Error> {
     let block_info = serde_json::from_slice(buf).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,

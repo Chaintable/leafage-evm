@@ -1,39 +1,43 @@
-use super::{utils, ApiImpl};
 use crate::api::EthApiServer;
-use crate::api_impl::utils::create_txn_env;
-use crate::error::{
-    internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code, DebankErrorCode,
+use crate::api_impl::core::{
+    Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
+use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId,
-    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, Header, JsonStorageKey,
-    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, Transaction, H256,
-    KECCAK256_EMPTY, U256,
+    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
+    BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, DebankErrorCode, Header, JsonStorageKey,
+    MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, H256, KECCAK256_EMPTY,
+    U256,
 };
-use leafage_evm_types::{CfgEnv, SpecId};
 use revm::context::result::ExecutionResult;
+use revm::context::Transaction as TransactionTrait;
 use revm::database::{CacheDB, DatabaseRef};
-use revm::inspector::NoOpInspector;
-use revm::ExecuteEvm;
 use serde_json::Value;
 use std::error::Error;
 use std::str::FromStr;
-use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
+impl<C> Api<C>
+where
+    C: ApiCore,
+    C::DB: EvmStorageRead + BlockIndex,
+    C::Tx: TransactionTrait + TxSetter + Clone,
+    C::TransactionError: ToJsonRpcError + GetTransactionError,
+    C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+{
     async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_id),
@@ -65,13 +69,13 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         state_override: Option<StateOverride>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<Bytes> {
-        let cfg = self.cfg.clone();
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_id),
@@ -90,21 +94,27 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         let mut block_env = block_env_from_block(&block);
         let mut db = CacheDB::new(EvmStorageWrapper {
             db: state.clone(),
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        let tx = create_txn_env(&block_env, request, &db, &cfg)?;
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
         }
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
-        let mut evm = utils::create_evm_from_state(block_env, cfg, db, NoOpInspector {});
-        let res = evm
-            .transact(tx)
-            .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
-        match res.result {
+        let tx = self.inner.create_txn_env(
+            &block_env,
+            request,
+            &db,
+            self.inner.evm_cfg().cfg.chain_id,
+        )?;
+        let res = self
+            .inner
+            .transact(&block_env, &db, tx)
+            .map_err(|e| e.to_rpc_error())?
+            .into();
+        match res {
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
             ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
                 "Reverted: {:?}",
@@ -238,47 +248,13 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         requests: Vec<CallRequest>,
         block_id: BlockId,
         fast_fail: Option<bool>,
-        _use_parallel: Option<bool>,
-        _disable_cache: Option<bool>,
+        _: Option<bool>,
+        _: Option<bool>,
     ) -> RpcResult<MultiCallResp> {
-        let cfg = self.cfg.clone();
-        let state = self
-            .db
-            .state_at(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
-        let state = state.unwrap();
-        let block = state
-            .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-
         let (tx, rx) = oneshot::channel();
-        let ovm_address = self.ovm_address.clone();
-        let normalize_state_key = self.normalize_state_key;
+        let this = self.clone();
         tokio::task::spawn_blocking(move || {
-            let rsp = Self::multi_call_from_state(
-                requests,
-                cfg,
-                EvmStorageWrapper {
-                    db: state,
-                    ovm_address,
-                    normalize_state_key,
-                },
-                block,
-                fast_fail.unwrap_or_default(),
-            );
+            let rsp = this.multi_call_impl_inner(requests, block_id, fast_fail.unwrap_or_default());
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
             }
@@ -289,13 +265,29 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         rsp
     }
 
-    fn multi_call_from_state(
+    fn multi_call_impl_inner(
+        &self,
         requests: Vec<CallRequest>,
-        cfg: CfgEnv<SpecId>,
-        state: EvmStorageWrapper<<DB as EvmStorageRead>::StateDB>,
-        block: Arc<Block<Transaction>>,
+        block_id: BlockId,
         fast_fail: bool,
     ) -> RpcResult<MultiCallResp> {
+        let state = self
+            .inner
+            .db()
+            .state_at(block_id)
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        if state.is_none() {
+            return Err(invalid_params_rpc_err("Block not found".to_string()));
+        }
+        let state = state.unwrap();
+        let block = state
+            .block_info_arc()
+            .map_err(|e| internal_rpc_err(e.to_string()))?;
+        let state = EvmStorageWrapper {
+            db: state.clone(),
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
+        };
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
             block_num: block.header.number,
@@ -332,47 +324,18 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
                     }
                 }
             }
-            let tx = create_txn_env(&block_env, request, &state, &cfg)?;
-            let mut evm = utils::create_evm_from_state(
-                block_env.clone(),
-                cfg.clone(),
+            let tx = self.inner.create_txn_env(
+                &block_env,
+                request,
                 state.clone(),
-                NoOpInspector {},
-            );
+                self.inner.evm_cfg().cfg.chain_id,
+            )?;
 
-            let res = evm
-                .transact(tx)
-                .map_err(|e| internal_rpc_err(format!("{:?}", e)))?;
-            let mut res = match res.result {
-                ExecutionResult::Success {
-                    output, gas_used, ..
-                } => SingleCallResult {
-                    code: MultiCallErrorCode::Success as i32,
-                    err: "".to_string(),
-                    from_cache: false,
-                    result: output.into_data().0.into(),
-                    gas_used: gas_used as i64,
-                    time_cost: 0.0,
-                },
-                ExecutionResult::Revert {
-                    output, gas_used, ..
-                } => SingleCallResult {
-                    code: MultiCallErrorCode::EVMReverted as i32,
-                    err: decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string()),
-                    from_cache: false,
-                    result: Bytes::default(),
-                    gas_used: gas_used as i64,
-                    time_cost: 0.0,
-                },
-                ExecutionResult::Halt { reason, gas_used } => SingleCallResult {
-                    code: MultiCallErrorCode::EVMCancelled as i32,
-                    err: format!("Halted: {:?}", reason),
-                    from_cache: false,
-                    result: Bytes::default(),
-                    gas_used: gas_used as i64,
-                    time_cost: 0.0,
-                },
-            };
+            let mut res: SingleCallResult = self
+                .inner
+                .transact(&block_env, state.clone(), tx)
+                .map_err(|e| e.to_rpc_error())?
+                .into();
             res.time_cost = start.elapsed().as_secs_f64();
             if res.code != MultiCallErrorCode::Success as i32 {
                 stats.success = false;
@@ -386,7 +349,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
 
     fn block_number_impl(&self) -> RpcResult<U256> {
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(BlockId::Number(BlockNumberOrTag::Latest))
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
@@ -400,12 +364,13 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
     }
 
     fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
-        let state = self
-            .db
+        let state: Option<_> = self
+            .inner
+            .db()
             .state_at(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_id),
@@ -420,33 +385,22 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         Self::get_balance_from_state(
             EvmStorageWrapper {
                 db: state.unwrap(),
-                ovm_address: self.ovm_address.clone(),
-                normalize_state_key: self.normalize_state_key,
+                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
             },
             address,
         )
         .map_err(|e| internal_rpc_err(e.to_string()))
     }
 
-    pub fn get_balance_from_state<StateDB>(state: StateDB, address: Address) -> RpcResult<U256>
-    where
-        StateDB: DatabaseRef,
-        StateDB::Error: Error,
-    {
-        let account = state
-            .basic_ref(address.0.into())
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        let balance = account.map(|a| a.balance);
-        Ok(balance.unwrap_or_default().into())
-    }
-
-    fn get_block_by_id_impl(&self, block_id: BlockId, full: bool) -> RpcResult<Option<Value>> {
+    fn get_block_by_id_impl(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
         let block = self
-            .db
+            .inner
+            .db()
             .get_block_by_id_arc(block_id)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if block.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_id),
@@ -459,23 +413,18 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
             }
         }
         let block = block.unwrap();
-        let value = if !full {
-            let mut block: Block<Transaction> = block.as_ref().clone().into();
-            block.transactions.convert_to_hashes();
-            serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
-        } else {
-            serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?
-        };
+        let value = serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?;
         Ok(Some(value))
     }
 
     fn get_code_impl(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(block_number)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_number),
@@ -489,8 +438,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
@@ -516,12 +465,13 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         block_number: BlockId,
     ) -> RpcResult<H256> {
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(block_number)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
 
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_number),
@@ -535,8 +485,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
@@ -556,11 +506,12 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         block_number: BlockId,
     ) -> RpcResult<U256> {
         let state = self
-            .db
+            .inner
+            .db()
             .state_at(block_number)
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         if state.is_none() {
-            if self.is_archive {
+            if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
                     format!("block block_id {:?} is invalid", block_number),
@@ -574,8 +525,8 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
         }
         let state = EvmStorageWrapper {
             db: state.unwrap(),
-            ovm_address: self.ovm_address.clone(),
-            normalize_state_key: self.normalize_state_key,
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
@@ -585,14 +536,18 @@ impl<DB: EvmStorageRead + BlockIndex> ApiImpl<DB> {
     }
 
     fn chain_id_impl(&self) -> RpcResult<U256> {
-        Ok(U256::from(self.cfg.chain_id))
+        Ok(U256::from(self.inner.evm_cfg().cfg.chain_id))
     }
 }
 
 #[async_trait::async_trait]
-impl<DB> EthApiServer for ApiImpl<DB>
+impl<C> EthApiServer for Api<C>
 where
-    DB: EvmStorageRead + BlockIndex + Send + Sync + 'static,
+    C: ApiCore,
+    C::DB: EvmStorageRead + BlockIndex,
+    C::Tx: TransactionTrait + TxSetter + Clone,
+    C::TransactionError: ToJsonRpcError + GetTransactionError,
+    C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
 {
     async fn call(
         &self,

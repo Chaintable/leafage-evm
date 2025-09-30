@@ -1,6 +1,6 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::snapshot::error::Error;
-use leafage_evm_types::{AccountInfo, Block, BlockStorageDiff, Bytecode, Transaction, H256, U256};
+use leafage_evm_types::{AccountInfo, Block, BlockStorageDiff, Bytecode, H256, U256};
 use quick_cache::sync::Cache;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -165,7 +165,7 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
 /// [`DiffLayer`] is the top layer of the linked list.
 /// It stores the diff of the EVM.
 pub struct DiffLayer<DB> {
-    pub block_info: Arc<Block<Transaction>>,
+    pub block_info: Arc<Block<H256>>,
     pub block_diff: Arc<BlockStorageDiff>,
     pub accounts: HashMap<H256, Option<AccountInfo>>,
     pub storage: HashMap<(H256, H256), U256>,
@@ -173,33 +173,23 @@ pub struct DiffLayer<DB> {
     pub next: RwLock<Arc<LinkedDiffLayer<DB>>>,
 }
 
-impl<DB>
-    From<(
-        Block<Transaction>,
-        BlockStorageDiff,
-        Arc<LinkedDiffLayer<DB>>,
-    )> for DiffLayer<DB>
-{
+impl<DB> From<(Block<H256>, BlockStorageDiff, Arc<LinkedDiffLayer<DB>>)> for DiffLayer<DB> {
     fn from(
-        (block_info, block_diff, db): (
-            Block<Transaction>,
-            BlockStorageDiff,
-            Arc<LinkedDiffLayer<DB>>,
-        ),
+        (block_info, block_diff, db): (Block<H256>, BlockStorageDiff, Arc<LinkedDiffLayer<DB>>),
     ) -> Self {
         Self::new(block_info, block_diff, db)
     }
 }
 
-impl<DB> Into<(Block<Transaction>, BlockStorageDiff)> for &DiffLayer<DB> {
-    fn into(self) -> (Block<Transaction>, BlockStorageDiff) {
+impl<DB> Into<(Block<H256>, BlockStorageDiff)> for &DiffLayer<DB> {
+    fn into(self) -> (Block<H256>, BlockStorageDiff) {
         self.storage_diff()
     }
 }
 
 impl<DB> DiffLayer<DB> {
     pub fn new(
-        block_info: Block<Transaction>,
+        block_info: Block<H256>,
         block_diff: BlockStorageDiff,
         next: Arc<LinkedDiffLayer<DB>>,
     ) -> Self {
@@ -235,7 +225,7 @@ impl<DB> DiffLayer<DB> {
         }
     }
 
-    fn storage_diff(&self) -> (Block<Transaction>, BlockStorageDiff) {
+    fn storage_diff(&self) -> (Block<H256>, BlockStorageDiff) {
         (
             self.block_info.as_ref().clone(),
             self.block_diff.as_ref().clone(),
@@ -330,7 +320,7 @@ impl<DB: StateDB> StateDB for LinkedDiffLayer<DB> {
 impl<DB: BlockContext> BlockContext for LinkedDiffLayer<DB> {
     type Error = Error<DB::Error>;
 
-    fn block_info_arc(&self) -> Result<Arc<Block<Transaction>>, Self::Error> {
+    fn block_info_arc(&self) -> Result<Arc<Block<H256>>, Self::Error> {
         match self {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {

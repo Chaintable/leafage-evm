@@ -1,11 +1,13 @@
 mod api;
-pub use api::{EthApiClient, EthApiServer, TraceApiClient, TraceApiServer, DebankApiClient, DebankApiServer};
+pub use api::{
+    DebankApiClient, DebankApiServer, EthApiClient, EthApiServer, TraceApiClient, TraceApiServer,
+};
 
 mod error;
 
 mod api_impl;
-pub use api_impl::ApiBuilder;
 #[cfg(target_os = "linux")]
 pub use api_impl::InterceptorConfig;
+pub use api_impl::{ApiBuilder, MultiChainCfgEnv};
 
 mod metrics;

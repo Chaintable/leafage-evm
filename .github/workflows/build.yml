@@ -39,7 +39,6 @@ jobs:
         id: meta
         run: |
           echo ::set-output name=tags::${REGISTRY}/leafage-evm-x:${{ matrix.arch }}-${REVISION}
-          echo ::set-output name=optags::${REGISTRY}/leafage-evm-op-x:${{ matrix.arch }}-${REVISION}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -57,17 +56,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           provenance: false
-
-      - name: Build op Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          file: Dockerfile
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.optags }}
-          provenance: false
-          build-args: |
-            features=optimism
           
       - name: comment PR
         uses: unsplash/comment-on-pr@master
