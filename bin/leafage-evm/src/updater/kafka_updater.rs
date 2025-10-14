@@ -332,7 +332,7 @@ where
         Ok(())
     }
 
-    async fn get_latest_offset(&self) -> Result<i64> {
+    async fn get_offset(&self) -> Result<(i64, i64)> {
         let (low, high) = self.consumer.fetch_watermarks(
             &self.kafka_s3_cfg.topic,
             self.kafka_s3_cfg.partition,
@@ -341,25 +341,34 @@ where
         if low == high {
             return Err(anyhow::anyhow!("No messages in the topic"));
         }
-        return Ok(high - 1);
+        return Ok((low, high - 1));
     }
 
     pub fn start(mut self) -> watch::Sender<()> {
         let (tx, mut rx) = watch::channel(());
         tokio::spawn(async move {
             let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
-            if let Some(offset) = offset {
-                self.set_offset(offset).expect("Failed to set offset");
-                info!(target: "updater", "kafka updater start with offset {}", offset);
-            } else {
-                info!(target: "updater", "kafka updater start with no offset, will read from s3");
-                self.read_from_kafka = false;
-                let latest_offset = self
-                    .get_latest_offset()
-                    .await
-                    .expect("Failed to get latest offset");
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
+            let (lowest_offset, latest_offset) = self
+                .get_offset()
+                .await
+                .expect("Failed to get latest offset");
+            match offset {
+                Some(offset) if offset >= lowest_offset => {
+                    self.set_offset(offset).expect("Failed to set offset");
+                    info!(target: "updater", "kafka updater start with offset {}", offset);
+                }
+                Some(offset) => {
+                    info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
+                    self.read_from_kafka = false;
+                    self.set_offset(latest_offset)
+                        .expect("Failed to set latest offset");
+                }
+                None => {
+                    info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
+                    self.read_from_kafka = false;
+                    self.set_offset(latest_offset)
+                        .expect("Failed to set latest offset");
+                }
             }
             let stream = self.consumer.stream();
             let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
