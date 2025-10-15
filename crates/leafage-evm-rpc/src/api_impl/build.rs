@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
-use super::{ApiImpl, InterceptorConfig, InterceptorLayer};
+use super::{InterceptorConfig, InterceptorLayer};
+use super::ApiImpl;
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{Api, MultiChainCfgEnv};
 use crate::metrics::RpcMetric;
