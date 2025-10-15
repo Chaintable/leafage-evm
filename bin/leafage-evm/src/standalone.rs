@@ -205,6 +205,13 @@ pub struct Command {
     #[arg(long, default_value_t = false)]
     normalize_state_key: bool,
 
+    /// The warmup duration for each column family in seconds
+    /// Default: 300
+    ///
+    /// This duration controls how long each column family will be warmed up.
+    #[arg(long, default_value = "300")]
+    warmup_duration: u64,
+
     /// The address for readiness probe server.
     /// Default: ""
     ///
@@ -353,6 +360,7 @@ impl Command {
         let res = match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
+                RocksDBStorage::spawn_warmup_with_mmap(db.clone(), self.db_path.clone(), self.warmup_duration);
                 let tree = Arc::new(SnapshotTree::new(
                     StateDBWrapper(db),
                     SnapshotTreeConfig::new(
@@ -392,6 +400,7 @@ impl Command {
                     self.db_path.as_path(),
                     self.db_cache,
                 ));
+                ArchiveRocksDBStorage::spawn_warmup_with_mmap(db.clone(), self.db_path.clone(), self.warmup_duration);
                 // check if db shoud be initialized
                 initialize_check(
                     db.clone(),

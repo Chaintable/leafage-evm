@@ -22,7 +22,7 @@ use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{Block, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256};
 use revm::database_interface::DBErrorMarker;
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, ReadOptions,
     WriteBatch, DB,
 };
 use serde_json::{from_slice, to_vec};
@@ -30,8 +30,14 @@ use std::env;
 use std::fmt::Display;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::info;
+use std::fs::File;
+use std::io;
+use std::path::PathBuf;
+use memmap2::MmapOptions;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -448,6 +454,150 @@ fn rocksdb_options() -> Options {
     opts
 }
 
+fn preheat_sst_file(file_path: &Path) -> io::Result<()> {
+    let file = File::open(file_path)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+
+    let mut sum = 0u8;
+    for byte in mmap.iter().step_by(4096) {
+        sum ^= *byte;
+    }
+    std::hint::black_box(sum);
+    Ok(())
+}
+
+fn warmup_column_family_mmap(db: &DB, db_path: &Path, cf_name: &str, max_duration: Duration) {
+    let start = std::time::Instant::now();
+
+    if let Some(cf_handle) = db.cf_handle(cf_name) {
+        let sst_by_levels = db.get_column_family_sst_name_by_levels(cf_handle);
+
+        for (level, sst_files) in sst_by_levels {
+            if start.elapsed() >= max_duration {
+                break;
+            }
+
+            let total_files = sst_files.len();
+            if total_files == 0 {
+                println!("列族 {} Level {}: 无文件需要预热", cf_name, level);
+                continue;
+            }
+
+            println!("列族 {} Level {}: {} 个文件待预热", cf_name, level, total_files);
+            let mut preheated_count = 0;
+
+            for sst_filename in sst_files {
+                if start.elapsed() >= max_duration {
+                    break;
+                }
+
+                let file_path = db_path.join(&sst_filename);
+                if file_path.exists() {
+                    if preheat_sst_file(&file_path).is_ok() {
+                        preheated_count += 1;
+                    }
+                } else {
+                    eprintln!("SST文件不存在: {:?}", file_path);
+                }
+            }
+
+            println!("列族 {} Level {}: 预热完成，共 {} 个文件", cf_name, level, preheated_count);
+        }
+    } else {
+        println!("警告: 列族 {} 句柄未找到", cf_name);
+    }
+}
+
+fn warmup_column_family(db: &DB, cf_name: &str, max_duration: Duration) {
+    let start = std::time::Instant::now();
+    if let Some(cf_handle) = db.cf_handle(cf_name) {
+        println!("开始预热列族 {} (最大时长 {:?})", cf_name, max_duration);
+
+        // 简单地遍历整个列族，分两个阶段：元数据、数据
+        let phases = [
+            ("元数据(索引+过滤器)", WarmupPhase::Metadata),
+            ("数据", WarmupPhase::Data),
+        ];
+
+        for (phase_name, phase) in phases.iter() {
+            if start.elapsed() >= max_duration {
+                println!("列族 {} 预热时间到达上限，停止在{}阶段", cf_name, phase_name);
+                return;
+            }
+
+            let phase_start = std::time::Instant::now();
+            println!("  阶段: 预热{}", phase_name);
+
+            let keys_processed = warmup_phase_complete(db, cf_handle, *phase, &start, max_duration);
+
+            println!("  阶段: {}预热完成，耗时 {:?}，遍历 {} 个键",
+                     phase_name, phase_start.elapsed(), keys_processed);
+
+            if start.elapsed() >= max_duration {
+                println!("列族 {} 预热时间到达上限", cf_name);
+                return;
+            }
+        }
+
+        println!("列族 {} 所有阶段预热完成，总耗时 {:?}", cf_name, start.elapsed());
+    } else {
+        println!("警告: 列族 {} 句柄未找到", cf_name);
+    }
+}
+
+fn warmup_phase_complete(
+    db: &DB,
+    cf_handle: &ColumnFamily,
+    phase: WarmupPhase,
+    global_start: &std::time::Instant,
+    max_duration: Duration
+) -> usize {
+    let mut keys_processed = 0;
+    let read_options = rocksdb_read_options();
+    let iter = db.iterator_cf_opt(cf_handle, read_options, IteratorMode::Start);
+
+    let check_interval = match phase {
+        WarmupPhase::Metadata => 2000,
+        WarmupPhase::Data => 5000,
+    };
+
+    for (i, item) in iter.enumerate() {
+        if global_start.elapsed() >= max_duration {
+            break;
+        }
+
+        if let Ok((key, value)) = item {
+            match phase {
+                WarmupPhase::Metadata => {
+                    // 只读键，触发索引块和Bloom过滤器加载
+                    std::hint::black_box(key);
+                }
+                WarmupPhase::Data => {
+                    // 读键值对，触发数据块加载
+                    std::hint::black_box((key, value));
+                }
+            }
+
+            keys_processed += 1;
+
+            // 定期检查超时
+            if i % check_interval == 0 && i > 0 {
+                if global_start.elapsed() >= max_duration {
+                    break;
+                }
+            }
+        }
+    }
+
+    keys_processed
+}
+
+#[derive(Debug, Copy, Clone)]
+enum WarmupPhase {
+    Metadata,
+    Data,
+}
+
 impl DataBase {
     pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
@@ -535,5 +685,26 @@ impl DataBase {
             ),
         ];
         Self { db, _cols: cols }
+    }
+
+    pub fn spawn_warmup_with_mmap(db_arc: Arc<Self>, db_path: PathBuf, warmup_duration_secs: u64) {
+        for cf_name in ["1", "2", "3", "4", "5", "6"] {
+            let db_clone = db_arc.clone();
+            let db_path_clone = db_path.clone();
+            let cf = cf_name.to_string();
+            std::thread::spawn(move || {
+                warmup_column_family_mmap(&db_clone.db, &db_path_clone, &cf, Duration::from_secs(warmup_duration_secs));
+            });
+        }
+    }
+
+    pub fn spawn_warmup(db_arc: Arc<Self>, warmup_duration_secs: u64) {
+        for cf_name in ["1", "2", "3", "4", "5", "6"] {
+            let db_clone = db_arc.clone();
+            let cf = cf_name.to_string();
+            std::thread::spawn(move || {
+                warmup_column_family(&db_clone.db, &cf, Duration::from_secs(warmup_duration_secs));
+            });
+        }
     }
 }
