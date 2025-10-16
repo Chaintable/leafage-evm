@@ -19,7 +19,7 @@
 use crate::db::{BlockRead, StateDBRead, StateDBWrite};
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
-use leafage_evm_types::{Block, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256};
+use leafage_evm_types::{Block, BlockStorageDiff, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256};
 use revm::database_interface::DBErrorMarker;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
@@ -535,5 +535,81 @@ impl DataBase {
             ),
         ];
         Self { db, _cols: cols }
+    }
+
+    pub async fn warmup_from_blocks<F, Fut>(
+        &self,
+        warmup_blocks: usize,
+        get_block_diff: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: Fn(u64) -> Fut,
+        Fut: std::future::Future<Output = Result<BlockStorageDiff, Box<dyn std::error::Error + Send + Sync>>>,
+    {
+        let latest_block_hash = self.read_latest_block_hash()?;
+        if latest_block_hash == H256::ZERO {
+            return Ok(());
+        }
+
+        let latest_block = self.read_block_info(latest_block_hash)?;
+        if latest_block.is_none() {
+            return Ok(());
+        }
+        let latest_block = latest_block.unwrap();
+        let latest_block_number = latest_block.header.number;
+
+        if latest_block_number == 0 {
+            return Ok(());
+        }
+
+        let start_block_number = latest_block_number.saturating_sub(warmup_blocks as u64 - 1);
+
+        let mut accounts_warmed = 0usize;
+        let mut storage_warmed = 0usize;
+        let mut codes_warmed = 0usize;
+
+        for block_number in (start_block_number..=latest_block_number).rev() {
+            match get_block_diff(block_number).await {
+                Ok(block_diff) => {
+                    let mut block_accounts = 0usize;
+                    let mut block_storage = 0usize;
+                    let mut block_codes = 0usize;
+
+                    for account in &block_diff.new_accounts {
+                        let _ = std::hint::black_box(self.read_account(account.address));
+                        block_accounts += 1;
+                    }
+
+                    for address in &block_diff.deleted_accounts {
+                        let _ = std::hint::black_box(self.read_account(*address));
+                        block_accounts += 1;
+                    }
+
+                    for storage_diff in &block_diff.storage_diffs {
+                        for index_value_pair in &storage_diff.diffs {
+                            let _ = std::hint::black_box(self.read_storage(storage_diff.address, index_value_pair.index));
+                            block_storage += 1;
+                        }
+                    }
+
+                    for code in &block_diff.new_codes {
+                        let _ = std::hint::black_box(self.read_code(code.code_hash));
+                        block_codes += 1;
+                    }
+
+                    accounts_warmed += block_accounts;
+                    storage_warmed += block_storage;
+                    codes_warmed += block_codes;
+
+                    info!(target: "warmup", "Block {}: {} accounts, {} storage, {} codes",
+                          block_number, block_accounts, block_storage, block_codes);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        info!(target: "warmup", "Warmup complete: {} accounts, {} storage, {} codes",
+              accounts_warmed, storage_warmed, codes_warmed);
+        Ok(())
     }
 }

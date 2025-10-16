@@ -211,6 +211,11 @@ pub struct Command {
     /// This address is used for the readiness probe server.
     #[arg(long, default_value = "")]
     readiness_addr: String,
+
+    /// The number of blocks to warmup from latest block backwards
+    /// Default: 1000
+    #[arg(long, default_value = "1000")]
+    warmup: usize,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -353,6 +358,47 @@ impl Command {
         let res = match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
+
+                // Warmup database if enabled
+                if self.warmup > 0 {
+                    if let Some(kafka_s3_cfg) = &self.kafka_s3_config {
+                        let rpc_client = if let Some(rpc_url) = &self.rpc_addr {
+                            Some(jsonrpsee::http_client::HttpClientBuilder::default().build(rpc_url)?)
+                        } else {
+                            None
+                        };
+                        let s3_config = aws_config::load_from_env().await;
+                        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+
+                        let get_block_diff = |block_number: u64| {
+                            let rpc_client = rpc_client.clone();
+                            let s3_client = s3_client.clone();
+                            let bucket_name = kafka_s3_cfg.bucket_name.clone();
+                            let outer_bucket_name = kafka_s3_cfg.outer_bucket_name.clone();
+                            let s3_chain_id = kafka_s3_cfg.s3_chain_id.clone();
+                            async move {
+                                match crate::utils::s3_get_block_info_and_diff_by_number(
+                                    &rpc_client,
+                                    &s3_client,
+                                    &bucket_name,
+                                    &outer_bucket_name,
+                                    &s3_chain_id,
+                                    block_number,
+                                )
+                                .await
+                                {
+                                    Ok((_, block_diff)) => Ok(block_diff),
+                                    Err(e) => Err(e.into()),
+                                }
+                            }
+                        };
+
+                        if let Err(e) = db.warmup_from_blocks(self.warmup, get_block_diff).await {
+                            info!(target: "warmup", "Warmup failed: {}", e);
+                        }
+                    }
+                }
+
                 let tree = Arc::new(SnapshotTree::new(
                     StateDBWrapper(db),
                     SnapshotTreeConfig::new(
@@ -400,6 +446,46 @@ impl Command {
                     self.genesis_number,
                 )
                 .await?;
+
+                // Warmup database if enabled
+                if self.warmup > 0 {
+                    if let Some(kafka_s3_cfg) = &self.kafka_s3_config {
+                        let rpc_client = if let Some(rpc_url) = &self.rpc_addr {
+                            Some(jsonrpsee::http_client::HttpClientBuilder::default().build(rpc_url)?)
+                        } else {
+                            None
+                        };
+                        let s3_config = aws_config::load_from_env().await;
+                        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+
+                        let get_block_diff = |block_number: u64| {
+                            let rpc_client = rpc_client.clone();
+                            let s3_client = s3_client.clone();
+                            let bucket_name = kafka_s3_cfg.bucket_name.clone();
+                            let outer_bucket_name = kafka_s3_cfg.outer_bucket_name.clone();
+                            let s3_chain_id = kafka_s3_cfg.s3_chain_id.clone();
+                            async move {
+                                match crate::utils::s3_get_block_info_and_diff_by_number(
+                                    &rpc_client,
+                                    &s3_client,
+                                    &bucket_name,
+                                    &outer_bucket_name,
+                                    &s3_chain_id,
+                                    block_number,
+                                )
+                                .await
+                                {
+                                    Ok((_, block_diff)) => Ok(block_diff),
+                                    Err(e) => Err(e.into()),
+                                }
+                            }
+                        };
+
+                        if let Err(e) = db.warmup_from_blocks(self.warmup, get_block_diff).await {
+                            info!(target: "warmup", "Warmup failed: {}", e);
+                        }
+                    }
+                }
 
                 let tree = Arc::new(ArchiveTree::new(
                     db,

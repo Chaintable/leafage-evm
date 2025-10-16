@@ -29,7 +29,7 @@ use alloy::primitives::B64;
 use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount, H256,
+    Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Bytes, Header, NewAccount, RawHeader, SlimAccount, H256,
     KECCAK256_EMPTY, U256,
 };
 use revm::database_interface::DBErrorMarker;
@@ -291,6 +291,110 @@ impl DataBaseRef {
         Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
         }
+    }
+
+    pub async fn warmup_from_blocks<F, Fut>(
+        &self,
+        warmup_blocks: usize,
+        get_block_diff: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: Fn(u64) -> Fut,
+        Fut: std::future::Future<Output = Result<BlockStorageDiff, Box<dyn std::error::Error + Send + Sync>>>,
+    {
+        let latest_block_hash = self.read_latest_block_hash()?;
+        if latest_block_hash == H256::ZERO {
+            return Ok(());
+        }
+
+        let latest_block = self.read_block_info(latest_block_hash)?;
+        if latest_block.is_none() {
+            return Ok(());
+        }
+        let latest_block = latest_block.unwrap();
+        let latest_block_number = latest_block.header.number;
+
+        if latest_block_number == 0 {
+            return Ok(());
+        }
+
+        let start_block_number = latest_block_number.saturating_sub(warmup_blocks as u64 - 1);
+
+        let mut accounts_warmed = 0usize;
+        let mut storage_warmed = 0usize;
+        let mut codes_warmed = 0usize;
+
+        for block_number in (start_block_number..=latest_block_number).rev() {
+            match get_block_diff(block_number).await {
+                Ok(block_diff) => {
+                    let mut block_accounts = 0usize;
+                    let mut block_storage = 0usize;
+                    let mut block_codes = 0usize;
+
+                    for account in &block_diff.new_accounts {
+                        let address_bytes: [u8; 32] = account.address.into();
+                        let block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
+                        let address_to_account_cf = self.db.cf_handle(StorageTypeColumn::AddressToAccount.to_str()).unwrap();
+                        let _ = std::hint::black_box(self.db.get_pinned_cf_opt(
+                            address_to_account_cf,
+                            [address_bytes.as_ref(), &block_num_bytes].concat(),
+                            &rocksdb_read_options(),
+                        ));
+                        block_accounts += 1;
+                    }
+
+                    for address in &block_diff.deleted_accounts {
+                        let address_bytes: [u8; 32] = (*address).into();
+                        let block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
+                        let address_to_account_cf = self.db.cf_handle(StorageTypeColumn::AddressToAccount.to_str()).unwrap();
+                        let _ = std::hint::black_box(self.db.get_pinned_cf_opt(
+                            address_to_account_cf,
+                            [address_bytes.as_ref(), &block_num_bytes].concat(),
+                            &rocksdb_read_options(),
+                        ));
+                        block_accounts += 1;
+                    }
+
+                    for storage_diff in &block_diff.storage_diffs {
+                        let address_bytes: [u8; 32] = storage_diff.address.into();
+                        let block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
+                        let address_to_storage_cf = self.db.cf_handle(StorageTypeColumn::AddressToStorage.to_str()).unwrap();
+                        for index_value_pair in &storage_diff.diffs {
+                            let key_bytes: [u8; 32] = index_value_pair.index.into();
+                            let _ = std::hint::black_box(self.db.get_pinned_cf_opt(
+                                address_to_storage_cf,
+                                [address_bytes.as_ref(), &key_bytes, &block_num_bytes].concat(),
+                                &rocksdb_read_options(),
+                            ));
+                            block_storage += 1;
+                        }
+                    }
+
+                    for code in &block_diff.new_codes {
+                        let code_hash_bytes: [u8; 32] = code.code_hash.into();
+                        let address_to_code_cf = self.db.cf_handle(StorageTypeColumn::HashToCode.to_str()).unwrap();
+                        let _ = std::hint::black_box(self.db.get_cf_opt(
+                            address_to_code_cf,
+                            code_hash_bytes,
+                            &rocksdb_read_options()
+                        ));
+                        block_codes += 1;
+                    }
+
+                    accounts_warmed += block_accounts;
+                    storage_warmed += block_storage;
+                    codes_warmed += block_codes;
+
+                    info!(target: "warmup", "Block {}: {} accounts, {} storage, {} codes",
+                          block_number, block_accounts, block_storage, block_codes);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        info!(target: "warmup", "Warmup complete: {} accounts, {} storage, {} codes",
+              accounts_warmed, storage_warmed, codes_warmed);
+        Ok(())
     }
 }
 
