@@ -287,6 +287,14 @@ impl DataBaseRef {
                 .unwrap(),
             ),
         ];
+        let storage_ref = db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let ssts = db.get_column_family_sst_name_by_levels(storage_ref);
+        info!(
+            target = "rocksdb",
+            "open rocksdb, address_to_storage sst files: {:?}", ssts
+        );
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
         Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
