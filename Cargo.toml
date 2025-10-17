@@ -76,6 +76,7 @@ op-revm = { version = "9.0.1", features = [
     "optional_block_gas_limit",
 ] }
 revm-inspectors = "0.28"
+revm-precompile = "28.0"
 revm-bytecode = "6.0"
 
 # alloy
@@ -101,6 +102,8 @@ bls_on_arkworks = "0.3.0"
 prost = "0.12.6"
 parity-bytes = "0.1.2"
 secp256k1 = "0.30"
+p256 = "0.13"
+num-bigint = "0.4"
 
 pprof = {version = "0.11",features = ["flamegraph"]}
 
