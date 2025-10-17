@@ -76,7 +76,6 @@ op-revm = { version = "9.0.1", features = [
     "optional_block_gas_limit",
 ] }
 revm-inspectors = "0.28"
-revm-precompile = "28.0"
 revm-bytecode = "6.0"
 
 # alloy

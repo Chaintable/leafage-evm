@@ -10,7 +10,6 @@ exclude.workspace = true
 [dependencies]
 alloy = { workspace = true, features = ["rpc-types-trace", "getrandom"] }
 revm.workspace = true
-revm-precompile.workspace = true
 p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
 num-bigint.workspace = true
 once_cell.workspace = true
