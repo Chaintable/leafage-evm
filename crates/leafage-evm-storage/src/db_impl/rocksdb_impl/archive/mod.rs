@@ -140,7 +140,7 @@ unsafe impl Send for DataBaseInner {}
 unsafe impl Sync for DataBaseInner {}
 
 #[inline]
-fn rocksdb_column_options(cache_size: usize, fixed_prefix_size: usize) -> Options {
+fn rocksdb_column_options(shared_cache: &Cache, fixed_prefix_size: usize) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
     cf_opts.set_keep_log_file_num(2);
@@ -150,8 +150,9 @@ fn rocksdb_column_options(cache_size: usize, fixed_prefix_size: usize) -> Option
         cf_opts.set_memtable_prefix_bloom_ratio(0.1);
     }
     let mut block_opts = BlockBasedOptions::default();
-    let cache = Cache::new_lru_cache(1024 * 1024 * cache_size);
-    block_opts.set_block_cache(&cache);
+
+    // Use the shared cache for this column family
+    block_opts.set_block_cache(shared_cache);
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_pin_top_level_index_and_filter(true);
@@ -176,6 +177,7 @@ fn rocksdb_options() -> Options {
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
     opts.increase_parallelism(2);
+    opts.set_use_direct_io_for_flush_and_compaction(true);
 
     if let Ok(max_open_file_string) = env::var("ROCKSDB_MAX_OPEN_FILE") {
         if let Ok(max_open_file) = max_open_file_string.parse::<i32>() {
@@ -186,7 +188,7 @@ fn rocksdb_options() -> Options {
             );
         }
     }
-
+    
     if let Ok(set_direct_io) = env::var("ROCKSDB_DIRECT_IO") {
         if set_direct_io == "1" || set_direct_io == "true" || set_direct_io == "TRUE" {
             opts.set_use_direct_reads(true);
@@ -203,29 +205,42 @@ fn rocksdb_options() -> Options {
 
 impl DataBaseRef {
     pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
+        // Create a single shared Clock Cache for all column families
+        // Total cache size was previously: ~160MB + cache_size * 1.4
+        // Now using a unified cache with the total size
+        let total_cache_size = 160 + (cache_size as f64 * 1.4) as usize;
+        let shared_cache = Cache::new_hyper_clock_cache(
+            1024 * 1024 * total_cache_size,
+            8192, // 8KB typical block size
+        );
+        info!(
+            target = "rocksdb",
+            "Created shared Clock Cache with size: {}MB for archive", total_cache_size
+        );
+
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(32, 0),
+            rocksdb_column_options(&shared_cache, 0),
         );
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(64, 0),
+            rocksdb_column_options(&shared_cache, 0),
         );
         let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(64, 0),
+            rocksdb_column_options(&shared_cache, 0),
         );
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(cache_size / 5, 32),
+            rocksdb_column_options(&shared_cache, 32),
         );
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(cache_size, 64),
+            rocksdb_column_options(&shared_cache, 64),
         );
         let hash_to_code_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(cache_size / 5, 0),
+            rocksdb_column_options(&shared_cache, 0),
         );
         let cfs = vec![
             latest_block_hash_cf,
