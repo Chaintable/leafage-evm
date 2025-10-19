@@ -51,10 +51,10 @@ pub struct Command {
     db_type: String,
 
     /// The size of the database cache in MB.
-    /// Default: 1024
+    /// Default: 2048
     ///
     /// This limit is used for the rocksdb cache.
-    #[arg(long, default_value = "1024")]
+    #[arg(long, default_value = "2048")]
     db_cache: usize,
 
     /// The address for rpc client.

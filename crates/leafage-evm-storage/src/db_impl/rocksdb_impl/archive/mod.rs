@@ -188,7 +188,7 @@ fn rocksdb_options() -> Options {
             );
         }
     }
-    
+
     if let Ok(set_direct_io) = env::var("ROCKSDB_DIRECT_IO") {
         if set_direct_io == "1" || set_direct_io == "true" || set_direct_io == "TRUE" {
             opts.set_use_direct_reads(true);
@@ -205,10 +205,7 @@ fn rocksdb_options() -> Options {
 
 impl DataBaseRef {
     pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
-        // Create a single shared Clock Cache for all column families
-        // Total cache size was previously: ~160MB + cache_size * 1.4
-        // Now using a unified cache with the total size
-        let total_cache_size = 160 + (cache_size as f64 * 1.4) as usize;
+        let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
             1024 * 1024 * total_cache_size,
             8192, // 8KB typical block size

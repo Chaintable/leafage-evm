@@ -452,10 +452,7 @@ fn rocksdb_options() -> Options {
 
 impl DataBase {
     pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
-        // Create a single shared Clock Cache for all column families
-        // Total cache size was previously: ~160MB + cache_size * 1.4
-        // Now using a unified cache with the total size
-        let total_cache_size = 160 + (cache_size as f64 * 1.4) as usize;
+        let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
             1024 * 1024 * total_cache_size,
             8192, // 8KB typical block size
