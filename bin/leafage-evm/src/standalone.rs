@@ -9,10 +9,10 @@ use clap::Parser;
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv};
 use leafage_evm_storage::{
-    ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree, SnapshotTreeConfig,
-    StateDBWrapper,
+    ArchiveDBProvider, ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree,
+    SnapshotTreeConfig, StateDBWrapper,
 };
-use leafage_evm_types::Address;
+use leafage_evm_types::{Address, BlockId, BlockNumberOrTag};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -353,6 +353,14 @@ impl Command {
         let res = match self.db_type.as_str() {
             "rocksdb" if !self.archive => {
                 let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
+                // check if db shoud be initialized
+                initialize_check(
+                    StateDBWrapper(db.clone()),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.genesis_number,
+                )
+                .await?;
                 let tree = Arc::new(SnapshotTree::new(
                     StateDBWrapper(db),
                     SnapshotTreeConfig::new(
@@ -394,7 +402,10 @@ impl Command {
                 ));
                 // check if db shoud be initialized
                 initialize_check(
-                    db.clone(),
+                    StateDBWrapper(
+                        db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?
+                            .unwrap(),
+                    ),
                     self.rpc_addr.clone(),
                     self.kafka_s3_config.clone(),
                     self.genesis_number,
