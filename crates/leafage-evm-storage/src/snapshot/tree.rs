@@ -4,6 +4,7 @@ use crate::snapshot::error::Error;
 use crate::snapshot::layer::{CacheDiskLayer, DiffLayer, LinkedDiffLayer};
 use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
 
@@ -244,7 +245,7 @@ impl<DB: BlockContext> BlockIndex for SnapshotTree<DB> {
 
 impl<DB, E> EvmStorageRead for SnapshotTree<DB>
 where
-    DB: StateDB<Error = E> + BlockContext<Error = E> + Send + Sync + 'static,
+    DB: StateDB<Error = E> + BlockContext<Error = E> + Send + Sync + Debug + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = Error<E>;

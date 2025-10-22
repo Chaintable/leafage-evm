@@ -96,6 +96,7 @@ impl Display for StorageTypeColumn {
     }
 }
 
+#[derive(Debug)]
 pub struct DataBase {
     db: DB,
     _cols: Vec<(StorageTypeColumn, NonNull<ColumnFamily>)>,

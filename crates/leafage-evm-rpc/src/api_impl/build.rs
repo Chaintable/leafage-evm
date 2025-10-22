@@ -1,8 +1,8 @@
+use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
-use super::ApiImpl;
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
-use crate::api_impl::core::{Api, MultiChainCfgEnv};
+use crate::api_impl::core::{Api, ApiBase, ApiCore, EvmExecuter, GetHaltReason, MultiChainCfgEnv};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
@@ -10,7 +10,7 @@ use jsonrpsee::{
     RpcModule,
 };
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
-use leafage_evm_types::Address;
+use leafage_evm_types::{Address, DebankErrorCode, PreErrorCode};
 use std::time::Duration;
 
 pub struct ApiBuilder<DB> {
@@ -93,31 +93,7 @@ where
                     is_archive,
                     normalize_state_key,
                 );
-                let api = Api::new(api_impl);
-                rpc_module
-                    .merge(DebankApiServer::into_rpc(api.clone()))
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to merge rpc module: {}", e),
-                        )
-                    })?;
-                rpc_module
-                    .merge(PreApiServer::into_rpc(api.clone()))
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to merge rpc module: {}", e),
-                        )
-                    })?;
-                rpc_module
-                    .merge(EthApiServer::into_rpc(api.clone()))
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to merge rpc module: {}", e),
-                        )
-                    })?;
+                register_api(&mut rpc_module, api_impl)?;
             }
             MultiChainCfgEnv::Op(cfg) => {
                 let api_impl = ApiImpl::new(
@@ -130,34 +106,59 @@ where
                     is_archive,
                     normalize_state_key,
                 );
-                let api = Api::new(api_impl);
-                rpc_module
-                    .merge(DebankApiServer::into_rpc(api.clone()))
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to merge rpc module: {}", e),
-                        )
-                    })?;
-                rpc_module
-                    .merge(PreApiServer::into_rpc(api.clone()))
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to merge rpc module: {}", e),
-                        )
-                    })?;
-                rpc_module
-                    .merge(EthApiServer::into_rpc(api.clone()))
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to merge rpc module: {}", e),
-                        )
-                    })?;
+                register_api(&mut rpc_module, api_impl)?;
+            }
+            MultiChainCfgEnv::Bsc(cfg) => {
+                let api_impl = ApiImpl::new(
+                    self.db,
+                    cfg.clone(),
+                    rpc_timeout,
+                    ovm_address.clone(),
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                );
+                register_api(&mut rpc_module, api_impl)?;
             }
         }
         let handle = server.start(rpc_module);
         Ok(handle)
     }
+}
+
+fn register_api<A>(rpc_module: &mut RpcModule<()>, api_impl: A) -> std::io::Result<()>
+where
+    A: ApiCore,
+    <A as ApiBase>::DB: BlockIndex + EvmStorageRead,
+    <A as EvmExecuter>::EvmHaltReason: GetHaltReason,
+    DebankErrorCode: From<<A as EvmExecuter>::EvmHaltReason>,
+    PreErrorCode: From<<A as EvmExecuter>::EvmHaltReason>,
+{
+    let api = Api::new(api_impl);
+    rpc_module
+        .merge(DebankApiServer::into_rpc(api.clone()))
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to merge rpc module: {}", e),
+            )
+        })?;
+    rpc_module
+        .merge(PreApiServer::into_rpc(api.clone()))
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to merge rpc module: {}", e),
+            )
+        })?;
+    rpc_module
+        .merge(EthApiServer::into_rpc(api.clone()))
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to merge rpc module: {}", e),
+            )
+        })?;
+    Ok(())
 }

@@ -11,6 +11,7 @@ exclude.workspace = true
 [dependencies]
 leafage-evm-types.workspace = true
 leafage-evm-storage.workspace = true
+leafage-evm-chains.workspace = true
 revm.workspace = true
 op-revm.workspace = true
 revm-inspectors.workspace = true
@@ -24,6 +25,7 @@ tokio.workspace = true
 tracing.workspace = true
 alloy.workspace = true
 alloy-rlp.workspace = true
+alloy-evm.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true
 hyper.workspace = true

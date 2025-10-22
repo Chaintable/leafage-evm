@@ -23,3 +23,4 @@ pub use core::MultiChainCfgEnv;
 mod mainnet;
 
 mod op;
+mod bsc;

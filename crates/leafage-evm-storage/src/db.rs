@@ -8,6 +8,7 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
+use std::fmt::Debug;
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockRead: Send + Sync + 'static {
@@ -122,6 +123,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
 }
 
 /// [`StateDBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
+#[derive(Debug)]
 pub struct StateDBWrapper<T>(pub T);
 
 impl<T> Clone for StateDBWrapper<T>
@@ -246,6 +248,7 @@ pub trait ArchiveDBProvider: Send + Sync + 'static {
         + Send
         + Sync
         + Clone
+        + Debug
         + 'static;
     fn db_at(
         &self,
