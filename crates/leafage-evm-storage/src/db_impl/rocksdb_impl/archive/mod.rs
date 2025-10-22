@@ -37,7 +37,7 @@ use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRawIteratorWithThreadMode,
     IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, DB,
 };
-use std::fmt::Display;
+use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -656,6 +656,15 @@ impl Clone for StateDB {
             account_iterator: Some(Mutex::new(account_iterator)),
             storage_iterator: Some(Mutex::new(storage_iterator)),
         }
+    }
+}
+
+impl Debug for StateDB {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateDB")
+            .field("block_num", &self.block_num)
+            .field("block_header", &self.block_header)
+            .finish()
     }
 }
 

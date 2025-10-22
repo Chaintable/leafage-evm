@@ -11,6 +11,7 @@ use tracing::info;
 /// two cases:
 /// 1. bottom [`CacheDiskLayer`] (when init).
 /// 2. top [`DiffLayer`] -> (top-1) [`DiffLayer`] -> ... -> bottom [`CacheDiskLayer`].
+#[derive(Debug)]
 pub enum LinkedDiffLayer<DB> {
     CacheDiskLayer(CacheDiskLayer<DB>),
     DiffLayer(DiffLayer<DB>),
@@ -104,6 +105,7 @@ impl<DB> LinkedDiffLayer<DB> {
 /// It stores the on-disk db of the EVM
 /// It is also a cache layer, which caches the
 /// (top-diff_tree_depth_limit,top-diff_tree_depth_limit-cache_tree_depth_limit] diff layers.
+#[derive(Debug)]
 pub struct CacheDiskLayer<DB> {
     accounts: Cache<H256, Option<AccountInfo>>,
     storages: Cache<(H256, H256), U256>,
@@ -164,6 +166,7 @@ impl<DB: EvmStorageWrite> CacheDiskLayer<DB> {
 
 /// [`DiffLayer`] is the top layer of the linked list.
 /// It stores the diff of the EVM.
+#[derive(Debug)]
 pub struct DiffLayer<DB> {
     pub block_info: Arc<Block<H256>>,
     pub block_diff: Arc<BlockStorageDiff>,

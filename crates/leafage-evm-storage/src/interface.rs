@@ -5,6 +5,7 @@ use leafage_evm_types::{
 };
 use revm::database_interface::DBErrorMarker;
 use revm::DatabaseRef;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 /// [`StateDB`] is a trait that provides access to the state of the EVM at a specific block height.
@@ -168,6 +169,7 @@ pub trait EvmStorageRead {
         + Send
         + Sync
         + Clone
+        + Debug
         + 'static;
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error>;
 }

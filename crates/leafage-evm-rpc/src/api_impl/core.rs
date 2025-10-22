@@ -6,8 +6,10 @@ use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
+use leafage_evm_chains::bsc::BscHardfork;
 
 #[derive(Clone, Debug)]
 pub struct EvmCfg<SpecId> {
@@ -48,7 +50,7 @@ pub(crate) trait EvmExecuter: Sync + Send + 'static {
         chain_id: u64,
     ) -> RpcResult<Self::Tx>;
 
-    fn transact<StateDB: DatabaseRef>(
+    fn transact<StateDB>(
         &self,
         block_env: &BlockEnv,
         state: StateDB,
@@ -56,13 +58,12 @@ pub(crate) trait EvmExecuter: Sync + Send + 'static {
     ) -> Result<
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
-    >;
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static;
 
-    fn inspect_tx_commit<
-        StateDB: DatabaseCommit + DatabaseRef,
-        R,
-        F: FnOnce(TracingInspector) -> R,
-    >(
+    fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
         state: StateDB,
@@ -72,7 +73,11 @@ pub(crate) trait EvmExecuter: Sync + Send + 'static {
     ) -> Result<
         (ExecutionResult<Self::EvmHaltReason>, R),
         EVMError<StateDB::Error, Self::TransactionError>,
-    >;
+    >
+    where
+        StateDB: DatabaseCommit + DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+        F: FnOnce(TracingInspector) -> R;
 }
 
 pub(crate) trait TxSetter {
@@ -107,6 +112,7 @@ impl<C> Clone for Api<C> {
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
     Op(CfgEnv<OpSpecId>),
+    Bsc(CfgEnv<BscHardfork>),
 }
 
 impl From<(u64, String)> for MultiChainCfgEnv {
@@ -130,6 +136,15 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.chain_id = chain_id;
                 MultiChainCfgEnv::Op(chain_cfg)
             }
+            "bsc" => {
+                let mut chain_cfg = CfgEnv::default();
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                MultiChainCfgEnv::Bsc(chain_cfg)
+            }
             _ => panic!("Unsupported evm type"),
         }
     }
@@ -140,6 +155,7 @@ impl MultiChainCfgEnv {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Bsc(cfh) => cfh.chain_id,
         }
     }
 }

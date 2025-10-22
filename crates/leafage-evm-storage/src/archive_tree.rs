@@ -8,6 +8,7 @@ use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockNumberOrTag, BlockStorageDiff, Bytecode, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
+use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -50,9 +51,10 @@ pub enum Error<E> {
 
 impl<E> DBErrorMarker for Error<E> {}
 
+#[derive(Debug)]
 pub enum MultiStateDB<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + Debug + 'static,
 {
     Snapshot(Arc<LinkedDiffLayer<StateDBWrapper<DB::StateDBReadWrite>>>),
     Archive(StateDBWrapper<DB::StateDBReadWrite>),
@@ -60,7 +62,7 @@ where
 
 impl<DB> Clone for MultiStateDB<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + 'static,
 {
     fn clone(&self) -> Self {
         match self {
@@ -72,7 +74,7 @@ where
 
 impl<DB> BlockContext for MultiStateDB<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + 'static,
 {
     type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
 
@@ -107,7 +109,7 @@ where
 
 impl<DB> StateDB for MultiStateDB<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + 'static,
 {
     type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
 
@@ -142,7 +144,7 @@ where
 
 impl<DB> EvmStorageRead for ArchiveTree<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + Debug + 'static,
 {
     type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
     type StateDB = MultiStateDB<DB>;
