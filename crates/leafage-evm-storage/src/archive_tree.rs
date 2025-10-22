@@ -54,7 +54,7 @@ impl<E> DBErrorMarker for Error<E> {}
 #[derive(Debug)]
 pub enum MultiStateDB<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + Debug + Debug + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + 'static,
 {
     Snapshot(Arc<LinkedDiffLayer<StateDBWrapper<DB::StateDBReadWrite>>>),
     Archive(StateDBWrapper<DB::StateDBReadWrite>),
@@ -144,7 +144,7 @@ where
 
 impl<DB> EvmStorageRead for ArchiveTree<DB>
 where
-    DB: ArchiveDBProvider + Sync + Send + Debug + Debug + 'static,
+    DB: ArchiveDBProvider + Sync + Send + Debug + 'static,
 {
     type Error = Error<<DB::StateDBReadWrite as StateDBRead>::Error>;
     type StateDB = MultiStateDB<DB>;
