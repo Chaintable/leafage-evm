@@ -8,7 +8,7 @@ use p256::{AffinePoint, EncodedPoint, FieldBytes, FieldElement, PublicKey, Scala
 use revm::precompile::PrecompileWithAddress;
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 
-pub(crate) const P256_VERIFY: PrecompileWithAddress = PrecompileWithAddress(
+pub const P256_VERIFY: PrecompileWithAddress = PrecompileWithAddress(
     address!("0x0000000000000000000000000000000000000100"),
     secp256r1_signature_verification_run,
 );

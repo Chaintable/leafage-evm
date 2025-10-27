@@ -20,6 +20,8 @@ bls_on_arkworks.workspace = true
 prost.workspace = true
 parity-bytes = { workspace = true, default-features = false }
 secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"] }
+p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
+num-bigint.workspace = true
 
 #only use in bsc precompile
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
