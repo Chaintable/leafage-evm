@@ -51,10 +51,10 @@ pub struct Command {
     db_type: String,
 
     /// The size of the database cache in MB.
-    /// Default: 1024
+    /// Default: 2048
     ///
     /// This limit is used for the rocksdb cache.
-    #[arg(long, default_value = "1024")]
+    #[arg(long, default_value = "2048")]
     db_cache: usize,
 
     /// The address for rpc client.
@@ -83,24 +83,24 @@ pub struct Command {
     diff_depth_limit: usize,
 
     /// The size of the account cache.
-    /// Default: 200000
+    /// Default: 100000
     ///
     /// This limit is used for the account cache.
-    #[arg(long, default_value = "200000")]
+    #[arg(long, default_value = "100000")]
     account_cache_size: usize,
 
     /// The size of the storage cache.
-    /// Default: 5000000
+    /// Default: 2000000
     ///
     /// This limit is used for the storage cache.
-    #[arg(long, default_value = "5000000")]
+    #[arg(long, default_value = "2000000")]
     storage_cache_size: usize,
 
     /// The size of the code cache.
-    /// Default: 50000
+    /// Default: 10000
     ///
     /// This limit is used for the code cache.
-    #[arg(long, default_value = "50000")]
+    #[arg(long, default_value = "10000")]
     code_cache_size: usize,
 
     /// The interval to fetch block and update the snapshot tree.

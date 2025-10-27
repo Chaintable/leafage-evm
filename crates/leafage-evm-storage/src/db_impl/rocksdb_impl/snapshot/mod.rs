@@ -394,14 +394,15 @@ impl StateDBWrite for DataBase {
 }
 
 #[inline]
-fn rocksdb_column_options(cache_size: usize) -> Options {
+fn rocksdb_column_options(shared_cache: &Cache) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
     cf_opts.set_keep_log_file_num(2);
     cf_opts.set_level_compaction_dynamic_level_bytes(true);
     let mut block_opts = BlockBasedOptions::default();
-    let cache = Cache::new_lru_cache(1024 * 1024 * cache_size);
-    block_opts.set_block_cache(&cache);
+
+    // Use the shared cache for this column family
+    block_opts.set_block_cache(shared_cache);
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_pin_top_level_index_and_filter(true);
@@ -424,6 +425,7 @@ fn rocksdb_options() -> Options {
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
     opts.enable_statistics();
     opts.increase_parallelism(2);
+    opts.set_use_direct_io_for_flush_and_compaction(true);
 
     if let Ok(max_open_file_string) = env::var("ROCKSDB_MAX_OPEN_FILE") {
         if let Ok(max_open_file) = max_open_file_string.parse::<i32>() {
@@ -451,29 +453,39 @@ fn rocksdb_options() -> Options {
 
 impl DataBase {
     pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
+        let total_cache_size = cache_size;
+        let shared_cache = Cache::new_hyper_clock_cache(
+            1024 * 1024 * total_cache_size,
+            8192, // 8KB typical block size
+        );
+        info!(
+            target = "rocksdb",
+            "Created shared Clock Cache with size: {}MB", total_cache_size
+        );
+
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(32),
+            rocksdb_column_options(&shared_cache),
         );
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(64),
+            rocksdb_column_options(&shared_cache),
         );
         let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(64),
+            rocksdb_column_options(&shared_cache),
         );
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(cache_size / 5),
+            rocksdb_column_options(&shared_cache),
         );
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(cache_size),
+            rocksdb_column_options(&shared_cache),
         );
         let hash_to_code_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(cache_size / 5),
+            rocksdb_column_options(&shared_cache),
         );
         let cfs = vec![
             latest_block_hash_cf,
