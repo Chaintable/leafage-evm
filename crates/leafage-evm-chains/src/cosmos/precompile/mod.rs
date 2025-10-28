@@ -3,6 +3,7 @@ use revm::handler::EthPrecompiles;
 use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::hardfork::SpecId;
 
+mod bech32;
 mod p256;
 
 pub struct CosmosPrecompiles {

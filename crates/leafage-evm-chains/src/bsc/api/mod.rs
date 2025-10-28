@@ -1,6 +1,9 @@
-use std::ops::{Deref, DerefMut};
 use alloy_evm::precompiles::PrecompilesMap;
+use std::ops::{Deref, DerefMut};
 
+use crate::bsc::hardforks::bsc::BscHardfork;
+use crate::bsc::precompile::BscPrecompiles;
+use crate::bsc::transaction::BscTxEnv;
 use alloy_evm::{Database, EvmEnv};
 use revm::{
     context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
@@ -13,9 +16,6 @@ use revm::{
     interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
     Context, Inspector, Journal,
 };
-use crate::bsc::hardforks::bsc::BscHardfork;
-use crate::bsc::precompile::BscPrecompiles;
-use crate::bsc::transaction::BscTxEnv;
 
 mod exec;
 
@@ -167,7 +167,12 @@ where
 
     fn ctx_inspector_frame_instructions(
         &mut self,
-    ) -> (&mut Self::Context, &mut Self::Inspector, &mut Self::Frame, &mut Self::Instructions) {
+    ) -> (
+        &mut Self::Context,
+        &mut Self::Inspector,
+        &mut Self::Frame,
+        &mut Self::Instructions,
+    ) {
         self.inner.ctx_inspector_frame_instructions()
     }
 }

@@ -13,6 +13,8 @@ alloy-rlp.workspace = true
 alloy-chains.workspace = true
 alloy-hardforks.workspace = true
 alloy-evm.workspace = true
+alloy-sol-types.workspace = true
+alloy-contract.workspace = true
 revm.workspace = true
 leafage-evm-types.workspace = true
 once_cell.workspace = true
@@ -22,6 +24,7 @@ parity-bytes = { workspace = true, default-features = false }
 secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"] }
 p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
 num-bigint.workspace = true
+bech32.workspace = true
 
 #only use in bsc precompile
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
@@ -29,6 +32,7 @@ cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfiel
 cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = ["secp256k1"] }
+bytes = "1.10.1"
 
 [dev-dependencies]
 elliptic-curve.workspace = true

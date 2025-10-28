@@ -1,3 +1,6 @@
+use crate::bsc::api::{BscContext, BscEvm};
+use crate::bsc::handler::BscHandler;
+use crate::bsc::transaction::BscTxEnv;
 use alloy_evm::Database;
 use revm::{
     context::{BlockEnv, ContextSetters},
@@ -10,9 +13,6 @@ use revm::{
     state::EvmState,
     DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
 };
-use crate::bsc::api::{BscContext, BscEvm};
-use crate::bsc::handler::BscHandler;
-use crate::bsc::transaction::BscTxEnv;
 
 impl<DB, INSP> ExecuteEvm for BscEvm<DB, INSP>
 where

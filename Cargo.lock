@@ -1894,6 +1894,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 
 [[package]]
+name = "bech32"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
+
+[[package]]
 name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4484,10 +4490,14 @@ version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-chains",
+ "alloy-contract",
  "alloy-evm",
  "alloy-hardforks 0.4.0",
  "alloy-rlp",
+ "alloy-sol-types",
+ "bech32",
  "bls_on_arkworks",
+ "bytes 1.10.1",
  "cometbft",
  "cometbft-light-client",
  "cometbft-light-client-verifier",
