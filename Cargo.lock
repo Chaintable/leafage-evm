@@ -4492,6 +4492,7 @@ dependencies = [
  "cometbft-light-client",
  "cometbft-light-client-verifier",
  "cometbft-proto",
+ "elliptic-curve 0.13.8",
  "leafage-evm-types",
  "num-bigint",
  "once_cell",
@@ -4500,6 +4501,7 @@ dependencies = [
  "prost 0.12.6",
  "revm",
  "secp256k1 0.30.0",
+ "sha2 0.10.9",
  "tendermint",
 ]
 

@@ -91,3 +91,50 @@ fn secp256r1_verify(
     };
     Ok(PrecompileOutput::new(VERIFY_GAS, padding.into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elliptic_curve::rand_core::OsRng;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn test_p256_verify() {
+        // Generate a valid private key and signature
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let public_key = verifying_key.to_encoded_point(false);
+
+        // Prepare message hash (32 bytes)
+        let message = b"Hello, secp256r1!";
+        let hash = Sha256::digest(message);
+
+        // Sign the hash
+        let signature: Signature = signing_key.sign(&hash);
+        let (r, s) = signature.split_scalars();
+
+        // Extract public key coordinates
+        let x = public_key.x().unwrap();
+        let y = public_key.y().unwrap();
+
+        // Build input (160 bytes)
+        let mut input = Vec::with_capacity(INPUT_LENGTH);
+        input.extend_from_slice(&hash);
+        input.extend_from_slice(r.to_bytes().as_ref());
+        input.extend_from_slice(s.to_bytes().as_ref());
+        input.extend_from_slice(x);
+        input.extend_from_slice(y);
+
+        // Verify
+        let result = secp256r1_signature_verification_run(&input, 10000);
+        assert!(result.is_ok());
+
+        // Check output (32 bytes with 1 at the end)
+        let output = result.unwrap().bytes;
+        let mut expected = vec![0u8; 32];
+        expected[31] = 1;
+        assert_eq!(output.to_vec(), expected);
+    }
+}
