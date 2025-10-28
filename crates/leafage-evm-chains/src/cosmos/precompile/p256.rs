@@ -132,9 +132,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Check output (32 bytes with 1 at the end)
-        let output = result.unwrap().bytes;
+        let output = result.unwrap();
         let mut expected = vec![0u8; 32];
         expected[31] = 1;
-        assert_eq!(output.to_vec(), expected);
+        assert_eq!(output.bytes.to_vec(), expected);
+        assert_eq!(output.gas_used, VERIFY_GAS);
     }
 }
