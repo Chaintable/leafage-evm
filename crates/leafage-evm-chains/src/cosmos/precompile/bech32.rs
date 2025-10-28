@@ -6,6 +6,7 @@ use leafage_evm_types::Bytes;
 use revm::precompile::{
     PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
 };
+use std::io::Read;
 
 pub const BECH32: PrecompileWithAddress = PrecompileWithAddress(
     address!("0x0000000000000000000000000000000000000400"),
@@ -51,7 +52,7 @@ fn bech32_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
     match call {
         Ok(Bech32ICalls::hexToBech32(call)) => hex_to_bech32(call),
         Ok(Bech32ICalls::bech32ToHex(call)) => bech32_to_hex(call),
-        Err(err) => return Err(PrecompileError::other(format!("{:?}", err))),
+        Err(err) => Err(PrecompileError::other(format!("{:?}", err))),
     }
 }
 
@@ -99,4 +100,41 @@ fn valid_address(addr: &Address) -> PrecompileResult {
         )));
     }
     Ok(PrecompileOutput::new(0, Default::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_bech32_convert() {
+        let address = address!("0xcf97C75484baA0439Fd7D19EDb59Cd489c8cb392");
+        let prefix = "cosmos";
+        let bech32_address = "cosmos1e7tuw4yyh2sy887h6x0dkkwdfzwgevujlzfyrk";
+        {
+            let input = Bech32ICalls::hexToBech32(hexToBech32Call {
+                addr: address,
+                prefix: prefix.to_string(),
+            });
+            let res = bech32_run(input.abi_encode().as_slice(), BECH32PRECOMPILE_BASE_GAS);
+            assert!(res.is_ok());
+            let res = res.unwrap();
+            let str = res.bytes.to_string();
+            assert_eq!(
+                str,
+                Bytes::copy_from_slice(bech32_address.as_bytes()).to_string()
+            );
+        }
+        {
+            let input = Bech32ICalls::bech32ToHex(bech32ToHexCall {
+                bech32Address: bech32_address.to_string(),
+            });
+            let res = bech32_run(input.abi_encode().as_slice(), BECH32PRECOMPILE_BASE_GAS);
+            assert!(res.is_ok());
+            let res = res.unwrap();
+            let str = res.bytes.to_string();
+            assert_eq!(str, address.to_string().to_lowercase());
+        }
+    }
 }
