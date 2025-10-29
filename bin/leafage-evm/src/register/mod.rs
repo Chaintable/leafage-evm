@@ -4,7 +4,7 @@ use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::interval;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub struct Register {
     etcd_cfg: EtcdRegisterConfig,
@@ -24,7 +24,7 @@ impl Register {
 
     async fn unregister(&mut self) -> Result<()> {
         self.etcd_client.delete(self.key.clone(), None).await?;
-        info!(target: "register", "unregister key:{}success", self.key);
+        info!(target: "register", "unregister key:{} success", self.key);
         Ok(())
     }
 
@@ -87,13 +87,15 @@ impl Register {
                             .or_else(vec![]);
 
                         match self.etcd_client.txn(txn).await {
-                            std::result::Result::Ok(resp) => {
+                            Result::Ok(resp) => {
                                 if resp.succeeded() {
                                     info!(target: "register", "register key:{}, success", self.key);
+                                } else {
+                                    debug!(target: "register", "key:{} already exists, skip registration", self.key);
                                 }
                             }
-                            Err(e) => {
-                                error!(target: "register", "register lease error: {e}");
+                            Result::Err(e) => {
+                                error!(target: "register", "register error: {e}");
                             }
                         }
                     }
