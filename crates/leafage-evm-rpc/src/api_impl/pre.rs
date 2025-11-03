@@ -1,6 +1,6 @@
 use crate::api::PreApiServer;
 use crate::api_impl::core::{
-    Api, ApiCore, EvmExecuter, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::error::{internal_rpc_err, rpc_error_with_code};
 use jsonrpsee::core::RpcResult;
@@ -22,7 +22,7 @@ where
     C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
-    PreErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+    PreErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
     async fn pre_trace_many_impl(
         &self,
@@ -140,7 +140,7 @@ where
     C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
-    PreErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+    PreErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
     async fn trace_many(
         &self,

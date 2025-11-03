@@ -2,7 +2,8 @@ use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
-use crate::api_impl::core::{Api, ApiBase, ApiCore, EvmExecuter, GetHaltReason, MultiChainCfgEnv};
+use crate::api_impl::core::{Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, MultiChainCfgEnv};
+use crate::api_impl::replay::Replyable;
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
@@ -10,14 +11,16 @@ use jsonrpsee::{
     RpcModule,
 };
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
-use leafage_evm_types::{Address, DebankErrorCode, PreErrorCode};
+use leafage_evm_types::{Address, Block, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
+use tracing::error;
 
 pub struct ApiBuilder<DB> {
     db: DB,
     cfg: MultiChainCfgEnv,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
+    replay_blocks: Option<Vec<Block<DebankTransaction>>>,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -30,6 +33,7 @@ where
             cfg,
             historical_client: None,
             historical_height: None,
+            replay_blocks: None,
         }
     }
 
@@ -49,6 +53,11 @@ where
         self.historical_height = historical_height;
         self
     }
+
+    pub fn with_replay_blocks(mut self, blocks: Vec<Block<DebankTransaction>>) -> Self {
+        self.replay_blocks = Some(blocks);
+        self
+    }
 }
 
 impl<DB> ApiBuilder<DB>
@@ -56,7 +65,7 @@ where
     DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
 {
     pub async fn build_and_run(
-        self,
+        mut self,
         addr: &str,
         max_connects: u32,
         rpc_timeout: Duration,
@@ -93,6 +102,11 @@ where
                     is_archive,
                     normalize_state_key,
                 );
+                if let Some(blocks) = self.replay_blocks.take() {
+                    if let Err(err) = api_impl.replay_blocks(blocks) {
+                        error!("Error while replaying blocks: {}", err);
+                    }
+                }
                 register_api(&mut rpc_module, api_impl)?;
             }
             MultiChainCfgEnv::Op(cfg) => {
@@ -106,6 +120,11 @@ where
                     is_archive,
                     normalize_state_key,
                 );
+                if let Some(blocks) = self.replay_blocks.take() {
+                    if let Err(err) = api_impl.replay_blocks(blocks) {
+                        error!("Error while replaying blocks: {}", err);
+                    }
+                }
                 register_api(&mut rpc_module, api_impl)?;
             }
             MultiChainCfgEnv::Bsc(cfg) => {
@@ -119,6 +138,11 @@ where
                     is_archive,
                     normalize_state_key,
                 );
+                if let Some(blocks) = self.replay_blocks.take() {
+                    if let Err(err) = api_impl.replay_blocks(blocks) {
+                        error!("Error while replaying blocks: {}", err);
+                    }
+                }
                 register_api(&mut rpc_module, api_impl)?;
             }
         }
@@ -131,9 +155,9 @@ fn register_api<A>(rpc_module: &mut RpcModule<()>, api_impl: A) -> std::io::Resu
 where
     A: ApiCore,
     <A as ApiBase>::DB: BlockIndex + EvmStorageRead,
-    <A as EvmExecuter>::EvmHaltReason: GetHaltReason,
-    DebankErrorCode: From<<A as EvmExecuter>::EvmHaltReason>,
-    PreErrorCode: From<<A as EvmExecuter>::EvmHaltReason>,
+    <A as EvmExecutor>::EvmHaltReason: GetHaltReason,
+    DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
+    PreErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
 {
     let api = Api::new(api_impl);
     rpc_module

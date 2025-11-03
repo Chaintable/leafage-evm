@@ -19,8 +19,10 @@ pub use interceptor::{InterceptorConfig, InterceptorLayer};
 
 mod core;
 pub use core::MultiChainCfgEnv;
+pub(crate) use core::{ApiBase, ApiCore, EvmExecutor};
 
 mod mainnet;
 
-mod op;
 mod bsc;
+mod op;
+mod replay;

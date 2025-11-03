@@ -1,4 +1,6 @@
 use crate::{Address, Block, BlockId, Bytes, H256, U256};
+use alloy::primitives::{BlockHash, TxKind};
+use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::decode_revert_reason;
 use op_revm::OpHaltReason;
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -288,6 +290,57 @@ impl<T> From<Arc<Block<T>>> for DebankBlock {
             miner: block.header.beneficiary,
             gas_limit: block.header.gas_limit,
             gas_used: block.header.gas_used,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(default)]
+pub struct DebankTransaction {
+    pub id: BlockHash,
+    #[serde(rename = "from_addr")]
+    pub from: Address,
+    #[serde(rename = "to_addr")]
+    pub to: Address,
+    pub gas_limit: u64,
+    pub gas_price: u128,
+    pub gas_used: u64,
+    pub status: bool,
+    #[serde(rename = "max_fee_per_gas")]
+    pub gas_fee_cap: u128,
+    #[serde(rename = "max_priority_fee_per_gas")]
+    pub gas_tip_cap: u128,
+    pub input: Bytes,
+    pub nonce: u64,
+    #[serde(rename = "idx")]
+    pub transaction_index: u64,
+    pub value: U256,
+}
+
+impl Into<TransactionRequest> for DebankTransaction {
+    fn into(self) -> TransactionRequest {
+        TransactionRequest {
+            from: self.from.into(),
+            to: Some(if self.to.is_empty() {
+                TxKind::Create
+            } else {
+                TxKind::Call(self.to)
+            }),
+            gas_price: self.gas_price.into(),
+            max_fee_per_gas: self.gas_fee_cap.into(),
+            max_priority_fee_per_gas: self.gas_tip_cap.into(),
+            max_fee_per_blob_gas: None,
+            gas: self.gas_limit.into(),
+            value: self.value.into(),
+            input: self.input.into(),
+            nonce: self.nonce.into(),
+            chain_id: None,
+            access_list: None,
+            transaction_type: None,
+            blob_versioned_hashes: None,
+            sidecar: None,
+            authorization_list: None,
         }
     }
 }

@@ -24,5 +24,5 @@ pub use alloy::rpc::types::state::{AccountOverride, StateOverride};
 pub use debank::{
     BlockType, DebankBlock, DebankBlockContext, DebankErrorCode, DebankEvent, DebankID,
     DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
-    DebankSingleCallResult, DebankSingleSimulateResult, DebankTrace,
+    DebankSingleCallResult, DebankSingleSimulateResult, DebankTrace, DebankTransaction,
 };
