@@ -393,7 +393,7 @@ where
         let stream = self.consumer.stream();
         let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
         let mut res = Vec::with_capacity(self.max_diff_depth);
-        while let Some(messages) = chunk.next().await {
+        if let Some(messages) = chunk.next().await {
             let mut msgs = vec![];
             for message in messages {
                 if message.is_err() {
@@ -401,9 +401,6 @@ where
                     break;
                 }
                 msgs.push(message.unwrap());
-            }
-            if msgs.is_empty() {
-                continue;
             }
             if !self.read_from_kafka {
                 loop {
