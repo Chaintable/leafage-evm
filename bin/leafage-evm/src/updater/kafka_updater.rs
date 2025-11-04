@@ -391,8 +391,6 @@ where
     pub async fn fetch_max_depth_blocks(&mut self) -> Result<Vec<Block<DebankTransaction>>> {
         self.init_offset().await;
         let stream = self.consumer.stream();
-        let mut latest_number = self.tree.last_committed_block()?.unwrap().header.number;
-        let target_block_number = latest_number + self.max_diff_depth as u64;
         let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
         let mut res = Vec::with_capacity(self.max_diff_depth);
         while let Some(messages) = chunk.next().await {
@@ -429,14 +427,10 @@ where
                     }
                 }
             }
-            latest_number = self.tree.last_committed_block()?.unwrap().header.number;
-            if latest_number >= target_block_number {
-                break;
-            }
         }
-        for block_num in
-            std::cmp::max(0, latest_number - self.max_diff_depth as u64 + 1)..=latest_number
-        {
+        let start = self.tree.last_committed_block()?.unwrap().header.number;
+        let end = start + self.max_diff_depth as u64 - 1;
+        for block_num in start..=end {
             let transactions = self.get_transactions(block_num).await?;
             let block = self
                 .tree
