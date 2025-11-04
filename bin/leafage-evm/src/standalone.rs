@@ -370,8 +370,23 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone())
-                    .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+
+                let (max_depth_blocks, updater_handle) = updater_build(
+                    tree.clone(),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.update_interval,
+                    self.diff_depth_limit,
+                    self.init_task_queue_size,
+                    !self.readiness_addr.is_empty(),
+                )
+                .await?;
+                let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+                    .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+                if !self.readiness_addr.is_empty() {
+                    rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
+                }
+                let rpc_handle = rpc_builder
                     .build_and_run(
                         &self.listen_addr,
                         self.max_connections,
@@ -383,16 +398,6 @@ impl Command {
                         self.normalize_state_key,
                     )
                     .await?;
-
-                let updater_handle = updater_build(
-                    tree.clone(),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.update_interval,
-                    self.diff_depth_limit,
-                    self.init_task_queue_size,
-                )
-                .await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             "rocksdb" if self.archive => {
@@ -421,8 +426,23 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-                let rpc_handle = ApiBuilder::new(tree.clone(), chain_cfg.clone())
-                    .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+
+                let (max_depth_blocks, updater_handle) = updater_build(
+                    tree.clone(),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.update_interval,
+                    self.diff_depth_limit,
+                    self.init_task_queue_size,
+                    !self.readiness_addr.is_empty(),
+                )
+                .await?;
+                let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+                    .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+                if !self.readiness_addr.is_empty() {
+                    rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
+                }
+                let rpc_handle = rpc_builder
                     .build_and_run(
                         &self.listen_addr,
                         self.max_connections,
@@ -434,16 +454,6 @@ impl Command {
                         self.normalize_state_key,
                     )
                     .await?;
-
-                let updater_handle = updater_build(
-                    tree.clone(),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.update_interval,
-                    self.diff_depth_limit,
-                    self.init_task_queue_size,
-                )
-                .await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             _ => bail!("only support rocksdb"),

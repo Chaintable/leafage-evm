@@ -100,6 +100,42 @@ pub async fn s3_get_block_transactions(
     })
 }
 
+pub async fn s3_get_block_transactions_by_number(
+    rpc_client: &Option<HttpClient>,
+    s3_client: &Client,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    number: u64,
+) -> Result<Vec<DebankTransaction>> {
+    let transactions = match rpc_client {
+        Some(rpc) => {
+            let block = rpc
+                .get_block_by_number(number.into(), false)
+                .await
+                .context(format!("rpc get block by hash failed, {number}"))?;
+            if block.is_none() {
+                return Err(anyhow::anyhow!(
+                    "rpc get block by hash returned none, {number}"
+                ));
+            }
+            let block: Block<H256> = serde_json::from_value(block.unwrap())
+                .context("rpc get block by hash parse failed")?;
+            s3_get_block_transactions(s3_client, outer_bucket_name, s3_chain_id, block.header.hash)
+                .await
+                .context(format!("s3 get transactions failed, {}", block.header.hash))?
+        }
+        None => {
+            let block_hash =
+                s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number)
+                    .await?;
+            s3_get_block_transactions(s3_client, outer_bucket_name, s3_chain_id, block_hash)
+                .await
+                .context(format!("s3 get transactions failed, {block_hash}"))?
+        }
+    };
+    Ok(transactions)
+}
+
 pub async fn s3_get_block_hash_by_number(
     s3_client: &Client,
     bucket_name: &str,

@@ -1,13 +1,17 @@
 use crate::utils::{
-    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number, KafkaS3Config,
+    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number,
+    s3_get_block_transactions, s3_get_block_transactions_by_number, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
+use leafage_evm_storage::{
+    read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
+};
 use leafage_evm_types::{
-    Block, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, H256,
+    Block, BlockStorageDiff, DebankBlockWrapper, DebankTransaction, KafkaBlockChangeNotification,
+    KafkaBlockContext, H256,
 };
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
@@ -37,6 +41,7 @@ pub struct Updater<Tree> {
     tree: Tree,
     max_diff_depth: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
+    num_to_hash: Mutex<HashMap<u64, H256>>,
     read_from_kafka: bool,
     init_task_queue_size: usize,
 }
@@ -83,6 +88,7 @@ where
             tree,
             max_diff_depth,
             hash_to_blockctx: Mutex::new(HashMap::default()),
+            num_to_hash: Mutex::new(Default::default()),
             read_from_kafka: true,
             init_task_queue_size,
         })
@@ -120,6 +126,30 @@ where
         .context(format!("s3 get block info failed, {block_hash}"))
     }
 
+    #[inline]
+    async fn get_transactions(&self, block_num: u64) -> Result<Vec<DebankTransaction>> {
+        if let Some(block_hash) = self.num_to_hash.lock().unwrap().get(&block_num) {
+            let transactions = s3_get_block_transactions(
+                &self.s3_client,
+                &self.kafka_s3_cfg.outer_bucket_name,
+                &self.kafka_s3_cfg.s3_chain_id,
+                *block_hash,
+            )
+            .await
+            .context(format!("s3 get transactions failed, {block_hash}"))?;
+            return Ok(transactions);
+        }
+        s3_get_block_transactions_by_number(
+            &self.rpc_client,
+            &self.s3_client,
+            &self.kafka_s3_cfg.outer_bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            block_num,
+        )
+        .await
+        .context(format!("s3 get transactions failed, {block_num}"))
+    }
+
     fn clear(
         &self,
         presist_block_num: u64,
@@ -135,6 +165,11 @@ where
             .lock()
             .unwrap()
             .retain(|_, block| block.block_info.header.number >= presist_block_num);
+
+        self.num_to_hash
+            .lock()
+            .unwrap()
+            .retain(|num, _| *num > presist_block_num);
 
         presist_block
     }
@@ -344,32 +379,99 @@ where
         return Ok((low, high - 1));
     }
 
+    async fn init_offset(&mut self) {
+        let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
+        let (lowest_offset, latest_offset) = self
+            .get_offset()
+            .await
+            .expect("Failed to get latest offset");
+        match offset {
+            Some(offset) if offset >= lowest_offset => {
+                self.set_offset(offset).expect("Failed to set offset");
+                info!(target: "updater", "kafka updater start with offset {}", offset);
+            }
+            Some(offset) => {
+                info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
+                self.read_from_kafka = false;
+                self.set_offset(latest_offset)
+                    .expect("Failed to set latest offset");
+            }
+            None => {
+                info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
+                self.read_from_kafka = false;
+                self.set_offset(latest_offset)
+                    .expect("Failed to set latest offset");
+            }
+        }
+    }
+
+    // only for replay block
+    pub async fn fetch_max_depth_blocks(&mut self) -> Result<Vec<Block<DebankTransaction>>> {
+        self.init_offset().await;
+        let stream = self.consumer.stream();
+        let mut latest_number = self.tree.last_committed_block()?.unwrap().header.number;
+        let target_block_number = latest_number + self.max_diff_depth as u64;
+        let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
+        let mut res = Vec::with_capacity(self.max_diff_depth);
+        while let Some(messages) = chunk.next().await {
+            let mut msgs = vec![];
+            for message in messages {
+                if message.is_err() {
+                    error!(target:"updater", "Failed to receive message: {:?}", message.err());
+                    break;
+                }
+                msgs.push(message.unwrap());
+            }
+            if msgs.is_empty() {
+                continue;
+            }
+            if !self.read_from_kafka {
+                loop {
+                    if let Err(e) = self.update_from_s3(&msgs).await {
+                        error!(target:"updater", "Failed to update from S3: {:?}", e);
+                        time::sleep(time::Duration::from_secs(1)).await
+                    } else {
+                        self.read_from_kafka = true;
+                        break;
+                    }
+                }
+            }
+            if self.read_from_kafka {
+                loop {
+                    if let Err(e) = self.update_from_kafka(&msgs).await {
+                        error!(target:"updater", "Failed to update: {:?}", e);
+                        self.commit_offset().expect("Failed to commit offset");
+                        time::sleep(time::Duration::from_secs(1)).await
+                    } else {
+                        break;
+                    }
+                }
+            }
+            latest_number = self.tree.last_committed_block()?.unwrap().header.number;
+            if latest_number >= target_block_number {
+                break;
+            }
+        }
+        for block_num in
+            std::cmp::max(0, latest_number - self.max_diff_depth as u64 + 1)..=latest_number
+        {
+            let transactions = self.get_transactions(block_num).await?;
+            let block = self
+                .tree
+                .state_at(block_num.into())?
+                .unwrap()
+                .block_info()?;
+            let block: Block<DebankTransaction> = DebankBlockWrapper(block, transactions).into();
+            res.push(block);
+        }
+        info!(target: "updater", "Fetch init blocks with length{}", res.len());
+        Ok(res)
+    }
+
     pub fn start(mut self) -> watch::Sender<()> {
         let (tx, mut rx) = watch::channel(());
         tokio::spawn(async move {
-            let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
-            let (lowest_offset, latest_offset) = self
-                .get_offset()
-                .await
-                .expect("Failed to get latest offset");
-            match offset {
-                Some(offset) if offset >= lowest_offset => {
-                    self.set_offset(offset).expect("Failed to set offset");
-                    info!(target: "updater", "kafka updater start with offset {}", offset);
-                }
-                Some(offset) => {
-                    info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
-                    self.read_from_kafka = false;
-                    self.set_offset(latest_offset)
-                        .expect("Failed to set latest offset");
-                }
-                None => {
-                    info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
-                    self.read_from_kafka = false;
-                    self.set_offset(latest_offset)
-                        .expect("Failed to set latest offset");
-                }
-            }
+            self.init_offset().await;
             let stream = self.consumer.stream();
             let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
             loop {

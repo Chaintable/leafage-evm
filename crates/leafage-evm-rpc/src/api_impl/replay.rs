@@ -7,6 +7,7 @@ use leafage_evm_types::{block_env_from_block, Block, DebankTransaction, Transact
 use revm::database::CacheDB;
 use revm_inspectors::tracing::TracingInspectorConfig;
 use serde::de::StdError;
+use tracing::info;
 
 pub trait Replyable: ApiCore {
     fn replay_blocks(&self, blocks: Vec<Block<DebankTransaction>>) -> RpcResult<()>;
@@ -19,6 +20,9 @@ where
     <Api as EvmExecutor>::TransactionError: Sync + Send + StdError,
 {
     fn replay_blocks(&self, blocks: Vec<Block<DebankTransaction>>) -> RpcResult<()> {
+        let start = std::time::Instant::now();
+        let block_len = blocks.len();
+        info!(target: "warmup","Start replay blocks with length {block_len}");
         for block in blocks {
             let block_id = block.header.hash.into();
             let transactions = block.transactions.into_transactions_vec();
@@ -78,6 +82,7 @@ where
                     .map_err(|e| e.to_rpc_error())?;
             }
         }
+        info!(target: "warmup", "Replay blocks {} time elapsed: {:?}",block_len, start.elapsed());
         Ok(())
     }
 }
