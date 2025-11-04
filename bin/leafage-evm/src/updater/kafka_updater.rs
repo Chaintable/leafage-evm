@@ -1,6 +1,6 @@
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number,
-    s3_get_block_transactions, s3_get_block_transactions_by_number, KafkaS3Config,
+    s3_get_block_transactions_by_number, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -41,7 +41,6 @@ pub struct Updater<Tree> {
     tree: Tree,
     max_diff_depth: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
-    num_to_hash: Mutex<HashMap<u64, H256>>,
     read_from_kafka: bool,
     init_task_queue_size: usize,
 }
@@ -88,7 +87,6 @@ where
             tree,
             max_diff_depth,
             hash_to_blockctx: Mutex::new(HashMap::default()),
-            num_to_hash: Mutex::new(Default::default()),
             read_from_kafka: true,
             init_task_queue_size,
         })
@@ -128,17 +126,6 @@ where
 
     #[inline]
     async fn get_transactions(&self, block_num: u64) -> Result<Vec<DebankTransaction>> {
-        if let Some(block_hash) = self.num_to_hash.lock().unwrap().get(&block_num) {
-            let transactions = s3_get_block_transactions(
-                &self.s3_client,
-                &self.kafka_s3_cfg.outer_bucket_name,
-                &self.kafka_s3_cfg.s3_chain_id,
-                *block_hash,
-            )
-            .await
-            .context(format!("s3 get transactions failed, {block_hash}"))?;
-            return Ok(transactions);
-        }
         s3_get_block_transactions_by_number(
             &self.rpc_client,
             &self.s3_client,
@@ -165,11 +152,6 @@ where
             .lock()
             .unwrap()
             .retain(|_, block| block.block_info.header.number >= presist_block_num);
-
-        self.num_to_hash
-            .lock()
-            .unwrap()
-            .retain(|num, _| *num > presist_block_num);
 
         presist_block
     }
