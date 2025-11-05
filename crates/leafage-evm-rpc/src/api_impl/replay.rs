@@ -22,7 +22,7 @@ where
     fn replay_blocks(&self, blocks: Vec<Block<DebankTransaction>>) -> RpcResult<()> {
         let start = std::time::Instant::now();
         let block_len = blocks.len();
-        info!(target: "warmup","Start replay blocks with length {block_len}");
+        info!(target: "warmup","Start replay blocks with {block_len} blocks");
         for block in blocks {
             let block_id = block.header.parent_hash.into();
             let transactions = block.transactions.into_transactions_vec();
@@ -82,7 +82,7 @@ where
                     .map_err(|e| e.to_rpc_error())?;
             }
         }
-        info!(target: "warmup", "Replay blocks {} time elapsed: {:?}",block_len, start.elapsed());
+        info!(target: "warmup", "Replay {block_len} blocks time elapsed: {:?}", start.elapsed());
         Ok(())
     }
 }
