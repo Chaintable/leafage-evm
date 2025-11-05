@@ -3,7 +3,6 @@ use super::ApiImpl;
 use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, MultiChainCfgEnv};
-use crate::api_impl::replay::Replyable;
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
@@ -102,12 +101,13 @@ where
                     is_archive,
                     normalize_state_key,
                 );
+                let api = Api::new(api_impl);
                 if let Some(blocks) = self.replay_blocks.take() {
-                    if let Err(err) = api_impl.replay_blocks(blocks) {
+                    if let Err(err) = api.replay_blocks(blocks).await {
                         error!("Error while replaying blocks: {}", err);
                     }
                 }
-                register_api(&mut rpc_module, api_impl)?;
+                register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Op(cfg) => {
                 let api_impl = ApiImpl::new(
@@ -120,12 +120,13 @@ where
                     is_archive,
                     normalize_state_key,
                 );
+                let api = Api::new(api_impl);
                 if let Some(blocks) = self.replay_blocks.take() {
-                    if let Err(err) = api_impl.replay_blocks(blocks) {
+                    if let Err(err) = api.replay_blocks(blocks).await {
                         error!("Error while replaying blocks: {}", err);
                     }
                 }
-                register_api(&mut rpc_module, api_impl)?;
+                register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Bsc(cfg) => {
                 let api_impl = ApiImpl::new(
@@ -138,12 +139,13 @@ where
                     is_archive,
                     normalize_state_key,
                 );
+                let api = Api::new(api_impl);
                 if let Some(blocks) = self.replay_blocks.take() {
-                    if let Err(err) = api_impl.replay_blocks(blocks) {
+                    if let Err(err) = api.replay_blocks(blocks).await {
                         error!("Error while replaying blocks: {}", err);
                     }
                 }
-                register_api(&mut rpc_module, api_impl)?;
+                register_api(&mut rpc_module, api)?;
             }
         }
         let handle = server.start(rpc_module);
@@ -151,7 +153,7 @@ where
     }
 }
 
-fn register_api<A>(rpc_module: &mut RpcModule<()>, api_impl: A) -> std::io::Result<()>
+fn register_api<A>(rpc_module: &mut RpcModule<()>, api: Api<A>) -> std::io::Result<()>
 where
     A: ApiCore,
     <A as ApiBase>::DB: BlockIndex + EvmStorageRead,
@@ -159,7 +161,6 @@ where
     DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
     PreErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
 {
-    let api = Api::new(api_impl);
     rpc_module
         .merge(DebankApiServer::into_rpc(api.clone()))
         .map_err(|e| {
