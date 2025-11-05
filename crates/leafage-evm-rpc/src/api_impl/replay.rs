@@ -1,6 +1,7 @@
 use crate::api_impl::core::ToJsonRpcError;
 use crate::api_impl::{ApiBase, ApiCore, EvmExecutor};
 use crate::error::internal_rpc_err;
+use alloy::rpc::types::TransactionRequest;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{block_env_from_block, Block, DebankTransaction, TransactionInfo, H256};
@@ -61,9 +62,14 @@ where
                     base_fee: block.header.base_fee_per_gas,
                 };
                 let trace_cfg = TracingInspectorConfig::default_parity();
+                let mut transaction_request: TransactionRequest = transaction.into();
+                transaction_request.gas_price = Some(0);
+                transaction_request.max_fee_per_gas = None;
+                transaction_request.max_priority_fee_per_gas = None;
+                transaction_request.max_fee_per_gas = None;
                 let tx = self.create_txn_env(
                     &block_env,
-                    transaction.into(),
+                    transaction_request,
                     &memory_db,
                     self.evm_cfg().cfg.chain_id,
                 )?;
