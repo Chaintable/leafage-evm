@@ -24,7 +24,7 @@ where
         let block_len = blocks.len();
         info!(target: "warmup","Start replay blocks with length {block_len}");
         for block in blocks {
-            let block_id = block.header.hash.into();
+            let block_id = block.header.parent_hash.into();
             let transactions = block.transactions.into_transactions_vec();
             let state = self
                 .db()
