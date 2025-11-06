@@ -383,7 +383,12 @@ impl Command {
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .with_historical_config(self.historical_rpc.clone(), self.historical_height);
                 if !self.readiness_addr.is_empty() {
-                    let max_depth_blocks = updater.fetch_max_depth_blocks().await?;
+                    let mut max_depth_blocks = updater.fetch_max_depth_blocks().await?;
+                    // [last_commited +1, last_commited + max_diff_depth]
+                    // state doesn't storage last_commited's state
+                    if !max_depth_blocks.is_empty() {
+                        max_depth_blocks.remove(0);
+                    }
                     rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
                 }
                 let rpc_handle = rpc_builder
