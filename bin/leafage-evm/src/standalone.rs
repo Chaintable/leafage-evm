@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
-use tracing::info;
+use tracing::{error, info};
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
@@ -383,13 +383,19 @@ impl Command {
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .with_historical_config(self.historical_rpc.clone(), self.historical_height);
                 if !self.readiness_addr.is_empty() {
-                    let mut max_depth_blocks = updater.fetch_max_depth_blocks().await?;
-                    // [last_commited +1, last_commited + max_diff_depth]
-                    // state doesn't storage last_commited's state
-                    if !max_depth_blocks.is_empty() {
-                        max_depth_blocks.remove(0);
+                    match updater.fetch_max_depth_blocks().await {
+                        Ok(mut max_depth_blocks) => {
+                            // [last_commited +1, last_commited + max_diff_depth]
+                            // state doesn't storage last_commited's state
+                            if !max_depth_blocks.is_empty() {
+                                max_depth_blocks.remove(0);
+                            }
+                            rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
+                        }
+                        Err(err) => {
+                            error!(target:"updater", "failed to fetch max depth blocks: {}", err);
+                        }
                     }
-                    rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
                 }
                 let rpc_handle = rpc_builder
                     .build_and_run(
@@ -445,8 +451,14 @@ impl Command {
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .with_historical_config(self.historical_rpc.clone(), self.historical_height);
                 if !self.readiness_addr.is_empty() {
-                    let max_depth_blocks = updater.fetch_max_depth_blocks().await?;
-                    rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
+                    match updater.fetch_max_depth_blocks().await {
+                        Ok(max_depth_blocks) => {
+                            rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
+                        }
+                        Err(err) => {
+                            error!(target:"updater", "failed to fetch max depth blocks: {}", err)
+                        }
+                    }
                 }
                 let rpc_handle = rpc_builder
                     .build_and_run(
