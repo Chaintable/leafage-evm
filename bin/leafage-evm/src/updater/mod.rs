@@ -7,8 +7,39 @@ pub use kafka_updater::Updater as KafkaUpdater;
 use crate::utils::KafkaS3Config;
 use anyhow::Result;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
+use leafage_evm_types::{Block, DebankTransaction};
 use std::time::Duration;
 use tokio::sync::watch;
+
+pub enum Updater<Tree> {
+    Http(HttpUpdater<Tree>),
+    Kafka(KafkaUpdater<Tree>),
+    None,
+}
+
+impl<Tree> Updater<Tree>
+where
+    Tree: EvmStorageRead
+        + EvmStorageWrite<Error = <Tree as EvmStorageRead>::Error>
+        + Send
+        + Sync
+        + 'static,
+{
+    pub fn start(self) -> watch::Sender<()> {
+        match self {
+            Updater::Http(updater) => updater.start(),
+            Updater::Kafka(updater) => updater.start(),
+            Updater::None => tokio::sync::watch::channel(()).0,
+        }
+    }
+
+    pub async fn fetch_max_depth_blocks(&mut self) -> Result<Vec<Block<DebankTransaction>>> {
+        match self {
+            Updater::Http(_) | Updater::None => Ok(Default::default()),
+            Updater::Kafka(updater) => updater.fetch_max_depth_blocks().await,
+        }
+    }
+}
 
 pub async fn updater_build<
     Tree: EvmStorageRead
@@ -23,25 +54,20 @@ pub async fn updater_build<
     update_interval: Duration,
     max_diff_depth: usize,
     init_task_queue_size: usize,
-) -> Result<watch::Sender<()>> {
+) -> Result<Updater<Tree>> {
     match (rpc_url, kafka_s3_cfg) {
         (Some(rpc_url), None) => {
-            let updater = HttpUpdater::new(tree, rpc_url, update_interval, max_diff_depth)?;
-            let updater_handle = updater.start();
-            Ok(updater_handle)
+            HttpUpdater::new(tree, rpc_url, update_interval, max_diff_depth).map(Updater::Http)
         }
-        (rpc_url, Some(kafka_s3_cfg)) => {
-            let updater = KafkaUpdater::new(
-                tree,
-                rpc_url,
-                kafka_s3_cfg,
-                max_diff_depth,
-                init_task_queue_size,
-            )
-            .await?;
-            let updater_handle = updater.start();
-            Ok(updater_handle)
-        }
-        (None, None) => Ok(tokio::sync::watch::channel(()).0),
+        (rpc_url, Some(kafka_s3_cfg)) => KafkaUpdater::new(
+            tree,
+            rpc_url,
+            kafka_s3_cfg,
+            max_diff_depth,
+            init_task_queue_size,
+        )
+        .await
+        .map(Updater::Kafka),
+        (None, None) => Ok(Updater::None),
     }
 }

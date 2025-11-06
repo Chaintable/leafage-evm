@@ -6,7 +6,6 @@ mod runner;
 mod standalone;
 mod updater;
 mod utils;
-
 use clap::Parser;
 use runner::Cli;
 use tikv_jemallocator;

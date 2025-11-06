@@ -4,9 +4,10 @@ use aws_sdk_s3::Client;
 use flate2::read;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_rpc::EthApiClient;
-use leafage_evm_types::{Block, BlockStorageDiff, H256};
+use leafage_evm_types::{Block, BlockStorageDiff, DebankTransaction, H256};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::sync::RwLock;
@@ -72,6 +73,67 @@ pub async fn s3_get_block_info(
         .unwrap()
         .put(block_hash, block.clone());
     Ok(block)
+}
+
+pub async fn s3_get_block_transactions(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    block_hash: H256,
+) -> Result<Vec<DebankTransaction>> {
+    let s3_key = format!("{}/{}", s3_chain_id, block_hash);
+    let s3_obj = s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&s3_key)
+        .send()
+        .await
+        .context(format!("{bucket_name}: {s3_key}"))?;
+    let bytes = s3_obj.body.collect().await?.into_bytes();
+    let mut gz = read::GzDecoder::new(&bytes[..]);
+    let mut bytes = Vec::new();
+    gz.read_to_end(&mut bytes)?;
+    let block_file: Value = serde_json::from_slice(&bytes)?;
+    Ok(match block_file.get("txs").cloned() {
+        None => Vec::new(),
+        Some(txs) => serde_json::from_value(txs)?,
+    })
+}
+
+pub async fn s3_get_block_transactions_by_number(
+    rpc_client: &Option<HttpClient>,
+    s3_client: &Client,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    number: u64,
+) -> Result<Vec<DebankTransaction>> {
+    let transactions = match rpc_client {
+        Some(rpc) => {
+            let block = rpc
+                .get_block_by_number(number.into(), false)
+                .await
+                .context(format!("rpc get block by hash failed, {number}"))?;
+            if block.is_none() {
+                return Err(anyhow::anyhow!(
+                    "rpc get block by hash returned none, {number}"
+                ));
+            }
+            let block: Block<H256> = serde_json::from_value(block.unwrap())
+                .context("rpc get block by hash parse failed")?;
+            s3_get_block_transactions(s3_client, outer_bucket_name, s3_chain_id, block.header.hash)
+                .await
+                .context(format!("s3 get transactions failed, {}", block.header.hash))?
+        }
+        None => {
+            let block_hash =
+                s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number)
+                    .await?;
+            s3_get_block_transactions(s3_client, outer_bucket_name, s3_chain_id, block_hash)
+                .await
+                .context(format!("s3 get transactions failed, {block_hash}"))?
+        }
+    };
+    Ok(transactions)
 }
 
 pub async fn s3_get_block_hash_by_number(

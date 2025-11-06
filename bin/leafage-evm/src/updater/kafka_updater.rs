@@ -1,14 +1,19 @@
 use crate::utils::{
-    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number, KafkaS3Config,
+    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number,
+    s3_get_block_transactions_by_number, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{
-    Block, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, H256,
+use leafage_evm_storage::{
+    read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
 };
+use leafage_evm_types::{
+    Block, BlockStorageDiff, DebankBlockWrapper, DebankTransaction, KafkaBlockChangeNotification,
+    KafkaBlockContext, H256,
+};
+use rdkafka::message::OwnedMessage;
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     message::BorrowedMessage,
@@ -118,6 +123,19 @@ where
         )
         .await
         .context(format!("s3 get block info failed, {block_hash}"))
+    }
+
+    #[inline]
+    async fn get_transactions(&self, block_num: u64) -> Result<Vec<DebankTransaction>> {
+        s3_get_block_transactions_by_number(
+            &self.rpc_client,
+            &self.s3_client,
+            &self.kafka_s3_cfg.outer_bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            block_num,
+        )
+        .await
+        .context(format!("s3 get transactions failed, {block_num}"))
     }
 
     fn clear(
@@ -232,6 +250,51 @@ where
         Ok(new_blocks)
     }
 
+    async fn update_range_from_s3(
+        &self,
+        start_block_number: u64,
+        end_block_number: u64,
+    ) -> Result<()> {
+        let mut get_block_info_diff_join_set = JoinSet::new();
+        for block_number in start_block_number..=end_block_number {
+            let rpc_client = self.rpc_client.clone();
+            let client = self.s3_client.clone();
+            let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
+            let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
+            let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+            get_block_info_diff_join_set.spawn(async move {
+                (
+                    block_number,
+                    s3_get_block_info_and_diff_by_number(
+                        &rpc_client,
+                        &client,
+                        &bucket_name,
+                        &outer_bucket_name,
+                        &s3_chain_id,
+                        block_number,
+                    )
+                    .await,
+                )
+            });
+        }
+        let mut all_results = get_block_info_diff_join_set.join_all().await;
+        all_results.sort_by_key(|(i, _)| *i);
+        for (_, res) in all_results {
+            match res {
+                Ok((block_info, block_diff)) => {
+                    info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                    self.tree.update_block(block_info.clone(), block_diff)?;
+                }
+                Err(e) => {
+                    error!(target: "etl", "Join error: {}", e);
+                    return Err(anyhow::anyhow!("Failed to join tasks: {}", e));
+                }
+            }
+        }
+        info!(target:"updater", "update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
+        Ok(())
+    }
+
     async fn update_from_s3(&self, messages: &Vec<BorrowedMessage<'_>>) -> Result<()> {
         let block_change_notification: KafkaBlockChangeNotification =
             messages[0].payload().unwrap().try_into()?;
@@ -242,52 +305,15 @@ where
             .clone();
         let target_block_number = target_block.block_number - 1;
         let mut start_block_number = self.tree.last_committed_block()?.unwrap().header.number + 1;
+        let batch_size = self.init_task_queue_size as u64;
         info!(target:"updater", "update from s3, start block number {}, target block number {}", start_block_number, target_block_number);
         while start_block_number <= target_block_number {
-            let mut get_block_info_diff_join_set = JoinSet::new();
-            let batch_size = self.init_task_queue_size as u64;
             let end_block_number =
                 std::cmp::min(start_block_number + batch_size - 1, target_block_number);
-            for block_number in start_block_number..=end_block_number {
-                let rpc_client = self.rpc_client.clone();
-                let client = self.s3_client.clone();
-                let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
-                let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
-                let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
-                get_block_info_diff_join_set.spawn(async move {
-                    (
-                        block_number,
-                        s3_get_block_info_and_diff_by_number(
-                            &rpc_client,
-                            &client,
-                            &bucket_name,
-                            &outer_bucket_name,
-                            &s3_chain_id,
-                            block_number,
-                        )
-                        .await,
-                    )
-                });
-            }
-            let mut all_results = get_block_info_diff_join_set.join_all().await;
-            all_results.sort_by_key(|(i, _)| *i);
-            for (_, res) in all_results {
-                match res {
-                    Ok((block_info, block_diff)) => {
-                        info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
-                        self.tree.update_block(block_info.clone(), block_diff)?;
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "etl", "Join error: {}", e);
-                        return Err(anyhow::anyhow!("Failed to join tasks: {}", e));
-                    }
-                }
-            }
-            info!(target:"updater", "update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
-
+            self.update_range_from_s3(start_block_number, end_block_number)
+                .await?;
             start_block_number += batch_size;
         }
-
         Ok(())
     }
 
@@ -344,32 +370,118 @@ where
         return Ok((low, high - 1));
     }
 
+    async fn fetch_latest_message(&self) -> Result<OwnedMessage> {
+        let (lowest_offset, latest_offset) = self.get_offset().await?;
+        if lowest_offset == latest_offset {
+            return Err(anyhow::anyhow!("No messages in the topic"));
+        }
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &self.kafka_s3_cfg.brokers)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set(
+                "group.id",
+                format!("leafage-evm-group-{}-tmp", self.kafka_s3_cfg.s3_chain_id),
+            )
+            .create()?;
+        let mut tpl = TopicPartitionList::with_capacity(1);
+        tpl.add_partition_offset(
+            &self.kafka_s3_cfg.topic,
+            self.kafka_s3_cfg.partition,
+            Offset::Offset(latest_offset),
+        )?;
+        consumer.assign(&tpl)?;
+        consumer.seek(
+            &self.kafka_s3_cfg.topic,
+            self.kafka_s3_cfg.partition,
+            Offset::Offset(latest_offset),
+            Timeout::Never,
+        )?;
+        let mut stream = consumer.stream();
+        stream
+            .next()
+            .await
+            .unwrap()
+            .map(|m| m.detach())
+            .map_err(Into::into)
+    }
+
+    async fn init_offset(&mut self) {
+        let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
+        let (lowest_offset, latest_offset) = self
+            .get_offset()
+            .await
+            .expect("Failed to get latest offset");
+        match offset {
+            Some(offset) if offset >= lowest_offset => {
+                self.set_offset(offset).expect("Failed to set offset");
+                info!(target: "updater", "kafka updater start with offset {}", offset);
+            }
+            Some(offset) => {
+                info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
+                self.read_from_kafka = false;
+                self.set_offset(latest_offset)
+                    .expect("Failed to set latest offset");
+            }
+            None => {
+                info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
+                self.read_from_kafka = false;
+                self.set_offset(latest_offset)
+                    .expect("Failed to set latest offset");
+            }
+        }
+    }
+
+    // only for replay block
+    pub async fn fetch_max_depth_blocks(&mut self) -> Result<Vec<Block<DebankTransaction>>> {
+        let mut res = Vec::with_capacity(self.max_diff_depth);
+        let start_block_number = self.tree.last_committed_block()?.unwrap().header.number + 1;
+        let mut end_block_number = start_block_number + self.max_diff_depth as u64 - 1;
+        let message = self.fetch_latest_message().await?;
+        // reset consumer to previous message
+        let block_change_notification: KafkaBlockChangeNotification =
+            message.payload().unwrap().try_into()?;
+        let target_block = block_change_notification
+            .new_blocks
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No new blocks in the message"))?
+            .clone();
+        let latest_block_number = target_block.block_number - 1;
+        end_block_number = std::cmp::min(latest_block_number, end_block_number);
+        // apply max_diff_depth blocks to storage
+        loop {
+            if let Err(e) = self
+                .update_range_from_s3(start_block_number, end_block_number)
+                .await
+            {
+                error!(target:"updater", "Failed to update from S3: {:?}", e);
+                time::sleep(time::Duration::from_secs(1)).await
+            } else {
+                break;
+            }
+        }
+        for block_num in start_block_number..=end_block_number {
+            let transactions = self.get_transactions(block_num).await?;
+            if let Some(block) = self
+                .tree
+                .state_at(block_num.into())?
+                .map(|state| state.block_info())
+                .transpose()?
+            {
+                let block: Block<DebankTransaction> =
+                    DebankBlockWrapper(block, transactions).into();
+                res.push(block);
+            }
+        }
+        info!(target: "updater", "Fetch init {} blocks", res.len());
+        Ok(res)
+    }
+
     pub fn start(mut self) -> watch::Sender<()> {
         let (tx, mut rx) = watch::channel(());
         tokio::spawn(async move {
-            let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
-            let (lowest_offset, latest_offset) = self
-                .get_offset()
-                .await
-                .expect("Failed to get latest offset");
-            match offset {
-                Some(offset) if offset >= lowest_offset => {
-                    self.set_offset(offset).expect("Failed to set offset");
-                    info!(target: "updater", "kafka updater start with offset {}", offset);
-                }
-                Some(offset) => {
-                    info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
-                    self.read_from_kafka = false;
-                    self.set_offset(latest_offset)
-                        .expect("Failed to set latest offset");
-                }
-                None => {
-                    info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
-                    self.read_from_kafka = false;
-                    self.set_offset(latest_offset)
-                        .expect("Failed to set latest offset");
-                }
-            }
+            self.init_offset().await;
             let stream = self.consumer.stream();
             let mut chunk = stream.ready_chunks(std::cmp::max(1, self.max_diff_depth));
             loop {

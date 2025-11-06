@@ -1,7 +1,7 @@
 use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
-    Api, ApiCore, EvmExecuter, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::utils::build_debank_traces;
 use crate::error::{internal_rpc_err, rpc_error_with_code};
@@ -59,7 +59,7 @@ where
     C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
-    DebankErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+    DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
     fn should_try_historical(&self, block_ctx: &Option<DebankBlockContext>) -> Option<&HttpClient> {
         let client = self.inner.historical_client()?;
@@ -929,7 +929,7 @@ where
     C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
-    DebankErrorCode: From<<C as EvmExecuter>::EvmHaltReason>,
+    DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
     async fn get_address_nonce(
         &self,

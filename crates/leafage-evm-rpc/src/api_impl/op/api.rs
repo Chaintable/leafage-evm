@@ -1,5 +1,5 @@
 use crate::api_impl::core::{
-    ApiCore, EvmExecuter, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::op::evm::{create_op_evm_from_state, create_op_txn_env};
 use crate::api_impl::ApiImpl;
@@ -17,7 +17,7 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type OpApiImpl<DB> = ApiImpl<DB, OpSpecId>;
 
-impl<DB> EvmExecuter for OpApiImpl<DB>
+impl<DB> EvmExecutor for OpApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {

@@ -1,5 +1,5 @@
 use crate::api_impl::core::{
-    ApiCore, EvmExecuter, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
@@ -16,7 +16,7 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type MainnetApiImpl<DB> = ApiImpl<DB, MainnetSpecId>;
 
-impl<DB> EvmExecuter for MainnetApiImpl<DB>
+impl<DB> EvmExecutor for MainnetApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {
