@@ -81,7 +81,7 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
                 output, gas_used, ..
             } => SingleCallResult {
                 code: MultiCallErrorCode::EVMReverted as i32,
-                err: decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string()),
+                err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
                 result: Bytes::default(),
                 gas_used: gas_used as i64,

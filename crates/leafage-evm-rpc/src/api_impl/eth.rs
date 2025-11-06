@@ -118,7 +118,7 @@ where
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
             ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
                 "Reverted: {:?}",
-                decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string())
+                decode_revert_reason(&output).unwrap_or("execution revert".to_string())
             ))
             .into()),
             ExecutionResult::Halt { reason, gas_used } => {

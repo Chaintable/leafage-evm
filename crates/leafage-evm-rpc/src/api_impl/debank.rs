@@ -723,7 +723,8 @@ where
                 ));
             }
             ExecutionResult::Revert { output, .. } => {
-                let reason = decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
+                let reason =
+                    decode_revert_reason(&output).unwrap_or("execution revert".to_string());
                 return Err(rpc_error_with_code(
                     DebankErrorCode::EvmRevert as i32,
                     reason,
