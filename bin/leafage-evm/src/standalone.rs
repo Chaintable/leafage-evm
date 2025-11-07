@@ -336,8 +336,6 @@ impl Command {
         if etcd_config.is_some() && !self.meta.is_empty() {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
-        let registry_handle =
-            register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
 
         // set default offset dir if not set
         if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
@@ -410,6 +408,8 @@ impl Command {
                     )
                     .await?;
                 let updater_handle = updater.start();
+                let registry_handle =
+                    register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             "rocksdb" if self.archive => {
@@ -473,6 +473,8 @@ impl Command {
                     )
                     .await?;
                 let updater_handle = updater.start();
+                let registry_handle =
+                    register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             _ => bail!("only support rocksdb"),
