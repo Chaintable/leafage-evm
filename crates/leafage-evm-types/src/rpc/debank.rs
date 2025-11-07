@@ -177,7 +177,7 @@ where
                 output, gas_used, ..
             } => DebankSingleCallResult {
                 code: DebankErrorCode::EvmRevert as i32,
-                err: decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string()),
+                err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
                 result: Bytes::default(),
                 gas_used: gas_used as i64,
@@ -232,7 +232,7 @@ where
     fn from(exec_res: ExecutionResult<T>) -> Self {
         match exec_res {
             ExecutionResult::Revert { gas_used, output } => {
-                let reason = decode_revert_reason(&output).unwrap_or("Reason Unknown".to_string());
+                let reason = decode_revert_reason(&output).unwrap_or("execution revert".to_string());
                 let pre_res = DebankSingleSimulateResult {
                     code: DebankErrorCode::EvmRevert as i32,
                     err: reason,
