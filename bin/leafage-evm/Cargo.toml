@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 tikv-jemallocator.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemalloc-sys.workspace = true
+jemalloc_pprof = { workspace = true }
 hyper.workspace = true
 alloy-rlp.workspace = true
 rdkafka.workspace = true
@@ -36,6 +37,10 @@ metrics.workspace = true
 futures.workspace = true
 lru.workspace = true
 axum.workspace = true
+pprof = { workspace = true, features = [
+    "cpp",
+    "prost-codec",
+] }
 
 [features]
 default = ["with-rocksdb"]
