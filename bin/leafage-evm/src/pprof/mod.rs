@@ -3,8 +3,8 @@ use axum::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-struct ProfileError(anyhow::Error);
-impl<E> From<E> for ProfileError
+struct PprofError(anyhow::Error);
+impl<E> From<E> for PprofError
 where
     E: Into<anyhow::Error>,
 {
@@ -13,7 +13,7 @@ where
     }
 }
 
-impl axum::response::IntoResponse for ProfileError {
+impl axum::response::IntoResponse for PprofError {
     fn into_response(self) -> axum::response::Response {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -26,18 +26,18 @@ impl axum::response::IntoResponse for ProfileError {
 const PPROF_DEFAULT_SECONDS: u64 = 30; // same as golang pprof
 const PPROF_DEFAULT_SAMPLING: u64 = 99;
 
-pub struct Profile {
+pub struct PProf {
     address: std::net::SocketAddr,
 }
 
-impl Profile {
+impl PProf {
     pub fn new(address: std::net::SocketAddr) -> Self {
         Self { address }
     }
     pub async fn start(self) -> anyhow::Result<()> {
         let router = axum::Router::new()
             .route("/debug/pprof/allocs", axum::routing::get(memory_profile))
-            .route("/debug/pprof/profile", axum::routing::get(cpu_profile));
+            .route("/debug/pprof/pprof", axum::routing::get(cpu_profile));
 
         let listener = tokio::net::TcpListener::bind(self.address)
             .await
@@ -56,7 +56,7 @@ struct CpuProfileReq {
     sampling: Option<u64>,
 }
 
-async fn cpu_profile(Query(req): Query<CpuProfileReq>) -> Result<axum::body::Bytes, ProfileError> {
+async fn cpu_profile(Query(req): Query<CpuProfileReq>) -> Result<axum::body::Bytes, PprofError> {
     use pprof::{protos::Message, ProfilerGuardBuilder};
     let profile_seconds = req.seconds.unwrap_or(PPROF_DEFAULT_SECONDS);
     let profile_sampling = req.sampling.unwrap_or(PPROF_DEFAULT_SAMPLING);
@@ -76,7 +76,7 @@ async fn cpu_profile(Query(req): Query<CpuProfileReq>) -> Result<axum::body::Byt
     Ok(axum::body::Bytes::from(content))
 }
 
-async fn memory_profile() -> Result<axum::body::Bytes, ProfileError> {
+async fn memory_profile() -> Result<axum::body::Bytes, PprofError> {
     let prof_ctl = jemalloc_pprof::PROF_CTL.as_ref();
 
     match prof_ctl {

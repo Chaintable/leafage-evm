@@ -6,7 +6,7 @@ mod runner;
 mod standalone;
 mod updater;
 mod utils;
-mod profile;
+mod pprof;
 
 use clap::Parser;
 use runner::Cli;

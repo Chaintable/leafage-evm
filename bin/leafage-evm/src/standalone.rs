@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
 use tracing::{error, info};
-use crate::profile::Profile;
+use crate::pprof::PProf;
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
@@ -221,11 +221,12 @@ pub struct Command {
     warmup_blocks: usize,
 
     /// The address for profile server.
+    /// The address for pprof server.
     /// Default: ""
     ///
-    /// This address is used for the profile server.
+    /// This address is used for the pprof server.
     #[arg(long, default_value = "")]
-    profile_addr: String,
+    pprof_addr: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -347,10 +348,10 @@ impl Command {
             });
         }
 
-        if !self.profile_addr.is_empty(){
-            let profile_server = Profile::new(self.profile_addr.parse()?);
+        if !self.pprof_addr.is_empty(){
+            let pprof_server = PProf::new(self.pprof_addr.parse()?);
             tokio::spawn(async move{
-                profile_server.start().await.expect("Failed to start profile server");
+                pprof_server.start().await.expect("Failed to start pprof server");
             });
         }
 
