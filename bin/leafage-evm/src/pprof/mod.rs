@@ -67,7 +67,7 @@ async fn cpu_profile(Query(req): Query<CpuProfileReq>) -> Result<axum::body::Byt
         .blocklist(blocklist)
         .build()?;
 
-    tokio::time::sleep(Duration::from_millis(profile_seconds.try_into()?)).await;
+    tokio::time::sleep(Duration::from_secs(profile_seconds.try_into()?)).await;
 
     let profile = guard.report().build()?.pprof()?;
 
