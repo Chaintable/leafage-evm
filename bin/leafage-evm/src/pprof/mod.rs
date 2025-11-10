@@ -37,7 +37,7 @@ impl PProf {
     pub async fn start(self) -> anyhow::Result<()> {
         let router = axum::Router::new()
             .route("/debug/pprof/allocs", axum::routing::get(memory_profile))
-            .route("/debug/pprof/pprof", axum::routing::get(cpu_profile));
+            .route("/debug/pprof/profile", axum::routing::get(cpu_profile));
 
         let listener = tokio::net::TcpListener::bind(self.address)
             .await
