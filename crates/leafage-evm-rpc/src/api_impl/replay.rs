@@ -7,7 +7,7 @@ use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
     BlockId, BlockNumberOrTag, BlockType, DebankBlockContext, DebankErrorCode, DebankTransaction,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 impl<C> Api<C>
 where
@@ -40,8 +40,12 @@ where
                     transaction_request
                 })
                 .collect();
-            self.simulate_transactions(calls, Some(block_id.clone()), None)
-                .await?;
+            if let Err(err) = self
+                .simulate_transactions(calls, Some(block_id.clone()), None)
+                .await
+            {
+                warn!(target: "warm", "Error while simulating transactions: {}", err);
+            }
         }
         info!(target: "warmup", "Replay {block_len} blocks {transactions_len} transactions time elapsed: {:?}", start.elapsed());
         Ok(())

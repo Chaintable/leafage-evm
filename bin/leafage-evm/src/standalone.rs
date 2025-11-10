@@ -383,19 +383,14 @@ impl Command {
                     self.update_interval,
                     self.diff_depth_limit,
                     self.init_task_queue_size,
-                    self.warmup_blocks
+                    self.warmup_blocks,
                 )
                 .await?;
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .with_historical_config(self.historical_rpc.clone(), self.historical_height);
                 if !self.readiness_addr.is_empty() {
                     match updater.fetch_warmup_blocks().await {
-                        Ok(mut max_depth_blocks) => {
-                            // [last_commited +1, last_commited + max_diff_depth]
-                            // state doesn't storage last_commited's state
-                            if !max_depth_blocks.is_empty() {
-                                max_depth_blocks.remove(0);
-                            }
+                        Ok(max_depth_blocks) => {
                             rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
                         }
                         Err(err) => {
@@ -454,7 +449,7 @@ impl Command {
                     self.update_interval,
                     self.diff_depth_limit,
                     self.init_task_queue_size,
-                    self.warmup_blocks
+                    self.warmup_blocks,
                 )
                 .await?;
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
