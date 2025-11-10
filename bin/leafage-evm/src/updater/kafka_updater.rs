@@ -6,14 +6,11 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_storage::{
-    read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
-};
+use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
-    Block, BlockStorageDiff, DebankBlockWrapper, DebankTransaction, KafkaBlockChangeNotification,
-    KafkaBlockContext, H256,
+    Block, BlockStorageDiff, DebankTransaction, KafkaBlockChangeNotification, KafkaBlockContext,
+    H256,
 };
-use rdkafka::message::OwnedMessage;
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     message::BorrowedMessage,
@@ -44,6 +41,7 @@ pub struct Updater<Tree> {
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
     read_from_kafka: bool,
     init_task_queue_size: usize,
+    warmup_blocks: usize,
 }
 
 impl<Tree> Updater<Tree>
@@ -60,6 +58,7 @@ where
         kafka_s3_cfg: KafkaS3Config,
         max_diff_depth: usize,
         init_task_queue_size: usize,
+        warmup_blocks: usize,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -90,6 +89,7 @@ where
             hash_to_blockctx: Mutex::new(HashMap::default()),
             read_from_kafka: true,
             init_task_queue_size,
+            warmup_blocks,
         })
     }
 
@@ -370,43 +370,6 @@ where
         return Ok((low, high - 1));
     }
 
-    async fn fetch_latest_message(&self) -> Result<OwnedMessage> {
-        let (lowest_offset, latest_offset) = self.get_offset().await?;
-        if lowest_offset == latest_offset {
-            return Err(anyhow::anyhow!("No messages in the topic"));
-        }
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &self.kafka_s3_cfg.brokers)
-            .set("enable.partition.eof", "false")
-            .set("session.timeout.ms", "6000")
-            .set("enable.auto.commit", "false")
-            .set(
-                "group.id",
-                format!("leafage-evm-group-{}-tmp", self.kafka_s3_cfg.s3_chain_id),
-            )
-            .create()?;
-        let mut tpl = TopicPartitionList::with_capacity(1);
-        tpl.add_partition_offset(
-            &self.kafka_s3_cfg.topic,
-            self.kafka_s3_cfg.partition,
-            Offset::Offset(latest_offset),
-        )?;
-        consumer.assign(&tpl)?;
-        consumer.seek(
-            &self.kafka_s3_cfg.topic,
-            self.kafka_s3_cfg.partition,
-            Offset::Offset(latest_offset),
-            Timeout::Never,
-        )?;
-        let mut stream = consumer.stream();
-        stream
-            .next()
-            .await
-            .unwrap()
-            .map(|m| m.detach())
-            .map_err(Into::into)
-    }
-
     async fn init_offset(&mut self) {
         let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
         let (lowest_offset, latest_offset) = self
@@ -434,45 +397,15 @@ where
     }
 
     // only for replay block
-    pub async fn fetch_max_depth_blocks(&mut self) -> Result<Vec<Block<DebankTransaction>>> {
-        let mut res = Vec::with_capacity(self.max_diff_depth);
-        let start_block_number = self.tree.last_committed_block()?.unwrap().header.number + 1;
-        let mut end_block_number = start_block_number + self.max_diff_depth as u64 - 1;
-        let message = self.fetch_latest_message().await?;
-        // reset consumer to previous message
-        let block_change_notification: KafkaBlockChangeNotification =
-            message.payload().unwrap().try_into()?;
-        let target_block = block_change_notification
-            .new_blocks
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No new blocks in the message"))?
-            .clone();
-        let latest_block_number = target_block.block_number - 1;
-        end_block_number = std::cmp::min(latest_block_number, end_block_number);
-        // apply max_diff_depth blocks to storage
-        loop {
-            if let Err(e) = self
-                .update_range_from_s3(start_block_number, end_block_number)
-                .await
-            {
-                error!(target:"updater", "Failed to update from S3: {:?}", e);
-                time::sleep(time::Duration::from_secs(1)).await
-            } else {
-                break;
-            }
-        }
+    pub async fn fetch_warmup_blocks(&mut self) -> Result<Vec<Vec<DebankTransaction>>> {
+        let mut res = Vec::with_capacity(self.warmup_blocks);
+        let end_block_number = self.tree.last_committed_block()?.unwrap().header.number;
+        let start_block_number = end_block_number
+            .checked_sub(self.warmup_blocks as u64 - 1)
+            .unwrap_or_default();
         for block_num in start_block_number..=end_block_number {
             let transactions = self.get_transactions(block_num).await?;
-            if let Some(block) = self
-                .tree
-                .state_at(block_num.into())?
-                .map(|state| state.block_info())
-                .transpose()?
-            {
-                let block: Block<DebankTransaction> =
-                    DebankBlockWrapper(block, transactions).into();
-                res.push(block);
-            }
+            res.push(transactions);
         }
         info!(target: "updater", "Fetch init {} blocks", res.len());
         Ok(res)
