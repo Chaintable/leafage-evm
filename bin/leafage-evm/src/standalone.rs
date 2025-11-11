@@ -437,8 +437,13 @@ impl Command {
                     self.init_task_queue_size,
                 )
                 .await?;
-                let registry_handle =
-                    register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
+                let registry_handle = register_build(
+                    chain_cfg.chain_id(),
+                    self.kafka_s3_config.clone().unwrap_or_default().version,
+                    etcd_config.clone(),
+                    self.archive,
+                )
+                .await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             "rocksdb" if self.archive => {
@@ -502,8 +507,13 @@ impl Command {
                     self.init_task_queue_size,
                 )
                 .await?;
-                let registry_handle =
-                    register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
+                let registry_handle = register_build(
+                    chain_cfg.chain_id(),
+                    self.kafka_s3_config.clone().unwrap_or_default().version,
+                    etcd_config.clone(),
+                    self.archive,
+                )
+                .await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
             }
             _ => bail!("only support rocksdb"),

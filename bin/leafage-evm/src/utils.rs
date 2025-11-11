@@ -27,15 +27,22 @@ pub struct KafkaS3Config {
     #[serde(default)]
     pub offset_dir: String,
     pub s3_chain_id: String,
+    #[serde(default)]
+    pub version: String,
 }
 
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     block_root: H256,
 ) -> Result<BlockStorageDiff> {
-    let s3_key = format!("{}/{}/stateDiff", s3_chain_id, block_root);
+    let s3_key = if version.is_empty() {
+        format!("{}/{}/stateDiff", s3_chain_id, block_root)
+    } else {
+        format!("{}/{}/{}/stateDiff", s3_chain_id, version, block_root)
+    };
     let s3_obj = s3_client
         .get_object()
         .bucket(bucket_name)
@@ -51,12 +58,17 @@ pub async fn s3_get_block_info(
     s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     block_hash: H256,
 ) -> Result<Block<H256>> {
     if let Some(block) = S3_BLOCK_CACHE.read().unwrap().peek(&block_hash) {
         return Ok(block.clone());
     }
-    let s3_key = format!("{}/{}/block", s3_chain_id, block_hash);
+    let s3_key = if version.is_empty() {
+        format!("{}/{}/block", s3_chain_id, block_hash)
+    } else {
+        format!("{}/{}/{}/block", s3_chain_id, version, block_hash)
+    };
     let s3_obj = s3_client
         .get_object()
         .bucket(bucket_name)
@@ -80,9 +92,14 @@ pub async fn s3_get_block_transactions(
     s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     block_hash: H256,
 ) -> Result<Vec<DebankTransaction>> {
-    let s3_key = format!("{}/{}", s3_chain_id, block_hash);
+    let s3_key = if version.is_empty() {
+        format!("{}/{}", s3_chain_id, block_hash)
+    } else {
+        format!("{}/{}/{}", s3_chain_id, version, block_hash)
+    };
     let s3_obj = s3_client
         .get_object()
         .bucket(bucket_name)
@@ -106,6 +123,7 @@ pub async fn s3_get_block_transactions_by_number(
     s3_client: &Client,
     outer_bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     number: u64,
 ) -> Result<Vec<DebankTransaction>> {
     let transactions = match rpc_client {
@@ -121,17 +139,34 @@ pub async fn s3_get_block_transactions_by_number(
             }
             let block: Block<H256> = serde_json::from_value(block.unwrap())
                 .context("rpc get block by hash parse failed")?;
-            s3_get_block_transactions(s3_client, outer_bucket_name, s3_chain_id, block.header.hash)
-                .await
-                .context(format!("s3 get transactions failed, {}", block.header.hash))?
+            s3_get_block_transactions(
+                s3_client,
+                outer_bucket_name,
+                s3_chain_id,
+                version,
+                block.header.hash,
+            )
+            .await
+            .context(format!("s3 get transactions failed, {}", block.header.hash))?
         }
         None => {
-            let block_hash =
-                s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number)
-                    .await?;
-            s3_get_block_transactions(s3_client, outer_bucket_name, s3_chain_id, block_hash)
-                .await
-                .context(format!("s3 get transactions failed, {block_hash}"))?
+            let block_hash = s3_get_block_hash_by_number(
+                s3_client,
+                outer_bucket_name,
+                s3_chain_id,
+                version,
+                number,
+            )
+            .await?;
+            s3_get_block_transactions(
+                s3_client,
+                outer_bucket_name,
+                s3_chain_id,
+                version,
+                block_hash,
+            )
+            .await
+            .context(format!("s3 get transactions failed, {block_hash}"))?
         }
     };
     Ok(transactions)
@@ -141,6 +176,7 @@ pub async fn s3_get_block_hash_by_number(
     s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     number: u64,
 ) -> Result<H256> {
     #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -149,7 +185,11 @@ pub async fn s3_get_block_hash_by_number(
         pub validation_hash: i64,
         pub is_fork: bool,
     }
-    let prefix = format!("{}/{}/", s3_chain_id, number);
+    let prefix = if version.is_empty() {
+        format!("{}/{}/", s3_chain_id, number)
+    } else {
+        format!("{}/{}/{}/", s3_chain_id, version, number)
+    };
     let list_output = s3_client
         .list_objects_v2()
         .bucket(bucket_name)
@@ -204,6 +244,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
     bucket_name: &str,
     outer_bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     number: u64,
 ) -> Result<(Block<H256>, BlockStorageDiff)> {
     let block_info = match rpc_client {
@@ -222,10 +263,15 @@ pub async fn s3_get_block_info_and_diff_by_number(
             block
         }
         None => {
-            let block_hash =
-                s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number)
-                    .await?;
-            s3_get_block_info(s3_client, bucket_name, s3_chain_id, block_hash)
+            let block_hash = s3_get_block_hash_by_number(
+                s3_client,
+                outer_bucket_name,
+                s3_chain_id,
+                version,
+                number,
+            )
+            .await?;
+            s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
                 .context(format!("s3 get block info failed, {block_hash}"))?
         }
@@ -235,6 +281,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
         s3_client,
         bucket_name,
         s3_chain_id,
+        version,
         block_info.header.parent_hash,
     )
     .await
@@ -247,6 +294,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
             s3_client,
             bucket_name,
             s3_chain_id,
+            version,
             block_info.header.state_root,
         )
         .await
@@ -269,6 +317,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     bucket_name: &str,
     outer_bucket_name: &str,
     s3_chain_id: &str,
+    version: &str,
     number: u64,
 ) -> Result<(Block<H256>, BlockStorageDiff)> {
     let block_info = match rpc_client {
@@ -287,10 +336,15 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
             block
         }
         None => {
-            let block_hash =
-                s3_get_block_hash_by_number(s3_client, outer_bucket_name, s3_chain_id, number)
-                    .await?;
-            s3_get_block_info(s3_client, bucket_name, s3_chain_id, block_hash)
+            let block_hash = s3_get_block_hash_by_number(
+                s3_client,
+                outer_bucket_name,
+                s3_chain_id,
+                version,
+                number,
+            )
+            .await?;
+            s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
                 .context(format!("s3 get block info failed, {block_hash}"))?
         }
@@ -299,6 +353,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
         s3_client,
         bucket_name,
         s3_chain_id,
+        version,
         block_info.header.state_root,
     )
     .await

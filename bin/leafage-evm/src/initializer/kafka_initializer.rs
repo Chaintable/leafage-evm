@@ -48,6 +48,7 @@ where
                 &self.kafka_s3_cfg.bucket_name,
                 &self.kafka_s3_cfg.outer_bucket_name,
                 &self.kafka_s3_cfg.s3_chain_id,
+                &self.kafka_s3_cfg.version,
                 self.genesis_number,
             )
             .await?;
