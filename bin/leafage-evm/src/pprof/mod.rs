@@ -32,8 +32,10 @@ pub struct PProf {
 
 impl PProf {
     pub fn new(address: std::net::SocketAddr) -> Self {
+        Self::set_jemalloc_prof(true);
         Self { address }
     }
+
     pub async fn start(self) -> anyhow::Result<()> {
         let router = axum::Router::new()
             .route("/debug/pprof/allocs", axum::routing::get(memory_profile))
@@ -47,6 +49,28 @@ impl PProf {
             .await
             .context("Failed to serve readiness")
             .map_err(Into::into)
+    }
+
+    fn set_jemalloc_prof(enable: bool) {
+        use std::ffi::{c_void, CString};
+        use std::mem::size_of;
+        use tikv_jemalloc_sys::mallctl;
+        let option = CString::new("prof.active").unwrap();
+        let mut new_val = enable as i32; // 0=false, 1=true
+        let mut old_val: i32 = 0;
+        let mut old_len = size_of::<i32>();
+
+        // invoke jemalloc mallctl change prof.active
+        unsafe {
+            mallctl(
+                option.as_ptr(), // "prof.active"
+                &mut old_val as *mut _ as *mut c_void,
+                &mut old_len as *mut _,
+                &mut new_val as *mut _ as *mut c_void,
+                size_of::<i32>() as _,
+            );
+        }
+        println!("Profiling state: old={}, new={}", old_val != 0, enable);
     }
 }
 
