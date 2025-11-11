@@ -92,17 +92,24 @@ async fn memory_profile() -> Result<axum::body::Bytes, PprofError> {
     Ok(axum::body::Bytes::from(pprof))
 }
 
-async fn memory_profile_flamegraph() -> Result<axum::body::Bytes, PprofError> {
+async fn memory_profile_flamegraph() -> Result<impl axum::response::IntoResponse, PprofError> {
+    use axum::body::Body;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::Response;
     let mut prof_ctl = jemalloc_pprof::PROF_CTL
         .as_ref()
         .ok_or(anyhow::anyhow!("heap profiling not activated"))?
         .try_lock()?;
 
     require_profiling_activated(&prof_ctl)?;
-    let pprof = prof_ctl
+    let svg = prof_ctl
         .dump_flamegraph()
         .context("Failed to dump flamegraph")?;
-    Ok(axum::body::Bytes::from(pprof))
+
+    Response::builder()
+        .header(CONTENT_TYPE, "image/svg+xml")
+        .body(Body::from(svg))
+        .map_err(Into::into)
 }
 fn require_profiling_activated(
     prof_ctl: &jemalloc_pprof::JemallocProfCtl,
