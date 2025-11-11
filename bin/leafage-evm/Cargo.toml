@@ -24,7 +24,7 @@ tracing-subscriber.workspace = true
 tikv-jemallocator = { workspace = true, features = ["profiling"] }
 tikv-jemalloc-ctl.workspace = true
 tikv-jemalloc-sys.workspace = true
-jemalloc_pprof = { workspace = true ,features = ["symbolize",]}
+jemalloc_pprof = { workspace = true, features = ["symbolize", "flamegraph"] }
 hyper.workspace = true
 alloy-rlp.workspace = true
 rdkafka.workspace = true

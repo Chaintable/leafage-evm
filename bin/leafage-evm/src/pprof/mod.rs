@@ -38,7 +38,10 @@ impl PProf {
     pub async fn start(self) -> anyhow::Result<()> {
         let router = axum::Router::new()
             .route("/debug/pprof/allocs", axum::routing::get(memory_profile))
-            .route("/debug/pprof/heap", axum::routing::get(memory_profile))
+            .route(
+                "/debug/pprof/allocs/flamegraph",
+                axum::routing::get(memory_profile_flamegraph),
+            )
             .route("/debug/pprof/profile", axum::routing::get(cpu_profile));
 
         let listener = tokio::net::TcpListener::bind(self.address)
@@ -79,20 +82,34 @@ async fn cpu_profile(Query(req): Query<CpuProfileReq>) -> Result<axum::body::Byt
 }
 
 async fn memory_profile() -> Result<axum::body::Bytes, PprofError> {
-    let prof_ctl = jemalloc_pprof::PROF_CTL.as_ref();
+    let mut prof_ctl = jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or(anyhow::anyhow!("heap profiling not activated"))?
+        .try_lock()?;
 
-    match prof_ctl {
-        None => Err(anyhow::anyhow!("heap profiling not activated").into()),
-        Some(prof_ctl) => {
-            let mut prof_ctl = prof_ctl.try_lock()?;
+    require_profiling_activated(&prof_ctl)?;
+    let pprof = prof_ctl.dump_pprof().context("Failed to dump pprof")?;
+    Ok(axum::body::Bytes::from(pprof))
+}
 
-            if !prof_ctl.activated() {
-                return Err(anyhow::anyhow!("heap profiling not activated").into());
-            }
+async fn memory_profile_flamegraph() -> Result<axum::body::Bytes, PprofError> {
+    let mut prof_ctl = jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or(anyhow::anyhow!("heap profiling not activated"))?
+        .try_lock()?;
 
-            let pprof = prof_ctl.dump_pprof().context("Failed to dump pprof")?;
-
-            Ok(axum::body::Bytes::from(pprof))
-        }
+    require_profiling_activated(&prof_ctl)?;
+    let pprof = prof_ctl
+        .dump_flamegraph()
+        .context("Failed to dump flamegraph")?;
+    Ok(axum::body::Bytes::from(pprof))
+}
+fn require_profiling_activated(
+    prof_ctl: &jemalloc_pprof::JemallocProfCtl,
+) -> Result<(), PprofError> {
+    if prof_ctl.activated() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("heap profiling not activated").into())
     }
 }
