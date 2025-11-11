@@ -38,6 +38,7 @@ impl PProf {
     pub async fn start(self) -> anyhow::Result<()> {
         let router = axum::Router::new()
             .route("/debug/pprof/allocs", axum::routing::get(memory_profile))
+            .route("/debug/pprof/heap", axum::routing::get(memory_profile))
             .route("/debug/pprof/profile", axum::routing::get(cpu_profile));
 
         let listener = tokio::net::TcpListener::bind(self.address)
@@ -89,7 +90,7 @@ async fn memory_profile() -> Result<axum::body::Bytes, PprofError> {
                 return Err(anyhow::anyhow!("heap profiling not activated").into());
             }
 
-            let pprof = prof_ctl.dump_pprof()?;
+            let pprof = prof_ctl.dump_pprof().context("Failed to dump pprof")?;
 
             Ok(axum::body::Bytes::from(pprof))
         }
