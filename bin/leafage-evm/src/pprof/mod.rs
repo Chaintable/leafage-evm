@@ -2,6 +2,7 @@ use anyhow::Context;
 use axum::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tracing::info;
 
 struct PprofError(anyhow::Error);
 impl<E> From<E> for PprofError
@@ -36,12 +37,9 @@ impl PProf {
     }
 
     pub async fn start(self) -> anyhow::Result<()> {
+        info!("starting pprof server at {}", self.address);
         let router = axum::Router::new()
             .route("/debug/pprof/allocs", axum::routing::get(memory_profile))
-            .route(
-                "/debug/pprof/allocs/flamegraph",
-                axum::routing::get(memory_profile_flamegraph),
-            )
             .route("/debug/pprof/profile", axum::routing::get(cpu_profile));
 
         let listener = tokio::net::TcpListener::bind(self.address)
@@ -92,25 +90,6 @@ async fn memory_profile() -> Result<axum::body::Bytes, PprofError> {
     Ok(axum::body::Bytes::from(pprof))
 }
 
-async fn memory_profile_flamegraph() -> Result<impl axum::response::IntoResponse, PprofError> {
-    use axum::body::Body;
-    use axum::http::header::CONTENT_TYPE;
-    use axum::response::Response;
-    let mut prof_ctl = jemalloc_pprof::PROF_CTL
-        .as_ref()
-        .ok_or(anyhow::anyhow!("heap profiling not activated"))?
-        .try_lock()?;
-
-    require_profiling_activated(&prof_ctl)?;
-    let svg = prof_ctl
-        .dump_flamegraph()
-        .context("Failed to dump flamegraph")?;
-
-    Response::builder()
-        .header(CONTENT_TYPE, "image/svg+xml")
-        .body(Body::from(svg))
-        .map_err(Into::into)
-}
 fn require_profiling_activated(
     prof_ctl: &jemalloc_pprof::JemallocProfCtl,
 ) -> Result<(), PprofError> {
