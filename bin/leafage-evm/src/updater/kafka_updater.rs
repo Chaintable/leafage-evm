@@ -125,19 +125,6 @@ where
         .context(format!("s3 get block info failed, {block_hash}"))
     }
 
-    #[inline]
-    async fn get_transactions(&self, block_num: u64) -> Result<Vec<DebankTransaction>> {
-        s3_get_block_transactions_by_number(
-            &self.rpc_client,
-            &self.s3_client,
-            &self.kafka_s3_cfg.outer_bucket_name,
-            &self.kafka_s3_cfg.s3_chain_id,
-            block_num,
-        )
-        .await
-        .context(format!("s3 get transactions failed, {block_num}"))
-    }
-
     fn clear(
         &self,
         presist_block_num: u64,
@@ -403,11 +390,37 @@ where
         let start_block_number = end_block_number
             .checked_sub(self.warmup_blocks as u64 - 1)
             .unwrap_or_default();
-        for block_num in start_block_number..=end_block_number {
-            let transactions = self.get_transactions(block_num).await?;
-            res.push(transactions);
+
+        let batch_size = self.init_task_queue_size as u64;
+        let mut current_start_block = start_block_number;
+        while current_start_block <= end_block_number {
+            let mut fetch_transactions_join_set = JoinSet::new();
+            let current_end_block =
+                std::cmp::min(start_block_number + batch_size - 1, end_block_number);
+            for block_num in current_start_block..=current_end_block {
+                let rpc_client = self.rpc_client.clone();
+                let s3_client = self.s3_client.clone();
+                let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
+                let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                fetch_transactions_join_set.spawn(async move {
+                    s3_get_block_transactions_by_number(
+                        &rpc_client,
+                        &s3_client,
+                        &outer_bucket_name,
+                        &s3_chain_id,
+                        block_num,
+                    )
+                    .await
+                    .context(format!("s3 get transactions failed, {block_num}"))
+                });
+            }
+            for transactions in fetch_transactions_join_set.join_all().await {
+                let transactions = transactions?;
+                res.push(transactions);
+            }
+            current_start_block += batch_size;
         }
-        info!(target: "updater", "Fetch init {} blocks", res.len());
+        info!(target: "updater", "Fetch {} warmup blocks", res.len());
         Ok(res)
     }
 
