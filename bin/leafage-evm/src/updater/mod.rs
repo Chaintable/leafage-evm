@@ -7,7 +7,7 @@ pub use kafka_updater::Updater as KafkaUpdater;
 use crate::utils::KafkaS3Config;
 use anyhow::Result;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{Block, DebankTransaction};
+use leafage_evm_types::DebankTransaction;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -33,10 +33,10 @@ where
         }
     }
 
-    pub async fn fetch_max_depth_blocks(&mut self) -> Result<Vec<Block<DebankTransaction>>> {
+    pub async fn fetch_warmup_blocks(&mut self) -> Result<Vec<Vec<DebankTransaction>>> {
         match self {
             Updater::Http(_) | Updater::None => Ok(Default::default()),
-            Updater::Kafka(updater) => updater.fetch_max_depth_blocks().await,
+            Updater::Kafka(updater) => updater.fetch_warmup_blocks().await,
         }
     }
 }
@@ -54,6 +54,7 @@ pub async fn updater_build<
     update_interval: Duration,
     max_diff_depth: usize,
     init_task_queue_size: usize,
+    warmup_blocks: usize,
 ) -> Result<Updater<Tree>> {
     match (rpc_url, kafka_s3_cfg) {
         (Some(rpc_url), None) => {
@@ -65,6 +66,7 @@ pub async fn updater_build<
             kafka_s3_cfg,
             max_diff_depth,
             init_task_queue_size,
+            warmup_blocks,
         )
         .await
         .map(Updater::Kafka),

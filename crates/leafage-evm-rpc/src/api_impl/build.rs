@@ -10,7 +10,7 @@ use jsonrpsee::{
     RpcModule,
 };
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
-use leafage_evm_types::{Address, Block, DebankErrorCode, DebankTransaction, PreErrorCode};
+use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
 use tracing::error;
 
@@ -19,7 +19,7 @@ pub struct ApiBuilder<DB> {
     cfg: MultiChainCfgEnv,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
-    replay_blocks: Option<Vec<Block<DebankTransaction>>>,
+    replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -53,7 +53,7 @@ where
         self
     }
 
-    pub fn with_replay_blocks(mut self, blocks: Vec<Block<DebankTransaction>>) -> Self {
+    pub fn with_replay_blocks(mut self, blocks: Vec<Vec<DebankTransaction>>) -> Self {
         self.replay_blocks = Some(blocks);
         self
     }
