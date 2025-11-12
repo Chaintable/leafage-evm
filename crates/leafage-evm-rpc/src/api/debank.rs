@@ -8,6 +8,9 @@ use leafage_evm_types::{
 #[rpc(server, client)]
 #[async_trait::async_trait]
 pub trait DebankApi {
+    #[method(name = "version")]
+    async fn version(&self) -> RpcResult<String>;
+
     #[method(name = "getAddressNonce")]
     async fn get_address_nonce(
         &self,

@@ -426,6 +426,7 @@ impl Command {
                         self.ovm_address.clone(),
                         self.archive,
                         self.normalize_state_key,
+                        self.kafka_s3_config.clone().unwrap_or_default().version,
                     )
                     .await?;
                 let updater_handle = updater_build(
@@ -496,6 +497,7 @@ impl Command {
                         self.ovm_address.clone(),
                         self.archive,
                         self.normalize_state_key,
+                        self.kafka_s3_config.clone().unwrap_or_default().version,
                     )
                     .await?;
                 let updater_handle = updater_build(
