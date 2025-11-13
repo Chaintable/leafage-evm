@@ -220,7 +220,6 @@ pub struct Command {
     #[arg(long, default_value = "128")]
     warmup_blocks: usize,
 
-    /// The address for profile server.
     /// The address for pprof server.
     /// Default: ""
     ///

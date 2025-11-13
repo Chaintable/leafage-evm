@@ -44,11 +44,11 @@ impl PProf {
 
         let listener = tokio::net::TcpListener::bind(self.address)
             .await
-            .context("Failed to bind readiness server")?;
+            .context("Failed to bind pprof server")?;
 
         axum::serve(listener, router.into_make_service())
             .await
-            .context("Failed to serve readiness")
+            .context("Failed to serve pprof server")
             .map_err(Into::into)
     }
 }
