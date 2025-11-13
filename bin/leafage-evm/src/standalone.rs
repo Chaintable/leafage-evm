@@ -20,6 +20,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
 use tracing::{error, info};
+use crate::pprof::PProf;
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
@@ -218,6 +219,13 @@ pub struct Command {
     /// This is only used when `readiness_addr` is set.
     #[arg(long, default_value = "128")]
     warmup_blocks: usize,
+
+    /// The address for pprof server.
+    /// Default: ""
+    ///
+    /// This address is used for the pprof server.
+    #[arg(long, default_value = "")]
+    pprof_addr: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -336,6 +344,13 @@ impl Command {
                 axum::serve(listener, app)
                     .await
                     .expect("Failed to serve readiness");
+            });
+        }
+
+        if !self.pprof_addr.is_empty(){
+            let pprof_server = PProf::new(self.pprof_addr.parse()?);
+            tokio::spawn(async move{
+                pprof_server.start().await.expect("Failed to start pprof server");
             });
         }
 
