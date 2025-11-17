@@ -154,7 +154,7 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
-                MultiChainCfgEnv::Bsc(chain_cfg)
+                MultiChainCfgEnv::Cosmos(chain_cfg)
             }
             _ => panic!("Unsupported evm type"),
         }

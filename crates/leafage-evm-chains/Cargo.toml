@@ -32,7 +32,6 @@ cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfiel
 cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = ["secp256k1"] }
-bytes = "1.10.1"
 
 [dev-dependencies]
 elliptic-curve.workspace = true

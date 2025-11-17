@@ -1,7 +1,7 @@
 use leafage_evm_types::MainnetSpecId;
 use std::ops::{Deref, DerefMut};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CosmosHardfork(MainnetSpecId);
 
 impl Deref for CosmosHardfork {

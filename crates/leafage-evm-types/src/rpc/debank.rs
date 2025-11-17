@@ -123,7 +123,7 @@ pub enum DebankErrorCode {
     DataBaseFailed = -39005,
     BlockNotFound = -39006,
     InvalidBlockID = -39007,
-    UnsupportedPrecompile = -390078,
+    UnsupportedPrecompile = -39008,
     #[allow(dead_code)]
     InternalError = -32603,
     TimeOut = -41002,
