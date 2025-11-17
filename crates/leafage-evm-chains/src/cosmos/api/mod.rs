@@ -127,7 +127,7 @@ where
         if let FrameInput::Call(ref call) = frame.input {
             if super::precompile::unsupported::is_unsupported(&call.target_address) {
                 return Err(ContextError::Custom(format!(
-                    "unsupported precompile address: {:?}",
+                    "unsupported precompile address: {}",
                     call.target_address
                 )));
             }
