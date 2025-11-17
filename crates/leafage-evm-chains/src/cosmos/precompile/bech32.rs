@@ -6,7 +6,6 @@ use leafage_evm_types::Bytes;
 use revm::precompile::{
     PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
 };
-use std::io::Read;
 
 pub const BECH32: PrecompileWithAddress = PrecompileWithAddress(
     address!("0x0000000000000000000000000000000000000400"),
@@ -105,7 +104,6 @@ fn valid_address(addr: &Address) -> PrecompileResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn test_bech32_convert() {
