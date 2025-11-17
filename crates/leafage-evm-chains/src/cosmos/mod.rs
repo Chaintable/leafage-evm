@@ -1,7 +1,7 @@
-mod precompile;
-mod hardforks;
 mod api;
+mod hardforks;
+mod precompile;
 
-pub use precompile::{CosmosPrecompiles,unsupported::is_unsupported};
+pub use api::{CosmosContext, CosmosEvm};
 pub use hardforks::CosmosHardfork;
-pub use api::{CosmosEvm,CosmosContext};
+pub use precompile::{unsupported::is_unsupported, CosmosPrecompiles};
