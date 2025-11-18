@@ -67,7 +67,7 @@ where
     }
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
-        self.set_tx(tx);
+        self.inner.ctx.set_tx(tx);
         CosmosHandler::default().inspect_run(self)
     }
 }
