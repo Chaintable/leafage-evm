@@ -118,7 +118,6 @@ where
         &mut self,
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        tracing::info!(target: "cosmos evm", "frame init frame input: {:?}",frame_input.frame_input);
         check_unsupported_precompiles(&frame_input.frame_input)?;
         self.inner.frame_init(frame_input)
     }
@@ -173,7 +172,7 @@ where
         &mut self,
         frame_init: <Self::Frame as FrameTr>::FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        tracing::info!(target: "cosmos evm", "inspect frame init input: {:?}",frame_init.frame_input);
+        check_unsupported_precompiles(&frame_init.frame_input)?;
         self.inner.inspect_frame_init(frame_init)
     }
 }
