@@ -1,4 +1,4 @@
-use crate::cosmos::{CosmosHardfork, CosmosPrecompiles};
+use crate::cosmos::{CosmosHardfork, CosmosPrecompiles, UNSUPPORTED_PRECOMPILE};
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv};
@@ -170,7 +170,9 @@ where
         self.inner.ctx_inspector_frame_instructions()
     }
 
-    fn inspect_frame_run(&mut self) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+    fn inspect_frame_run(
+        &mut self,
+    ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
         let frame = self.inner.frame_stack().get();
         tracing::info!(target: "cosmos evm", "inspect frame run input: {:?}",frame.input);
         check_unsupported_precompiles(&frame.input)?;
@@ -182,7 +184,7 @@ fn check_unsupported_precompiles<DB>(frame_input: &FrameInput) -> Result<(), Con
     if let FrameInput::Call(ref call) = frame_input {
         if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
             return Err(ContextError::Custom(format!(
-                "unsupported precompile address: {}",
+                "{UNSUPPORTED_PRECOMPILE}: {}",
                 call.target_address
             )));
         }

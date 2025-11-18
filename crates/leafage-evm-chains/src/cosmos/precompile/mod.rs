@@ -46,6 +46,8 @@ impl From<CosmosPrecompiles> for EthPrecompiles {
 
 pub(crate) mod unsupported {
     use revm::primitives::{address, Address};
+    use std::collections::HashSet;
+    use std::sync::LazyLock;
 
     const STAKING: Address = address!("0x0000000000000000000000000000000000000800");
     const DISTRIBUTION: Address = address!("0x0000000000000000000000000000000000000801");
@@ -53,11 +55,12 @@ pub(crate) mod unsupported {
     const BANK: Address = address!("0x0000000000000000000000000000000000000804");
     const GOVERNANCE: Address = address!("0x0000000000000000000000000000000000000805");
     const SLASHING: Address = address!("0x0000000000000000000000000000000000000806");
-
-    const UNSUPPORTED_LIST: [Address; 6] =
-        [STAKING, DISTRIBUTION, ICS20, BANK, GOVERNANCE, SLASHING];
+    pub static UNSUPPORTED_LIST: LazyLock<HashSet<Address>> = LazyLock::new(|| {
+        let unsupported_addresses = vec![STAKING, DISTRIBUTION, ICS20, BANK, GOVERNANCE, SLASHING];
+        unsupported_addresses.into_iter().collect()
+    });
 
     pub fn is_unsupported(addr: &Address) -> bool {
-        UNSUPPORTED_LIST.contains(&addr)
+        UNSUPPORTED_LIST.contains(addr)
     }
 }
