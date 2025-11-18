@@ -1,6 +1,9 @@
 use crate::cosmos::api::{CosmosContext, CosmosEvm};
+use crate::cosmos::handler::CosmosHandler;
 use alloy_evm::Database;
-use revm::context::TxEnv;
+use revm::context::{ContextSetters, TxEnv};
+use revm::handler::Handler;
+use revm::inspector::InspectorHandler;
 use revm::{
     context::BlockEnv,
     context_interface::{
@@ -27,8 +30,8 @@ where
     }
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
-        tracing::info!(target: "cosmos evm", "transact one tx {:?}", tx);
-        self.inner.transact_one(tx)
+        self.inner.ctx.set_tx(tx);
+        CosmosHandler::default().run(self)
     }
 
     fn finalize(&mut self) -> Self::State {
@@ -36,7 +39,10 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
-        self.inner.replay()
+        CosmosHandler::default().run(self).map(|result| {
+            let state = self.finalize();
+            ResultAndState::new(result, state)
+        })
     }
 }
 
@@ -61,7 +67,8 @@ where
     }
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
-        self.inner.inspect_one_tx(tx)
+        self.set_tx(tx);
+        CosmosHandler::default().inspect_run(self)
     }
 }
 

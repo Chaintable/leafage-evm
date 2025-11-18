@@ -7,10 +7,11 @@ use revm::context::{Evm, JournalTr, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
 use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult};
+use revm::inspector::InspectorEvmTr;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::FrameInput;
-use revm::Journal;
+use revm::{Inspector, Journal};
 use std::ops::{Deref, DerefMut};
 
 mod exec;
@@ -134,6 +135,39 @@ where
         result: FrameResult,
     ) -> Result<Option<FrameResult>, ContextDbError<Self::Context>> {
         self.inner.frame_return_result(result)
+    }
+}
+
+impl<DB, INSP> InspectorEvmTr for CosmosEvm<DB, INSP>
+where
+    DB: Database,
+    INSP: Inspector<CosmosContext<DB>>,
+{
+    type Inspector = INSP;
+
+    fn inspector(&mut self) -> &mut Self::Inspector {
+        self.inner.inspector()
+    }
+
+    fn ctx_inspector(&mut self) -> (&mut Self::Context, &mut Self::Inspector) {
+        self.inner.ctx_inspector()
+    }
+
+    fn ctx_inspector_frame(
+        &mut self,
+    ) -> (&mut Self::Context, &mut Self::Inspector, &mut Self::Frame) {
+        self.inner.ctx_inspector_frame()
+    }
+
+    fn ctx_inspector_frame_instructions(
+        &mut self,
+    ) -> (
+        &mut Self::Context,
+        &mut Self::Inspector,
+        &mut Self::Frame,
+        &mut Self::Instructions,
+    ) {
+        self.inner.ctx_inspector_frame_instructions()
     }
 }
 

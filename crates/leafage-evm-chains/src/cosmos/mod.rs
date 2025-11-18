@@ -1,4 +1,5 @@
 mod api;
+mod handler;
 mod hardforks;
 mod precompile;
 
