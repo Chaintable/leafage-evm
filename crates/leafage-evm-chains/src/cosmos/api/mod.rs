@@ -1,4 +1,4 @@
-use crate::cosmos::{CosmosHardfork, CosmosPrecompiles, UNSUPPORTED_PRECOMPILE};
+use crate::cosmos::{CosmosHardfork, CosmosPrecompiles};
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv};
@@ -6,7 +6,7 @@ use revm::context::{Context, ContextError, FrameStack};
 use revm::context::{Evm, JournalTr, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
-use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult};
+use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, FrameTr};
 use revm::inspector::InspectorEvmTr;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
@@ -118,15 +118,14 @@ where
         &mut self,
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        tracing::info!(target: "cosmos evm", "frame init frame input: {:?}",frame_input.frame_input);
+        check_unsupported_precompiles(&frame_input.frame_input)?;
         self.inner.frame_init(frame_input)
     }
 
     fn frame_run(
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
-        let frame = self.inner.frame_stack().get();
-        tracing::info!(target: "cosmos evm", "frame run input: {:?}",frame.input);
-        check_unsupported_precompiles(&frame.input)?;
         self.inner.frame_run()
     }
 
@@ -170,13 +169,12 @@ where
         self.inner.ctx_inspector_frame_instructions()
     }
 
-    fn inspect_frame_run(
+    fn inspect_frame_init(
         &mut self,
-    ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
-        let frame = self.inner.frame_stack().get();
-        tracing::info!(target: "cosmos evm", "inspect frame run input: {:?}",frame.input);
-        check_unsupported_precompiles(&frame.input)?;
-        self.inner.inspect_frame_run()
+        frame_init: <Self::Frame as FrameTr>::FrameInit,
+    ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        tracing::info!(target: "cosmos evm", "inspect frame init input: {:?}",frame_init.frame_input);
+        self.inner.inspect_frame_init(frame_init)
     }
 }
 
@@ -184,7 +182,7 @@ fn check_unsupported_precompiles<DB>(frame_input: &FrameInput) -> Result<(), Con
     if let FrameInput::Call(ref call) = frame_input {
         if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
             return Err(ContextError::Custom(format!(
-                "{UNSUPPORTED_PRECOMPILE}: {}",
+                "unsupported precompile address: {}",
                 call.target_address
             )));
         }
