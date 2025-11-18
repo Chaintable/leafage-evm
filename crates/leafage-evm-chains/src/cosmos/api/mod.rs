@@ -124,14 +124,7 @@ where
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
         let frame = self.inner.frame_stack().get();
-        if let FrameInput::Call(ref call) = frame.input {
-            if super::precompile::unsupported::is_unsupported(&call.target_address) {
-                return Err(ContextError::Custom(format!(
-                    "unsupported precompile address: {}",
-                    call.target_address
-                )));
-            }
-        }
+        check_unsupported_precompiles(&frame.input)?;
         self.inner.frame_run()
     }
 
@@ -141,4 +134,16 @@ where
     ) -> Result<Option<FrameResult>, ContextDbError<Self::Context>> {
         self.inner.frame_return_result(result)
     }
+}
+
+fn check_unsupported_precompiles<DB>(frame_input: &FrameInput) -> Result<(), ContextError<DB>> {
+    if let FrameInput::Call(ref call) = frame_input {
+        if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
+            return Err(ContextError::Custom(format!(
+                "unsupported precompile address: {}",
+                call.target_address
+            )));
+        }
+    }
+    Ok(())
 }
