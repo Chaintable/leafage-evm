@@ -169,6 +169,13 @@ where
     ) {
         self.inner.ctx_inspector_frame_instructions()
     }
+
+    fn inspect_frame_run(&mut self) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+        let frame = self.inner.frame_stack().get();
+        tracing::info!(target: "cosmos evm", "inspect frame run input: {:?}",frame.input);
+        check_unsupported_precompiles(&frame.input)?;
+        self.inner.inspect_frame_run()
+    }
 }
 
 fn check_unsupported_precompiles<DB>(frame_input: &FrameInput) -> Result<(), ContextError<DB>> {
