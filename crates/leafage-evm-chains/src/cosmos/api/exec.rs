@@ -27,6 +27,7 @@ where
     }
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        tracing::info!(target: "cosmos evm", "transact one tx {:?}", tx);
         self.inner.transact_one(tx)
     }
 

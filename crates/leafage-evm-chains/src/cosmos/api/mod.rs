@@ -124,6 +124,7 @@ where
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
         let frame = self.inner.frame_stack().get();
+        tracing::info!(target: "cosmos evm", "frame run input: {:?}",frame.input);
         check_unsupported_precompiles(&frame.input)?;
         self.inner.frame_run()
     }
