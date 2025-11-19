@@ -15,6 +15,7 @@ use jsonrpsee::{
 };
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
+use std::str::FromStr;
 use std::time::Duration;
 use tracing::error;
 
@@ -1205,7 +1206,7 @@ where
             &address!("0x5853ed4f26a3fcea565b3fbc698bb19cdf6deb85"),
             erc20_addresses
                 .into_iter()
-                .map(|address| Address::from_slice(address.as_bytes()))
+                .filter_map(|address| Address::from_str(address).ok())
                 .collect::<Vec<_>>()
                 .as_slice(),
         )

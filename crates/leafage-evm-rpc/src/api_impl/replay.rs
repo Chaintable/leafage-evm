@@ -76,6 +76,7 @@ where
         address: &Address,
         erc20_addresses: &[Address],
     ) -> RpcResult<()> {
+        let start = std::time::Instant::now();
         let input = IERC20::balanceOfCall { owner: *address };
         let requests = erc20_addresses
             .iter()
@@ -90,6 +91,7 @@ where
             .collect();
         self.contract_multi_call(requests, None, None, None, None, None, None)
             .await?;
+        info!(target: "warmup", "Warmup erc20 {} tokens", erc20_addresses.len());
         Ok(())
     }
 }
