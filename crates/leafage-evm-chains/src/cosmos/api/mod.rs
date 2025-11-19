@@ -182,7 +182,7 @@ fn check_unsupported_precompiles<DB>(frame_input: &FrameInput) -> Result<(), Con
         if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
             return Err(ContextError::Custom(format!(
                 "unsupported precompile address: {}",
-                call.target_address
+                call.bytecode_address
             )));
         }
     }

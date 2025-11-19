@@ -7,7 +7,7 @@ use revm::interpreter::interpreter::EthInterpreter;
 use revm::Inspector;
 
 pub struct CosmosHandler<DB: revm::database::Database, INSP> {
-    pub _phantom: core::marker::PhantomData<(CosmosEvm<DB, INSP>, EVMError<DB::Error>, EthFrame)>,
+    _phantom: core::marker::PhantomData<(CosmosEvm<DB, INSP>, EVMError<DB::Error>, EthFrame)>,
 }
 
 impl<DB: revm::database::Database, INSP> CosmosHandler<DB, INSP> {
