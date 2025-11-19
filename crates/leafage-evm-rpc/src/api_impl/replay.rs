@@ -91,7 +91,7 @@ where
             .collect();
         self.contract_multi_call(requests, None, None, None, None, None, None)
             .await?;
-        info!(target: "warmup", "Warmup erc20 {} tokens", erc20_addresses.len());
+        info!(target: "warmup", "Warmup erc20 {} tokens time elapsed: {:?}", erc20_addresses.len(),start.elapsed());
         Ok(())
     }
 }
