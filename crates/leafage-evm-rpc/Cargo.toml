@@ -26,6 +26,7 @@ tracing.workspace = true
 alloy.workspace = true
 alloy-rlp.workspace = true
 alloy-evm.workspace = true
+alloy-contract.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true
 hyper.workspace = true

@@ -1,14 +1,35 @@
 use crate::api_impl::core::{Api, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter};
 use crate::api_impl::{ApiCore, EvmExecutor};
 use crate::DebankApiServer;
+use alloy::core::sol;
+use alloy::primitives::TxKind;
 use alloy::rpc::types::TransactionRequest;
+use alloy::sol_types::SolCall;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
-    BlockId, BlockNumberOrTag, BlockType, DebankBlockContext, DebankErrorCode, DebankTransaction,
+    BlockId, BlockNumberOrTag, BlockType, CallRequest, DebankBlockContext, DebankErrorCode,
+    DebankTransaction,
 };
+use revm::primitives::Address;
 use tracing::{info, warn};
 
+sol! {
+    #[sol(rpc)]
+    interface IERC20 {
+        #[derive(Debug)]
+        function name() external view returns (string);
+        function symbol() external view returns (string);
+        function decimals() external view returns (uint8);
+        function totalSupply() external view returns (uint256);
+        function balanceOf(address owner) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
+        function approve(address spender, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+        function mint(address to, uint256 amount) external;
+        function burn(uint256 amount) external;
+    }
+}
 impl<C> Api<C>
 where
     C: ApiCore,
@@ -48,6 +69,27 @@ where
             }
         }
         info!(target: "warmup", "Replay {block_len} blocks {transactions_len} transactions time elapsed: {:?}", start.elapsed());
+        Ok(())
+    }
+    pub(crate) async fn warmup_erc20_address(
+        &self,
+        address: &Address,
+        erc20_addresses: &[Address],
+    ) -> RpcResult<()> {
+        let input = IERC20::balanceOfCall { owner: *address };
+        let requests = erc20_addresses
+            .iter()
+            .map(|address| {
+                let request = CallRequest {
+                    to: TxKind::Call(*address).into(),
+                    input: input.abi_encode().into(),
+                    ..Default::default()
+                };
+                request
+            })
+            .collect();
+        self.contract_multi_call(requests, None, None, None, None, None, None)
+            .await?;
         Ok(())
     }
 }
