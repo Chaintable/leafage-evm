@@ -1,14 +1,14 @@
 //! Credits to <https://github.com/bnb-chain/revm/blob/d66170e712460ae766fc26a063f106658ce33e9d/crates/precompile/src/double_sign.rs>
 
+use crate::bsc::precompile::error::BscPrecompileError;
+use alloy::primitives::{keccak256, BlockNumber, ChainId, B256, B512};
 use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use core::cmp::Ordering;
-use alloy::primitives::{keccak256, BlockNumber, ChainId, B256, B512};
+use leafage_evm_types::{Bytes, U256};
 use revm::precompile::{
     secp256k1, u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult,
     PrecompileWithAddress,
 };
-use leafage_evm_types::{Bytes, U256};
-use crate::bsc::precompile::error::BscPrecompileError;
 
 /// Double sign evidence validation precompile for BSC.
 pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: PrecompileWithAddress =
@@ -82,16 +82,23 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64) -> Precompi
     }
 
     let revert = || {
-        Ok(PrecompileOutput::new_reverted(DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE, Default::default()))
+        Ok(PrecompileOutput::new_reverted(
+            DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
+            Default::default(),
+        ))
     };
 
     let Ok(evidence) = DoubleSignEvidence::decode(&mut input.iter().as_ref()) else {
-        return revert()
+        return revert();
     };
 
-    let Ok(header1) = Header::decode(&mut evidence.header_bytes1.as_ref()) else { return revert() };
+    let Ok(header1) = Header::decode(&mut evidence.header_bytes1.as_ref()) else {
+        return revert();
+    };
 
-    let Ok(header2) = Header::decode(&mut evidence.header_bytes2.as_ref()) else { return revert() };
+    let Ok(header2) = Header::decode(&mut evidence.header_bytes2.as_ref()) else {
+        return revert();
+    };
 
     // basic check
     if header1.number.to_be_bytes().len() > 32 || header2.number.to_be_bytes().len() > 32 {
@@ -124,11 +131,15 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64) -> Precompi
 
     let recid1 = sig1[64];
     let sig1 = <&B512>::try_from(&sig1[..64]).unwrap();
-    let Ok(addr1) = secp256k1::ecrecover(sig1, recid1, &msg_hash1) else { return revert() };
+    let Ok(addr1) = secp256k1::ecrecover(sig1, recid1, &msg_hash1) else {
+        return revert();
+    };
 
     let recid2 = sig2[64];
     let sig2 = <&B512>::try_from(&sig2[..64]).unwrap();
-    let Ok(addr2) = secp256k1::ecrecover(sig2, recid2, &msg_hash2) else { return revert() };
+    let Ok(addr2) = secp256k1::ecrecover(sig2, recid2, &msg_hash2) else {
+        return revert();
+    };
 
     if !addr1.eq(&addr2) {
         return Err(BscPrecompileError::DoubleSignInvalidEvidence.into());
@@ -139,7 +150,10 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64) -> Precompi
     res[..20].clone_from_slice(signer);
     res[52 - header1.number.to_be_bytes().len()..].clone_from_slice(&header1.number.to_be_bytes());
 
-    Ok(PrecompileOutput::new(DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE, Bytes::copy_from_slice(&res)))
+    Ok(PrecompileOutput::new(
+        DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
+        Bytes::copy_from_slice(&res),
+    ))
 }
 
 fn seal_hash(header: &Header, chain_id: ChainId) -> B256 {
@@ -168,8 +182,8 @@ fn seal_hash(header: &Header, chain_id: ChainId) -> B256 {
 
 #[cfg(test)]
 mod tests {
-    use leafage_evm_types::hex;
     use super::*;
+    use leafage_evm_types::hex;
 
     #[test]
     fn test_double_sign_evidence_validation_run() {
@@ -236,6 +250,9 @@ mod tests {
         let input = hex::decode("f9066b38b90332f9032fa01062d3d5015b9242bc193a9b0769f3d3780ecb55f97f40a752ae26d0b68cd0d8a0fae1a05fcb14bfd9b8a9f2b65007a9b6c2000de0627a73be644dd993d32342c494df87f0e2b8519ea2dd4abd8b639cdd628497ed25a0f385cc58ed297ff0d66eb5580b02853d3478ba418b1819ac659ee05df49b9794a0bf88464af369ed6b8cf02db00f0b9556ffa8d49cd491b00952a7f83431446638a00a6d0870e586a76278fbfdcedf76ef6679af18fc1f9137cfad495f434974ea81b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a1010000000000000000000000000000000000000000000000000000000000000000830f4240830f42408465bc6996b90115d983010306846765746889676f312e32302e3131856c696e7578000053474aa9f8b25fb860b0844a5082bfaa2299d2a23f076e2f6b17b15f839cc3e7d5a875656f6733fd4b87ba3401f906d15f3dea263cd9a6076107c7db620a4630dd3832c4a4b57eb8f497e28a3d69e5c03b30205c4b45675747d513e1accd66329770f3c35b18c9d023f84c84023a5ad6a086a28d985d9a6c8e7f9a4feadd5ace0adba9818e1e1727edca755fcc0bd8344684023a5ad7a0bc3492196b2e68b8e6ceea87cfa7588b4d590089eb885c4f2c1e9d9fb450f7b980988e1b9d0beb91dab063e04879a24c43d33baae3759dee41fd62ffa83c77fd202bea27a829b49e8025bdd198393526dd12b223ab16052fd26a43f3aabf63e76901a0232c9ba2d41b40d36ed794c306747bcbc49bf61a0f37409c18bfe2b5bef26a2d880000000000000000b90332f9032fa01062d3d5015b9242bc193a9b0769f3d3780ecb55f97f40a752ae26d0b68cd0d8a0b2789a5357827ed838335283e15c4dcc42b9bebcbf2919a18613246787e2f96094df87f0e2b8519ea2dd4abd8b639cdd628497ed25a071ce4c09ee275206013f0063761bc19c93c13990582f918cc57333634c94ce89a00e095703e5c9b149f253fe89697230029e32484a410b4b1f2c61442d73c3095aa0d317ae19ede7c8a2d3ac9ef98735b049bcb7278d12f48c42b924538b60a25e12b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a1010000000000000000000000000000000000000000000000000000000000000000830f4240830f42408465bc6996b90115d983010306846765746889676f312e32302e3131856c696e7578000053474aa9f8b25fb860b0844a5082bfaa2299d2a23f076e2f6b17b15f839cc3e7d5a875656f6733fd4b87ba3401f906d15f3dea263cd9a6076107c7db620a4630dd3832c4a4b57eb8f497e28a3d69e5c03b30205c4b45675747d513e1accd66329770f3c35b18c9d023f84c84023a5ad6a086a28d985d9a6c8e7f9a4feadd5ace0adba9818e1e1727edca755fcc0bd8344684023a5ad7a0bc3492196b2e68b8e6ceea87cfa7588b4d590089eb885c4f2c1e9d9fb450f7b9804c71ed015dd0c5c2d7393b68c2927f83f0a5da4c66f761f09e2f950cc610832c7876144599368404096ddef0eadacfde57717e2c7d23982b927285b797d41bfa00a0b56228685be711834d0f154292d07826dea42a0fad3e4f56c31470b7fbfbea26880000000000000000").unwrap();
 
         let res = double_sign_evidence_validation_run(&Bytes::from(input), 10_000);
-        assert_eq!(res, Ok(PrecompileOutput::new_reverted(10_000, Default::default())));
+        assert_eq!(
+            res,
+            Ok(PrecompileOutput::new_reverted(10_000, Default::default()))
+        );
     }
 }

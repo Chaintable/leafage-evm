@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+use crate::bsc::hardforks::bsc::BscHardfork;
 use once_cell::race::OnceBox;
 use revm::{
     context::Cfg,
@@ -7,7 +8,6 @@ use revm::{
     precompile::{bls12_381, kzg_point_evaluation, modexp, secp256r1, Precompiles},
 };
 use std::boxed::Box;
-use crate::bsc::hardforks::bsc::BscHardfork;
 
 mod bls;
 mod cometbft;

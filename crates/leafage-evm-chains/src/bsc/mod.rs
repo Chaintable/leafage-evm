@@ -1,5 +1,5 @@
-mod precompile;
 pub mod hardforks;
+mod precompile;
 pub use hardforks::{bsc::BscHardfork, BscHardforks};
 
 pub mod api;

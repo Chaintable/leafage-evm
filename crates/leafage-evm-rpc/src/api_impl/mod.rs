@@ -26,3 +26,4 @@ mod mainnet;
 mod bsc;
 mod op;
 mod replay;
+mod cosmos;

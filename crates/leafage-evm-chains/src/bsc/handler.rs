@@ -3,7 +3,11 @@
 use alloy::primitives::address;
 use revm::{bytecode::Bytecode, primitives::eip7702};
 
+use crate::bsc::api::{BscContext, BscEvm};
+use crate::bsc::blacklist;
 use alloy_evm::Database;
+use leafage_evm_types::{Address, U256};
+use revm::primitives::KECCAK_EMPTY;
 use revm::{
     context::{
         result::{EVMError, ExecutionResult, FromStringError, HaltReason},
@@ -16,10 +20,6 @@ use revm::{
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
     primitives::hardfork::SpecId,
 };
-use revm::primitives::KECCAK_EMPTY;
-use leafage_evm_types::{Address, U256};
-use crate::bsc::api::{BscContext, BscEvm};
-use crate::bsc::blacklist;
 
 const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
 
@@ -29,7 +29,9 @@ pub struct BscHandler<DB: revm::database::Database, INSP> {
 
 impl<DB: revm::database::Database, INSP> BscHandler<DB, INSP> {
     pub fn new() -> Self {
-        Self { mainnet: MainnetHandler::default() }
+        Self {
+            mainnet: MainnetHandler::default(),
+        }
     }
 }
 
@@ -145,7 +147,10 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let tx = ctx.tx();
 
         if tx.is_system_transaction {
-            return Ok(InitialAndFloorGas { initial_gas: 0, floor_gas: 0 });
+            return Ok(InitialAndFloorGas {
+                initial_gas: 0,
+                floor_gas: 0,
+            });
         }
 
         self.mainnet.validate_initial_tx_gas(evm)
@@ -192,8 +197,11 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         }
 
         // used gas with refund calculated.
-        let gas_refunded =
-            if evm.ctx().tx().is_system_transaction { 0 } else { result.gas().refunded() as u64 };
+        let gas_refunded = if evm.ctx().tx().is_system_transaction {
+            0
+        } else {
+            result.gas().refunded() as u64
+        };
         let final_gas_used = result.gas().spent() - gas_refunded;
         let output = result.output();
         let instruction_result = result.into_interpreter_result();
@@ -209,12 +217,14 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 logs,
                 output,
             },
-            SuccessOrHalt::Revert => {
-                ExecutionResult::Revert { gas_used: final_gas_used, output: output.into_data() }
-            }
-            SuccessOrHalt::Halt(reason) => {
-                ExecutionResult::Halt { reason, gas_used: final_gas_used }
-            }
+            SuccessOrHalt::Revert => ExecutionResult::Revert {
+                gas_used: final_gas_used,
+                output: output.into_data(),
+            },
+            SuccessOrHalt::Halt(reason) => ExecutionResult::Halt {
+                reason,
+                gas_used: final_gas_used,
+            },
             // Only two internal return flags.
             flag @ (SuccessOrHalt::FatalExternalError | SuccessOrHalt::Internal(_)) => {
                 panic!(

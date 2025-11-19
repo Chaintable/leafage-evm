@@ -1,27 +1,28 @@
-use crate::bsc::api::{BscContext, BscEvm};
-use crate::bsc::handler::BscHandler;
-use crate::bsc::transaction::BscTxEnv;
+use crate::cosmos::api::{CosmosContext, CosmosEvm};
+use crate::cosmos::handler::CosmosHandler;
 use alloy_evm::Database;
+use revm::context::{ContextSetters, TxEnv};
+use revm::handler::Handler;
+use revm::inspector::InspectorHandler;
 use revm::{
-    context::{BlockEnv, ContextSetters},
+    context::BlockEnv,
     context_interface::{
         result::{EVMError, ExecutionResult, ResultAndState},
         ContextTr,
     },
-    handler::Handler,
-    inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorHandler},
+    inspector::{InspectCommitEvm, InspectEvm, Inspector},
     state::EvmState,
     DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
 };
 
-impl<DB, INSP> ExecuteEvm for BscEvm<DB, INSP>
+impl<DB, INSP> ExecuteEvm for CosmosEvm<DB, INSP>
 where
     DB: Database,
 {
     type ExecutionResult = ExecutionResult;
     type State = EvmState;
     type Error = EVMError<DB::Error>;
-    type Tx = BscTxEnv;
+    type Tx = TxEnv;
     type Block = BlockEnv;
 
     fn set_block(&mut self, block: Self::Block) {
@@ -30,7 +31,7 @@ where
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        BscHandler::new().run(self)
+        CosmosHandler::default().run(self)
     }
 
     fn finalize(&mut self) -> Self::State {
@@ -38,14 +39,14 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
-        BscHandler::new().run(self).map(|result| {
+        CosmosHandler::default().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
         })
     }
 }
 
-impl<DB, INSP> ExecuteCommitEvm for BscEvm<DB, INSP>
+impl<DB, INSP> ExecuteCommitEvm for CosmosEvm<DB, INSP>
 where
     DB: Database + DatabaseCommit,
 {
@@ -54,10 +55,10 @@ where
     }
 }
 
-impl<DB, INSP> InspectEvm for BscEvm<DB, INSP>
+impl<DB, INSP> InspectEvm for CosmosEvm<DB, INSP>
 where
     DB: Database,
-    INSP: Inspector<BscContext<DB>>,
+    INSP: Inspector<CosmosContext<DB>>,
 {
     type Inspector = INSP;
 
@@ -67,13 +68,13 @@ where
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        BscHandler::new().inspect_run(self)
+        CosmosHandler::default().inspect_run(self)
     }
 }
 
-impl<DB, INSP> InspectCommitEvm for BscEvm<DB, INSP>
+impl<DB, INSP> InspectCommitEvm for CosmosEvm<DB, INSP>
 where
     DB: Database + DatabaseCommit,
-    INSP: Inspector<BscContext<DB>>,
+    INSP: Inspector<CosmosContext<DB>>,
 {
 }

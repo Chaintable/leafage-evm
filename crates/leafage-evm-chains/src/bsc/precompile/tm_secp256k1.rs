@@ -1,11 +1,11 @@
 //! Credits to <https://github.com/bnb-chain/revm/blob/d66170e712460ae766fc26a063f106658ce33e9d/crates/precompile/src/tm_secp256k1.rs>
 
+use leafage_evm_types::Bytes;
 use revm::precompile::{
     u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
 };
 use secp256k1::{ecdsa, Message, PublicKey};
 use tendermint::{account, public_key};
-use leafage_evm_types::Bytes;
 
 /// Tendermint SECP256K1 signature recover precompile for BSC.
 pub(crate) const TM_SECP256K1_SIGNATURE_RECOVER: PrecompileWithAddress =
@@ -30,8 +30,8 @@ fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64) -> Precompil
     }
 
     let input_length = input.len();
-    if input_length !=
-        SECP256K1_PUBKEY_LENGTH + SECP256K1_SIGNATURE_LENGTH + SECP256K1_SIGNATURE_MSGHASH_LENGTH
+    if input_length
+        != SECP256K1_PUBKEY_LENGTH + SECP256K1_SIGNATURE_LENGTH + SECP256K1_SIGNATURE_MSGHASH_LENGTH
     {
         return Err(PrecompileError::other("invalid input"));
     }
@@ -42,7 +42,9 @@ fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64) -> Precompil
     };
 
     let message = Message::from_digest(
-        input[SECP256K1_PUBKEY_LENGTH + SECP256K1_SIGNATURE_LENGTH..].try_into().unwrap(),
+        input[SECP256K1_PUBKEY_LENGTH + SECP256K1_SIGNATURE_LENGTH..]
+            .try_into()
+            .unwrap(),
     );
 
     let sig = match ecdsa::Signature::from_compact(
@@ -72,8 +74,8 @@ fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64) -> Precompil
 
 #[cfg(test)]
 mod tests {
-    use leafage_evm_types::hex;
     use super::*;
+    use leafage_evm_types::hex;
 
     #[test]
     fn test_tm_secp256k1_signature_recover_run_local_key() {

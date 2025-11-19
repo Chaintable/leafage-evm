@@ -1894,6 +1894,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 
 [[package]]
+name = "bech32"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
+
+[[package]]
 name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2723,6 +2729,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -2978,6 +2985,7 @@ dependencies = [
  "ff 0.13.1",
  "generic-array 0.14.7",
  "group 0.13.0",
+ "pem-rfc7468",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "sec1 0.7.3",
@@ -4482,20 +4490,27 @@ version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-chains",
+ "alloy-contract",
  "alloy-evm",
  "alloy-hardforks 0.4.0",
  "alloy-rlp",
+ "alloy-sol-types",
+ "bech32",
  "bls_on_arkworks",
  "cometbft",
  "cometbft-light-client",
  "cometbft-light-client-verifier",
  "cometbft-proto",
+ "elliptic-curve 0.13.8",
  "leafage-evm-types",
+ "num-bigint",
  "once_cell",
+ "p256 0.13.2",
  "parity-bytes",
  "prost 0.12.6",
  "revm",
  "secp256k1 0.30.0",
+ "sha2 0.10.9",
  "tendermint",
 ]
 
@@ -5354,6 +5369,15 @@ name = "peg-runtime"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "132dca9b868d927b35b5dd728167b2dee150eb1ad686008fc71ccb298b776fca"
+
+[[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
 
 [[package]]
 name = "percent-encoding"

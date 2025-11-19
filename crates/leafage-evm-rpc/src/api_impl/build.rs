@@ -2,7 +2,10 @@ use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
-use crate::api_impl::core::{Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, MultiChainCfgEnv};
+use crate::api_impl::core::{
+    Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
+    ToJsonRpcError, TxSetter,
+};
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
@@ -102,11 +105,7 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                if let Some(blocks) = self.replay_blocks.take() {
-                    if let Err(err) = api.replay_blocks(blocks).await {
-                        error!("Error while replaying blocks: {}", err);
-                    }
-                }
+                replay_blocks(&api, self.replay_blocks.take()).await;
                 register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Op(cfg) => {
@@ -121,11 +120,7 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                if let Some(blocks) = self.replay_blocks.take() {
-                    if let Err(err) = api.replay_blocks(blocks).await {
-                        error!("Error while replaying blocks: {}", err);
-                    }
-                }
+                replay_blocks(&api, self.replay_blocks.take()).await;
                 register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Bsc(cfg) => {
@@ -140,16 +135,43 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                if let Some(blocks) = self.replay_blocks.take() {
-                    if let Err(err) = api.replay_blocks(blocks).await {
-                        error!("Error while replaying blocks: {}", err);
-                    }
-                }
+                replay_blocks(&api, self.replay_blocks.take()).await;
+                register_api(&mut rpc_module, api)?;
+            }
+            MultiChainCfgEnv::Cosmos(cfg) => {
+                let api_impl = ApiImpl::new(
+                    self.db,
+                    cfg.clone(),
+                    rpc_timeout,
+                    ovm_address.clone(),
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                );
+                let api = Api::new(api_impl);
+                replay_blocks(&api, self.replay_blocks.take()).await;
                 register_api(&mut rpc_module, api)?;
             }
         }
         let handle = server.start(rpc_module);
         Ok(handle)
+    }
+}
+
+async fn replay_blocks<A>(api: &Api<A>, blocks: Option<Vec<Vec<DebankTransaction>>>)
+where
+    A: ApiCore,
+    A::DB: EvmStorageRead + BlockIndex,
+    A::Tx: TxSetter + Clone,
+    A::TransactionError: ToJsonRpcError + GetTransactionError,
+    A::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
+{
+    if let Some(blocks) = blocks {
+        if let Err(err) = api.replay_blocks(blocks).await {
+            error!("Error while replaying blocks: {}", err);
+        }
     }
 }
 

@@ -5,6 +5,7 @@ use leafage_evm_types::{Address, DebankErrorCode};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::CfgEnv;
 use revm::primitives::keccak256;
+use std::str::FromStr;
 use std::time::Duration;
 
 /// [`ApiImpl`] implements the EthApi trait.
@@ -82,7 +83,18 @@ where
                 }
                 EVMError::Transaction(t) => t.to_rpc_error(),
 
-                e => rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e.to_string()),
+                EVMError::Custom(str) if str.starts_with("unsupported precompile address: ") => {
+                    if let Some(address) = str.split(": ").nth(1) {
+                        if let Ok(_) = Address::from_str(address) {
+                            return rpc_error_with_code(
+                                DebankErrorCode::UnsupportedPrecompile as i32,
+                                e.to_string(),
+                            );
+                        }
+                    }
+                    rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e.to_string())
+                }
+                _ => rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e.to_string()),
             },
         }
     }
