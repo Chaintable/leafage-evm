@@ -76,21 +76,24 @@ where
         address: &Address,
         erc20_addresses: &[Address],
     ) -> RpcResult<()> {
+        const BATCH: usize = 16;
         let start = std::time::Instant::now();
         let input = IERC20::balanceOfCall { owner: *address };
-        let requests = erc20_addresses
-            .iter()
-            .map(|address| {
-                let request = CallRequest {
-                    to: TxKind::Call(*address).into(),
-                    input: input.abi_encode().into(),
-                    ..Default::default()
-                };
-                request
-            })
-            .collect();
-        self.contract_multi_call(requests, None, None, None, None, None, None)
-            .await?;
+        for erc20_addresses in erc20_addresses.chunks(BATCH) {
+            let requests = erc20_addresses
+                .iter()
+                .map(|address| {
+                    let request = CallRequest {
+                        to: TxKind::Call(*address).into(),
+                        input: input.abi_encode().into(),
+                        ..Default::default()
+                    };
+                    request
+                })
+                .collect();
+            self.contract_multi_call(requests, None, None, None, None, None, None)
+                .await?;
+        }
         info!(target: "warmup", "Warmup erc20 {} tokens time elapsed: {:?}", erc20_addresses.len(),start.elapsed());
         Ok(())
     }
