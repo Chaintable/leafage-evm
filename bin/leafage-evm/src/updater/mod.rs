@@ -41,10 +41,10 @@ where
         }
     }
 
-    pub async fn fetch_tokens(&mut self) -> Result<(Address, Vec<Address>)> {
+    pub async fn fetch_tokens(&mut self, max_warmup_tokens:usize) -> Result<(Address, Vec<Address>)> {
         match self {
             Updater::Http(_) | Updater::None => Ok(Default::default()),
-            Updater::Kafka(updater) => updater.fetch_tokens().await,
+            Updater::Kafka(updater) => updater.fetch_tokens(max_warmup_tokens).await,
         }
     }
 }

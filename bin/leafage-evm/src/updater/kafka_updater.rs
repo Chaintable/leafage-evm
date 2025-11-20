@@ -425,13 +425,14 @@ where
         Ok(res)
     }
 
-    pub async fn fetch_tokens(&self) -> Result<(Address, Vec<Address>)> {
-        let tokens = s3_get_tokens(
+    pub async fn fetch_tokens(&self, max_warmup_tokens: usize) -> Result<(Address, Vec<Address>)> {
+        let mut tokens = s3_get_tokens(
             &self.s3_client,
             &self.kafka_s3_cfg.bucket_name,
             &self.kafka_s3_cfg.s3_chain_id,
         )
         .await?;
+        tokens.1 = tokens.1.into_iter().take(max_warmup_tokens).collect();
         info!(target: "updater", "Fetch {} warmup tokens", tokens.1.len());
         Ok(tokens)
     }

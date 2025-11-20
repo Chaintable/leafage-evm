@@ -220,6 +220,13 @@ pub struct Command {
     #[arg(long, default_value = "128")]
     warmup_blocks: usize,
 
+    /// Number of warmup tokens
+    /// Default: 1000000
+    ///
+    /// This is only used when `readiness_addr` is set.
+    #[arg(long, default_value = "128")]
+    warmup_tokens: usize,
+
     /// The address for pprof server.
     /// Default: ""
     ///
@@ -415,7 +422,7 @@ impl Command {
                             error!(target:"updater", "failed to fetch max depth blocks: {}", err);
                         }
                     }
-                    match updater.fetch_tokens().await {
+                    match updater.fetch_tokens(self.warmup_tokens).await {
                         Ok(tokens) => {
                             rpc_builder =
                                 rpc_builder.with_warmup_erc20_addresses(tokens.0, tokens.1)
@@ -490,7 +497,7 @@ impl Command {
                             error!(target:"updater", "failed to fetch max depth blocks: {}", err)
                         }
                     }
-                    match updater.fetch_tokens().await {
+                    match updater.fetch_tokens(self.warmup_tokens).await {
                         Ok(tokens) => {
                             rpc_builder =
                                 rpc_builder.with_warmup_erc20_addresses(tokens.0, tokens.1)
