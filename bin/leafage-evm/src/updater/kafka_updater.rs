@@ -432,7 +432,7 @@ where
             &self.kafka_s3_cfg.s3_chain_id,
         )
         .await?;
-        info!(target: "updater", "Fetch {} warmup blocks", tokens.1.len());
+        info!(target: "updater", "Fetch {} warmup tokens", tokens.1.len());
         Ok(tokens)
     }
 
