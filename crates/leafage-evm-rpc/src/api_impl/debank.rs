@@ -8,6 +8,7 @@ use crate::error::{internal_rpc_err, rpc_error_with_code};
 
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
+use futures::{stream, StreamExt};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
@@ -24,7 +25,7 @@ use revm::database::{CacheDB, DatabaseRef};
 use revm_inspectors::tracing::TracingInspectorConfig;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::task::{spawn_blocking, JoinSet};
+use tokio::task::spawn_blocking;
 use tokio::{sync::oneshot, time::timeout};
 use tracing::error;
 
@@ -335,8 +336,8 @@ where
                     },
                     user_addr,
                 )
-                .map(|u256| u256)
-                .unwrap_or_default();
+                    .map(|u256| u256)
+                    .unwrap_or_default();
 
                 return DebankSingleCallResult {
                     code: 0,
@@ -487,30 +488,37 @@ where
             cache_enabled: false,
         };
         let mut results: Vec<DebankSingleCallResult> = Vec::with_capacity(requests.len());
+        let concurrent = requests.len();
         if use_parallel {
-            let mut tasks = JoinSet::new();
-            for request in requests {
-                let this = self.clone();
-                let block_overrides = block_overrides.clone();
-                let state_override = state_override.clone();
-                let state = state.clone();
-                tasks.spawn_blocking(move || {
-                    this.debank_single_call_from_state_impl_inner(
-                        &state,
-                        request,
-                        block_overrides.clone(),
-                        state_override.clone(),
-                    )
-                });
-            }
-            while let Some(res) = tasks.join_next().await {
+            let this = self.clone();
+            let mut tasks = stream::iter(requests)
+                .zip(stream::repeat((
+                    this,
+                    block_overrides,
+                    state_override,
+                    state,
+                )))
+                .map(
+                    |(request, (this, block_overrides, state_override, state))| {
+                        spawn_blocking(move || {
+                            this.debank_single_call_from_state_impl_inner(
+                                &state,
+                                request,
+                                block_overrides.clone(),
+                                state_override.clone(),
+                            )
+                        })
+                    },
+                )
+                .buffered(concurrent);
+            while let Some(res) = tasks.next().await {
                 let res = res.map_err(|e| internal_rpc_err(e.to_string()))??;
                 if res.code != 0i32 {
                     stats.success = false;
                 }
                 results.push(res);
-                if !stats.success && fast_fail {
-                    tasks.abort_all();
+                if fast_fail && !stats.success {
+                    break;
                 }
             }
         } else {
@@ -537,8 +545,8 @@ where
                 }
                 RpcResult::Ok(results)
             })
-            .await
-            .map_err(|e| internal_rpc_err(e.to_string()))??;
+                .await
+                .map_err(|e| internal_rpc_err(e.to_string()))??;
         }
 
         Ok(DebankMultiCallResp { stats, results })
@@ -1170,9 +1178,9 @@ where
 
         if self.inner.historical_client().is_some()
             && self
-                .inner
-                .historical_height()
-                .map_or(false, |h| block_number < h)
+            .inner
+            .historical_height()
+            .map_or(false, |h| block_number < h)
         {
             if let Some(historical_client) = self.inner.historical_client() {
                 return historical_client
