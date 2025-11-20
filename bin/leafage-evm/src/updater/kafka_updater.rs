@@ -426,11 +426,14 @@ where
     }
 
     pub async fn fetch_tokens(&self) -> Result<(Address, Vec<Address>)> {
-        s3_get_tokens(
+        let tokens = s3_get_tokens(
             &self.s3_client,
             &self.kafka_s3_cfg.bucket_name,
             &self.kafka_s3_cfg.s3_chain_id,
-        ).await
+        )
+        .await?;
+        info!(target: "updater", "Fetch {} warmup blocks", tokens.1.len());
+        Ok(tokens)
     }
 
     pub fn start(mut self) -> watch::Sender<()> {

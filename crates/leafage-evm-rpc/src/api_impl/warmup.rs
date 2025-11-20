@@ -80,11 +80,10 @@ where
         erc20_addresses: &[Address],
     ) -> RpcResult<()> {
         const ERC20_ADDRESS_BATCH: usize = 16;
-        const TASK_CONCURRENT: usize = 64;
+        const TASK_CONCURRENT: usize = 12;
 
         let start = std::time::Instant::now();
         let input = IERC20::balanceOfCall { owner: *owner };
-        let mut tasks = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(TASK_CONCURRENT));
         for erc20_addresses in erc20_addresses.chunks(ERC20_ADDRESS_BATCH) {
             let requests = erc20_addresses
@@ -98,8 +97,8 @@ where
                     request
                 })
                 .collect();
-            tasks.spawn({
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            tokio::spawn({
                 let this = self.clone();
                 async move {
                     this.contract_multi_call(requests, None, None, None, None, None, None)
