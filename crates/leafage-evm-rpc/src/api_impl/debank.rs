@@ -24,6 +24,7 @@ use revm::database::{CacheDB, DatabaseRef};
 use revm_inspectors::tracing::TracingInspectorConfig;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::task::{spawn_blocking, JoinSet};
 use tokio::{sync::oneshot, time::timeout};
 use tracing::error;
 
@@ -410,13 +411,69 @@ where
         }
     }
 
-    fn debank_multi_call_from_state_impl_inner(
+    fn debank_single_call_from_state_impl_inner(
+        &self,
+        state: &<C::DB as EvmStorageRead>::StateDB,
+        request: CallRequest,
+        block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
+    ) -> RpcResult<DebankSingleCallResult> {
+        let block = state.block_info_arc().map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+        let mut block_env = block_env_from_block(&block);
+        let start = std::time::Instant::now();
+        if let Some(txkind) = request.to {
+            if let Some(address) = txkind.to() {
+                if *address
+                    == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
+                {
+                    let mut res = Self::debank_eth_erc20_handle(
+                        &block.header,
+                        state.clone(),
+                        request,
+                        self.inner.evm_cfg().ovm_address.clone(),
+                        self.inner.evm_cfg().normalize_state_key,
+                    );
+                    res.time_cost = start.elapsed().as_secs_f64();
+                    return Ok(res);
+                }
+            }
+        }
+        let mut db = CacheDB::new(EvmStorageWrapper {
+            db: state.clone(),
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
+        });
+        if let Some(overrides) = block_overrides.clone() {
+            super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
+        }
+        if let Some(state_override) = state_override.clone() {
+            super::utils::apply_state_overrides(state_override, &mut db)?;
+        }
+        let tx = self.inner.create_txn_env(
+            &block_env,
+            request,
+            &db,
+            self.inner.evm_cfg().cfg.chain_id,
+        )?;
+        let mut res: DebankSingleCallResult = self
+            .inner
+            .transact(&block_env, &db, tx)
+            .map_err(|e| e.to_rpc_error())?
+            .into();
+        res.time_cost = start.elapsed().as_secs_f64();
+        Ok(res)
+    }
+
+    async fn debank_multi_call_from_state_impl_inner(
         &self,
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
         fast_fail: bool,
+        use_parallel: bool,
     ) -> RpcResult<DebankMultiCallResp> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
@@ -429,65 +486,61 @@ where
             success: true,
             cache_enabled: false,
         };
-        // run in sequence
-        let mut results: Vec<DebankSingleCallResult> = vec![];
-        for request in requests {
-            let mut block_env = block_env_from_block(&block);
-            let start = std::time::Instant::now();
-            if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
-                let res = results.last().unwrap().clone();
-                results.push(res);
-                continue;
+        let mut results: Vec<DebankSingleCallResult> = Vec::with_capacity(requests.len());
+        if use_parallel {
+            let mut tasks = JoinSet::new();
+            for request in requests {
+                let this = self.clone();
+                let block_overrides = block_overrides.clone();
+                let state_override = state_override.clone();
+                let state = state.clone();
+                tasks.spawn_blocking(move || {
+                    this.debank_single_call_from_state_impl_inner(
+                        &state,
+                        request,
+                        block_overrides.clone(),
+                        state_override.clone(),
+                    )
+                });
             }
-            if let Some(txkind) = request.to {
-                if let Some(address) = txkind.to() {
-                    if *address
-                        == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
-                    {
-                        let mut res = Self::debank_eth_erc20_handle(
-                            &block.header,
-                            state.clone(),
-                            request,
-                            self.inner.evm_cfg().ovm_address.clone(),
-                            self.inner.evm_cfg().normalize_state_key,
-                        );
-                        if res.code != 0 as i32 {
-                            stats.success = false;
-                        }
-                        res.time_cost = start.elapsed().as_secs_f64();
+            while let Some(res) = tasks.join_next().await {
+                let res = res.map_err(|e| internal_rpc_err(e.to_string()))??;
+                if res.code != 0i32 {
+                    stats.success = false;
+                }
+                results.push(res);
+                if !stats.success && fast_fail {
+                    tasks.abort_all();
+                }
+            }
+        } else {
+            // run in sequence
+            let this = self.clone();
+            results = spawn_blocking(move || {
+                let mut results: Vec<DebankSingleCallResult> = vec![];
+                for request in requests {
+                    if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
+                        let res = results.last().unwrap().clone();
                         results.push(res);
                         continue;
                     }
+                    let res = this.debank_single_call_from_state_impl_inner(
+                        &state,
+                        request,
+                        block_overrides.clone(),
+                        state_override.clone(),
+                    )?;
+                    if res.code != 0i32 {
+                        stats.success = false;
+                    }
+                    results.push(res);
                 }
-            }
-            let mut db = CacheDB::new(EvmStorageWrapper {
-                db: state.clone(),
-                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-            });
-            if let Some(overrides) = block_overrides.clone() {
-                super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
-            }
-            if let Some(state_override) = state_override.clone() {
-                super::utils::apply_state_overrides(state_override, &mut db)?;
-            }
-            let tx = self.inner.create_txn_env(
-                &block_env,
-                request,
-                &db,
-                self.inner.evm_cfg().cfg.chain_id,
-            )?;
-            let mut res: DebankSingleCallResult = self
-                .inner
-                .transact(&block_env, &db, tx)
-                .map_err(|e| e.to_rpc_error())?
-                .into();
-            res.time_cost = start.elapsed().as_secs_f64();
-            if res.code != 0 {
-                stats.success = false;
-            }
-            results.push(res);
+                RpcResult::Ok(results)
+            })
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))??;
         }
+
         Ok(DebankMultiCallResp { stats, results })
     }
 
@@ -498,19 +551,22 @@ where
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
         fast_fail: Option<bool>,
-        _use_parallel: Option<bool>,
+        use_parallel: Option<bool>,
         _disable_cache: Option<bool>,
     ) -> RpcResult<DebankMultiCallResp> {
         let (tx, rx) = oneshot::channel();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let rsp = this.debank_multi_call_from_state_impl_inner(
-                requests,
-                block_ctx,
-                block_overrides,
-                state_override,
-                fast_fail.unwrap_or_default(),
-            );
+        tokio::spawn(async move {
+            let rsp = this
+                .debank_multi_call_from_state_impl_inner(
+                    requests,
+                    block_ctx,
+                    block_overrides,
+                    state_override,
+                    fast_fail.unwrap_or_default(),
+                    use_parallel.unwrap_or_default(),
+                )
+                .await;
             if let Err(e) = tx.send(rsp) {
                 error!("Failed to send multi_call result: {:?}", e);
             }
