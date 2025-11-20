@@ -14,7 +14,6 @@ use leafage_evm_types::{
 use revm::primitives::Address;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 sol! {
