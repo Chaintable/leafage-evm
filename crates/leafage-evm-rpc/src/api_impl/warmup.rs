@@ -101,7 +101,7 @@ where
             tokio::spawn({
                 let this = self.clone();
                 async move {
-                    this.contract_multi_call(requests, None, None, None, None, None, None)
+                    this.contract_multi_call(requests, None, None, None, None, Some(true), None)
                         .await?;
                     drop(permit);
                     RpcResult::Ok(())
