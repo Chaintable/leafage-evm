@@ -1,6 +1,6 @@
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number,
-    s3_get_block_transactions_by_number, KafkaS3Config,
+    s3_get_block_transactions_by_number, s3_get_tokens, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -17,6 +17,7 @@ use rdkafka::{
     util::Timeout,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
+use revm::primitives::Address;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -384,7 +385,7 @@ where
     }
 
     // only for replay block
-    pub async fn fetch_warmup_blocks(&mut self) -> Result<Vec<Vec<DebankTransaction>>> {
+    pub async fn fetch_warmup_blocks(&self) -> Result<Vec<Vec<DebankTransaction>>> {
         let mut res = Vec::with_capacity(self.warmup_blocks);
         let end_block_number = self.tree.last_committed_block()?.unwrap().header.number;
         let start_block_number = end_block_number
@@ -422,6 +423,14 @@ where
         }
         info!(target: "updater", "Fetch {} warmup blocks", res.len());
         Ok(res)
+    }
+
+    pub async fn fetch_tokens(&self) -> Result<(Address, Vec<Address>)> {
+        s3_get_tokens(
+            &self.s3_client,
+            &self.kafka_s3_cfg.bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+        ).await
     }
 
     pub fn start(mut self) -> watch::Sender<()> {

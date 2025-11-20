@@ -12,6 +12,9 @@ use leafage_evm_types::{
     DebankTransaction,
 };
 use revm::primitives::Address;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 sol! {
@@ -73,13 +76,17 @@ where
     }
     pub(crate) async fn warmup_erc20_address(
         &self,
-        address: &Address,
+        owner: &Address,
         erc20_addresses: &[Address],
     ) -> RpcResult<()> {
-        const BATCH: usize = 16;
+        const ERC20_ADDRESS_BATCH: usize = 16;
+        const TASK_CONCURRENT: usize = 64;
+
         let start = std::time::Instant::now();
-        let input = IERC20::balanceOfCall { owner: *address };
-        for erc20_addresses in erc20_addresses.chunks(BATCH) {
+        let input = IERC20::balanceOfCall { owner: *owner };
+        let mut tasks = JoinSet::new();
+        let semaphore = Arc::new(Semaphore::new(TASK_CONCURRENT));
+        for erc20_addresses in erc20_addresses.chunks(ERC20_ADDRESS_BATCH) {
             let requests = erc20_addresses
                 .iter()
                 .map(|address| {
@@ -91,8 +98,16 @@ where
                     request
                 })
                 .collect();
-            self.contract_multi_call(requests, None, None, None, None, None, None)
-                .await?;
+            tasks.spawn({
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let this = self.clone();
+                async move {
+                    this.contract_multi_call(requests, None, None, None, None, None, None)
+                        .await?;
+                    drop(permit);
+                    RpcResult::Ok(())
+                }
+            });
         }
         info!(target: "warmup", "Warmup erc20 {} tokens time elapsed: {:?}", erc20_addresses.len(),start.elapsed());
         Ok(())

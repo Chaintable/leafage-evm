@@ -9,6 +9,7 @@ use anyhow::Result;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::DebankTransaction;
 use std::time::Duration;
+use revm::primitives::Address;
 use tokio::sync::watch;
 
 pub enum Updater<Tree> {
@@ -37,6 +38,13 @@ where
         match self {
             Updater::Http(_) | Updater::None => Ok(Default::default()),
             Updater::Kafka(updater) => updater.fetch_warmup_blocks().await,
+        }
+    }
+
+    pub async fn fetch_tokens(&mut self) -> Result<(Address, Vec<Address>)> {
+        match self {
+            Updater::Http(_) | Updater::None => Ok(Default::default()),
+            Updater::Kafka(updater) => updater.fetch_tokens().await,
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::initializer::initialize_check;
+use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
@@ -20,7 +21,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
 use tracing::{error, info};
-use crate::pprof::PProf;
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
@@ -347,10 +347,13 @@ impl Command {
             });
         }
 
-        if !self.pprof_addr.is_empty(){
+        if !self.pprof_addr.is_empty() {
             let pprof_server = PProf::new(self.pprof_addr.parse()?);
-            tokio::spawn(async move{
-                pprof_server.start().await.expect("Failed to start pprof server");
+            tokio::spawn(async move {
+                pprof_server
+                    .start()
+                    .await
+                    .expect("Failed to start pprof server");
             });
         }
 
@@ -410,6 +413,15 @@ impl Command {
                         }
                         Err(err) => {
                             error!(target:"updater", "failed to fetch max depth blocks: {}", err);
+                        }
+                    }
+                    match updater.fetch_tokens().await {
+                        Ok(tokens) => {
+                            rpc_builder =
+                                rpc_builder.with_warmup_erc20_addresses(tokens.0, tokens.1)
+                        }
+                        Err(err) => {
+                            error!(target:"updater", "failed to fetch tokens: {}", err);
                         }
                     }
                 }
@@ -476,6 +488,15 @@ impl Command {
                         }
                         Err(err) => {
                             error!(target:"updater", "failed to fetch max depth blocks: {}", err)
+                        }
+                    }
+                    match updater.fetch_tokens().await {
+                        Ok(tokens) => {
+                            rpc_builder =
+                                rpc_builder.with_warmup_erc20_addresses(tokens.0, tokens.1)
+                        }
+                        Err(err) => {
+                            error!(target:"updater", "failed to fetch tokens: {}", err);
                         }
                     }
                 }
