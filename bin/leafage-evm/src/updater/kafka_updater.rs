@@ -396,7 +396,7 @@ where
         while current_start_block <= end_block_number {
             let mut fetch_transactions_join_set = JoinSet::new();
             let current_end_block =
-                std::cmp::min(start_block_number + batch_size - 1, end_block_number);
+                std::cmp::min(current_start_block + batch_size - 1, end_block_number);
             for block_num in current_start_block..=current_end_block {
                 let rpc_client = self.rpc_client.clone();
                 let s3_client = self.s3_client.clone();
