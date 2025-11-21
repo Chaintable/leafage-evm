@@ -336,8 +336,7 @@ where
                     },
                     user_addr,
                 )
-                    .map(|u256| u256)
-                    .unwrap_or_default();
+                .unwrap_or_default();
 
                 return DebankSingleCallResult {
                     code: 0,
@@ -488,8 +487,9 @@ where
             cache_enabled: false,
         };
         let mut results: Vec<DebankSingleCallResult> = Vec::with_capacity(requests.len());
-        let concurrent = requests.len();
         if use_parallel {
+            const MAX_CONCURRENT: usize = 20;
+            let concurrent = std::cmp::min(MAX_CONCURRENT, requests.len());
             let this = self.clone();
             let mut tasks = stream::iter(requests)
                 .zip(stream::repeat((
@@ -524,7 +524,7 @@ where
         } else {
             // run in sequence
             let this = self.clone();
-            results = spawn_blocking(move || {
+            (stats, results) = spawn_blocking(move || {
                 let mut results: Vec<DebankSingleCallResult> = vec![];
                 for request in requests {
                     if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
@@ -543,10 +543,10 @@ where
                     }
                     results.push(res);
                 }
-                RpcResult::Ok(results)
+                RpcResult::Ok((stats, results))
             })
-                .await
-                .map_err(|e| internal_rpc_err(e.to_string()))??;
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))??;
         }
 
         Ok(DebankMultiCallResp { stats, results })
@@ -1178,9 +1178,9 @@ where
 
         if self.inner.historical_client().is_some()
             && self
-            .inner
-            .historical_height()
-            .map_or(false, |h| block_number < h)
+                .inner
+                .historical_height()
+                .map_or(false, |h| block_number < h)
         {
             if let Some(historical_client) = self.inner.historical_client() {
                 return historical_client
