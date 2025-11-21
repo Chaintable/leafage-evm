@@ -4,6 +4,7 @@ use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
 use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
+use crate::warm::Warmup;
 use anyhow::{bail, Result};
 use clap::Parser;
 #[cfg(target_os = "linux")]
@@ -20,7 +21,7 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
-use tracing::{error, info};
+use tracing::info;
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
@@ -401,36 +402,19 @@ impl Command {
                     ),
                 )?);
 
-                let mut updater = updater_build(
-                    tree.clone(),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.update_interval,
-                    self.diff_depth_limit,
-                    self.init_task_queue_size,
-                    self.warmup_blocks,
-                )
-                .await?;
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .with_historical_config(self.historical_rpc.clone(), self.historical_height);
                 if !self.readiness_addr.is_empty() {
-                    match updater.fetch_warmup_blocks().await {
-                        Ok(max_depth_blocks) => {
-                            rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
-                        }
-                        Err(err) => {
-                            error!(target:"updater", "failed to fetch max depth blocks: {}", err);
-                        }
-                    }
-                    match updater.fetch_tokens(self.warmup_tokens).await {
-                        Ok(tokens) => {
-                            rpc_builder =
-                                rpc_builder.with_warmup_erc20_addresses(tokens.0, tokens.1)
-                        }
-                        Err(err) => {
-                            error!(target:"updater", "failed to fetch tokens: {}", err);
-                        }
-                    }
+                    let warmup = Warmup::new(
+                        self.rpc_addr.clone(),
+                        self.kafka_s3_config.clone().unwrap_or_default(),
+                        tree.clone(),
+                        self.warmup_blocks,
+                        self.warmup_tokens,
+                        self.init_task_queue_size,
+                    )
+                    .await?;
+                    rpc_builder = warmup.with_warmup_data(rpc_builder).await;
                 }
                 let rpc_handle = rpc_builder
                     .build_and_run(
@@ -444,7 +428,15 @@ impl Command {
                         self.normalize_state_key,
                     )
                     .await?;
-                let updater_handle = updater.start();
+                let updater_handle = updater_build(
+                    tree.clone(),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.update_interval,
+                    self.diff_depth_limit,
+                    self.init_task_queue_size,
+                )
+                .await?;
                 let registry_handle =
                     register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
                 Ok((updater_handle, rpc_handle, registry_handle))
@@ -475,37 +467,19 @@ impl Command {
                         self.code_cache_size,
                     ),
                 )?);
-
-                let mut updater = updater_build(
-                    tree.clone(),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.update_interval,
-                    self.diff_depth_limit,
-                    self.init_task_queue_size,
-                    self.warmup_blocks,
-                )
-                .await?;
                 let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
                     .with_historical_config(self.historical_rpc.clone(), self.historical_height);
                 if !self.readiness_addr.is_empty() {
-                    match updater.fetch_warmup_blocks().await {
-                        Ok(max_depth_blocks) => {
-                            rpc_builder = rpc_builder.with_replay_blocks(max_depth_blocks)
-                        }
-                        Err(err) => {
-                            error!(target:"updater", "failed to fetch max depth blocks: {}", err)
-                        }
-                    }
-                    match updater.fetch_tokens(self.warmup_tokens).await {
-                        Ok(tokens) => {
-                            rpc_builder =
-                                rpc_builder.with_warmup_erc20_addresses(tokens.0, tokens.1)
-                        }
-                        Err(err) => {
-                            error!(target:"updater", "failed to fetch tokens: {}", err);
-                        }
-                    }
+                    let warmup = Warmup::new(
+                        self.rpc_addr.clone(),
+                        self.kafka_s3_config.clone().unwrap_or_default(),
+                        tree.clone(),
+                        self.warmup_blocks,
+                        self.warmup_tokens,
+                        self.init_task_queue_size,
+                    )
+                    .await?;
+                    rpc_builder = warmup.with_warmup_data(rpc_builder).await;
                 }
                 let rpc_handle = rpc_builder
                     .build_and_run(
@@ -519,7 +493,15 @@ impl Command {
                         self.normalize_state_key,
                     )
                     .await?;
-                let updater_handle = updater.start();
+                let updater_handle = updater_build(
+                    tree.clone(),
+                    self.rpc_addr.clone(),
+                    self.kafka_s3_config.clone(),
+                    self.update_interval,
+                    self.diff_depth_limit,
+                    self.init_task_queue_size,
+                )
+                .await?;
                 let registry_handle =
                     register_build(chain_cfg.chain_id(), etcd_config.clone(), self.archive).await?;
                 Ok((updater_handle, rpc_handle, registry_handle))

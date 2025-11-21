@@ -7,6 +7,7 @@ mod standalone;
 mod updater;
 mod utils;
 mod pprof;
+mod warm;
 
 use clap::Parser;
 use runner::Cli;
