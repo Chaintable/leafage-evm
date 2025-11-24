@@ -215,17 +215,17 @@ pub struct Command {
     readiness_addr: String,
 
     /// Number of warmup blocks
-    /// Default: 128
+    /// Default: 0
     ///
     /// This is only used when `readiness_addr` is set.
-    #[arg(long, default_value = "128")]
+    #[arg(long, default_value = "0")]
     warmup_blocks: usize,
 
     /// Number of warmup tokens
-    /// Default: 1000000
+    /// Default: 0
     ///
     /// This is only used when `readiness_addr` is set.
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "0")]
     warmup_tokens: usize,
 
     /// The address for pprof server.

@@ -21,10 +21,10 @@ pub struct Warmup<Tree> {
 impl<Tree> Warmup<Tree>
 where
     Tree: EvmStorageRead
-    + EvmStorageWrite<Error=<Tree as EvmStorageRead>::Error>
-    + Send
-    + Sync
-    + 'static,
+        + EvmStorageWrite<Error = <Tree as EvmStorageRead>::Error>
+        + Send
+        + Sync
+        + 'static,
 {
     pub async fn new(
         rpc_url: Option<impl AsRef<str>>,
@@ -79,8 +79,8 @@ where
                         &s3_chain_id,
                         block_num,
                     )
-                        .await
-                        .context(format!("s3 get transactions failed, {block_num}"))
+                    .await
+                    .context(format!("s3 get transactions failed, {block_num}"))
                 });
             }
             for transactions in fetch_transactions_join_set.join_all().await {
@@ -99,7 +99,7 @@ where
             &self.kafka_s3_cfg.bucket_name,
             &self.kafka_s3_cfg.s3_chain_id,
         )
-            .await?;
+        .await?;
         tokens.1 = tokens.1.into_iter().take(self.warmup_tokens).collect();
         info!(target: "updater", "Fetch {} warmup tokens", tokens.1.len());
         Ok(tokens)
@@ -109,26 +109,26 @@ where
     where
         DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
     {
-        let blocks = match self
-            .fetch_warmup_blocks()
-            .await {
-            Ok(blocks) => blocks,
-            Err(err) => {
-                error!(target:"updater", "failed to fetch warmup blocks: {}", err);
-                return builder;
-            }
-        };
-        builder = builder.with_replay_blocks(blocks);
-        let tokens = match self
-            .fetch_tokens()
-            .await {
-            Ok(tokens) => tokens,
-            Err(err) => {
-                error!(target:"updater", "failed to fetch tokens: {}", err);
-                return builder;
-            }
-        };
-        builder = builder.with_warmup_erc20_addresses(tokens.0, tokens.1);
+        if self.warmup_blocks > 0 {
+            let blocks = match self.fetch_warmup_blocks().await {
+                Ok(blocks) => blocks,
+                Err(err) => {
+                    error!(target:"updater", "failed to fetch warmup blocks: {}", err);
+                    return builder;
+                }
+            };
+            builder = builder.with_replay_blocks(blocks);
+        }
+        if self.warmup_tokens > 0 {
+            let tokens = match self.fetch_tokens().await {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    error!(target:"updater", "failed to fetch tokens: {}", err);
+                    return builder;
+                }
+            };
+            builder = builder.with_warmup_erc20_addresses(tokens.0, tokens.1);
+        }
         builder
     }
 }
