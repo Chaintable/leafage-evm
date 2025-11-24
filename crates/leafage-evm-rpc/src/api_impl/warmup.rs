@@ -1,5 +1,6 @@
 use crate::api_impl::core::{Api, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter};
 use crate::api_impl::{ApiCore, EvmExecutor};
+use crate::error::internal_rpc_err;
 use crate::DebankApiServer;
 use alloy::core::sol;
 use alloy::primitives::TxKind;
@@ -14,6 +15,7 @@ use leafage_evm_types::{
 use revm::primitives::Address;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 sol! {
@@ -59,7 +61,6 @@ where
                     transaction_request.gas_price = Some(0);
                     transaction_request.max_fee_per_gas = None;
                     transaction_request.max_priority_fee_per_gas = None;
-                    transaction_request.max_fee_per_gas = None;
                     transaction_request
                 })
                 .collect();
@@ -84,6 +85,7 @@ where
         let start = std::time::Instant::now();
         let input = IERC20::balanceOfCall { owner: *owner };
         let semaphore = Arc::new(Semaphore::new(TASK_CONCURRENT));
+        let mut tasks = JoinSet::new();
         for erc20_addresses in erc20_addresses.chunks(ERC20_ADDRESS_BATCH) {
             let requests = erc20_addresses
                 .iter()
@@ -97,7 +99,7 @@ where
                 })
                 .collect();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
-            tokio::spawn({
+            tasks.spawn({
                 let this = self.clone();
                 async move {
                     this.contract_multi_call(requests, None, None, None, None, Some(true), None)
@@ -106,6 +108,9 @@ where
                     RpcResult::Ok(())
                 }
             });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.map_err(|err| internal_rpc_err(err.to_string()))??;
         }
         info!(target: "warmup", "Warmup erc20 {} tokens time elapsed: {:?}", erc20_addresses.len(),start.elapsed());
         Ok(())
