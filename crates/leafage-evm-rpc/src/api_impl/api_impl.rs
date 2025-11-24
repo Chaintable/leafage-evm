@@ -26,6 +26,7 @@ impl<DB, SpecId> ApiImpl<DB, SpecId> {
         historical_height: Option<u64>,
         is_archive: bool,
         normalize_state_key: bool,
+        version: String,
     ) -> Self {
         Self {
             db,
@@ -35,6 +36,7 @@ impl<DB, SpecId> ApiImpl<DB, SpecId> {
                 cfg,
                 ovm_address: ovm_address.map(|addr| keccak256(addr.as_slice())),
                 time_out,
+                version,
             },
             historical_client,
             historical_height,

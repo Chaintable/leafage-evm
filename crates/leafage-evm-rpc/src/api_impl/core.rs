@@ -19,6 +19,7 @@ pub struct EvmCfg<SpecId> {
     pub cfg: CfgEnv<SpecId>,
     pub ovm_address: Option<H256>,
     pub time_out: Duration,
+    pub version: String,
 }
 
 pub(crate) trait ApiCore: ApiBase + EvmExecutor {}

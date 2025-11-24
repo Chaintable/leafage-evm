@@ -82,6 +82,11 @@ where
             None
         }
     }
+
+    fn debank_version(&self) -> RpcResult<String> {
+        Ok(self.inner.evm_cfg().version.clone())
+    }
+
     fn debank_get_state_by_ctx_impl(
         &self,
         block_ctx: Option<DebankBlockContext>,
@@ -996,6 +1001,10 @@ where
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
+    async fn version(&self) -> RpcResult<String> {
+        self.debank_version()
+    }
+
     async fn get_address_nonce(
         &self,
         address: Address,

@@ -114,6 +114,7 @@ where
             &self.s3_client,
             &self.kafka_s3_cfg.bucket_name,
             &self.kafka_s3_cfg.s3_chain_id,
+            &self.kafka_s3_cfg.version,
             block_hash,
         )
         .await
@@ -157,9 +158,10 @@ where
                 let client = self.s3_client.clone();
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                let version = self.kafka_s3_cfg.version.clone();
                 let hash = new_block.hash;
                 get_block_info_join_set.spawn(async move {
-                    s3_get_block_info(&client, &bucket_name, &s3_chain_id, hash).await
+                    s3_get_block_info(&client, &bucket_name, &s3_chain_id, &version, hash).await
                 });
             }
             msgs.push((offset, block_change_notification));
@@ -186,9 +188,11 @@ where
                 let client = self.s3_client.clone();
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                let version = self.kafka_s3_cfg.version.clone();
                 let block_root = block_info.header.state_root;
                 get_block_diff_join_set.spawn(async move {
-                    s3_get_block_diff(&client, &bucket_name, &s3_chain_id, block_root).await
+                    s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, block_root)
+                        .await
                 });
             };
         }
@@ -244,6 +248,7 @@ where
             let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
             let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
             let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+            let version = self.kafka_s3_cfg.version.clone();
             get_block_info_diff_join_set.spawn(async move {
                 (
                     block_number,
@@ -253,6 +258,7 @@ where
                         &bucket_name,
                         &outer_bucket_name,
                         &s3_chain_id,
+                        &version,
                         block_number,
                     )
                     .await,

@@ -82,6 +82,7 @@ where
         ovm_address: Option<Address>,
         is_archive: bool,
         normalize_state_key: bool,
+        version: String,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
@@ -110,6 +111,7 @@ where
                     self.historical_height,
                     is_archive,
                     normalize_state_key,
+                    version,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -130,6 +132,7 @@ where
                     self.historical_height,
                     is_archive,
                     normalize_state_key,
+                    version,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -150,6 +153,7 @@ where
                     self.historical_height,
                     is_archive,
                     normalize_state_key,
+                    version,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -170,6 +174,7 @@ where
                     self.historical_height,
                     is_archive,
                     normalize_state_key,
+                    version,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(

@@ -30,6 +30,7 @@ impl Register {
 
     pub async fn new(
         chain_id: u64,
+        version: String,
         etcd_cfg: EtcdRegisterConfig,
         is_archive: bool,
     ) -> Result<Self> {
@@ -44,7 +45,11 @@ impl Register {
         }
         let ip = ip_host[0];
         let port = ip_host[1].parse::<u64>()?;
-        let key = format!("{chain_id}/nodes/{ip}_{port}");
+        let key = if version.is_empty() {
+            format!("{chain_id}/nodes/{ip}_{port}")
+        } else {
+            format!("{chain_id}/{version}/nodes/{ip}_{port}")
+        };
         let value = serde_json::to_string(&NodeInfo {
             state_type: StateType::Delay as u64,
             address: ip.to_string(),
@@ -108,11 +113,12 @@ impl Register {
 
 pub async fn register_build(
     chain_id: u64,
+    version: String,
     etcd_cfg: Option<EtcdRegisterConfig>,
     is_archive: bool,
 ) -> Result<watch::Sender<()>> {
     if let Some(etcd_cfg) = etcd_cfg {
-        let register = Register::new(chain_id, etcd_cfg, is_archive).await?;
+        let register = Register::new(chain_id, version, etcd_cfg, is_archive).await?;
         let register_handle = register.start().await?;
         Ok(register_handle)
     } else {
