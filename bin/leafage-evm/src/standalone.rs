@@ -225,7 +225,7 @@ pub struct Command {
     /// Default: 1000000
     ///
     /// This is only used when `readiness_addr` is set.
-    #[arg(long, default_value = "1000000")]
+    #[arg(long, default_value = "100000")]
     warmup_tokens: usize,
 
     /// The address for pprof server.
