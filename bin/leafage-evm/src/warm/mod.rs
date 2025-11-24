@@ -119,7 +119,7 @@ where
             };
             builder = builder.with_replay_blocks(blocks);
         }
-        if self.warmup_blocks > 0 {
+        if self.warmup_tokens > 0 {
             let tokens = match self.fetch_tokens().await {
                 Ok(tokens) => tokens,
                 Err(err) => {
