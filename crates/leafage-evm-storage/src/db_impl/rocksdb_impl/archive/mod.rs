@@ -21,18 +21,15 @@
 //! - `get_transaction_by_hash`
 //! - `get_transaction_by_context`
 
-use crate::db::{
-    ArchiveDBProvider, BlockIterator, BlockRead, StateDBIterator, StateDBRead, StateDBWrite,
-};
+use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy::primitives::B64;
-use alloy::rpc::types::ConversionError;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
     Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount, H256,
     KECCAK256_EMPTY, U256,
 };
-use revm::database_interface::DBErrorMarker;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRawIteratorWithThreadMode,
     IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, DB,
@@ -42,25 +39,9 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::{env, u64};
-use thiserror::Error;
 use tracing::info;
 
 static mut DATA_BASE: Option<DataBaseInner> = None;
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("rocksdb error, {0}")]
-    RocksDB(#[from] rocksdb::Error),
-    #[error("rlp error, {0}")]
-    Rlp(#[from] alloy_rlp::Error),
-    #[error("unsupported operation, {0}")]
-    UnSupported(String),
-    #[error("unsupported block id, {0}")]
-    UnsupportedBlockId(BlockId),
-    #[error("conversion error, {0}")]
-    Conversion(#[from] ConversionError),
-}
-impl DBErrorMarker for Error {}
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -306,9 +287,7 @@ impl DataBaseRef {
     }
 }
 
-impl BlockRead for DataBaseRef {
-    type Error = Error;
-
+impl DataBaseRef {
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
@@ -413,10 +392,9 @@ impl BlockRead for DataBaseRef {
     }
 }
 
-impl StateDBIterator for DataBaseRef {
-    type Error = Error;
+impl LatestStateDBIterator for DataBaseRef {
     /// account address -> raw account
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Self::Error>> {
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -454,7 +432,7 @@ impl StateDBIterator for DataBaseRef {
     }
 
     /// code hash -> code
-    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Self::Error>> {
+    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -474,7 +452,7 @@ impl StateDBIterator for DataBaseRef {
     }
 
     /// account address | storage index -> storage value
-    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Self::Error>> {
+    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -504,8 +482,7 @@ impl StateDBIterator for DataBaseRef {
 }
 
 impl BlockIterator for DataBaseRef {
-    type Error = Error;
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Self::Error>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -533,7 +510,7 @@ impl BlockIterator for DataBaseRef {
             })
     }
 
-    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Self::Error>> {
+    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -554,7 +531,7 @@ impl BlockIterator for DataBaseRef {
     }
 }
 
-impl ArchiveDBProvider for Arc<DataBaseRef> {
+impl StateDBProvider for Arc<DataBaseRef> {
     type StateDBReadWrite = StateDB;
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;
@@ -684,8 +661,6 @@ unsafe impl Send for StateDB {}
 unsafe impl Sync for StateDB {}
 
 impl StateDBRead for StateDB {
-    type Error = Error;
-
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
@@ -822,10 +797,6 @@ impl StateDBRead for StateDB {
         }
         Ok(Some(Bytes::from(code.unwrap())))
     }
-}
-
-impl BlockRead for StateDB {
-    type Error = Error;
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         if block_num == self.block_num && self.block_header.is_some() {
@@ -851,9 +822,8 @@ impl BlockRead for StateDB {
     }
 }
 impl StateDBWrite for StateDB {
-    type Error = Error;
     type DBWriteBatch = WriteBatch;
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
+    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
         Ok(WriteBatch::default())
     }
     fn write_block_hash(
@@ -861,7 +831,7 @@ impl StateDBWrite for StateDB {
         batch: &mut Self::DBWriteBatch,
         block_num: u64,
         block_hash: H256,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Error> {
         let block_num_to_block_hash_cf = self
             .db
             .db
@@ -1010,7 +980,7 @@ impl StateDBWrite for StateDB {
         Ok(())
     }
 
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
         self.db.db.write(batch)?;
         Ok(())
     }

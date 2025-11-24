@@ -11,8 +11,7 @@ use clap::Parser;
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv};
 use leafage_evm_storage::{
-    ArchiveDBProvider, ArchiveRocksDBStorage, ArchiveTree, RocksDBStorage, SnapshotTree,
-    SnapshotTreeConfig, StateDBWrapper,
+    MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag};
 use metrics::gauge;
@@ -50,7 +49,7 @@ pub struct Command {
     /// The type of database to use for this node.
     /// Default: rocksdb
     #[arg(long, default_value = "rocksdb")]
-    db_type: String,
+    db_type: StorageKind,
 
     /// The size of the database cache in MB.
     /// Default: 2048
@@ -381,148 +380,87 @@ impl Command {
             info!(target:"updater", "no kafka s3 config");
         }
 
-        let res = match self.db_type.as_str() {
-            "rocksdb" if !self.archive => {
-                let db = Arc::new(RocksDBStorage::open(self.db_path.as_path(), self.db_cache));
-                // check if db shoud be initialized
-                initialize_check(
-                    StateDBWrapper(db.clone()),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.genesis_number,
-                )
-                .await?;
-                let tree = Arc::new(SnapshotTree::new(
-                    StateDBWrapper(db),
-                    SnapshotTreeConfig::new(
-                        self.diff_depth_limit,
-                        self.account_cache_size,
-                        self.storage_cache_size,
-                        self.code_cache_size,
-                    ),
-                )?);
+        let db = MultiStorage::open(
+            self.db_path.as_path(),
+            self.db_cache,
+            self.db_type,
+            self.archive,
+        )?;
 
-                let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
-                    .with_historical_config(self.historical_rpc.clone(), self.historical_height);
-                if !self.readiness_addr.is_empty() {
-                    let warmup = Warmup::new(
-                        self.rpc_addr.clone(),
-                        self.kafka_s3_config.clone().unwrap_or_default(),
-                        tree.clone(),
-                        self.warmup_blocks,
-                        self.warmup_tokens,
-                        self.init_task_queue_size,
-                    )
-                    .await?;
-                    rpc_builder = warmup.with_warmup_data(rpc_builder).await;
-                }
-                let rpc_handle = rpc_builder
-                    .build_and_run(
-                        &self.listen_addr,
-                        self.max_connections,
-                        self.rpc_timeout,
-                        #[cfg(target_os = "linux")]
-                        self.interceptor_config.clone(),
-                        self.ovm_address.clone(),
-                        self.archive,
-                        self.normalize_state_key,
-                        self.kafka_s3_config.clone().unwrap_or_default().version,
-                    )
-                    .await?;
-                let updater_handle = updater_build(
-                    tree.clone(),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.update_interval,
-                    self.diff_depth_limit,
-                    self.init_task_queue_size,
-                )
-                .await?;
-                let registry_handle = register_build(
-                    chain_cfg.chain_id(),
-                    self.kafka_s3_config.clone().unwrap_or_default().version,
-                    etcd_config.clone(),
-                    self.archive,
-                )
-                .await?;
-                Ok((updater_handle, rpc_handle, registry_handle))
-            }
-            "rocksdb" if self.archive => {
-                let db = Arc::new(ArchiveRocksDBStorage::open(
-                    self.db_path.as_path(),
-                    self.db_cache,
-                ));
-                // check if db shoud be initialized
-                initialize_check(
-                    StateDBWrapper(
-                        db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?
-                            .unwrap(),
-                    ),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.genesis_number,
-                )
-                .await?;
+        // check if db shoud be initialized
+        initialize_check(
+            StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))?
+                    .unwrap(),
+            ),
+            self.rpc_addr.clone(),
+            self.kafka_s3_config.clone(),
+            self.genesis_number,
+        )
+        .await?;
 
-                let tree = Arc::new(ArchiveTree::new(
-                    db,
-                    SnapshotTreeConfig::new(
-                        self.diff_depth_limit,
-                        self.account_cache_size,
-                        self.storage_cache_size,
-                        self.code_cache_size,
-                    ),
-                )?);
-                let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
-                    .with_historical_config(self.historical_rpc.clone(), self.historical_height);
-                if !self.readiness_addr.is_empty() {
-                    let warmup = Warmup::new(
-                        self.rpc_addr.clone(),
-                        self.kafka_s3_config.clone().unwrap_or_default(),
-                        tree.clone(),
-                        self.warmup_blocks,
-                        self.warmup_tokens,
-                        self.init_task_queue_size,
-                    )
-                    .await?;
-                    rpc_builder = warmup.with_warmup_data(rpc_builder).await;
-                }
-                let rpc_handle = rpc_builder
-                    .build_and_run(
-                        &self.listen_addr,
-                        self.max_connections,
-                        self.rpc_timeout,
-                        #[cfg(target_os = "linux")]
-                        self.interceptor_config.clone(),
-                        self.ovm_address.clone(),
-                        self.archive,
-                        self.normalize_state_key,
-                        self.kafka_s3_config.clone().unwrap_or_default().version,
-                    )
-                    .await?;
-                let updater_handle = updater_build(
-                    tree.clone(),
-                    self.rpc_addr.clone(),
-                    self.kafka_s3_config.clone(),
-                    self.update_interval,
-                    self.diff_depth_limit,
-                    self.init_task_queue_size,
-                )
-                .await?;
-                let registry_handle = register_build(
-                    chain_cfg.chain_id(),
-                    self.kafka_s3_config.clone().unwrap_or_default().version,
-                    etcd_config.clone(),
-                    self.archive,
-                )
-                .await?;
-                Ok((updater_handle, rpc_handle, registry_handle))
-            }
-            _ => bail!("only support rocksdb"),
-        };
+        let tree = Arc::new(StateTree::new(
+            db,
+            StateTreeConfig::new(
+                self.diff_depth_limit,
+                self.account_cache_size,
+                self.storage_cache_size,
+                self.code_cache_size,
+            ),
+        )?);
+
+        let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+            .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+
+        if !self.readiness_addr.is_empty() {
+            let warmup = Warmup::new(
+                self.rpc_addr.clone(),
+                self.kafka_s3_config.clone().unwrap_or_default(),
+                tree.clone(),
+                self.warmup_blocks,
+                self.warmup_tokens,
+                self.init_task_queue_size,
+            )
+            .await?;
+            rpc_builder = warmup.with_warmup_data(rpc_builder).await;
+        }
+
+        let rpc_handle = rpc_builder
+            .build_and_run(
+                &self.listen_addr,
+                self.max_connections,
+                self.rpc_timeout,
+                #[cfg(target_os = "linux")]
+                self.interceptor_config.clone(),
+                self.ovm_address.clone(),
+                self.archive,
+                self.normalize_state_key,
+                self.kafka_s3_config.clone().unwrap_or_default().version,
+            )
+            .await?;
+
+        let updater_handle = updater_build(
+            tree.clone(),
+            self.rpc_addr.clone(),
+            self.kafka_s3_config.clone(),
+            self.update_interval,
+            self.diff_depth_limit,
+            self.init_task_queue_size,
+        )
+        .await?;
+
+        let registry_handle = register_build(
+            chain_cfg.chain_id(),
+            self.kafka_s3_config.clone().unwrap_or_default().version,
+            etcd_config.clone(),
+            self.archive,
+        )
+        .await?;
+
         ready.store(true, std::sync::atomic::Ordering::SeqCst);
         info!(target:"updater", "leafage server started");
-        res
+
+        Ok((updater_handle, rpc_handle, registry_handle))
     }
 
     pub async fn run(&mut self) -> Result<()> {

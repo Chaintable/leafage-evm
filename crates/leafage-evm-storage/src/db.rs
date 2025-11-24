@@ -1,87 +1,76 @@
+use crate::db_impl::StorageError;
+use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::metrics::STORAGE_METRICS;
-use crate::{
-    interface::{BlockContext, EvmStorageWrite, StateDB},
-    EvmStorageRead,
-};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
     AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
-use revm::database_interface::DBErrorMarker;
 use std::fmt::Debug;
 
 #[auto_impl(&, Box, Arc)]
-pub trait BlockRead: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync + 'static;
-    /// latest block hash
-    fn read_latest_block_hash(&self) -> Result<H256, Self::Error>;
-
-    /// block hash -> block info
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Self::Error>;
-
-    /// block num -> block hash
-    fn read_block_hash(&self, block_num: u64) -> Result<H256, Self::Error>;
-}
-
-#[auto_impl(&, Box, Arc)]
 pub trait BlockIterator: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync + 'static;
     /// block num -> block info
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Self::Error>>;
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, StorageError>>;
 
     /// block num -> block hash
-    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Self::Error>>;
+    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), StorageError>>;
 }
 
 /// [`StateDBRead`] offers read-only access to the state database.
 #[auto_impl(&, Box, Arc)]
 pub trait StateDBRead {
-    type Error: std::error::Error + DBErrorMarker + Send + Sync + 'static;
+    /// latest block hash
+    fn read_latest_block_hash(&self) -> Result<H256, StorageError>;
+
+    /// block hash -> block info
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, StorageError>;
+
+    /// block num -> block hash
+    fn read_block_hash(&self, block_num: u64) -> Result<H256, StorageError>;
+
     /// account address -> raw account
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Self::Error>;
+    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, StorageError>;
 
     /// code hash -> code
-    fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Self::Error>;
+    fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, StorageError>;
 
     /// account address | storage index -> storage value
-    fn read_storage(&self, address: H256, key: H256) -> Result<U256, Self::Error>;
+    fn read_storage(&self, address: H256, key: H256) -> Result<U256, StorageError>;
 }
 
 #[auto_impl(&, Box, Arc)]
-pub trait StateDBIterator: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync + 'static;
+pub trait LatestStateDBIterator: Send + Sync + 'static {
     /// account address -> raw account
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Self::Error>>;
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), StorageError>>;
 
     /// code hash -> code
-    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Self::Error>>;
+    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), StorageError>>;
 
     /// account address | storage index -> storage value
-    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Self::Error>>;
+    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), StorageError>>;
 }
 
 /// [`StateDBWrite`] offers write-only access to the state database.
 #[auto_impl(& , Box, Arc)]
 pub trait StateDBWrite: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync + 'static;
     type DBWriteBatch: Send;
 
     /// prepare write batch for write
-    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Self::Error>;
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, StorageError>;
 
     /// latest block hash
     fn write_latest_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
         block_hash: H256,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), StorageError>;
 
     /// block hash -> block info
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
         block_info: Block<H256>,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), StorageError>;
 
     /// block num -> block hash
     fn write_block_hash(
@@ -89,7 +78,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         batch: &mut Self::DBWriteBatch,
         block_num: u64, // only for archive db
         block_hash: H256,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), StorageError>;
 
     /// account address -> raw account
     fn write_account(
@@ -98,7 +87,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         address: H256,
         block_num: u64, // only for archive db
         raw_account: Option<NewAccount>,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), StorageError>;
 
     /// code hash -> code
     fn write_code(
@@ -106,7 +95,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         batch: &mut Self::DBWriteBatch,
         code_hash: H256,
         code: Bytes,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), StorageError>;
 
     /// account address | storage index -> storage value
     fn write_storage(
@@ -116,10 +105,10 @@ pub trait StateDBWrite: Send + Sync + 'static {
         key: H256,
         block_num: u64,
         value: U256,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), StorageError>;
 
     /// commit write batch
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error>;
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError>;
 }
 
 /// [`StateDBWrapper`] wraps a [`StateDBRead`] to implements [`BlockContext`]、[`StateDB`] and [`EvmStorageWrite`].
@@ -137,9 +126,9 @@ where
 
 impl<T> BlockContext for StateDBWrapper<T>
 where
-    T: BlockRead,
+    T: StateDBRead,
 {
-    type Error = T::Error;
+    type Error = StorageError;
 
     fn block_info(&self) -> Result<Block<H256>, Self::Error> {
         let latest_block_hash = self.0.read_latest_block_hash()?;
@@ -147,12 +136,11 @@ where
     }
 }
 
-impl<T, E> StateDB for StateDBWrapper<T>
+impl<T> StateDB for StateDBWrapper<T>
 where
-    T: StateDBRead<Error = E> + BlockRead<Error = E>,
-    E: std::error::Error + DBErrorMarker + Send + Sync + 'static,
+    T: StateDBRead,
 {
-    type Error = E;
+    type Error = StorageError;
 
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
         let raw_account_info = self.0.read_account(address.into())?;
@@ -182,12 +170,11 @@ where
     }
 }
 
-impl<T, E> EvmStorageWrite for StateDBWrapper<T>
+impl<T> EvmStorageWrite for StateDBWrapper<T>
 where
-    T: StateDBWrite<Error = E> + BlockRead<Error = E>,
-    E: std::error::Error + Send + Sync + 'static,
+    T: StateDBWrite + StateDBRead,
 {
-    type Error = E;
+    type Error = StorageError;
 
     fn update_block(
         &self,
@@ -239,35 +226,17 @@ where
     }
 }
 
-/// [`ArchiveDBProvider`] offers read-only access to the archive database.
+/// [`StateDBProvider`] offers read-only access to the archive database.
 #[auto_impl(&, Box, Arc)]
-pub trait ArchiveDBProvider: Send + Sync + 'static {
-    type StateDBReadWrite: StateDBRead
-        + BlockRead<Error = <Self::StateDBReadWrite as StateDBRead>::Error>
-        + StateDBWrite<Error = <Self::StateDBReadWrite as StateDBRead>::Error>
-        + Send
-        + Sync
-        + Clone
-        + Debug
-        + 'static;
-    fn db_at(
+pub trait StateDBProvider: Send + Sync + 'static {
+    type StateDBReadWrite: StateDBRead + StateDBWrite + Send + Sync + Clone + Debug + 'static;
+    fn db_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDBReadWrite>, StorageError>;
+
+    fn state_at(
         &self,
         block_arg: BlockId,
-    ) -> Result<Option<Self::StateDBReadWrite>, <Self::StateDBReadWrite as StateDBRead>::Error>;
-}
-
-pub struct ArchiveDBWrapper<T>(pub T);
-
-impl<T> EvmStorageRead for ArchiveDBWrapper<T>
-where
-    T: ArchiveDBProvider,
-{
-    type Error = <<T as ArchiveDBProvider>::StateDBReadWrite as StateDBRead>::Error;
-
-    type StateDB = StateDBWrapper<<T as ArchiveDBProvider>::StateDBReadWrite>;
-
-    fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
-        let db = self.0.db_at(block_arg)?;
+    ) -> Result<Option<StateDBWrapper<Self::StateDBReadWrite>>, StorageError> {
+        let db = self.db_at(block_arg)?;
         Ok(db.map(|db| StateDBWrapper(db)))
     }
 }

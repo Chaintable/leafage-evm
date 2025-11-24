@@ -16,11 +16,13 @@
 //! The `HashToCode` column family stores the code hash to code maps.
 //! All [`U256`] are big-endian encoded.
 
-use crate::db::{BlockRead, StateDBRead, StateDBWrite};
+use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
-use leafage_evm_types::{Block, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256};
-use revm::database_interface::DBErrorMarker;
+use leafage_evm_types::{
+    Block, BlockId, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256,
+};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
     WriteBatch, DB,
@@ -30,18 +32,8 @@ use std::env;
 use std::fmt::Display;
 use std::path::Path;
 use std::ptr::NonNull;
-use thiserror::Error;
+use std::sync::Arc;
 use tracing::info;
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("rocksdb error, {0}")]
-    RocksDB(#[from] rocksdb::Error),
-    #[error("serde_json error, {0}")]
-    SerdeJson(#[from] serde_json::Error),
-}
-
-impl DBErrorMarker for Error {}
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,9 +97,7 @@ pub struct DataBase {
 unsafe impl Send for DataBase {}
 unsafe impl Sync for DataBase {}
 
-impl BlockRead for DataBase {
-    type Error = Error;
-
+impl StateDBRead for DataBase {
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
@@ -176,10 +166,6 @@ impl BlockRead for DataBase {
         let block_hash = H256::from_slice(block_hash_bytes.as_slice());
         Ok(block_hash)
     }
-}
-
-impl StateDBRead for DataBase {
-    type Error = Error;
 
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
@@ -260,9 +246,8 @@ impl StateDBRead for DataBase {
 }
 
 impl StateDBWrite for DataBase {
-    type Error = Error;
     type DBWriteBatch = WriteBatch;
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Self::Error> {
+    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
         Ok(WriteBatch::default())
     }
     fn write_block_hash(
@@ -270,7 +255,7 @@ impl StateDBWrite for DataBase {
         batch: &mut Self::DBWriteBatch,
         block_num: u64,
         block_hash: H256,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Error> {
         let block_num_to_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
@@ -387,7 +372,7 @@ impl StateDBWrite for DataBase {
         Ok(())
     }
 
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Self::Error> {
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
         self.db.write(batch)?;
         Ok(())
     }
@@ -548,5 +533,131 @@ impl DataBase {
             ),
         ];
         Self { db, _cols: cols }
+    }
+}
+
+impl StateDBProvider for Arc<DataBase> {
+    type StateDBReadWrite = Arc<DataBase>;
+
+    fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
+        match block_id {
+            BlockId::Number(block_number_or_tag) => match block_number_or_tag {
+                BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
+                    return Ok(Some(self.clone()));
+                }
+                _ => Ok(None),
+            },
+            BlockId::Hash(_) => Ok(None),
+        }
+    }
+}
+
+impl LatestStateDBIterator for DataBase {
+    /// account address -> raw account
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+        let address_to_account_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+            .unwrap();
+        let iter = self.db.iterator_cf_opt(
+            address_to_account_cf,
+            rocksdb_read_options(),
+            rocksdb::IteratorMode::Start,
+        );
+        iter.map(|item| {
+            let (key, value) = item?;
+            let address = H256::from_slice(key.as_ref());
+            let mut raw_account_slice = value.as_ref();
+            let account = SlimAccount::decode(&mut raw_account_slice)
+                .expect(format!("Invalid account data for address {:?}", address).as_str());
+            let account = NewAccount {
+                address,
+                balance: account.balance,
+                nonce: account.nonce,
+                code_hash: if account.code_hash.is_zero() {
+                    KECCAK256_EMPTY.0.into()
+                } else {
+                    account.code_hash
+                },
+            };
+            Ok((address, account))
+        })
+    }
+
+    /// code hash -> code
+    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Error>> {
+        let hash_to_code_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::HashToCode.to_str())
+            .unwrap();
+        let iter = self.db.iterator_cf_opt(
+            hash_to_code_cf,
+            rocksdb_read_options(),
+            rocksdb::IteratorMode::Start,
+        );
+        iter.map(|item| {
+            let (key, value) = item?;
+            let code_hash = H256::from_slice(key.as_ref());
+            Ok((code_hash, Bytes::from(value)))
+        })
+    }
+
+    /// account address | storage index -> storage value
+    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
+        let address_to_storage_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let iter = self.db.iterator_cf_opt(
+            address_to_storage_cf,
+            rocksdb_read_options(),
+            rocksdb::IteratorMode::Start,
+        );
+        iter.map(|item| {
+            let (key, value) = item?;
+            let address_bytes = &key[..32];
+            let address = H256::from_slice(address_bytes);
+            let key_bytes = &key[32..64];
+            let storage_key = H256::from_slice(key_bytes);
+            let storage_value = U256::from_be_slice(value.as_ref());
+            Ok((address, storage_key, storage_value))
+        })
+    }
+}
+
+impl BlockIterator for DataBase {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Error>> {
+        let block_hash_to_block_info_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+            .unwrap();
+        let iter = self.db.iterator_cf_opt(
+            block_hash_to_block_info_cf,
+            rocksdb_read_options(),
+            rocksdb::IteratorMode::Start,
+        );
+        iter.map(|item| {
+            let (_, value) = item?;
+            let block_info: Block<H256> = from_slice(value.as_ref())?;
+            Ok(block_info)
+        })
+    }
+
+    fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Error>> {
+        let block_num_to_block_hash_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
+            .unwrap();
+        let iter = self.db.iterator_cf_opt(
+            block_num_to_block_hash_cf,
+            rocksdb_read_options(),
+            rocksdb::IteratorMode::Start,
+        );
+        iter.map(|item| {
+            let (key, value) = item?;
+            let block_num: u64 = U256::from_be_slice(key.as_ref()).try_into().unwrap();
+            let block_hash = H256::from_slice(value.as_ref());
+            Ok((block_num, block_hash))
+        })
     }
 }
