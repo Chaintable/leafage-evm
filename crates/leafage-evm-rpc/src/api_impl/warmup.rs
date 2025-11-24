@@ -86,6 +86,7 @@ where
         let input = IERC20::balanceOfCall { owner: *owner };
         let semaphore = Arc::new(Semaphore::new(TASK_CONCURRENT));
         let mut tasks = JoinSet::new();
+        info!(target: "warmup","Start warmup {} with {} tokens",owner, erc20_addresses.len());
         for erc20_addresses in erc20_addresses.chunks(ERC20_ADDRESS_BATCH) {
             let requests = erc20_addresses
                 .iter()
