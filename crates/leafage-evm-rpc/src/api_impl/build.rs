@@ -23,6 +23,7 @@ pub struct ApiBuilder<DB> {
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
+    warmup_erc20_addresses: Option<(Address, Vec<Address>)>,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -36,6 +37,7 @@ where
             historical_client: None,
             historical_height: None,
             replay_blocks: None,
+            warmup_erc20_addresses: None,
         }
     }
 
@@ -58,6 +60,11 @@ where
 
     pub fn with_replay_blocks(mut self, blocks: Vec<Vec<DebankTransaction>>) -> Self {
         self.replay_blocks = Some(blocks);
+        self
+    }
+
+    pub fn with_warmup_erc20_addresses(mut self, owner: Address, addresses: Vec<Address>) -> Self {
+        self.warmup_erc20_addresses = Some((owner, addresses));
         self
     }
 }
@@ -105,7 +112,12 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                replay_blocks(&api, self.replay_blocks.take()).await;
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
                 register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Op(cfg) => {
@@ -120,7 +132,12 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                replay_blocks(&api, self.replay_blocks.take()).await;
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
                 register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Bsc(cfg) => {
@@ -135,7 +152,12 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                replay_blocks(&api, self.replay_blocks.take()).await;
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
                 register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Cosmos(cfg) => {
@@ -150,7 +172,12 @@ where
                     normalize_state_key,
                 );
                 let api = Api::new(api_impl);
-                replay_blocks(&api, self.replay_blocks.take()).await;
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
                 register_api(&mut rpc_module, api)?;
             }
         }
@@ -159,8 +186,11 @@ where
     }
 }
 
-async fn replay_blocks<A>(api: &Api<A>, blocks: Option<Vec<Vec<DebankTransaction>>>)
-where
+async fn warmup_api<A>(
+    api: &Api<A>,
+    blocks: Option<Vec<Vec<DebankTransaction>>>,
+    erc20_addresses: Option<(Address, Vec<Address>)>,
+) where
     A: ApiCore,
     A::DB: EvmStorageRead + BlockIndex,
     A::Tx: TxSetter + Clone,
@@ -171,6 +201,11 @@ where
     if let Some(blocks) = blocks {
         if let Err(err) = api.replay_blocks(blocks).await {
             error!("Error while replaying blocks: {}", err);
+        }
+    }
+    if let Some((owner, erc20_addresses)) = erc20_addresses {
+        if let Err(err) = api.warmup_erc20_address(&owner, &erc20_addresses).await {
+            error!("Error while warmup erc20 address: {}", err);
         }
     }
 }

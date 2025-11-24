@@ -4519,6 +4519,7 @@ name = "leafage-evm-rpc"
 version = "0.2.0"
 dependencies = [
  "alloy",
+ "alloy-contract",
  "alloy-evm",
  "alloy-rlp",
  "async-trait",

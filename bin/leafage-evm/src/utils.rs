@@ -6,6 +6,7 @@ use jsonrpsee::http_client::HttpClient;
 use leafage_evm_rpc::EthApiClient;
 use leafage_evm_types::{Block, BlockStorageDiff, DebankTransaction, H256};
 use lru::LruCache;
+use revm::primitives::Address;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -306,6 +307,30 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
         block_info.header.state_root, number
     ))?;
     Ok((block_info, block_diff))
+}
+
+pub async fn s3_get_tokens(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+) -> Result<(Address, Vec<Address>)> {
+    #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    struct Tokens {
+        pub owner: Address,
+        pub erc20_addresses: Vec<Address>,
+    }
+    let s3_key = format!("{}/tokens", s3_chain_id);
+    let s3_obj = s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&s3_key)
+        .send()
+        .await
+        .context(format!("{bucket_name}: {s3_key}"))?;
+    let bytes = s3_obj.body.collect().await?.into_bytes();
+    let tokens: Tokens = serde_json::from_slice(&bytes)?;
+    Ok((tokens.owner, tokens.erc20_addresses))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
