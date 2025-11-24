@@ -71,12 +71,14 @@ where
                 let s3_client = self.s3_client.clone();
                 let outer_bucket_name = self.kafka_s3_cfg.outer_bucket_name.clone();
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                let version = self.kafka_s3_cfg.version.clone();
                 fetch_transactions_join_set.spawn(async move {
                     s3_get_block_transactions_by_number(
                         &rpc_client,
                         &s3_client,
                         &outer_bucket_name,
                         &s3_chain_id,
+                        &version,
                         block_num,
                     )
                     .await

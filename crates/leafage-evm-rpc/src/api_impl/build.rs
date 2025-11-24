@@ -174,6 +174,7 @@ where
                     self.historical_height,
                     is_archive,
                     normalize_state_key,
+                    version,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
