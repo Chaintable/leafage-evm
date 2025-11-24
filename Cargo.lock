@@ -4558,9 +4558,11 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "leafage-evm-types",
+ "libmdbx",
  "metrics",
  "metrics-derive",
  "once_cell",
+ "page_size",
  "quick_cache",
  "revm",
  "rocksdb",
@@ -4611,6 +4613,21 @@ name = "libm"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
+
+[[package]]
+name = "libmdbx"
+version = "1.0.0"
+source = "git+https://github.com/Chaintable/libmdbx-rs.git?tag=1.0.0#470dad642e9e60ce2e6fb138fa35c4d462df97e5"
+dependencies = [
+ "bitflags 2.9.1",
+ "byteorder",
+ "derive_more 2.0.1",
+ "mdbx-sys",
+ "parking_lot",
+ "smallvec",
+ "thiserror 2.0.14",
+ "tracing",
+]
 
 [[package]]
 name = "librocksdb-sys"
@@ -4804,6 +4821,17 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "mdbx-sys"
+version = "13.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad61901fd9a1817214822b951cc1366dcff1a0d396c1448faa8b31612a7420d6"
+dependencies = [
+ "bindgen 0.72.1",
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -5279,6 +5307,16 @@ dependencies = [
  "elliptic-curve 0.13.8",
  "primeorder",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "page_size"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

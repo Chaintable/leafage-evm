@@ -37,11 +37,4 @@ metrics.workspace = true
 futures.workspace = true
 lru.workspace = true
 axum.workspace = true
-pprof = { workspace = true, features = [
-    "cpp",
-    "prost-codec",
-] }
-
-[features]
-default = ["with-rocksdb"]
-with-rocksdb = ["leafage-evm-storage/with-rocksdb"]
+pprof = { workspace = true, features = ["cpp", "prost-codec"] }

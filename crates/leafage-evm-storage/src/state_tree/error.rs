@@ -10,6 +10,8 @@ pub enum Error<DBError> {
     ParentBlockHashNotFound(H256, u64, H256),
     #[error("BlockId: {0:?} not supported")]
     UnsupportedBlockId(BlockId),
+    #[error("No latest block found in DB")]
+    NoLatestBlockInDB,
 }
 
 impl<DBError> From<DBError> for Error<DBError> {

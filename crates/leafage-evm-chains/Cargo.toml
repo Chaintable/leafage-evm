@@ -21,7 +21,11 @@ once_cell.workspace = true
 bls_on_arkworks.workspace = true
 prost.workspace = true
 parity-bytes = { workspace = true, default-features = false }
-secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"] }
+secp256k1 = { workspace = true, features = [
+    "global-context",
+    "std",
+    "recovery",
+] }
 p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
 num-bigint.workspace = true
 bech32.workspace = true
@@ -31,7 +35,9 @@ cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", re
 cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
-tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = ["secp256k1"] }
+tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = [
+    "secp256k1",
+] }
 
 [dev-dependencies]
 elliptic-curve.workspace = true
