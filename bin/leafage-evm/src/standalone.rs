@@ -48,7 +48,7 @@ pub struct Command {
 
     /// The type of database to use for this node.
     /// Default: rocksdb
-    #[arg(long, value_parser = ["rocksdb", "mdbx"],default_value = "rocksdb")]
+    #[arg(long, default_value = "rocksdb")]
     db_type: StorageKind,
 
     /// The size of the database cache in MB.
