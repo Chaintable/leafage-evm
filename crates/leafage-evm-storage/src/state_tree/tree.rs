@@ -72,11 +72,11 @@ impl<DB> StateTree<DB> {
         self.hash_diff_map
             .write()
             .unwrap()
-            .retain(|_, v| v.unwrap_diff_layer().block_info.header.number > bottom_height);
+            .retain(|_, v| v.unwrap_diff_layer().block_info.header.number >= bottom_height);
         self.num_diff_map
             .write()
             .unwrap()
-            .retain(|num, _| *num > bottom_height);
+            .retain(|num, _| *num >= bottom_height);
     }
 
     pub fn get_config(&self) -> StateTreeConfig {
