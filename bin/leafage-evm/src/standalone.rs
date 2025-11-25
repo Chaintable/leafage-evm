@@ -48,7 +48,7 @@ pub struct Command {
 
     /// The type of database to use for this node.
     /// Default: rocksdb
-    #[arg(long, default_value = "rocksdb")]
+    #[arg(long, value_parser = ["rocksdb", "mdbx"],default_value = "rocksdb")]
     db_type: StorageKind,
 
     /// The size of the database cache in MB.
@@ -84,10 +84,10 @@ pub struct Command {
     diff_depth_limit: usize,
 
     /// The size of the account cache.
-    /// Default: 100000
+    /// Default: 200000
     ///
     /// This limit is used for the account cache.
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "200000")]
     account_cache_size: usize,
 
     /// The size of the storage cache.
@@ -98,10 +98,10 @@ pub struct Command {
     storage_cache_size: usize,
 
     /// The size of the code cache.
-    /// Default: 10000
+    /// Default: 200000
     ///
     /// This limit is used for the code cache.
-    #[arg(long, default_value = "10000")]
+    #[arg(long, default_value = "200000")]
     code_cache_size: usize,
 
     /// The interval to fetch block and update the snapshot tree.
