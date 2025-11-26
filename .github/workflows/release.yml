@@ -57,7 +57,7 @@ jobs:
 
   merge-docker-manifest:
     runs-on: [self-hosted]
-    needs: build-artifacts
+    needs: make-artifacts
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
