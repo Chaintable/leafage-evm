@@ -13,7 +13,7 @@ jobs:
   make-artifacts:
     strategy:
       matrix:
-        arch: [amd64]
+        arch: [amd64, arm64]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
     steps:
       - name: Checkout code
@@ -65,3 +65,24 @@ jobs:
           msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm-x:${{ matrix.arch }}-${{ env.REVISION }}`, Image `${{ env.REGISTRY }}/leafage-evm-op-x:${{ matrix.arch }}-${{ env.REVISION }} were builded"
           check_for_duplicate_msg: true
         continue-on-error: true
+
+
+  merge-docker-manifest:
+    runs-on: [self-hosted]
+    needs: build-artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set env
+        run: |
+          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Merge manifest
+        run: |
+          docker pull --platform=linux/amd64 ${REGISTRY}/${IMAGE}:amd64-${REVISION}
+          docker pull --platform=linux/arm64 ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+

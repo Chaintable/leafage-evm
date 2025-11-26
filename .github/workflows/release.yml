@@ -13,7 +13,7 @@ jobs:
   make-artifacts:
     strategy:
       matrix:
-        arch: [amd64]
+        arch: [amd64, arm64]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
     steps:
       - name: Checkout code
@@ -55,3 +55,19 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           provenance: false
 
+  merge-docker-manifest:
+    runs-on: [self-hosted]
+    needs: build-artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set env
+        run: |
+          echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Merge manifest
+        run: |
+          docker pull --platform=linux/amd64 ${REGISTRY}/${IMAGE}:amd64-${REVISION}
+          docker pull --platform=linux/arm64 ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
