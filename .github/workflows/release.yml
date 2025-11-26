@@ -13,7 +13,7 @@ jobs:
   make-artifacts:
     strategy:
       matrix:
-        arch: [amd64]
+        arch: [amd64, arm64]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
     steps:
       - name: Checkout code
@@ -55,3 +55,28 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           provenance: false
 
+  merge-docker-manifest:
+    runs-on: [self-hosted]
+    needs: make-artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set env
+        run: |
+          echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-northeast-1
+          
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Merge manifest
+        run: |
+          docker pull --platform=linux/amd64 ${REGISTRY}/leafage-evm-x:amd64-${REVISION}
+          docker pull --platform=linux/arm64 ${REGISTRY}/leafage-evm-x:arm64-${REVISION}
+          docker buildx imagetools create --tag ${REGISTRY}/leafage-evm-x:${REVISION} ${REGISTRY}/leafage-evm-x:amd64-${REVISION} ${REGISTRY}/leafage-evm-x:arm64-${REVISION}
