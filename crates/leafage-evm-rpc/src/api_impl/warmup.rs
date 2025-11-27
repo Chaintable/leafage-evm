@@ -103,8 +103,10 @@ where
             tasks.spawn({
                 let this = self.clone();
                 async move {
-                    this.contract_multi_call(requests, None, None, None, None, Some(true), None)
-                        .await?;
+                    this.debank_multi_call_from_state_impl_inner(
+                        requests, None, None, None, false, true,
+                    )
+                    .await?;
                     drop(permit);
                     RpcResult::Ok(())
                 }

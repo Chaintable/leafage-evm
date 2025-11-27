@@ -466,7 +466,7 @@ where
         Ok(res)
     }
 
-    async fn debank_multi_call_from_state_impl_inner(
+    pub(crate) async fn debank_multi_call_from_state_impl_inner(
         &self,
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
