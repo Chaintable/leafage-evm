@@ -143,6 +143,7 @@ fn rocksdb_column_options(shared_cache: &Cache, fixed_prefix_size: usize) -> Opt
     block_opts.set_metadata_block_size(4096);
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
+    cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
     cf_opts
 }
 
