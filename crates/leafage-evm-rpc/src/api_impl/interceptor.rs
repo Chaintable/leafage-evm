@@ -507,6 +507,11 @@ where
     }
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        // 检查是否跳过拦截
+        if request.headers().contains_key("x-skip-interceptor") {
+            return Box::pin(self.inner.call(request).map_err(Into::into));
+        }
+
         let load_shedding = LoadShedding::from(request.headers());
         // 请求超过终止时间
         if self.check_load_deadline(&load_shedding) {

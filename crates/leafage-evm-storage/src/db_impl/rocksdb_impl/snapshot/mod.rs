@@ -394,6 +394,7 @@ fn rocksdb_column_options(shared_cache: &Cache) -> Options {
     block_opts.set_bloom_filter(10.0, false);
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
+    cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
     cf_opts
 }
 
