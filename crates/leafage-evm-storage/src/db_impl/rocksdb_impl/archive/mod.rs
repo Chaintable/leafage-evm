@@ -148,7 +148,7 @@ fn rocksdb_column_options(shared_cache: &Cache, fixed_prefix_size: usize) -> Opt
 }
 
 #[inline]
-fn rocksdb_options() -> Options {
+fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     let mut opts = Options::default();
     opts.create_missing_column_families(true);
     opts.create_if_missing(true);
@@ -160,6 +160,7 @@ fn rocksdb_options() -> Options {
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
     opts.increase_parallelism(2);
     opts.set_use_direct_io_for_flush_and_compaction(true);
+    opts.set_disable_auto_compactions(disable_auto_compactions);
 
     if let Ok(max_open_file_string) = env::var("ROCKSDB_MAX_OPEN_FILE") {
         if let Ok(max_open_file) = max_open_file_string.parse::<i32>() {
@@ -186,7 +187,11 @@ fn rocksdb_options() -> Options {
 }
 
 impl DataBaseRef {
-    pub fn open<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        cache_size: usize,
+        disable_auto_compactions: bool,
+    ) -> Self {
         let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
             1024 * 1024 * total_cache_size,
@@ -229,7 +234,7 @@ impl DataBaseRef {
             address_to_storage_cf,
             hash_to_code_cf,
         ];
-        let db_opt = rocksdb_options();
+        let db_opt = rocksdb_options(disable_auto_compactions);
         let db = DB::open_cf_descriptors(&db_opt, path, cfs).unwrap();
         let cols = vec![
             (
