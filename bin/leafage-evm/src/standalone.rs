@@ -233,6 +233,12 @@ pub struct Command {
     /// This address is used for the pprof server.
     #[arg(long, default_value = "")]
     pprof_addr: String,
+
+    /// Disables db automatic compactions.
+    /// Default: false
+    /// This address is used when `db_type` is Rocksdb.
+    #[arg(long, default_value = "false")]
+    disable_auto_compactions: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -385,6 +391,7 @@ impl Command {
             self.db_cache,
             self.db_type,
             self.archive,
+            self.disable_auto_compactions
         )?;
 
         // check if db shoud be initialized
