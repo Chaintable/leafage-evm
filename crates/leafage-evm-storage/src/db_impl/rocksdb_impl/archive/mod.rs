@@ -121,7 +121,11 @@ unsafe impl Send for DataBaseInner {}
 unsafe impl Sync for DataBaseInner {}
 
 #[inline]
-fn rocksdb_column_options(shared_cache: &Cache, fixed_prefix_size: usize) -> Options {
+fn rocksdb_column_options(
+    shared_cache: &Cache,
+    fixed_prefix_size: usize,
+    disable_auto_compactions: bool,
+) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
     cf_opts.set_keep_log_file_num(2);
@@ -144,6 +148,7 @@ fn rocksdb_column_options(shared_cache: &Cache, fixed_prefix_size: usize) -> Opt
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
+    cf_opts.set_disable_auto_compactions(disable_auto_compactions);
     cf_opts
 }
 
@@ -204,27 +209,27 @@ impl DataBaseRef {
 
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
         );
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(&shared_cache, 0),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
         );
         let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
         );
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(&shared_cache, 32),
+            rocksdb_column_options(&shared_cache, 32, disable_auto_compactions),
         );
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(&shared_cache, 64),
+            rocksdb_column_options(&shared_cache, 64, disable_auto_compactions),
         );
         let hash_to_code_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(&shared_cache, 0),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
         );
         let cfs = vec![
             latest_block_hash_cf,
