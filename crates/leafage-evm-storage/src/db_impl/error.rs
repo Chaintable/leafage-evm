@@ -17,6 +17,8 @@ pub enum Error {
     Conversion(#[from] ConversionError),
     #[error("serde_json error, {0}")]
     SerdeJson(#[from] serde_json::Error),
+    #[error("iterator timed out for block {0}")]
+    IteratorTimedOut(u64),
 }
 
 impl DBErrorMarker for Error {}

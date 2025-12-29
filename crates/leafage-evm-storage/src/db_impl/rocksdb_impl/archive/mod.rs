@@ -31,15 +31,43 @@ use leafage_evm_types::{
     KECCAK256_EMPTY, U256,
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBRawIteratorWithThreadMode,
-    IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
+    ReadOptions, SliceTransform, WriteBatch, DB,
 };
 use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{env, u64};
 use tracing::info;
+
+mod iterator_tracker;
+use iterator_tracker::{
+    next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
+};
+use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
+
+/// Global iterator tracker for StateDB instances
+static ITERATOR_TRACKER: LazyLock<Arc<IteratorTracker>> = LazyLock::new(|| {
+    let timeout_secs = std::env::var("ROCKSDB_ITERATOR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_ITERATOR_TIMEOUT_SECS);
+
+    let tracker = IteratorTracker::new(timeout_secs);
+
+    if tracker.is_enabled() {
+        info!(
+            target: "rocksdb",
+            timeout_secs = timeout_secs,
+            "Initialized iterator tracker"
+        );
+        tracker.clone().start_monitor();
+    }
+
+    tracker
+});
 
 static mut DATA_BASE: Option<DataBaseInner> = None;
 
@@ -563,8 +591,9 @@ impl StateDBProvider for Arc<DataBaseRef> {
                         db: self.clone(),
                         block_num,
                         block_header: None,
-                        account_iterator: None,
-                        storage_iterator: None,
+                        iterators: None,
+                        tracker_id: None, // Latest queries don't need tracking
+                        timed_out: None,
                     }));
                 }
                 BlockNumberOrTag::Number(num) => {
@@ -599,12 +628,26 @@ impl StateDBProvider for Arc<DataBaseRef> {
         let storage_iterator = self
             .db
             .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
+
+        // Create shared iterators
+        let iterators = SharedIterators::new(account_iterator, storage_iterator);
+
+        // Register with iterator tracker if enabled
+        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
+            let id = next_statedb_id();
+            let flag = ITERATOR_TRACKER.register(id, block_num, iterators.clone());
+            (Some(id), Some(flag))
+        } else {
+            (None, None)
+        };
+
         Ok(Some(StateDB {
             db: self.clone(),
             block_num,
             block_header: Some(block_header),
-            account_iterator: Some(Mutex::new(account_iterator)),
-            storage_iterator: Some(Mutex::new(storage_iterator)),
+            iterators: Some(iterators),
+            tracker_id,
+            timed_out,
         }))
     }
 }
@@ -613,8 +656,12 @@ pub struct StateDB {
     db: Arc<DataBaseRef>,
     block_num: u64,
     block_header: Option<Header>,
-    account_iterator: Option<Mutex<DBRawIteratorWithThreadMode<'static, DB>>>,
-    storage_iterator: Option<Mutex<DBRawIteratorWithThreadMode<'static, DB>>>,
+    /// Shared iterators (None for Latest queries)
+    iterators: Option<Arc<SharedIterators>>,
+    /// Tracker ID for iterator lifecycle management (None for Latest queries)
+    tracker_id: Option<u64>,
+    /// Shared timeout flag with IteratorTracker (None for Latest queries)
+    timed_out: Option<TimeoutFlag>,
 }
 
 impl Clone for StateDB {
@@ -624,8 +671,9 @@ impl Clone for StateDB {
                 db: self.db.clone(),
                 block_num: self.block_num,
                 block_header: self.block_header.clone(),
-                account_iterator: None,
-                storage_iterator: None,
+                iterators: None,
+                tracker_id: None, // Latest queries don't need tracking
+                timed_out: None,
             };
         }
 
@@ -649,12 +697,26 @@ impl Clone for StateDB {
             .db
             .db
             .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
+
+        // Create shared iterators
+        let iterators = SharedIterators::new(account_iterator, storage_iterator);
+
+        // Register cloned StateDB with iterator tracker if enabled
+        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
+            let id = next_statedb_id();
+            let flag = ITERATOR_TRACKER.register(id, self.block_num, iterators.clone());
+            (Some(id), Some(flag))
+        } else {
+            (None, None)
+        };
+
         Self {
             db: self.db.clone(),
             block_num: self.block_num,
             block_header: self.block_header.clone(),
-            account_iterator: Some(Mutex::new(account_iterator)),
-            storage_iterator: Some(Mutex::new(storage_iterator)),
+            iterators: Some(iterators),
+            tracker_id,
+            timed_out,
         }
     }
 }
@@ -670,6 +732,28 @@ impl Debug for StateDB {
 
 unsafe impl Send for StateDB {}
 unsafe impl Sync for StateDB {}
+
+impl Drop for StateDB {
+    fn drop(&mut self) {
+        // Unregister from iterator tracker if we have a tracker_id
+        if let Some(id) = self.tracker_id {
+            ITERATOR_TRACKER.unregister(id);
+        }
+    }
+}
+
+impl StateDB {
+    /// Check if this StateDB's iterator has timed out
+    #[inline]
+    fn check_timeout(&self) -> Result<(), Error> {
+        if let Some(ref flag) = self.timed_out {
+            if flag.load(Ordering::Relaxed) {
+                return Err(Error::IteratorTimedOut(self.block_num));
+            }
+        }
+        Ok(())
+    }
+}
 
 impl StateDBRead for StateDB {
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
@@ -708,7 +792,13 @@ impl StateDBRead for StateDB {
             };
             return Ok(Some(account));
         }
-        let mut account_iter = self.account_iterator.as_ref().unwrap().lock().unwrap();
+        // Check timeout before using iterator
+        self.check_timeout()?;
+        let iterators = self.iterators.as_ref().unwrap();
+        let mut account_iter_guard = iterators.account_iterator.lock().unwrap();
+        let account_iter = account_iter_guard
+            .as_mut()
+            .ok_or(Error::IteratorTimedOut(self.block_num))?;
         account_iter.seek_for_prev([address_bytes.as_ref(), &block_num_bytes].concat());
         STORAGE_METRICS
             .read_account_latency
@@ -764,7 +854,13 @@ impl StateDBRead for StateDB {
             let value = U256::from_be_slice(value_bytes.as_ref());
             return Ok(value);
         }
-        let mut storage_iter = self.storage_iterator.as_ref().unwrap().lock().unwrap();
+        // Check timeout before using iterator
+        self.check_timeout()?;
+        let iterators = self.iterators.as_ref().unwrap();
+        let mut storage_iter_guard = iterators.storage_iterator.lock().unwrap();
+        let storage_iter = storage_iter_guard
+            .as_mut()
+            .ok_or(Error::IteratorTimedOut(self.block_num))?;
         storage_iter
             .seek_for_prev([address_bytes.as_ref(), key_bytes.as_ref(), &block_num_bytes].concat());
         STORAGE_METRICS
