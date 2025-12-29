@@ -28,6 +28,12 @@ pub struct StorageMetrics {
     pub commit_block_latency: Histogram,
     /// latest commit block.
     pub latest_commit_block: Gauge,
+    /// Active iterators in Archive mode.
+    pub active_iterators: Gauge,
+    /// Timed out iterators in Archive mode.
+    pub timed_out_iterators: Gauge,
+    /// Force released iterators in Archive mode (cumulative counter).
+    pub force_released_iterators: Gauge,
 }
 
 #[derive(Metrics, Clone)]

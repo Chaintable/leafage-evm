@@ -4557,6 +4557,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "auto_impl",
+ "dashmap",
  "leafage-evm-types",
  "libmdbx",
  "metrics",

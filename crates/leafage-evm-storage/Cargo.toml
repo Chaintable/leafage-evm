@@ -28,3 +28,4 @@ metrics.workspace = true
 metrics-derive.workspace = true
 libmdbx.workspace = true
 page_size.workspace = true
+dashmap.workspace = true

@@ -239,6 +239,13 @@ pub struct Command {
     /// This address is used when `db_type` is Rocksdb.
     #[arg(long, default_value = "false")]
     disable_auto_compactions: bool,
+
+    /// Iterator timeout in seconds for archive mode.
+    /// Default: 0 (disabled)
+    /// When > 0, StateDB iterators will be tracked and logged when they exceed this timeout.
+    /// At 2x timeout, iterators are force-released to unblock RocksDB compaction.
+    #[arg(long, default_value = "0")]
+    iterator_timeout_secs: u64,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -384,6 +391,14 @@ impl Command {
             info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
         } else {
             info!(target:"updater", "no kafka s3 config");
+        }
+
+        // Set iterator timeout environment variable for archive mode
+        if self.archive {
+            std::env::set_var(
+                "ROCKSDB_ITERATOR_TIMEOUT_SECS",
+                self.iterator_timeout_secs.to_string(),
+            );
         }
 
         let db = MultiStorage::open(
