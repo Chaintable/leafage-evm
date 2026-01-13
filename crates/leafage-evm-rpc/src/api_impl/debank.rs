@@ -812,11 +812,11 @@ where
 
         if optimistic_gas_limit < highest_gas_limit {
             tx.set_gas_limit(optimistic_gas_limit);
-            let exec_res = self
+            let res = self
                 .inner
                 .transact(&block_env, &memory_db, tx.clone())
                 .map_err(|e| e.to_rpc_error())?;
-            gas_used = exec_res.gas_used();
+            gas_used = res.gas_used();
             update_estimated_gas_range(
                 &res,
                 optimistic_gas_limit,
@@ -844,15 +844,14 @@ where
 
             match res {
                 Err(e) => {
-                    if let Some(invaild_tx_err) = e.get_transaction_error() {
-                        match invaild_tx_err {
-                            InvalidTransaction::CallerGasLimitMoreThanBlock => {
+                    if let Some(invalid_tx_err) = e.get_transaction_error() {
+                        match invalid_tx_err {
+                            InvalidTransaction::CallerGasLimitMoreThanBlock
+                            | InvalidTransaction::TxGasLimitGreaterThanCap { .. } => {
                                 highest_gas_limit = mid_gas_limit;
                             }
-                            InvalidTransaction::CallGasCostMoreThanGasLimit {
-                                initial_gas: _initial_gas,
-                                gas_limit: _gas_limit,
-                            } => {
+                            InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+                            | InvalidTransaction::GasFloorMoreThanGasLimit { .. } => {
                                 lowest_gas_limit = mid_gas_limit;
                             }
                             e => {
@@ -892,13 +891,13 @@ where
         tokio::task::spawn_blocking(move || {
             let rsp = this.debank_estimate_gas_inner(request, block_ctx, block_overrides);
             if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
+                error!("Failed to send debank_estimate result: {:?}", e);
             }
         });
 
         let rsp = rx
             .await
-            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
+            .map_err(|_| internal_rpc_err("estimate failed".to_string()))?;
         rsp
     }
 
