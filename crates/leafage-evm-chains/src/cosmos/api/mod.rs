@@ -93,25 +93,26 @@ where
     type Precompiles = PrecompilesMap;
     type Frame = EthFrame;
 
-    fn ctx(&mut self) -> &mut Self::Context {
-        self.inner.ctx_mut()
+    fn all(
+        &self,
+    ) -> (
+        &Self::Context,
+        &Self::Instructions,
+        &Self::Precompiles,
+        &FrameStack<Self::Frame>,
+    ) {
+        self.inner.all()
     }
 
-    fn ctx_ref(&self) -> &Self::Context {
-        self.inner.ctx_ref()
-    }
-
-    fn ctx_instructions(&mut self) -> (&mut Self::Context, &mut Self::Instructions) {
-        self.inner.ctx_instructions()
-    }
-
-    fn ctx_precompiles(&mut self) -> (&mut Self::Context, &mut Self::Precompiles) {
-        self.inner.ctx_precompiles()
-    }
-
-    /// Returns a mutable reference to the frame stack.
-    fn frame_stack(&mut self) -> &mut FrameStack<Self::Frame> {
-        self.inner.frame_stack()
+    fn all_mut(
+        &mut self,
+    ) -> (
+        &mut Self::Context,
+        &mut Self::Instructions,
+        &mut Self::Precompiles,
+        &mut FrameStack<Self::Frame>,
+    ) {
+        self.inner.all_mut()
     }
 
     fn frame_init(
@@ -139,33 +140,32 @@ where
 impl<DB, INSP> InspectorEvmTr for CosmosEvm<DB, INSP>
 where
     DB: Database,
-    INSP: Inspector<CosmosContext<DB>>,
+    INSP: Inspector<CosmosContext<DB>, EthInterpreter>,
 {
     type Inspector = INSP;
 
-    fn inspector(&mut self) -> &mut Self::Inspector {
-        self.inner.inspector()
+    fn all_inspector(
+        &self,
+    ) -> (
+        &Self::Context,
+        &Self::Instructions,
+        &Self::Precompiles,
+        &FrameStack<Self::Frame>,
+        &Self::Inspector,
+    ) {
+        self.inner.all_inspector()
     }
 
-    fn ctx_inspector(&mut self) -> (&mut Self::Context, &mut Self::Inspector) {
-        self.inner.ctx_inspector()
-    }
-
-    fn ctx_inspector_frame(
-        &mut self,
-    ) -> (&mut Self::Context, &mut Self::Inspector, &mut Self::Frame) {
-        self.inner.ctx_inspector_frame()
-    }
-
-    fn ctx_inspector_frame_instructions(
+    fn all_mut_inspector(
         &mut self,
     ) -> (
         &mut Self::Context,
-        &mut Self::Inspector,
-        &mut Self::Frame,
         &mut Self::Instructions,
+        &mut Self::Precompiles,
+        &mut FrameStack<Self::Frame>,
+        &mut Self::Inspector,
     ) {
-        self.inner.ctx_inspector_frame_instructions()
+        self.inner.all_mut_inspector()
     }
 
     fn inspect_frame_init(

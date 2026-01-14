@@ -4,10 +4,12 @@ use alloy_sol_types::{sol, SolInterface};
 use bech32::{Bech32m, Hrp};
 use leafage_evm_types::Bytes;
 use revm::precompile::{
-    PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
+    Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
+use std::borrow::Cow;
 
-pub const BECH32: PrecompileWithAddress = PrecompileWithAddress(
+pub const BECH32: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COSMOS_BECH32")),
     address!("0x0000000000000000000000000000000000000400"),
     bech32_run,
 );

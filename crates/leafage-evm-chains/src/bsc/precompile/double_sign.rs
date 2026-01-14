@@ -6,13 +6,17 @@ use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use core::cmp::Ordering;
 use leafage_evm_types::{Bytes, U256};
 use revm::precompile::{
-    secp256k1, u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult,
-    PrecompileWithAddress,
+    secp256k1, u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput,
+    PrecompileResult,
 };
+use std::borrow::Cow;
 
 /// Double sign evidence validation precompile for BSC.
-pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(104), double_sign_evidence_validation_run);
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BSC_DOUBLE_SIGN_EVIDENCE_VALIDATION")),
+    u64_to_address(104),
+    double_sign_evidence_validation_run,
+);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 
