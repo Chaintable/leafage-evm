@@ -8,6 +8,7 @@ mod multi_call;
 pub use multi_call::{MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult};
 
 pub use alloy::consensus::{Header as RawHeader, TxEnvelope};
+pub use alloy::rpc::types::trace::geth::{DefaultFrame, StructLog};
 pub use alloy::rpc::types::trace::parity::{
     Action, CallAction, CallOutput, CallType, CreateAction, CreateOutput,
     LocalizedTransactionTrace, RewardAction, SelfdestructAction, TraceOutput, TransactionTrace,
