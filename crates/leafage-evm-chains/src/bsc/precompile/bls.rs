@@ -4,12 +4,16 @@ use super::error::BscPrecompileError;
 use bls_on_arkworks as bls;
 use leafage_evm_types::Bytes;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
+use std::borrow::Cow;
 use std::vec::Vec;
 
-pub(crate) const BLS_SIGNATURE_VALIDATION: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(102), bls_signature_validation_run);
+pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BSC_BLS_SIGNATURE_VALIDATION")),
+    u64_to_address(102),
+    bls_signature_validation_run,
+);
 
 const BLS_MSG_HASH_LENGTH: u64 = 32;
 const BLS_SIGNATURE_LENGTH: u64 = 96;

@@ -1,13 +1,12 @@
 //! EVM Handler related to Bsc chain
 
 use alloy::primitives::address;
-use revm::{bytecode::Bytecode, primitives::eip7702};
+use revm::primitives::eip7702;
 
 use crate::bsc::api::{BscContext, BscEvm};
 use crate::bsc::blacklist;
 use alloy_evm::Database;
 use leafage_evm_types::{Address, U256};
-use revm::primitives::KECCAK_EMPTY;
 use revm::{
     context::{
         result::{EVMError, ExecutionResult, FromStringError, HaltReason},
@@ -88,7 +87,8 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
             // warm authority account and check nonce.
             // 4. Add `authority` to `accessed_addresses` (as defined in [EIP-2929](./eip-2929.md).)
-            let mut authority_acc = journal.load_account_code(authority)?;
+            // First load immutably for checking
+            let authority_acc = journal.load_account_with_code(authority)?;
 
             // 5. Verify the code of `authority` is either empty or already delegated.
             if let Some(bytecode) = &authority_acc.info.code {
@@ -117,20 +117,11 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             //    not write the designation. Clear the accounts code and reset the account's code
             //    hash to the empty hash
             //    `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
-            let address = authorization.address();
-            let (bytecode, hash) = if address.is_zero() {
-                (Bytecode::default(), KECCAK_EMPTY)
-            } else {
-                let bytecode = Bytecode::new_eip7702(address);
-                let hash = bytecode.hash_slow();
-                (bytecode, hash)
-            };
-            authority_acc.info.code_hash = hash;
-            authority_acc.info.code = Some(bytecode);
-
             // 9. Increase the nonce of `authority` by one.
-            authority_acc.info.nonce = authority_acc.info.nonce.saturating_add(1);
-            authority_acc.mark_touch();
+            // Use load_account_mut_optional_code to get mutable JournaledAccount with delegate method
+            let mut authority_acc_mut = journal.load_account_mut_optional_code(authority, true)?;
+            let address = authorization.address();
+            authority_acc_mut.data.delegate(address);
         }
 
         let refunded_gas =
@@ -179,9 +170,8 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             tx_fee = tx_fee.saturating_add(data_fee);
         }
 
-        let system_account = ctx.journal_mut().load_account(SYSTEM_ADDRESS)?;
-        system_account.data.mark_touch();
-        system_account.data.info.balance = system_account.data.info.balance.saturating_add(tx_fee);
+        let mut system_account = ctx.journal_mut().load_account_mut_optional_code(SYSTEM_ADDRESS, false)?;
+        system_account.data.incr_balance(tx_fee);
         Ok(())
     }
 

@@ -5,10 +5,11 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use p256::elliptic_curve::sec1::FromEncodedPoint;
 use p256::elliptic_curve::PrimeField;
 use p256::{AffinePoint, EncodedPoint, FieldBytes, FieldElement, PublicKey, Scalar};
-use revm::precompile::PrecompileWithAddress;
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
+use std::borrow::Cow;
 
-pub const P256_VERIFY: PrecompileWithAddress = PrecompileWithAddress(
+pub const P256_VERIFY: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COSMOS_P256_VERIFY")),
     address!("0x0000000000000000000000000000000000000100"),
     secp256r1_signature_verification_run,
 );
