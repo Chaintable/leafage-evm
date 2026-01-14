@@ -122,21 +122,24 @@ impl From<(u64, String)> for MultiChainCfgEnv {
     fn from((chain_id, evm_type): (u64, String)) -> Self {
         match evm_type.as_str() {
             "mainnet" => {
-                let mut chain_cfg = CfgEnv::default();
+                // Use AMSTERDAM (latest) spec for mainnet
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
                 MultiChainCfgEnv::Mainnet(chain_cfg)
             }
             "op" => {
-                let mut chain_cfg = CfgEnv::default();
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
                 MultiChainCfgEnv::Op(chain_cfg)
             }
             "bsc" => {
@@ -149,12 +152,13 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 MultiChainCfgEnv::Bsc(chain_cfg)
             }
             "cosmos" => {
-                let mut chain_cfg = CfgEnv::default();
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
                 MultiChainCfgEnv::Cosmos(chain_cfg)
             }
             _ => panic!("Unsupported evm type"),
