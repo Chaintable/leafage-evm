@@ -1,77 +1,190 @@
 # leafage-evm
 
-leafage-evm is a light-weight evm excuter that only retains the state of the
-most recent 64 blocks, which can only be updated through a specific json-rpc
-interface.
+[中文文档](README_cn.md)
 
-leafage-evm is designed as an eth client that only retains the the most recent
-state. It doesn't support the complete eth json-rpc. Its core objective is to
-offer state-related RPCs like `eth_call` with minimal storage and computational
-resources.
-
-## Design
-
-See [design.md](doc/design.md) for details.
+leafage-evm is a lightweight EVM executor built with Rust and [revm](https://github.com/bluealloy/revm). It receives state updates via Kafka + S3, rather than P2P synchronization.
 
 ## Features
 
-- Only Need ~60GB storage for eth mainnet
+- **Two Node Modes**:
+  - **State Node**: Only retains recent block states (default 64 blocks), ~90GB for ETH mainnet (as of 2025.1)
+  - **Archive Node**: Retains complete historical state, ~360GB for ETH mainnet (as of 2025.1)
+- **Multi-chain Support**: Ethereum mainnet, Optimism, BSC, Cosmos EVM
+- **Multiple Database Backends**: RocksDB (default), MDBX
+- **Data Migration**: Import initial state from Geth snapshots
 
-- Support JSON-RPC
-  - [x] eth_call
-  - [x] eth_multiCall
-  - [x] eth_baseFee
-  - [x] eth_blockNumber
-  - [x] eth_getBalance
-  - [x] eth_getBlockByHash
-  - [x] eth_getBlockByNumber
-  - [x] eth_getCode
-  - [x] eth_getStorageAt
-  - [x] eth_getTransactionCount
-  - [x] eth_chainId
-  - [x] eth_getTransactionByHash
-  - [x] eth_getTransactionByBlockHashAndIndex
+## Supported JSON-RPC Methods
 
-- Update by `trace_blockStateDiff` RPC, which returns the storage diff of a
-  given block on the parent block's state, See
-  [trace_blockStateDiff.md](doc/trace_blockStateDiff.md) for details.
+### eth_*
 
-- Support Migrate data from geth's state snapshot
+| Method | Description |
+|--------|-------------|
+| `eth_call` | Execute a contract call |
+| `eth_multiCall` | Batch contract calls |
+| `eth_blockNumber` | Get current block number |
+| `eth_getBalance` | Get account balance |
+| `eth_getBlockByNumber` | Get block by number |
+| `eth_getBlockByHash` | Get block by hash |
+| `eth_getCode` | Get contract code |
+| `eth_getStorageAt` | Get storage slot data |
+| `eth_getTransactionCount` | Get account nonce |
+| `eth_chainId` | Get chain ID |
+| `eth_baseFee` | Get base fee |
 
-- Plan to support different database backends, including rocksdb, mdbx etc.
+### DeBankApi (no namespace prefix)
 
-## Usage
+| Method | Description |
+|--------|-------------|
+| `version` | Get version info |
+| `getAddressNonce` | Get account nonce |
+| `getAddressBalance` | Get account balance |
+| `getAddressCode` | Get contract code |
+| `getStorageAt` | Get storage slot data |
+| `contractMultiCall` | Batch contract calls |
+| `simulateTransactions` | Simulate transaction execution |
+| `estimateGas` | Estimate gas |
+| `getLatestBlock` | Get latest block |
+| `getBlockByHeight` | Get block by height |
+| `getBlockById` | Get block by hash |
+| `blockIsValid` | Validate block |
 
-See [usage.md](doc/usage.md) for details.
+### pre_*
+
+| Method | Description |
+|--------|-------------|
+| `pre_traceCall` | Pre-execute call trace |
+| `pre_traceMany` | Batch pre-execute traces |
 
 ## Build
 
-### main
+**Requirements**: Rust 1.79+
 
-main分支可以构建mainnet和op
-
-- mainnet:
-
-```shell
+```bash
 cargo build --release
 ```
 
-通过.github/workflows/release.yml 和.github/workflows/build.yml构建
+Docker build:
 
-- op
-
-```shell
-cargo build --release --features=optimism
+```bash
+docker build -t leafage-evm .
 ```
 
-通过.github/workflows/release_op.yml 和.github/workflows/build.yml构建
+## Usage
 
-### bsc
+### Start Server
 
-bsc分支可以构建bsc
-
-```shell
-cargo build --release
+```bash
+RUST_LOG=info ./target/release/leafage-evm standalone \
+  --db-path /path/to/db \
+  --listen-addr 0.0.0.0:8545 \
+  --rpc-addr http://geth:8545 \
+  --evm-type mainnet \
+  --chain-cfg 1
 ```
 
-通过.github/workflows/release.yml 和.github/workflows/build.yml构建
+### Main Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--db-path` | - | Database path (required) |
+| `--listen-addr` | 0.0.0.0:8545 | RPC listen address |
+| `--rpc-addr` | - | Geth RPC address (for HTTP mode state updates) |
+| `--evm-type` | mainnet | EVM type: mainnet/op/bsc/cosmos |
+| `--chain-cfg` | 1 | Chain ID |
+| `--db-type` | rocksdb | Database type: rocksdb/mdbx |
+| `--db-cache` | 2048 | Database cache size (MB) |
+| `--diff-depth-limit` | 64 | Block diff depth retained in memory |
+| `--archive` | false | Enable archive mode |
+| `--prometheus-addr` | - | Prometheus metrics address |
+| `--kafka-s3-config` | - | Path to Kafka + S3 config JSON file |
+| `--max-connections` | 5000 | Maximum concurrent RPC connections |
+| `--rpc-timeout` | 10000 | RPC request timeout (ms) |
+| `--iterator-timeout-secs` | 0 | Iterator timeout for archive mode (0 = disabled) |
+| `--historical-rpc` | - | Historical RPC endpoint for pre-fork queries (e.g., OP pre-bedrock) |
+| `--historical-height` | - | Fork height threshold for historical RPC forwarding |
+
+### Kafka + S3 Configuration
+
+When using Kafka + S3 mode, provide a JSON config file:
+
+```json
+{
+  "topic": "block-notifications",
+  "brokers": "kafka1:9092,kafka2:9092",
+  "partition": 0,
+  "bucket_name": "state-diffs-bucket",
+  "outer_bucket_name": "block-info-bucket",
+  "offset_dir": "/path/to/offset",
+  "s3_chain_id": "1",
+  "version": "v1"
+}
+```
+
+### Data Migration
+
+Migrate initial data from Geth snapshot:
+
+```bash
+# 1. Export snapshot from Geth
+./geth snapshot dump2 --dumpdb /nodex_backup --datadir /eth/state/geth/
+
+# 2. Import to leafage-evm
+RUST_LOG=info ./target/release/leafage-evm file-migrate \
+  --source-path /nodex_backup \
+  --db-path /path/to/leafage/db
+```
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture.md](docs/Architecture.md) | System architecture, crate structure, key traits |
+| [StateManage.md](docs/StateManage.md) | In-memory state tree, fork handling, finalization |
+| [StateUpdater.md](docs/StateUpdater.md) | Kafka + S3 and HTTP update modes |
+| [Database.md](docs/Database.md) | RocksDB storage layout for state and archive nodes |
+
+## Architecture
+
+### State Management
+
+leafage-evm manages state using a linked-list structure:
+
+```
+Latest Block (Head)
+    ↓
+Block N-1 diff
+    ↓
+   ...
+    ↓
+Block N-63 diff
+    ↓
+Base State (RocksDB)
+```
+
+- Recent 64 block diffs are kept in memory for fast access
+- State queries search from top to bottom, falling back to RocksDB
+- On new block: push new diff to head, persist oldest diff to RocksDB when exceeding depth limit
+
+### State Update
+
+leafage-evm supports two modes for receiving state updates:
+
+- **Kafka + S3 (Primary)**: Receives block change notifications via Kafka, fetches block info and state diffs from S3
+- **HTTP (Fallback)**: Polls `trace_blockStateDiff` RPC from a modified Geth instance
+
+## Project Structure
+
+```
+leafage-evm/
+├── bin/leafage-evm/           # CLI entry point
+├── crates/
+│   ├── leafage-evm-types/     # Type definitions
+│   ├── leafage-evm-storage/   # Storage layer (RocksDB/MDBX, StateTree)
+│   ├── leafage-evm-rpc/       # JSON-RPC implementation
+│   └── leafage-evm-chains/    # Chain-specific logic (BSC/Cosmos precompiles)
+└── docs/                      # Documentation
+```
+
+## License
+
+MIT OR Apache-2.0
