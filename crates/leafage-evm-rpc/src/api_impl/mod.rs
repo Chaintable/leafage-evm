@@ -25,5 +25,6 @@ mod mainnet;
 
 mod bsc;
 mod op;
+mod mantle;
 mod warmup;
 mod cosmos;

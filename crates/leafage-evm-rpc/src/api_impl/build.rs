@@ -185,6 +185,27 @@ where
                 .await;
                 register_api(&mut rpc_module, api)?;
             }
+            MultiChainCfgEnv::Mantle(cfg) => {
+                let api_impl = ApiImpl::new(
+                    self.db,
+                    cfg.clone(),
+                    rpc_timeout,
+                    ovm_address.clone(),
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                    version,
+                );
+                let api = Api::new(api_impl);
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
+                register_api(&mut rpc_module, api)?;
+            }
         }
         let handle = server.start(rpc_module);
         Ok(handle)
