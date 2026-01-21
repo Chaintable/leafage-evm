@@ -83,6 +83,7 @@ where
         is_archive: bool,
         normalize_state_key: bool,
         version: String,
+        estimate_gas_buffer: u64,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
@@ -112,6 +113,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -133,6 +135,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -154,6 +157,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -175,6 +179,29 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
+                );
+                let api = Api::new(api_impl);
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
+                register_api(&mut rpc_module, api)?;
+            }
+            MultiChainCfgEnv::Mantle(cfg) => {
+                let api_impl = ApiImpl::new(
+                    self.db,
+                    cfg.clone(),
+                    rpc_timeout,
+                    ovm_address.clone(),
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                    version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(

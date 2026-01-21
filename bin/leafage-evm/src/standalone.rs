@@ -33,7 +33,7 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos"], default_value = "mainnet")]
+    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2"], default_value = "mainnet")]
     evm_type: String,
 
     /// The Ethereum Execution Specification ID for the chain.
@@ -246,6 +246,13 @@ pub struct Command {
     /// At 2x timeout, iterators are force-released to unblock RocksDB compaction.
     #[arg(long, default_value = "0")]
     iterator_timeout_secs: u64,
+
+    /// Gas estimation buffer percentage (100 = no buffer, 120 = +20% buffer)
+    /// Default: 100
+    ///
+    /// This adds a safety margin to gas estimates to reduce the risk of out-of-gas errors.
+    #[arg(long, default_value = "100")]
+    estimate_gas_buffer: u64,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -458,6 +465,7 @@ impl Command {
                 self.archive,
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
+                self.estimate_gas_buffer,
             )
             .await?;
 

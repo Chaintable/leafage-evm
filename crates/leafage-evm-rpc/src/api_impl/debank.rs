@@ -877,7 +877,16 @@ where
 
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
-        Ok(U256::from(highest_gas_limit))
+
+        let buffer = self.inner.evm_cfg().estimate_gas_buffer;
+        let final_gas = if buffer > 100 {
+            let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
+            buffered.min(u64::MAX as u128) as u64
+        } else {
+            highest_gas_limit
+        };
+
+        Ok(U256::from(final_gas))
     }
 
     async fn debank_estimate_gas_impl(

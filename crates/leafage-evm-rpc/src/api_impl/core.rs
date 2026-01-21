@@ -2,6 +2,7 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::cosmos::CosmosHardfork;
+use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -20,6 +21,7 @@ pub struct EvmCfg<SpecId> {
     pub ovm_address: Option<H256>,
     pub time_out: Duration,
     pub version: String,
+    pub estimate_gas_buffer: u64,
 }
 
 pub(crate) trait ApiCore: ApiBase + EvmExecutor {}
@@ -116,6 +118,7 @@ pub enum MultiChainCfgEnv {
     Op(CfgEnv<OpSpecId>),
     Bsc(CfgEnv<BscHardfork>),
     Cosmos(CfgEnv<CosmosHardfork>),
+    Mantle(CfgEnv<MantleHardfork>),
 }
 
 impl From<(u64, String)> for MultiChainCfgEnv {
@@ -161,6 +164,16 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
                 MultiChainCfgEnv::Cosmos(chain_cfg)
             }
+            "mantlev2" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
+                MultiChainCfgEnv::Mantle(chain_cfg)
+            }
             _ => panic!("Unsupported evm type"),
         }
     }
@@ -173,6 +186,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
         }
     }
 }
