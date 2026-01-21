@@ -27,6 +27,7 @@ impl<DB, SpecId> ApiImpl<DB, SpecId> {
         is_archive: bool,
         normalize_state_key: bool,
         version: String,
+        estimate_gas_buffer: u64,
     ) -> Self {
         Self {
             db,
@@ -37,6 +38,7 @@ impl<DB, SpecId> ApiImpl<DB, SpecId> {
                 ovm_address: ovm_address.map(|addr| keccak256(addr.as_slice())),
                 time_out,
                 version,
+                estimate_gas_buffer,
             },
             historical_client,
             historical_height,

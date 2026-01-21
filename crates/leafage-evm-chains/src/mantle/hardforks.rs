@@ -32,19 +32,7 @@ impl From<MantleHardfork> for OpSpecId {
 
 impl MantleHardfork {
     pub fn convert_cfg_env(cfg: CfgEnv<MantleHardfork>) -> CfgEnv<OpSpecId> {
-        let mut op_cfg = CfgEnv::new_with_spec(cfg.spec.into());
-        op_cfg.disable_balance_check = cfg.disable_balance_check;
-        op_cfg.disable_eip3607 = cfg.disable_eip3607;
-        op_cfg.disable_block_gas_limit = cfg.disable_block_gas_limit;
-        op_cfg.disable_base_fee = cfg.disable_base_fee;
-        op_cfg.chain_id = cfg.chain_id;
-        op_cfg.tx_gas_limit_cap = cfg.tx_gas_limit_cap;
-        op_cfg.tx_chain_id_check = cfg.tx_chain_id_check;
-        op_cfg.limit_contract_code_size = cfg.limit_contract_code_size;
-        op_cfg.limit_contract_initcode_size = cfg.limit_contract_initcode_size;
-        op_cfg.disable_nonce_check = cfg.disable_nonce_check;
-        op_cfg.max_blobs_per_tx = cfg.max_blobs_per_tx;
-        op_cfg.blob_base_fee_update_fraction = cfg.blob_base_fee_update_fraction;
-        op_cfg
+        let spec = cfg.spec.into();
+        cfg.with_spec(spec)
     }
 }

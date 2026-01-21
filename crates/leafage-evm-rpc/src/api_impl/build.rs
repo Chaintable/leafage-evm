@@ -83,6 +83,7 @@ where
         is_archive: bool,
         normalize_state_key: bool,
         version: String,
+        estimate_gas_buffer: u64,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
@@ -112,6 +113,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -133,6 +135,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -154,6 +157,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -175,6 +179,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -196,6 +201,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version,
+                    estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
