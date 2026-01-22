@@ -1,9 +1,9 @@
 use alloy_rlp::Decodable;
 use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_rpc::{EthApiClient, TraceApiClient};
+use leafage_evm_rpc::TraceApiClient;
 use leafage_evm_storage::EvmStorageWrite;
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff};
 use tracing::info;
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
@@ -22,24 +22,15 @@ where
     }
 
     pub async fn init(&mut self) -> Result<()> {
-        let latest_block = self
+        let debank_output = self
             .rpc_client
-            .get_block_by_number(BlockNumberOrTag::Number(0), true)
+            .debank_block(BlockId::Number(BlockNumberOrTag::Number(0)))
             .await?;
-        if latest_block.is_none() {
-            return Err(anyhow::anyhow!("failed to get genesis block"));
-        }
-        let latest_block = latest_block.unwrap();
-        let latest_block_info: Block<H256> = serde_json::from_value(latest_block)?;
-        let laest_block_diff = self
-            .rpc_client
-            .block_state_diff(BlockId::Hash(latest_block_info.header.hash.into()), false)
-            .await?;
-        let laest_block_diff: BlockStorageDiff =
-            BlockStorageDiff::decode(&mut laest_block_diff.as_ref())?;
-        self.db
-            .update_block(latest_block_info.clone(), laest_block_diff)?;
-        info!(target: "initializer", "initialized genesis block, num {}, hash {}", latest_block_info.header.number,latest_block_info.header.hash);
+        let block_info = Block::empty(debank_output.header.clone());
+        let block_diff: BlockStorageDiff =
+            BlockStorageDiff::decode(&mut debank_output.state_diff.as_ref())?;
+        self.db.update_block(block_info.clone(), block_diff)?;
+        info!(target: "initializer", "initialized genesis block, num {}, hash {}", block_info.header.number, block_info.header.hash);
         Ok(())
     }
 }

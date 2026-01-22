@@ -3,7 +3,7 @@ use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
+use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, DebankOutPut};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 pub struct Updater<Tree> {
     rpc_client: HttpClient,
     tree: Tree,
-    block_queue: VecDeque<Block<H256>>,
+    block_queue: VecDeque<DebankOutPut>,
     update_interval: Duration,
     max_diff_depth: usize,
 }
@@ -60,20 +60,12 @@ where
             }
             let next_block_number =
                 BlockNumberOrTag::Number((current_block_info.header.number + 1).into());
-            let next_block_info = self
+            let debank_output = self
                 .rpc_client
-                .get_block_by_number(next_block_number, true)
-                .await;
+                .debank_block(BlockId::Number(next_block_number))
+                .await?;
             info!(target:"updater", "current block number {:?}", current_block_info.header.number);
-            let next_block_info = next_block_info?;
-            if next_block_info.is_none() {
-                info!(target:"updater", "no new block");
-                return Ok(false);
-            } else {
-                let next_block_info: Block<H256> =
-                    serde_json::from_value(next_block_info.unwrap())?;
-                self.block_queue.push_back(next_block_info);
-            }
+            self.block_queue.push_back(debank_output);
         }
         // find the first block whose parent block is in the snapshot tree
         loop {
@@ -81,43 +73,33 @@ where
                 info!(target:"updater", "can't find parent block before max diff depth, drop");
                 return Ok(false);
             }
-            let first_block_info = self.block_queue.front().unwrap();
+            let first_output = self.block_queue.front().unwrap();
             if self
                 .tree
-                .state_at(BlockId::Hash(first_block_info.header.parent_hash.into()))?
+                .state_at(BlockId::Hash(first_output.header.parent_hash.into()))?
                 .is_some()
             {
-                debug!(target:"updater", "find parent block {}", first_block_info.header.parent_hash);
+                debug!(target:"updater", "find parent block {}", first_output.header.parent_hash);
                 break;
             }
-            let parent_block_info = self
+            let debank_output = self
                 .rpc_client
-                .get_block_by_hash(first_block_info.header.parent_hash, true)
+                .debank_block(BlockId::Hash(first_output.header.parent_hash.into()))
                 .await?;
-            if parent_block_info.is_none() {
-                info!(target:"updater", "can't not find block {}", first_block_info.header.parent_hash);
-                return Ok(false);
-            } else {
-                let parent_block_info: Block<H256> =
-                    serde_json::from_value(parent_block_info.unwrap())?;
-                self.block_queue.push_front(parent_block_info);
-            }
+            self.block_queue.push_front(debank_output);
         }
 
-        while let Some(block_info) = self.block_queue.pop_front() {
-            let diff = self
-                .rpc_client
-                .block_state_diff(BlockId::Hash(block_info.header.hash.into()), true)
-                .await?;
-            let mut bytes = diff.as_ref();
+        while let Some(debank_output) = self.block_queue.pop_front() {
+            let mut bytes = debank_output.state_diff.as_ref();
             let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
-            let block_hash = block_info.header.hash;
-            let block_num = block_info.header.number;
+            let block_hash = debank_output.header.hash;
+            let block_num = debank_output.header.number;
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
+            let block_info = Block::empty(debank_output.header);
             self.tree.update_block(block_info, block_storage_diff)?;
-            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}", 
+            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                             block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
 
@@ -164,13 +146,10 @@ mod tests {
             .unwrap();
         for i in 0..1 {
             let res = rpc_client
-                .block_state_diff(
-                    BlockId::Number(BlockNumberOrTag::Number(18022783 + i)),
-                    true,
-                )
+                .debank_block(BlockId::Number(BlockNumberOrTag::Number(18022783 + i)))
                 .await
                 .unwrap();
-            let block_diff: BlockStorageDiff = Decodable::decode(&mut res.as_ref()).unwrap();
+            let block_diff: BlockStorageDiff = Decodable::decode(&mut res.state_diff.as_ref()).unwrap();
             println!("{:?}", block_diff.storage_diffs);
         }
     }

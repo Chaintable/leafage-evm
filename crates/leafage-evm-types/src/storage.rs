@@ -1,8 +1,9 @@
 use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, U256};
-use crate::rpc::Block;
+use crate::rpc::{Block, Header};
 use alloy::primitives::keccak256;
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::context_interface::block::BlobExcessGasAndPrice;
+use serde::{Deserialize, Serialize};
 
 pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
     BlockEnv {
@@ -26,6 +27,13 @@ pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
             }
         }),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebankOutPut {
+    pub header: Header,
+    /// RLP encoded BlockStorageDiff
+    pub state_diff: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
