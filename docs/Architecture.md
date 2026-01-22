@@ -2,7 +2,7 @@
 
 ## Overview
 
-leafage-evm is a lightweight EVM executor that provides JSON-RPC interfaces for blockchain state queries. It does not perform P2P synchronization but receives state updates via Kafka + S3.
+leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_estimateGas`, etc.) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -199,7 +199,7 @@ Kafka Consumer                           S3 Storage
 
 ### HTTP Mode (Fallback)
 
-Polls `trace_blockStateDiff` RPC from a modified Geth instance. Used when Kafka is unavailable.
+Polls `trace_debankBlock` RPC from a modified Geth instance. Used when Kafka is unavailable.
 
 ## EVM Execution
 

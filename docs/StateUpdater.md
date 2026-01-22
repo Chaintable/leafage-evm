@@ -9,7 +9,7 @@ leafage-evm does not perform P2P synchronization. Instead, it receives state upd
 | Mode | Primary Use | Data Source |
 |------|-------------|-------------|
 | Kafka + S3 | Production | Kafka notifications + S3 block data |
-| HTTP | Development/Fallback | Geth RPC (`trace_blockStateDiff`) |
+| HTTP | Development/Fallback | Geth RPC (`trace_debankBlock`) |
 
 ## Mode Selection
 
@@ -144,8 +144,8 @@ Kafka + S3 config file (`--kafka-s3-config`):
 ┌─────────────────┐     ┌─────────────────┐
 │   Modified Geth │     │   leafage-evm   │
 │                 │     │                 │
-│  trace_block    │     │  HttpUpdater    │
-│  StateDiff RPC  │────►│                 │
+│ trace_debank    │     │  HttpUpdater    │
+│ Block RPC       │────►│                 │
 │                 │     │  StateTree      │
 └─────────────────┘     └─────────────────┘
 ```
@@ -165,13 +165,11 @@ Kafka + S3 config file (`--kafka-s3-config`):
 │     └── eth_blockNumber                                     │
 │                                                             │
 │  3. If new blocks available:                                │
-│     a. Fetch next block info                                │
-│        └── eth_getBlockByNumber                             │
+│     a. Fetch block info and state diff via debank_block     │
+│        └── trace_debankBlock(block_id)                      │
 │     b. Handle reorg if parent not in StateTree              │
 │        └── Walk back to find common ancestor                │
-│     c. Fetch state diff                                     │
-│        └── trace_blockStateDiff(block_hash, re_exec=true)   │
-│     d. Apply to StateTree                                   │
+│     c. Apply to StateTree                                   │
 │        └── tree.update_block(block_info, block_diff)        │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -220,3 +218,7 @@ Detection:
 | `--update-interval` | HTTP polling interval (ms) |
 | `--diff-depth-limit` | Max block diffs in memory / reorg depth |
 | `--init-task-queue-size` | Batch size for S3 catch-up (default: 256) |
+
+## Related Documentation
+
+- [DataSpec.md](DataSpec.md) - Data format specification for S3 and HTTP modes
