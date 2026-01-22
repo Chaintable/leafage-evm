@@ -378,7 +378,7 @@ impl From<&CallTraceNode> for DebankTrace {
                 | CallKind::StaticCall
                 | CallKind::CallCode
                 | CallKind::DelegateCall
-                | CallKind::AuthCall => "call".to_string(),
+                | CallKind::AuthCall => trace.kind.to_string(),
                 CallKind::Create | CallKind::Create2 => "create".to_string(),
             },
             call_type: match trace.kind {
