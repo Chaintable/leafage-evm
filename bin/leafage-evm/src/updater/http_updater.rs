@@ -90,8 +90,12 @@ where
         }
 
         while let Some(debank_output) = self.block_queue.pop_front() {
-            let mut bytes = debank_output.state_diff.as_ref();
-            let block_storage_diff = BlockStorageDiff::decode(&mut bytes)?;
+            let block_storage_diff = if debank_output.state_diff.is_empty() {
+                BlockStorageDiff::default()
+            } else {
+                let mut bytes = debank_output.state_diff.as_ref();
+                BlockStorageDiff::decode(&mut bytes)?
+            };
             let block_hash = debank_output.header.hash;
             let block_num = debank_output.header.number;
             let new_accounts_num = block_storage_diff.new_accounts.len();
