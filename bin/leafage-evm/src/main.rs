@@ -1,3 +1,4 @@
+mod archive_init;
 mod db_migrate;
 mod file_migrate;
 mod initializer;

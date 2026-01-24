@@ -1,4 +1,4 @@
-use crate::{db_migrate, file_migrate, standalone};
+use crate::{archive_init, db_migrate, file_migrate, standalone};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::future::Future;
@@ -29,6 +29,9 @@ pub(crate) enum Commands {
     FileMigrate(file_migrate::Command),
     #[command(name = "db-migrate")]
     DBMigrate(db_migrate::Command),
+    /// Initialize archive database from S3 and RPC
+    #[command(name = "archive-init")]
+    ArchiveInit(archive_init::Command),
 }
 
 impl Commands {
@@ -37,6 +40,7 @@ impl Commands {
             Commands::Standalone(mut cmd) => cmd.run().await,
             Commands::FileMigrate(mut cmd) => cmd.run().await,
             Commands::DBMigrate(mut cmd) => cmd.run().await,
+            Commands::ArchiveInit(mut cmd) => cmd.run().await,
         }
     }
 }

@@ -327,7 +327,7 @@ impl DataBaseRef {
 }
 
 impl DataBaseRef {
-    fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
+    pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
             .db
@@ -350,7 +350,7 @@ impl DataBaseRef {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -408,7 +408,7 @@ impl DataBaseRef {
         Ok(Some(block))
     }
 
-    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+    pub fn read_latest_block_hash(&self) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let latest_block_hash_cf = self
             .db
@@ -429,10 +429,8 @@ impl DataBaseRef {
         let block_hash = H256::from_slice(block_hash_bytes.as_slice());
         Ok(block_hash)
     }
-}
 
-impl DataBaseRef {
-    fn read_latest_block_num(&self) -> Result<Option<u64>, Error> {
+    pub fn read_latest_block_num(&self) -> Result<Option<u64>, Error> {
         let latest_hash = self.read_latest_block_hash()?;
         if latest_hash == H256::ZERO {
             return Ok(None);
@@ -933,11 +931,83 @@ impl StateDBRead for StateDB {
         Ok(self.block_header.hash)
     }
 }
+/// StateDB delegates all write operations to Arc<DataBaseRef>
 impl StateDBWrite for StateDB {
     type DBWriteBatch = WriteBatch;
+
+    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
+        self.db.prepare_write_batch()
+    }
+
+    fn write_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_num: u64,
+        block_hash: H256,
+    ) -> Result<(), Error> {
+        self.db.write_block_hash(batch, block_num, block_hash)
+    }
+
+    fn write_block_info(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_info: Block<H256>,
+    ) -> Result<(), Error> {
+        self.db.write_block_info(batch, block_info)
+    }
+
+    fn write_account(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+        raw_account: Option<NewAccount>,
+    ) -> Result<(), Error> {
+        self.db.write_account(batch, address, block_num, raw_account)
+    }
+
+    fn write_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        key: H256,
+        block_num: u64,
+        value: U256,
+    ) -> Result<(), Error> {
+        self.db.write_storage(batch, address, key, block_num, value)
+    }
+
+    fn write_code(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        code_hash: H256,
+        code: Bytes,
+    ) -> Result<(), Error> {
+        self.db.write_code(batch, code_hash, code)
+    }
+
+    fn write_latest_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_hash: H256,
+    ) -> Result<(), Error> {
+        self.db.write_latest_block_hash(batch, block_hash)
+    }
+
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
+        self.db.commit(batch)
+    }
+}
+
+/// Direct write implementation for `Arc<DataBaseRef>` without needing a StateDB instance.
+/// This is useful for bulk initialization where we don't need read capabilities.
+impl StateDBWrite for Arc<DataBaseRef> {
+    type DBWriteBatch = WriteBatch;
+
     fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
         Ok(WriteBatch::default())
     }
+
     fn write_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -945,7 +1015,6 @@ impl StateDBWrite for StateDB {
         block_hash: H256,
     ) -> Result<(), Error> {
         let block_num_to_block_hash_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
@@ -965,7 +1034,6 @@ impl StateDBWrite for StateDB {
         block_info: Block<H256>,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
@@ -989,7 +1057,6 @@ impl StateDBWrite for StateDB {
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
         let address_to_account_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
@@ -1025,7 +1092,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_storage_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
             .unwrap();
         let address_bytes = address.as_slice();
@@ -1049,7 +1115,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_code_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
         let code_hash_bytes = code_hash.as_slice();
@@ -1064,7 +1129,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let latest_block_hash_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
         batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_slice());
@@ -1072,7 +1136,7 @@ impl StateDBWrite for StateDB {
     }
 
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
-        self.db.db.write(batch)?;
+        self.db.write(batch)?;
         Ok(())
     }
 }
