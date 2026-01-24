@@ -10,9 +10,9 @@ use leafage_evm_storage::{ArchiveRocksDBStorage, StateDBWrite};
 use leafage_evm_types::{Block, BlockStorageDiff, H256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -70,86 +70,6 @@ struct ProcessResult {
     block_hash: H256,
 }
 
-/// Tracks completed blocks and computes the maximum contiguous completed block
-struct CompletionTracker {
-    start_block: u64,
-    /// Maps block_num -> block_hash for completed blocks
-    /// Also stores max_contiguous to ensure atomic updates under the same lock
-    inner: Mutex<CompletionTrackerInner>,
-}
-
-struct CompletionTrackerInner {
-    completed: BTreeMap<u64, H256>,
-    /// The highest block number where all blocks from start_block to this block are completed
-    max_contiguous: u64,
-    /// Last written checkpoint number (for cleanup)
-    last_written_checkpoint: u64,
-}
-
-impl CompletionTracker {
-    fn new(start_block: u64) -> Self {
-        Self {
-            start_block,
-            inner: Mutex::new(CompletionTrackerInner {
-                completed: BTreeMap::new(),
-                max_contiguous: start_block.saturating_sub(1),
-                last_written_checkpoint: (start_block.saturating_sub(1)) / CHECKPOINT_INTERVAL,
-            }),
-        }
-    }
-
-    /// Record a completed block and update max_contiguous if possible
-    /// Returns the new max_contiguous value
-    fn record_completion(&self, block_num: u64, block_hash: H256) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
-        inner.completed.insert(block_num, block_hash);
-
-        // Update max_contiguous by scanning from current max + 1
-        // This is now atomic with the insert since we hold the lock
-        let mut current = inner.max_contiguous;
-        loop {
-            let next = current + 1;
-            if inner.completed.contains_key(&next) {
-                current = next;
-            } else {
-                break;
-            }
-        }
-        inner.max_contiguous = current;
-
-        // Clean up completed blocks to save memory
-        // Keep blocks from the last written checkpoint onwards to ensure we can read checkpoint hashes
-        let cleanup_threshold = inner.last_written_checkpoint * CHECKPOINT_INTERVAL;
-        if cleanup_threshold > self.start_block {
-            inner.completed.retain(|&k, _| k >= cleanup_threshold);
-        }
-
-        current
-    }
-
-    /// Mark a checkpoint as written, allowing older data to be cleaned up
-    fn mark_checkpoint_written(&self, checkpoint_num: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        if checkpoint_num > inner.last_written_checkpoint {
-            inner.last_written_checkpoint = checkpoint_num;
-        }
-    }
-
-    /// Get the block hash for a specific block number (if still in memory)
-    fn get_block_hash(&self, block_num: u64) -> Option<H256> {
-        self.inner
-            .lock()
-            .unwrap()
-            .completed
-            .get(&block_num)
-            .copied()
-    }
-
-    fn max_contiguous(&self) -> u64 {
-        self.inner.lock().unwrap().max_contiguous
-    }
-}
-
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
         info!(target: "archive_init", "Starting archive initialization");
@@ -184,14 +104,18 @@ impl Command {
 
         let overall_start = Instant::now();
 
-        // Counter for progress tracking
-        let success_count = Arc::new(AtomicU64::new(0));
+        // Create channel for sending ProcessResult to checkpoint worker
+        let (tx, rx) = mpsc::unbounded_channel::<ProcessResult>();
 
-        // Track completed blocks for checkpoint logic
-        let tracker = Arc::new(CompletionTracker::new(start_block));
-        let last_checkpoint = Arc::new(AtomicU64::new(
-            (start_block.saturating_sub(1)) / CHECKPOINT_INTERVAL,
-        ));
+        // Spawn checkpoint worker
+        let checkpoint_worker = Self::spawn_checkpoint_worker(
+            rx,
+            db.clone(),
+            start_block,
+            self.end_block,
+            total_blocks,
+            overall_start,
+        );
 
         // Create stream of block heights
         let blocks = stream::iter(start_block..=self.end_block);
@@ -217,88 +141,39 @@ impl Command {
 
                 async move {
                     Self::fetch_and_write_block_with_retry(
-                        rpc, s3, bucket, outer_bucket, chain_id, version, db, block_num,
+                        rpc,
+                        s3,
+                        bucket,
+                        outer_bucket,
+                        chain_id,
+                        version,
+                        db,
+                        block_num,
                     )
                     .await
                 }
             })
             .buffer_unordered(max_tasks)
             .for_each(|result| {
-                let success_count = success_count.clone();
-                let tracker = tracker.clone();
-                let last_checkpoint = last_checkpoint.clone();
-                let db = db.clone();
-                let overall_start = overall_start;
-
+                let tx = tx.clone();
                 async move {
-                    let count = success_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-                    // Record completion and get the new max contiguous block
-                    let max_contiguous = tracker.record_completion(result.block_num, result.block_hash);
-
-                    // Check if we can write a new checkpoint
-                    // Checkpoint at block N means all blocks 0..=N are complete
-                    let current_checkpoint_num = max_contiguous / CHECKPOINT_INTERVAL;
-                    let last_checkpoint_num = last_checkpoint.load(Ordering::Relaxed);
-
-                    if current_checkpoint_num > last_checkpoint_num {
-                        let checkpoint_block = current_checkpoint_num * CHECKPOINT_INTERVAL;
-
-                        // Read checkpoint block's hash from database (more reliable than tracker)
-                        let checkpoint_hash = db
-                            .read_block_hash(checkpoint_block)
-                            .expect("Failed to read checkpoint block hash");
-
-                        if checkpoint_hash != H256::ZERO {
-                            let mut batch = db.prepare_write_batch().expect("Failed to prepare batch");
-                            db.write_latest_block_hash(&mut batch, checkpoint_hash)
-                                .expect("Failed to write latest block hash");
-                            db.commit(batch).expect("Failed to commit checkpoint");
-                            last_checkpoint.store(current_checkpoint_num, Ordering::Relaxed);
-                            tracker.mark_checkpoint_written(current_checkpoint_num);
-                            info!(target: "archive_init",
-                                "Checkpoint written at block {} (max_contiguous: {})",
-                                checkpoint_block, max_contiguous);
-                        }
-                    }
-
-                    // Log progress every 100 blocks
-                    if count % 100 == 0 {
-                        let elapsed = overall_start.elapsed().as_secs_f64();
-                        let blocks_per_sec = count as f64 / elapsed;
-                        let remaining = total_blocks - count;
-                        let eta_secs = if blocks_per_sec > 0.0 {
-                            (remaining as f64 / blocks_per_sec) as u64
-                        } else {
-                            0
-                        };
-                        let progress_pct = (count * 100) / total_blocks;
-
-                        info!(target: "archive_init",
-                            "Progress: {}% ({}/{}) | Block {} | Contiguous: {} | Speed: {:.1} blocks/s | ETA: {}s",
-                            progress_pct, count, total_blocks, result.block_num, max_contiguous,
-                            blocks_per_sec, eta_secs);
-                    }
+                    // Send result to checkpoint worker
+                    tx.send(result).expect("Checkpoint worker channel closed");
                 }
             })
             .await;
 
-        // Final statistics
-        let final_success = success_count.load(Ordering::Relaxed);
+        // Drop the sender to signal completion to the checkpoint worker
+        drop(tx);
+
+        // Wait for checkpoint worker to finish and get final stats
+        let (final_success, final_contiguous) = checkpoint_worker.await?;
+
         let total_time = overall_start.elapsed().as_secs_f64();
         let avg_speed = final_success as f64 / total_time;
 
-        // Write final checkpoint - all blocks should be complete now
-        let final_contiguous = tracker.max_contiguous();
-        if final_contiguous >= self.end_block {
-            if let Some(latest_hash) = tracker.get_block_hash(self.end_block) {
-                let mut batch = db.prepare_write_batch()?;
-                db.write_latest_block_hash(&mut batch, latest_hash)?;
-                db.commit(batch)?;
-                info!(target: "archive_init", "Final checkpoint written at block {}", self.end_block);
-            }
-        } else {
-            // This shouldn't happen since all blocks should be processed
+        // Verify all blocks were processed
+        if final_contiguous < self.end_block {
             panic!(
                 "Final contiguous block {} is less than end_block {}",
                 final_contiguous, self.end_block
@@ -310,6 +185,105 @@ impl Command {
             final_success, total_time, avg_speed);
 
         Ok(())
+    }
+
+    /// Spawn checkpoint worker that handles max_contiguous tracking, checkpoint commits, and progress logging
+    fn spawn_checkpoint_worker(
+        mut rx: mpsc::UnboundedReceiver<ProcessResult>,
+        db: Arc<ArchiveRocksDBStorage>,
+        start_block: u64,
+        end_block: u64,
+        total_blocks: u64,
+        overall_start: Instant,
+    ) -> tokio::task::JoinHandle<(u64, u64)> {
+        tokio::spawn(async move {
+            let mut completed: BTreeMap<u64, H256> = BTreeMap::new();
+            // Use Option to correctly handle start_block = 0 case
+            let mut max_contiguous: Option<u64> = if start_block == 0 {
+                None
+            } else {
+                Some(start_block - 1)
+            };
+            let mut last_checkpoint_num = start_block.saturating_sub(1) / CHECKPOINT_INTERVAL;
+            let mut count: u64 = 0;
+
+            while let Some(result) = rx.recv().await {
+                count += 1;
+
+                // Record completion
+                completed.insert(result.block_num, result.block_hash);
+
+                // Update max_contiguous by scanning from start_block or current max + 1
+                let scan_start = match max_contiguous {
+                    Some(mc) => mc + 1,
+                    None => start_block,
+                };
+                let mut current = max_contiguous;
+                let mut next = scan_start;
+                while completed.contains_key(&next) {
+                    current = Some(next);
+                    next += 1;
+                }
+                max_contiguous = current;
+
+                // Check if we can write a new checkpoint
+                if let Some(mc) = max_contiguous {
+                    let current_checkpoint_num = mc / CHECKPOINT_INTERVAL;
+                    if current_checkpoint_num > last_checkpoint_num {
+                        let checkpoint_block = current_checkpoint_num * CHECKPOINT_INTERVAL;
+                        let block_hash = completed[&checkpoint_block];
+                        Self::commit_checkpoint(&db, block_hash);
+                        last_checkpoint_num = current_checkpoint_num;
+                        info!(target: "archive_init",
+                            "Checkpoint written at block {} (max_contiguous: {})",
+                            checkpoint_block, mc);
+
+                        // Clean up completed blocks to save memory
+                        let cleanup_threshold = last_checkpoint_num * CHECKPOINT_INTERVAL;
+                        if cleanup_threshold > start_block {
+                            completed.retain(|&k, _| k >= cleanup_threshold);
+                        }
+                    }
+                }
+
+                // Log progress every 100 blocks
+                if count % 100 == 0 {
+                    let elapsed = overall_start.elapsed().as_secs_f64();
+                    let blocks_per_sec = count as f64 / elapsed;
+                    let remaining = total_blocks - count;
+                    let eta_secs = if blocks_per_sec > 0.0 {
+                        (remaining as f64 / blocks_per_sec) as u64
+                    } else {
+                        0
+                    };
+                    let progress_pct = (count * 100) / total_blocks;
+                    let mc_display = max_contiguous.map(|v| v as i64).unwrap_or(-1);
+
+                    info!(target: "archive_init",
+                        "Progress: {}% ({}/{}) | Block {} | Contiguous: {} | Speed: {:.1} blocks/s | ETA: {}s",
+                        progress_pct, count, total_blocks, result.block_num, mc_display,
+                        blocks_per_sec, eta_secs);
+                }
+            }
+
+            // Write final checkpoint
+            let final_contiguous = max_contiguous.unwrap_or(start_block.saturating_sub(1));
+            if final_contiguous >= end_block {
+                let block_hash = completed[&end_block];
+                Self::commit_checkpoint(&db, block_hash);
+                info!(target: "archive_init", "Final checkpoint written at block {}", end_block);
+            }
+
+            (count, final_contiguous)
+        })
+    }
+
+    /// Commit a checkpoint to the database
+    fn commit_checkpoint(db: &Arc<ArchiveRocksDBStorage>, block_hash: H256) {
+        let mut batch = db.prepare_write_batch().expect("Failed to prepare batch");
+        db.write_latest_block_hash(&mut batch, block_hash)
+            .expect("Failed to write latest block hash");
+        db.commit(batch).expect("Failed to commit checkpoint");
     }
 
     /// Get the start block number, checking for existing data to support resume
