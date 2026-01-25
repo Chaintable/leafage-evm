@@ -184,6 +184,10 @@ impl Command {
             "Archive initialization completed. Total: {} blocks in {:.1}s ({:.1} blocks/s)",
             final_success, total_time, avg_speed);
 
+        info!(target: "archive_init", "Starting database compaction...");
+        db.compact()?;
+        info!(target: "archive_init", "Database compaction completed.");
+
         Ok(())
     }
 
@@ -278,12 +282,13 @@ impl Command {
         })
     }
 
-    /// Commit a checkpoint to the database
+    /// Commit a checkpoint to the database and flush to reduce WAL size
     fn commit_checkpoint(db: &Arc<ArchiveRocksDBStorage>, block_hash: H256) {
         let mut batch = db.prepare_write_batch().expect("Failed to prepare batch");
         db.write_latest_block_hash(&mut batch, block_hash)
             .expect("Failed to write latest block hash");
         db.commit(batch).expect("Failed to commit checkpoint");
+        db.flush().expect("Failed to flush database");
     }
 
     /// Get the start block number, checking for existing data to support resume

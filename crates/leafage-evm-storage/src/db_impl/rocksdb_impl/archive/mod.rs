@@ -34,11 +34,11 @@ use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
     ReadOptions, SliceTransform, WriteBatch, DB,
 };
+use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::env;
 use tracing::info;
 
 mod iterator_tracker;
@@ -439,6 +439,63 @@ impl DataBaseRef {
         match block_info {
             Some(block) => Ok(Some(block.header.number)),
             None => Ok(None),
+        }
+    }
+
+    pub fn flush(&self) -> Result<(), Error> {
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn compact(&self) -> Result<(), Error> {
+        // Compact each column family separately to reduce memory usage
+        let column_families = [
+            StorageTypeColumn::LatestBlockHash,
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::HashToCode,
+        ];
+
+        for cf_type in column_families {
+            let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+            info!(target: "archive_compact", "Compacting column family: {}", cf_type);
+
+            // For large column families, compact by key range (first byte prefix)
+            // to further reduce memory usage
+            match cf_type {
+                StorageTypeColumn::AddressToAccount => {
+                    // Key structure: address (32) || block_num (8) = 40 bytes
+                    self.compact_cf_by_prefix::<40>(cf);
+                }
+                StorageTypeColumn::AddressToStorage => {
+                    // Key structure: address (32) || index (32) || block_num (8) = 72 bytes
+                    self.compact_cf_by_prefix::<72>(cf);
+                }
+                _ => {
+                    // Small column families can be compacted in one go
+                    self.db
+                        .compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+                }
+            }
+
+            info!(target: "archive_compact", "Finished compacting column family: {}", cf_type);
+        }
+
+        Ok(())
+    }
+
+    /// Compact a column family in 16 ranges based on first byte's high nibble.
+    /// This reduces memory usage by processing smaller chunks at a time.
+    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily) {
+        for i in 0u8..16 {
+            let start = [i << 4];
+            let mut end = [0xFFu8; KEY_LEN];
+            end[0] = (i << 4) | 0x0F;
+            info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
+                i + 1, i << 4, (i << 4) | 0x0F);
+            self.db.compact_range_cf(cf, Some(&start), Some(&end));
         }
     }
 }
@@ -963,7 +1020,8 @@ impl StateDBWrite for StateDB {
         block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
-        self.db.write_account(batch, address, block_num, raw_account)
+        self.db
+            .write_account(batch, address, block_num, raw_account)
     }
 
     fn write_storage(
