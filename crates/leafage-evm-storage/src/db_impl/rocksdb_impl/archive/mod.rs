@@ -148,11 +148,23 @@ impl Drop for DataBaseRef {
 unsafe impl Send for DataBaseInner {}
 unsafe impl Sync for DataBaseInner {}
 
+/// Compression type for column families
+#[derive(Clone, Copy)]
+enum CfCompression {
+    /// No compression (small values, not worth compressing)
+    None,
+    /// LZ4 compression (good balance of speed and compression)
+    Lz4,
+    /// ZSTD compression (high compression ratio for large values like code)
+    Zstd,
+}
+
 #[inline]
 fn rocksdb_column_options(
     shared_cache: &Cache,
     fixed_prefix_size: usize,
     disable_auto_compactions: bool,
+    compression: CfCompression,
 ) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
@@ -177,6 +189,45 @@ fn rocksdb_column_options(
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
+
+    // Set compression based on data characteristics
+    match compression {
+        CfCompression::None => {
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+        }
+        CfCompression::Lz4 => {
+            // L0-L1: no compression (frequently accessed), L2+: LZ4
+            cf_opts.set_compression_per_level(&[
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+            ]);
+        }
+        CfCompression::Zstd => {
+            // L0-L1: LZ4 (fast), L2+: ZSTD (high compression for large code blobs)
+            cf_opts.set_compression_per_level(&[
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+            ]);
+            // Enable ZSTD dictionary compression for better compression of similar data patterns
+            // - max_train_bytes: bytes to sample for dictionary training (1MB)
+            // - zstd_max_train_bytes: same as above for ZSTD specifically
+            cf_opts.set_zstd_max_train_bytes(1024 * 1024); // 1MB training data
+            // compression_opts: (window_bits, level, strategy, max_dict_bytes)
+            // max_dict_bytes: dictionary size (16KB is a good default)
+            cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
+        }
+    }
+
     cf_opts
 }
 
@@ -235,29 +286,35 @@ impl DataBaseRef {
             "Created shared Clock Cache with size: {}MB for archive", total_cache_size
         );
 
+        // LatestBlockHash: single record, no compression needed
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::None),
         );
+        // BlockHashToBlockInfo: ~500 bytes value, LZ4 compression
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::Lz4),
         );
+        // BlockNumToBlockHash: 32 bytes value, no compression needed
         let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::None),
         );
+        // AddressToAccount: ~100 bytes value, LZ4 compression
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(&shared_cache, 32, disable_auto_compactions),
+            rocksdb_column_options(&shared_cache, 32, disable_auto_compactions, CfCompression::Lz4),
         );
+        // AddressToStorage: 32 bytes value, no compression needed
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(&shared_cache, 64, disable_auto_compactions),
+            rocksdb_column_options(&shared_cache, 64, disable_auto_compactions, CfCompression::None),
         );
+        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
         let hash_to_code_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::Zstd),
         );
         let cfs = vec![
             latest_block_hash_cf,

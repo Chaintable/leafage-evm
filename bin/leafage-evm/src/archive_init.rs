@@ -87,7 +87,7 @@ impl Command {
         let db = Arc::new(ArchiveRocksDBStorage::open(
             &self.db_path,
             self.db_cache,
-            true, // disable_auto_compactions
+            false, // disable_auto_compactions for faster bulk writes
         ));
 
         // Determine start block (support resume)
