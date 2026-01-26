@@ -1,7 +1,6 @@
 mod archive_init;
 mod compact;
 mod db_migrate;
-mod file_migrate;
 mod initializer;
 mod register;
 mod runner;
