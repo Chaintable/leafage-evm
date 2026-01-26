@@ -25,6 +25,9 @@ const MAX_RETRIES: u32 = 3;
 /// Delay between retries
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Delay for RocksDB to settle after closing (background threads to terminate)
+const ROCKSDB_SETTLE_DELAY: Duration = Duration::from_secs(10);
+
 /// `leafage-evm archive-init` command
 #[derive(Debug, Parser)]
 pub struct Command {
@@ -87,7 +90,7 @@ impl Command {
         let db = Arc::new(ArchiveRocksDBStorage::open(
             &self.db_path,
             self.db_cache,
-            false, // disable_auto_compactions for faster bulk writes
+            true, // disable_auto_compactions for faster bulk writes
         ));
 
         // Determine start block (support resume)
@@ -184,8 +187,18 @@ impl Command {
             "Archive initialization completed. Total: {} blocks in {:.1}s ({:.1} blocks/s)",
             final_success, total_time, avg_speed);
 
+        // Close database to ensure all writes are persisted before compaction
+        info!(target: "archive_init", "Closing database before compaction...");
+        Arc::try_unwrap(db)
+            .expect("Database Arc has other references, cannot close safely");
+
+        // Wait for RocksDB background threads to fully terminate
+        sleep(ROCKSDB_SETTLE_DELAY).await;
+
+        // Reopen database with auto compaction enabled for the compaction phase
+        let compact_db = ArchiveRocksDBStorage::open(&self.db_path, self.db_cache, false);
         info!(target: "archive_init", "Starting database compaction...");
-        db.compact()?;
+        compact_db.compact()?;
         info!(target: "archive_init", "Database compaction completed.");
 
         Ok(())
