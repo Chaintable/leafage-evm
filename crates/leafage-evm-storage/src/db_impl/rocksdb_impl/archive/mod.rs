@@ -222,8 +222,8 @@ fn rocksdb_column_options(
             // - max_train_bytes: bytes to sample for dictionary training (1MB)
             // - zstd_max_train_bytes: same as above for ZSTD specifically
             cf_opts.set_zstd_max_train_bytes(1024 * 1024); // 1MB training data
-            // compression_opts: (window_bits, level, strategy, max_dict_bytes)
-            // max_dict_bytes: dictionary size (16KB is a good default)
+                                                           // compression_opts: (window_bits, level, strategy, max_dict_bytes)
+                                                           // max_dict_bytes: dictionary size (16KB is a good default)
             cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
         }
     }
@@ -289,32 +289,62 @@ impl DataBaseRef {
         // LatestBlockHash: single record, no compression needed
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::None),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+            ),
         );
         // BlockHashToBlockInfo: ~500 bytes value, LZ4 compression
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::Lz4),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::Lz4,
+            ),
         );
         // BlockNumToBlockHash: 32 bytes value, no compression needed
         let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::None),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+            ),
         );
         // AddressToAccount: ~100 bytes value, LZ4 compression
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(&shared_cache, 32, disable_auto_compactions, CfCompression::Lz4),
+            rocksdb_column_options(
+                &shared_cache,
+                32,
+                disable_auto_compactions,
+                CfCompression::Lz4,
+            ),
         );
         // AddressToStorage: 32 bytes value, no compression needed
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(&shared_cache, 64, disable_auto_compactions, CfCompression::None),
+            rocksdb_column_options(
+                &shared_cache,
+                64,
+                disable_auto_compactions,
+                CfCompression::None,
+            ),
         );
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
         let hash_to_code_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions, CfCompression::Zstd),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::Zstd,
+            ),
         );
         let cfs = vec![
             latest_block_hash_cf,
@@ -532,8 +562,7 @@ impl DataBaseRef {
                 }
                 _ => {
                     // Small column families can be compacted in one go
-                    self.db
-                        .compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+                    self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
                 }
             }
 
