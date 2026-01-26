@@ -5,6 +5,7 @@ use revm::precompile::{PrecompileSpecId, Precompiles};
 
 mod bech32;
 mod p256;
+mod erc20;
 
 pub struct CosmosPrecompiles {
     inner: EthPrecompiles,

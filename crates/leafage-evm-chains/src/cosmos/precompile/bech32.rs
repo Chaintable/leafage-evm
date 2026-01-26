@@ -1,6 +1,6 @@
 use crate::cosmos::precompile::bech32::Bech32I::{bech32ToHexCall, hexToBech32Call, Bech32ICalls};
 use alloy::primitives::{address, Address};
-use alloy_sol_types::{sol, SolInterface};
+use alloy_sol_types::{sol, SolInterface, SolValue};
 use bech32::{Bech32m, Hrp};
 use leafage_evm_types::Bytes;
 use revm::precompile::{
@@ -66,9 +66,10 @@ fn hex_to_bech32(call: hexToBech32Call) -> PrecompileResult {
     let hrp = Hrp::parse(&prefix).map_err(|err| PrecompileError::other(err.to_string()))?;
     let bech32_str = bech32::encode::<Bech32m>(hrp, &addr.to_vec())
         .map_err(|err| PrecompileError::other(err.to_string()))?;
+    let ret = (bech32_str,);
     Ok(PrecompileOutput::new(
         BECH32PRECOMPILE_BASE_GAS,
-        Bytes::copy_from_slice(bech32_str.as_bytes()),
+        Bytes::from(ret.abi_encode()),
     ))
 }
 
@@ -83,9 +84,10 @@ fn bech32_to_hex(call: bech32ToHexCall) -> PrecompileResult {
         .map_err(|err| PrecompileError::other(format!("decoding bech32 failed: {}", err)))?;
     let address = Address::from_slice(&decoded_data);
     valid_address(&address)?;
+    let ret = (address,);
     Ok(PrecompileOutput::new(
         BECH32PRECOMPILE_BASE_GAS,
-        Bytes::copy_from_slice(address.as_slice()),
+        Bytes::from(ret.abi_encode()),
     ))
 }
 
@@ -123,7 +125,8 @@ mod tests {
             let str = res.bytes.to_string();
             assert_eq!(
                 str,
-                Bytes::copy_from_slice(bech32_address.as_bytes()).to_string()
+                Bytes::from(("cosmos1e7tuw4yyh2sy887h6x0dkkwdfzwgevujlzfyrk",).abi_encode())
+                    .to_string()
             );
         }
         {
@@ -134,7 +137,7 @@ mod tests {
             assert!(res.is_ok());
             let res = res.unwrap();
             let str = res.bytes.to_string();
-            assert_eq!(str, address.to_string().to_lowercase());
+            assert_eq!(str, Bytes::from(address.abi_encode()).to_string());
         }
     }
 }

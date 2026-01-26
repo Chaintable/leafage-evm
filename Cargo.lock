@@ -4590,6 +4590,7 @@ dependencies = [
  "alloy-sol-types",
  "bech32",
  "bls_on_arkworks",
+ "bytes 1.10.1",
  "cometbft",
  "cometbft-light-client",
  "cometbft-light-client-verifier",
