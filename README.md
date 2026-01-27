@@ -2,7 +2,7 @@
 
 [中文文档](README_cn.md)
 
-leafage-evm is a lightweight EVM executor built with Rust and [revm](https://github.com/bluealloy/revm). It receives state updates via Kafka + S3, rather than P2P synchronization.
+leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_estimateGas`, etc.) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
 
 ## Features
 
@@ -47,6 +47,8 @@ leafage-evm is a lightweight EVM executor built with Rust and [revm](https://git
 | `getBlockByHeight` | Get block by height |
 | `getBlockById` | Get block by hash |
 | `blockIsValid` | Validate block |
+
+> **Note**: Block query methods (`eth_getBlockByNumber`, `eth_getBlockByHash`, `getLatestBlock`, `getBlockByHeight`, `getBlockById`) return **header only** - `transactions` and `uncles` are always empty. leafage-evm does not store transaction data.
 
 ### pre_*
 
@@ -170,7 +172,7 @@ Base State (RocksDB)
 leafage-evm supports two modes for receiving state updates:
 
 - **Kafka + S3 (Primary)**: Receives block change notifications via Kafka, fetches block info and state diffs from S3
-- **HTTP (Fallback)**: Polls `trace_blockStateDiff` RPC from a modified Geth instance
+- **HTTP (Fallback)**: Polls `trace_debankBlock` RPC from a modified Geth instance
 
 ## Project Structure
 

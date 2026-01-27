@@ -1,8 +1,9 @@
 use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, U256};
-use crate::rpc::Block;
+use crate::rpc::{Block, Header};
 use alloy::primitives::keccak256;
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::context_interface::block::BlobExcessGasAndPrice;
+use serde::{Deserialize, Serialize};
 
 pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
     BlockEnv {
@@ -26,6 +27,13 @@ pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
             }
         }),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebankOutPut {
+    pub header: Header,
+    /// RLP encoded BlockStorageDiff
+    pub state_diff: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
@@ -143,5 +151,29 @@ mod tests {
         let mut buf = Vec::new();
         slim_account.encode(&mut buf);
         dbg!(buf.len());
+    }
+
+    #[test]
+    fn test_debank_output_deserialize() {
+        let json = r#"{"header":{"number":"0x2","hash":"0x0dbde0ab2bd706dc3f4a90d67c9c50e77ffe16cc5d4cae1eea88c64a793a6054","parentHash":"0x0d68991dc0f42c522166e243f0d64a0f6ccf374dde2f4b30b37c131d73908989","nonce":"0x0000000000000000","mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000","sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","stateRoot":"0x02f5551b11102f3f654e411c4bf5ff853364c7de69a3ea81b9b9e306a77a0dc0","miner":"0x0000000000000000000000000000000000000000","difficulty":"0x0","extraData":"0x","gasLimit":"0x1c9c380","gasUsed":"0x0","timestamp":"0x6715ede6","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","baseFeePerGas":"0xf4240"},"state_diff":"0x"}"#;
+        let output: DebankOutPut = serde_json::from_str(json).unwrap();
+        assert_eq!(output.header.number, 2);
+        assert_eq!(
+            output.header.hash,
+            "0x0dbde0ab2bd706dc3f4a90d67c9c50e77ffe16cc5d4cae1eea88c64a793a6054"
+                .parse::<H256>()
+                .unwrap()
+        );
+        assert_eq!(
+            output.header.parent_hash,
+            "0x0d68991dc0f42c522166e243f0d64a0f6ccf374dde2f4b30b37c131d73908989"
+                .parse::<H256>()
+                .unwrap()
+        );
+        assert_eq!(output.header.gas_limit, 0x1c9c380);
+        assert_eq!(output.header.gas_used, 0);
+        assert_eq!(output.header.timestamp, 0x6715ede6);
+        assert_eq!(output.header.base_fee_per_gas, Some(0xf4240));
+        assert!(output.state_diff.is_empty());
     }
 }
