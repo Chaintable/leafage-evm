@@ -413,7 +413,7 @@ impl Command {
             self.db_cache,
             self.db_type,
             self.archive,
-            self.disable_auto_compactions
+            self.disable_auto_compactions,
         )?;
 
         // check if db shoud be initialized
@@ -439,7 +439,11 @@ impl Command {
         )?);
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+            .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+
+        #[cfg(target_os = "linux")]
+        rpc_builder.with_interceptor_config(interceptor_config.clone());
 
         if !self.readiness_addr.is_empty() {
             let warmup = Warmup::new(
@@ -459,9 +463,6 @@ impl Command {
                 &self.listen_addr,
                 self.max_connections,
                 self.rpc_timeout,
-                #[cfg(target_os = "linux")]
-                self.interceptor_config.clone(),
-                self.ovm_address.clone(),
                 self.archive,
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
