@@ -1,7 +1,8 @@
+use crate::cosmos::config::CosmosEvmConfig;
 use crate::cosmos::{CosmosHardfork, CosmosPrecompiles};
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, EvmEnv};
-use leafage_evm_types::{BlockEnv, CfgEnv};
+use leafage_evm_types::{Address, BlockEnv, CfgEnv};
 use revm::context::{Context, ContextError, FrameStack};
 use revm::context::{Evm, JournalTr, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
@@ -27,14 +28,20 @@ pub struct CosmosEvm<DB: revm::database::Database, I> {
         EthFrame,
     >,
     pub inspect: bool,
+    pub config: CosmosEvmConfig,
 }
 
 impl<DB: Database, I> CosmosEvm<DB, I> {
     /// Creates a new [`CosmosEvm`].
-    pub fn new(env: EvmEnv<CosmosHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
-        let precompiles =
-            PrecompilesMap::from_static(CosmosPrecompiles::new(env.cfg_env.spec).precompiles());
-
+    pub fn new(
+        env: EvmEnv<CosmosHardfork>,
+        evm_config: CosmosEvmConfig,
+        db: DB,
+        inspector: I,
+        inspect: bool,
+    ) -> Self {
+        let cosmos_precompiles = CosmosPrecompiles::new(env.cfg_env.spec);
+        let precompiles = PrecompilesMap::from_static(cosmos_precompiles.precompiles());
         Self {
             inner: Evm {
                 ctx: Context {
@@ -52,6 +59,7 @@ impl<DB: Database, I> CosmosEvm<DB, I> {
                 frame_stack: Default::default(),
             },
             inspect,
+            config: evm_config,
         }
     }
 }
@@ -119,7 +127,7 @@ where
         &mut self,
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        check_unsupported_precompiles(&frame_input.frame_input)?;
+        self.check_unsupported_precompiles(&frame_input.frame_input)?;
         self.inner.frame_init(frame_input)
     }
 
@@ -172,19 +180,35 @@ where
         &mut self,
         frame_init: <Self::Frame as FrameTr>::FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        check_unsupported_precompiles(&frame_init.frame_input)?;
+        self.check_unsupported_precompiles(&frame_init.frame_input)?;
         self.inner.inspect_frame_init(frame_init)
     }
 }
 
-fn check_unsupported_precompiles<DB>(frame_input: &FrameInput) -> Result<(), ContextError<DB>> {
-    if let FrameInput::Call(ref call) = frame_input {
-        if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
+impl<DB, INSP> CosmosEvm<DB, INSP>
+where
+    DB: Database,
+{
+    fn check_unsupported_precompiles<D>(
+        &self,
+        frame_input: &FrameInput,
+    ) -> Result<(), ContextError<D>> {
+        let unsupported_precompiles = |addr: Address| {
             return Err(ContextError::Custom(format!(
                 "unsupported precompile address: {}",
-                call.bytecode_address
+                addr
             )));
+        };
+        if let FrameInput::Call(ref call) = frame_input {
+            if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
+                return unsupported_precompiles(call.bytecode_address);
+            }
+            if let Some(addr) = self.config.native_token {
+                if addr.eq(&call.bytecode_address) {
+                    return unsupported_precompiles(call.bytecode_address);
+                }
+            }
         }
+        Ok(())
     }
-    Ok(())
 }

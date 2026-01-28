@@ -36,6 +36,14 @@ pub struct Command {
     #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2"], default_value = "mainnet")]
     evm_type: String,
 
+    /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
+    ///
+    /// # Example
+    /// --evm-type=cosmos
+    /// --evm-custom-config={"native_token":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+    #[arg(long)]
+    evm_custom_config: Option<String>,
+
     /// The Ethereum Execution Specification ID for the chain.
     ///
     /// if not specified, the default spec_id is u8::MAX
@@ -236,7 +244,7 @@ pub struct Command {
 
     /// Disables db automatic compactions.
     /// Default: false
-    /// This address is used when `db_type` is Rocksdb.
+    /// This value is used when `db_type` is Rocksdb.
     #[arg(long, default_value = "false")]
     disable_auto_compactions: bool,
 
@@ -413,7 +421,7 @@ impl Command {
             self.db_cache,
             self.db_type,
             self.archive,
-            self.disable_auto_compactions
+            self.disable_auto_compactions,
         )?;
 
         // check if db shoud be initialized
@@ -439,7 +447,13 @@ impl Command {
         )?);
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+            .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+
+        #[cfg(target_os = "linux")]
+        {
+            rpc_builder = rpc_builder.with_interceptor_cfg(self.interceptor_config.clone());
+        }
 
         if !self.readiness_addr.is_empty() {
             let warmup = Warmup::new(
@@ -459,9 +473,6 @@ impl Command {
                 &self.listen_addr,
                 self.max_connections,
                 self.rpc_timeout,
-                #[cfg(target_os = "linux")]
-                self.interceptor_config.clone(),
-                self.ovm_address.clone(),
                 self.archive,
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
@@ -495,7 +506,14 @@ impl Command {
 
     pub async fn run(&mut self) -> Result<()> {
         let (updater_handle, rpc_handle, resgitry_handle) = self
-            .start((self.chain_cfg.clone(), self.evm_type.clone()).into())
+            .start(
+                (
+                    self.chain_cfg.clone(),
+                    self.evm_type.clone(),
+                    self.evm_custom_config.clone(),
+                )
+                    .try_into()?,
+            )
             .await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");

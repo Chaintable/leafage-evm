@@ -2,7 +2,7 @@ use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::cosmos::{CosmosEvm, CosmosHardfork};
+use leafage_evm_chains::cosmos::{CosmosEvm, CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_types::{BlockEnv, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context::TxEnv;
@@ -12,7 +12,7 @@ use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
-type CosmosApiImpl<DB> = ApiImpl<DB, CosmosHardfork>;
+type CosmosApiImpl<DB> = ApiImpl<DB, CosmosHardfork, CosmosEvmConfig>;
 
 impl<DB> EvmExecutor for CosmosApiImpl<DB>
 where
@@ -46,7 +46,13 @@ where
     {
         let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
         let wrap_database_ref = WrapDatabaseRef(state);
-        let mut evm = CosmosEvm::new(evm_env, wrap_database_ref, NoOpInspector {}, false);
+        let mut evm = CosmosEvm::new(
+            evm_env,
+            self.evm_cfg.custom_cfg.clone().unwrap_or_default(),
+            wrap_database_ref,
+            NoOpInspector {},
+            false,
+        );
         let res = evm.transact(tx).map(|res| res.result.into());
         res
     }
@@ -70,7 +76,13 @@ where
         let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
         let wrap_database_ref = WrapDatabaseRef(state);
         let mut inspector = TracingInspector::new(inspector_cfg);
-        let mut evm = CosmosEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
+        let mut evm = CosmosEvm::new(
+            evm_env,
+            self.evm_cfg.custom_cfg.clone().unwrap_or_default(),
+            wrap_database_ref,
+            &mut inspector,
+            true,
+        );
         let res = evm
             .inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)));

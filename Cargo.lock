@@ -4590,6 +4590,7 @@ dependencies = [
  "alloy-sol-types",
  "bech32",
  "bls_on_arkworks",
+ "bytes 1.10.1",
  "cometbft",
  "cometbft-light-client",
  "cometbft-light-client-verifier",
@@ -4603,6 +4604,7 @@ dependencies = [
  "prost 0.12.6",
  "revm",
  "secp256k1 0.30.0",
+ "serde",
  "sha2 0.10.9",
  "tendermint",
 ]
@@ -4615,6 +4617,7 @@ dependencies = [
  "alloy-contract",
  "alloy-evm",
  "alloy-rlp",
+ "anyhow",
  "async-trait",
  "futures",
  "http 1.3.1",

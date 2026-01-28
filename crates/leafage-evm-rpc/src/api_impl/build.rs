@@ -20,6 +20,9 @@ use tracing::error;
 pub struct ApiBuilder<DB> {
     db: DB,
     cfg: MultiChainCfgEnv,
+    ovm_address: Option<Address>,
+    #[cfg(target_os = "linux")]
+    interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
@@ -34,11 +37,25 @@ where
         Self {
             db,
             cfg,
+            ovm_address: None,
+            #[cfg(target_os = "linux")]
+            interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
             replay_blocks: None,
             warmup_erc20_addresses: None,
         }
+    }
+
+    pub fn with_ovm_address(mut self, ovm_address: Option<Address>) -> Self {
+        self.ovm_address = ovm_address;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_interceptor_cfg(mut self, interceptor_cfg: Option<InterceptorConfig>) -> Self {
+        self.interceptor_cfg = interceptor_cfg;
+        self
     }
 
     pub fn with_historical_config(
@@ -78,8 +95,6 @@ where
         addr: &str,
         max_connects: u32,
         rpc_timeout: Duration,
-        #[cfg(target_os = "linux")] interceptor_cfg: Option<InterceptorConfig>,
-        ovm_address: Option<Address>,
         is_archive: bool,
         normalize_state_key: bool,
         version: String,
@@ -87,8 +102,9 @@ where
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
-        let http_middleware =
-            http_middleware.layer(InterceptorLayer::new(&interceptor_cfg.unwrap_or_default()));
+        let http_middleware = http_middleware.layer(InterceptorLayer::new(
+            &self.interceptor_cfg.unwrap_or_default(),
+        ));
 
         let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
         let server = ServerBuilder::default()
@@ -100,19 +116,19 @@ where
             .build(addr)
             .await?;
         let mut rpc_module = RpcModule::new(());
-
-        match &self.cfg {
-            MultiChainCfgEnv::Mainnet(cfg) => {
+        macro_rules! run_chain_setup {
+            ($cfg:expr, $custom_evm_cfg: expr) => {{
                 let api_impl = ApiImpl::new(
                     self.db,
-                    cfg.clone(),
+                    $cfg,
+                    $custom_evm_cfg,
                     rpc_timeout,
-                    ovm_address.clone(),
+                    self.ovm_address.clone(),
                     self.historical_client.clone(),
                     self.historical_height,
                     is_archive,
                     normalize_state_key,
-                    version,
+                    version.clone(),
                     estimate_gas_buffer,
                 );
                 let api = Api::new(api_impl);
@@ -123,96 +139,19 @@ where
                 )
                 .await;
                 register_api(&mut rpc_module, api)?;
-            }
-            MultiChainCfgEnv::Op(cfg) => {
-                let api_impl = ApiImpl::new(
-                    self.db,
-                    cfg.clone(),
-                    rpc_timeout,
-                    ovm_address.clone(),
-                    self.historical_client.clone(),
-                    self.historical_height,
-                    is_archive,
-                    normalize_state_key,
-                    version,
-                    estimate_gas_buffer,
-                );
-                let api = Api::new(api_impl);
-                warmup_api(
-                    &api,
-                    self.replay_blocks.take(),
-                    self.warmup_erc20_addresses.take(),
-                )
-                .await;
-                register_api(&mut rpc_module, api)?;
-            }
-            MultiChainCfgEnv::Bsc(cfg) => {
-                let api_impl = ApiImpl::new(
-                    self.db,
-                    cfg.clone(),
-                    rpc_timeout,
-                    ovm_address.clone(),
-                    self.historical_client.clone(),
-                    self.historical_height,
-                    is_archive,
-                    normalize_state_key,
-                    version,
-                    estimate_gas_buffer,
-                );
-                let api = Api::new(api_impl);
-                warmup_api(
-                    &api,
-                    self.replay_blocks.take(),
-                    self.warmup_erc20_addresses.take(),
-                )
-                .await;
-                register_api(&mut rpc_module, api)?;
-            }
-            MultiChainCfgEnv::Cosmos(cfg) => {
-                let api_impl = ApiImpl::new(
-                    self.db,
-                    cfg.clone(),
-                    rpc_timeout,
-                    ovm_address.clone(),
-                    self.historical_client.clone(),
-                    self.historical_height,
-                    is_archive,
-                    normalize_state_key,
-                    version,
-                    estimate_gas_buffer,
-                );
-                let api = Api::new(api_impl);
-                warmup_api(
-                    &api,
-                    self.replay_blocks.take(),
-                    self.warmup_erc20_addresses.take(),
-                )
-                .await;
-                register_api(&mut rpc_module, api)?;
-            }
-            MultiChainCfgEnv::Mantle(cfg) => {
-                let api_impl = ApiImpl::new(
-                    self.db,
-                    cfg.clone(),
-                    rpc_timeout,
-                    ovm_address.clone(),
-                    self.historical_client.clone(),
-                    self.historical_height,
-                    is_archive,
-                    normalize_state_key,
-                    version,
-                    estimate_gas_buffer,
-                );
-                let api = Api::new(api_impl);
-                warmup_api(
-                    &api,
-                    self.replay_blocks.take(),
-                    self.warmup_erc20_addresses.take(),
-                )
-                .await;
-                register_api(&mut rpc_module, api)?;
-            }
+            }};
         }
+
+        match self.cfg.clone() {
+            MultiChainCfgEnv::Mainnet(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Bsc(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
+                run_chain_setup!(env, custom_evm_cfg)
+            }
+            MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+        };
+
         let handle = server.start(rpc_module);
         Ok(handle)
     }

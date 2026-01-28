@@ -1,11 +1,14 @@
 use alloy::primitives::address;
-use num_bigint::BigUint;
+use alloy_sol_types::SolValue;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::elliptic_curve::sec1::FromEncodedPoint;
 use p256::elliptic_curve::PrimeField;
 use p256::{AffinePoint, EncodedPoint, FieldBytes, FieldElement, PublicKey, Scalar};
-use revm::precompile::{Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::{
+    Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+};
+use revm::primitives::{Bytes, U256};
 use std::borrow::Cow;
 
 pub const P256_VERIFY: Precompile = Precompile::new(
@@ -81,16 +84,12 @@ fn secp256r1_verify(
     // verify signature
     let padding = match verifying_key.verify(hash, &signature) {
         Ok(_) => {
-            let big1 = BigUint::from(1u8);
-            let big1_bytes = big1.to_bytes_be();
-            let mut padded = vec![0u8; 32];
-            let start = 32 - big1_bytes.len();
-            padded[start..].copy_from_slice(&big1_bytes);
-            padded
+            let ret = (U256::from(1),);
+            ret.abi_encode()
         }
         Err(_) => Default::default(),
     };
-    Ok(PrecompileOutput::new(VERIFY_GAS, padding.into()))
+    Ok(PrecompileOutput::new(VERIFY_GAS, Bytes::from(padding)))
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
+use anyhow::{anyhow, bail};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
-use leafage_evm_chains::cosmos::CosmosHardfork;
+use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
-pub struct EvmCfg<SpecId> {
+pub struct EvmCfg<SpecId, CustomCfg> {
     pub is_archive: bool,
     pub normalize_state_key: bool,
     pub cfg: CfgEnv<SpecId>,
@@ -22,6 +23,7 @@ pub struct EvmCfg<SpecId> {
     pub time_out: Duration,
     pub version: String,
     pub estimate_gas_buffer: u64,
+    pub custom_cfg: Option<CustomCfg>,
 }
 
 pub(crate) trait ApiCore: ApiBase + EvmExecutor {}
@@ -29,10 +31,11 @@ pub(crate) trait ApiCore: ApiBase + EvmExecutor {}
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
     type SpecId;
+    type CustomCfg;
 
     fn db(&self) -> &Self::DB;
 
-    fn evm_cfg(&self) -> &EvmCfg<Self::SpecId>;
+    fn evm_cfg(&self) -> &EvmCfg<Self::SpecId, Self::CustomCfg>;
 
     fn historical_client(&self) -> Option<&HttpClient>;
 
@@ -117,12 +120,16 @@ pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
     Op(CfgEnv<OpSpecId>),
     Bsc(CfgEnv<BscHardfork>),
-    Cosmos(CfgEnv<CosmosHardfork>),
+    Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
 }
 
-impl From<(u64, String)> for MultiChainCfgEnv {
-    fn from((chain_id, evm_type): (u64, String)) -> Self {
+impl TryFrom<(u64, String, Option<String>)> for MultiChainCfgEnv {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        (chain_id, evm_type, custom_evm_cfg): (u64, String, Option<String>),
+    ) -> Result<Self, Self::Error> {
         match evm_type.as_str() {
             "mainnet" => {
                 // Use AMSTERDAM (latest) spec for mainnet
@@ -133,7 +140,7 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
-                MultiChainCfgEnv::Mainnet(chain_cfg)
+                Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
             "op" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
@@ -143,7 +150,7 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
-                MultiChainCfgEnv::Op(chain_cfg)
+                Ok(MultiChainCfgEnv::Op(chain_cfg))
             }
             "bsc" => {
                 let mut chain_cfg = CfgEnv::default();
@@ -152,7 +159,7 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
-                MultiChainCfgEnv::Bsc(chain_cfg)
+                Ok(MultiChainCfgEnv::Bsc(chain_cfg))
             }
             "cosmos" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM.into());
@@ -162,7 +169,13 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
-                MultiChainCfgEnv::Cosmos(chain_cfg)
+                let custom_evm_cfg = custom_evm_cfg
+                    .map(|str| {
+                        serde_json::from_str(&str)
+                            .map_err(|err| anyhow!("cannot parse cosmos custom evm config: {}", err))
+                    })
+                    .transpose()?;
+                Ok(MultiChainCfgEnv::Cosmos((chain_cfg, custom_evm_cfg)))
             }
             "mantlev2" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
@@ -172,9 +185,9 @@ impl From<(u64, String)> for MultiChainCfgEnv {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
-                MultiChainCfgEnv::Mantle(chain_cfg)
+                Ok(MultiChainCfgEnv::Mantle(chain_cfg))
             }
-            _ => panic!("Unsupported evm type"),
+            _ => bail!("Unsupported evm type"),
         }
     }
 }
@@ -185,7 +198,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
-            MultiChainCfgEnv::Cosmos(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
         }
     }
