@@ -40,7 +40,7 @@ pub struct Command {
     ///
     /// # Example
     /// --evm-type=cosmos
-    /// --evm-custom-config={"native_token":{"address":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","name":"XRPL","symbol":"XRPL","decimals":6,"total_supply":"0x3b9aca00"}}
+    /// --evm-custom-config={"native_token":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
     #[arg(long)]
     evm_custom_config: Option<String>,
 

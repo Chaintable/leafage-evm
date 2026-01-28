@@ -1,29 +1,23 @@
-use crate::cosmos::config::TokenConfig;
-use crate::cosmos::precompile::erc20::{create_erc20_precompile, Erc20Precompile};
 use crate::cosmos::CosmosHardfork;
-use alloy_evm::precompiles::DynPrecompile;
 use once_cell::race::OnceBox;
 use revm::handler::EthPrecompiles;
 use revm::precompile::{PrecompileSpecId, Precompiles};
 
 mod bech32;
-mod erc20;
 mod p256;
 
 pub struct CosmosPrecompiles {
     inner: EthPrecompiles,
-    native_token: Option<TokenConfig>,
 }
 
 impl CosmosPrecompiles {
-    pub fn new(spec: CosmosHardfork, native_token: Option<TokenConfig>) -> Self {
+    pub fn new(spec: CosmosHardfork) -> Self {
         let precompiles = Self::init_precompiles(spec.clone());
         Self {
             inner: EthPrecompiles {
                 precompiles,
                 spec: spec.into(),
             },
-            native_token,
         }
     }
 
@@ -35,19 +29,6 @@ impl CosmosPrecompiles {
             precompiles.extend([p256::P256_VERIFY, bech32::BECH32]);
             Box::new(precompiles)
         })
-    }
-
-    pub fn native_token_precompiles(&self) -> Option<DynPrecompile> {
-        let Some(ref cfg) = self.native_token else {
-            return None;
-        };
-        let precompile = Erc20Precompile::new(
-            cfg.name.clone(),
-            cfg.symbol.clone(),
-            cfg.decimals,
-            cfg.total_supply,
-        );
-        Some(create_erc20_precompile(precompile))
     }
 
     #[inline]
