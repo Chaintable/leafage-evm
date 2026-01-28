@@ -1,3 +1,4 @@
+use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
     ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
@@ -15,7 +16,7 @@ use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
-type OpApiImpl<DB> = ApiImpl<DB, OpSpecId>;
+type OpApiImpl<DB> = ApiImpl<DB, OpSpecId, NoneEvmCustomConfig>;
 
 impl<DB> EvmExecutor for OpApiImpl<DB>
 where

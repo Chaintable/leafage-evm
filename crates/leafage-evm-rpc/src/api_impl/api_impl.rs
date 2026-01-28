@@ -9,17 +9,18 @@ use std::str::FromStr;
 use std::time::Duration;
 
 /// [`ApiImpl`] implements the EthApi trait.
-pub struct ApiImpl<DB, SpecId> {
+pub struct ApiImpl<DB, SpecId, CustomCfg> {
     pub db: DB,
-    pub evm_cfg: EvmCfg<SpecId>,
+    pub evm_cfg: EvmCfg<SpecId, CustomCfg>,
     pub historical_client: Option<HttpClient>,
     pub historical_height: Option<u64>,
 }
 
-impl<DB, SpecId> ApiImpl<DB, SpecId> {
+impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
     pub fn new(
         db: DB,
         cfg: CfgEnv<SpecId>,
+        custom_cfg: Option<CustomCfg>,
         time_out: Duration,
         ovm_address: Option<Address>,
         historical_client: Option<HttpClient>,
@@ -39,6 +40,7 @@ impl<DB, SpecId> ApiImpl<DB, SpecId> {
                 time_out,
                 version,
                 estimate_gas_buffer,
+                custom_cfg,
             },
             historical_client,
             historical_height,
@@ -46,19 +48,21 @@ impl<DB, SpecId> ApiImpl<DB, SpecId> {
     }
 }
 
-impl<DB, SpecId> ApiBase for ApiImpl<DB, SpecId>
+impl<DB, SpecId, CustomCfg> ApiBase for ApiImpl<DB, SpecId, CustomCfg>
 where
     DB: Sync + Send + 'static,
     SpecId: Send + Sync + 'static,
+    CustomCfg: Send + Sync + 'static,
 {
     type DB = DB;
     type SpecId = SpecId;
+    type CustomCfg = CustomCfg;
 
     fn db(&self) -> &Self::DB {
         &self.db
     }
 
-    fn evm_cfg(&self) -> &EvmCfg<Self::SpecId> {
+    fn evm_cfg(&self) -> &EvmCfg<Self::SpecId, Self::CustomCfg> {
         &self.evm_cfg
     }
 
@@ -112,3 +116,7 @@ impl<T: GetTransactionError, DBError> GetTransactionError for EVMError<DBError, 
         }
     }
 }
+
+/// NoneEvmCustomConfig represents an EVM configuration without any additional customization.
+#[derive(Debug, Clone)]
+pub struct NoneEvmCustomConfig;

@@ -38,6 +38,8 @@ where
             db,
             cfg,
             ovm_address: None,
+            #[cfg(target_os = "linux")]
+            interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
             replay_blocks: None,
@@ -100,8 +102,9 @@ where
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
-        let http_middleware =
-            http_middleware.layer(InterceptorLayer::new(&self.interceptor_cfg.unwrap_or_default()));
+        let http_middleware = http_middleware.layer(InterceptorLayer::new(
+            &self.interceptor_cfg.unwrap_or_default(),
+        ));
 
         let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
         let server = ServerBuilder::default()
@@ -114,10 +117,11 @@ where
             .await?;
         let mut rpc_module = RpcModule::new(());
         macro_rules! run_chain_setup {
-            ($cfg:expr) => {{
+            ($cfg:expr, $custom_evm_cfg: expr) => {{
                 let api_impl = ApiImpl::new(
                     self.db,
-                    $cfg.clone(),
+                    $cfg,
+                    $custom_evm_cfg,
                     rpc_timeout,
                     self.ovm_address.clone(),
                     self.historical_client.clone(),
@@ -138,12 +142,14 @@ where
             }};
         }
 
-        match &self.cfg {
-            MultiChainCfgEnv::Mainnet(cfg) => run_chain_setup!(cfg),
-            MultiChainCfgEnv::Op(cfg) => run_chain_setup!(cfg),
-            MultiChainCfgEnv::Bsc(cfg) => run_chain_setup!(cfg),
-            MultiChainCfgEnv::Cosmos(cfg) => run_chain_setup!(cfg),
-            MultiChainCfgEnv::Mantle(cfg) => run_chain_setup!(cfg),
+        match self.cfg.clone() {
+            MultiChainCfgEnv::Mainnet(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Bsc(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
+                run_chain_setup!(env, custom_evm_cfg)
+            }
+            MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
         };
 
         let handle = server.start(rpc_module);

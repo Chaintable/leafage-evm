@@ -1,3 +1,4 @@
+use crate::cosmos::config::CosmosEvmConfig;
 use crate::cosmos::{CosmosHardfork, CosmosPrecompiles};
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, EvmEnv};
@@ -31,10 +32,21 @@ pub struct CosmosEvm<DB: revm::database::Database, I> {
 
 impl<DB: Database, I> CosmosEvm<DB, I> {
     /// Creates a new [`CosmosEvm`].
-    pub fn new(env: EvmEnv<CosmosHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
-        let precompiles =
-            PrecompilesMap::from_static(CosmosPrecompiles::new(env.cfg_env.spec).precompiles());
-
+    pub fn new(
+        env: EvmEnv<CosmosHardfork>,
+        evm_config: CosmosEvmConfig,
+        db: DB,
+        inspector: I,
+        inspect: bool,
+    ) -> Self {
+        let cosmos_precompiles =
+            CosmosPrecompiles::new(env.cfg_env.spec, evm_config.native_token.clone());
+        let mut precompiles = PrecompilesMap::from_static(cosmos_precompiles.precompiles());
+        if let Some(token_cfg) = evm_config.native_token {
+            precompiles.apply_precompile(&token_cfg.address, |_| {
+                cosmos_precompiles.native_token_precompiles()
+            })
+        }
         Self {
             inner: Evm {
                 ctx: Context {

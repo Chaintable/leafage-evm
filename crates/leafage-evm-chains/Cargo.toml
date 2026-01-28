@@ -15,6 +15,7 @@ alloy-hardforks.workspace = true
 alloy-evm.workspace = true
 alloy-sol-types.workspace = true
 alloy-contract.workspace = true
+serde.workspace = true
 revm.workspace = true
 leafage-evm-types.workspace = true
 once_cell.workspace = true

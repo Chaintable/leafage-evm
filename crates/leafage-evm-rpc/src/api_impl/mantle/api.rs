@@ -13,8 +13,9 @@ use revm::ExecuteEvm;
 use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use crate::api_impl::api_impl::NoneEvmCustomConfig;
 
-type MantleApiImpl<DB> = ApiImpl<DB, MantleHardfork>;
+type MantleApiImpl<DB> = ApiImpl<DB, MantleHardfork, NoneEvmCustomConfig>;
 
 fn get_token_ratio<DB: DatabaseRef>(db: &DB) -> u64 {
     match db.storage_ref(GAS_ORACLE_ADDR, TOKEN_RATIO_SLOT) {

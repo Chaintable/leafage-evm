@@ -111,8 +111,6 @@ interface IERC20 {
 mod gas {
     pub(super) const TRANSFER: u64 = 3_000_000;
     pub(super) const APPROVE: u64 = 30_956;
-    pub(super) const INCREASE_ALLOWANCE: u64 = 34_605;
-    pub(super) const DECREASE_ALLOWANCE: u64 = 34_519;
     pub(super) const NAME: u64 = 3_421;
     pub(super) const SYMBOL: u64 = 3_464;
     pub(super) const DECIMALS: u64 = 427;

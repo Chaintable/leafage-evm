@@ -36,6 +36,14 @@ pub struct Command {
     #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2"], default_value = "mainnet")]
     evm_type: String,
 
+    /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
+    ///
+    /// # Example
+    /// --evm-type=cosmos
+    /// --evm-custom-config={"native_token":{"address":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","name":"XRPL","symbol":"XRPL","decimals":6,"total_supply":"0x3b9aca00"}}
+    #[arg(long)]
+    evm_custom_config: Option<String>,
+
     /// The Ethereum Execution Specification ID for the chain.
     ///
     /// if not specified, the default spec_id is u8::MAX
@@ -236,7 +244,7 @@ pub struct Command {
 
     /// Disables db automatic compactions.
     /// Default: false
-    /// This address is used when `db_type` is Rocksdb.
+    /// This value is used when `db_type` is Rocksdb.
     #[arg(long, default_value = "false")]
     disable_auto_compactions: bool,
 
@@ -443,7 +451,9 @@ impl Command {
             .with_historical_config(self.historical_rpc.clone(), self.historical_height);
 
         #[cfg(target_os = "linux")]
-        rpc_builder.with_interceptor_config(interceptor_config.clone());
+        {
+            rpc_builder = rpc_builder.with_interceptor_cfg(self.interceptor_config.clone());
+        }
 
         if !self.readiness_addr.is_empty() {
             let warmup = Warmup::new(
@@ -496,7 +506,14 @@ impl Command {
 
     pub async fn run(&mut self) -> Result<()> {
         let (updater_handle, rpc_handle, resgitry_handle) = self
-            .start((self.chain_cfg.clone(), self.evm_type.clone()).into())
+            .start(
+                (
+                    self.chain_cfg.clone(),
+                    self.evm_type.clone(),
+                    self.evm_custom_config.clone(),
+                )
+                    .try_into()?,
+            )
             .await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");

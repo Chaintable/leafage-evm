@@ -1,3 +1,4 @@
+use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
     ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
@@ -14,7 +15,7 @@ use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
-type MainnetApiImpl<DB> = ApiImpl<DB, MainnetSpecId>;
+type MainnetApiImpl<DB> = ApiImpl<DB, MainnetSpecId, NoneEvmCustomConfig>;
 
 impl<DB> EvmExecutor for MainnetApiImpl<DB>
 where
