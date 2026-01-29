@@ -6,7 +6,6 @@ use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::CfgEnv;
 use revm::primitives::keccak256;
 use std::str::FromStr;
-use std::time::Duration;
 
 /// [`ApiImpl`] implements the EthApi trait.
 pub struct ApiImpl<DB, SpecId, CustomCfg> {
@@ -21,7 +20,6 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
         db: DB,
         cfg: CfgEnv<SpecId>,
         custom_cfg: Option<CustomCfg>,
-        time_out: Duration,
         ovm_address: Option<Address>,
         historical_client: Option<HttpClient>,
         historical_height: Option<u64>,
@@ -37,7 +35,6 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 normalize_state_key,
                 cfg,
                 ovm_address: ovm_address.map(|addr| keccak256(addr.as_slice())),
-                time_out,
                 version,
                 estimate_gas_buffer,
                 custom_cfg,

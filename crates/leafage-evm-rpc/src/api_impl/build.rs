@@ -122,7 +122,6 @@ where
                     self.db,
                     $cfg,
                     $custom_evm_cfg,
-                    rpc_timeout,
                     self.ovm_address.clone(),
                     self.historical_client.clone(),
                     self.historical_height,

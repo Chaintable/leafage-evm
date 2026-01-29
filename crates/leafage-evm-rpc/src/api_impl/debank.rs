@@ -26,8 +26,8 @@ use revm::database::{CacheDB, DatabaseRef};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
-use tokio::{sync::oneshot, time::timeout};
 use tracing::error;
 
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
@@ -472,15 +472,18 @@ where
         Ok(res)
     }
 
-    pub(crate) async fn debank_multi_call_from_state_impl_inner(
+    pub async fn contract_multi_call_impl(
         &self,
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
-        fast_fail: bool,
-        use_parallel: bool,
+        fast_fail: Option<bool>,
+        use_parallel: Option<bool>,
+        _disable_cache: Option<bool>,
     ) -> RpcResult<DebankMultiCallResp> {
+        let fast_fail = fast_fail.unwrap_or_default();
+        let use_parallel = use_parallel.unwrap_or_default();
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -556,47 +559,6 @@ where
         }
 
         Ok(DebankMultiCallResp { stats, results })
-    }
-
-    async fn contract_multi_call_impl(
-        &self,
-        requests: Vec<CallRequest>,
-        block_ctx: Option<DebankBlockContext>,
-        block_overrides: Option<BlockOverrides>,
-        state_override: Option<StateOverride>,
-        fast_fail: Option<bool>,
-        use_parallel: Option<bool>,
-        _disable_cache: Option<bool>,
-    ) -> RpcResult<DebankMultiCallResp> {
-        let (tx, rx) = oneshot::channel();
-        let this = self.clone();
-        tokio::spawn(async move {
-            let rsp = this
-                .debank_multi_call_from_state_impl_inner(
-                    requests,
-                    block_ctx,
-                    block_overrides,
-                    state_override,
-                    fast_fail.unwrap_or_default(),
-                    use_parallel.unwrap_or_default(),
-                )
-                .await;
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-
-        let rsp = timeout(self.inner.evm_cfg().time_out, rx)
-            .await
-            .map_err(|_| {
-                rpc_error_with_code(
-                    DebankErrorCode::TimeOut as i32,
-                    "MultiCall timed out".to_string(),
-                )
-            })? // 超时错误
-            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?; // 发送失败错误
-
-        rsp
     }
 
     async fn debank_simulate_transactions_impl(
