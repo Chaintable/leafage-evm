@@ -12,7 +12,6 @@ use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct EvmCfg<SpecId, CustomCfg> {
@@ -20,7 +19,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub normalize_state_key: bool,
     pub cfg: CfgEnv<SpecId>,
     pub ovm_address: Option<H256>,
-    pub time_out: Duration,
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
@@ -171,8 +169,9 @@ impl TryFrom<(u64, String, Option<String>)> for MultiChainCfgEnv {
                 chain_cfg.tx_gas_limit_cap = Some(u64::MAX);
                 let custom_evm_cfg = custom_evm_cfg
                     .map(|str| {
-                        serde_json::from_str(&str)
-                            .map_err(|err| anyhow!("cannot parse cosmos custom evm config: {}", err))
+                        serde_json::from_str(&str).map_err(|err| {
+                            anyhow!("cannot parse cosmos custom evm config: {}", err)
+                        })
                     })
                     .transpose()?;
                 Ok(MultiChainCfgEnv::Cosmos((chain_cfg, custom_evm_cfg)))
