@@ -34,11 +34,11 @@ use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
     ReadOptions, SliceTransform, WriteBatch, DB,
 };
+use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::{env, u64};
 use tracing::info;
 
 mod iterator_tracker;
@@ -148,11 +148,23 @@ impl Drop for DataBaseRef {
 unsafe impl Send for DataBaseInner {}
 unsafe impl Sync for DataBaseInner {}
 
+/// Compression type for column families
+#[derive(Clone, Copy)]
+enum CfCompression {
+    /// No compression (small values, not worth compressing)
+    None,
+    /// LZ4 compression (good balance of speed and compression)
+    Lz4,
+    /// ZSTD compression (high compression ratio for large values like code)
+    Zstd,
+}
+
 #[inline]
 fn rocksdb_column_options(
     shared_cache: &Cache,
     fixed_prefix_size: usize,
     disable_auto_compactions: bool,
+    compression: CfCompression,
 ) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
@@ -177,6 +189,45 @@ fn rocksdb_column_options(
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
+
+    // Set compression based on data characteristics
+    match compression {
+        CfCompression::None => {
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+        }
+        CfCompression::Lz4 => {
+            // L0-L1: no compression (frequently accessed), L2+: LZ4
+            cf_opts.set_compression_per_level(&[
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+            ]);
+        }
+        CfCompression::Zstd => {
+            // L0-L1: LZ4 (fast), L2+: ZSTD (high compression for large code blobs)
+            cf_opts.set_compression_per_level(&[
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+                rocksdb::DBCompressionType::Zstd,
+            ]);
+            // Enable ZSTD dictionary compression for better compression of similar data patterns
+            // - max_train_bytes: bytes to sample for dictionary training (1MB)
+            // - zstd_max_train_bytes: same as above for ZSTD specifically
+            cf_opts.set_zstd_max_train_bytes(1024 * 1024); // 1MB training data
+                                                           // compression_opts: (window_bits, level, strategy, max_dict_bytes)
+                                                           // max_dict_bytes: dictionary size (16KB is a good default)
+            cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
+        }
+    }
+
     cf_opts
 }
 
@@ -235,29 +286,65 @@ impl DataBaseRef {
             "Created shared Clock Cache with size: {}MB for archive", total_cache_size
         );
 
+        // LatestBlockHash: single record, no compression needed
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+            ),
         );
+        // BlockHashToBlockInfo: ~500 bytes value, LZ4 compression
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::Lz4,
+            ),
         );
+        // BlockNumToBlockHash: 32 bytes value, no compression needed
         let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+            ),
         );
+        // AddressToAccount: ~100 bytes value, LZ4 compression
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(&shared_cache, 32, disable_auto_compactions),
+            rocksdb_column_options(
+                &shared_cache,
+                32,
+                disable_auto_compactions,
+                CfCompression::Lz4,
+            ),
         );
+        // AddressToStorage: 32 bytes value, no compression needed
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(&shared_cache, 64, disable_auto_compactions),
+            rocksdb_column_options(
+                &shared_cache,
+                64,
+                disable_auto_compactions,
+                CfCompression::None,
+            ),
         );
+        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
         let hash_to_code_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(&shared_cache, 0, disable_auto_compactions),
+            rocksdb_column_options(
+                &shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::Zstd,
+            ),
         );
         let cfs = vec![
             latest_block_hash_cf,
@@ -327,7 +414,7 @@ impl DataBaseRef {
 }
 
 impl DataBaseRef {
-    fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
+    pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
             .db
@@ -350,7 +437,7 @@ impl DataBaseRef {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -408,7 +495,7 @@ impl DataBaseRef {
         Ok(Some(block))
     }
 
-    fn read_latest_block_hash(&self) -> Result<H256, Error> {
+    pub fn read_latest_block_hash(&self) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let latest_block_hash_cf = self
             .db
@@ -429,12 +516,84 @@ impl DataBaseRef {
         let block_hash = H256::from_slice(block_hash_bytes.as_slice());
         Ok(block_hash)
     }
+
+    pub fn read_latest_block_num(&self) -> Result<Option<u64>, Error> {
+        let latest_hash = self.read_latest_block_hash()?;
+        if latest_hash == H256::ZERO {
+            return Ok(None);
+        }
+        let block_info = self.read_block_info(latest_hash)?;
+        match block_info {
+            Some(block) => Ok(Some(block.header.number)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn flush(&self) -> Result<(), Error> {
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn compact(&self) -> Result<(), Error> {
+        // Compact each column family separately to reduce memory usage
+        let column_families = [
+            StorageTypeColumn::LatestBlockHash,
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::HashToCode,
+        ];
+
+        for cf_type in column_families {
+            let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+            info!(target: "archive_compact", "Compacting column family: {}", cf_type);
+
+            // For large column families, compact by key range (first byte prefix)
+            // to further reduce memory usage
+            match cf_type {
+                StorageTypeColumn::AddressToAccount => {
+                    // Key structure: address (32) || block_num (8) = 40 bytes
+                    self.compact_cf_by_prefix::<40>(cf);
+                }
+                StorageTypeColumn::AddressToStorage => {
+                    // Key structure: address (32) || index (32) || block_num (8) = 72 bytes
+                    self.compact_cf_by_prefix::<72>(cf);
+                }
+                _ => {
+                    // Small column families can be compacted in one go
+                    self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+                }
+            }
+
+            info!(target: "archive_compact", "Finished compacting column family: {}", cf_type);
+        }
+
+        Ok(())
+    }
+
+    /// Compact a column family in 16 ranges based on first byte's high nibble.
+    /// This reduces memory usage by processing smaller chunks at a time.
+    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily) {
+        for i in 0u8..16 {
+            let start = [i << 4];
+            let mut end = [0xFFu8; KEY_LEN];
+            end[0] = (i << 4) | 0x0F;
+            info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
+                i + 1, i << 4, (i << 4) | 0x0F);
+            self.db.compact_range_cf(cf, Some(&start), Some(&end));
+        }
+    }
 }
 
 impl LatestStateDBIterator for DataBaseRef {
     /// account address -> raw account
+    /// Returns the latest state for each address (the record with highest block_num)
     fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
-        self.db
+        // Data is sorted by address || block_num, so records for the same address are consecutive
+        // and ordered by block_num ascending. We need the last record for each address.
+        let mut iter = self
+            .db
             .iterator_cf_opt(
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -442,19 +601,38 @@ impl LatestStateDBIterator for DataBaseRef {
                 rocksdb_read_options(),
                 IteratorMode::Start,
             )
-            .filter_map(|item| {
+            .peekable();
+
+        std::iter::from_fn(move || {
+            loop {
+                let item = iter.next()?;
                 if item.is_err() {
                     return Some(Err(Error::RocksDB(item.unwrap_err())));
                 }
                 let (key, value) = item.unwrap();
-                let block_num_bytes = &key[32..];
-                let block_num = U256::from_be_slice(block_num_bytes);
-                if block_num != U256::from(u64::MAX) {
-                    return None;
+                let address_bytes: [u8; 32] = key[..32].try_into().unwrap();
+
+                // Check if next record has the same address
+                let is_last_for_address = match iter.peek() {
+                    Some(Ok((next_key, _))) => next_key[..32] != address_bytes,
+                    Some(Err(_)) => true, // Will handle error on next iteration
+                    None => true,         // No more records
+                };
+
+                if !is_last_for_address {
+                    // Skip this record, there's a newer one for this address
+                    continue;
                 }
-                let address_bytes = &key[..32];
-                let address = H256::from_slice(address_bytes);
+
+                // This is the last (newest) record for this address
+                let address = H256::from_slice(&address_bytes);
                 let mut raw_account_slice = value.as_ref();
+
+                // Skip empty values (deleted accounts)
+                if raw_account_slice.is_empty() {
+                    continue;
+                }
+
                 let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
                 let account = NewAccount {
                     address,
@@ -466,8 +644,9 @@ impl LatestStateDBIterator for DataBaseRef {
                         raw_account.code_hash
                     },
                 };
-                Some(Ok((address, account)))
-            })
+                return Some(Ok((address, account)));
+            }
+        })
     }
 
     /// code hash -> code
@@ -491,8 +670,12 @@ impl LatestStateDBIterator for DataBaseRef {
     }
 
     /// account address | storage index -> storage value
+    /// Returns the latest state for each (address, index) pair (the record with highest block_num)
     fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
-        self.db
+        // Data is sorted by address || index || block_num, so records for the same (address, index)
+        // are consecutive and ordered by block_num ascending. We need the last record for each pair.
+        let mut iter = self
+            .db
             .iterator_cf_opt(
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
@@ -500,23 +683,42 @@ impl LatestStateDBIterator for DataBaseRef {
                 rocksdb_read_options(),
                 IteratorMode::Start,
             )
-            .filter_map(|item| {
+            .peekable();
+
+        std::iter::from_fn(move || {
+            loop {
+                let item = iter.next()?;
                 if item.is_err() {
                     return Some(Err(Error::RocksDB(item.unwrap_err())));
                 }
                 let (key, value) = item.unwrap();
-                let block_num_bytes = &key[64..];
-                let block_num = U256::from_be_slice(block_num_bytes);
-                if block_num != U256::from(u64::MAX) {
-                    return None;
+                let prefix: [u8; 64] = key[..64].try_into().unwrap(); // address || index
+
+                // Check if next record has the same (address, index)
+                let is_last_for_prefix = match iter.peek() {
+                    Some(Ok((next_key, _))) => next_key[..64] != prefix,
+                    Some(Err(_)) => true, // Will handle error on next iteration
+                    None => true,         // No more records
+                };
+
+                if !is_last_for_prefix {
+                    // Skip this record, there's a newer one for this (address, index)
+                    continue;
                 }
-                let address_bytes = &key[..32];
-                let address = H256::from_slice(address_bytes);
-                let key_bytes = &key[32..64];
-                let key = H256::from_slice(key_bytes);
-                let value = U256::from_be_slice(value.as_ref());
-                Some(Ok((address, key, value)))
-            })
+
+                // This is the last (newest) record for this (address, index)
+                let address = H256::from_slice(&prefix[..32]);
+                let storage_key = H256::from_slice(&prefix[32..64]);
+                let storage_value = U256::from_be_slice(value.as_ref());
+
+                // Skip zero values (deleted storage slots)
+                if storage_value == U256::ZERO {
+                    continue;
+                }
+
+                return Some(Ok((address, storage_key, storage_value)));
+            }
+        })
     }
 }
 
@@ -586,15 +788,26 @@ impl StateDBProvider for Arc<DataBaseRef> {
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    block_num = u64::MAX;
-                    return Ok(Some(StateDB {
-                        db: self.clone(),
-                        block_num,
-                        block_header: None,
-                        iterators: None,
-                        tracker_id: None, // Latest queries don't need tracking
-                        timed_out: None,
-                    }));
+                    // Get the real latest block number instead of using u64::MAX
+                    let latest_block_num = self.read_latest_block_num()?;
+                    match latest_block_num {
+                        Some(num) => {
+                            block_num = num;
+                            let block_hash = self.read_block_hash(num)?;
+                            if block_hash == H256::ZERO {
+                                return Ok(None);
+                            }
+                            let header = self.read_block_info(block_hash)?;
+                            if header.is_none() {
+                                return Ok(None);
+                            }
+                            block_header = header.unwrap().header;
+                        }
+                        None => {
+                            // No blocks in database
+                            return Ok(None);
+                        }
+                    }
                 }
                 BlockNumberOrTag::Number(num) => {
                     block_num = num;
@@ -644,8 +857,8 @@ impl StateDBProvider for Arc<DataBaseRef> {
         Ok(Some(StateDB {
             db: self.clone(),
             block_num,
-            block_header: Some(block_header),
-            iterators: Some(iterators),
+            block_header,
+            iterators,
             tracker_id,
             timed_out,
         }))
@@ -655,28 +868,17 @@ impl StateDBProvider for Arc<DataBaseRef> {
 pub struct StateDB {
     db: Arc<DataBaseRef>,
     block_num: u64,
-    block_header: Option<Header>,
-    /// Shared iterators (None for Latest queries)
-    iterators: Option<Arc<SharedIterators>>,
-    /// Tracker ID for iterator lifecycle management (None for Latest queries)
+    block_header: Header,
+    /// Shared iterators
+    iterators: Arc<SharedIterators>,
+    /// Tracker ID for iterator lifecycle management
     tracker_id: Option<u64>,
-    /// Shared timeout flag with IteratorTracker (None for Latest queries)
+    /// Shared timeout flag with IteratorTracker
     timed_out: Option<TimeoutFlag>,
 }
 
 impl Clone for StateDB {
     fn clone(&self) -> Self {
-        if self.block_num == u64::MAX {
-            return Self {
-                db: self.db.clone(),
-                block_num: self.block_num,
-                block_header: self.block_header.clone(),
-                iterators: None,
-                tracker_id: None, // Latest queries don't need tracking
-                timed_out: None,
-            };
-        }
-
         let address_to_account_cf = self
             .db
             .db
@@ -714,7 +916,7 @@ impl Clone for StateDB {
             db: self.db.clone(),
             block_num: self.block_num,
             block_header: self.block_header.clone(),
-            iterators: Some(iterators),
+            iterators,
             tracker_id,
             timed_out,
         }
@@ -760,42 +962,10 @@ impl StateDBRead for StateDB {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
-        if self.block_num == u64::MAX {
-            let address_to_account_cf = self
-                .db
-                .db
-                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-                .unwrap();
-            let raw_account_bytes = self.db.db.get_pinned_cf_opt(
-                address_to_account_cf,
-                [address_bytes.as_ref(), &block_num_bytes].concat(),
-                &rocksdb_read_options(),
-            )?;
-            STORAGE_METRICS
-                .read_account_latency
-                .record(start.elapsed().as_secs_f64());
-            if raw_account_bytes.is_none() {
-                return Ok(None);
-            }
-            let raw_account_bytes = raw_account_bytes.unwrap();
-            let mut raw_account_slice = raw_account_bytes.as_ref();
-            let account = SlimAccount::decode(&mut raw_account_slice).unwrap();
-            let account = NewAccount {
-                address,
-                balance: account.balance,
-                nonce: account.nonce,
-                code_hash: if account.code_hash.is_zero() {
-                    KECCAK256_EMPTY.0.into()
-                } else {
-                    account.code_hash
-                },
-            };
-            return Ok(Some(account));
-        }
+
         // Check timeout before using iterator
         self.check_timeout()?;
-        let iterators = self.iterators.as_ref().unwrap();
-        let mut account_iter_guard = iterators.account_iterator.lock().unwrap();
+        let mut account_iter_guard = self.iterators.account_iterator.lock().unwrap();
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
@@ -833,31 +1003,10 @@ impl StateDBRead for StateDB {
         let address_bytes: [u8; 32] = address.into();
         let key_bytes: [u8; 32] = key.into();
         let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
-        if self.block_num == u64::MAX {
-            let address_to_storage_cf = self
-                .db
-                .db
-                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-                .unwrap();
-            let value_bytes = self.db.db.get_pinned_cf_opt(
-                address_to_storage_cf,
-                [address_bytes.as_ref(), &key_bytes, &block_num_bytes].concat(),
-                &rocksdb_read_options(),
-            )?;
-            STORAGE_METRICS
-                .read_storage_latency
-                .record(start.elapsed().as_secs_f64());
-            if value_bytes.is_none() {
-                return Ok(U256::ZERO);
-            }
-            let value_bytes = value_bytes.unwrap();
-            let value = U256::from_be_slice(value_bytes.as_ref());
-            return Ok(value);
-        }
+
         // Check timeout before using iterator
         self.check_timeout()?;
-        let iterators = self.iterators.as_ref().unwrap();
-        let mut storage_iter_guard = iterators.storage_iterator.lock().unwrap();
+        let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
         let storage_iter = storage_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
@@ -906,33 +1055,103 @@ impl StateDBRead for StateDB {
     }
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        if block_num == self.block_num && self.block_header.is_some() {
-            return Ok(self.block_header.as_ref().unwrap().hash);
+        if block_num == self.block_num {
+            return Ok(self.block_header.hash);
         }
         self.db.read_block_hash(block_num)
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
-        if self.block_header.is_some() && block_hash == self.block_header.as_ref().unwrap().hash {
+        if block_hash == self.block_header.hash {
             return Ok(Some(Block {
-                header: self.block_header.as_ref().unwrap().clone(),
+                header: self.block_header.clone(),
                 ..Default::default()
             }));
         }
         self.db.read_block_info(block_hash)
     }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        if self.block_num == u64::MAX {
-            return Ok(self.db.read_latest_block_hash()?);
-        }
-        Ok(self.block_header.as_ref().unwrap().hash)
+        Ok(self.block_header.hash)
     }
 }
+/// StateDB delegates all write operations to Arc<DataBaseRef>
 impl StateDBWrite for StateDB {
     type DBWriteBatch = WriteBatch;
+
+    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
+        self.db.prepare_write_batch()
+    }
+
+    fn write_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_num: u64,
+        block_hash: H256,
+    ) -> Result<(), Error> {
+        self.db.write_block_hash(batch, block_num, block_hash)
+    }
+
+    fn write_block_info(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_info: Block<H256>,
+    ) -> Result<(), Error> {
+        self.db.write_block_info(batch, block_info)
+    }
+
+    fn write_account(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+        raw_account: Option<NewAccount>,
+    ) -> Result<(), Error> {
+        self.db
+            .write_account(batch, address, block_num, raw_account)
+    }
+
+    fn write_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        key: H256,
+        block_num: u64,
+        value: U256,
+    ) -> Result<(), Error> {
+        self.db.write_storage(batch, address, key, block_num, value)
+    }
+
+    fn write_code(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        code_hash: H256,
+        code: Bytes,
+    ) -> Result<(), Error> {
+        self.db.write_code(batch, code_hash, code)
+    }
+
+    fn write_latest_block_hash(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        block_hash: H256,
+    ) -> Result<(), Error> {
+        self.db.write_latest_block_hash(batch, block_hash)
+    }
+
+    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
+        self.db.commit(batch)
+    }
+}
+
+/// Direct write implementation for `Arc<DataBaseRef>` without needing a StateDB instance.
+/// This is useful for bulk initialization where we don't need read capabilities.
+impl StateDBWrite for Arc<DataBaseRef> {
+    type DBWriteBatch = WriteBatch;
+
     fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
         Ok(WriteBatch::default())
     }
+
     fn write_block_hash(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -940,7 +1159,6 @@ impl StateDBWrite for StateDB {
         block_hash: H256,
     ) -> Result<(), Error> {
         let block_num_to_block_hash_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
@@ -960,7 +1178,6 @@ impl StateDBWrite for StateDB {
         block_info: Block<H256>,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
-            .db
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
             .unwrap();
@@ -985,12 +1202,11 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_account_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
         let address_bytes = address.as_slice();
         let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-        let max_block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
+
         if let Some(raw_account) = raw_account {
             let raw_account: SlimAccount = raw_account.into();
             let mut raw_account_bytes = Vec::new();
@@ -1000,20 +1216,11 @@ impl StateDBWrite for StateDB {
                 [address_bytes, &block_num_bytes].concat(),
                 &raw_account_bytes,
             );
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &max_block_num_bytes].concat(),
-                &raw_account_bytes,
-            );
         } else {
             batch.put_cf(
                 address_to_account_cf,
                 [address_bytes, &block_num_bytes].concat(),
                 &[],
-            );
-            batch.delete_cf(
-                address_to_account_cf,
-                [address_bytes, &max_block_num_bytes].concat(),
             );
         }
         Ok(())
@@ -1029,26 +1236,13 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_storage_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
             .unwrap();
         let address_bytes = address.as_slice();
         let key_bytes: [u8; 32] = key.into();
         let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-        let max_block_num_bytes: [u8; 32] = U256::from(u64::MAX).to_be_bytes();
         let value_bytes: [u8; 32] = value.to_be_bytes();
-        if value == U256::ZERO {
-            batch.delete_cf(
-                address_to_storage_cf,
-                [address_bytes, &key_bytes, &max_block_num_bytes].concat(),
-            );
-        } else {
-            batch.put_cf(
-                address_to_storage_cf,
-                [address_bytes, &key_bytes, &max_block_num_bytes].concat(),
-                value_bytes,
-            );
-        }
+
         batch.put_cf(
             address_to_storage_cf,
             [address_bytes, &key_bytes, &block_num_bytes].concat(),
@@ -1065,7 +1259,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let address_to_code_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
         let code_hash_bytes = code_hash.as_slice();
@@ -1080,7 +1273,6 @@ impl StateDBWrite for StateDB {
     ) -> Result<(), Error> {
         let latest_block_hash_cf = self
             .db
-            .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
         batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_slice());
@@ -1088,7 +1280,7 @@ impl StateDBWrite for StateDB {
     }
 
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
-        self.db.db.write(batch)?;
+        self.db.write(batch)?;
         Ok(())
     }
 }
