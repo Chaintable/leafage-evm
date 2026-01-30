@@ -316,3 +316,5 @@ pub struct StateTreeConfig {
 - [Architecture.md](Architecture.md) - Overall system architecture
 - [Database.md](Database.md) - Database storage layout
 - [StateUpdater.md](StateUpdater.md) - How state updates are received
+- [DataSpec.md](DataSpec.md) - Data format specification
+- [Deploy](deploy/) - Deployment guide with Docker Compose

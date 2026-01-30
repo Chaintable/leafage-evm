@@ -1,0 +1,78 @@
+version: "3.5"
+networks:
+  eth:
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.0.90.0/24
+
+services:
+  beacon:
+    networks:
+      - eth
+    image: sigp/lighthouse:v8.0.1
+    volumes:
+      - ${DATA_DIR:-/eth}:/var/data/
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: '12G'
+    command:
+      - lighthouse
+      - beacon_node
+      - --network=mainnet
+      - --datadir=/var/data/lighthouse
+      - --execution-endpoint=http://geth:8551
+      - --execution-jwt=/var/data/geth/jwtsecret
+      - --checkpoint-sync-url=https://mainnet.checkpoint.sigp.io
+
+  geth:
+    networks:
+      - eth
+    image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain-gethx:amd64-v1.16.7-debank-4
+    ports:
+      - 8666:8545
+    volumes:
+      - ${DATA_DIR:-/eth}:/var/data/
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: '24G'
+    entrypoint:
+      - /app/geth
+      - --datadir=/var/data/geth
+      - --syncmode=full
+      - --gcmode=archive
+      - --rpc.allow-unprotected-txs
+      - --rpc.gascap=250000000
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/var/data/geth/jwtsecret
+      - --authrpc.vhosts=*
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.vhosts=*
+      - --http.corsdomain=*
+      - --http.api=net,web3,eth,admin,debug,txpool,pre,engine,trace
+
+  leafage-evm-x-eth:
+    image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/leafage-evm-x:amd64-chaintable-v102-debank-7
+    networks:
+      - eth
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    volumes:
+      - /data/nodex-eth3:/nodex
+    ports:
+      - 8659:8659
+    command:
+      - standalone
+      - --db-path=/nodex
+      - --listen-addr=0.0.0.0:8659
+      - --chain-cfg=1
+      - --meta=172.21.49.2:8659
+      - --rpc-addr=http://geth:8545
