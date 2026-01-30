@@ -221,3 +221,11 @@ opts.set_use_direct_io_for_flush_and_compaction(true);
 | `ROCKSDB_MAX_OPEN_FILE` | Max open file descriptors |
 | `ROCKSDB_DIRECT_IO` | Enable direct I/O for reads |
 | `ROCKSDB_ITERATOR_TIMEOUT_SECS` | Iterator timeout (archive only) |
+
+## Related Documentation
+
+- [Architecture.md](Architecture.md) - Overall system architecture
+- [StateManage.md](StateManage.md) - In-memory state tree and fork handling
+- [StateUpdater.md](StateUpdater.md) - Kafka + S3 and HTTP update modes
+- [DataSpec.md](DataSpec.md) - Data format specification
+- [Deploy](deploy/) - Deployment guide with Docker Compose

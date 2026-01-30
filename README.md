@@ -144,6 +144,8 @@ RUST_LOG=info ./target/release/leafage-evm file-migrate \
 | [StateManage.md](docs/StateManage.md) | In-memory state tree, fork handling, finalization |
 | [StateUpdater.md](docs/StateUpdater.md) | Kafka + S3 and HTTP update modes |
 | [Database.md](docs/Database.md) | RocksDB storage layout for state and archive nodes |
+| [DataSpec.md](docs/DataSpec.md) | Data format specification for state updates |
+| [Deploy](docs/deploy/) | Deployment guide with Docker Compose |
 
 ## Architecture
 

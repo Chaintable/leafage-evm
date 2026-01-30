@@ -144,6 +144,8 @@ RUST_LOG=info ./target/release/leafage-evm file-migrate \
 | [StateManage.md](docs/StateManage.md) | 内存状态树、fork 处理、区块落盘 |
 | [StateUpdater.md](docs/StateUpdater.md) | Kafka + S3 和 HTTP 更新模式 |
 | [Database.md](docs/Database.md) | RocksDB 存储布局（State/Archive 节点） |
+| [DataSpec.md](docs/DataSpec.md) | 状态更新数据格式规范 |
+| [Deploy](docs/deploy/) | Docker Compose 部署指南 |
 
 ## 架构
 

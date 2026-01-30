@@ -359,3 +359,11 @@ For `trace_debankBlock`:
 1. All addresses in `new_accounts` and `storage_diffs` must be keccak256 hashed
 2. All storage indices must be keccak256 hashed
 3. `code_hash` in `new_accounts` must match the hash of corresponding code in `new_codes`
+
+## Related Documentation
+
+- [Architecture.md](Architecture.md) - Overall system architecture
+- [StateManage.md](StateManage.md) - In-memory state tree and fork handling
+- [StateUpdater.md](StateUpdater.md) - Kafka + S3 and HTTP update modes
+- [Database.md](Database.md) - Database storage layout
+- [Deploy](deploy/) - Deployment guide with Docker Compose
