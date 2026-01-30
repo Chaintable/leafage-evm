@@ -697,28 +697,28 @@ where
             &memory_db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        if tx.input().is_empty() {
-            if let TransactTo::Call(to) = tx.kind() {
-                if let Ok(account) = memory_db.basic_ref(to) {
-                    let no_code_callee = account
-                        .map(|account| {
-                            account.is_empty_code_hash() || account.code_hash().is_zero()
-                        })
-                        .unwrap_or(true);
-                    if no_code_callee {
-                        let mut tx = tx.clone();
-                        tx.set_gas_limit(MIN_TRANSACTION_GAS);
-                        let exec_res = self
-                            .inner
-                            .transact(&block_env, &memory_db, tx)
-                            .map_err(|e| e.to_rpc_error())?;
-                        if exec_res.is_success() {
-                            return Ok(U256::from(MIN_TRANSACTION_GAS));
-                        }
-                    }
-                }
-            }
-        }
+        // if tx.input().is_empty() {
+        //     if let TransactTo::Call(to) = tx.kind() {
+        //         if let Ok(account) = memory_db.basic_ref(to) {
+        //             let no_code_callee = account
+        //                 .map(|account| {
+        //                     account.is_empty_code_hash() || account.code_hash().is_zero()
+        //                 })
+        //                 .unwrap_or(true);
+        //             if no_code_callee {
+        //                 let mut tx = tx.clone();
+        //                 tx.set_gas_limit(MIN_TRANSACTION_GAS);
+        //                 let exec_res = self
+        //                     .inner
+        //                     .transact(&block_env, &memory_db, tx)
+        //                     .map_err(|e| e.to_rpc_error())?;
+        //                 if exec_res.is_success() {
+        //                     return Ok(U256::from(MIN_TRANSACTION_GAS));
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
         if tx.gas_price() > 0 {
             let caller = memory_db.basic_ref(tx.caller()).map_err(|e| {
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
