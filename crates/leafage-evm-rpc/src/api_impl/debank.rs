@@ -708,12 +708,10 @@ where
                     if no_code_callee {
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
-                        let exec_res = self
-                            .inner
-                            .transact(&block_env, &memory_db, tx)
-                            .map_err(|e| e.to_rpc_error())?;
-                        if exec_res.is_success() {
-                            return Ok(U256::from(MIN_TRANSACTION_GAS));
+                        if let Ok(exec_res) = self.inner.transact(&block_env, &memory_db, tx) {
+                            if exec_res.is_success() {
+                                return Ok(U256::from(MIN_TRANSACTION_GAS));
+                            }
                         }
                     }
                 }
