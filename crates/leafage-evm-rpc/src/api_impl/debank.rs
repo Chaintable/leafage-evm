@@ -670,15 +670,21 @@ where
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
         let block_env_gas_limit = block_env.gas_limit;
+        let max_gas_limit = self
+            .inner
+            .evm_cfg()
+            .cfg
+            .tx_gas_limit_cap
+            .map_or_else(|| block_env_gas_limit, |cap| cap.min(block_env_gas_limit));
         let mut highest_gas_limit = tx_request_gas_limit
             .map(|tx_gas_limit| {
-                if tx_gas_limit > block_env_gas_limit {
+                if tx_gas_limit > max_gas_limit {
                     tx_gas_limit
                 } else {
-                    block_env_gas_limit
+                    max_gas_limit
                 }
             })
-            .unwrap_or(block_env_gas_limit);
+            .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
             &block_env,
             request.clone(),
@@ -782,7 +788,7 @@ where
         );
 
         while (highest_gas_limit - lowest_gas_limit) > 1 {
-            if cancel_token.is_cancelled(){
+            if cancel_token.is_cancelled() {
                 return Err(internal_rpc_err(
                     "estimate gas cancelled by caller".to_string(),
                 ));

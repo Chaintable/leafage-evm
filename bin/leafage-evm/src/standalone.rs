@@ -5,7 +5,7 @@ use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
 use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
 use crate::warm::Warmup;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
@@ -13,7 +13,7 @@ use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv};
 use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
-use leafage_evm_types::{Address, BlockId, BlockNumberOrTag};
+use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -49,6 +49,11 @@ pub struct Command {
     /// if not specified, the default spec_id is u8::MAX
     #[arg(long, default_value = "255")]
     spec_id: u8,
+
+    /// Maximum gas limit for RPC methods
+    /// [default: u64::MAX]
+    #[arg(long, default_value = "50000000")]
+    pub rpc_gas_cap: u64,
 
     /// The path to the database to use for this node.
     #[arg(long, value_name = "PATH")]
@@ -334,6 +339,73 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
 }
 
 impl Command {
+    fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
+        let chain_id = self.chain_cfg;
+        let evm_type = self.evm_type.clone();
+        let custom_evm_cfg = self.evm_custom_config.clone();
+        let gas_cap = self.rpc_gas_cap;
+        match evm_type.as_str() {
+            "mainnet" => {
+                // Use AMSTERDAM (latest) spec for mainnet
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "op" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Op(chain_cfg))
+            }
+            "bsc" => {
+                let mut chain_cfg = CfgEnv::default();
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Bsc(chain_cfg))
+            }
+            "cosmos" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                let custom_evm_cfg = custom_evm_cfg
+                    .map(|str| {
+                        serde_json::from_str(&str).map_err(|err| {
+                            anyhow!("cannot parse cosmos custom evm config: {}", err)
+                        })
+                    })
+                    .transpose()?;
+                Ok(MultiChainCfgEnv::Cosmos((chain_cfg, custom_evm_cfg)))
+            }
+            "mantlev2" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Mantle(chain_cfg))
+            }
+            _ => bail!("Unsupported evm type"),
+        }
+    }
     async fn start(
         &mut self,
         chain_cfg: MultiChainCfgEnv,
@@ -505,16 +577,8 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, resgitry_handle) = self
-            .start(
-                (
-                    self.chain_cfg.clone(),
-                    self.evm_type.clone(),
-                    self.evm_custom_config.clone(),
-                )
-                    .try_into()?,
-            )
-            .await?;
+        let (updater_handle, rpc_handle, resgitry_handle) =
+            self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());

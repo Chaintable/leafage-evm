@@ -35,7 +35,6 @@ http-body-util.workspace = true
 http-body.workspace = true
 http.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 serde.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
