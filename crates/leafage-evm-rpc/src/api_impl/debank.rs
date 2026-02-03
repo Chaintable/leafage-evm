@@ -8,7 +8,6 @@ use crate::error::{internal_rpc_err, rpc_error_with_code};
 
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
-use futures::{stream, StreamExt};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
@@ -26,8 +25,7 @@ use revm::database::{CacheDB, DatabaseRef};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
-use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
@@ -472,18 +470,15 @@ where
         Ok(res)
     }
 
-    pub async fn contract_multi_call_impl(
+    fn debank_multi_call_from_state_impl_inner(
         &self,
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
-        fast_fail: Option<bool>,
-        use_parallel: Option<bool>,
-        _disable_cache: Option<bool>,
+        fast_fail: bool,
+        cancel_token: CancellationToken,
     ) -> RpcResult<DebankMultiCallResp> {
-        let fast_fail = fast_fail.unwrap_or_default();
-        let use_parallel = use_parallel.unwrap_or_default();
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
@@ -495,70 +490,57 @@ where
             success: true,
             cache_enabled: false,
         };
-        let mut results: Vec<DebankSingleCallResult> = Vec::with_capacity(requests.len());
-        if use_parallel {
-            const MAX_CONCURRENT: usize = 20;
-            let concurrent = std::cmp::min(MAX_CONCURRENT, requests.len());
-            let this = self.clone();
-            let mut tasks = stream::iter(requests)
-                .zip(stream::repeat((
-                    this,
-                    block_overrides,
-                    state_override,
-                    state,
-                )))
-                .map(
-                    |(request, (this, block_overrides, state_override, state))| {
-                        spawn_blocking(move || {
-                            this.debank_single_call_from_state_impl_inner(
-                                &state,
-                                request,
-                                block_overrides.clone(),
-                                state_override.clone(),
-                            )
-                        })
-                    },
-                )
-                .buffered(concurrent);
-            while let Some(res) = tasks.next().await {
-                let res = res.map_err(|e| internal_rpc_err(e.to_string()))??;
-                if res.code != 0i32 {
-                    stats.success = false;
-                }
-                results.push(res);
-                if fast_fail && !stats.success {
-                    break;
-                }
+        // run in sequence
+        let mut results: Vec<DebankSingleCallResult> = vec![];
+        for request in requests {
+            if cancel_token.is_cancelled() {
+                return Err(internal_rpc_err(
+                    "multicall cancelled by caller".to_string(),
+                ));
             }
-        } else {
-            // run in sequence
-            let this = self.clone();
-            (stats, results) = spawn_blocking(move || {
-                let mut results: Vec<DebankSingleCallResult> = vec![];
-                for request in requests {
-                    if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
-                        let res = results.last().unwrap().clone();
-                        results.push(res);
-                        continue;
-                    }
-                    let res = this.debank_single_call_from_state_impl_inner(
-                        &state,
-                        request,
-                        block_overrides.clone(),
-                        state_override.clone(),
-                    )?;
-                    if res.code != 0i32 {
-                        stats.success = false;
-                    }
-                    results.push(res);
-                }
-                RpcResult::Ok((stats, results))
-            })
-            .await
-            .map_err(|e| internal_rpc_err(e.to_string()))??;
+            if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
+                let res = results.last().unwrap().clone();
+                results.push(res);
+                continue;
+            }
+            let res = self.debank_single_call_from_state_impl_inner(
+                &state,
+                request,
+                block_overrides.clone(),
+                state_override.clone(),
+            )?;
+            if res.code != 0 {
+                stats.success = false;
+            }
+            results.push(res);
         }
-
         Ok(DebankMultiCallResp { stats, results })
+    }
+
+    pub async fn contract_multi_call_impl(
+        &self,
+        requests: Vec<CallRequest>,
+        block_ctx: Option<DebankBlockContext>,
+        block_overrides: Option<BlockOverrides>,
+        state_override: Option<StateOverride>,
+        fast_fail: Option<bool>,
+        _use_parallel: Option<bool>,
+        _disable_cache: Option<bool>,
+    ) -> RpcResult<DebankMultiCallResp> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |token| {
+            this.debank_multi_call_from_state_impl_inner(
+                requests,
+                block_ctx,
+                block_overrides,
+                state_override,
+                fast_fail.unwrap_or_default(),
+                token,
+            )
+        })
+        .await
+        .inspect_err(|err| error!("Failed to spawn contract_multi_call result: {:?}", err))
+        .map_err(|_| internal_rpc_err("multi call failed"))?
     }
 
     async fn debank_simulate_transactions_impl(
@@ -567,19 +549,18 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
-        let (tx, rx) = oneshot::channel();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let rsp =
-                this.debank_simulate_transactions_impl_inner(requests, block_ctx, block_overrides);
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send simulate_transactions result: {:?}", e);
-            }
-        });
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("simulate_transactions failed".to_string()))?;
-        rsp
+        utils::spawn_blocking_with_cancel(move |token| {
+            this.debank_simulate_transactions_impl_inner(
+                requests,
+                block_ctx,
+                block_overrides,
+                token,
+            )
+        })
+        .await
+        .inspect_err(|err| error!("Failed to spawn simulate_transactions result: {:?}", err))
+        .map_err(|_| internal_rpc_err("simulate transactions failed"))?
     }
 
     fn debank_simulate_transactions_impl_inner(
@@ -587,6 +568,7 @@ where
         txs: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
+        cancel_token: CancellationToken,
     ) -> RpcResult<DebankSimulateResp> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
@@ -610,6 +592,11 @@ where
         let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
         for tx in txs {
+            if cancel_token.is_cancelled() {
+                return Err(internal_rpc_err(
+                    "simulate transactions cancelled by caller".to_string(),
+                ));
+            }
             let tx_info = TransactionInfo {
                 hash: Some(H256::random()),
                 index: Some(tx_index),
@@ -662,6 +649,7 @@ where
         mut request: CallRequest,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
+        cancel_token: CancellationToken,
     ) -> RpcResult<U256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
@@ -794,6 +782,11 @@ where
         );
 
         while (highest_gas_limit - lowest_gas_limit) > 1 {
+            if cancel_token.is_cancelled(){
+                return Err(internal_rpc_err(
+                    "estimate gas cancelled by caller".to_string(),
+                ));
+            }
             if (highest_gas_limit - lowest_gas_limit) as f64 / (highest_gas_limit as f64)
                 < ESTIMATE_GAS_ERROR_RATIO
             {
@@ -857,19 +850,13 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
-        let (tx, rx) = oneshot::channel();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let rsp = this.debank_estimate_gas_inner(request, block_ctx, block_overrides);
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send debank_estimate result: {:?}", e);
-            }
-        });
-
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("estimate failed".to_string()))?;
-        rsp
+        utils::spawn_blocking_with_cancel(move |token| {
+            this.debank_estimate_gas_inner(request, block_ctx, block_overrides, token)
+        })
+        .await
+        .inspect_err(|err| error!("Failed to spawn debank_estimate result: {:?}", err))
+        .map_err(|_| internal_rpc_err("estimate failed".to_string()))?
     }
 
     fn block_is_valid_impl(&self, id: H256) -> RpcResult<bool> {

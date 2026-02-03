@@ -22,6 +22,7 @@ tower.workspace = true
 once_cell.workspace = true
 futures.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 alloy.workspace = true
 alloy-rlp.workspace = true
