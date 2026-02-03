@@ -2,6 +2,7 @@ use crate::api::EthApiServer;
 use crate::api_impl::core::{
     Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
+use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
@@ -19,7 +20,7 @@ use revm::database::{CacheDB, DatabaseRef};
 use serde_json::Value;
 use std::error::Error;
 use std::str::FromStr;
-use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 impl<C> Api<C>
@@ -251,18 +252,14 @@ where
         _: Option<bool>,
         _: Option<bool>,
     ) -> RpcResult<MultiCallResp> {
-        let (tx, rx) = oneshot::channel();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let rsp = this.multi_call_impl_inner(requests, block_id, fast_fail.unwrap_or_default());
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("MultiCall failed".to_string()))?;
-        rsp
+
+        utils::spawn_blocking_with_cancel(move |token| {
+            this.multi_call_impl_inner(requests, block_id, fast_fail.unwrap_or_default(), token)
+        })
+        .await
+        .inspect_err(|err| error!("Failed to spawn eth_multi_call result: {:?}", err))
+        .map_err(|_| internal_rpc_err("multi call failed"))?
     }
 
     fn multi_call_impl_inner(
@@ -270,6 +267,7 @@ where
         requests: Vec<CallRequest>,
         block_id: BlockId,
         fast_fail: bool,
+        cancellation_token: CancellationToken,
     ) -> RpcResult<MultiCallResp> {
         let state = self
             .inner
@@ -299,6 +297,11 @@ where
         // run in sequence
         let mut results: Vec<SingleCallResult> = vec![];
         for request in requests {
+            if cancellation_token.is_cancelled() {
+                return Err(internal_rpc_err(
+                    "multicall cancelled by caller".to_string(),
+                ));
+            }
             let start = std::time::Instant::now();
             if fast_fail
                 && !results.is_empty()

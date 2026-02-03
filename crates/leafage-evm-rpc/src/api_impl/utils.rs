@@ -12,6 +12,8 @@ use revm::{Database, DatabaseCommit};
 use revm_inspectors::tracing::types::{CallTraceNode, TraceMemberOrder};
 use revm_inspectors::tracing::CallTraceArena;
 use std::collections::HashMap;
+use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 
 pub fn apply_block_overrides<DB>(
     overrides: BlockOverrides,
@@ -254,4 +256,66 @@ pub(crate) fn build_debank_traces(
     let mut events = vec![];
     finish_build_traces(&mut top, &mut traces, &mut events);
     (traces, events)
+}
+
+/// Spawns a blocking task with automatic cancellation handling.
+///
+/// 1. Internally initializes a `CancellationToken` and a `DropGuard`.
+/// 2. Triggers cancellation automatically if the returned Future is dropped.
+/// 3. Provides the token to the closure to allow for internal cancellation checks.
+pub async fn spawn_blocking_with_cancel<F, R>(task: F) -> Result<R, JoinError>
+where
+    F: FnOnce(CancellationToken) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let token = CancellationToken::new();
+
+    let _guard = token.clone().drop_guard();
+
+    tokio::task::spawn_blocking(move || task(token)).await
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{atomic, Arc};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_normal_execution() {
+        let result = spawn_blocking_with_cancel(|_token| {
+            std::thread::sleep(Duration::from_millis(10));
+            42
+        })
+        .await
+        .expect("Task failed");
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_with_cancel() {
+        let val = Arc::new(AtomicU64::new(0));
+        let val_clone = val.clone();
+        let _ = timeout(
+            Duration::from_millis(50),
+            spawn_blocking_with_cancel(move |token| {
+                for _ in 0..10 {
+                    println!(
+                        "val: {}, canceled: {}",
+                        val_clone.load(atomic::Ordering::Relaxed),
+                        token.is_cancelled()
+                    );
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    val_clone.fetch_add(1, atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }),
+        )
+        .await;
+        assert_eq!(val.load(atomic::Ordering::SeqCst), 5);
+    }
 }

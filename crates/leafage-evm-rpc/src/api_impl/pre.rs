@@ -2,6 +2,7 @@ use crate::api::PreApiServer;
 use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
+use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, rpc_error_with_code};
 use alloy::primitives::Bytes;
 use alloy::rpc::types::trace::geth::GethDefaultTracingOptions;
@@ -16,6 +17,7 @@ use revm::context::Transaction as TransactionTrait;
 use revm::database::CacheDB;
 use revm_inspectors::tracing::TracingInspectorConfig;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 impl<C> Api<C>
@@ -123,24 +125,20 @@ where
         requests: Vec<CallRequest>,
         block_id: Option<BlockId>,
     ) -> RpcResult<Vec<PreResult>> {
-        let (tx, rx) = oneshot::channel();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let rsp = this.pre_trace_many_impl_inner(requests, block_id);
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send multi_call result: {:?}", e);
-            }
-        });
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("PreTraceMany failed".to_string()))?;
-        rsp
+        utils::spawn_blocking_with_cancel(move |token| {
+            this.pre_trace_many_impl_inner(requests, block_id, token)
+        })
+        .await
+        .inspect_err(|err| error!("Failed to spawn pre_trace_many result: {:?}", err))
+        .map_err(|_| internal_rpc_err("pre trace many failed"))?
     }
 
     fn pre_trace_many_impl_inner(
         &self,
         txs: Vec<CallRequest>,
         block_id: Option<BlockId>,
+        cancellation_token: CancellationToken,
     ) -> RpcResult<Vec<PreResult>> {
         let state = self
             .inner
@@ -174,6 +172,11 @@ where
         let mut log_index = 0;
         let mut pre_results: Vec<PreResult> = Vec::new();
         for tx in txs {
+            if cancellation_token.is_cancelled() {
+                return Err(internal_rpc_err(
+                    "pre trace many cancelled by caller".to_string(),
+                ));
+            }
             let tx_info = TransactionInfo {
                 hash: Some(H256::random()),
                 index: Some(tx_index),
