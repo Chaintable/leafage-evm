@@ -51,8 +51,8 @@ pub struct Command {
     spec_id: u8,
 
     /// Maximum gas limit for RPC methods
-    /// [default: u64::MAX]
-    #[arg(long, default_value = "50000000")]
+    /// [default: 18446744073709551615]
+    #[arg(long, default_value_t = u64::MAX)]
     pub rpc_gas_cap: u64,
 
     /// The path to the database to use for this node.
