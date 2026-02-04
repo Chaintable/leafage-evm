@@ -3,12 +3,12 @@ use crate::utils::{
 };
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use futures::{stream, StreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
     rocksdb, ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
-    StateDBWrite,
+    StateDBWrite, StorageKind,
 };
 use leafage_evm_types::{Block, BlockStorageDiff, H256};
 use std::collections::BTreeMap;
@@ -30,14 +30,6 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Delay for RocksDB to settle after closing (background threads to terminate)
 const ROCKSDB_SETTLE_DELAY: Duration = Duration::from_secs(10);
-
-/// Storage type for archive database
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-pub enum StorageType {
-    #[default]
-    Rocksdb,
-    Mdbx,
-}
 
 /// `leafage-evm archive-init` command
 #[derive(Debug, Parser)]
@@ -71,8 +63,8 @@ pub struct Command {
     end_block: u64,
 
     /// Storage type (rocksdb or mdbx)
-    #[arg(long, value_enum, default_value = "rocksdb")]
-    storage_kind: StorageType,
+    #[arg(long, default_value = "rocksdb")]
+    storage_kind: StorageKind,
 
     /// Database cache size in MB (RocksDB only)
     #[arg(long, default_value = "2048")]
@@ -126,7 +118,9 @@ impl ArchiveStorage {
 
     fn prepare_write_batch(&self) -> Result<ArchiveWriteBatch, anyhow::Error> {
         match self {
-            ArchiveStorage::RocksDB(db) => Ok(ArchiveWriteBatch::RocksDB(db.prepare_write_batch()?)),
+            ArchiveStorage::RocksDB(db) => {
+                Ok(ArchiveWriteBatch::RocksDB(db.prepare_write_batch()?))
+            }
             ArchiveStorage::MDBX(db) => Ok(ArchiveWriteBatch::MDBX(db.prepare_write_batch()?)),
         }
     }
@@ -266,7 +260,7 @@ impl Command {
 
         // Open archive database based on storage kind
         let db = Arc::new(match self.storage_kind {
-            StorageType::Rocksdb => {
+            StorageKind::Rocksdb => {
                 info!(target: "archive_init", "Opening RocksDB archive database with cache_size: {}MB", self.db_cache);
                 ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open(
                     &self.db_path,
@@ -274,7 +268,7 @@ impl Command {
                     true, // disable_auto_compactions for faster bulk writes
                 )))
             }
-            StorageType::Mdbx => {
+            StorageKind::MDBX => {
                 // Validate MDBX configuration
                 if self.mdbx_initial_size_gb > self.mdbx_max_size_gb {
                     anyhow::bail!(
@@ -393,11 +387,10 @@ impl Command {
             final_success, total_time, avg_speed);
 
         // RocksDB-specific: compaction phase
-        if matches!(self.storage_kind, StorageType::Rocksdb) {
+        if matches!(self.storage_kind, StorageKind::Rocksdb) {
             // Close database to ensure all writes are persisted before compaction
             info!(target: "archive_init", "Closing database before compaction...");
-            Arc::try_unwrap(db)
-                .expect("Database Arc has other references, cannot close safely");
+            Arc::try_unwrap(db).expect("Database Arc has other references, cannot close safely");
 
             // Wait for RocksDB background threads to fully terminate
             sleep(ROCKSDB_SETTLE_DELAY).await;
