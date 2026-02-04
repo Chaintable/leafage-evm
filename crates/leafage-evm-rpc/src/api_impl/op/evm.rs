@@ -10,13 +10,14 @@ use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::Context;
 
-pub(crate) fn create_op_txn_env<ODB: DatabaseRef>(
+pub(crate) fn create_op_txn_env<ODB: DatabaseRef, SpecId>(
     block_env: &BlockEnv,
+    cfg_env: CfgEnv<SpecId>,
     request: CallRequest,
     db: ODB,
     origin_chain_id: u64,
 ) -> RpcResult<OpTransaction<TxEnv>> {
-    let base = create_mainnet_txn_env(block_env, request, db, origin_chain_id)?;
+    let base = create_mainnet_txn_env(block_env, cfg_env, request, db, origin_chain_id)?;
     Ok(OpTransaction {
         base,
         enveloped_tx: Some(leafage_evm_types::Bytes::new()),

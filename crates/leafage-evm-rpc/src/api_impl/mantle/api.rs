@@ -1,8 +1,9 @@
+use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{ApiCore, EvmExecutor, TxSetter};
 use crate::api_impl::mantle::evm::{create_mantle_evm_from_state, create_mantle_txn_env};
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::mantle::{GAS_ORACLE_ADDR, MantleHardfork, TOKEN_RATIO_SLOT};
+use leafage_evm_chains::mantle::{MantleHardfork, GAS_ORACLE_ADDR, TOKEN_RATIO_SLOT};
 use leafage_evm_types::CallRequest;
 use op_revm::transaction::OpTxTr;
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
@@ -13,7 +14,6 @@ use revm::ExecuteEvm;
 use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
-use crate::api_impl::api_impl::NoneEvmCustomConfig;
 
 type MantleApiImpl<DB> = ApiImpl<DB, MantleHardfork, NoneEvmCustomConfig>;
 
@@ -39,7 +39,7 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        create_mantle_txn_env(block_env, request, db, chain_id)
+        create_mantle_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)
     }
 
     fn transact<StateDB: DatabaseRef>(
@@ -53,9 +53,7 @@ where
     > {
         let token_ratio = get_token_ratio(&state);
 
-        let should_apply_ratio = token_ratio > 1
-            && !tx.is_deposit()
-            && !tx.is_system_transaction();
+        let should_apply_ratio = token_ratio > 1 && !tx.is_deposit() && !tx.is_system_transaction();
 
         if should_apply_ratio {
             let original_gas_limit = tx.base.gas_limit;
@@ -73,27 +71,27 @@ where
 
         let final_result = if should_apply_ratio {
             match result.result {
-                ExecutionResult::Success { gas_used, gas_refunded, output, logs, reason } => {
-                    ExecutionResult::Success {
-                        gas_used: gas_used * token_ratio,
-                        gas_refunded: gas_refunded * token_ratio,
-                        output,
-                        logs,
-                        reason,
-                    }
-                }
-                ExecutionResult::Revert { gas_used, output } => {
-                    ExecutionResult::Revert {
-                        gas_used: gas_used * token_ratio,
-                        output,
-                    }
-                }
-                ExecutionResult::Halt { reason, gas_used } => {
-                    ExecutionResult::Halt {
-                        reason,
-                        gas_used: gas_used * token_ratio,
-                    }
-                }
+                ExecutionResult::Success {
+                    gas_used,
+                    gas_refunded,
+                    output,
+                    logs,
+                    reason,
+                } => ExecutionResult::Success {
+                    gas_used: gas_used * token_ratio,
+                    gas_refunded: gas_refunded * token_ratio,
+                    output,
+                    logs,
+                    reason,
+                },
+                ExecutionResult::Revert { gas_used, output } => ExecutionResult::Revert {
+                    gas_used: gas_used * token_ratio,
+                    output,
+                },
+                ExecutionResult::Halt { reason, gas_used } => ExecutionResult::Halt {
+                    reason,
+                    gas_used: gas_used * token_ratio,
+                },
             }
         } else {
             result.result
@@ -119,9 +117,7 @@ where
     > {
         let token_ratio = get_token_ratio(&state);
 
-        let should_apply_ratio = token_ratio > 1
-            && !tx.is_deposit()
-            && !tx.is_system_transaction();
+        let should_apply_ratio = token_ratio > 1 && !tx.is_deposit() && !tx.is_system_transaction();
 
         if should_apply_ratio {
             let original_gas_limit = tx.base.gas_limit;
@@ -140,27 +136,27 @@ where
 
         let final_result = if should_apply_ratio {
             match result {
-                ExecutionResult::Success { gas_used, gas_refunded, output, logs, reason } => {
-                    ExecutionResult::Success {
-                        gas_used: gas_used * token_ratio,
-                        gas_refunded: gas_refunded * token_ratio,
-                        output,
-                        logs,
-                        reason,
-                    }
-                }
-                ExecutionResult::Revert { gas_used, output } => {
-                    ExecutionResult::Revert {
-                        gas_used: gas_used * token_ratio,
-                        output,
-                    }
-                }
-                ExecutionResult::Halt { reason, gas_used } => {
-                    ExecutionResult::Halt {
-                        reason,
-                        gas_used: gas_used * token_ratio,
-                    }
-                }
+                ExecutionResult::Success {
+                    gas_used,
+                    gas_refunded,
+                    output,
+                    logs,
+                    reason,
+                } => ExecutionResult::Success {
+                    gas_used: gas_used * token_ratio,
+                    gas_refunded: gas_refunded * token_ratio,
+                    output,
+                    logs,
+                    reason,
+                },
+                ExecutionResult::Revert { gas_used, output } => ExecutionResult::Revert {
+                    gas_used: gas_used * token_ratio,
+                    output,
+                },
+                ExecutionResult::Halt { reason, gas_used } => ExecutionResult::Halt {
+                    reason,
+                    gas_used: gas_used * token_ratio,
+                },
             }
         } else {
             result

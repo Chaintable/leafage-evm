@@ -30,7 +30,8 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        let txn_env = create_mainnet_txn_env(block_env, request, db, chain_id)?;
+        let txn_env =
+            create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
         Ok(BscTxEnv::new(txn_env))
     }
 
