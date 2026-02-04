@@ -7,7 +7,11 @@ mod mdbx_impl;
 mod error;
 
 pub use error::Error as StorageError;
-pub use mdbx_impl::{MDBXStateDB, MDBXStorage, MDBXWriteBatch};
+pub use mdbx_impl::{
+    MDBXArchiveOptions, MDBXArchiveStateDB, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXStateDB,
+    MDBXStorage, MDBXWriteBatch,
+};
+pub use rocksdb;
 pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, RocksDBStorage};
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
@@ -21,6 +25,7 @@ pub enum MultiStorage {
     RocksDBState(Arc<RocksDBStorage>),
     RocksDBArchive(Arc<ArchiveRocksDBStorage>),
     MDBXState(Arc<MDBXStorage>),
+    MDBXArchive(Arc<MDBXArchiveStorage>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,9 +70,10 @@ impl MultiStorage {
                 let db = MDBXStorage::open(path);
                 Ok(MultiStorage::MDBXState(Arc::new(db)))
             }
-            (StorageKind::MDBX, true) => Err(StorageError::UnSupported(
-                "MDBX archive storage is not supported".to_string(),
-            )),
+            (StorageKind::MDBX, true) => {
+                let db = MDBXArchiveStorage::open(path);
+                Ok(MultiStorage::MDBXArchive(Arc::new(db)))
+            }
         }
     }
 }
@@ -77,6 +83,7 @@ pub enum MultiStateDB {
     RocksDBState(Arc<RocksDBStorage>),
     RocksDBArchive(ArchiveStateDB),
     MDBXState(MDBXStateDB),
+    MDBXArchive(MDBXArchiveStateDB),
 }
 
 impl LatestStateDBIterator for MultiStorage {
@@ -91,6 +98,9 @@ impl LatestStateDBIterator for MultiStorage {
             MultiStorage::MDBXState(db) => {
                 Box::new(db.account_iter()) as Box<dyn Iterator<Item = _>>
             }
+            MultiStorage::MDBXArchive(db) => {
+                Box::new(db.account_iter()) as Box<dyn Iterator<Item = _>>
+            }
         }
     }
 
@@ -103,6 +113,9 @@ impl LatestStateDBIterator for MultiStorage {
                 Box::new(db.code_iter()) as Box<dyn Iterator<Item = _>>
             }
             MultiStorage::MDBXState(db) => Box::new(db.code_iter()) as Box<dyn Iterator<Item = _>>,
+            MultiStorage::MDBXArchive(db) => {
+                Box::new(db.code_iter()) as Box<dyn Iterator<Item = _>>
+            }
         }
     }
 
@@ -115,6 +128,9 @@ impl LatestStateDBIterator for MultiStorage {
                 Box::new(db.storage_iter()) as Box<dyn Iterator<Item = _>>
             }
             MultiStorage::MDBXState(db) => {
+                Box::new(db.storage_iter()) as Box<dyn Iterator<Item = _>>
+            }
+            MultiStorage::MDBXArchive(db) => {
                 Box::new(db.storage_iter()) as Box<dyn Iterator<Item = _>>
             }
         }
@@ -133,6 +149,9 @@ impl BlockIterator for MultiStorage {
             MultiStorage::MDBXState(db) => {
                 Box::new(db.block_info_iter()) as Box<dyn Iterator<Item = _>>
             }
+            MultiStorage::MDBXArchive(db) => {
+                Box::new(db.block_info_iter()) as Box<dyn Iterator<Item = _>>
+            }
         }
     }
 
@@ -145,6 +164,9 @@ impl BlockIterator for MultiStorage {
                 Box::new(db.block_hash_iter()) as Box<dyn Iterator<Item = _>>
             }
             MultiStorage::MDBXState(db) => {
+                Box::new(db.block_hash_iter()) as Box<dyn Iterator<Item = _>>
+            }
+            MultiStorage::MDBXArchive(db) => {
                 Box::new(db.block_hash_iter()) as Box<dyn Iterator<Item = _>>
             }
         }
@@ -165,6 +187,9 @@ impl StateDBProvider for MultiStorage {
             MultiStorage::MDBXState(db) => db
                 .db_at(block_arg)
                 .map(|opt| opt.map(MultiStateDB::MDBXState)),
+            MultiStorage::MDBXArchive(db) => db
+                .db_at(block_arg)
+                .map(|opt| opt.map(MultiStateDB::MDBXArchive)),
         }
     }
 }
@@ -175,6 +200,7 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBState(db) => db.read_account(address),
             MultiStateDB::RocksDBArchive(db) => db.read_account(address),
             MultiStateDB::MDBXState(db) => db.read_account(address),
+            MultiStateDB::MDBXArchive(db) => db.read_account(address),
         }
     }
 
@@ -183,6 +209,7 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBState(db) => db.read_code(code_hash),
             MultiStateDB::RocksDBArchive(db) => db.read_code(code_hash),
             MultiStateDB::MDBXState(db) => db.read_code(code_hash),
+            MultiStateDB::MDBXArchive(db) => db.read_code(code_hash),
         }
     }
 
@@ -191,6 +218,7 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBState(db) => db.read_storage(address, key),
             MultiStateDB::RocksDBArchive(db) => db.read_storage(address, key),
             MultiStateDB::MDBXState(db) => db.read_storage(address, key),
+            MultiStateDB::MDBXArchive(db) => db.read_storage(address, key),
         }
     }
 
@@ -199,6 +227,7 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBState(db) => db.read_latest_block_hash(),
             MultiStateDB::RocksDBArchive(db) => db.read_latest_block_hash(),
             MultiStateDB::MDBXState(db) => db.read_latest_block_hash(),
+            MultiStateDB::MDBXArchive(db) => db.read_latest_block_hash(),
         }
     }
 
@@ -207,6 +236,7 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBState(db) => db.read_block_info(block_hash),
             MultiStateDB::RocksDBArchive(db) => db.read_block_info(block_hash),
             MultiStateDB::MDBXState(db) => db.read_block_info(block_hash),
+            MultiStateDB::MDBXArchive(db) => db.read_block_info(block_hash),
         }
     }
 
@@ -215,6 +245,7 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBState(db) => db.read_block_hash(block_num),
             MultiStateDB::RocksDBArchive(db) => db.read_block_hash(block_num),
             MultiStateDB::MDBXState(db) => db.read_block_hash(block_num),
+            MultiStateDB::MDBXArchive(db) => db.read_block_hash(block_num),
         }
     }
 }
@@ -222,6 +253,7 @@ impl StateDBRead for MultiStateDB {
 pub enum MultiWriteBatch {
     RocksDBBatch(rocksdb::WriteBatch),
     MDBXBatch(MDBXWriteBatch),
+    MDBXArchiveBatch(MDBXArchiveWriteBatch),
 }
 
 impl StateDBWrite for MultiStateDB {
@@ -237,6 +269,9 @@ impl StateDBWrite for MultiStateDB {
             }
             MultiStateDB::MDBXState(db) => {
                 Ok(MultiWriteBatch::MDBXBatch(db.prepare_write_batch()?))
+            }
+            MultiStateDB::MDBXArchive(db) => {
+                Ok(MultiWriteBatch::MDBXArchiveBatch(db.prepare_write_batch()?))
             }
         }
     }
@@ -254,6 +289,9 @@ impl StateDBWrite for MultiStateDB {
                 db.write_latest_block_hash(b, block_hash)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
+                db.write_latest_block_hash(b, block_hash)
+            }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
                 db.write_latest_block_hash(b, block_hash)
             }
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
@@ -275,6 +313,9 @@ impl StateDBWrite for MultiStateDB {
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
                 db.write_block_info(b, block_info)
             }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
+                db.write_block_info(b, block_info)
+            }
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
         }
     }
@@ -293,6 +334,9 @@ impl StateDBWrite for MultiStateDB {
                 db.write_block_hash(b, block_num, block_hash)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
+                db.write_block_hash(b, block_num, block_hash)
+            }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
                 db.write_block_hash(b, block_num, block_hash)
             }
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
@@ -316,6 +360,9 @@ impl StateDBWrite for MultiStateDB {
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
                 db.write_account(b, address, block_num, raw_account)
             }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
+                db.write_account(b, address, block_num, raw_account)
+            }
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
         }
     }
@@ -334,6 +381,9 @@ impl StateDBWrite for MultiStateDB {
                 db.write_code(b, code_hash, code)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
+                db.write_code(b, code_hash, code)
+            }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
                 db.write_code(b, code_hash, code)
             }
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
@@ -358,6 +408,9 @@ impl StateDBWrite for MultiStateDB {
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
                 db.write_storage(b, address, key, block_num, value)
             }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
+                db.write_storage(b, address, key, block_num, value)
+            }
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
         }
     }
@@ -367,6 +420,7 @@ impl StateDBWrite for MultiStateDB {
             (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => db.commit(b),
             (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => db.commit(b),
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => db.commit(b),
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => db.commit(b),
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
         }
     }

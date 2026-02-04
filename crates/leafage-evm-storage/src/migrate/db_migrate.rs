@@ -23,7 +23,10 @@ impl DBSource {
         let dst = MultiStorage::open(dst_path, cache_size, dst_kind, false, false)?;
 
         // 验证 dst 不是 archive 类型
-        if matches!(dst, MultiStorage::RocksDBArchive(_)) {
+        if matches!(
+            dst,
+            MultiStorage::RocksDBArchive(_) | MultiStorage::MDBXArchive(_)
+        ) {
             return Err(StorageError::UnSupported(
                 "Destination storage cannot be archive type".to_string(),
             ));

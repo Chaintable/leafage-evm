@@ -3,10 +3,13 @@ use crate::utils::{
 };
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::{stream, StreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_storage::{ArchiveRocksDBStorage, StateDBWrite};
+use leafage_evm_storage::{
+    rocksdb, ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
+    StateDBWrite,
+};
 use leafage_evm_types::{Block, BlockStorageDiff, H256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,6 +30,14 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Delay for RocksDB to settle after closing (background threads to terminate)
 const ROCKSDB_SETTLE_DELAY: Duration = Duration::from_secs(10);
+
+/// Storage type for archive database
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum StorageType {
+    #[default]
+    Rocksdb,
+    Mdbx,
+}
 
 /// `leafage-evm archive-init` command
 #[derive(Debug, Parser)]
@@ -59,9 +70,21 @@ pub struct Command {
     #[arg(long)]
     end_block: u64,
 
-    /// Database cache size in MB
+    /// Storage type (rocksdb or mdbx)
+    #[arg(long, value_enum, default_value = "rocksdb")]
+    storage_kind: StorageType,
+
+    /// Database cache size in MB (RocksDB only)
     #[arg(long, default_value = "2048")]
     db_cache: usize,
+
+    /// MDBX initial database size in GB (MDBX only)
+    #[arg(long, default_value = "1")]
+    mdbx_initial_size_gb: usize,
+
+    /// MDBX maximum database size in GB (MDBX only)
+    #[arg(long, default_value = "1024")]
+    mdbx_max_size_gb: usize,
 
     /// Max concurrent tasks for fetching and writing
     #[arg(long, default_value = "256")]
@@ -73,11 +96,166 @@ struct ProcessResult {
     block_hash: H256,
 }
 
+/// Unified archive storage abstraction
+#[derive(Debug)]
+enum ArchiveStorage {
+    RocksDB(Arc<ArchiveRocksDBStorage>),
+    MDBX(Arc<MDBXArchiveStorage>),
+}
+
+/// Unified write batch abstraction
+enum ArchiveWriteBatch {
+    RocksDB(rocksdb::WriteBatch),
+    MDBX(MDBXArchiveWriteBatch),
+}
+
+impl ArchiveStorage {
+    fn read_latest_block_hash(&self) -> Result<H256, anyhow::Error> {
+        match self {
+            ArchiveStorage::RocksDB(db) => Ok(db.read_latest_block_hash()?),
+            ArchiveStorage::MDBX(db) => Ok(db.read_latest_block_hash()?),
+        }
+    }
+
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, anyhow::Error> {
+        match self {
+            ArchiveStorage::RocksDB(db) => Ok(db.read_block_info(block_hash)?),
+            ArchiveStorage::MDBX(db) => Ok(db.read_block_info(block_hash)?),
+        }
+    }
+
+    fn prepare_write_batch(&self) -> Result<ArchiveWriteBatch, anyhow::Error> {
+        match self {
+            ArchiveStorage::RocksDB(db) => Ok(ArchiveWriteBatch::RocksDB(db.prepare_write_batch()?)),
+            ArchiveStorage::MDBX(db) => Ok(ArchiveWriteBatch::MDBX(db.prepare_write_batch()?)),
+        }
+    }
+
+    fn write_latest_block_hash(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        block_hash: H256,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_latest_block_hash(b, block_hash)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_latest_block_hash(b, block_hash)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn write_block_hash(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        block_num: u64,
+        block_hash: H256,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_block_hash(b, block_num, block_hash)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_block_hash(b, block_num, block_hash)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn write_block_info(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        block_info: Block<H256>,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_block_info(b, block_info)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_block_info(b, block_info)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn write_account(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        address: H256,
+        block_num: u64,
+        raw_account: Option<leafage_evm_types::NewAccount>,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_account(b, address, block_num, raw_account)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_account(b, address, block_num, raw_account)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn write_storage(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        address: H256,
+        key: H256,
+        block_num: u64,
+        value: leafage_evm_types::U256,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_storage(b, address, key, block_num, value)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_storage(b, address, key, block_num, value)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn write_code(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        code_hash: H256,
+        code: leafage_evm_types::Bytes,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_code(b, code_hash, code)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_code(b, code_hash, code)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn commit(&self, batch: ArchiveWriteBatch) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => Ok(db.commit(b)?),
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => Ok(db.commit(b)?),
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    /// Flush database (RocksDB only, no-op for MDBX)
+    fn flush(&self) -> Result<(), anyhow::Error> {
+        match self {
+            ArchiveStorage::RocksDB(db) => Ok(db.flush()?),
+            ArchiveStorage::MDBX(_) => Ok(()), // MDBX doesn't need flush
+        }
+    }
+}
+
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
         info!(target: "archive_init", "Starting archive initialization");
-        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}",
-              self.db_path, self.rpc_addr, self.end_block, self.max_tasks);
+        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, storage_kind: {:?}",
+              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.storage_kind);
 
         // Initialize S3 client
         let s3_config = aws_config::load_from_env().await;
@@ -86,12 +264,39 @@ impl Command {
         // Initialize RPC client
         let rpc_client = HttpClientBuilder::default().build(&self.rpc_addr)?;
 
-        // Open archive database with auto compactions disabled for faster bulk writes
-        let db = Arc::new(ArchiveRocksDBStorage::open(
-            &self.db_path,
-            self.db_cache,
-            true, // disable_auto_compactions for faster bulk writes
-        ));
+        // Open archive database based on storage kind
+        let db = Arc::new(match self.storage_kind {
+            StorageType::Rocksdb => {
+                info!(target: "archive_init", "Opening RocksDB archive database with cache_size: {}MB", self.db_cache);
+                ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open(
+                    &self.db_path,
+                    self.db_cache,
+                    true, // disable_auto_compactions for faster bulk writes
+                )))
+            }
+            StorageType::Mdbx => {
+                // Validate MDBX configuration
+                if self.mdbx_initial_size_gb > self.mdbx_max_size_gb {
+                    anyhow::bail!(
+                        "MDBX initial size ({}GB) cannot be greater than max size ({}GB)",
+                        self.mdbx_initial_size_gb,
+                        self.mdbx_max_size_gb
+                    );
+                }
+                const GB: usize = 1024 * 1024 * 1024;
+                let options = MDBXArchiveOptions {
+                    initial_size: self.mdbx_initial_size_gb * GB,
+                    max_size: self.mdbx_max_size_gb * GB,
+                    ..Default::default()
+                };
+                info!(target: "archive_init", "Opening MDBX archive database with initial_size: {}GB, max_size: {}GB",
+                      self.mdbx_initial_size_gb, self.mdbx_max_size_gb);
+                ArchiveStorage::MDBX(Arc::new(MDBXArchiveStorage::open_with_options(
+                    &self.db_path,
+                    options,
+                )))
+            }
+        });
 
         // Determine start block (support resume)
         let start_block = self.get_start_block(&db)?;
@@ -187,19 +392,22 @@ impl Command {
             "Archive initialization completed. Total: {} blocks in {:.1}s ({:.1} blocks/s)",
             final_success, total_time, avg_speed);
 
-        // Close database to ensure all writes are persisted before compaction
-        info!(target: "archive_init", "Closing database before compaction...");
-        Arc::try_unwrap(db)
-            .expect("Database Arc has other references, cannot close safely");
+        // RocksDB-specific: compaction phase
+        if matches!(self.storage_kind, StorageType::Rocksdb) {
+            // Close database to ensure all writes are persisted before compaction
+            info!(target: "archive_init", "Closing database before compaction...");
+            Arc::try_unwrap(db)
+                .expect("Database Arc has other references, cannot close safely");
 
-        // Wait for RocksDB background threads to fully terminate
-        sleep(ROCKSDB_SETTLE_DELAY).await;
+            // Wait for RocksDB background threads to fully terminate
+            sleep(ROCKSDB_SETTLE_DELAY).await;
 
-        // Reopen database with auto compaction enabled for the compaction phase
-        let compact_db = ArchiveRocksDBStorage::open(&self.db_path, self.db_cache, false);
-        info!(target: "archive_init", "Starting database compaction...");
-        compact_db.compact()?;
-        info!(target: "archive_init", "Database compaction completed.");
+            // Reopen database with auto compaction enabled for the compaction phase
+            let compact_db = ArchiveRocksDBStorage::open(&self.db_path, self.db_cache, false);
+            info!(target: "archive_init", "Starting database compaction...");
+            compact_db.compact()?;
+            info!(target: "archive_init", "Database compaction completed.");
+        }
 
         Ok(())
     }
@@ -207,7 +415,7 @@ impl Command {
     /// Spawn checkpoint worker that handles max_contiguous tracking, checkpoint commits, and progress logging
     fn spawn_checkpoint_worker(
         mut rx: mpsc::UnboundedReceiver<ProcessResult>,
-        db: Arc<ArchiveRocksDBStorage>,
+        db: Arc<ArchiveStorage>,
         start_block: u64,
         end_block: u64,
         total_blocks: u64,
@@ -295,8 +503,8 @@ impl Command {
         })
     }
 
-    /// Commit a checkpoint to the database and flush to reduce WAL size
-    fn commit_checkpoint(db: &Arc<ArchiveRocksDBStorage>, block_hash: H256) {
+    /// Commit a checkpoint to the database and flush (RocksDB only) to reduce WAL size
+    fn commit_checkpoint(db: &Arc<ArchiveStorage>, block_hash: H256) {
         let mut batch = db.prepare_write_batch().expect("Failed to prepare batch");
         db.write_latest_block_hash(&mut batch, block_hash)
             .expect("Failed to write latest block hash");
@@ -305,7 +513,7 @@ impl Command {
     }
 
     /// Get the start block number, checking for existing data to support resume
-    fn get_start_block(&self, db: &Arc<ArchiveRocksDBStorage>) -> Result<u64> {
+    fn get_start_block(&self, db: &Arc<ArchiveStorage>) -> Result<u64> {
         let latest_hash = db.read_latest_block_hash()?;
         if latest_hash == H256::ZERO {
             // Database is empty, start from 0
@@ -339,7 +547,7 @@ impl Command {
         outer_bucket: String,
         chain_id: String,
         version: String,
-        db: Arc<ArchiveRocksDBStorage>,
+        db: Arc<ArchiveStorage>,
         block_num: u64,
     ) -> ProcessResult {
         let mut last_error = String::new();
@@ -385,7 +593,7 @@ impl Command {
         outer_bucket: String,
         chain_id: String,
         version: String,
-        db: Arc<ArchiveRocksDBStorage>,
+        db: Arc<ArchiveStorage>,
         block_num: u64,
     ) -> Result<ProcessResult> {
         // Step 1: Fetch block data
@@ -430,7 +638,7 @@ impl Command {
 
     /// Write a single block to the database
     fn write_block(
-        db: &Arc<ArchiveRocksDBStorage>,
+        db: &Arc<ArchiveStorage>,
         block_num: u64,
         block_info: Block<H256>,
         block_diff: BlockStorageDiff,
