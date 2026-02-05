@@ -19,9 +19,6 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-/// Checkpoint interval for writing latest block hash
-const CHECKPOINT_INTERVAL: u64 = 10240;
-
 /// Maximum retry attempts for failed blocks
 const MAX_RETRIES: u32 = 3;
 
@@ -81,6 +78,10 @@ pub struct Command {
     /// Max concurrent tasks for fetching and writing
     #[arg(long, default_value = "256")]
     max_tasks: usize,
+
+    /// Checkpoint interval for committing blocks to database
+    #[arg(long, default_value = "1024")]
+    checkpoint_interval: u64,
 }
 
 /// Data fetched for a single block, to be written by checkpoint worker
@@ -320,6 +321,7 @@ impl Command {
             self.end_block,
             total_blocks,
             overall_start,
+            self.checkpoint_interval,
         );
 
         // Create stream of block heights
@@ -415,6 +417,7 @@ impl Command {
         end_block: u64,
         total_blocks: u64,
         overall_start: Instant,
+        checkpoint_interval: u64,
     ) -> tokio::task::JoinHandle<(u64, u64)> {
         tokio::spawn(async move {
             // Pending blocks waiting to be written (out-of-order arrivals)
@@ -427,12 +430,14 @@ impl Command {
             } else {
                 Some(start_block - 1)
             };
-            let mut last_checkpoint_num = start_block.saturating_sub(1) / CHECKPOINT_INTERVAL;
+            let mut last_checkpoint_num = start_block.saturating_sub(1) / checkpoint_interval;
             let mut count: u64 = 0;
             let mut written_count: u64 = 0;
 
             // Current batch for accumulating writes
-            let mut current_batch = db.prepare_write_batch().expect("Failed to prepare initial batch");
+            let mut current_batch = db
+                .prepare_write_batch()
+                .expect("Failed to prepare initial batch");
 
             while let Some(block_data) = rx.recv().await {
                 count += 1;
@@ -462,10 +467,10 @@ impl Command {
 
                 // Check if we should commit at checkpoint boundary
                 if let Some(mc) = max_contiguous {
-                    let current_checkpoint_num = mc / CHECKPOINT_INTERVAL;
+                    let current_checkpoint_num = mc / checkpoint_interval;
                     if current_checkpoint_num > last_checkpoint_num {
                         // Write latest_block_hash using the correct checkpoint block hash
-                        let checkpoint_block = current_checkpoint_num * CHECKPOINT_INTERVAL;
+                        let checkpoint_block = current_checkpoint_num * checkpoint_interval;
                         if let Some(&checkpoint_hash) = written_hashes.get(&checkpoint_block) {
                             db.write_latest_block_hash(&mut current_batch, checkpoint_hash)
                                 .expect("Failed to write latest block hash");
@@ -484,7 +489,9 @@ impl Command {
                         written_hashes.retain(|&k, _| k > checkpoint_block);
 
                         // Prepare new batch for next interval
-                        current_batch = db.prepare_write_batch().expect("Failed to prepare new batch");
+                        current_batch = db
+                            .prepare_write_batch()
+                            .expect("Failed to prepare new batch");
                     }
                 }
 
@@ -517,12 +524,14 @@ impl Command {
                     db.write_latest_block_hash(&mut current_batch, end_block_hash)
                         .expect("Failed to write final latest block hash");
                 }
-                db.commit(current_batch).expect("Failed to commit final batch");
+                db.commit(current_batch)
+                    .expect("Failed to commit final batch");
                 db.flush().expect("Failed to flush database");
                 info!(target: "archive_init", "Final checkpoint written at block {}", end_block);
             } else {
                 // Commit remaining blocks even if not at end_block
-                db.commit(current_batch).expect("Failed to commit remaining batch");
+                db.commit(current_batch)
+                    .expect("Failed to commit remaining batch");
                 db.flush().expect("Failed to flush database");
             }
 
@@ -539,7 +548,11 @@ impl Command {
         let block_num = block_data.block_num;
 
         // Write block hash mapping
-        db.write_block_hash(batch, block_data.block_info.header.number, block_data.block_hash)?;
+        db.write_block_hash(
+            batch,
+            block_data.block_info.header.number,
+            block_data.block_hash,
+        )?;
 
         // Write block info
         db.write_block_info(batch, block_data.block_info.clone())?;
