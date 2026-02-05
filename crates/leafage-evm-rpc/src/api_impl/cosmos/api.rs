@@ -29,7 +29,7 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        create_mainnet_txn_env(block_env, request, db, chain_id)
+        create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)
     }
 
     fn transact<StateDB: DatabaseRef + Debug>(
