@@ -1026,10 +1026,11 @@ impl StateDBWrite for Arc<DataBase> {
                 Error::UnSupported("BlockNumToBlockHash cursor not found".to_string())
             })?;
 
-        // Use APPEND mode since block_num is strictly increasing during archive init.
-        // This skips B-tree search and directly appends to the end, significantly improving performance.
+        // Use UPSERT mode for safety. APPEND would be faster but fails if:
+        // 1. Resuming from existing database (block_num <= max existing)
+        // 2. Any out-of-order writes occur
         cursor
-            .put(&block_num_bytes, &block_hash_bytes, WriteFlags::APPEND)
+            .put(&block_num_bytes, &block_hash_bytes, WriteFlags::UPSERT)
             .map_err(|e| Error::UnSupported(format!("Failed to write block hash: {}", e)))?;
         Ok(())
     }
