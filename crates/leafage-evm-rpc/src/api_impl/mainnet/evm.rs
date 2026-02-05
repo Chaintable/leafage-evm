@@ -137,7 +137,7 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         .tx_gas_limit_cap
         .map_or_else(|| block_env.gas_limit, |cap| cap.min(block_env.gas_limit));
 
-    let gas_limit = gas.unwrap_or(max_gas_limit);
+    let gas_limit = gas.map_or(max_gas_limit, |g| g.min(max_gas_limit));
 
     let caller = from.unwrap_or_default();
 
