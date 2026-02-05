@@ -89,7 +89,7 @@ pub struct Command {
 
     /// Storage type (rocksdb or mdbx)
     #[arg(long, default_value = "rocksdb")]
-    storage_kind: StorageKind,
+    db_type: StorageKind,
 
     /// Database cache size in MB (RocksDB only)
     #[arg(long, default_value = "2048")]
@@ -294,8 +294,8 @@ impl ArchiveStorage {
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
         info!(target: "archive_init", "Starting archive initialization");
-        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, storage_kind: {:?}",
-              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.storage_kind);
+        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, db_type: {:?}",
+              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type);
 
         // Validate checkpoint_interval
         if self.checkpoint_interval == 0 {
@@ -309,8 +309,8 @@ impl Command {
         // Initialize RPC client
         let rpc_client = HttpClientBuilder::default().build(&self.rpc_addr)?;
 
-        // Open archive database based on storage kind
-        let db = Arc::new(match self.storage_kind {
+        // Open archive database based on db type
+        let db = Arc::new(match self.db_type {
             StorageKind::Rocksdb => {
                 info!(target: "archive_init", "Opening RocksDB archive database with cache_size: {}MB", self.db_cache);
                 ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open(
@@ -439,7 +439,7 @@ impl Command {
             final_success, total_time, avg_speed);
 
         // RocksDB-specific: compaction phase
-        if matches!(self.storage_kind, StorageKind::Rocksdb) {
+        if matches!(self.db_type, StorageKind::Rocksdb) {
             // Close database to ensure all writes are persisted before compaction
             info!(target: "archive_init", "Closing database before compaction...");
             Arc::try_unwrap(db).expect("Database Arc has other references, cannot close safely");
