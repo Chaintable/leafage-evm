@@ -138,8 +138,24 @@ impl Debug for StateDB {
 unsafe impl Send for StateDB {}
 unsafe impl Sync for StateDB {}
 
+/// Write batch with deferred sorting for optimized sequential writes.
+///
+/// Performance optimizations:
+/// - Caches Account and Storage writes, sorts them at commit time
+/// - Sorted writes improve cursor locality and reduce B-tree traversal
+/// - Other tables (block_hash, block_info, code) are written immediately
+///
+/// This design makes sorting transparent to callers - they can write data
+/// in any order, and the batch will sort it before committing.
 pub struct MDBXWriteBatch {
     txn: Transaction<RW>,
+    /// Cached cursors for tables that use immediate writes.
+    cursors: HashMap<&'static str, Cursor<RW>>,
+    /// Cached account writes: (encoded_key, encoded_value)
+    /// Value is None for account deletion (empty bytes will be written)
+    account_cache: Vec<([u8; 64], Option<Vec<u8>>)>,
+    /// Cached storage writes: (encoded_key, value_bytes)
+    storage_cache: Vec<([u8; 96], [u8; 32])>,
 }
 
 // ===== DataBase Implementation =====
@@ -248,6 +264,15 @@ impl DataBase {
             env,
             dbis: Arc::new(dbis),
         }
+    }
+
+    /// Manually sync/flush data to disk.
+    /// This is important when using `UtterlyNoSync` mode to ensure data durability.
+    /// Returns `true` if sync was needed, `false` if already synced.
+    pub fn sync(&self, force: bool) -> Result<bool, Error> {
+        self.env
+            .sync(force)
+            .map_err(|e| Error::UnSupported(format!("Failed to sync MDBX: {}", e)))
     }
 
     /// Read block hash by block number
@@ -916,7 +941,31 @@ impl StateDBWrite for Arc<DataBase> {
             .env
             .begin_rw_txn()
             .map_err(|e| Error::UnSupported(format!("Failed to begin write transaction: {}", e)))?;
-        Ok(MDBXWriteBatch { txn })
+
+        // Pre-create cursors only for tables that use immediate writes.
+        // AddressToAccount and AddressToStorage use deferred writes (cached and sorted at commit).
+        let mut cursors = HashMap::new();
+        for table in [
+            StorageTable::LatestBlockHash,
+            StorageTable::BlockHashToBlockInfo,
+            StorageTable::BlockNumToBlockHash,
+            StorageTable::HashToCode,
+        ] {
+            let db = txn
+                .open_db(Some(table.to_str()))
+                .map_err(|e| Error::UnSupported(format!("Failed to open db {}: {}", table, e)))?;
+            let cursor = txn.cursor(&db).map_err(|e| {
+                Error::UnSupported(format!("Failed to create cursor for {}: {}", table, e))
+            })?;
+            cursors.insert(table.to_str(), cursor);
+        }
+
+        Ok(MDBXWriteBatch {
+            txn,
+            cursors,
+            account_cache: Vec::new(),
+            storage_cache: Vec::new(),
+        })
     }
 
     fn write_latest_block_hash(
@@ -924,18 +973,16 @@ impl StateDBWrite for Arc<DataBase> {
         batch: &mut Self::DBWriteBatch,
         block_hash: H256,
     ) -> Result<(), Error> {
-        let dbi = self
-            .dbis
-            .get(StorageTable::LatestBlockHash.to_str())
-            .ok_or_else(|| Error::UnSupported("LatestBlockHash table not found".to_string()))?;
+        let cursor = batch
+            .cursors
+            .get_mut(StorageTable::LatestBlockHash.to_str())
+            .ok_or_else(|| Error::UnSupported("LatestBlockHash cursor not found".to_string()))?;
 
-        batch
-            .txn
+        cursor
             .put(
-                *dbi,
                 LATEST_BLOCK_HASH_KEY,
                 block_hash.as_slice(),
-                WriteFlags::empty(),
+                WriteFlags::UPSERT,
             )
             .map_err(|e| Error::UnSupported(format!("Failed to write latest block hash: {}", e)))?;
         Ok(())
@@ -946,25 +993,19 @@ impl StateDBWrite for Arc<DataBase> {
         batch: &mut Self::DBWriteBatch,
         block_info: Block<H256>,
     ) -> Result<(), Error> {
-        let dbi = self
-            .dbis
-            .get(StorageTable::BlockHashToBlockInfo.to_str())
-            .ok_or_else(|| {
-                Error::UnSupported("BlockHashToBlockInfo table not found".to_string())
-            })?;
-
         let block_info_bytes = to_vec(&block_info)
             .map_err(|e| Error::UnSupported(format!("Failed to serialize block info: {}", e)))?;
         let block_hash = block_info.header.hash;
 
-        batch
-            .txn
-            .put(
-                *dbi,
-                block_hash.as_slice(),
-                &block_info_bytes,
-                WriteFlags::empty(),
-            )
+        let cursor = batch
+            .cursors
+            .get_mut(StorageTable::BlockHashToBlockInfo.to_str())
+            .ok_or_else(|| {
+                Error::UnSupported("BlockHashToBlockInfo cursor not found".to_string())
+            })?;
+
+        cursor
+            .put(block_hash.as_slice(), &block_info_bytes, WriteFlags::UPSERT)
             .map_err(|e| Error::UnSupported(format!("Failed to write block info: {}", e)))?;
         Ok(())
     }
@@ -975,22 +1016,20 @@ impl StateDBWrite for Arc<DataBase> {
         block_num: u64,
         block_hash: H256,
     ) -> Result<(), Error> {
-        let dbi = self
-            .dbis
-            .get(StorageTable::BlockNumToBlockHash.to_str())
-            .ok_or_else(|| Error::UnSupported("BlockNumToBlockHash table not found".to_string()))?;
-
         let block_hash_bytes: [u8; 32] = block_hash.into();
         let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
 
-        batch
-            .txn
-            .put(
-                *dbi,
-                &block_num_bytes,
-                &block_hash_bytes,
-                WriteFlags::empty(),
-            )
+        let cursor = batch
+            .cursors
+            .get_mut(StorageTable::BlockNumToBlockHash.to_str())
+            .ok_or_else(|| {
+                Error::UnSupported("BlockNumToBlockHash cursor not found".to_string())
+            })?;
+
+        // Use APPEND mode since block_num is strictly increasing during archive init.
+        // This skips B-tree search and directly appends to the end, significantly improving performance.
+        cursor
+            .put(&block_num_bytes, &block_hash_bytes, WriteFlags::APPEND)
             .map_err(|e| Error::UnSupported(format!("Failed to write block hash: {}", e)))?;
         Ok(())
     }
@@ -1002,31 +1041,18 @@ impl StateDBWrite for Arc<DataBase> {
         block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
-        let dbi = self
-            .dbis
-            .get(StorageTable::AddressToAccount.to_str())
-            .ok_or_else(|| Error::UnSupported("AddressToAccount table not found".to_string()))?;
-
         // Key format: address(32) || block_num(32)
         let key = encode_account_key(address, block_num);
 
-        if let Some(raw_account) = raw_account {
-            let slim_account: SlimAccount = raw_account.into();
-            let mut raw_account_bytes = Vec::new();
-            slim_account.encode(&mut raw_account_bytes);
-            batch
-                .txn
-                .put(*dbi, &key, &raw_account_bytes, WriteFlags::empty())
-                .map_err(|e| Error::UnSupported(format!("Failed to write account: {}", e)))?;
-        } else {
-            // Write empty value to mark deletion
-            batch
-                .txn
-                .put(*dbi, &key, &[], WriteFlags::empty())
-                .map_err(|e| {
-                    Error::UnSupported(format!("Failed to write account deletion: {}", e))
-                })?;
-        }
+        // Encode value and cache for deferred sorted write
+        let value = raw_account.map(|acc| {
+            let slim_account: SlimAccount = acc.into();
+            let mut bytes = Vec::new();
+            slim_account.encode(&mut bytes);
+            bytes
+        });
+
+        batch.account_cache.push((key, value));
         Ok(())
     }
 
@@ -1036,14 +1062,13 @@ impl StateDBWrite for Arc<DataBase> {
         code_hash: H256,
         code: Bytes,
     ) -> Result<(), Error> {
-        let dbi = self
-            .dbis
-            .get(StorageTable::HashToCode.to_str())
-            .ok_or_else(|| Error::UnSupported("HashToCode table not found".to_string()))?;
+        let cursor = batch
+            .cursors
+            .get_mut(StorageTable::HashToCode.to_str())
+            .ok_or_else(|| Error::UnSupported("HashToCode cursor not found".to_string()))?;
 
-        batch
-            .txn
-            .put(*dbi, code_hash.as_slice(), &code, WriteFlags::empty())
+        cursor
+            .put(code_hash.as_slice(), &code, WriteFlags::UPSERT)
             .map_err(|e| Error::UnSupported(format!("Failed to write code: {}", e)))?;
         Ok(())
     }
@@ -1056,23 +1081,64 @@ impl StateDBWrite for Arc<DataBase> {
         block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
-        let dbi = self
-            .dbis
-            .get(StorageTable::AddressToStorage.to_str())
-            .ok_or_else(|| Error::UnSupported("AddressToStorage table not found".to_string()))?;
-
         // Key format: address(32) || storage_key(32) || block_num(32)
         let storage_key = encode_storage_key(address, key, block_num);
         let value_bytes: [u8; 32] = value.to_be_bytes();
 
-        batch
-            .txn
-            .put(*dbi, &storage_key, &value_bytes, WriteFlags::empty())
-            .map_err(|e| Error::UnSupported(format!("Failed to write storage: {}", e)))?;
+        // Cache for deferred sorted write
+        batch.storage_cache.push((storage_key, value_bytes));
         Ok(())
     }
 
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
+    fn commit(&self, mut batch: Self::DBWriteBatch) -> Result<(), Error> {
+        // 1. Sort and write cached account data
+        if !batch.account_cache.is_empty() {
+            // Sort by key (address || block_num) for optimal cursor traversal
+            batch.account_cache.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+            // Create cursor and write sorted data
+            let db = batch
+                .txn
+                .open_db(Some(StorageTable::AddressToAccount.to_str()))
+                .map_err(|e| {
+                    Error::UnSupported(format!("Failed to open AddressToAccount: {}", e))
+                })?;
+            let mut cursor = batch.txn.cursor(&db).map_err(|e| {
+                Error::UnSupported(format!("Failed to create AddressToAccount cursor: {}", e))
+            })?;
+
+            for (key, value_opt) in &batch.account_cache {
+                let value = value_opt.as_deref().unwrap_or(&[]);
+                cursor.put(key, value, WriteFlags::UPSERT).map_err(|e| {
+                    Error::UnSupported(format!("Failed to write account: {}", e))
+                })?;
+            }
+        }
+
+        // 2. Sort and write cached storage data
+        if !batch.storage_cache.is_empty() {
+            // Sort by key (address || storage_key || block_num) for optimal cursor traversal
+            batch.storage_cache.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+            // Create cursor and write sorted data
+            let db = batch
+                .txn
+                .open_db(Some(StorageTable::AddressToStorage.to_str()))
+                .map_err(|e| {
+                    Error::UnSupported(format!("Failed to open AddressToStorage: {}", e))
+                })?;
+            let mut cursor = batch.txn.cursor(&db).map_err(|e| {
+                Error::UnSupported(format!("Failed to create AddressToStorage cursor: {}", e))
+            })?;
+
+            for (key, value) in &batch.storage_cache {
+                cursor.put(key, value, WriteFlags::UPSERT).map_err(|e| {
+                    Error::UnSupported(format!("Failed to write storage: {}", e))
+                })?;
+            }
+        }
+
+        // 3. Commit the transaction
         batch
             .txn
             .commit()

@@ -10,6 +10,9 @@ pub use snapshot::DataBase as MDBXStorage;
 pub use snapshot::MDBXWriteBatch;
 pub use snapshot::StateDB as MDBXStateDB;
 
+// Re-export libmdbx types used in public API
+pub use libmdbx::SyncMode as MDBXSyncMode;
+
 // ===== Common Constants =====
 
 /// 1 KB in bytes

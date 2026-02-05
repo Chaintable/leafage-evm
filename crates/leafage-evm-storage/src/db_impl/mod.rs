@@ -9,7 +9,7 @@ mod error;
 pub use error::Error as StorageError;
 pub use mdbx_impl::{
     MDBXArchiveOptions, MDBXArchiveStateDB, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXStateDB,
-    MDBXStorage, MDBXWriteBatch,
+    MDBXStorage, MDBXSyncMode, MDBXWriteBatch,
 };
 pub use rocksdb;
 pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, RocksDBStorage};

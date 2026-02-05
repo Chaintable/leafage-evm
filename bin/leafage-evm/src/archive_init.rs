@@ -8,7 +8,7 @@ use futures::{stream, StreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
     rocksdb, ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
-    StateDBWrite, StorageKind,
+    MDBXSyncMode, StateDBWrite, StorageKind,
 };
 use leafage_evm_types::{Block, BlockStorageDiff, H256};
 use std::collections::BTreeMap;
@@ -27,6 +27,34 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Delay for RocksDB to settle after closing (background threads to terminate)
 const ROCKSDB_SETTLE_DELAY: Duration = Duration::from_secs(10);
+
+/// MDBX sync mode for durability vs performance trade-off (MDBX only)
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum MdbxSyncMode {
+    /// Default robust and durable sync mode. Safest but slowest.
+    Durable,
+    /// Don't sync the meta-page after commit. ~2x write performance.
+    /// Database integrity preserved, but system crash may undo last committed transaction.
+    NoMetaSync,
+    /// Asynchronous mmap-flushes. ~10x write performance.
+    /// Keeps previous steady commits, safer than UtterlyNoSync.
+    SafeNoSync,
+    /// No sync at all. Maximum write performance but least safe.
+    /// Use only when data can be re-fetched (e.g., archive init from S3).
+    #[default]
+    UtterlyNoSync,
+}
+
+impl From<MdbxSyncMode> for MDBXSyncMode {
+    fn from(mode: MdbxSyncMode) -> Self {
+        match mode {
+            MdbxSyncMode::Durable => MDBXSyncMode::Durable,
+            MdbxSyncMode::NoMetaSync => MDBXSyncMode::NoMetaSync,
+            MdbxSyncMode::SafeNoSync => MDBXSyncMode::SafeNoSync,
+            MdbxSyncMode::UtterlyNoSync => MDBXSyncMode::UtterlyNoSync,
+        }
+    }
+}
 
 /// `leafage-evm archive-init` command
 #[derive(Debug, Parser)]
@@ -74,6 +102,14 @@ pub struct Command {
     /// MDBX maximum database size in GB (MDBX only)
     #[arg(long, default_value = "1024")]
     mdbx_max_size_gb: usize,
+
+    /// MDBX sync mode for durability vs performance trade-off (MDBX only).
+    /// - durable: Safest, slowest
+    /// - no-meta-sync: ~2x faster, system crash may lose last txn
+    /// - safe-no-sync: ~10x faster, async flush
+    /// - utterly-no-sync: Fastest, no sync (default for archive-init)
+    #[arg(long, value_enum, default_value = "utterly-no-sync")]
+    mdbx_sync_mode: MdbxSyncMode,
 
     /// Max concurrent tasks for fetching and writing
     #[arg(long, default_value = "256")]
@@ -240,11 +276,17 @@ impl ArchiveStorage {
         }
     }
 
-    /// Flush database (RocksDB only, no-op for MDBX)
+    /// Flush database to disk.
+    /// For RocksDB: uses WAL flush.
+    /// For MDBX: uses env.sync(force=true) to ensure durability, especially important
+    /// when using UtterlyNoSync mode.
     fn flush(&self) -> Result<(), anyhow::Error> {
         match self {
             ArchiveStorage::RocksDB(db) => Ok(db.flush()?),
-            ArchiveStorage::MDBX(_) => Ok(()), // MDBX doesn't need flush
+            ArchiveStorage::MDBX(db) => {
+                db.sync(true)?;
+                Ok(())
+            }
         }
     }
 }
@@ -254,6 +296,11 @@ impl Command {
         info!(target: "archive_init", "Starting archive initialization");
         info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, storage_kind: {:?}",
               self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.storage_kind);
+
+        // Validate checkpoint_interval
+        if self.checkpoint_interval == 0 {
+            anyhow::bail!("checkpoint_interval must be greater than 0");
+        }
 
         // Initialize S3 client
         let s3_config = aws_config::load_from_env().await;
@@ -285,10 +332,11 @@ impl Command {
                 let options = MDBXArchiveOptions {
                     initial_size: self.mdbx_initial_size_gb * GB,
                     max_size: self.mdbx_max_size_gb * GB,
+                    sync_mode: self.mdbx_sync_mode.into(),
                     ..Default::default()
                 };
-                info!(target: "archive_init", "Opening MDBX archive database with initial_size: {}GB, max_size: {}GB",
-                      self.mdbx_initial_size_gb, self.mdbx_max_size_gb);
+                info!(target: "archive_init", "Opening MDBX archive database with initial_size: {}GB, max_size: {}GB, sync_mode: {:?}",
+                      self.mdbx_initial_size_gb, self.mdbx_max_size_gb, self.mdbx_sync_mode);
                 ArchiveStorage::MDBX(Arc::new(MDBXArchiveStorage::open_with_options(
                     &self.db_path,
                     options,
@@ -409,7 +457,12 @@ impl Command {
         Ok(())
     }
 
-    /// Spawn checkpoint worker that handles block writing, max_contiguous tracking, checkpoint commits, and progress logging
+    /// Spawn checkpoint worker that handles block writing, max_contiguous tracking, checkpoint commits, and progress logging.
+    ///
+    /// Performance optimizations:
+    /// 1. Uses cursor-based writes instead of direct transaction puts
+    /// 2. MDBX batch automatically sorts account/storage writes at commit time
+    /// 3. Uses APPEND mode for strictly increasing keys (block_num)
     fn spawn_checkpoint_worker(
         mut rx: mpsc::UnboundedReceiver<BlockData>,
         db: Arc<ArchiveStorage>,
@@ -454,7 +507,7 @@ impl Command {
                 // Write all consecutive blocks we have
                 let mut next_to_write = write_start;
                 while let Some(block) = pending_blocks.remove(&next_to_write) {
-                    // Write block to current batch
+                    // Write block data to batch (MDBX will sort at commit time)
                     Self::write_block_to_batch(&db, &mut current_batch, &block)
                         .expect("Failed to write block to batch");
 
@@ -476,9 +529,8 @@ impl Command {
                                 .expect("Failed to write latest block hash");
                         }
 
-                        // Commit the batch
+                        // Commit the batch (MDBX will sort account/storage writes here)
                         db.commit(current_batch).expect("Failed to commit batch");
-                        db.flush().expect("Failed to flush database");
 
                         last_checkpoint_num = current_checkpoint_num;
                         info!(target: "archive_init",
@@ -518,6 +570,7 @@ impl Command {
 
             // Write final checkpoint - commit any remaining blocks in batch
             let final_contiguous = max_contiguous.unwrap_or(start_block.saturating_sub(1));
+
             if final_contiguous >= end_block {
                 // Use the end_block hash for final checkpoint
                 if let Some(&end_block_hash) = written_hashes.get(&end_block) {
@@ -526,20 +579,20 @@ impl Command {
                 }
                 db.commit(current_batch)
                     .expect("Failed to commit final batch");
-                db.flush().expect("Failed to flush database");
                 info!(target: "archive_init", "Final checkpoint written at block {}", end_block);
             } else {
                 // Commit remaining blocks even if not at end_block
                 db.commit(current_batch)
                     .expect("Failed to commit remaining batch");
-                db.flush().expect("Failed to flush database");
             }
+            db.flush().expect("Failed to flush database");
 
             (count, final_contiguous)
         })
     }
 
-    /// Write a single block to the provided batch (without committing)
+    /// Write a single block to the provided batch (without committing).
+    /// For MDBX, account and storage writes are cached and sorted at commit time.
     fn write_block_to_batch(
         db: &Arc<ArchiveStorage>,
         batch: &mut ArchiveWriteBatch,
@@ -569,13 +622,13 @@ impl Command {
 
         // Write storage diffs
         for account_diff in &block_data.block_diff.storage_diffs {
-            for index_value_pair in &account_diff.diffs {
+            for pair in &account_diff.diffs {
                 db.write_storage(
                     batch,
                     account_diff.address,
-                    index_value_pair.index,
+                    pair.index,
                     block_num,
-                    index_value_pair.value,
+                    pair.value,
                 )?;
             }
         }
