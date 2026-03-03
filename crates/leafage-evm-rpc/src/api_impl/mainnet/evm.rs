@@ -133,9 +133,9 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
     )
     .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
 
-    let max_gas_limit = cfg_env
-        .tx_gas_limit_cap
-        .map_or_else(|| block_env.gas_limit, |cap| cap.min(block_env.gas_limit));
+    let max_gas_limit = cfg_env.tx_gas_limit_cap
+        .filter(|&cap| cap != 0)
+        .unwrap_or(block_env.gas_limit);
 
     let gas_limit = gas.map_or(max_gas_limit, |g| g.min(max_gas_limit));
 
