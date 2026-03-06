@@ -36,6 +36,7 @@ http-body.workspace = true
 http.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+anyhow.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true

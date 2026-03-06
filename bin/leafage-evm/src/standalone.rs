@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
-use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv};
+use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv, TokenCollector};
 use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
@@ -266,6 +266,14 @@ pub struct Command {
     /// This adds a safety margin to gas estimates to reduce the risk of out-of-gas errors.
     #[arg(long, default_value = "100")]
     estimate_gas_buffer: u64,
+
+    /// Path to the local JSON file for auto-collecting ERC20 token addresses.
+    /// Default: "" (disabled)
+    ///
+    /// When set, ERC20 contract addresses observed in eth_call / contractMultiCall
+    /// will be automatically saved to this file for future warmup use.
+    #[arg(long, default_value = "")]
+    token_collector_path: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -527,6 +535,23 @@ impl Command {
             rpc_builder = rpc_builder.with_interceptor_cfg(self.interceptor_config.clone());
         }
 
+        // Initialize token collector if path is configured (before warmup so it can be used)
+        let token_collector = if !self.token_collector_path.is_empty() {
+            let collector_path = PathBuf::from(&self.token_collector_path);
+            if let Some(parent) = collector_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let collector = TokenCollector::new(collector_path).await?;
+            info!(
+                target: "updater",
+                "token collector enabled, saving to {}",
+                self.token_collector_path
+            );
+            Some(collector)
+        } else {
+            None
+        };
+
         if !self.readiness_addr.is_empty() {
             let warmup = Warmup::new(
                 self.rpc_addr.clone(),
@@ -535,9 +560,14 @@ impl Command {
                 self.warmup_blocks,
                 self.warmup_tokens,
                 self.init_task_queue_size,
+                token_collector.clone(),
             )
             .await?;
             rpc_builder = warmup.with_warmup_data(rpc_builder).await;
+        }
+
+        if let Some(collector) = token_collector {
+            rpc_builder = rpc_builder.with_token_collector(collector);
         }
 
         let rpc_handle = rpc_builder

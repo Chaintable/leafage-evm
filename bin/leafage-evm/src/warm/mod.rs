@@ -1,8 +1,8 @@
-use crate::utils::{s3_get_block_transactions_by_number, s3_get_tokens, KafkaS3Config};
+use crate::utils::{s3_get_block_transactions_by_number, KafkaS3Config};
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_rpc::ApiBuilder;
+use leafage_evm_rpc::{ApiBuilder, TokenCollector};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{Address, DebankTransaction};
 use tokio::task::JoinSet;
@@ -16,6 +16,7 @@ pub struct Warmup<Tree> {
     warmup_blocks: usize,
     warmup_tokens: usize,
     init_task_queue_size: usize,
+    token_collector: Option<TokenCollector>,
 }
 
 impl<Tree> Warmup<Tree>
@@ -33,6 +34,7 @@ where
         warmup_blocks: usize,
         warmup_tokens: usize,
         init_task_queue_size: usize,
+        token_collector: Option<TokenCollector>,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -49,6 +51,7 @@ where
             warmup_blocks,
             warmup_tokens,
             init_task_queue_size,
+            token_collector,
         })
     }
 
@@ -95,18 +98,6 @@ where
         Ok(res)
     }
 
-    async fn fetch_tokens(&self) -> Result<(Address, Vec<Address>)> {
-        let mut tokens = s3_get_tokens(
-            &self.s3_client,
-            &self.kafka_s3_cfg.bucket_name,
-            &self.kafka_s3_cfg.s3_chain_id,
-        )
-        .await?;
-        tokens.1 = tokens.1.into_iter().take(self.warmup_tokens).collect();
-        info!(target: "updater", "Fetch {} warmup tokens", tokens.1.len());
-        Ok(tokens)
-    }
-
     pub async fn with_warmup_data<DB>(&self, mut builder: ApiBuilder<DB>) -> ApiBuilder<DB>
     where
         DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
@@ -122,14 +113,17 @@ where
             builder = builder.with_replay_blocks(blocks);
         }
         if self.warmup_tokens > 0 {
-            let tokens = match self.fetch_tokens().await {
-                Ok(tokens) => tokens,
-                Err(err) => {
-                    error!(target:"updater", "failed to fetch tokens: {}", err);
-                    return builder;
-                }
-            };
-            builder = builder.with_warmup_erc20_addresses(tokens.0, tokens.1);
+            let owner = Address::random();
+            let mut tokens = Vec::new();
+            // Merge locally collected token addresses from TokenCollector
+            if let Some(ref collector) = self.token_collector {
+                tokens = collector.get_all().await;
+                info!(
+                    target: "updater", "fetch local collected tokens, total unique warmup tokens: {}", tokens.len()
+                );
+            }
+
+            builder = builder.with_warmup_erc20_addresses(owner, tokens);
         }
         builder
     }

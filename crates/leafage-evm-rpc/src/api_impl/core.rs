@@ -1,3 +1,4 @@
+use crate::api_impl::token_collector::TokenCollector;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
@@ -37,6 +38,8 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn historical_client(&self) -> Option<&HttpClient>;
 
     fn historical_height(&self) -> Option<u64>;
+
+    fn token_collector(&self) -> Option<&TokenCollector>;
 }
 
 pub(crate) trait EvmExecutor: Sync + Send + 'static {
