@@ -117,7 +117,7 @@ where
             let mut tokens = Vec::new();
             // Merge locally collected token addresses from TokenCollector
             if let Some(ref collector) = self.token_collector {
-                tokens = collector.get_all().await;
+                tokens = collector.get_all().await.into_iter().take(self.warmup_tokens).collect();
                 info!(
                     target: "updater", "fetch local collected tokens, total unique warmup tokens: {}", tokens.len()
                 );
