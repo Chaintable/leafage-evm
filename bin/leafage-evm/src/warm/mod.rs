@@ -115,7 +115,6 @@ where
         if self.warmup_tokens > 0 {
             let owner = Address::random();
             let mut tokens = Vec::new();
-            // Merge locally collected token addresses from TokenCollector
             if let Some(ref collector) = self.token_collector {
                 tokens = collector.get_all().await.into_iter().take(self.warmup_tokens).collect();
                 info!(

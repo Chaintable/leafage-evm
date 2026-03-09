@@ -30,7 +30,6 @@ struct TokenCollectorInner {
     current_size: AtomicUsize,
 }
 
-
 impl TokenCollector {
     pub async fn new(file_path: PathBuf) -> anyhow::Result<Self> {
         let mut initial = HashSet::new();
@@ -132,6 +131,7 @@ impl TokenCollector {
             addresses.sort();
             addresses
         };
+        let addr_count = addrs.len();
 
         let json = tokio::task::spawn_blocking(move || {
             serde_json::to_string(&TokenAddressFile { tokens: addrs })
@@ -140,7 +140,7 @@ impl TokenCollector {
         .context("spawn_blocking failed")?
         .context("failed to serialize token file")?;
 
-        let tmp_path = inner.file_path.with_extension("json.tmp");
+        let tmp_path = inner.file_path.with_extension("tmp");
 
         tokio::fs::write(&tmp_path, &json)
             .await
@@ -150,7 +150,7 @@ impl TokenCollector {
             .await
             .context("failed to rename token file")?;
 
-        info!(target: "token_collector", "flushed token addresses to {}", inner.file_path.display());
+        info!(target: "token_collector", "flushed {} token addresses to {:?}", addr_count, inner.file_path);
         Ok(())
     }
 
