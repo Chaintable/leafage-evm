@@ -113,7 +113,8 @@ unsafe impl Sync for DataBase {}
 pub struct StateDB {
     db: Arc<DataBase>,
     block_num: u64,
-    block_header: Header,
+    /// `None` when the database is empty (no blocks committed yet).
+    block_header: Option<Header>,
 }
 
 impl Clone for StateDB {
@@ -647,7 +648,7 @@ impl StateDBProvider for Arc<DataBase> {
 
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;
-        let block_header: Header;
+        let block_header: Option<Header>;
 
         match block_id {
             BlockId::Hash(hash) => {
@@ -655,8 +656,8 @@ impl StateDBProvider for Arc<DataBase> {
                 if header.is_none() {
                     return Ok(None);
                 }
-                block_header = header.unwrap().header;
-                block_num = block_header.number;
+                block_header = Some(header.unwrap().header);
+                block_num = block_header.as_ref().unwrap().number;
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
@@ -672,10 +673,13 @@ impl StateDBProvider for Arc<DataBase> {
                             if header.is_none() {
                                 return Ok(None);
                             }
-                            block_header = header.unwrap().header;
+                            block_header = Some(header.unwrap().header);
                         }
                         None => {
-                            return Ok(None);
+                            // Empty database: return a StateDB with no cached
+                            // header so initialize_check can write the genesis block.
+                            block_num = 0;
+                            block_header = None;
                         }
                     }
                 }
@@ -689,7 +693,7 @@ impl StateDBProvider for Arc<DataBase> {
                     if header.is_none() {
                         return Ok(None);
                     }
-                    block_header = header.unwrap().header;
+                    block_header = Some(header.unwrap().header);
                 }
                 _ => return Err(Error::UnsupportedBlockId(block_id)),
             },
@@ -707,22 +711,29 @@ impl StateDBProvider for Arc<DataBase> {
 
 impl StateDBRead for StateDB {
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        Ok(self.block_header.hash)
+        match &self.block_header {
+            Some(h) => Ok(h.hash),
+            None => self.db.read_latest_block_hash(),
+        }
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
-        if block_hash == self.block_header.hash {
-            return Ok(Some(Block {
-                header: self.block_header.clone(),
-                ..Default::default()
-            }));
+        if let Some(h) = &self.block_header {
+            if block_hash == h.hash {
+                return Ok(Some(Block {
+                    header: h.clone(),
+                    ..Default::default()
+                }));
+            }
         }
         self.db.read_block_info(block_hash)
     }
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        if block_num == self.block_num {
-            return Ok(self.block_header.hash);
+        if let Some(h) = &self.block_header {
+            if block_num == self.block_num {
+                return Ok(h.hash);
+            }
         }
         self.db.read_block_hash(block_num)
     }
