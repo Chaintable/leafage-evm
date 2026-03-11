@@ -534,25 +534,19 @@ impl Command {
         {
             rpc_builder = rpc_builder.with_interceptor_cfg(self.interceptor_config.clone());
         }
-
-        // Initialize token collector if path is configured (before warmup so it can be used)
-        let token_collector = if !self.token_collector_path.is_empty() {
-            let collector_path = PathBuf::from(&self.token_collector_path);
-            if let Some(parent) = collector_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let collector = TokenCollector::new(collector_path).await?;
-            info!(
-                target: "updater",
-                "token collector enabled, saving to {}",
-                self.token_collector_path
-            );
-            Some(collector)
-        } else {
-            None
-        };
-
         if !self.readiness_addr.is_empty() {
+            // Initialize token collector if path is configured (before warmup so it can be used)
+            let token_collector_path =   if !self.token_collector_path.is_empty(){
+                let collector_path = PathBuf::from(&self.token_collector_path);
+                if let Some(parent) = collector_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                collector_path
+            }else{
+                self.db_path.join("tokens.json")
+            };
+            info!(target: "updater", "token collector enabled, saving to {:?}", token_collector_path);
+            let token_collector = TokenCollector::new(token_collector_path).await?;
             let warmup = Warmup::new(
                 self.rpc_addr.clone(),
                 self.kafka_s3_config.clone().unwrap_or_default(),
@@ -564,11 +558,9 @@ impl Command {
             )
             .await?;
             rpc_builder = warmup.with_warmup_data(rpc_builder).await;
+            rpc_builder = rpc_builder.with_token_collector(token_collector);
         }
 
-        if let Some(collector) = token_collector {
-            rpc_builder = rpc_builder.with_token_collector(collector);
-        }
 
         let rpc_handle = rpc_builder
             .build_and_run(

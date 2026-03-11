@@ -16,7 +16,7 @@ pub struct Warmup<Tree> {
     warmup_blocks: usize,
     warmup_tokens: usize,
     init_task_queue_size: usize,
-    token_collector: Option<TokenCollector>,
+    token_collector: TokenCollector,
 }
 
 impl<Tree> Warmup<Tree>
@@ -34,7 +34,7 @@ where
         warmup_blocks: usize,
         warmup_tokens: usize,
         init_task_queue_size: usize,
-        token_collector: Option<TokenCollector>,
+        token_collector: TokenCollector,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -114,14 +114,16 @@ where
         }
         if self.warmup_tokens > 0 {
             let owner = Address::random();
-            let mut tokens = Vec::new();
-            if let Some(ref collector) = self.token_collector {
-                tokens = collector.get_all().await.into_iter().take(self.warmup_tokens).collect();
-                info!(
-                    target: "updater", "fetch local collected tokens, total unique warmup tokens: {}", tokens.len()
-                );
-            }
-
+            let tokens:Vec<_> = self
+                .token_collector
+                .get_all()
+                .await
+                .into_iter()
+                .take(self.warmup_tokens)
+                .collect();
+            info!(
+                target: "updater", "fetch local collected tokens, total unique warmup tokens: {}", tokens.len()
+            );
             builder = builder.with_warmup_erc20_addresses(owner, tokens);
         }
         builder
