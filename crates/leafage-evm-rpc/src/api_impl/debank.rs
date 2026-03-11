@@ -427,6 +427,14 @@ where
         })?;
         let mut block_env = block_env_from_block(&block);
         let start = std::time::Instant::now();
+
+        // Collect ERC20 token address if token_collector is enabled
+        if let Some(collector) = self.inner.token_collector() {
+            let to = request.to.and_then(|txkind| txkind.to().copied());
+            let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
+            collector.maybe_collect_call(to, data);
+        }
+
         if let Some(txkind) = request.to {
             if let Some(address) = txkind.to() {
                 if *address

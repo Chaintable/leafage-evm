@@ -1,4 +1,5 @@
 use crate::api_impl::core::{ApiBase, EvmCfg, GetTransactionError, ToJsonRpcError};
+use crate::api_impl::token_collector::TokenCollector;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_types::{Address, DebankErrorCode};
@@ -13,6 +14,7 @@ pub struct ApiImpl<DB, SpecId, CustomCfg> {
     pub evm_cfg: EvmCfg<SpecId, CustomCfg>,
     pub historical_client: Option<HttpClient>,
     pub historical_height: Option<u64>,
+    pub token_collector: Option<TokenCollector>,
 }
 
 impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
@@ -27,6 +29,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
         normalize_state_key: bool,
         version: String,
         estimate_gas_buffer: u64,
+        token_collector: Option<TokenCollector>,
     ) -> Self {
         Self {
             db,
@@ -41,6 +44,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
             },
             historical_client,
             historical_height,
+            token_collector,
         }
     }
 }
@@ -69,6 +73,10 @@ where
 
     fn historical_height(&self) -> Option<u64> {
         self.historical_height
+    }
+
+    fn token_collector(&self) -> Option<&TokenCollector> {
+        self.token_collector.as_ref()
     }
 }
 

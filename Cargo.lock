@@ -4617,6 +4617,7 @@ dependencies = [
  "alloy-contract",
  "alloy-evm",
  "alloy-rlp",
+ "anyhow",
  "async-trait",
  "futures",
  "http 1.3.1",

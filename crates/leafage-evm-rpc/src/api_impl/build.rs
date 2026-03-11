@@ -1,6 +1,7 @@
 use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
+use super::token_collector::TokenCollector;
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
@@ -27,6 +28,7 @@ pub struct ApiBuilder<DB> {
     historical_height: Option<u64>,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
     warmup_erc20_addresses: Option<(Address, Vec<Address>)>,
+    token_collector: Option<TokenCollector>,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -44,6 +46,7 @@ where
             historical_height: None,
             replay_blocks: None,
             warmup_erc20_addresses: None,
+            token_collector: None,
         }
     }
 
@@ -82,6 +85,11 @@ where
 
     pub fn with_warmup_erc20_addresses(mut self, owner: Address, addresses: Vec<Address>) -> Self {
         self.warmup_erc20_addresses = Some((owner, addresses));
+        self
+    }
+
+    pub fn with_token_collector(mut self, collector: TokenCollector) -> Self {
+        self.token_collector = Some(collector);
         self
     }
 }
@@ -129,6 +137,7 @@ where
                     normalize_state_key,
                     version.clone(),
                     estimate_gas_buffer,
+                    self.token_collector.clone(),
                 );
                 let api = Api::new(api_impl);
                 warmup_api(

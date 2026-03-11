@@ -70,6 +70,13 @@ where
         state_override: Option<StateOverride>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<Bytes> {
+        // Collect ERC20 token address if token_collector is enabled
+        if let Some(collector) = self.inner.token_collector() {
+            let to = request.to.and_then(|txkind| txkind.to().copied());
+            let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
+            collector.maybe_collect_call(to, data);
+        }
+
         let state = self
             .inner
             .db()
@@ -296,7 +303,15 @@ where
         };
         // run in sequence
         let mut results: Vec<SingleCallResult> = vec![];
+        let token_collector = self.inner.token_collector();
         for request in requests {
+            // Collect ERC20 token address if token_collector is enabled
+            if let Some(collector) = token_collector {
+                let to = request.to.and_then(|txkind| txkind.to().copied());
+                let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
+                collector.maybe_collect_call(to, data);
+            }
+
             if cancellation_token.is_cancelled() {
                 return Err(internal_rpc_err(
                     "multicall cancelled by caller".to_string(),
