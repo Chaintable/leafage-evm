@@ -4,18 +4,64 @@ use crate::api_impl::core::{
 };
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
-use crate::error::rpc_error_with_code;
+use crate::error::{internal_rpc_err, rpc_error_with_code};
+use alloy::consensus::BlockHeader;
+use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, DebankErrorCode, MainnetSpecId};
+use leafage_evm_types::{CallRequest, DebankErrorCode, MainnetSpecId, H256};
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction};
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
 use revm::inspector::NoOpInspector;
+use revm::primitives::hardfork::SpecId;
 use revm::ExecuteEvm;
 use revm::InspectCommitEvm;
+use revm::SystemCallEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use std::fmt::Debug;
 
 type MainnetApiImpl<DB> = ApiImpl<DB, MainnetSpecId, NoneEvmCustomConfig>;
+
+impl<DB> MainnetApiImpl<DB>
+where
+    DB: Sync + Send + 'static,
+{
+    fn apply_blockhashes_contract_call<StateDB>(
+        &self,
+        parent_block_hash: H256,
+        block_env: &BlockEnv,
+        state: &mut StateDB,
+    ) -> RpcResult<()>
+    where
+        StateDB: DatabaseCommit + DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        if !self.evm_cfg.cfg.spec.is_enabled_in(SpecId::PRAGUE) {
+            return Ok(());
+        }
+
+        if block_env.number.is_zero() {
+            return Ok(());
+        }
+
+        let result = {
+            let mut evm = create_main_evm_from_state(
+                block_env.clone(),
+                self.evm_cfg.cfg.clone(),
+                &*state,
+                NoOpInspector {},
+            );
+
+            evm.system_call(HISTORY_STORAGE_ADDRESS, parent_block_hash.0.into())
+                .map_err(|e| {
+                    internal_rpc_err(format!("EIP-2935 blockhashes contract call failed: {e}"))
+                })?
+        };
+
+        state.commit(result.state);
+        Ok(())
+    }
+}
 
 impl<DB> EvmExecutor for MainnetApiImpl<DB>
 where
@@ -53,6 +99,19 @@ where
 
         let res = evm.transact(tx).map(|res| res.result.into());
         res
+    }
+
+    fn apply_pre_execution_changes<StateDB>(
+        &self,
+        header: impl BlockHeader,
+        block_env: &BlockEnv,
+        state: &mut StateDB,
+    ) -> RpcResult<()>
+    where
+        StateDB: DatabaseCommit + DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        self.apply_blockhashes_contract_call(header.parent_hash(), block_env, state)
     }
 
     fn inspect_tx_commit<

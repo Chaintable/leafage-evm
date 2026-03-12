@@ -1,4 +1,5 @@
 use crate::api_impl::token_collector::TokenCollector;
+use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
@@ -56,6 +57,21 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx>;
+
+    /// Apply pre-execution changes before transaction execution.
+    /// Calls EIP-2935 blockhashes and EIP-4788 beacon root system contracts.
+    fn apply_pre_execution_changes<StateDB>(
+        &self,
+        header: impl BlockHeader,
+        block_env: &BlockEnv,
+        state: &mut StateDB,
+    ) -> RpcResult<()>
+    where
+        StateDB: DatabaseCommit + DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        Ok(())
+    }
 
     fn transact<StateDB>(
         &self,

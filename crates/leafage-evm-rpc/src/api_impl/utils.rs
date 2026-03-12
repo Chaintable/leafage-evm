@@ -1,8 +1,8 @@
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
-    AccountOverride, BlockOverrides, Bytecode, DebankEvent, DebankID, DebankTrace, StateOverride,
-    H256, U256,
+    AccountOverride, BlockOverrides, Bytecode, DebankEvent, DebankID, DebankTrace, Header,
+    StateOverride, H256, U256,
 };
 use revm::context::BlockEnv;
 use revm::database::{CacheDB, DatabaseRef};
@@ -15,11 +15,32 @@ use std::collections::HashMap;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
+/// Applies the given block overrides to the [`CacheDB`] and [`BlockEnv`].
+///
+/// When `overrides.number` is greater than the current `env.number`, ensures that
+/// `block_hash[number - 1]` is set (defaults to `current_block_hash` if not provided),
+/// and returns `Some(hash)` as the parent block hash for EIP-2935 system call.
 pub fn apply_block_overrides<DB>(
-    overrides: BlockOverrides,
+    mut overrides: BlockOverrides,
     db: &mut CacheDB<DB>,
     env: &mut BlockEnv,
-) {
+    mut latest_header: Header,
+) -> Option<Header> {
+    let mut header = None;
+
+    if let Some(number) = overrides.number {
+        if number > env.number {
+            let number_u64: u64 = number.saturating_to();
+            let block_hashes = overrides.block_hash.get_or_insert_with(Default::default);
+            block_hashes
+                .entry(number_u64 - 1)
+                .or_insert(latest_header.parent_hash);
+            block_hashes.entry(number_u64).or_insert(latest_header.hash);
+            latest_header.number = number_u64;
+            header = Some(latest_header);
+        }
+    }
+
     let BlockOverrides {
         number,
         difficulty,
@@ -61,6 +82,8 @@ pub fn apply_block_overrides<DB>(
     if let Some(base_fee) = base_fee {
         env.basefee = base_fee.saturating_to();
     }
+
+    header
 }
 
 /// Applies the given state overrides (a set of [`AccountOverride`]) to the [`CacheDB`].

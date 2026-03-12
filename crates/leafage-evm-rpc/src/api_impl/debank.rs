@@ -458,7 +458,12 @@ where
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
         if let Some(overrides) = block_overrides.clone() {
-            super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
+            super::utils::apply_block_overrides(
+                overrides,
+                &mut db,
+                &mut block_env,
+                block.header.clone(),
+            );
         }
         if let Some(state_override) = state_override.clone() {
             super::utils::apply_state_overrides(state_override, &mut db)?;
@@ -594,8 +599,17 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        if let Some(overrides) = block_overrides.clone() {
-            super::utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
+        if let Some(overrides) = block_overrides {
+            let header = super::utils::apply_block_overrides(
+                overrides,
+                &mut memory_db,
+                &mut block_env,
+                block.header.clone(),
+            );
+            if let Some(header) = header {
+                self.inner
+                    .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
+            }
         }
         let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
@@ -644,8 +658,6 @@ where
             pre_res.events = events;
             if pre_res.code != 0 {
                 stats.success = false;
-            } else {
-                stats.success = true;
             }
             results.push(pre_res);
         }
@@ -672,7 +684,12 @@ where
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
         if let Some(overrides) = block_overrides.clone() {
-            utils::apply_block_overrides(overrides, &mut memory_db, &mut block_env);
+            utils::apply_block_overrides(
+                overrides,
+                &mut memory_db,
+                &mut block_env,
+                block.header.clone(),
+            );
         }
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
