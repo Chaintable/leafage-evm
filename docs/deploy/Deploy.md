@@ -39,7 +39,7 @@ Beacon chain client for consensus layer:
 
 Modified Geth client for execution layer:
 
-- **Image**: `gethx:amd64-v1.16.7-debank-4`
+- **Image**: `294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain-gethx:amd64-v1.16.7-debank-4`
 - **Resources**: 4 CPU / 24GB memory
 - **Port Mapping**: 8666 → 8545 (HTTP RPC)
 - **Sync Mode**: full sync + archive mode
@@ -49,7 +49,7 @@ Modified Geth client for execution layer:
 
 Lightweight EVM executor for state queries:
 
-- **Image**: `leafage-evm-x:amd64-chaintable-v102-debank-7`
+- **Image**: `294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/leafage-evm-x:amd64-chaintable-v102-debank-7`
 - **Port Mapping**: 8659 → 8659
 - **Features**:
   - Receives block state updates from geth
@@ -70,26 +70,59 @@ Lightweight EVM executor for state queries:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATA_DIR` | `/eth` | Root data storage directory |
+| `ETH_DATA_DIR` | `/eth` | Eth data storage directory |
+| `LEAFAGE_DATA_DIR` | `/nodex-eth` | Leafage data storage directory |
 
 ### Data Directory Structure
 
 ```
-${DATA_DIR}/
+${ETH_DATA_DIR}/
 ├── lighthouse/          # Beacon chain data
 ├── geth/               # Execution layer data
 │   └── jwtsecret       # JWT authentication key
 └── ...
+
+${LEAFAGE_DATA_DIR}/
+├── ....sst # rocksdb data file
+└── ...
+
 ```
 
-### JWT Secret
 
-Generate JWT secret before first startup:
+## Snapshot Download
+
+You can download pre-synced snapshots from S3 to speed up initial deployment.
+
+### Download via AWS CLI
 
 ```bash
-mkdir -p ${DATA_DIR}/geth
-openssl rand -hex 32 > ${DATA_DIR}/geth/jwtsecret
+# Install zstd for decompression
+apt-get install -y zstd
+
+# Geth snapshot (block 24646705, requires ~850GB free space)
+aws s3 cp s3://blockchain-snapshot-backup/eth/geth-24646705.tar.zstd .
+tar --use-compress-program=unzstd -xf geth-24646705.tar.zstd -C ${ETH_DATA_DIR}/
 ```
+
+Leafage snapshot has two modes, **choose one** based on your needs:
+
+**Option A**: State mode (requires ~150GB free space)
+
+```bash
+aws s3 cp s3://blockchain-snapshot-backup/eth/leafage-24647777.tar.zstd .
+tar --use-compress-program=unzstd -xf leafage-24647777.tar.zstd -C ${LEAFAGE_DATA_DIR}/
+```
+
+**Option B**: Archive mode (requires ~450GB free space, requires `--archive` flag)
+
+```bash
+aws s3 cp s3://blockchain-snapshot-backup/eth/leafage-archive-24646705.tar.zstd .
+tar --use-compress-program=unzstd -xf leafage-archive-24646705.tar.zstd -C ${LEAFAGE_DATA_DIR}/
+```
+
+> **About Geth snapshot**: The provided geth snapshot is ancient-pruned. You can also use a regular full sync geth snapshot from other sources (e.g., publicnode), as long as the geth snapshot block height is **lower than or equal to** the leafage snapshot block height. Leafage syncs state from geth on startup — if geth is ahead, leafage will miss intermediate blocks and fail to sync correctly.
+>
+> **Note**: Archive mode requires adding the `--archive` flag to the leafage-evm startup parameters. See [leafage-evm Configuration Parameters](#leafage-evm-configuration-parameters) for details.
 
 ## Deployment Steps
 
@@ -173,8 +206,8 @@ Main startup parameters for leafage-evm-x-eth:
 | `--db-path` | Database storage path |
 | `--listen-addr` | Service listen address |
 | `--chain-cfg` | Chain config ID (1 = Ethereum mainnet) |
-| `--meta` | Meta service address |
 | `--rpc-addr` | Upstream RPC address (geth) |
+| `--archive` | Enable archive mode (required when using archive snapshot) |
 
 ## Notes
 

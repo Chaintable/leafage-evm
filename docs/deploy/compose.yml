@@ -12,7 +12,7 @@ services:
       - eth
     image: sigp/lighthouse:v8.0.1
     volumes:
-      - ${DATA_DIR:-/eth}:/var/data/
+      - ${ETH_DATA_DIR:-/eth}:/var/data/
     deploy:
       resources:
         limits:
@@ -31,10 +31,8 @@ services:
     networks:
       - eth
     image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain-gethx:amd64-v1.16.7-debank-4
-    ports:
-      - 8666:8545
     volumes:
-      - ${DATA_DIR:-/eth}:/var/data/
+      - ${ETH_DATA_DIR:-/eth}:/var/data/
     deploy:
       resources:
         limits:
@@ -66,13 +64,12 @@ services:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     volumes:
-      - /data/nodex-eth3:/nodex
+      -  ${LEAFAGE_DATA_DIR:-/nodex-eth}:/nodex-eth
     ports:
       - 8659:8659
     command:
       - standalone
-      - --db-path=/nodex
+      - --db-path=/nodex-eth
       - --listen-addr=0.0.0.0:8659
       - --chain-cfg=1
-      - --meta=172.21.49.2:8659
       - --rpc-addr=http://geth:8545
