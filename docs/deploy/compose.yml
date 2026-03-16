@@ -38,6 +38,8 @@ services:
         limits:
           cpus: '4'
           memory: '24G'
+    ports:
+      - 8666:8545
     entrypoint:
       - /app/geth
       - --datadir=/var/data/geth
@@ -54,7 +56,7 @@ services:
       - --http.port=8545
       - --http.vhosts=*
       - --http.corsdomain=*
-      - --http.api=net,web3,eth,admin,debug,txpool,pre,engine,trace
+      - --http.api=net,web3,eth,admin,debug,txpool,engine,trace
 
   leafage-evm-x-eth:
     image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/leafage-evm-x:amd64-chaintable-v102-debank-7
