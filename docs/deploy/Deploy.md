@@ -30,10 +30,6 @@ Beacon chain client for consensus layer:
 
 - **Image**: `sigp/lighthouse:v8.0.1`
 - **Resources**: 4 CPU / 12GB memory
-- **Features**:
-  - Syncs Ethereum consensus layer
-  - Communicates with geth via JWT authentication
-  - Uses checkpoint sync for faster initial sync
 
 ### geth (Execution Layer)
 
@@ -43,7 +39,7 @@ Modified Geth client for execution layer:
 - **Resources**: 4 CPU / 24GB memory
 - **Port Mapping**: 8666 → 8545 (HTTP RPC)
 - **Sync Mode**: full sync + archive mode
-- **RPC APIs**: `net,web3,eth,admin,debug,txpool,pre,engine,trace`
+- **RPC APIs**: `net,web3,eth,admin,debug,txpool,engine,trace`
 
 ### leafage-evm-x-eth
 
@@ -59,9 +55,8 @@ Lightweight EVM executor for state queries:
 
 1. **Docker** and **Docker Compose** installed
 2. **Storage**:
-   - Geth archive mode: ~2TB+
-   - Lighthouse: ~200GB
-   - leafage-evm: ~360GB (archive) or ~90GB (state)
+   - Geth archive mode + Lighthouse: ~850GB
+   - leafage-evm: ~450GB (archive) or ~150GB (state)
 3. **Network**: Access to Ethereum P2P network and checkpoint sync URL
 
 ## Configuration
@@ -130,13 +125,13 @@ tar --use-compress-program=unzstd -xf leafage-archive-24646705.tar.zstd -C ${LEA
 
 ```bash
 # Set data directory
-export DATA_DIR=/eth
+export ETH_DATA_DIR=/eth
 
 # Create required directories
-mkdir -p ${DATA_DIR}/geth ${DATA_DIR}/lighthouse
+mkdir -p ${ETH_DATA_DIR}/geth ${ETH_DATA_DIR}/lighthouse
 
 # Generate JWT secret
-openssl rand -hex 32 > ${DATA_DIR}/geth/jwtsecret
+openssl rand -hex 32 > ${ETH_DATA_DIR}/geth/jwtsecret
 ```
 
 ### 2. Start Services
