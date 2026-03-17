@@ -1,0 +1,17 @@
+[package]
+name = "leafage-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+exclude.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+leafage-evm-types.workspace = true
+alloy.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+tokio.workspace = true
