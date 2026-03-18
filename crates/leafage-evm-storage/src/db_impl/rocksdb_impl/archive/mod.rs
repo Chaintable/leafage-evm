@@ -342,14 +342,16 @@ impl DataBaseRef {
                 CfCompression::Lz4,
             ),
         );
-        // AddressToStorage: 32 bytes value, no compression needed
+        // AddressToStorage: 32 bytes value, but 96-byte keys have high prefix
+        // redundancy. LZ4 at deeper levels reduces disk usage with negligible
+        // CPU overhead.
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 64,
                 disable_auto_compactions,
-                CfCompression::None,
+                CfCompression::Lz4,
             ),
         );
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
