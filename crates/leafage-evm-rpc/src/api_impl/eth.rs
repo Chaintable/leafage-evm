@@ -106,7 +106,12 @@ where
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
         if let Some(overrides) = block_overrides {
-            super::utils::apply_block_overrides(overrides, &mut db, &mut block_env);
+            super::utils::apply_block_overrides(
+                overrides,
+                &mut db,
+                &mut block_env,
+                block.header.clone(),
+            );
         }
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
