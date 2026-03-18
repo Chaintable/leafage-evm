@@ -1937,7 +1937,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -4703,7 +4703,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.3",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -4729,9 +4729,8 @@ dependencies = [
 
 [[package]]
 name = "librocksdb-sys"
-version = "0.17.3+10.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9"
+version = "0.18.0+10.7.5"
+source = "git+https://github.com/rust-rocksdb/rust-rocksdb?rev=a4f178d0ca668c4b48d993ab8aef6f4004780f23#a4f178d0ca668c4b48d993ab8aef6f4004780f23"
 dependencies = [
  "bindgen 0.72.1",
  "bzip2-sys",
@@ -6765,8 +6764,7 @@ dependencies = [
 [[package]]
 name = "rocksdb"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddb7af00d2b17dbd07d82c0063e25411959748ff03e8d4f96134c2ff41fce34f"
+source = "git+https://github.com/rust-rocksdb/rust-rocksdb?rev=a4f178d0ca668c4b48d993ab8aef6f4004780f23#a4f178d0ca668c4b48d993ab8aef6f4004780f23"
 dependencies = [
  "libc",
  "librocksdb-sys",
