@@ -48,7 +48,7 @@ pub struct Command {
     ///
     /// When set, corpus shuffle is deterministic and reproducible.
     #[arg(long, value_name = "N")]
-    pub shuffle_seed: Option<u64>,
+    pub seed: Option<u64>,
 
     /// Directory for benchmark result files.
     ///
@@ -72,7 +72,7 @@ impl Command {
         }
         println!("concurrency : {}", self.concurrency);
         println!("requests    : {}", self.requests.map(|v| v.to_string()).unwrap_or_else(|| "auto(corpus size)".to_string()));
-        println!("shuffle-seed: {}", self.shuffle_seed.map(|v| v.to_string()).unwrap_or_else(|| "random".to_string()));
+        println!("shuffle-seed: {}", self.seed.map(|v| v.to_string()).unwrap_or_else(|| "random".to_string()));
         println!("output-dir  : {}", self.output_dir.display());
     }
 
@@ -89,7 +89,7 @@ impl Command {
         println!("effective requests : {}", effective_requests);
 
         let runner = BenchRunner::new(&self.target, self.compare.as_deref(), self.concurrency)?;
-        runner.run(corpus, self.requests, self.shuffle_seed).await?;
+        runner.run(corpus, self.requests, self.seed).await?;
         Ok(())
     }
 }
