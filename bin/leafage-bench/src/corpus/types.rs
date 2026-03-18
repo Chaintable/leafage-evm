@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-
+use std::str::FromStr;
 use serde::Deserialize;
 use leafage_evm_types::{Bytes, CallRequest, U256};
 
@@ -17,6 +17,12 @@ impl Corpus {
         let corpus = serde_json::from_reader(file)?;
         Ok(corpus)
     }
+
+    pub fn filter_label(&mut self, label: Option<ClassLabel>) {
+        if let Some(label) = label {
+            self.cases.retain(|case| case.classification.label == label);
+        }
+    }
 }
 /// Meta
 #[derive(Debug, Clone, Deserialize)]
@@ -25,7 +31,9 @@ pub struct CorpusMeta {
     pub generated_at: String,
     pub format: String,
     pub seed: String,
+    #[allow(dead_code)]
     pub group_cap: u32,
+    #[allow(dead_code)]
     pub selector_cap: u32,
     /// Per-label case quotas used during balanced sampling, e.g. `{"L1": 300, "L2": 300, "L3": 100}`.
     pub quotas: HashMap<String, u32>,
@@ -43,6 +51,7 @@ pub struct IngestStats {
 }
 
 /// Case
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CorpusCase {
@@ -72,6 +81,7 @@ pub struct CorpusCase {
 }
 
 /// Complexity tier and scoring details assigned by the signal model.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Classification {
@@ -106,6 +116,20 @@ impl ClassLabel {
             ClassLabel::L2 => "L2",
             ClassLabel::L3 => "L3",
         }
+    }
+}
+
+impl FromStr for ClassLabel{
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+       let label = match s {
+         "L1"  => ClassLabel::L1,
+         "L2"  => ClassLabel::L2,
+         "L3"  => ClassLabel::L3,
+            _ => anyhow::bail!("invalid class label: {}", s),
+       };
+        Ok(label)
     }
 }
 

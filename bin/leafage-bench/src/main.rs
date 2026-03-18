@@ -1,6 +1,7 @@
 mod corpus;
 mod inspect;
 mod run;
+mod bench_runner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

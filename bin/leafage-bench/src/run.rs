@@ -1,7 +1,10 @@
-use std::path::PathBuf;
-
+use crate::corpus::types::ClassLabel;
+use crate::corpus::Corpus;
 use anyhow::Result;
 use clap::Args;
+use std::path::PathBuf;
+use std::str::FromStr;
+use crate::bench_runner::BenchRunner;
 
 /// Run the benchmark against one or two RPC endpoints.
 #[derive(Debug, Args)]
@@ -12,7 +15,7 @@ pub struct Command {
 
     /// Only run cases with this complexity label.
     /// Omit to run all labels.
-    #[arg(long, value_name = "LABEL", value_parser = ["L1", "L2", "L3"])]
+    #[arg(long, value_parser = ["L1", "L2", "L3"])]
     pub label: Option<String>,
 
     /// HTTP(S) URL of the primary RPC endpoint (leafage-evm).
@@ -54,8 +57,7 @@ pub struct Command {
 }
 
 impl Command {
-    pub async fn run(self) -> Result<()> {
-        // TODO: implement request runner and result aggregation.
+    fn print_base_info(&self){
         println!("corpus      : {}", self.corpus.display());
         println!("label       : {}", self.label.as_deref().unwrap_or("all"));
         println!("target      : {}", self.target);
@@ -64,8 +66,19 @@ impl Command {
         }
         println!("concurrency : {}", self.concurrency);
         println!("output-dir  : {}", self.output_dir.display());
-        println!("\n[stub] benchmark runner not yet implemented.");
+    }
+    pub async fn run(self) -> Result<()> {
+        self.print_base_info();
+        let label = self
+            .label
+            .as_ref()
+            .map(|label| ClassLabel::from_str(label).ok())
+            .flatten();
+        let mut corpus = Corpus::load(self.corpus.as_path())?;
+        corpus.filter_label(label);
+
+        let runner = BenchRunner::new(&self.target, self.compare.as_deref(), self.concurrency)?;
+        runner.run(corpus).await?;
         Ok(())
     }
 }
-
