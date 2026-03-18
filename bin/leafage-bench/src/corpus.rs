@@ -123,12 +123,12 @@ impl FromStr for ClassLabel{
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-       let label = match s {
-         "L1"  => ClassLabel::L1,
-         "L2"  => ClassLabel::L2,
-         "L3"  => ClassLabel::L3,
+        let label = match s {
+            "L1"  => ClassLabel::L1,
+            "L2"  => ClassLabel::L2,
+            "L3"  => ClassLabel::L3,
             _ => anyhow::bail!("invalid class label: {}", s),
-       };
+        };
         Ok(label)
     }
 }

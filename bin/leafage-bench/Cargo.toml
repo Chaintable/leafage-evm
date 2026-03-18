@@ -17,3 +17,4 @@ clap = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 jsonrpsee.workspace = true
 comfy-table.workspace = true
+rand.workspace = true

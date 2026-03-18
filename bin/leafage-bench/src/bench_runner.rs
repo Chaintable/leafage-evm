@@ -3,15 +3,18 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::corpus::types::{ClassLabel, CorpusCase};
 use crate::corpus::Corpus;
-use anyhow::Result;
+use crate::corpus::{ClassLabel, CorpusCase};
+use anyhow::{bail, Result};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{ContentArrangement, Table};
 use jsonrpsee::core::client::Error;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::EthApiClient;
 use leafage_evm_types::{BlockId, Bytes};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -230,7 +233,6 @@ impl std::fmt::Display for RunSummary {
     }
 }
 
-
 pub struct BenchRunner {
     /// Primary endpoint client (leafage-evm).
     /// HttpClient is zero-copy clone internally, no Arc needed.
@@ -254,21 +256,40 @@ impl BenchRunner {
         })
     }
 
-    pub async fn run(&self, corpus: Corpus) -> Result<()> {
+    pub async fn run(
+        &self,
+        mut corpus: Corpus,
+        requests: Option<usize>,
+        shuffle_seed: Option<u64>,
+    ) -> Result<()> {
+        if let Some(seed) = shuffle_seed {
+            let mut rng = StdRng::seed_from_u64(seed);
+            corpus.cases.shuffle(&mut rng);
+        }
         if self.compare.is_some() {
-            let (target_sum, compare_sum) = self.run_compare(&corpus.cases).await?;
+            let (target_sum, compare_sum) = self.run_compare(&corpus.cases, requests).await?;
             println!("{}", render_compare_report(&target_sum, &compare_sum));
         } else {
-            let target_sum = self.run_target(&corpus.cases).await?;
+            let target_sum = self.run_target(&corpus.cases, requests).await?;
             println!("{}", target_sum);
         }
         Ok(())
     }
 
     /// Run all cases against the primary endpoint and return aggregated results.
-    pub async fn run_target(&self, cases: &[CorpusCase]) -> Result<RunSummary> {
-        let (results, duration) =
-            run_cases(self.target.clone(), cases.to_vec(), self.concurrency).await?;
+    pub async fn run_target(
+        &self,
+        cases: &[CorpusCase],
+        requests: Option<usize>,
+    ) -> Result<RunSummary> {
+        let total_requests = resolve_total_requests(cases.len(), requests)?;
+        let (results, duration) = run_cases(
+            self.target.clone(),
+            cases.to_vec(),
+            self.concurrency,
+            total_requests,
+        )
+        .await?;
         Ok(RunSummary::from_results("target".into(), results, duration))
     }
 
@@ -276,18 +297,29 @@ impl BenchRunner {
     ///
     /// The two endpoint runs are fired simultaneously; wall-clock time for each
     /// is measured independently.  Returns `(target, compare)`.
-    pub async fn run_compare(&self, cases: &[CorpusCase]) -> Result<(RunSummary, RunSummary)> {
+    pub async fn run_compare(
+        &self,
+        cases: &[CorpusCase],
+        requests: Option<usize>,
+    ) -> Result<(RunSummary, RunSummary)> {
         let compare = self
             .compare
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("compare endpoint not configured"))?
             .clone();
 
+        let total_requests = resolve_total_requests(cases.len(), requests)?;
         let target = self.target.clone();
         let concurrency = self.concurrency;
+        let cases = cases.to_vec();
         let (target_res, compare_res) = tokio::try_join!(
-            tokio::spawn(run_cases(target, cases.to_vec(), concurrency)),
-            tokio::spawn(run_cases(compare, cases.to_vec(), concurrency)),
+            tokio::spawn(run_cases(
+                target,
+                cases.clone(),
+                concurrency,
+                total_requests
+            )),
+            tokio::spawn(run_cases(compare, cases, concurrency, total_requests)),
         )?;
         let target_res = target_res?;
         let compare_res = compare_res?;
@@ -296,6 +328,17 @@ impl BenchRunner {
             RunSummary::from_results("target".into(), target_res.0, target_res.1),
             RunSummary::from_results("compare".into(), compare_res.0, compare_res.1),
         ))
+    }
+}
+
+fn resolve_total_requests(cases_len: usize, requests: Option<usize>) -> Result<usize> {
+    if cases_len == 0 {
+        bail!("no corpus cases after filtering");
+    }
+    match requests {
+        Some(0) => bail!("--requests must be greater than 0"),
+        Some(n) => Ok(n),
+        None => Ok(cases_len),
     }
 }
 
@@ -308,12 +351,14 @@ async fn run_cases(
     client: HttpClient,
     cases: Vec<CorpusCase>,
     concurrency: usize,
+    total_requests: usize,
 ) -> Result<(Vec<CaseResult>, Duration)> {
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut set = JoinSet::new();
     let wall_start = Instant::now();
 
-    for case in cases.iter() {
+    for i in 0..total_requests {
+        let case = &cases[i % cases.len()];
         let client = client.clone();
         let sem = Arc::clone(&sem);
         let case_id = case.case_id.clone();
@@ -337,7 +382,7 @@ async fn run_cases(
         });
     }
 
-    let mut results = Vec::with_capacity(cases.len());
+    let mut results = Vec::with_capacity(total_requests);
     while let Some(res) = set.join_next().await {
         results.push(res??);
     }
@@ -350,11 +395,7 @@ fn render_compare_report(target: &RunSummary, compare: &RunSummary) -> String {
     let _ = writeln!(&mut out, "{} vs {}", target.name, compare.name);
 
     let _ = writeln!(&mut out, "\n[overall]");
-    let _ = writeln!(
-        &mut out,
-        "{}",
-        render_table("overall", target, compare)
-    );
+    let _ = writeln!(&mut out, "{}", render_table("overall", target, compare));
 
     for label in [ClassLabel::L1, ClassLabel::L2, ClassLabel::L3] {
         if !target.by_label.contains_key(&label) || !compare.by_label.contains_key(&label) {

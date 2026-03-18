@@ -1,4 +1,4 @@
-use crate::corpus::types::ClassLabel;
+use crate::corpus::ClassLabel;
 use crate::corpus::Corpus;
 use anyhow::Result;
 use clap::Args;
@@ -44,6 +44,12 @@ pub struct Command {
     #[arg(long, value_name = "N")]
     pub requests: Option<usize>,
 
+    /// Shuffle seed for corpus ordering.
+    ///
+    /// When set, corpus shuffle is deterministic and reproducible.
+    #[arg(long, value_name = "N")]
+    pub shuffle_seed: Option<u64>,
+
     /// Directory for benchmark result files.
     ///
     /// A timestamped sub-directory is created automatically under this path,
@@ -65,20 +71,25 @@ impl Command {
             println!("compare     : {cmp}");
         }
         println!("concurrency : {}", self.concurrency);
+        println!("requests    : {}", self.requests.map(|v| v.to_string()).unwrap_or_else(|| "auto(corpus size)".to_string()));
+        println!("shuffle-seed: {}", self.shuffle_seed.map(|v| v.to_string()).unwrap_or_else(|| "random".to_string()));
         println!("output-dir  : {}", self.output_dir.display());
     }
+
     pub async fn run(self) -> Result<()> {
         self.print_base_info();
         let label = self
             .label
             .as_ref()
-            .map(|label| ClassLabel::from_str(label).ok())
-            .flatten();
+            .and_then(|label| ClassLabel::from_str(label).ok());
         let mut corpus = Corpus::load(self.corpus.as_path())?;
         corpus.filter_label(label);
 
+        let effective_requests = self.requests.unwrap_or(corpus.cases.len());
+        println!("effective requests : {}", effective_requests);
+
         let runner = BenchRunner::new(&self.target, self.compare.as_deref(), self.concurrency)?;
-        runner.run(corpus).await?;
+        runner.run(corpus, self.requests, self.shuffle_seed).await?;
         Ok(())
     }
 }

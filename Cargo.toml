@@ -118,6 +118,7 @@ dashmap = "6.1"
 
 # bench
 comfy-table = "7.1"
+rand = "0.10"
 
 [profile.release]
 opt-level = 3
