@@ -5,14 +5,13 @@ use std::time::{Duration, Instant};
 
 use crate::corpus::types::{ClassLabel, CorpusCase};
 use crate::corpus::Corpus;
-use alloy::eips::BlockId;
 use anyhow::Result;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{ContentArrangement, Table};
 use jsonrpsee::core::client::Error;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::EthApiClient;
-use leafage_evm_types::Bytes;
+use leafage_evm_types::{BlockId, Bytes};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 

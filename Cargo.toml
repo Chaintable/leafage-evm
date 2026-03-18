@@ -116,6 +116,9 @@ libmdbx = { git = "https://github.com/Chaintable/libmdbx-rs.git", tag = "1.0.0" 
 page_size = "0.6.0"
 dashmap = "6.1"
 
+# bench
+comfy-table = "7.1"
+
 [profile.release]
 opt-level = 3
 debug = true
