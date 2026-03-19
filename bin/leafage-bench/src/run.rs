@@ -37,33 +37,29 @@ pub struct Command {
     #[arg(long, default_value_t = 10, value_name = "N")]
     pub concurrency: usize,
 
-    /// Total number of requests to send per endpoint.
+    /// Total number of requests to send per endpoint per round.
     ///
     /// Defaults to the number of cases in the (filtered) corpus.
     /// Set to a larger value to replay the corpus in a round-robin loop.
     #[arg(long, value_name = "N")]
     pub requests: Option<usize>,
 
+    /// Number of benchmark rounds to run.
+    ///
+    /// When greater than 1, the benchmark is repeated and an aggregated
+    /// summary with mean and standard deviation is printed after all rounds.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    pub rounds: usize,
+
     /// Shuffle seed for corpus ordering.
     ///
     /// When set, corpus shuffle is deterministic and reproducible.
     #[arg(long, value_name = "N")]
     pub seed: Option<u64>,
-
-    /// Directory for benchmark result files.
-    ///
-    /// A timestamped sub-directory is created automatically under this path,
-    /// e.g. `bench-results/2026-03-17T12:00:00/`.
-    #[arg(long, default_value = "bench-results", value_name = "DIR")]
-    pub output_dir: PathBuf,
-
-    /// Print one JSON line per request to stdout in addition to the summary.
-    #[arg(long, default_value_t = false)]
-    pub verbose: bool,
 }
 
 impl Command {
-    fn print_base_info(&self){
+    fn print_base_info(&self) {
         println!("corpus      : {}", self.corpus.display());
         println!("label       : {}", self.label.as_deref().unwrap_or("all"));
         println!("target      : {}", self.target);
@@ -72,8 +68,8 @@ impl Command {
         }
         println!("concurrency : {}", self.concurrency);
         println!("requests    : {}", self.requests.map(|v| v.to_string()).unwrap_or_else(|| "auto(corpus size)".to_string()));
-        println!("shuffle-seed: {}", self.seed.map(|v| v.to_string()).unwrap_or_else(|| "random".to_string()));
-        println!("output-dir  : {}", self.output_dir.display());
+        println!("rounds      : {}", self.rounds);
+        println!("shuffle-seed: {}", self.seed.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()));
     }
 
     pub async fn run(self) -> Result<()> {
@@ -86,10 +82,13 @@ impl Command {
         corpus.filter_label(label);
 
         let effective_requests = self.requests.unwrap_or(corpus.cases.len());
-        println!("effective requests : {}", effective_requests);
+        println!("effective requests per round: {}", effective_requests);
+        println!();
 
         let runner = BenchRunner::new(&self.target, self.compare.as_deref(), self.concurrency)?;
-        runner.run(corpus, self.requests, self.seed).await?;
+        runner
+            .run(corpus, self.requests, self.seed, self.rounds)
+            .await?;
         Ok(())
     }
 }
