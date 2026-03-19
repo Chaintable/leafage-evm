@@ -1,5 +1,5 @@
-use crate::bench_runner::render::table::RenderWrapper;
-use crate::bench_runner::render::{fmt_mean_std, Render};
+use crate::bench_runner::render::table::{AggLabelView, AggOverallView};
+use crate::bench_runner::render::{fmt_mean_std, TableView};
 use crate::bench_runner::CaseResult;
 use crate::corpus::ClassLabel;
 use comfy_table::presets::UTF8_FULL;
@@ -196,9 +196,6 @@ impl std::fmt::Display for RunSummary {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Multi-round aggregation
-// ---------------------------------------------------------------------------
 
 /// Aggregated statistics across multiple benchmark rounds.
 pub struct AggregatedSummary {
@@ -267,16 +264,17 @@ impl std::fmt::Display for AggregatedSummary {
             fmt_mean_std(&self.error_rates),
         )?;
 
-        write!(f, "{}", RenderWrapper(self).render_table("overall"))?;
+        let overall_view = AggOverallView { summary: self };
+        write!(f, "{}", overall_view.render_table("overall"))?;
 
         for label in [ClassLabel::L1, ClassLabel::L2, ClassLabel::L3] {
             if self.by_label.contains_key(&label) {
                 writeln!(f)?;
-                write!(
-                    f,
-                    "{}",
-                    RenderWrapper((self, label)).render_table(label.as_str())
-                )?;
+                let label_view = AggLabelView {
+                    summary: self,
+                    label,
+                };
+                write!(f, "{}", label_view.render_table(label.as_str()))?;
             }
         }
 
@@ -311,5 +309,198 @@ impl AggregatedPercentiles {
         pcts.p95.push(m.percentile_ms(95.0));
         pcts.p99.push(m.percentile_ms(99.0));
         pcts.p999.push(m.percentile_ms(99.9));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal Metric impl for testing pure functions without needing
+    /// CaseResult / RPC types.
+    struct FakeMetric {
+        latencies_ns: Vec<u64>,
+        total: usize,
+        errors: usize,
+    }
+
+    impl FakeMetric {
+        fn new(latencies_ms: &[f64], errors: usize) -> Self {
+            let mut latencies_ns: Vec<u64> = latencies_ms
+                .iter()
+                .map(|ms| (*ms * 1_000_000.0) as u64)
+                .collect();
+            latencies_ns.sort_unstable();
+            let total = latencies_ns.len();
+            Self {
+                latencies_ns,
+                total,
+                errors,
+            }
+        }
+    }
+
+    impl Metric for &FakeMetric {
+        fn latencies_ns(&self) -> &[u64] {
+            &self.latencies_ns
+        }
+        fn total_requests(&self) -> usize {
+            self.total
+        }
+        fn total_errors(&self) -> usize {
+            self.errors
+        }
+    }
+
+    #[test]
+    fn nearest_rank_single_element() {
+        // Any percentile on a 1-element array should return index 0.
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(1, 0.0), 0);
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(1, 50.0), 0);
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(1, 100.0), 0);
+    }
+
+    #[test]
+    fn nearest_rank_boundary_zero() {
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(10, 0.0), 0);
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(10, -5.0), 0);
+    }
+
+    #[test]
+    fn nearest_rank_boundary_hundred() {
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(10, 100.0), 9);
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(10, 150.0), 9);
+    }
+
+    #[test]
+    fn nearest_rank_nan_inf() {
+        // All non-finite values are treated as out-of-range and clamped to index 0.
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(5, f64::NAN), 0);
+        assert_eq!(
+            <&FakeMetric as Metric>::nearest_rank_index(5, f64::INFINITY),
+            0
+        );
+        assert_eq!(
+            <&FakeMetric as Metric>::nearest_rank_index(5, f64::NEG_INFINITY),
+            0
+        );
+    }
+
+    #[test]
+    fn nearest_rank_p50_ten_elements() {
+        // len=10, pct=50 → rank = ceil(0.5 * 10) = 5 → index = 4
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(10, 50.0), 4);
+    }
+
+    #[test]
+    fn nearest_rank_p99_hundred_elements() {
+        // len=100, pct=99 → rank = ceil(0.99 * 100) = 99 → index = 98
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(100, 99.0), 98);
+    }
+
+    #[test]
+    fn nearest_rank_p95_twenty_elements() {
+        // len=20, pct=95 → rank = ceil(0.95 * 20) = ceil(19.0) = 19 → index = 18
+        assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(20, 95.0), 18);
+    }
+
+
+    #[test]
+    fn percentile_ms_empty() {
+        let m = FakeMetric::new(&[], 0);
+        assert_eq!((&m).percentile_ms(50.0), 0.0);
+    }
+
+    #[test]
+    fn percentile_ms_single() {
+        let m = FakeMetric::new(&[10.0], 0);
+        let p = (&m).percentile_ms(50.0);
+        assert!((p - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn percentile_ms_known() {
+        // 10 elements: 1..=10 ms, sorted
+        let latencies: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        let m = FakeMetric::new(&latencies, 0);
+        // p50 → index 4 → 5 ms
+        let p50 = (&m).percentile_ms(50.0);
+        assert!((p50 - 5.0).abs() < 0.01);
+        // p100 → index 9 → 10 ms
+        let p100 = (&m).percentile_ms(100.0);
+        assert!((p100 - 10.0).abs() < 0.01);
+    }
+
+
+    #[test]
+    fn error_rate_zero_total() {
+        let m = FakeMetric::new(&[], 0);
+        assert_eq!((&m).error_rate(), 0.0);
+    }
+
+    #[test]
+    fn error_rate_no_errors() {
+        let m = FakeMetric::new(&[1.0, 2.0, 3.0], 0);
+        assert_eq!((&m).error_rate(), 0.0);
+    }
+
+    #[test]
+    fn error_rate_half() {
+        let m = FakeMetric {
+            latencies_ns: vec![1_000_000, 2_000_000],
+            total: 2,
+            errors: 1,
+        };
+        assert!(((&m).error_rate() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn error_rate_all() {
+        let m = FakeMetric {
+            latencies_ns: vec![1_000_000],
+            total: 1,
+            errors: 1,
+        };
+        assert!(((&m).error_rate() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn push_from_collects_percentiles() {
+        let m1 = FakeMetric::new(&[10.0, 20.0, 30.0, 40.0, 50.0], 0);
+        let m2 = FakeMetric::new(&[100.0, 200.0, 300.0, 400.0, 500.0], 0);
+
+        let mut pcts = AggregatedPercentiles::new();
+        AggregatedPercentiles::push_from(&mut pcts, &m1);
+        AggregatedPercentiles::push_from(&mut pcts, &m2);
+
+        assert_eq!(pcts.p50.len(), 2);
+        assert_eq!(pcts.p90.len(), 2);
+        assert_eq!(pcts.p95.len(), 2);
+        assert_eq!(pcts.p99.len(), 2);
+        assert_eq!(pcts.p999.len(), 2);
+
+        // m1 p50 → index 2 → 30ms, m2 p50 → index 2 → 300ms
+        assert!((pcts.p50[0] - 30.0).abs() < 0.01);
+        assert!((pcts.p50[1] - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn push_from_empty_metric() {
+        let m = FakeMetric::new(&[], 0);
+        let mut pcts = AggregatedPercentiles::new();
+        AggregatedPercentiles::push_from(&mut pcts, &m);
+
+        // Empty metric → percentile_ms returns 0.0
+        assert_eq!(pcts.p50.len(), 1);
+        assert_eq!(pcts.p50[0], 0.0);
+    }
+    #[test]
+    fn aggregated_percentiles_default_is_empty() {
+        let pcts = AggregatedPercentiles::default();
+        assert!(pcts.p50.is_empty());
+        assert!(pcts.p90.is_empty());
+        assert!(pcts.p95.is_empty());
+        assert!(pcts.p99.is_empty());
+        assert!(pcts.p999.is_empty());
     }
 }

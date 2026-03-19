@@ -4,6 +4,7 @@ mod summary;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::bench_runner::render::report::{CompareAggReport, CompareReport, Report};
 use crate::bench_runner::summary::{AggregatedSummary, RunSummary};
 use crate::corpus::Corpus;
 use crate::corpus::{ClassLabel, CorpusCase};
@@ -17,7 +18,6 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use crate::bench_runner::render::Report;
 
 #[derive(Debug)]
 pub struct CaseResult {
@@ -96,15 +96,20 @@ impl BenchRunner {
             if rounds > 1 {
                 let agg_target = AggregatedSummary::from_rounds("target", &target_summaries);
                 let agg_compare = AggregatedSummary::from_rounds("compare", &compare_summaries);
+                let agg_report = CompareAggReport {
+                    target: &agg_target,
+                    compare: &agg_compare,
+                };
                 println!(
                     "\n══ aggregated ({rounds} rounds) ══\n{}",
-                    (&agg_target, &agg_compare).render_report()
+                    agg_report.render_report()
                 );
             } else {
-                println!(
-                    "\n{}",
-                    (&target_summaries[0], &compare_summaries[0]).render_report()
-                );
+                let report = CompareReport {
+                    target: &target_summaries[0],
+                    compare: &compare_summaries[0],
+                };
+                println!("\n{}", report.render_report());
             }
         } else {
             let mut summaries = Vec::with_capacity(rounds);
@@ -187,7 +192,7 @@ fn resolve_total_requests(cases_len: usize, requests: Option<usize>) -> Result<u
         bail!("no corpus cases after filtering");
     }
     match requests {
-        Some(0) => bail!("--requests must be greater than 0"),
+        Some(0) => bail!("requests must be greater than 0"),
         Some(n) => Ok(n),
         None => Ok(cases_len),
     }
