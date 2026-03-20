@@ -189,11 +189,27 @@ fn rocksdb_column_options(
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
+    // Disable TTL-based compaction. Archive data is immutable — recompacting
+    // old SST files just because they exceed 30 days (the default set by
+    // optimize_level_style_compaction) provides no benefit and causes massive
+    // temporary disk usage spikes (e.g. ~30 GB for AddressToStorage L6 rewrites).
+    cf_opts.set_ttl(0);
 
-    // Set compression based on data characteristics
+    // Set compression based on data characteristics.
+    // NOTE: optimize_level_style_compaction() populates compression_per_level
+    // (L0-L1: None, L2+: LZ4), which takes precedence over set_compression_type().
+    // We must use set_compression_per_level() to override it reliably.
     match compression {
         CfCompression::None => {
-            cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+            cf_opts.set_compression_per_level(&[
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+                rocksdb::DBCompressionType::None,
+            ]);
         }
         CfCompression::Lz4 => {
             // L0-L1: no compression (frequently accessed), L2+: LZ4
@@ -326,14 +342,16 @@ impl DataBaseRef {
                 CfCompression::Lz4,
             ),
         );
-        // AddressToStorage: 32 bytes value, no compression needed
+        // AddressToStorage: 32 bytes value, but 96-byte keys have high prefix
+        // redundancy. LZ4 at deeper levels reduces disk usage with negligible
+        // CPU overhead.
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 64,
                 disable_auto_compactions,
-                CfCompression::None,
+                CfCompression::Lz4,
             ),
         );
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
