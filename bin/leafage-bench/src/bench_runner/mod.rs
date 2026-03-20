@@ -4,7 +4,7 @@ mod summary;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::bench_runner::render::report::{CompareAggReport, CompareReport, Report};
+use crate::bench_runner::render::report::{CompareAggReport, CompareReport, Report, SummaryReport};
 use crate::bench_runner::summary::{AggregatedSummary, RunSummary};
 use crate::corpus::Corpus;
 use crate::corpus::{ClassLabel, CorpusCase};
@@ -82,49 +82,60 @@ impl BenchRunner {
         if self.compare.is_some() {
             let mut target_summaries = Vec::with_capacity(rounds);
             let mut compare_summaries = Vec::with_capacity(rounds);
+            let target_name = "target";
+            let compare_name = "compare";
 
             for round in 1..=rounds {
-                println!("round {round}/{rounds} started");
                 let (t, c) = self.run_compare(&corpus.cases, requests).await?;
-                println!("round {round}/{rounds} finished");
-                println!("\n── round {round} target ──\n{t}");
-                println!("\n── round {round} compare ──\n{c}");
+                let target_report = SummaryReport {
+                    name:target_name,
+                    round,
+                    summary: &t,
+                };
+                let report = SummaryReport {
+                    name:compare_name,
+                    round,
+                    summary: &c,
+                };
+                println!("{}", target_report.render_report());
+                println!("{}", report.render_report());
                 target_summaries.push(t);
                 compare_summaries.push(c);
             }
 
             if rounds > 1 {
-                let agg_target = AggregatedSummary::from_rounds("target", &target_summaries);
-                let agg_compare = AggregatedSummary::from_rounds("compare", &compare_summaries);
+                let agg_target = AggregatedSummary::from_rounds(target_name, &target_summaries);
+                let agg_compare = AggregatedSummary::from_rounds(compare_name, &compare_summaries);
                 let agg_report = CompareAggReport {
                     target: &agg_target,
                     compare: &agg_compare,
                 };
-                println!(
-                    "\n══ aggregated ({rounds} rounds) ══\n{}",
-                    agg_report.render_report()
-                );
+                println!("{}", agg_report.render_report());
             } else {
                 let report = CompareReport {
                     target: &target_summaries[0],
                     compare: &compare_summaries[0],
                 };
-                println!("\n{}", report.render_report());
+                println!("{}", report.render_report());
             }
         } else {
+            let name = "target";
             let mut summaries = Vec::with_capacity(rounds);
 
             for round in 1..=rounds {
-                println!("round {round}/{rounds} started");
-                let s = self.run_target(&corpus.cases, requests).await?;
-                println!("round {round}/{rounds} finished");
-                println!("\n── round {round} ──\n{s}");
-                summaries.push(s);
+                let summary = self.run_target(&corpus.cases, requests).await?;
+                let report = SummaryReport {
+                    name,
+                    round,
+                    summary: &summary,
+                };
+                println!("{}",report.render_report());
+                summaries.push(summary);
             }
 
             if rounds > 1 {
-                let agg = AggregatedSummary::from_rounds("target", &summaries);
-                println!("\n══ aggregated ({rounds} rounds) ══\n{agg}");
+                let agg = AggregatedSummary::from_rounds(name, &summaries);
+                println!("{}", agg.render_report());
             }
         }
         Ok(())

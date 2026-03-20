@@ -1,36 +1,73 @@
 use crate::bench_runner::render::{fmt_mean_std, format_delta_percent, mean, stddev};
-use crate::bench_runner::summary::{
-    AggregatedPercentiles, AggregatedSummary, LabelStats, Metric, RunSummary,
-};
+use crate::bench_runner::summary::{AggregatedPercentiles, AggregatedSummary, Metric, RunSummary};
 use crate::corpus::ClassLabel;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{ContentArrangement, Table};
 
 pub(crate) trait TableView {
-    fn render_table(&self, title: &str) -> Table;
+    fn render_overall_table(&self, title: &str) -> Table;
+    fn render_label_table(&self, label: ClassLabel) -> Option<Table>;
 }
 
-/// Compare view for two single-round summaries (overall).
+impl TableView for RunSummary {
+    fn render_overall_table(&self, title: &str) -> Table {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header([
+                "label", "count", "error%", "p50 ms", "p95 ms", "p99 ms", "p999 ms",
+            ]);
+
+        table.add_row([
+            title.to_string(),
+            self.total.to_string(),
+            format!("{:.1}", self.error_rate()),
+            format!("{:.2}", self.percentile_ms(50.0)),
+            format!("{:.2}", self.percentile_ms(95.0)),
+            format!("{:.2}", self.percentile_ms(99.0)),
+            format!("{:.2}", self.percentile_ms(99.9)),
+        ]);
+
+        for label in [ClassLabel::L1, ClassLabel::L2, ClassLabel::L3] {
+            if let Some(s) = self.by_label.get(&label) {
+                table.add_row([
+                    label.as_str().to_string(),
+                    s.total.to_string(),
+                    format!("{:.1}", s.error_rate()),
+                    format!("{:.2}", s.percentile_ms(50.0)),
+                    format!("{:.2}", s.percentile_ms(95.0)),
+                    format!("{:.2}", s.percentile_ms(99.0)),
+                    format!("{:.2}", s.percentile_ms(99.9)),
+                ]);
+            }
+        }
+        table
+    }
+
+    fn render_label_table(&self, _label: ClassLabel) -> Option<Table> {
+        unimplemented!()
+    }
+}
+
 pub(crate) struct CompareView<'a> {
     pub target: &'a RunSummary,
     pub compare: &'a RunSummary,
 }
 
-/// Compare view for two single-round label stats.
-pub(crate) struct CompareLabelView<'a> {
-    pub target: &'a LabelStats,
-    pub compare: &'a LabelStats,
-}
-
 impl TableView for CompareView<'_> {
-    fn render_table(&self, title: &str) -> Table {
+    fn render_overall_table(&self, title: &str) -> Table {
         render_compare_metric_table(title, self.target, self.compare)
     }
-}
 
-impl TableView for CompareLabelView<'_> {
-    fn render_table(&self, title: &str) -> Table {
-        render_compare_metric_table(title, self.target, self.compare)
+    fn render_label_table(&self, label: ClassLabel) -> Option<Table> {
+        if let (Some(target), Some(compare)) = (
+            self.target.by_label.get(&label),
+            self.compare.by_label.get(&label),
+        ) {
+            return Some(render_compare_metric_table(label.as_str(), target, compare));
+        }
+        None
     }
 }
 
@@ -84,36 +121,24 @@ fn render_compare_metric_table(title: &str, t: impl Metric, c: impl Metric) -> T
     ]);
     table
 }
-/// Aggregated overall view for a single endpoint across multiple rounds.
-pub(crate) struct AggOverallView<'a> {
-    pub summary: &'a AggregatedSummary,
-}
 
-/// Aggregated per-label view for a single endpoint across multiple rounds.
-pub(crate) struct AggLabelView<'a> {
-    pub summary: &'a AggregatedSummary,
-    pub label: ClassLabel,
-}
+impl TableView for AggregatedSummary {
+    fn render_overall_table(&self, title: &str) -> Table {
+        render_aggregated_table(title, &self.overall_pcts, &self.error_rates)
+    }
 
-impl TableView for AggOverallView<'_> {
-    fn render_table(&self, title: &str) -> Table {
-        render_aggregated_table(title, &self.summary.overall_pcts, &self.summary.error_rates)
+    fn render_label_table(&self, label: ClassLabel) -> Option<Table> {
+        if let Some(pcts) = self.by_label.get(&label) {
+            let err = self
+                .label_error_rates
+                .get(&label)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            return Some(render_aggregated_table(label.as_str(), pcts, err));
+        }
+        None
     }
 }
-
-impl TableView for AggLabelView<'_> {
-    fn render_table(&self, title: &str) -> Table {
-        let pcts = self.summary.by_label.get(&self.label).unwrap();
-        let err = self
-            .summary
-            .label_error_rates
-            .get(&self.label)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        render_aggregated_table(title, pcts, err)
-    }
-}
-
 fn render_aggregated_table(
     title: &str,
     pcts: &AggregatedPercentiles,
@@ -158,21 +183,13 @@ fn render_aggregated_table(
     table
 }
 
-/// Aggregated compare overall view: target vs compare across multiple rounds.
-pub(crate) struct AggCompareOverallView<'a> {
+pub(crate) struct AggCompareView<'a> {
     pub target: &'a AggregatedSummary,
     pub compare: &'a AggregatedSummary,
 }
 
-/// Aggregated compare per-label view: target vs compare for a specific label.
-pub(crate) struct AggCompareLabelView<'a> {
-    pub target: &'a AggregatedSummary,
-    pub compare: &'a AggregatedSummary,
-    pub label: ClassLabel,
-}
-
-impl TableView for AggCompareOverallView<'_> {
-    fn render_table(&self, title: &str) -> Table {
+impl TableView for AggCompareView<'_> {
+    fn render_overall_table(&self, title: &str) -> Table {
         render_aggregated_compare_table(
             title,
             &self.target.overall_pcts,
@@ -183,25 +200,35 @@ impl TableView for AggCompareOverallView<'_> {
             &self.compare.qps_values,
         )
     }
-}
 
-impl TableView for AggCompareLabelView<'_> {
-    fn render_table(&self, title: &str) -> Table {
-        let tp = self.target.by_label.get(&self.label).unwrap();
-        let cp = self.compare.by_label.get(&self.label).unwrap();
-        let te = self
-            .target
-            .label_error_rates
-            .get(&self.label)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let ce = self
-            .compare
-            .label_error_rates
-            .get(&self.label)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        render_aggregated_compare_table(title, tp, te, &[], cp, ce, &[])
+    fn render_label_table(&self, label: ClassLabel) -> Option<Table> {
+        if let (Some(tp), Some(cp)) = (
+            self.target.by_label.get(&label),
+            self.compare.by_label.get(&label),
+        ) {
+            let te = self
+                .target
+                .label_error_rates
+                .get(&label)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let ce = self
+                .compare
+                .label_error_rates
+                .get(&label)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            return Some(render_aggregated_compare_table(
+                label.as_str(),
+                tp,
+                te,
+                &[],
+                cp,
+                ce,
+                &[],
+            ));
+        }
+        None
     }
 }
 

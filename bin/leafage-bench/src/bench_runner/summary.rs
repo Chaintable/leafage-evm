@@ -1,9 +1,5 @@
-use crate::bench_runner::render::table::{AggLabelView, AggOverallView};
-use crate::bench_runner::render::{fmt_mean_std, TableView};
 use crate::bench_runner::CaseResult;
 use crate::corpus::ClassLabel;
-use comfy_table::presets::UTF8_FULL;
-use comfy_table::{ContentArrangement, Table};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -147,56 +143,6 @@ impl Metric for &RunSummary {
     }
 }
 
-impl std::fmt::Display for RunSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "{} total={} errors={} ({:.1}%) duration={:.2}s qps={:.1}",
-            self.name,
-            self.total,
-            self.errors,
-            self.error_rate(),
-            self.duration.as_secs_f64(),
-            self.qps()
-        )?;
-
-        let mut table = Table::new();
-        table
-            .load_preset(UTF8_FULL)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header([
-                "label", "count", "error%", "p50 ms", "p95 ms", "p99 ms", "p999 ms",
-            ]);
-
-        table.add_row([
-            "overall".to_string(),
-            self.total.to_string(),
-            format!("{:.1}", self.error_rate()),
-            format!("{:.2}", self.percentile_ms(50.0)),
-            format!("{:.2}", self.percentile_ms(95.0)),
-            format!("{:.2}", self.percentile_ms(99.0)),
-            format!("{:.2}", self.percentile_ms(99.9)),
-        ]);
-
-        for label in [ClassLabel::L1, ClassLabel::L2, ClassLabel::L3] {
-            if let Some(s) = self.by_label.get(&label) {
-                table.add_row([
-                    label.as_str().to_string(),
-                    s.total.to_string(),
-                    format!("{:.1}", s.error_rate()),
-                    format!("{:.2}", s.percentile_ms(50.0)),
-                    format!("{:.2}", s.percentile_ms(95.0)),
-                    format!("{:.2}", s.percentile_ms(99.0)),
-                    format!("{:.2}", s.percentile_ms(99.9)),
-                ]);
-            }
-        }
-
-        write!(f, "{table}")
-    }
-}
-
-
 /// Aggregated statistics across multiple benchmark rounds.
 pub struct AggregatedSummary {
     pub name: String,
@@ -250,35 +196,6 @@ impl AggregatedSummary {
             by_label,
             label_error_rates,
         }
-    }
-}
-
-impl std::fmt::Display for AggregatedSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "{} (aggregated over {} rounds)  qps={}  error%={}",
-            self.name,
-            self.rounds,
-            fmt_mean_std(&self.qps_values),
-            fmt_mean_std(&self.error_rates),
-        )?;
-
-        let overall_view = AggOverallView { summary: self };
-        write!(f, "{}", overall_view.render_table("overall"))?;
-
-        for label in [ClassLabel::L1, ClassLabel::L2, ClassLabel::L3] {
-            if self.by_label.contains_key(&label) {
-                writeln!(f)?;
-                let label_view = AggLabelView {
-                    summary: self,
-                    label,
-                };
-                write!(f, "{}", label_view.render_table(label.as_str()))?;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -404,7 +321,6 @@ mod tests {
         assert_eq!(<&FakeMetric as Metric>::nearest_rank_index(20, 95.0), 18);
     }
 
-
     #[test]
     fn percentile_ms_empty() {
         let m = FakeMetric::new(&[], 0);
@@ -430,7 +346,6 @@ mod tests {
         let p100 = (&m).percentile_ms(100.0);
         assert!((p100 - 10.0).abs() < 0.01);
     }
-
 
     #[test]
     fn error_rate_zero_total() {
