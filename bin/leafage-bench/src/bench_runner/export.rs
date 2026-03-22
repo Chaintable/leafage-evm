@@ -271,7 +271,7 @@ impl From<&AggregatedSummary> for AggSummaryOutput {
 async fn write_file<T: ?Sized + Serialize>(dir: &Path, file_name: &str, value: &T) -> Result<()> {
     let path = dir.join(file_name);
     let mut file = tokio::fs::File::create(&path).await?;
-    let json = serde_json::to_vec(value)?;
+    let json = serde_json::to_vec_pretty(value)?;
     file.write_all(json.as_ref()).await?;
     println!("wrote {}", path.display());
     Ok(())
