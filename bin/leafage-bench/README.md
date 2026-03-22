@@ -4,6 +4,81 @@ Benchmark CLI for comparing `eth_call` performance between **leafage-evm** and *
 
 ---
 
+## Build
+
+```bash
+cargo build --release -p leafage-bench
+```
+
+---
+
+## Usage
+
+### `run` — Run the benchmark
+
+```bash
+./target/release/leafage-bench run \
+  --corpus bin/leafage-bench/corpus/corpus.json \
+  --target http://leafage-evm:8545 \
+  --compare http://geth:8545
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--corpus` / `-c` | - | Path to the corpus JSON file (required) |
+| `--target` | - | Primary RPC endpoint URL (leafage-evm) (required) |
+| `--compare` | - | Comparison RPC endpoint URL (geth) |
+| `--label` | all | Only run cases with this complexity label: `L1`, `L2`, `L3` |
+| `--concurrency` | 10 | Number of concurrent requests per endpoint |
+| `--requests` | corpus size | Total requests per endpoint per round |
+| `--rounds` | 1 | Number of benchmark rounds |
+| `--seed` | - | Shuffle seed for corpus ordering |
+| `--output-dir` | - | Directory for export files (`summary.json`, `verbose.json`) |
+| `--verbose` | false | Write per-request details to `verbose.json` (requires `--output-dir`) |
+
+All requests use `latest` as the block tag. The per-request RPC timeout is 30 seconds.
+
+**Console output**: After each round, a latency table (p50 / p90 / p95 / p99 / p99.9) broken down by tier (L1 / L2 / L3) is printed to stdout. When `--compare` is set, a side-by-side comparison table is shown. For multi-round runs, an aggregated report (mean ± stddev across rounds) is printed at the end.
+
+**File output** (requires `--output-dir`):
+
+| File | Written when | Contents |
+|------|-------------|----------|
+| `summary.json` | always | Run metadata, per-round statistics, aggregated statistics (multi-round only) |
+| `verbose.json` | `--verbose` is set | Per-request details: case ID, label, latency, return value / error |
+
+### `inspect` — Inspect the corpus
+
+Print summary statistics of the corpus without running any requests:
+
+```bash
+./target/release/leafage-bench inspect \
+  --corpus bin/leafage-bench/corpus/corpus.json
+```
+
+Example output:
+
+```
+file        : bin/leafage-bench/corpus/corpus.json
+generated   : 2025-01-15T10:00:00Z
+format      : v1
+seed        : abc123
+stage       : balanced
+total cases : 700
+
+quotas:
+  L1 : quota=300  actual=300
+  L2 : quota=300  actual=300
+  L3 : quota=100  actual=100
+
+ingest stats:
+  requests_received : 50000
+  cases_ingested    : 12000
+  rpc_objects_found : 48000
+```
+
+---
+
 ## Corpus
 
 The benchmark corpus (`corpus/corpus.json`) is a curated set of real-world `eth_call` requests

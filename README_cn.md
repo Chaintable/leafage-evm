@@ -136,6 +136,57 @@ RUST_LOG=info ./target/release/leafage-evm file-migrate \
   --db-path /path/to/leafage/db
 ```
 
+## 性能测试
+
+`leafage-bench` 是用于对比 leafage-evm 与 geth 的 `eth_call` 性能的 CLI 工具。
+
+### 构建
+
+```bash
+cargo build --release -p leafage-bench
+```
+
+### 测试语料库
+
+测试语料库（`bin/leafage-bench/corpus/corpus.json`）通过 **Git LFS** 管理，克隆仓库后执行：
+
+```bash
+git lfs pull
+```
+
+### 子命令
+
+#### `run` — 执行性能测试
+
+```bash
+./target/release/leafage-bench run \
+  --corpus bin/leafage-bench/corpus/corpus.json \
+  --target http://leafage-evm:8545 \
+  --compare http://geth:8545
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--corpus` / `-c` | - | 语料库 JSON 文件路径（必需） |
+| `--target` | - | 主测目标 RPC 地址（leafage-evm）（必需） |
+| `--compare` | - | 对比 RPC 地址（geth） |
+| `--label` | all | 仅运行指定复杂度的用例：`L1`、`L2`、`L3` |
+| `--concurrency` | 10 | 每个端点的并发请求数 |
+| `--requests` | 语料库大小 | 每轮每个端点发送的总请求数 |
+| `--rounds` | 1 | 测试轮数 |
+| `--seed` | - | 语料库随机排序种子 |
+| `--output-dir` | - | 输出目录（生成 `summary.json`、`verbose.json`） |
+| `--verbose` | false | 将每条请求详情写入 `verbose.json`（需配合 `--output-dir` 使用） |
+
+#### `inspect` — 查看语料库信息
+
+不执行测试，仅输出语料库的统计摘要：
+
+```bash
+./target/release/leafage-bench inspect \
+  --corpus bin/leafage-bench/corpus/corpus.json
+```
+
 ## 文档
 
 | 文档 | 说明 |
