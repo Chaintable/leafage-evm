@@ -1,15 +1,21 @@
+pub(crate) mod export;
 pub(crate) mod render;
 mod summary;
 
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::bench_runner::export::{
+    AggSummaryOutput, AggregatedOutput, BenchmarkOutput, RoundOutput, RunMetadata, SummaryOutput,
+    VerboseOutput, VerboseRound,
+};
 use crate::bench_runner::render::report::{CompareAggReport, CompareReport, Report, SummaryReport};
 use crate::bench_runner::summary::{AggregatedSummary, RunSummary};
 use crate::corpus::Corpus;
 use crate::corpus::{ClassLabel, CorpusCase};
-use anyhow::{bail, Result};
-use jsonrpsee::core::client::Error;
+use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::EthApiClient;
 use leafage_evm_types::{BlockId, Bytes};
@@ -35,7 +41,7 @@ impl CaseResult {
         match self.outcome {
             Ok(_) => true,
             Err(ref err) => match err {
-                Error::Call(call_err) => {
+                jsonrpsee::core::client::error::Error::Call(call_err) => {
                     let msg = call_err.message();
                     msg.contains("execution reverted") || msg.contains("Reverted")
                 }
@@ -44,176 +50,263 @@ impl CaseResult {
         }
     }
 }
+
+/// Options passed from CLI into the benchmark runner.
+pub struct RunConfig {
+    pub requests: Option<usize>,
+    pub shuffle_seed: Option<u64>,
+    pub rounds: usize,
+    pub output_dir: Option<PathBuf>,
+    pub verbose: bool,
+    // metadata fields for JSON export
+    pub target_url: String,
+    pub compare_url: Option<String>,
+    pub concurrency: usize,
+    pub label_filter: Option<String>,
+    pub corpus_cases: usize,
+}
+
 pub struct BenchRunner {
     /// Primary endpoint client (leafage-evm).
-    /// HttpClient is zero-copy clone internally, no Arc needed.
     target: HttpClient,
     /// Optional comparison endpoint client (geth).
     compare: Option<HttpClient>,
-    concurrency: usize,
+    cfg: RunConfig,
+}
+
+/// Result of a single benchmark round.
+struct RoundResult {
+    target: (Vec<CaseResult>, Duration),
+    compare: Option<(Vec<CaseResult>, Duration)>,
 }
 
 impl BenchRunner {
-    pub fn new(target_url: &str, compare_url: Option<&str>, concurrency: usize) -> Result<Self> {
+    pub fn new(cfg: RunConfig) -> Result<Self> {
         let build = |url: &str| -> Result<HttpClient> {
             Ok(HttpClientBuilder::default()
                 .request_timeout(Duration::from_secs(30))
                 .build(url)?)
         };
         Ok(Self {
-            target: build(target_url)?,
-            compare: compare_url.map(build).transpose()?,
-            concurrency,
+            target: build(cfg.target_url.as_str())?,
+            compare: cfg
+                .compare_url
+                .as_ref()
+                .map(|url| build(url.as_str()))
+                .transpose()?,
+            cfg,
         })
     }
 
-    pub async fn run(
-        &self,
-        mut corpus: Corpus,
-        requests: Option<usize>,
-        shuffle_seed: Option<u64>,
-        rounds: usize,
-    ) -> Result<()> {
-        if let Some(seed) = shuffle_seed {
+    pub async fn run(&self, mut corpus: Corpus) -> Result<()> {
+        let metadata: RunMetadata = (&self.cfg).into();
+
+        if let Some(seed) = self.cfg.shuffle_seed {
             let mut rng = StdRng::seed_from_u64(seed);
             corpus.cases.shuffle(&mut rng);
         }
 
-        if self.compare.is_some() {
-            let mut target_summaries = Vec::with_capacity(rounds);
-            let mut compare_summaries = Vec::with_capacity(rounds);
-            let target_name = "target";
-            let compare_name = "compare";
+        let rounds = self.cfg.rounds;
 
-            for round in 1..=rounds {
-                let (t, c) = self.run_compare(&corpus.cases, requests).await?;
-                let target_report = SummaryReport {
-                    name:target_name,
-                    round,
-                    summary: &t,
-                };
-                let report = SummaryReport {
-                    name:compare_name,
-                    round,
-                    summary: &c,
-                };
-                println!("{}", target_report.render_report());
-                println!("{}", report.render_report());
-                target_summaries.push(t);
-                compare_summaries.push(c);
-            }
+        let mut verbose_rounds: Vec<VerboseRound> = Vec::with_capacity(rounds);
+        let mut benchmark_output = BenchmarkOutput {
+            metadata,
+            rounds: Vec::with_capacity(rounds),
+            aggregated: None,
+        };
 
-            if rounds > 1 {
-                let agg_target = AggregatedSummary::from_rounds(target_name, &target_summaries);
-                let agg_compare = AggregatedSummary::from_rounds(compare_name, &compare_summaries);
-                let agg_report = CompareAggReport {
-                    target: &agg_target,
-                    compare: &agg_compare,
-                };
-                println!("{}", agg_report.render_report());
-            } else {
-                let report = CompareReport {
-                    target: &target_summaries[0],
-                    compare: &compare_summaries[0],
-                };
-                println!("{}", report.render_report());
+        let mut target_summaries = Vec::with_capacity(rounds);
+        let mut compare_summaries: Vec<RunSummary> = Vec::with_capacity(rounds);
+
+        for round in 1..=rounds {
+            let round_result = self.run_round(&corpus.cases).await?;
+            let (verbose, output, target_summary, compare_summary) =
+                self.process_round(round, round_result)?;
+
+            verbose_rounds.push(verbose);
+            benchmark_output.rounds.push(output);
+            target_summaries.push(target_summary);
+            if let Some(compare_summary) = compare_summary {
+                compare_summaries.push(compare_summary);
             }
+        }
+
+        let compare_ref = if compare_summaries.is_empty() {
+            None
         } else {
-            let name = "target";
-            let mut summaries = Vec::with_capacity(rounds);
+            Some(compare_summaries.as_slice())
+        };
+        self.render_final_report(&target_summaries, compare_ref)?;
+        benchmark_output.aggregated = Self::build_aggregated_output(&target_summaries, compare_ref);
 
-            for round in 1..=rounds {
-                let summary = self.run_target(&corpus.cases, requests).await?;
-                let report = SummaryReport {
-                    name,
-                    round,
-                    summary: &summary,
-                };
-                println!("{}",report.render_report());
-                summaries.push(summary);
-            }
+        self.write_benchmark_output(&benchmark_output, &verbose_rounds.into())
+            .await?;
 
-            if rounds > 1 {
-                let agg = AggregatedSummary::from_rounds(name, &summaries);
-                println!("{}", agg.render_report());
+        Ok(())
+    }
+
+    /// Run a single round against the target (and optionally the compare) endpoint.
+    async fn run_round(&self, cases: &[CorpusCase]) -> Result<RoundResult> {
+        let total_requests = self.resolve_total_requests();
+
+        let target = run_cases(
+            self.target.clone(),
+            cases.to_vec(),
+            self.cfg.concurrency,
+            total_requests,
+        )
+        .await?;
+
+        let compare = if let Some(ref cmp_client) = self.compare {
+            Some(
+                run_cases(
+                    cmp_client.clone(),
+                    cases.to_vec(),
+                    self.cfg.concurrency,
+                    total_requests,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(RoundResult { target, compare })
+    }
+
+    /// Process raw round results into verbose output, round output, and summaries.
+    fn process_round(
+        &self,
+        round: usize,
+        result: RoundResult,
+    ) -> Result<(VerboseRound, RoundOutput, RunSummary, Option<RunSummary>)> {
+        let (target_results, target_duration) = result.target;
+
+        let verbose_target = target_results.iter().map(Into::into).collect();
+        let verbose_compare = result
+            .compare
+            .as_ref()
+            .map(|(cr, _)| cr.iter().map(Into::into).collect());
+
+        let verbose = VerboseRound {
+            round,
+            target: verbose_target,
+            compare: verbose_compare,
+        };
+
+        let target_summary =
+            RunSummary::from_results("target".into(), target_results, target_duration);
+
+        let compare_summary = result
+            .compare
+            .map(|(cr, cd)| RunSummary::from_results("compare".into(), cr, cd));
+
+        // Stream to stdout
+        SummaryReport {
+            name: "target",
+            round,
+            summary: &target_summary,
+        }
+        .render_report(&mut io::stdout())?;
+
+        if let Some(ref cs) = compare_summary {
+            SummaryReport {
+                name: "compare",
+                round,
+                summary: cs,
             }
+            .render_report(&mut io::stdout())?;
+        }
+
+        let output = RoundOutput {
+            round,
+            target: SummaryOutput::from(&target_summary),
+            compare: compare_summary.as_ref().map(SummaryOutput::from),
+        };
+
+        Ok((verbose, output, target_summary, compare_summary))
+    }
+
+    fn resolve_total_requests(&self) -> usize {
+        self.cfg.requests.unwrap_or(self.cfg.corpus_cases)
+    }
+
+    async fn write_benchmark_output(
+        &self,
+        output: &BenchmarkOutput,
+        verbose: &VerboseOutput,
+    ) -> Result<()> {
+        if let Some(ref dir) = self.cfg.output_dir {
+            export::write_outputs(dir, output, verbose, self.cfg.verbose).await?;
         }
         Ok(())
     }
 
-    /// Run all cases against the primary endpoint and return aggregated results.
-    pub async fn run_target(
+    /// Render the final aggregated / compare report to stdout. Pure display, no data returned.
+    fn render_final_report(
         &self,
-        cases: &[CorpusCase],
-        requests: Option<usize>,
-    ) -> Result<RunSummary> {
-        let total_requests = resolve_total_requests(cases.len(), requests)?;
-        let (results, duration) = run_cases(
-            self.target.clone(),
-            cases.to_vec(),
-            self.concurrency,
-            total_requests,
-        )
-        .await?;
-        Ok(RunSummary::from_results("target".into(), results, duration))
+        target_summaries: &[RunSummary],
+        compare_summaries: Option<&[RunSummary]>,
+    ) -> io::Result<()> {
+        let has_compare = compare_summaries.is_some();
+        let multi_round = self.cfg.rounds > 1;
+        let w = &mut io::stdout();
+
+        if !multi_round && has_compare {
+            let report = CompareReport {
+                target: &target_summaries[0],
+                compare: &compare_summaries.unwrap()[0],
+            };
+            report.render_report(w)?;
+            return Ok(());
+        }
+
+        if !multi_round {
+            return Ok(());
+        }
+
+        let agg_target = AggregatedSummary::from_rounds("target", target_summaries);
+
+        if let Some(cmp) = compare_summaries {
+            let agg_compare = AggregatedSummary::from_rounds("compare", cmp);
+            let report = CompareAggReport {
+                target: &agg_target,
+                compare: &agg_compare,
+            };
+            report.render_report(w)?;
+        } else {
+            // Multi-round target only
+            agg_target.render_report(w)?;
+        }
+
+        Ok(())
     }
 
-    /// Run all cases against both endpoints **sequentially** and return both summaries.
-    ///
-    /// The target endpoint is benchmarked first, then the compare endpoint.
-    /// This avoids resource contention on a single host that would skew
-    /// latency measurements.  Returns `(target, compare)`.
-    pub async fn run_compare(
-        &self,
-        cases: &[CorpusCase],
-        requests: Option<usize>,
-    ) -> Result<(RunSummary, RunSummary)> {
-        let compare = self
-            .compare
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("compare endpoint not configured"))?
-            .clone();
+    /// Build the aggregated output for JSON export. Pure data transformation, no side effects.
+    fn build_aggregated_output(
+        target_summaries: &[RunSummary],
+        compare_summaries: Option<&[RunSummary]>,
+    ) -> Option<AggregatedOutput> {
+        // Only produce aggregated output for multi-round runs
+        if target_summaries.len() <= 1 {
+            return None;
+        }
 
-        let total_requests = resolve_total_requests(cases.len(), requests)?;
+        let agg_target = AggregatedSummary::from_rounds("target", target_summaries);
 
-        // --- target first ---
-        println!("  benchmarking target endpoint ...");
-        let (target_results, target_duration) = run_cases(
-            self.target.clone(),
-            cases.to_vec(),
-            self.concurrency,
-            total_requests,
-        )
-        .await?;
+        let compare = compare_summaries.map(|cmp| {
+            let agg_compare = AggregatedSummary::from_rounds("compare", cmp);
+            AggSummaryOutput::from(&agg_compare)
+        });
 
-        // --- then compare ---
-        println!("  benchmarking compare endpoint ...");
-        let (compare_results, compare_duration) =
-            run_cases(compare, cases.to_vec(), self.concurrency, total_requests).await?;
-
-        Ok((
-            RunSummary::from_results("target".into(), target_results, target_duration),
-            RunSummary::from_results("compare".into(), compare_results, compare_duration),
-        ))
-    }
-}
-
-fn resolve_total_requests(cases_len: usize, requests: Option<usize>) -> Result<usize> {
-    if cases_len == 0 {
-        bail!("no corpus cases after filtering");
-    }
-    match requests {
-        Some(0) => bail!("requests must be greater than 0"),
-        Some(n) => Ok(n),
-        None => Ok(cases_len),
+        Some(AggregatedOutput {
+            target: AggSummaryOutput::from(&agg_target),
+            compare,
+        })
     }
 }
 
 /// Dispatch all cases to `client` with bounded concurrency.
-///
-/// All tasks are queued upfront and up to `concurrency` run in parallel at
-/// any time (Semaphore), so there is no chunk-level serialisation.
-/// Returns `(case_results, wall_clock_duration)`.
 async fn run_cases(
     client: HttpClient,
     cases: Vec<CorpusCase>,
@@ -233,9 +326,6 @@ async fn run_cases(
         let request = case.request.clone();
         let block_id = BlockId::latest();
 
-        // All tasks are queued immediately.  Each task acquires the permit
-        // itself, so the main loop is never blocked and true concurrency is
-        // bounded by the semaphore without chunk-level serialisation.
         set.spawn(async move {
             let _permit = sem.acquire_owned().await?;
             let start = Instant::now();

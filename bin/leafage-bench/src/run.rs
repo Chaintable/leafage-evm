@@ -1,10 +1,10 @@
+use crate::bench_runner::{BenchRunner, RunConfig};
 use crate::corpus::ClassLabel;
 use crate::corpus::Corpus;
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
 use std::str::FromStr;
-use crate::bench_runner::BenchRunner;
 
 /// Run the benchmark against one or two RPC endpoints.
 #[derive(Debug, Args)]
@@ -19,17 +19,10 @@ pub struct Command {
     pub label: Option<String>,
 
     /// HTTP(S) URL of the primary RPC endpoint (leafage-evm).
-    ///
-    /// Measures latency distribution (p50/p95/p99/p999), throughput (QPS),
-    /// and error rate for the target endpoint. When --compare is omitted,
-    /// only this endpoint is benchmarked to establish a performance baseline.
     #[arg(long, value_name = "URL")]
     pub target: String,
 
     /// HTTP(S) URL of the comparison RPC endpoint (geth).
-    ///
-    /// When provided, every case is replayed against both endpoints and the
-    /// results are compared side-by-side (latency delta, QPS ratio, error rate).
     #[arg(long, value_name = "URL")]
     pub compare: Option<String>,
 
@@ -40,22 +33,31 @@ pub struct Command {
     /// Total number of requests to send per endpoint per round.
     ///
     /// Defaults to the number of cases in the (filtered) corpus.
-    /// Set to a larger value to replay the corpus in a round-robin loop.
     #[arg(long, value_name = "N")]
     pub requests: Option<usize>,
 
     /// Number of benchmark rounds to run.
-    ///
-    /// When greater than 1, the benchmark is repeated and an aggregated
-    /// summary with mean and standard deviation is printed after all rounds.
     #[arg(long, default_value_t = 1, value_name = "N")]
     pub rounds: usize,
 
     /// Shuffle seed for corpus ordering.
-    ///
-    /// When set, corpus shuffle is deterministic and reproducible.
     #[arg(long, value_name = "N")]
     pub seed: Option<u64>,
+
+    /// Output directory for export files.
+    ///
+    /// Files written to this directory:
+    ///   summary.json  — aggregated statistics for every round
+    ///   verbose.json  — per-request details (only when --verbose is set)
+    #[arg(long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+
+    /// Include per-request details (return value, error, latency) in a
+    /// separate verbose.json file.
+    ///
+    /// Only effective when --output-dir is set.
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 impl Command {
@@ -67,9 +69,23 @@ impl Command {
             println!("compare     : {cmp}");
         }
         println!("concurrency : {}", self.concurrency);
-        println!("requests    : {}", self.requests.map(|v| v.to_string()).unwrap_or_else(|| "auto(corpus size)".to_string()));
+        println!(
+            "requests    : {}",
+            self.requests
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "auto(corpus size)".to_string())
+        );
         println!("rounds      : {}", self.rounds);
-        println!("shuffle-seed: {}", self.seed.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()));
+        println!(
+            "shuffle-seed: {}",
+            self.seed
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        if let Some(ref dir) = self.output_dir {
+            println!("output-dir  : {}", dir.display());
+            println!("verbose     : {}", self.verbose);
+        }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -82,13 +98,22 @@ impl Command {
         corpus.filter_label(label);
 
         let effective_requests = self.requests.unwrap_or(corpus.cases.len());
-        println!("effective requests per round: {}", effective_requests);
+        println!("effective requests per round: {effective_requests}");
         println!();
-
-        let runner = BenchRunner::new(&self.target, self.compare.as_deref(), self.concurrency)?;
-        runner
-            .run(corpus, self.requests, self.seed, self.rounds)
-            .await?;
+        let cfg = RunConfig {
+            requests: self.requests,
+            shuffle_seed: self.seed,
+            rounds: self.rounds,
+            output_dir: self.output_dir,
+            verbose: self.verbose,
+            target_url: self.target,
+            compare_url: self.compare,
+            concurrency: self.concurrency,
+            label_filter: self.label,
+            corpus_cases: corpus.cases.len(),
+        };
+        let runner = BenchRunner::new(cfg)?;
+        runner.run(corpus).await?;
         Ok(())
     }
 }

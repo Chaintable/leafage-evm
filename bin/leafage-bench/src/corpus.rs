@@ -98,7 +98,7 @@ pub struct Classification {
 }
 
 /// Complexity tier of an `eth_call` case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, serde::Serialize)]
 pub enum ClassLabel {
     /// Lightweight read: simple getter, ≤ 1 argument, or known cheap selector
     /// (`balanceOf`, `totalSupply`, `decimals`, …).
