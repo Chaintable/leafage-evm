@@ -236,6 +236,9 @@ impl BenchRunner {
         verbose: &VerboseOutput,
     ) -> Result<()> {
         if let Some(ref dir) = self.cfg.output_dir {
+            if !dir.exists() {
+                tokio::fs::create_dir_all(dir).await?;
+            }
             export::write_outputs(dir, output, verbose, self.cfg.verbose).await?;
         }
         Ok(())
