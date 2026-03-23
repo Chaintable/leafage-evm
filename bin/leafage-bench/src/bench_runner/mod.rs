@@ -201,7 +201,6 @@ impl BenchRunner {
             .compare
             .map(|(cr, cd)| RunSummary::from_results("compare".into(), cr, cd));
 
-        // Stream to stdout
         SummaryReport {
             name: "target",
             round,
@@ -242,7 +241,6 @@ impl BenchRunner {
         Ok(())
     }
 
-    /// Render the final aggregated / compare report to stdout. Pure display, no data returned.
     fn render_final_report(
         &self,
         target_summaries: &[RunSummary],
@@ -282,7 +280,6 @@ impl BenchRunner {
         Ok(())
     }
 
-    /// Build the aggregated output for JSON export. Pure data transformation, no side effects.
     fn build_aggregated_output(
         target_summaries: &[RunSummary],
         compare_summaries: Option<&[RunSummary]>,
