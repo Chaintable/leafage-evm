@@ -161,3 +161,119 @@ Each request starts at score `0`. Signals add or subtract points:
 
 The 700-case balanced corpus is sufficient for a first-version benchmark that reliably detects
 performance differences of 5 %+ between leafage-evm and geth.
+
+---
+
+## Benchmark Results
+
+> **Command**:
+> ```bash
+> cargo run --bin leafage-bench run \
+>   --corpus ./bin/leafage-bench/corpus/corpus.json \
+>   --target http://<geth>:8545 \
+>   --compare http://<leafage-evm>:8555 \
+>   --concurrency=10 \
+>   --requests=1000 \
+>   --rounds=20 \
+>   --seed=20 \
+>   --output-dir=bench-result \
+>   --verbose
+> ```
+
+Aggregated over 20 rounds (mean ± stddev):
+
+### Overall
+
+| Metric   | leafage-evm (target)  | geth (compare)   | delta    |
+|----------|-----------------------|------------------|----------|
+| QPS      | 121.86 ± 18.03        | 120.32 ± 19.34   | −1.27%   |
+| p50 ms   | 67.06 ± 2.53          | 67.39 ± 4.27     | +0.49%   |
+| p90 ms   | 133.21 ± 51.26        | 132.00 ± 56.19   | −0.91%   |
+| p95 ms   | 165.49 ± 65.54        | 162.78 ± 59.39   | −1.64%   |
+| p99 ms   | 236.05 ± 107.31       | 240.29 ± 80.31   | +1.79%   |
+| p999 ms  | 291.96 ± 138.18       | 334.62 ± 133.02  | +14.61%  |
+
+### By Label
+
+| Label | Metric  | leafage-evm (target)  | geth (compare)   | delta    |
+|-------|---------|-----------------------|------------------|----------|
+| L1    | p50 ms  | 66.84 ± 2.71          | 67.32 ± 4.22     | +0.72%   |
+| L1    | p95 ms  | 171.39 ± 77.72        | 164.59 ± 60.89   | −3.97%   |
+| L1    | p99 ms  | 239.45 ± 110.46       | 264.91 ± 110.86  | +10.63%  |
+| L1    | p999 ms | 284.95 ± 142.95       | 324.74 ± 123.99  | +13.96%  |
+| L2    | p50 ms  | 67.02 ± 2.33          | 67.43 ± 4.21     | +0.62%   |
+| L2    | p95 ms  | 166.13 ± 66.84        | 161.05 ± 55.40   | −3.06%   |
+| L2    | p99 ms  | 245.72 ± 118.00       | 251.82 ± 90.72   | +2.48%   |
+| L2    | p999 ms | 281.40 ± 129.27       | 324.09 ± 124.32  | +15.17%  |
+| L3    | p50 ms  | 67.93 ± 3.16          | 68.16 ± 5.73     | +0.34%   |
+| L3    | p95 ms  | 170.08 ± 66.55        | 157.58 ± 65.40   | −7.35%   |
+| L3    | p99 ms  | 251.91 ± 123.37       | 262.91 ± 102.56  | +4.37%   |
+| L3    | p999 ms | 271.68 ± 134.28       | 309.19 ± 127.58  | +13.81%  |
+
+**Summary**: At p50 both implementations are essentially identical (~67 ms). leafage-evm shows a
+consistent tail-latency advantage at p999: **−14 %** overall vs geth, and **−14 % / −15 % / −14 %**
+for L1 / L2 / L3 respectively. Error rate was 0 % across all 20 rounds on both endpoints.
+
+---
+
+## Reference Deployment Configuration
+
+The benchmark was run against the following two services.
+
+### beacon (consensus layer)
+
+- **Image**: `sigp/lighthouse:v8.1.1`
+
+### geth (execution layer)
+
+- **Image**: custom debank-patched build based on `v1.16.7`
+
+```
+geth
+--datadir=/var/data
+--syncmode=full
+--state.scheme=path
+--snapshot=true
+--cache=4096
+--http
+--http.addr=0.0.0.0
+--http.port=8545
+--http.vhosts=*
+--http.corsdomain=*
+--http.api=net,web3,eth,admin,debug,txpool,engine
+--maxpeers=200
+--rpc.allow-unprotected-txs
+--allow-insecure-unlock
+--rpc.gascap=250000000
+--authrpc.addr=0.0.0.0
+--authrpc.port=8551
+--authrpc.jwtsecret=/var/data/geth/jwtsecret
+--authrpc.vhosts=*
+--db.engine=pebble
+--history.transactions=0
+--ws
+--ws.addr=0.0.0.0
+--ws.port=8546
+--ws.api=net,web3,eth,admin
+--pprof
+--pprof.addr=0.0.0.0
+--pprof.port=9260
+```
+
+### leafage-evm
+
+- **Version**: `chaintable-v102-debank-14` 
+
+```
+leafage-evm
+standalone
+--db-path=/nodex
+--listen-addr=0.0.0.0:8555
+--chain-cfg=1
+--meta=<meta-endpoint>
+--kafka-s3-config=<kafka-s3-config-json>
+--etcd-config=<etcd-config-json>
+--warmup-tokens=50000
+--readiness-addr=0.0.0.0:6000
+```
+
