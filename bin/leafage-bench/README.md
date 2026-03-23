@@ -164,6 +164,20 @@ performance differences of 5 %+ between leafage-evm and geth.
 
 ---
 
+## Test Environment
+
+Both geth and leafage-evm ran on the **same** AWS EC2 `i3en.2xlarge` instance:
+
+| |                                                                        |
+|---|------------------------------------------------------------------------|
+| **Instance type** | `i3en.2xlarge`                                                         |
+| **CPU** | Intel Xeon Platinum 8259CL @ 2.50 GHz (4 cores / 8 vCPUs, Hyper-Threading) |
+| **L3 cache** | 35.75 MiB                                                              |
+| **Memory** | 64 GiB                                                                 |
+| **Storage** | NVMe                                                                   |
+
+---
+
 ## Benchmark Results
 
 > **Command**:
