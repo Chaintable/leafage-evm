@@ -93,7 +93,7 @@
 4. **StablecoinDEX 的复杂度** — 4952 行最大预编译，CLOB 订单簿。需要评估是否完整移植还是 stub 不常用的方法
 5. **cross-precompile 调用** — TIP20 transfer 调 TIP403、FeeManager 调 TIP20 等。当前各预编译独立移植 + stub，最后需要连接起来验证
 6. **Rust 工具链** — 项目没有 rust-toolchain.toml，CI 用什么版本？是否需要添加？
-7. **TempoApiImpl 与 MainnetApiImpl 类型冲突** — 两者都是 `ApiImpl<DB, MainnetSpecId, NoneEvmCustomConfig>`，EvmExecutor 不能对同类型 impl 两次。需要用 marker type 或独立 struct 区分
+7. ~~**TempoApiImpl 与 MainnetApiImpl 类型冲突**~~ — 已解决：使用 `TempoEvmCustomConfig` marker type 区分。`TempoApiImpl<DB> = ApiImpl<DB, MainnetSpecId, TempoEvmCustomConfig>`，Mainnet 用 `NoneEvmCustomConfig`。同时需要在 build.rs 的 macro 调用中显式标注 `None::<NoneEvmCustomConfig>` 和 `None::<TempoEvmCustomConfig>` 以消除类型推导歧义
 
 ## 后续工作（当前 scope 外）
 

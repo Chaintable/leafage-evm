@@ -138,6 +138,7 @@ pub enum MultiChainCfgEnv {
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
+    Tempo(CfgEnv<MainnetSpecId>),
 }
 
 impl MultiChainCfgEnv {
@@ -148,6 +149,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
         }
     }
 }

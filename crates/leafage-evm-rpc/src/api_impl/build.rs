@@ -1,6 +1,8 @@
 use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
+use super::api_impl::NoneEvmCustomConfig;
+use super::tempo::api::TempoEvmCustomConfig;
 use super::token_collector::TokenCollector;
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
@@ -151,13 +153,18 @@ where
         }
 
         match self.cfg.clone() {
-            MultiChainCfgEnv::Mainnet(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Mainnet(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None),
             MultiChainCfgEnv::Bsc(env) => run_chain_setup!(env, None),
             MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Tempo(env) => {
+                run_chain_setup!(env, None::<TempoEvmCustomConfig>)
+            }
         };
 
         let handle = server.start(rpc_module);
