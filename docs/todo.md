@@ -18,6 +18,7 @@
 14. **ValidatorConfigV2 Ed25519 签名验证 stubbed** — leafage 不包含 `commonware-cryptography` crate，ed25519 验证被 stub 为始终成功。不影响 view call，mutate 仅在 simulateTransactions 中执行
 15. **StablecoinDEX token transfers stubbed** — transfer/transfer_from 被 stub（leafage 是只读节点）。DEX 内部余额记账（balance_of, set_balance）正常工作，view 方法（quote_swap_*, get_order, balance_of）可正确读取链上状态
 16. **extend_tempo_precompiles** — 注册全部 9 个预编译到 PrecompilesMap，使用 set_precompile_lookup 闭包。TIP-20 用前缀匹配，其余用精确地址匹配
+17. **TempoEvm wrapper** — 使用 `TempoHandler`（thin wrapper over default `Handler` trait impl）而非 `MainnetHandler` 直接使用，因为 `ExecuteEvm`/`InspectEvm` 需要具体 handler 类型。模式与 CosmosHandler 一致（无自定义方法覆盖）。使用 `MainnetSpecId::PRAGUE` 作为 spec（`AMSTERDAM` 也可用但 `PRAGUE` 足够覆盖 Tempo 需求）
 
 ## Stub / TODO 点（代码中已标记）
 
