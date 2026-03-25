@@ -8,6 +8,10 @@
 4. **revm 版本** — 不升级 revm（保持 33.1），用 LeafageStorageProvider 适配层桥接
 5. **GasParams** — 不使用 revm 36 的 GasParams API，改为 TempoGasCosts hardcoded 常量
 6. **编译工具链** — 使用 Rust 1.87.0（1.93.1 与 tokio 不兼容）
+7. **StorageKey for u64** — 为 `u64` 添加 `StorageKey` impl（TIP403Registry 的 `Mapping<u64, PolicyRecord>` 需要）
+8. **AccountKeychain 签名验证不需要 p256/sha2 crate** — leafage 只读取 keychain state，不做签名验证。`validate_keychain_authorization` 验证 key 存在性、revocation、expiry 和 sig_type 匹配，但实际密码学验证在 tx handler 层（不在预编译 scope）
+9. **TempoPrecompileError::under_overflow()** — 添加 Panic(0x11) 辅助方法，TIP403Registry 的 policy counter overflow 需要
+10. **TempoHardfork::is_t0()** — 添加（AccountKeychain expiry 检查需要），与其他 is_*() 一样始终返回 true
 
 ## Stub / TODO 点（代码中已标记）
 
@@ -30,6 +34,22 @@
 ### TIP20Factory (tip20_factory.rs)
 - [x] **Core logic ported** -- `create_token`, `create_token_reserved_address`, `is_tip20`, `get_token_address`, `compute_tip20_address`
 - [x] **Dispatch** -- `createToken` (mutate), `isTIP20` (view), `getTokenAddress` (view)
+
+### AccountKeychain (account_keychain.rs)
+- [x] **Core logic ported** -- key authorization, revocation, spending limits, transaction key, active key validation
+- [x] **Dispatch** -- `authorizeKey` (mutate), `revokeKey` (mutate), `updateSpendingLimit` (mutate), `getKey` (view), `getRemainingLimit` (view), `getTransactionKey` (view)
+- [x] **AuthorizedKey Storable** -- manually implemented packed storage layout (u8 + u64 + bool + bool = 11 bytes)
+- [x] **Internal methods ported** -- `validate_keychain_authorization`, `verify_and_update_spending`, `refund_spending_limit`, `authorize_transfer`, `authorize_approve`
+- [ ] **P256/WebAuthn signature verification** -- not needed for leafage eth_call mode. `validate_keychain_authorization` reads key state and checks expiry/type match, but actual signature crypto is done by the transaction handler (outside precompile scope)
+- [ ] **Cross-precompile wiring** -- TIP20 calls `authorize_transfer` / `authorize_approve` for spending limit enforcement. Currently each precompile is independent; needs wiring in Task 5/6
+
+### TIP403Registry (tip403_registry.rs)
+- [x] **Core logic ported** -- policy CRUD, whitelist/blacklist/compound authorization, admin management
+- [x] **Dispatch** -- all 12 functions: `policyIdCounter`, `policyExists`, `policyData`, `isAuthorized`, `isAuthorizedSender`, `isAuthorizedRecipient`, `isAuthorizedMintRecipient`, `compoundPolicyData` (views); `createPolicy`, `createPolicyWithAccounts`, `setPolicyAdmin`, `modifyPolicyWhitelist`, `modifyPolicyBlacklist`, `createCompoundPolicy` (mutates)
+- [x] **PolicyData/CompoundPolicyData/PolicyRecord Storable** -- manually implemented packed storage layouts
+- [x] **AuthRole** -- hardfork-aware role selection (always T2+ in leafage)
+- [x] **is_policy_lookup_error helper** -- ported for TIP20 cross-precompile error detection
+- [ ] **Cross-precompile wiring** -- TIP20 `is_transfer_authorized` needs to call TIP403Registry. Currently stubbed to always allow
 
 ### ValidatorConfig (validator_config.rs)
 - [x] **Core logic ported** -- owner management, validator CRUD, DKG ceremony epoch, status changes

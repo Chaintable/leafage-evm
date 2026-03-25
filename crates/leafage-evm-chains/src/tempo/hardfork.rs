@@ -12,6 +12,9 @@ pub enum TempoHardfork {
 }
 
 impl TempoHardfork {
+    pub fn is_t0(&self) -> bool {
+        true
+    }
     pub fn is_t1(&self) -> bool {
         true
     }

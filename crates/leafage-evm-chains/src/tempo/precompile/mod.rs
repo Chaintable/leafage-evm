@@ -9,6 +9,7 @@
 //! - [`storage`] -- `PrecompileStorageProvider` trait, `LeafageStorageProvider`, `StorageCtx`
 //! - [`storage_types`] -- `Slot`, `Mapping`, packing helpers, primitive type encoders
 
+pub mod account_keychain;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
@@ -16,6 +17,7 @@ pub mod storage;
 pub mod storage_types;
 pub mod tip20;
 pub mod tip20_factory;
+pub mod tip403_registry;
 pub mod validator_config;
 
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};

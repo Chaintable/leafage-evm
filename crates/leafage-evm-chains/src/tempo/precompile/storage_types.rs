@@ -947,6 +947,13 @@ impl_uint_storable! {
     u128, 16;
 }
 
+impl StorageKey for u64 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
 // -- alloy B256 --
 
 impl sealed::OnlyPrimitives for alloy::primitives::B256 {}
