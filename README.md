@@ -136,6 +136,57 @@ RUST_LOG=info ./target/release/leafage-evm file-migrate \
   --db-path /path/to/leafage/db
 ```
 
+## Benchmark
+
+`leafage-bench` is a CLI tool for benchmarking `eth_call` performance between leafage-evm and geth.
+
+### Build
+
+```bash
+cargo build --release -p leafage-bench
+```
+
+### Corpus
+
+The benchmark corpus (`bin/leafage-bench/corpus/corpus.json`) is tracked via **Git LFS**. Pull it after cloning:
+
+```bash
+git lfs pull
+```
+
+### Subcommands
+
+#### `run` — Run the benchmark
+
+```bash
+./target/release/leafage-bench run \
+  --corpus bin/leafage-bench/corpus/corpus.json \
+  --target http://leafage-evm:8545 \
+  --compare http://geth:8545
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--corpus` / `-c` | - | Path to the corpus JSON file (required) |
+| `--target` | - | Primary RPC endpoint URL (leafage-evm) (required) |
+| `--compare` | - | Comparison RPC endpoint URL (geth) |
+| `--label` | all | Only run cases with this complexity label: `L1`, `L2`, `L3` |
+| `--concurrency` | 10 | Number of concurrent requests per endpoint |
+| `--requests` | corpus size | Total requests per endpoint per round |
+| `--rounds` | 1 | Number of benchmark rounds |
+| `--seed` | - | Shuffle seed for corpus ordering |
+| `--output-dir` | - | Directory for export files (`summary.json`, `verbose.json`) |
+| `--verbose` | false | Write per-request details to `verbose.json` (requires `--output-dir`) |
+
+#### `inspect` — Inspect the corpus
+
+Print summary statistics of the corpus without running any benchmark:
+
+```bash
+./target/release/leafage-bench inspect \
+  --corpus bin/leafage-bench/corpus/corpus.json
+```
+
 ## Documentation
 
 | Document | Description |

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/leafage-evm", "crates/*"]
+members = ["bin/leafage-bench","bin/leafage-evm", "crates/*"]
 resolver = "2"
 
 [workspace.package]
@@ -29,7 +29,7 @@ async-trait = "0.1"
 anyhow = "1.0"
 tokio = { version = "1.44", features = ["full"] }
 tokio-util = "0.7"
-clap = { version = "4.3", features = ["derive"] }
+clap = { version = "4.3", features = ["derive", "env"] }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
 tikv-jemalloc-sys = { version = "0.6", features = [
@@ -115,6 +115,10 @@ pprof = { version = "0.11", features = ["flamegraph"] }
 libmdbx = { git = "https://github.com/Chaintable/libmdbx-rs.git", tag = "1.0.0" }
 page_size = "0.6.0"
 dashmap = "6.1"
+
+# bench
+comfy-table = "7.1"
+rand = "0.10"
 
 [profile.release]
 opt-level = 3
