@@ -13,12 +13,14 @@ pub mod account_keychain;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
+pub mod stablecoin_dex;
 pub mod storage;
 pub mod storage_types;
 pub mod tip20;
 pub mod tip20_factory;
 pub mod tip403_registry;
 pub mod validator_config;
+pub mod validator_config_v2;
 
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};
 pub use storage::{
@@ -32,6 +34,7 @@ pub use storage_types::{
 
 use alloy::primitives::{address, Address, Bytes};
 use alloy::sol_types::{SolCall, SolError};
+use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
 use revm::precompile::{PrecompileOutput, PrecompileResult};
 
 // ===========================================================================
@@ -219,4 +222,96 @@ pub fn fill_precompile_output(
         output.gas_refunded = storage.gas_refunded();
     }
     output
+}
+
+// ===========================================================================
+// Precompile registration
+// ===========================================================================
+
+/// Registers all 9 Tempo precompiles into the given [`PrecompilesMap`].
+///
+/// Uses [`set_precompile_lookup`] to install a closure that matches addresses to
+/// the appropriate Tempo precompile. TIP-20 tokens use prefix matching; all other
+/// precompiles use exact address matching.
+///
+/// Each precompile is wrapped via the [`tempo_precompile!`] macro which handles
+/// DELEGATECALL rejection, `LeafageStorageProvider` setup, and gas accounting.
+pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, chain_id: u64) {
+    precompiles.set_precompile_lookup(move |address: &Address| {
+        if tip20::is_tip20_prefix(*address) {
+            Some(create_tip20_precompile(*address, chain_id))
+        } else if *address == TIP20_FACTORY_ADDRESS {
+            Some(create_tip20_factory_precompile(chain_id))
+        } else if *address == TIP403_REGISTRY_ADDRESS {
+            Some(create_tip403_registry_precompile(chain_id))
+        } else if *address == TIP_FEE_MANAGER_ADDRESS {
+            Some(create_fee_manager_precompile(chain_id))
+        } else if *address == STABLECOIN_DEX_ADDRESS {
+            Some(create_stablecoin_dex_precompile(chain_id))
+        } else if *address == NONCE_PRECOMPILE_ADDRESS {
+            Some(create_nonce_precompile(chain_id))
+        } else if *address == VALIDATOR_CONFIG_ADDRESS {
+            Some(create_validator_config_precompile(chain_id))
+        } else if *address == ACCOUNT_KEYCHAIN_ADDRESS {
+            Some(create_account_keychain_precompile(chain_id))
+        } else if *address == VALIDATOR_CONFIG_V2_ADDRESS {
+            Some(create_validator_config_v2_precompile(chain_id))
+        } else {
+            None
+        }
+    });
+}
+
+fn create_tip20_precompile(address: Address, chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("TIP20", chain_id, |input| {
+        tip20::TIP20Token::from_address_unchecked(address)
+    })
+}
+
+fn create_tip20_factory_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("TIP20Factory", chain_id, |input| {
+        tip20_factory::TIP20Factory::new()
+    })
+}
+
+fn create_tip403_registry_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("TIP403Registry", chain_id, |input| {
+        tip403_registry::TIP403Registry::new()
+    })
+}
+
+fn create_fee_manager_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("TipFeeManager", chain_id, |input| {
+        fee_manager::TipFeeManager::new()
+    })
+}
+
+fn create_stablecoin_dex_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("StablecoinDEX", chain_id, |input| {
+        stablecoin_dex::StablecoinDEX::new()
+    })
+}
+
+fn create_nonce_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("NonceManager", chain_id, |input| {
+        nonce::NonceManager::new()
+    })
+}
+
+fn create_validator_config_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("ValidatorConfig", chain_id, |input| {
+        validator_config::ValidatorConfig::new()
+    })
+}
+
+fn create_account_keychain_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("AccountKeychain", chain_id, |input| {
+        account_keychain::AccountKeychain::new()
+    })
+}
+
+fn create_validator_config_v2_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("ValidatorConfigV2", chain_id, |input| {
+        validator_config_v2::ValidatorConfigV2::new()
+    })
 }

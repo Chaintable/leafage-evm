@@ -954,6 +954,22 @@ impl StorageKey for u64 {
     }
 }
 
+impl StorageKey for u128 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
+impl sealed::OnlyPrimitives for i16 {}
+
+impl StorageKey for i16 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
 // -- alloy B256 --
 
 impl sealed::OnlyPrimitives for alloy::primitives::B256 {}
@@ -1346,6 +1362,19 @@ where
         elem_slot.write(value)?;
         let mut length_slot = Slot::<U256>::new(self.len_slot, self.address);
         length_slot.write(U256::from(length + 1))
+    }
+
+    /// Removes and discards the last element of the vector.
+    ///
+    /// Decrements the length by one. The storage slot of the removed element is NOT zeroed --
+    /// callers are responsible for clearing the element's data before calling `pop` if needed.
+    pub fn pop(&self) -> Result<()> {
+        let length = self.len()?;
+        if length == 0 {
+            return Err(TempoPrecompileError::Fatal("Vec is empty".into()));
+        }
+        let mut length_slot = Slot::<U256>::new(self.len_slot, self.address);
+        length_slot.write(U256::from(length - 1))
     }
 }
 

@@ -12,6 +12,12 @@
 8. **AccountKeychain 签名验证不需要 p256/sha2 crate** — leafage 只读取 keychain state，不做签名验证。`validate_keychain_authorization` 验证 key 存在性、revocation、expiry 和 sig_type 匹配，但实际密码学验证在 tx handler 层（不在预编译 scope）
 9. **TempoPrecompileError::under_overflow()** — 添加 Panic(0x11) 辅助方法，TIP403Registry 的 policy counter overflow 需要
 10. **TempoHardfork::is_t0()** — 添加（AccountKeychain expiry 检查需要），与其他 is_*() 一样始终返回 true
+11. **StorageKey for u128** — 为 `u128` 添加 `StorageKey` impl（StablecoinDEX 的 `Mapping<u128, Order>` 需要）
+12. **StorageKey for i16** — 为 `i16` 添加 `StorageKey` impl（StablecoinDEX 的 `Mapping<i16, TickLevel>` 和 bitmap 需要）
+13. **VecHandler::pop()** — 添加 pop 方法（ValidatorConfigV2 的 swap-and-pop deactivation 需要）
+14. **ValidatorConfigV2 Ed25519 签名验证 stubbed** — leafage 不包含 `commonware-cryptography` crate，ed25519 验证被 stub 为始终成功。不影响 view call，mutate 仅在 simulateTransactions 中执行
+15. **StablecoinDEX token transfers stubbed** — transfer/transfer_from 被 stub（leafage 是只读节点）。DEX 内部余额记账（balance_of, set_balance）正常工作，view 方法（quote_swap_*, get_order, balance_of）可正确读取链上状态
+16. **extend_tempo_precompiles** — 注册全部 9 个预编译到 PrecompilesMap，使用 set_precompile_lookup 闭包。TIP-20 用前缀匹配，其余用精确地址匹配
 
 ## Stub / TODO 点（代码中已标记）
 
@@ -56,6 +62,23 @@
 - [x] **ip_validation inlined** -- `ensure_address_is_ip_port` inlined as local function (was question #3 -- resolved: used by ValidatorConfig for address validation)
 - [x] **Hardfork gating** -- `changeValidatorStatusByIndex` always available (leafage runs latest spec, no T0/T1 distinction)
 - [x] **Validator Storable** -- manually implemented packed storage layout matching `#[derive(Storable)]` output
+
+### ValidatorConfigV2 (validator_config_v2.rs)
+- [x] **Core logic ported** -- Config, ValidatorRecord Storable, all view/mutate methods, migration from V1
+- [x] **Dispatch** -- all 20 functions: `owner`, `getActiveValidators`, `getInitializedAtHeight`, `validatorCount`, `validatorByIndex`, `validatorByAddress`, `validatorByPublicKey`, `getNextNetworkIdentityRotationEpoch`, `isInitialized` (views); `addValidator`, `deactivateValidator`, `rotateValidator`, `setFeeRecipient`, `setIpAddresses`, `transferValidatorOwnership`, `transferOwnership`, `setNetworkIdentityRotationEpoch`, `migrateValidator`, `initializeIfMigrated` (mutates)
+- [x] **Config/ValidatorRecord Storable** -- manually implemented packed storage layouts
+- [x] **IP validation** -- ensure_address_is_ip_port + ensure_address_is_ip + ingress_key hashing
+- [x] **Active indices swap-and-pop** -- O(1) deactivation with backpointer update
+- [ ] **Ed25519 signature verification** -- stubbed (leafage does not depend on commonware-cryptography)
+
+### StablecoinDEX (stablecoin_dex.rs)
+- [x] **Core logic ported** -- CLOB orderbook, tick-based pricing, order CRUD, swap routing, quote functions
+- [x] **Dispatch** -- all 25 functions: `balanceOf`, `getOrder`, `getTickLevel`, `pairKey`, `books`, `nextOrderId`, `quoteSwapExactAmountIn`, `quoteSwapExactAmountOut`, `MIN_TICK`, `MAX_TICK`, `TICK_SPACING`, `PRICE_SCALE`, `MIN_ORDER_AMOUNT`, `MIN_PRICE`, `MAX_PRICE`, `tickToPrice`, `priceToTick` (views); `place`, `placeFlip`, `createPair`, `withdraw`, `cancel`, `cancelStaleOrder`, `swapExactAmountIn`, `swapExactAmountOut` (mutates)
+- [x] **Order/TickLevel/OrderbookData Storable** -- manually implemented packed storage layouts
+- [x] **Tick bitmap** -- efficient bitmap word traversal for price discovery (bid/ask)
+- [x] **Multi-hop routing** -- find_trade_path via LCA algorithm
+- [ ] **Token transfers** -- transfer/transfer_from stubbed (leafage is read-only)
+- [ ] **Cross-precompile wiring** -- TIP20Factory.is_tip20, TIP403Registry.is_authorized_as, FeeManager.validate_usd_currency all called directly
 
 ### Storage 层 (storage.rs)
 - [ ] **Journal checkpoints** — 被 stub（EvmInternals 0.25.2 不暴露 checkpoint 操作）。leafage 是只读场景，实际不需要 checkpoint，但如果 simulateTransactions 中的 mutate 操作需要 rollback 语义，可能有问题
