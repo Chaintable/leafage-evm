@@ -12,6 +12,7 @@
 pub mod error;
 pub mod storage;
 pub mod storage_types;
+pub mod tip20;
 
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};
 pub use storage::{
