@@ -1097,3 +1097,273 @@ impl Storable for String {
         Bytes::delete(storage, slot, ctx)
     }
 }
+
+// ===========================================================================
+// Vec<T> (Solidity-compatible dynamic array)
+// ===========================================================================
+
+/// Computes the data start slot for a dynamic array: `keccak256(len_slot)`.
+fn calc_data_slot(len_slot: U256) -> U256 {
+    U256::from_be_bytes(keccak256(len_slot.to_be_bytes::<32>()).0)
+}
+
+impl<T> StorableType for Vec<T>
+where
+    T: Storable,
+{
+    const LAYOUT: Layout = Layout::Slots(1);
+    const IS_DYNAMIC: bool = true;
+    type Handler = VecHandler<T>;
+
+    fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
+        VecHandler::new(slot, address)
+    }
+}
+
+impl<T> Storable for Vec<T>
+where
+    T: Storable,
+{
+    fn load<S: StorageOps>(storage: &S, len_slot: U256, ctx: LayoutCtx) -> Result<Self> {
+        debug_assert_eq!(ctx, LayoutCtx::FULL, "Dynamic arrays cannot be packed");
+        let length_value = storage.load(len_slot)?;
+        let length = length_value.to::<usize>();
+
+        if length == 0 {
+            return Ok(Self::new());
+        }
+
+        let data_start = calc_data_slot(len_slot);
+        if T::BYTES <= 16 {
+            // Packed elements
+            let mut result = Vec::with_capacity(length);
+            let slots_needed = packing::calc_packed_slot_count(length, T::BYTES);
+            for slot_idx in 0..slots_needed {
+                let slot_value = storage.load(data_start + U256::from(slot_idx))?;
+                let packed = packing::PackedSlot(slot_value);
+                let elems_per_slot = 32 / T::BYTES;
+                let start_elem = slot_idx * elems_per_slot;
+                let end_elem = (start_elem + elems_per_slot).min(length);
+                for elem_idx in start_elem..end_elem {
+                    let loc = packing::calc_element_loc(elem_idx, T::BYTES);
+                    let elem = T::load(&packed, U256::ZERO, LayoutCtx::packed(loc.offset_bytes))?;
+                    result.push(elem);
+                }
+            }
+            Ok(result)
+        } else {
+            // Unpacked (multi-slot) elements
+            let mut result = Vec::with_capacity(length);
+            for elem_idx in 0..length {
+                let elem_slot = data_start + U256::from(elem_idx * T::SLOTS);
+                let elem = T::load(storage, elem_slot, LayoutCtx::FULL)?;
+                result.push(elem);
+            }
+            Ok(result)
+        }
+    }
+
+    fn store<S: StorageOps>(&self, storage: &mut S, len_slot: U256, ctx: LayoutCtx) -> Result<()> {
+        debug_assert_eq!(ctx, LayoutCtx::FULL, "Dynamic arrays cannot be packed");
+        storage.store(len_slot, U256::from(self.len()))?;
+
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        let data_start = calc_data_slot(len_slot);
+        if T::BYTES <= 16 {
+            let elems_per_slot = 32 / T::BYTES;
+            let slots_needed = packing::calc_packed_slot_count(self.len(), T::BYTES);
+            for slot_idx in 0..slots_needed {
+                let mut packed = packing::PackedSlot(U256::ZERO);
+                let start_elem = slot_idx * elems_per_slot;
+                let end_elem = (start_elem + elems_per_slot).min(self.len());
+                for elem_idx in start_elem..end_elem {
+                    let loc = packing::calc_element_loc(elem_idx, T::BYTES);
+                    self[elem_idx].store(
+                        &mut packed,
+                        U256::ZERO,
+                        LayoutCtx::packed(loc.offset_bytes),
+                    )?;
+                }
+                storage.store(data_start + U256::from(slot_idx), packed.0)?;
+            }
+        } else {
+            for (elem_idx, elem) in self.iter().enumerate() {
+                let elem_slot = data_start + U256::from(elem_idx * T::SLOTS);
+                elem.store(storage, elem_slot, LayoutCtx::FULL)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn delete<S: StorageOps>(storage: &mut S, len_slot: U256, ctx: LayoutCtx) -> Result<()> {
+        debug_assert_eq!(ctx, LayoutCtx::FULL, "Dynamic arrays cannot be packed");
+        let length_value = storage.load(len_slot)?;
+        let length = length_value.to::<usize>();
+        storage.store(len_slot, U256::ZERO)?;
+
+        if length == 0 {
+            return Ok(());
+        }
+
+        let data_start = calc_data_slot(len_slot);
+        if T::BYTES <= 16 {
+            let slot_count = packing::calc_packed_slot_count(length, T::BYTES);
+            for slot_idx in 0..slot_count {
+                storage.store(data_start + U256::from(slot_idx), U256::ZERO)?;
+            }
+        } else {
+            for elem_idx in 0..length {
+                let elem_slot = data_start + U256::from(elem_idx * T::SLOTS);
+                T::delete(storage, elem_slot, LayoutCtx::FULL)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Type-safe handler for accessing `Vec<T>` in storage.
+///
+/// Provides full-vector operations (read/write/delete) and individual element access
+/// via `at(index)` with bounds checking or `[index]` without bounds checking.
+#[derive(Debug, Clone)]
+pub struct VecHandler<T: Storable> {
+    len_slot: U256,
+    address: Address,
+    cache: HandlerCache<usize, T::Handler>,
+}
+
+impl<T> Handler<Vec<T>> for VecHandler<T>
+where
+    T: Storable,
+{
+    fn read(&self) -> Result<Vec<T>> {
+        self.as_slot().read()
+    }
+    fn write(&mut self, value: Vec<T>) -> Result<()> {
+        self.as_slot().write(value)
+    }
+    fn delete(&mut self) -> Result<()> {
+        self.as_slot().delete()
+    }
+    fn t_read(&self) -> Result<Vec<T>> {
+        self.as_slot().t_read()
+    }
+    fn t_write(&mut self, value: Vec<T>) -> Result<()> {
+        self.as_slot().t_write(value)
+    }
+    fn t_delete(&mut self) -> Result<()> {
+        self.as_slot().t_delete()
+    }
+}
+
+impl<T> VecHandler<T>
+where
+    T: Storable,
+{
+    /// Creates a new handler for the vector at the given base slot.
+    pub fn new(len_slot: U256, address: Address) -> Self {
+        Self {
+            len_slot,
+            address,
+            cache: HandlerCache::new(),
+        }
+    }
+
+    const fn max_index() -> usize {
+        if T::BYTES <= 16 {
+            u32::MAX as usize / T::BYTES
+        } else {
+            u32::MAX as usize / T::SLOTS
+        }
+    }
+
+    fn as_slot(&self) -> Slot<Vec<T>> {
+        Slot::new(self.len_slot, self.address)
+    }
+
+    /// Returns the data start slot for this array.
+    pub fn data_slot(&self) -> U256 {
+        calc_data_slot(self.len_slot)
+    }
+
+    /// Returns the length of the vector (reads from storage).
+    pub fn len(&self) -> Result<usize> {
+        let slot = Slot::<U256>::new(self.len_slot, self.address);
+        Ok(slot.read()?.to::<usize>())
+    }
+
+    /// Returns whether the vector is empty.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    fn compute_handler(data_start: U256, address: Address, index: usize) -> T::Handler {
+        let (slot, layout_ctx) = if T::BYTES <= 16 {
+            let location = packing::calc_element_loc(index, T::BYTES);
+            (
+                data_start + U256::from(location.offset_slots),
+                LayoutCtx::packed(location.offset_bytes),
+            )
+        } else {
+            (data_start + U256::from(index * T::SLOTS), LayoutCtx::FULL)
+        };
+        T::handle(slot, layout_ctx, address)
+    }
+
+    /// Returns a `Handler` for the element at the given index with bounds checking.
+    pub fn at(&self, index: usize) -> Result<Option<&T::Handler>> {
+        if index >= self.len()? {
+            return Ok(None);
+        }
+        let (data_start, address) = (self.data_slot(), self.address);
+        Ok(Some(self.cache.get_or_insert(&index, || {
+            Self::compute_handler(data_start, address, index)
+        })))
+    }
+
+    /// Pushes a new element to the end of the vector.
+    pub fn push(&self, value: T) -> Result<()>
+    where
+        T::Handler: Handler<T>,
+    {
+        let length = self.len()?;
+        if length >= Self::max_index() {
+            return Err(TempoPrecompileError::Fatal("Vec is at max capacity".into()));
+        }
+        let mut elem_slot = Self::compute_handler(self.data_slot(), self.address, length);
+        elem_slot.write(value)?;
+        let mut length_slot = Slot::<U256>::new(self.len_slot, self.address);
+        length_slot.write(U256::from(length + 1))
+    }
+}
+
+impl<T> Index<usize> for VecHandler<T>
+where
+    T: Storable,
+{
+    type Output = T::Handler;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let (data_start, address) = (self.data_slot(), self.address);
+        self.cache.get_or_insert(&index, || {
+            Self::compute_handler(data_start, address, index)
+        })
+    }
+}
+
+impl<T> IndexMut<usize> for VecHandler<T>
+where
+    T: Storable,
+{
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let (data_start, address) = (self.data_slot(), self.address);
+        self.cache.get_or_insert_mut(&index, || {
+            Self::compute_handler(data_start, address, index)
+        })
+    }
+}
