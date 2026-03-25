@@ -174,7 +174,7 @@ Both geth and leafage-evm ran on the **same** AWS EC2 `i3en.2xlarge` instance:
 | **CPU** | Intel Xeon Platinum 8259CL @ 2.50 GHz (4 cores / 8 vCPUs, Hyper-Threading) |
 | **L3 cache** | 35.75 MiB                                                              |
 | **Memory** | 64 GiB                                                                 |
-| **Storage** | NVMe                                                                   |
+| **Storage** | EBS (IOPS 3000, throughput 300 MB/s)                                   |
 
 ---
 
@@ -184,8 +184,8 @@ Both geth and leafage-evm ran on the **same** AWS EC2 `i3en.2xlarge` instance:
 > ```bash
 > cargo run --bin leafage-bench run \
 >   --corpus ./bin/leafage-bench/corpus/corpus.json \
->   --target http://<geth>:8545 \
->   --compare http://<leafage-evm>:8555 \
+>   --target http://<leafage-evm>:8555 \
+>   --compare http://<geth>:8545 \
 >   --concurrency=10 \
 >   --requests=1000 \
 >   --rounds=20 \
@@ -200,33 +200,34 @@ Aggregated over 20 rounds (mean ± stddev):
 
 | Metric   | leafage-evm (target)  | geth (compare)   | delta    |
 |----------|-----------------------|------------------|----------|
-| QPS      | 121.86 ± 18.03        | 120.32 ± 19.34   | −1.27%   |
-| p50 ms   | 67.06 ± 2.53          | 67.39 ± 4.27     | +0.49%   |
-| p90 ms   | 133.21 ± 51.26        | 132.00 ± 56.19   | −0.91%   |
-| p95 ms   | 165.49 ± 65.54        | 162.78 ± 59.39   | −1.64%   |
-| p99 ms   | 236.05 ± 107.31       | 240.29 ± 80.31   | +1.79%   |
-| p999 ms  | 291.96 ± 138.18       | 334.62 ± 133.02  | +14.61%  |
+| QPS      | 115.09 ± 3.94         | 115.12 ± 2.69    | +0.02%   |
+| p50 ms   | 82.29 ± 2.65          | 81.06 ± 3.13     | −1.49%   |
+| p90 ms   | 111.73 ± 6.63         | 110.54 ± 4.80    | −1.06%   |
+| p95 ms   | 122.46 ± 10.67        | 121.39 ± 5.54    | −0.87%   |
+| p99 ms   | 167.53 ± 44.56        | 177.73 ± 33.24   | +6.09%   |
+| p999 ms  | 199.42 ± 61.40        | 236.86 ± 41.15   | +18.77%  |
 
 ### By Label
 
 | Label | Metric  | leafage-evm (target)  | geth (compare)   | delta    |
 |-------|---------|-----------------------|------------------|----------|
-| L1    | p50 ms  | 66.84 ± 2.71          | 67.32 ± 4.22     | +0.72%   |
-| L1    | p95 ms  | 171.39 ± 77.72        | 164.59 ± 60.89   | −3.97%   |
-| L1    | p99 ms  | 239.45 ± 110.46       | 264.91 ± 110.86  | +10.63%  |
-| L1    | p999 ms | 284.95 ± 142.95       | 324.74 ± 123.99  | +13.96%  |
-| L2    | p50 ms  | 67.02 ± 2.33          | 67.43 ± 4.21     | +0.62%   |
-| L2    | p95 ms  | 166.13 ± 66.84        | 161.05 ± 55.40   | −3.06%   |
-| L2    | p99 ms  | 245.72 ± 118.00       | 251.82 ± 90.72   | +2.48%   |
-| L2    | p999 ms | 281.40 ± 129.27       | 324.09 ± 124.32  | +15.17%  |
-| L3    | p50 ms  | 67.93 ± 3.16          | 68.16 ± 5.73     | +0.34%   |
-| L3    | p95 ms  | 170.08 ± 66.55        | 157.58 ± 65.40   | −7.35%   |
-| L3    | p99 ms  | 251.91 ± 123.37       | 262.91 ± 102.56  | +4.37%   |
-| L3    | p999 ms | 271.68 ± 134.28       | 309.19 ± 127.58  | +13.81%  |
+| L1    | p50 ms  | 82.70 ± 3.19          | 82.43 ± 4.01     | −0.33%   |
+| L1    | p95 ms  | 122.74 ± 10.26        | 122.42 ± 6.88    | −0.27%   |
+| L1    | p99 ms  | 171.70 ± 49.90        | 174.58 ± 35.33   | +1.68%   |
+| L1    | p999 ms | 196.40 ± 61.92        | 223.16 ± 40.37   | +13.62%  |
+| L2    | p50 ms  | 81.44 ± 2.88          | 80.38 ± 2.89     | −1.31%   |
+| L2    | p95 ms  | 125.18 ± 17.32        | 120.59 ± 5.97    | −3.67%   |
+| L2    | p99 ms  | 157.74 ± 39.67        | 185.92 ± 38.22   | +17.86%  |
+| L2    | p999 ms | 190.49 ± 57.30        | 231.21 ± 40.08   | +21.37%  |
+| L3    | p50 ms  | 81.65 ± 4.52          | 79.27 ± 3.75     | −2.90%   |
+| L3    | p95 ms  | 120.90 ± 12.21        | 118.87 ± 9.22    | −1.68%   |
+| L3    | p99 ms  | 161.13 ± 46.39        | 178.23 ± 34.38   | +10.62%  |
+| L3    | p999 ms | 180.78 ± 54.62        | 201.77 ± 37.08   | +11.61%  |
 
-**Summary**: At p50 both implementations are essentially identical (~67 ms). leafage-evm shows a
-consistent tail-latency advantage at p999: **−14 %** overall vs geth, and **−14 % / −15 % / −14 %**
-for L1 / L2 / L3 respectively. Error rate was 0 % across all 20 rounds on both endpoints.
+**Summary**: At p50 both implementations are essentially identical (~82 ms). leafage-evm shows a
+consistent tail-latency advantage at p99 and p999: **+6 %** at p99 and **+19 %** at p999 overall vs geth.
+By label, leafage-evm shows **+14 % / +21 % / +12 %** improvements at p999 for L1 / L2 / L3 respectively.
+Error rate was 0 % across all 20 rounds on both endpoints.
 
 ---
 
