@@ -270,7 +270,7 @@ DeBankCore 调用方式：
 - [x] ~~**TempoTransaction (0x76) 批量执行**~~ — 已完成，TempoTxEnv + TempoHandler + CallRequest 扩展
 - [ ] **Fee log 生成** — 如 DeBankCore 需要 fee Transfer log
 - [x] ~~**Hardfork 动态切换**~~ — `TempoHardfork::from_timestamp()` 使用 mainnet 激活时间戳，`LeafageStorageProvider` 和 `TempoEvm::new()` 从 block timestamp 推导 hardfork
-- [ ] **cargo feature gate** — `tempo` feature 减少非 Tempo 链编译时间
+- ~~**cargo feature gate**~~ — 不做，其他链也没有 feature gate，保持一致
 
 ## 9. 启动参数
 

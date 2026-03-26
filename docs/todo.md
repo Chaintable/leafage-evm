@@ -11,7 +11,7 @@
 7. **StorageKey for u64** — 为 `u64` 添加 `StorageKey` impl（TIP403Registry 的 `Mapping<u64, PolicyRecord>` 需要）
 8. **AccountKeychain P256/WebAuthn 签名验证无需实现** — leafage 只读取 keychain state。`validate_keychain_authorization` 仅做 key 存在性/过期/类型匹配检查，不执行实际密码学验证。P256/WebAuthn 签名验证在 handler 层的 `verify_signature` 中（不在预编译 dispatch scope）。注：ecrecover 已通过 `secp256k1` crate 在 `PrecompileStorageProvider` trait 中实现，供 TIP20 permit 使用
 9. **TempoPrecompileError::under_overflow()** — 添加 Panic(0x11) 辅助方法
-10. **TempoHardfork::is_t0()** — 添加，与其他 is_*() 一样始终返回 true
+10. **TempoHardfork::is_t0()** — 添加，`>= Self::Genesis`（始终为 true，Genesis 是最低 hardfork）
 11. **StorageKey for u128** — StablecoinDEX 的 `Mapping<u128, Order>` 需要
 12. **StorageKey for i16** — StablecoinDEX 的 `Mapping<i16, TickLevel>` 和 bitmap 需要
 13. **VecHandler::pop()** — ValidatorConfigV2 的 swap-and-pop deactivation 需要
@@ -38,7 +38,7 @@
 - [x] ~~**transfer_fee_pre_tx / transfer_fee_post_tx**~~ — 已连接：调用 TIP20 的 transfer_fee_pre_tx / transfer_fee_post_tx
 - [x] ~~**TIP20Factory::is_tip20 cross-call**~~ — 已连接：set_validator_token / set_user_token 调用 `TIP20Factory::is_tip20()`
 - [x] ~~**AMM token transfers**~~ — 已连接：rebalance_swap / mint / burn 通过 `system_transfer_from` + `transfer` 执行实际 TIP20 转账
-- [ ] **Transient storage reservation** — omitted（leafage 是只读节点）
+- [x] ~~**Transient storage reservation**~~ — 无需实现。`pending_fee_swap_reservation` 仅在 handler 的 `collect_fee_pre_tx` 中写入，eth_call 模式下 fee handler 短路不触发
 
 ### AccountKeychain (account_keychain.rs)
 - [x] ~~**P256/WebAuthn 签名验证**~~ — 已确认无需实现。`validate_keychain_authorization` 仅在 handler 层 tx validation 调用（检查 key 存在性/过期/类型匹配），不执行实际密码学验证。eth_call 不触发签名验证路径。P256 验证在 handler 的 `verify_signature` 中，不在预编译 dispatch scope
@@ -65,7 +65,7 @@
 3. ~~**ip_validation 模块**~~ — 已解决：内联到 validator_config.rs
 4. ~~**StablecoinDEX 的复杂度**~~ — 已完整移植（2239 行），view 方法可正确读取链上状态
 5. ~~**cross-precompile 调用**~~ — 全部已连接：TIP20 ↔ TIP403、TIP20 ↔ AccountKeychain、FeeManager ↔ TIP20、TIP20 ↔ TIP20Factory、StablecoinDEX ↔ TIP20
-6. **Rust 工具链** — 项目没有 rust-toolchain.toml。当前用 1.93.0，CI 需确认
+6. ~~**Rust 工具链**~~ — 已解决：Dockerfile 从 `rust:1.88.0` 升级到 `rust:1.93.0`（revm-inspectors 0.36.1 要求 1.91+），Cargo.toml `rust-version = "1.91"`
 7. ~~**TempoApiImpl 与 MainnetApiImpl 类型冲突**~~ — 已解决：`TempoEvmCustomConfig` marker type
 
 ## 后续工作
@@ -73,10 +73,10 @@
 ### P0 — 上线前
 
 - [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证
-- [ ] **Cross-precompile stub 评估** — 集成测试中确认是否影响 DeBankCore
+- [x] ~~**Cross-precompile stub 评估**~~ — 全部已连接，无残留 stub
 
 ### P2 — 按需
 
 - [ ] Fee log 生成（如 DeBankCore 需要 fee Transfer log）
 - [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
-- [ ] cargo feature gate `tempo`
+- ~~cargo feature gate `tempo`~~ — 不做，其他链（BSC/Cosmos/Mantle）也没有 feature gate，保持一致
