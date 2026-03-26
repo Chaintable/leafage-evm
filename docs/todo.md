@@ -4,7 +4,7 @@
 
 1. ~~**不实现 AA tx (0x76) 完整执行路径**~~ — 已实现批量原子执行（TempoTxEnv + TempoHandler::execute_multi_call），不需要 fee handler 和签名验证
 2. **Fee handler 无需实现** — 已确认 Tempo writer 的 `eth_call` / `eth_estimateGas` 在 `disable_balance_check=true` 下，handler 的 `validate_against_state_and_deduct_caller` 中 `gas_balance_spending=0` 自动短路跳过 fee 收取。leafage 行为一致
-3. **Hardfork 策略** — 最小 TempoHardfork 枚举，所有 is_*() 返回 true，只跑最新 spec
+3. **Hardfork 策略** — TempoHardfork 枚举支持 `from_timestamp()` 动态切换（archive 模式），`Default` 仍返回 T3（latest spec）。`is_*()` 方法使用 `>=` 比较而非硬编码 true
 4. **revm 版本** — 已升级到 revm 36.0.0 (op-revm 17.0.0, revm-inspectors 0.36.1, revm-bytecode 9.0.0, alloy-evm 0.29.2)
 5. **GasParams** — 已使用 revm 36 原生 GasParams API 设置 Tempo TIP-1000 gas 参数覆盖（TempoEvm::new 中 7 项 override），同时保留 TempoGasCosts 常量供 LeafageStorageProvider 使用
 6. **编译工具链** — Rust 1.93.0（revm 36 要求 1.88+, revm-inspectors 0.36.1 要求 1.91+）
@@ -78,5 +78,5 @@
 ### P2 — 按需
 
 - [ ] Fee log 生成（如 DeBankCore 需要 fee Transfer log）
-- [ ] Tempo hardfork 动态切换（如需 archive 模式）
+- [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
 - [ ] cargo feature gate `tempo`

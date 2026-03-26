@@ -35,7 +35,7 @@ background-tracer (sidecar)
 | 交易类型 | Legacy/EIP-1559/4844/7702 | 新增 TempoTransaction (type 0x76) — AA tx | **已适配** — 批量原子执行 + 2D nonce，fee/签名 eth_call 模式自动跳过 |
 | Fee 机制 | ETH gas fee | TIP-20 fee + AMM 兑换 | **无需实现** — Tempo writer 的 `eth_call` / `eth_estimateGas` 在 `disable_balance_check=true` 下，handler 的 `validate_against_state_and_deduct_caller` 中 `calculate_caller_fee` 返回的 `new_balance >= account_balance`，导致 `gas_balance_spending=0` 短路跳过 `collect_fee_pre_tx`。leafage 行为一致 |
 | Value transfer | 允许 | 禁止 | 无需处理（DeBankCore 发 value=0） |
-| Hardfork | EIP 编号 | T0→T3，全部映射到 SpecId::OSAKA | 只跑最新 spec |
+| Hardfork | EIP 编号 | T0→T3，全部映射到 SpecId::OSAKA | `TempoHardfork::from_timestamp()` 动态切换，支持 archive 模式 |
 
 ## 4. 架构设计
 
@@ -156,7 +156,7 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 
 | 项 | leafage | Tempo writer | 说明 |
 |---|---|---|---|
-| `TempoHardfork` | 最小枚举，`is_*()` 全返回 true | 完整枚举 + timestamp 激活 | leafage 只跑最新 spec，不需要 hardfork 切换 |
+| `TempoHardfork` | 枚举 + `from_timestamp()` 动态切换 | 完整枚举 + timestamp 激活 | leafage 支持 archive 模式，从 block timestamp 推导 hardfork |
 | StorageProvider | `LeafageStorageProvider`（显式传 chain_id） | `EvmPrecompileStorageProvider` | 功能相同，构造方式不同。`recover_signer` 使用 `secp256k1` crate 直接实现（Tempo 用 `alloy::consensus::crypto::secp256k1`） |
 
 ## 5. 预编译地址表
@@ -257,7 +257,7 @@ DeBankCore 调用方式：
 
 ### P0 — 上线前必须
 
-- [x] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证 TIP20 balanceOf/transfer, eth_multiCall, simulateTransactions, estimateGas
+- [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证 TIP20 balanceOf/transfer, eth_multiCall, simulateTransactions, estimateGas
 - [x] ~~**Cross-precompile 连接**~~ — TIP20 ↔ TIP403 和 TIP20 ↔ AccountKeychain 已全部连接
 
 ### P1 — 上线后优化
@@ -269,7 +269,7 @@ DeBankCore 调用方式：
 
 - [x] ~~**TempoTransaction (0x76) 批量执行**~~ — 已完成，TempoTxEnv + TempoHandler + CallRequest 扩展
 - [ ] **Fee log 生成** — 如 DeBankCore 需要 fee Transfer log
-- [ ] **Hardfork 动态切换** — 如需 archive 模式支持历史区块
+- [x] ~~**Hardfork 动态切换**~~ — `TempoHardfork::from_timestamp()` 使用 mainnet 激活时间戳，`LeafageStorageProvider` 和 `TempoEvm::new()` 从 block timestamp 推导 hardfork
 - [ ] **cargo feature gate** — `tempo` feature 减少非 Tempo 链编译时间
 
 ## 9. 启动参数

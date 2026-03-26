@@ -228,13 +228,16 @@ impl<'a> LeafageStorageProvider<'a> {
         chain_id: u64,
         is_static: bool,
     ) -> Self {
+        // Derive hardfork from block timestamp for archive mode support.
+        let timestamp: u64 = internals.block_timestamp().saturating_to();
+        let spec = TempoHardfork::from_timestamp(timestamp);
         Self {
             internals,
             gas_remaining: gas_limit,
             gas_refunded: 0,
             gas_limit,
             chain_id,
-            spec: TempoHardfork::default(),
+            spec,
             is_static,
         }
     }

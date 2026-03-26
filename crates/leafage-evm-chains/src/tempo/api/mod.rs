@@ -1,6 +1,7 @@
 use alloy_evm::precompiles::PrecompilesMap;
 use std::ops::{Deref, DerefMut};
 
+use crate::tempo::hardfork::TempoHardfork;
 use crate::tempo::precompile::extend_tempo_precompiles;
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
@@ -57,18 +58,25 @@ impl<DB: Database, I> TempoEvm<DB, I> {
         );
         extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
 
+        // Determine active hardfork from block timestamp for archive mode support.
+        let timestamp = env.block_env.timestamp.saturating_to::<u64>();
+        let hardfork = TempoHardfork::from_timestamp(timestamp);
+
         // Apply Tempo TIP-1000 gas parameter overrides via revm 36 GasParams API.
+        // TIP-1000 was introduced in T1, so only apply overrides for T1+ blocks.
         let mut cfg_env = env.cfg_env;
         let mut gas_params = GasParams::new_spec(cfg_env.spec.into());
-        gas_params.override_gas([
-            (GasId::sstore_set_without_load_cost(), 250_000),
-            (GasId::create(), 500_000),
-            (GasId::tx_create_cost(), 500_000),
-            (GasId::new_account_cost(), 250_000),
-            (GasId::new_account_cost_for_selfdestruct(), 250_000),
-            (GasId::code_deposit_cost(), 1_000),
-            (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
-        ]);
+        if hardfork.is_t1() {
+            gas_params.override_gas([
+                (GasId::sstore_set_without_load_cost(), 250_000),
+                (GasId::create(), 500_000),
+                (GasId::tx_create_cost(), 500_000),
+                (GasId::new_account_cost(), 250_000),
+                (GasId::new_account_cost_for_selfdestruct(), 250_000),
+                (GasId::code_deposit_cost(), 1_000),
+                (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+            ]);
+        }
         cfg_env.gas_params = gas_params;
 
         Self {
