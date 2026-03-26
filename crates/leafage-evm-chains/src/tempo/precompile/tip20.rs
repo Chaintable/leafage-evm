@@ -1010,14 +1010,35 @@ impl TIP20Token {
         )?;
 
         // 4. Validate ECDSA signature
-        // NOTE: ecrecover is not available through the storage provider in leafage-evm.
-        // This is a genuine limitation -- permit() requires ECDSA recovery which is not
-        // accessible from precompile context. For a read-only node this path is rarely
-        // exercised in practice (permit is a write operation).
-        let _ = digest;
-        return Err(TempoPrecompileError::Revert(
-            ITIP20::InvalidSignature {}.abi_encode().into(),
-        ));
+        // Only v=27/28 is accepted; v=0/1 is intentionally NOT normalized (see TIP-1004 spec).
+        let recovered = self
+            .storage
+            .recover_signer(digest, call.v, call.r, call.s)?
+            .ok_or_else(|| {
+                TempoPrecompileError::Revert(ITIP20::InvalidSignature {}.abi_encode().into())
+            })?;
+        if recovered != call.owner {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidSignature {}.abi_encode().into(),
+            ));
+        }
+
+        // 5. Increment nonce
+        self.permit_nonces[call.owner].write(
+            nonce
+                .checked_add(U256::from(1))
+                .ok_or(TempoPrecompileError::under_overflow())?,
+        )?;
+
+        // 6. Set allowance
+        self.set_allowance(call.owner, call.spender, call.value)?;
+
+        // 7. Emit Approval event
+        self.emit_event(ITIP20::Approval {
+            owner: call.owner,
+            spender: call.spender,
+            amount: call.value,
+        })
     }
 
     /// Transfers `amount` tokens from the caller to `to`.

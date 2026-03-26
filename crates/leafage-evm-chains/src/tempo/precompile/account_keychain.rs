@@ -14,9 +14,13 @@
 //! ## Signature verification
 //!
 //! Methods that only read keychain state (getKey, getRemainingLimit, etc.) are fully ported.
-//! Methods that verify P256/WebAuthn signatures (`validate_keychain_authorization` with
-//! signature type matching) are ported for state reads but signature verification itself
-//! is not needed -- leafage is a read-only node that replays existing blocks.
+//! `validate_keychain_authorization` checks key existence, revocation, expiry, and signature
+//! type matching -- all state reads, no actual cryptographic verification.
+//!
+//! P256/WebAuthn signature verification is **not needed** in precompile dispatch. The actual
+//! cryptographic verification happens in the handler layer's `verify_signature` during tx
+//! validation, which is not triggered by eth_call. The precompile only stores/reads key
+//! metadata (including signature type for type-matching checks).
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};

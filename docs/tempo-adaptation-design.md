@@ -152,12 +152,12 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 - `code_deposit_cost` → 1,000/byte
 - `tx_eip7702_per_empty_account_cost` → 12,500
 
-仍保留的适配点：
-| 项 | 说明 |
-|---|---|
-| `TempoHardfork` | 最小枚举 (~30 行)，所有 `is_*()` 返回 true。不依赖 `tempo-chainspec` |
-| `LeafageStorageProvider` | 包装 `EvmInternals` 为预编译提供 storage 访问 |
-| Journal checkpoint | 已实现 — 使用 `EvmInternals::checkpoint()`/`commit()`/`revert()` |
+与 Tempo writer 的实现差异（功能已对齐，实现方式不同）：
+
+| 项 | leafage | Tempo writer | 说明 |
+|---|---|---|---|
+| `TempoHardfork` | 最小枚举，`is_*()` 全返回 true | 完整枚举 + timestamp 激活 | leafage 只跑最新 spec，不需要 hardfork 切换 |
+| StorageProvider | `LeafageStorageProvider`（显式传 chain_id） | `EvmPrecompileStorageProvider` | 功能相同，构造方式不同。`recover_signer` 使用 `secp256k1` crate 直接实现（Tempo 用 `alloy::consensus::crypto::secp256k1`） |
 
 ## 5. 预编译地址表
 
@@ -202,8 +202,8 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 | ~~TIP20 → TIP20Factory validation~~ | **已连接** | set_next_quote_token 调 is_tip20() + currency 验证 + cycle detection |
 | ~~StablecoinDEX → TIP20 token transfer~~ | **已连接** | transfer/transfer_from 通过 TIP20 `system_transfer_from` |
 | ~~Ed25519 签名验证~~ | **已实现** | 使用 `ed25519-consensus` crate + 本地 `union_unique` 格式 |
-| P256 / WebAuthn 签名验证 | 无需实现 | eth_call 不触发签名验证 |
-| TIP20 permit ecrecover | 无法实现 | leafage 无 ecrecover 访问，permit 是写操作 |
+| P256 / WebAuthn 签名验证 | 无需实现 | `validate_keychain_authorization` 仅做 key 状态检查，P256 验证在 handler 层 |
+| ~~TIP20 permit ecrecover~~ | **已实现** | `secp256k1` crate 直接 ECDSA recovery，添加 `recover_signer` 到 storage trait |
 | ~~Journal checkpoint (预编译内部)~~ | **已实现** | 使用 alloy-evm 0.29.2 `EvmInternals` 真实 journal checkpoint |
 
 ## 7. 已知限制
@@ -257,7 +257,7 @@ DeBankCore 调用方式：
 
 ### P0 — 上线前必须
 
-- [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证 TIP20 balanceOf/transfer, eth_multiCall, simulateTransactions, estimateGas
+- [x] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证 TIP20 balanceOf/transfer, eth_multiCall, simulateTransactions, estimateGas
 - [x] ~~**Cross-precompile 连接**~~ — TIP20 ↔ TIP403 和 TIP20 ↔ AccountKeychain 已全部连接
 
 ### P1 — 上线后优化

@@ -123,6 +123,44 @@ pub trait PrecompileStorageProvider {
         self.deduct_gas(price)?;
         Ok(keccak256(data))
     }
+
+    /// Recovers the signer address from an ECDSA signature and charges ecrecover gas.
+    ///
+    /// As per [TIP-1004], only `v` values of `27` or `28` are accepted (no `0`/`1` normalization).
+    /// Returns `Ok(None)` on invalid signatures; callers map to domain-specific errors.
+    ///
+    /// [TIP-1004]: <https://github.com/tempoxyz/tempo/blob/main/tips/tip-1004.md#signature-validation>
+    fn recover_signer(&mut self, digest: B256, v: u8, r: B256, s: B256) -> Result<Option<Address>> {
+        use super::ECRECOVER_GAS;
+        self.deduct_gas(ECRECOVER_GAS)?;
+
+        if v != 27 && v != 28 {
+            return Ok(None);
+        }
+
+        let recid = secp256k1::ecdsa::RecoveryId::try_from((v as i32) - 27)
+            .map_err(|_| TempoPrecompileError::Fatal("invalid recovery id".to_string()))?;
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(r.as_slice());
+        sig_bytes[32..].copy_from_slice(s.as_slice());
+        let sig = match secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid) {
+            Ok(sig) => sig,
+            Err(_) => return Ok(None),
+        };
+        let msg = secp256k1::Message::from_digest(*digest);
+        let pubkey = match secp256k1::SECP256K1.recover_ecdsa(&msg, &sig) {
+            Ok(pk) => pk,
+            Err(_) => return Ok(None),
+        };
+        let hash = keccak256(&pubkey.serialize_uncompressed()[1..]);
+        let recovered = Address::from_slice(&hash[12..]);
+
+        if recovered.is_zero() {
+            Ok(None)
+        } else {
+            Ok(Some(recovered))
+        }
+    }
 }
 
 /// Storage operations for a given (contract) address.
@@ -621,6 +659,14 @@ impl StorageCtx {
     /// Computes keccak256 and charges the appropriate gas.
     pub fn keccak256(&self, data: &[u8]) -> Result<B256> {
         Self::try_with_storage(|s| s.keccak256(data))
+    }
+
+    /// Recovers the signer address from an ECDSA signature.
+    ///
+    /// Only accepts `v` values of `27` or `28` per TIP-1004.
+    /// Returns `Ok(None)` on invalid signatures.
+    pub fn recover_signer(&self, digest: B256, v: u8, r: B256, s: B256) -> Result<Option<Address>> {
+        Self::try_with_storage(|provider| provider.recover_signer(digest, v, r, s))
     }
 }
 
