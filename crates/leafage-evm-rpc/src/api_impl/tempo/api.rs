@@ -37,17 +37,35 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        // Build standard TxEnv first.
+        use leafage_evm_chains::tempo::tx::{TempoCall, TempoTxFields};
+        use revm::primitives::TxKind;
+
+        // Extract Tempo-specific fields before consuming the request
+        let tempo_calls = request.tempo_calls.clone();
+        let nonce_key = request.nonce_key;
+
+        // Build standard TxEnv
         let base =
             create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
 
-        // TODO: Extract tempo_calls and nonce_key from the RPC request.
-        // alloy's TransactionRequest does not have these fields natively.
-        // When the Tempo RPC endpoint is wired with custom deserialization,
-        // parse the batch calls here and populate TempoTxFields.
+        // Build TempoTxFields if batch calls are present
+        let tempo_fields = tempo_calls
+            .filter(|calls| !calls.is_empty())
+            .map(|calls| TempoTxFields {
+                aa_calls: calls
+                    .into_iter()
+                    .map(|c| TempoCall {
+                        to: c.to.unwrap_or(TxKind::Create),
+                        value: c.value.unwrap_or_default(),
+                        input: c.input.into_input().unwrap_or_default(),
+                    })
+                    .collect(),
+                nonce_key: nonce_key.unwrap_or_default(),
+            });
+
         Ok(TempoTxEnv {
             base,
-            tempo_fields: None,
+            tempo_fields,
         })
     }
 

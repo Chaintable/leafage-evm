@@ -1,5 +1,6 @@
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::consensus::TxType;
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::Either;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, H256, U256};
@@ -102,7 +103,7 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         TxType::Legacy
     } as u8;
 
-    let CallRequest {
+    let TransactionRequest {
         from,
         to,
         gas_price,
@@ -117,7 +118,7 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         blob_versioned_hashes,
         authorization_list,
         ..
-    } = request;
+    } = request.inner;
 
     let CallFees {
         max_priority_fee_per_gas,
