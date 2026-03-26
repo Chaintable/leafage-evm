@@ -247,9 +247,15 @@ DeBankCore 调用方式：
 
 注意：对于 DeBankCore 的模拟交易和 gas 预估场景，用现有 `Vec<CallRequest>` 逐笔模拟通常已够用。batch 执行仅在需要原子性语义时有差异。
 
-### 7.4 Fee log 不产生
+### 7.4 Fee log 不产生（已验证）
 
-与 writer 端 `pre_traceMany` 行为一致 — `simulateTransactions` 不执行 fee handler，不产生 TIP-20 fee Transfer log。
+**实测确认**：Tempo writer 的 eth_call / pre_traceMany **无论 gas_price 是否为 0 都不产生 fee log**。验证命令：
+```
+pre_traceMany + gas_price=0x174876e800 → logs count: 0
+pre_traceMany + gas_price=0 → logs count: 0
+```
+
+原因：reth 的 eth_call / prepare_call_env 强制设 `disable_base_fee=true`，使 `calculate_caller_fee` 中 `gas_balance_spending=0`，fee handler 始终短路。gas_price 的值不影响此逻辑。leafage 行为完全一致。
 
 ## 8. 后续工作
 
@@ -268,7 +274,7 @@ DeBankCore 调用方式：
 ### P2 — 按需
 
 - [x] ~~**TempoTransaction (0x76) 批量执行**~~ — 已完成，TempoTxEnv + TempoHandler + CallRequest 扩展
-- [ ] **Fee log 生成** — 如 DeBankCore 需要 fee Transfer log
+- ~~**Fee log 生成**~~ — 不需要，eth_call 不产生 fee log 是设计如此，与 Tempo writer 一致
 - [x] ~~**Hardfork 动态切换**~~ — `TempoHardfork::from_timestamp()` 使用 mainnet 激活时间戳，`LeafageStorageProvider` 和 `TempoEvm::new()` 从 block timestamp 推导 hardfork
 - ~~**cargo feature gate**~~ — 不做，其他链也没有 feature gate，保持一致
 
