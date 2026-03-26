@@ -17,7 +17,7 @@ This document describes how to deploy leafage-evm Ethereum node using Docker Com
 │                             │                    │           │
 └─────────────────────────────┼────────────────────┼───────────┘
                               │                    │
-                         Port 8666            Port 8659
+                        8666 → 8545          8659 → 8659
                               ▼                    ▼
                        External Access      External Access
 ```
@@ -51,13 +51,33 @@ Lightweight EVM executor for state queries:
   - Receives block state updates from geth
   - Provides `eth_call`, `eth_estimateGas` and other query APIs
 
+## Quick Start
+
+Use the one-click deployment script to automate the entire setup:
+
+```bash
+cd docs/deploy
+
+# Interactive mode — prompts for data directories and archive mode
+sudo ./deploy.sh
+
+# Or specify options directly
+sudo ./deploy.sh --eth-data-dir /data/eth --leafage-data-dir /data/leafage --archive
+
+# Skip snapshot download if you already have data
+sudo ./deploy.sh --skip-snapshot
+```
+
+The script handles directory creation, JWT generation, snapshot download & extraction, and service startup.
+
 ## Prerequisites
 
 1. **Docker** and **Docker Compose** installed
-2. **Storage**:
+2. **AWS CLI**, **zstd**, and **openssl** installed (for snapshot download and JWT generation)
+3. **Storage**:
    - Geth archive mode + Lighthouse: ~850GB
    - leafage-evm: ~450GB (archive) or ~150GB (state)
-3. **Network**: Access to Ethereum P2P network and checkpoint sync URL
+4. **Network**: Access to Ethereum P2P network and checkpoint sync URL
 
 ## Configuration
 
@@ -124,11 +144,12 @@ tar --use-compress-program=unzstd -xf leafage-archive-24646705.tar.zstd -C ${LEA
 ### 1. Prepare Configuration
 
 ```bash
-# Set data directory
+# Set data directories
 export ETH_DATA_DIR=/eth
+export LEAFAGE_DATA_DIR=/nodex-eth
 
 # Create required directories
-mkdir -p ${ETH_DATA_DIR}/geth ${ETH_DATA_DIR}/lighthouse
+mkdir -p ${ETH_DATA_DIR}/geth ${ETH_DATA_DIR}/lighthouse ${LEAFAGE_DATA_DIR}
 
 # Generate JWT secret
 openssl rand -hex 32 > ${ETH_DATA_DIR}/geth/jwtsecret
