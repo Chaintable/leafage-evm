@@ -157,7 +157,7 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 |---|---|
 | `TempoHardfork` | 最小枚举 (~30 行)，所有 `is_*()` 返回 true。不依赖 `tempo-chainspec` |
 | `LeafageStorageProvider` | 包装 `EvmInternals` 为预编译提供 storage 访问 |
-| Journal checkpoint | stub（leafage 只读场景不需要） |
+| Journal checkpoint | 已实现 — 使用 `EvmInternals::checkpoint()`/`commit()`/`revert()` |
 
 ## 5. 预编译地址表
 
@@ -200,10 +200,11 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 | ~~FeeManager → TIP20 token transfer~~ | **已连接** | collect_fee_pre/post_tx + AMM (rebalance_swap/mint/burn) 全部调 TIP20 |
 | ~~FeeManager → TIP20Factory::is_tip20~~ | **已连接** | set_validator_token / set_user_token 调 TIP20Factory |
 | ~~TIP20 → TIP20Factory validation~~ | **已连接** | set_next_quote_token 调 is_tip20() + currency 验证 + cycle detection |
-| StablecoinDEX → TIP20 token transfer | stub | 无影响 — view 方法可正确读链上状态 |
-| ed25519 / P256 / WebAuthn 签名验证 | 无需实现 | eth_call 不触发签名验证 |
+| ~~StablecoinDEX → TIP20 token transfer~~ | **已连接** | transfer/transfer_from 通过 TIP20 `system_transfer_from` |
+| ~~Ed25519 签名验证~~ | **已实现** | 使用 `ed25519-consensus` crate + 本地 `union_unique` 格式 |
+| P256 / WebAuthn 签名验证 | 无需实现 | eth_call 不触发签名验证 |
 | TIP20 permit ecrecover | 无法实现 | leafage 无 ecrecover 访问，permit 是写操作 |
-| Journal checkpoint (预编译内部) | stub | TempoHandler 级别已通过 revm journal 实现批量原子性 |
+| ~~Journal checkpoint (预编译内部)~~ | **已实现** | 使用 alloy-evm 0.29.2 `EvmInternals` 真实 journal checkpoint |
 
 ## 7. 已知限制
 

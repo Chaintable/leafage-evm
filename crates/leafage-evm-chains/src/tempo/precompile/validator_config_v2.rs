@@ -25,13 +25,13 @@
 //!
 //! ## Signature verification
 //!
-//! Ed25519 signature verification is **stubbed** in leafage-evm. The original Tempo node uses
-//! `commonware-cryptography` for ed25519 verification, which we do not depend on. Since leafage
-//! is a read-only node and signature verification only gates mutate operations, this stub
-//! does not affect view call correctness.
+//! Ed25519 signature verification uses `ed25519-consensus` (the same crate used internally by
+//! Tempo's `commonware-cryptography`). The `union_unique(namespace, message)` format is
+//! replicated locally to avoid the heavy `commonware-cryptography` dependency.
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
+use ed25519_consensus::{Signature as Ed25519Signature, VerificationKey as Ed25519VerificationKey};
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -213,9 +213,16 @@ fn err_ingress_already_exists(ingress: String) -> TempoPrecompileError {
     )
 }
 
-#[allow(dead_code)]
 fn err_invalid_signature() -> TempoPrecompileError {
     TempoPrecompileError::Revert(IValidatorConfigV2::InvalidSignature {}.abi_encode().into())
+}
+
+fn err_invalid_signature_format() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        IValidatorConfigV2::InvalidSignatureFormat {}
+            .abi_encode()
+            .into(),
+    )
 }
 
 fn err_invalid_owner() -> TempoPrecompileError {
@@ -244,6 +251,36 @@ fn err_empty_v1_validator_set() -> TempoPrecompileError {
             .abi_encode()
             .into(),
     )
+}
+
+// ===========================================================================
+// Ed25519 signature verification
+// ===========================================================================
+
+/// Signature namespace for `addValidator` operations.
+const VALIDATOR_NS_ADD: &[u8] = b"TEMPO_VALIDATOR_CONFIG_V2_ADD_VALIDATOR";
+/// Signature namespace for `rotateValidator` operations.
+const VALIDATOR_NS_ROTATE: &[u8] = b"TEMPO_VALIDATOR_CONFIG_V2_ROTATE_VALIDATOR";
+
+/// Constructs the `union_unique(namespace, payload)` byte sequence compatible with
+/// `commonware-codec`'s varint length-prefixed format used by `commonware-cryptography`.
+///
+/// Format: `varint(namespace.len() as u32) || namespace || payload`
+///
+/// Since both namespace constants used here are < 128 bytes, the varint encoding
+/// is a single byte equal to the length value.
+fn union_unique(namespace: &[u8], payload: &[u8]) -> Vec<u8> {
+    // commonware-codec uses protobuf-style LEB128 varint for u32.
+    // For lengths < 128, this is a single byte equal to the value.
+    debug_assert!(
+        namespace.len() < 128,
+        "union_unique: namespace length must be < 128 for single-byte varint"
+    );
+    let mut buf = Vec::with_capacity(1 + namespace.len() + payload.len());
+    buf.push(namespace.len() as u8);
+    buf.extend_from_slice(namespace);
+    buf.extend_from_slice(payload);
+    buf
 }
 
 // ===========================================================================
@@ -809,23 +846,60 @@ impl ValidatorConfigV2 {
         Ok(())
     }
 
-    /// Verifies a validator signature for add or rotate operations.
+    /// Verifies a validator Ed25519 signature for add or rotate operations.
     ///
-    /// **STUBBED**: leafage-evm does not include ed25519 verification. The original Tempo
-    /// node uses `commonware-cryptography::ed25519` for this. Since leafage is a read-only
-    /// node and signature verification only gates mutate operations (which are only exercised
-    /// during simulateTransactions), we accept all signatures.
+    /// Constructs the message as:
+    /// `keccak256(chainId || contractAddr || validatorAddr || len(ingress) || ingress || len(egress) || egress [|| feeRecipient])`
+    ///
+    /// Then verifies the Ed25519 signature over `union_unique(namespace, message)` using
+    /// `ed25519-consensus`, matching Tempo's `commonware-cryptography` behavior.
     fn verify_validator_signature(
         &self,
-        _pubkey: &B256,
-        _signature: &[u8],
-        _validator_address: Address,
-        _ingress: &str,
-        _egress: &str,
-        _is_add: bool,
-        _fee_recipient: Option<Address>,
+        pubkey: &B256,
+        signature: &[u8],
+        validator_address: Address,
+        ingress: &str,
+        egress: &str,
+        is_add: bool,
+        fee_recipient: Option<Address>,
     ) -> Result<()> {
-        // Stubbed: always succeeds in leafage-evm
+        // Decode Ed25519 signature (64 bytes)
+        let sig = Ed25519Signature::try_from(signature)
+            .map_err(|_| err_invalid_signature_format())?;
+
+        // Build the message hash (same as Tempo's Keccak256 hasher)
+        use alloy::primitives::Keccak256;
+        let mut hasher = Keccak256::new();
+        hasher.update(self.storage.chain_id().to_be_bytes());
+        hasher.update(VALIDATOR_CONFIG_V2_ADDRESS.as_slice());
+        hasher.update(validator_address.as_slice());
+        hasher.update([
+            u8::try_from(ingress.len()).expect("validator ingress length must fit in uint8"),
+        ]);
+        hasher.update(ingress.as_bytes());
+        hasher.update([
+            u8::try_from(egress.len()).expect("validator egress length must fit in uint8"),
+        ]);
+        hasher.update(egress.as_bytes());
+
+        let namespace = if is_add {
+            if let Some(fee_recipient) = fee_recipient {
+                hasher.update(fee_recipient.as_slice());
+            }
+            VALIDATOR_NS_ADD
+        } else {
+            VALIDATOR_NS_ROTATE
+        };
+        let message = hasher.finalize();
+
+        // Decode public key and verify
+        let vk = Ed25519VerificationKey::try_from(pubkey.as_slice())
+            .map_err(|_| err_invalid_public_key())?;
+
+        let payload = union_unique(namespace, message.as_slice());
+        vk.verify(&sig, &payload)
+            .map_err(|_| err_invalid_signature())?;
+
         Ok(())
     }
 
@@ -1165,8 +1239,8 @@ impl ValidatorConfigV2 {
             s.config.write(cfg)
         };
 
-        // Skip if public key is zero (invalid)
-        if v1_val.publicKey.is_zero() {
+        // Skip if public key is not a valid Ed25519 point
+        if Ed25519VerificationKey::try_from(v1_val.publicKey.as_slice()).is_err() {
             return skip(self);
         }
 

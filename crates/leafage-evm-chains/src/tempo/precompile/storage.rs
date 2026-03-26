@@ -11,7 +11,7 @@
 //! - `chain_id` passed explicitly to `LeafageStorageProvider::new` for convenience
 //! - Gas accounting uses hardcoded `TempoGasCosts` constants (matching GasParams overrides)
 //! - `with_account_info` uses `load_account_code` + `JournaledAccountTr::account()` for info access
-//! - Checkpoint operations are stubbed (leafage is read-only, no real rollback needed)
+//! - Checkpoint operations delegate to `EvmInternals` (alloy-evm 0.29.2)
 
 use alloy::primitives::{keccak256, Address, Log, LogData, B256, U256};
 use alloy_evm::EvmInternals;
@@ -32,16 +32,12 @@ use super::error::{Result, TempoPrecompileError};
 use crate::tempo::gas_params::TempoGasCosts;
 use crate::tempo::hardfork::TempoHardfork;
 
-/// Dummy checkpoint type.
+/// Re-export of `revm::context_interface::journaled_state::JournalCheckpoint`.
 ///
-/// alloy-evm 0.25.2's `EvmInternals` does not expose journal checkpoint operations
-/// (`checkpoint`/`checkpoint_commit`/`checkpoint_revert` live on `JournalTr`). Since
-/// leafage-evm is a read-only node and precompiles execute against a snapshot DB,
-/// we do not need real checkpointing. This stub satisfies the trait signatures.
-#[derive(Debug, Clone, Copy)]
-pub struct JournalCheckpoint {
-    _private: (),
-}
+/// alloy-evm 0.29.2's `EvmInternals` exposes `checkpoint()`, `checkpoint_commit()`,
+/// and `checkpoint_revert()` which delegate to the underlying journal. We use the real
+/// revm `JournalCheckpoint` type directly.
+pub use revm::context_interface::journaled_state::JournalCheckpoint;
 
 // ---------------------------------------------------------------------------
 // PrecompileStorageProvider trait
@@ -108,9 +104,6 @@ pub trait PrecompileStorageProvider {
     fn is_static(&self) -> bool;
 
     /// Creates a new journal checkpoint.
-    ///
-    /// **Stubbed in leafage-evm** -- returns a dummy checkpoint since alloy-evm 0.25.2
-    /// EvmInternals does not expose checkpoint operations.
     fn checkpoint(&mut self) -> JournalCheckpoint;
 
     /// Commits all state changes since the given checkpoint.
@@ -172,7 +165,7 @@ pub trait ContractStorage {
 /// - `chain_id` is passed explicitly for convenience
 /// - Gas accounting uses hardcoded `TempoGasCosts` constants (matching GasParams overrides in TempoEvm)
 /// - `with_account_info` uses `load_account_code` + `JournaledAccountTr::account().info`
-/// - Checkpoint operations are stubbed (no-op, leafage is read-only)
+/// - Checkpoint operations delegate to `EvmInternals` (available since alloy-evm 0.29.2)
 pub struct LeafageStorageProvider<'a> {
     internals: EvmInternals<'a>,
     gas_remaining: u64,
@@ -389,19 +382,17 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
     #[inline]
     fn checkpoint(&mut self) -> JournalCheckpoint {
-        // Stubbed: alloy-evm 0.25.2 EvmInternals does not expose checkpoint operations.
-        // Leafage-evm is read-only, so checkpoints are never needed in practice.
-        JournalCheckpoint { _private: () }
+        self.internals.checkpoint()
     }
 
     #[inline]
     fn checkpoint_commit(&mut self, _checkpoint: JournalCheckpoint) {
-        // Stubbed: no-op. See checkpoint() doc.
+        self.internals.checkpoint_commit()
     }
 
     #[inline]
-    fn checkpoint_revert(&mut self, _checkpoint: JournalCheckpoint) {
-        // Stubbed: no-op. See checkpoint() doc.
+    fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.internals.checkpoint_revert(checkpoint)
     }
 }
 

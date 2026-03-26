@@ -4692,6 +4692,7 @@ dependencies = [
  "cometbft-light-client",
  "cometbft-light-client-verifier",
  "cometbft-proto",
+ "ed25519-consensus",
  "elliptic-curve 0.13.8",
  "leafage-evm-types",
  "num-bigint",

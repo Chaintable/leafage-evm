@@ -15,8 +15,8 @@
 11. **StorageKey for u128** — StablecoinDEX 的 `Mapping<u128, Order>` 需要
 12. **StorageKey for i16** — StablecoinDEX 的 `Mapping<i16, TickLevel>` 和 bitmap 需要
 13. **VecHandler::pop()** — ValidatorConfigV2 的 swap-and-pop deactivation 需要
-14. **ValidatorConfigV2 Ed25519 签名验证 stubbed** — leafage 不包含 `commonware-cryptography` crate，不影响 view call
-15. **StablecoinDEX token transfers stubbed** — view 方法可正确读取链上状态
+14. ~~**ValidatorConfigV2 Ed25519 签名验证 stubbed**~~ — 已实现：使用 `ed25519-consensus` crate（`commonware-cryptography` 的底层依赖），replicate `union_unique` 格式避免重依赖
+15. ~~**StablecoinDEX token transfers stubbed**~~ — 已实现：transfer/transfer_from 通过 TIP20 `system_transfer_from` 执行
 16. **extend_tempo_precompiles** — 全部 9 个预编译注册到 PrecompilesMap
 17. **TempoHandler** — 使用 thin wrapper（CosmosHandler 模式），override `execution()` 支持 batch/single dispatch
 18. **TempoTxEnv** — `TempoContext` 使用 `TempoTxEnv` 替代 `TxEnv`
@@ -48,19 +48,19 @@
 - [x] ~~**Cross-precompile wiring**~~ — 已连接：TIP20 的 `is_transfer_authorized`、`changeTransferPolicyId`、`_mint`、`burnBlocked` 全部调 TIP403Registry
 
 ### ValidatorConfigV2 (validator_config_v2.rs)
-- [ ] **Ed25519 签名验证** — stub（无 commonware-cryptography）。不影响 view call
+- [x] ~~**Ed25519 签名验证**~~ — 已实现：`ed25519-consensus` + 本地 `union_unique` 格式复制
 
 ### StablecoinDEX (stablecoin_dex.rs)
-- [ ] **Token transfers** — transfer/transfer_from stub
+- [x] ~~**Token transfers**~~ — 已实现：transfer/transfer_from 通过 TIP20 `system_transfer_from`
 - [ ] **Cross-precompile wiring** — TIP20Factory.is_tip20, TIP403Registry.is_authorized_as 等
 
 ### Storage 层 (storage.rs)
-- [ ] **Journal checkpoints** — 升级到 revm 36 / alloy-evm 0.29 后 EvmInternals 是否已暴露 checkpoint API 待确认。当前仍为 stub
+- [x] ~~**Journal checkpoints**~~ — 已实现：alloy-evm 0.29.2 `EvmInternals` 暴露了 `checkpoint()`/`checkpoint_commit()`/`checkpoint_revert()`
 - [ ] **load_account_mut_skip_cold_load** — 用 load_account_code + clone 替代
 
 ## 待确认的疑问
 
-1. ~~**Journal checkpoint stub 是否影响 simulateTransactions？**~~ — TempoHandler::execute_multi_call 已通过 Handler 级别的 journal checkpoint 实现批量原子性，预编译内部的 checkpoint stub 影响有限
+1. ~~**Journal checkpoint stub 是否影响 simulateTransactions？**~~ — 已解决：alloy-evm 0.29.2 暴露了 checkpoint API，预编译内部现在使用真实 journal checkpoint
 2. ~~**AccountKeychain 签名验证**~~ — 已确认不需要。eth_call 不触发签名验证，签名在 recover_signer() 层做
 3. ~~**ip_validation 模块**~~ — 已解决：内联到 validator_config.rs
 4. ~~**StablecoinDEX 的复杂度**~~ — 已完整移植（2239 行），view 方法可正确读取链上状态

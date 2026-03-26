@@ -109,6 +109,7 @@ num-bigint = "0.4"
 elliptic-curve = "0.13"
 sha2 = "0.10"
 bech32 = "0.11"
+ed25519-consensus = { version = "2.1", default-features = false }
 
 pprof = { version = "0.11", features = ["flamegraph"] }
 

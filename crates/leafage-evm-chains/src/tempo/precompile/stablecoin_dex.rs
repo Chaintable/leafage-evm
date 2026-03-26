@@ -22,7 +22,7 @@
 //! - **TIP403Registry**: is_authorized_as for cancel_stale_order
 //! - **FeeManager**: validate_usd_currency for pair creation
 //!
-//! Token transfers (transfer, transfer_from) are stubbed since leafage is read-only.
+//! Token transfers (transfer, transfer_from) delegate to TIP20 system_transfer_from.
 //! View methods (balance_of, get_order, quote_swap_*) work correctly against on-chain state.
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
@@ -1017,16 +1017,23 @@ impl StablecoinDEX {
         )
     }
 
-    /// Transfer tokens. Stubbed -- actual TIP20 token transfers are not executed in leafage.
-    fn transfer(&mut self, _token: Address, _to: Address, _amount: u128) -> Result<()> {
-        // Stubbed: leafage-evm does not execute real TIP20 transfers.
-        // The original calls TIP20Token::from_address(token)?.transfer(...)
+    /// Transfer tokens from the DEX to `to` via TIP20 system_transfer_from.
+    fn transfer(&mut self, token: Address, to: Address, amount: u128) -> Result<()> {
+        TIP20Token::from_address(token)?.system_transfer_from(
+            STABLECOIN_DEX_ADDRESS,
+            to,
+            U256::from(amount),
+        )?;
         Ok(())
     }
 
-    /// Transfer tokens from user. Stubbed.
-    fn transfer_from(&mut self, _token: Address, _from: Address, _amount: u128) -> Result<()> {
-        // Stubbed: leafage-evm does not execute real TIP20 transfers.
+    /// Transfer tokens from `from` to the DEX via TIP20 system_transfer_from.
+    fn transfer_from(&mut self, token: Address, from: Address, amount: u128) -> Result<()> {
+        TIP20Token::from_address(token)?.system_transfer_from(
+            from,
+            STABLECOIN_DEX_ADDRESS,
+            U256::from(amount),
+        )?;
         Ok(())
     }
 
