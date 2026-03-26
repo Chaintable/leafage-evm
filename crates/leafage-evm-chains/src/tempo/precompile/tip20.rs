@@ -886,7 +886,30 @@ impl TIP20Token {
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
 
-        // TODO(task-4a): Validate via TIP20Factory::is_tip20() and currency checks
+        if self.address == super::PATH_USD_ADDRESS {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidQuoteToken {}.abi_encode().into(),
+            ));
+        }
+
+        // Verify the new quote token is a valid deployed TIP20 via factory
+        if !super::tip20_factory::TIP20Factory::new().is_tip20(call.newQuoteToken)? {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidQuoteToken {}.abi_encode().into(),
+            ));
+        }
+
+        // If currency is USD, the quote token's currency must also be USD
+        let currency = self.currency()?;
+        if currency == "USD" {
+            let quote_token_currency = Self::from_address(call.newQuoteToken)?.currency()?;
+            if quote_token_currency != "USD" {
+                return Err(TempoPrecompileError::Revert(
+                    ITIP20::InvalidQuoteToken {}.abi_encode().into(),
+                ));
+            }
+        }
+
         self.next_quote_token.write(call.newQuoteToken)?;
 
         self.emit_event(ITIP20::NextQuoteTokenSet {
@@ -905,8 +928,17 @@ impl TIP20Token {
 
         let next_quote_token = self.next_quote_token()?;
 
-        // TODO: Cycle detection (walk quote-token chain) omitted for now.
-        // The full Tempo implementation walks the quote-token graph to detect cycles.
+        // Cycle detection: walk the quote-token chain from next_quote_token back
+        // to pathUSD. If we encounter self.address, the update would create a cycle.
+        let mut current = next_quote_token;
+        while current != super::PATH_USD_ADDRESS {
+            if current == self.address {
+                return Err(TempoPrecompileError::Revert(
+                    ITIP20::InvalidQuoteToken {}.abi_encode().into(),
+                ));
+            }
+            current = Self::from_address(current)?.quote_token()?;
+        }
 
         self.quote_token.write(next_quote_token)?;
 
@@ -979,9 +1011,9 @@ impl TIP20Token {
 
         // 4. Validate ECDSA signature
         // NOTE: ecrecover is not available through the storage provider in leafage-evm.
-        // For a read-only node this path is rarely exercised in practice.
-        // We store a TODO and return an error for now.
-        // TODO: Implement ecrecover via storage provider once available
+        // This is a genuine limitation -- permit() requires ECDSA recovery which is not
+        // accessible from precompile context. For a read-only node this path is rarely
+        // exercised in practice (permit is a write operation).
         let _ = digest;
         return Err(TempoPrecompileError::Revert(
             ITIP20::InvalidSignature {}.abi_encode().into(),
@@ -1083,6 +1115,128 @@ impl TIP20Token {
             to: call.to,
             amount: call.amount,
             memo: call.memo,
+        })
+    }
+
+    /// Transfers `amount` from `from` to `to` without approval, for use by other
+    /// precompiles only (not exposed via ABI). Enforces compliance via TIP-403
+    /// and AccountKeychain spending limits.
+    pub fn system_transfer_from(
+        &mut self,
+        from: Address,
+        to: Address,
+        amount: U256,
+    ) -> Result<bool> {
+        self.check_not_paused()?;
+        self.check_recipient(to)?;
+        self.ensure_transfer_authorized(from, to)?;
+        // AccountKeychain spending limit
+        super::account_keychain::AccountKeychain::new()
+            .authorize_transfer(from, self.address, amount)?;
+        self._transfer(from, to, amount)?;
+        Ok(true)
+    }
+
+    /// Transfers fee tokens from `from` to the fee manager before transaction execution.
+    /// Respects the token's pause state and deducts from the AccountKeychain spending limit.
+    pub fn transfer_fee_pre_tx(&mut self, from: Address, amount: U256) -> Result<()> {
+        // This function respects the token's pause state and will revert if the token is paused.
+        // transfer_fee_post_tx is intentionally allowed even when paused so that a pause
+        // transaction can still receive its fee refund.
+        self.check_not_paused()?;
+        let from_balance = self.get_balance(from)?;
+        if amount > from_balance {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InsufficientBalance {
+                    balance: from_balance,
+                    amount,
+                    token: self.address,
+                }
+                .abi_encode()
+                .into(),
+            ));
+        }
+
+        // AccountKeychain spending limit
+        super::account_keychain::AccountKeychain::new()
+            .authorize_transfer(from, self.address, amount)?;
+
+        self.handle_rewards_on_transfer(from, TIP_FEE_MANAGER_ADDRESS, amount)?;
+
+        let new_from_balance = from_balance.checked_sub(amount).ok_or_else(|| {
+            TempoPrecompileError::Revert(
+                ITIP20::InsufficientBalance {
+                    balance: from_balance,
+                    amount,
+                    token: self.address,
+                }
+                .abi_encode()
+                .into(),
+            )
+        })?;
+        self.set_balance(from, new_from_balance)?;
+
+        let to_balance = self.get_balance(TIP_FEE_MANAGER_ADDRESS)?;
+        let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
+            TempoPrecompileError::Revert(
+                ITIP20::SupplyCapExceeded {}.abi_encode().into(),
+            )
+        })?;
+        self.set_balance(TIP_FEE_MANAGER_ADDRESS, new_to_balance)
+    }
+
+    /// Refunds unused fee tokens from the fee manager back to `to` and emits a transfer
+    /// event for actual gas spent. Intentionally allowed when paused so that a pause
+    /// transaction can still receive its fee refund.
+    pub fn transfer_fee_post_tx(
+        &mut self,
+        to: Address,
+        refund: U256,
+        actual_spending: U256,
+    ) -> Result<()> {
+        self.emit_event(ITIP20::Transfer {
+            from: to,
+            to: TIP_FEE_MANAGER_ADDRESS,
+            amount: actual_spending,
+        })?;
+
+        // Exit early if there is no refund
+        if refund.is_zero() {
+            return Ok(());
+        }
+
+        // Refund spending limit
+        super::account_keychain::AccountKeychain::new()
+            .refund_spending_limit(to, self.address, refund)?;
+
+        self.handle_rewards_on_transfer(TIP_FEE_MANAGER_ADDRESS, to, refund)?;
+
+        let from_balance = self.get_balance(TIP_FEE_MANAGER_ADDRESS)?;
+        let new_from_balance = from_balance.checked_sub(refund).ok_or_else(|| {
+            TempoPrecompileError::Revert(
+                ITIP20::InsufficientBalance {
+                    balance: from_balance,
+                    amount: refund,
+                    token: self.address,
+                }
+                .abi_encode()
+                .into(),
+            )
+        })?;
+        self.set_balance(TIP_FEE_MANAGER_ADDRESS, new_from_balance)?;
+
+        let to_balance = self.get_balance(to)?;
+        let new_to_balance = to_balance.checked_add(refund).ok_or_else(|| {
+            TempoPrecompileError::Revert(
+                ITIP20::SupplyCapExceeded {}.abi_encode().into(),
+            )
+        })?;
+        self.set_balance(to, new_to_balance)?;
+
+        self.emit_event(ITIP20::Transfer {
+            from: TIP_FEE_MANAGER_ADDRESS,
+            to,
+            amount: refund,
         })
     }
 

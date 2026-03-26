@@ -259,9 +259,8 @@ impl TipFeeManager {
         call: IFeeManager::setValidatorTokenCall,
         beneficiary: Address,
     ) -> Result<()> {
-        // Validate that the token is a valid deployed TIP20
-        // TODO(task-4a): cross-precompile call to TIP20Factory::is_tip20 -- stubbed to prefix check
-        if !super::tip20::is_tip20_prefix(call.token) {
+        // Validate that the token is a valid deployed TIP20 via factory
+        if !super::tip20_factory::TIP20Factory::new().is_tip20(call.token)? {
             return Err(TempoPrecompileError::Revert(
                 IFeeManager::InvalidToken {}.abi_encode().into(),
             ));
@@ -291,8 +290,7 @@ impl TipFeeManager {
         sender: Address,
         call: IFeeManager::setUserTokenCall,
     ) -> Result<()> {
-        // TODO(task-4a): cross-precompile call to TIP20Factory::is_tip20 -- stubbed to prefix check
-        if !super::tip20::is_tip20_prefix(call.token) {
+        if !super::tip20_factory::TIP20Factory::new().is_tip20(call.token)? {
             return Err(TempoPrecompileError::Revert(
                 IFeeManager::InvalidToken {}.abi_encode().into(),
             ));
@@ -320,12 +318,9 @@ impl TipFeeManager {
     ) -> Result<Address> {
         let validator_token = self.get_validator_token(beneficiary)?;
 
-        let tip20_token = TIP20Token::from_address(user_token)?;
+        let mut tip20_token = TIP20Token::from_address(user_token)?;
         tip20_token.ensure_transfer_authorized(fee_payer, self.address)?;
-        // TODO(task-4a): transfer_fee_pre_tx is a fee-handler-specific method not in the ported TIP20.
-        // In the full Tempo node this debits max_amount from fee_payer to the fee manager.
-        // Stubbed: the actual token transfer is skipped; pool reserve accounting still works.
-        let _ = (fee_payer, max_amount);
+        tip20_token.transfer_fee_pre_tx(fee_payer, max_amount)?;
 
         if user_token != validator_token {
             let pool_id = PoolKey::new(user_token, validator_token).get_id();
@@ -345,11 +340,8 @@ impl TipFeeManager {
         fee_token: Address,
         beneficiary: Address,
     ) -> Result<()> {
-        let _tip20_token = TIP20Token::from_address(fee_token)?;
-        // TODO(task-4a): transfer_fee_post_tx is a fee-handler-specific method not in the ported TIP20.
-        // In the full Tempo node this refunds unused tokens and settles actual spending.
-        // Stubbed: the actual token transfer is skipped; pool reserve accounting still works.
-        let _ = (fee_payer, refund_amount, actual_spending);
+        let mut tip20_token = TIP20Token::from_address(fee_token)?;
+        tip20_token.transfer_fee_post_tx(fee_payer, refund_amount, actual_spending)?;
 
         let validator_token = self.get_validator_token(beneficiary)?;
 
@@ -465,7 +457,7 @@ impl TipFeeManager {
         user_token: Address,
         validator_token: Address,
         amount_out: U256,
-        _to: Address,
+        to: Address,
     ) -> Result<U256> {
         if amount_out.is_zero() {
             return Err(TempoPrecompileError::Revert(
@@ -506,8 +498,21 @@ impl TipFeeManager {
 
         self.pools[pool_id].write(pool)?;
 
-        // TODO(task-4a): cross-precompile TIP20 system_transfer_from + transfer for token swaps
-        // For now the pool reserves are updated but actual token transfers are stubbed.
+        // Transfer validator tokens from swapper into the pool
+        TIP20Token::from_address(validator_token)?.system_transfer_from(
+            msg_sender,
+            self.address,
+            amount_in,
+        )?;
+
+        // Transfer user tokens from pool to recipient
+        TIP20Token::from_address(user_token)?.transfer(
+            self.address,
+            super::tip20::ITIP20::transferCall {
+                to,
+                amount: amount_out,
+            },
+        )?;
 
         self.emit_event(ITIPFeeAMM::RebalanceSwap {
             userToken: user_token,
@@ -610,7 +615,12 @@ impl TipFeeManager {
             ));
         }
 
-        // TODO(task-4a): cross-precompile TIP20 system_transfer_from for validator token deposit
+        // Transfer validator tokens from sender into the pool
+        TIP20Token::from_address(validator_token)?.system_transfer_from(
+            msg_sender,
+            self.address,
+            amount_validator_token,
+        )?;
 
         let validator_amount: u128 = amount_validator_token.try_into().map_err(|_| {
             TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
@@ -735,7 +745,22 @@ impl TipFeeManager {
                 })?;
         self.pools[pool_id].write(pool)?;
 
-        // TODO(task-4a): cross-precompile TIP20 transfers for burn payout
+        // Transfer pool tokens to the burn recipient
+        TIP20Token::from_address(user_token)?.transfer(
+            self.address,
+            super::tip20::ITIP20::transferCall {
+                to,
+                amount: amount_user_token,
+            },
+        )?;
+
+        TIP20Token::from_address(validator_token)?.transfer(
+            self.address,
+            super::tip20::ITIP20::transferCall {
+                to,
+                amount: amount_validator_token,
+            },
+        )?;
 
         self.emit_event(ITIPFeeAMM::Burn {
             sender: msg_sender,

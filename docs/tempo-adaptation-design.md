@@ -193,14 +193,17 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 
 ### 已知 stub（预编译间交叉调用未连接）
 
-| stub 点 | 影响 |
-|---------|------|
-| TIP20 → TIP403 compliance check | transfer 不做合规检查，始终允许 |
-| TIP20 → AccountKeychain spending limits | 不检查访问密钥的支出限额 |
-| FeeManager → TIP20 token transfer | fee 收取时的 TIP20 扣款被跳过 |
-| StablecoinDEX → TIP20 token transfer | DEX 交易时的 token 转移被跳过 |
-| ed25519 / P256 / WebAuthn 签名验证 | stub 为始终成功/总是失败 |
-| Journal checkpoint | stub — 影响预编译内部 rollback 语义 |
+| 项 | 状态 | 影响 |
+|---|------|------|
+| ~~TIP20 → TIP403 compliance check~~ | **已连接** | transfer/mint/burnBlocked 全部经 TIP403 合规检查 |
+| ~~TIP20 → AccountKeychain spending limits~~ | **已连接** | transfer/approve/distributeReward 经 AccountKeychain 限额检查 |
+| ~~FeeManager → TIP20 token transfer~~ | **已连接** | collect_fee_pre/post_tx + AMM (rebalance_swap/mint/burn) 全部调 TIP20 |
+| ~~FeeManager → TIP20Factory::is_tip20~~ | **已连接** | set_validator_token / set_user_token 调 TIP20Factory |
+| ~~TIP20 → TIP20Factory validation~~ | **已连接** | set_next_quote_token 调 is_tip20() + currency 验证 + cycle detection |
+| StablecoinDEX → TIP20 token transfer | stub | 无影响 — view 方法可正确读链上状态 |
+| ed25519 / P256 / WebAuthn 签名验证 | 无需实现 | eth_call 不触发签名验证 |
+| TIP20 permit ecrecover | 无法实现 | leafage 无 ecrecover 访问，permit 是写操作 |
+| Journal checkpoint (预编译内部) | stub | TempoHandler 级别已通过 revm journal 实现批量原子性 |
 
 ## 7. 已知限制
 
@@ -254,7 +257,7 @@ DeBankCore 调用方式：
 ### P0 — 上线前必须
 
 - [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证 TIP20 balanceOf/transfer, eth_multiCall, simulateTransactions, estimateGas
-- [ ] **Cross-precompile 连接** — TIP20 ↔ TIP403, TIP20 ↔ AccountKeychain 的 stub 需要在集成测试中评估是否影响 DeBankCore 业务
+- [x] ~~**Cross-precompile 连接**~~ — TIP20 ↔ TIP403 和 TIP20 ↔ AccountKeychain 已全部连接
 
 ### P1 — 上线后优化
 

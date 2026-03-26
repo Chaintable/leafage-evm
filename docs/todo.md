@@ -26,23 +26,26 @@
 ## Stub / TODO 点（代码中已标记）
 
 ### TIP20 预编译 (tip20.rs)
-- [ ] **TIP-403 compliance check** — `is_transfer_authorized` stub 为始终返回 `Ok(true)`。影响：simulateTransactions 中 TIP20 transfer 不做合规检查。集成测试需确认 DeBankCore 是否命中
-- [ ] **AccountKeychain spending limits** — stub。影响：不检查访问密钥的支出限额
-- [ ] **TIP20Factory validation** — `set_next_quote_token` 中的工厂验证 stub
-- [ ] **permit ecrecover** — 返回 InvalidSignature。影响：eth_call 不触发 permit
+- [x] ~~**TIP-403 compliance check**~~ — 已连接 TIP403Registry：transfer/transferFrom/transferWithMemo 合规检查、changeTransferPolicyId policy 存在性验证、mint/mintWithMemo recipient 授权、burnBlocked sender 检查
+- [x] ~~**AccountKeychain spending limits**~~ — 已连接：transfer/transferWithMemo/distributeReward 的 authorize_transfer、approve 的 authorize_approve
+- [x] ~~**TIP20Factory validation**~~ — 已连接：`set_next_quote_token` 调用 `TIP20Factory::is_tip20()` + USD currency 验证
+- [x] ~~**Quote-token cycle detection**~~ — 已实现：`complete_quote_token_update` 遍历 quote-token 链检测环路
+- [x] ~~**system_transfer_from**~~ — 已实现：供 FeeManager 等预编译使用的无授权跨预编译转账
+- [x] ~~**transfer_fee_pre_tx / transfer_fee_post_tx**~~ — 已实现：Fee handler 专用的预/后交易转账方法
+- [ ] **permit ecrecover** — 返回 InvalidSignature（genuine limitation：leafage 无 ecrecover 访问，permit 是写操作不影响 eth_call）
 
 ### FeeManager + TIPFeeAMM (fee_manager.rs)
-- [ ] **transfer_fee_pre_tx / transfer_fee_post_tx** — stub。影响：无（eth_call 模式不走 fee 路径）
-- [ ] **TIP20Factory::is_tip20 cross-call** — stub 为 `is_tip20_prefix` 前缀检查
-- [ ] **AMM token transfers** — pool reserve math 已移植，实际 TIP20 token 转移 stub
+- [x] ~~**transfer_fee_pre_tx / transfer_fee_post_tx**~~ — 已连接：调用 TIP20 的 transfer_fee_pre_tx / transfer_fee_post_tx
+- [x] ~~**TIP20Factory::is_tip20 cross-call**~~ — 已连接：set_validator_token / set_user_token 调用 `TIP20Factory::is_tip20()`
+- [x] ~~**AMM token transfers**~~ — 已连接：rebalance_swap / mint / burn 通过 `system_transfer_from` + `transfer` 执行实际 TIP20 转账
 - [ ] **Transient storage reservation** — omitted（leafage 是只读节点）
 
 ### AccountKeychain (account_keychain.rs)
-- [ ] **P256/WebAuthn 签名验证** — 无需实现。eth_call 不触发签名验证路径
-- [ ] **Cross-precompile wiring** — TIP20 调 `authorize_transfer` / `authorize_approve` 的连接
+- [x] ~~**P256/WebAuthn 签名验证**~~ — 已确认无需实现。eth_call 不触发签名验证路径
+- [x] ~~**Cross-precompile wiring**~~ — 已连接：TIP20 调 `authorize_transfer` / `authorize_approve`
 
 ### TIP403Registry (tip403_registry.rs)
-- [ ] **Cross-precompile wiring** — TIP20 `is_transfer_authorized` 需要调 TIP403Registry
+- [x] ~~**Cross-precompile wiring**~~ — 已连接：TIP20 的 `is_transfer_authorized`、`changeTransferPolicyId`、`_mint`、`burnBlocked` 全部调 TIP403Registry
 
 ### ValidatorConfigV2 (validator_config_v2.rs)
 - [ ] **Ed25519 签名验证** — stub（无 commonware-cryptography）。不影响 view call
@@ -61,7 +64,7 @@
 2. ~~**AccountKeychain 签名验证**~~ — 已确认不需要。eth_call 不触发签名验证，签名在 recover_signer() 层做
 3. ~~**ip_validation 模块**~~ — 已解决：内联到 validator_config.rs
 4. ~~**StablecoinDEX 的复杂度**~~ — 已完整移植（2239 行），view 方法可正确读取链上状态
-5. **cross-precompile 调用** — 仍需在集成测试中评估。当前各预编译独立移植 + stub
+5. ~~**cross-precompile 调用**~~ — TIP20 ↔ TIP403、TIP20 ↔ AccountKeychain、FeeManager ↔ TIP20、TIP20 ↔ TIP20Factory 全部已连接。仅 StablecoinDEX token transfer 保留 stub（view 方法不受影响）
 6. **Rust 工具链** — 项目没有 rust-toolchain.toml。当前用 1.93.0，CI 需确认
 7. ~~**TempoApiImpl 与 MainnetApiImpl 类型冲突**~~ — 已解决：`TempoEvmCustomConfig` marker type
 
