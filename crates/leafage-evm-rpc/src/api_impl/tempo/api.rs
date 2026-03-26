@@ -1,12 +1,12 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor};
+use crate::api_impl::core::{ApiCore, EvmExecutor, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
+use leafage_evm_chains::tempo::tx::TempoTxEnv;
 use leafage_evm_chains::tempo::TempoEvm;
 use leafage_evm_types::{BlockEnv, CallRequest, MainnetSpecId};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
-use revm::context::TxEnv;
 use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
@@ -26,7 +26,7 @@ impl<DB> EvmExecutor for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {
-    type Tx = TxEnv;
+    type Tx = TempoTxEnv;
     type TransactionError = InvalidTransaction;
     type EvmHaltReason = HaltReason;
 
@@ -37,7 +37,18 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)
+        // Build standard TxEnv first.
+        let base =
+            create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
+
+        // TODO: Extract tempo_calls and nonce_key from the RPC request.
+        // alloy's TransactionRequest does not have these fields natively.
+        // When the Tempo RPC endpoint is wired with custom deserialization,
+        // parse the batch calls here and populate TempoTxFields.
+        Ok(TempoTxEnv {
+            base,
+            tempo_fields: None,
+        })
     }
 
     fn transact<StateDB: DatabaseRef + Debug>(
@@ -55,8 +66,7 @@ where
         let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
         let wrap_database_ref = WrapDatabaseRef(state);
         let mut evm = TempoEvm::new(evm_env, wrap_database_ref, NoOpInspector {}, false);
-        let res = evm.transact(tx).map(|res| res.result.into());
-        res
+        evm.transact(tx).map(|res| res.result.into())
     }
 
     fn inspect_tx_commit<StateDB, R, F>(
@@ -79,11 +89,14 @@ where
         let wrap_database_ref = WrapDatabaseRef(state);
         let mut inspector = TracingInspector::new(inspector_cfg);
         let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
-        let res = evm
-            .inspect_tx_commit(tx)
-            .map(|res| (res.into(), inspector_collect(inspector)));
+        evm.inspect_tx_commit(tx)
+            .map(|res| (res.into(), inspector_collect(inspector)))
+    }
+}
 
-        res
+impl TxSetter for TempoTxEnv {
+    fn set_gas_limit(&mut self, gas_limit: u64) {
+        self.base.gas_limit = gas_limit;
     }
 }
 

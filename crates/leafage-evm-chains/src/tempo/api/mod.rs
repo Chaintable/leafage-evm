@@ -2,10 +2,11 @@ use alloy_evm::precompiles::PrecompilesMap;
 use std::ops::{Deref, DerefMut};
 
 use crate::tempo::precompile::extend_tempo_precompiles;
+use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::MainnetSpecId;
 use revm::{
-    context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr, TxEnv},
+    context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
     context_interface::cfg::gas_params::{GasId, GasParams},
     handler::{
         evm::{ContextDbError, FrameInitResult},
@@ -21,7 +22,7 @@ use revm::{
 mod exec;
 
 /// Type alias for the default context type of the TempoEvm.
-pub type TempoContext<DB> = Context<BlockEnv, TxEnv, CfgEnv<MainnetSpecId>, DB>;
+pub type TempoContext<DB> = Context<BlockEnv, TempoTxEnv, CfgEnv<MainnetSpecId>, DB>;
 
 /// Tempo EVM implementation.
 ///

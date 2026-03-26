@@ -97,11 +97,44 @@
 
 ## 后续工作（当前 scope 外）
 
-- [ ] AA tx 完整执行路径（如需求升级）
-- [ ] TempoTransaction (type 0x76) 支持 — 批量调用、2D nonce、fee payer、多签名（需自定义 TxEnv + Handler）
+- [x] TempoTransaction (type 0x76) 批量执行支持 — **已实现**，详见下方实现方案
 - [ ] Fee log 生成（如 DeBankCore 需要）
 - [ ] Tempo hardfork 动态切换（如需支持历史区块查询）
 - [ ] cargo feature gate `tempo`（减少非 Tempo 链的编译时间）
 - [ ] **estimateGas 与 Tempo writer 端 eth_estimateGas 的差异**:
   - **caller_gas_allowance**: Tempo writer 用 TIP-20 余额 * SCALING_FACTOR / gas_price 计算 gas 上界，leafage 用 rpc_gas_cap（固定值，不依赖余额）。当前无影响（leafage 不用余额算上界），但如果需要精确匹配 writer 端行为则需适配
   - **fee overhead**: Tempo writer 的 estimateGas 走完整 TempoEvmHandler（TIP-20 fee 预扣 → EVM 执行 → fee 退还），估算结果包含 handler 层 fee overhead。leafage 用 disable_base_fee=true 的标准 EVM，不含 fee overhead，结果会偏低。需要实现 TempoEvmHandler 才能解决
+
+18. **TempoTxEnv** — `TempoContext` 使用 `TempoTxEnv` 替代 `TxEnv`，`TempoHandler::execution()` override 支持 batch/single dispatch。`TempoTxFields` 在 `TempoEvm` 中通过 `tempo_fields` 字段传递
+19. **RPC batch calls 尚未接入** — `CallRequest` 是 `alloy::rpc::types::TransactionRequest` re-export，无法添加自定义字段。`create_txn_env` 当前返回 `tempo_fields: None`。待接入方案：自定义 serde wrapper 或 Tempo-specific RPC endpoint，从 JSON 解析 `tempo_calls` / `nonce_key` 后填充 `TempoTxFields`
+
+## TempoTransaction (0x76) 批量执行实现方案
+
+### 背景分析
+
+通过阅读 Tempo writer 端 `handler.rs` 源码确认：eth_call / eth_estimateGas 模式下（`disable_balance_check = true`）：
+
+1. **Fee handler 自动跳过** — `gas_balance_spending = max(account_balance, new_balance) - new_balance = 0`，短路返回不执行 `collect_fee_pre_tx`
+2. **签名验证不在 handler 里** — 在 `recover_signer()` 时做，eth_call 不走这条路
+3. **批量执行仍然生效** — handler `execution()` 检查 `tempo_tx_env.aa_calls`，有值就走 `execute_multi_call`
+4. **2D nonce** — `create_txn_env` 从 NonceManager 预编译 storage 读取
+5. **Keychain set_tx_origin** — 在 `validate_against_state_and_deduct_caller` 里执行
+
+**结论：不需要 fee handler，不需要签名验证。只需要批量原子执行 + 2D nonce + keychain tx_origin。**
+
+### 具体改动 (~200 行)
+
+| 改动 | 文件 | 行数 | 说明 |
+|------|------|------|------|
+| `TempoTxEnv` | `tempo/tx.rs` (新建) | ~50 | 包装 `TxEnv` + `tempo_tx_env: Option<TempoTxFields>` (aa_calls, nonce_key, override_key_id) |
+| `TempoHandler::execution()` | `tempo/api/exec.rs` | ~80 | override `execution()` — 检查 aa_calls，有值走 `execute_multi_call`（checkpoint → 逐 call 执行 → 任一失败 revert），无值走标准单 call |
+| `create_txn_env` 2D nonce | `tempo/api/mod.rs` 或 `rpc/tempo/api.rs` | ~30 | nonce_key != 0 时从 NonceManager storage 读取 nonce |
+| `validate` keychain | `tempo/api/exec.rs` | ~20 | override `validate_against_state_and_deduct_caller` — 调 `AccountKeychain::set_tx_origin()` |
+| RPC 类型扩展 | `leafage-evm-types/src/rpc/call.rs` | ~30 | `CallRequest` 加 `tempo_calls: Option<Vec<TempoCall>>`, `nonce_key: Option<U256>` 可选字段 |
+
+### 不需要的
+
+- Fee handler (validate_against_state 中 fee 部分自动跳过)
+- 签名验证 (P256/WebAuthn/Keychain — 不在 handler scope)
+- fee_payer / fee_token 推断 (跳过)
+- Authorization list 处理 (eth_call 不需要)
