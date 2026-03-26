@@ -1,8 +1,9 @@
-use crate::bench_runner::render::{mean, stddev};
-use crate::bench_runner::summary::{
+use crate::render::{mean, stddev};
+use crate::runner::summary::{
     AggregatedPercentiles, AggregatedSummary, LabelStats, Metric, RunSummary,
 };
-use crate::bench_runner::{CaseResult, RunConfig};
+use crate::runner::bench::BenchConfig;
+use crate::runner::CaseResult;
 use crate::corpus::ClassLabel;
 use anyhow::Result;
 use serde::Serialize;
@@ -33,8 +34,8 @@ pub struct RunMetadata {
     pub corpus_cases: usize,
 }
 
-impl From<&RunConfig> for RunMetadata {
-    fn from(cfg: &RunConfig) -> Self {
+impl From<&BenchConfig> for RunMetadata {
+    fn from(cfg: &BenchConfig) -> Self {
         RunMetadata {
             target: cfg.target_url.to_string(),
             compare: cfg.compare_url.clone(),

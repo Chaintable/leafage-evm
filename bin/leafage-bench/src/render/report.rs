@@ -1,6 +1,9 @@
-use crate::bench_runner::render::table::{AggCompareView, CompareView};
-use crate::bench_runner::render::{fmt_mean_std, TableView};
-use crate::bench_runner::summary::{AggregatedSummary, Metric, RunSummary};
+use crate::render::table::{
+    AggCompareView, CompareView, StressCompareView, StressSingleView,
+    render_stress_delta_table,
+};
+use crate::render::{fmt_mean_std, mean, TableView};
+use crate::runner::summary::{AggregatedSummary, Metric, RunSummary, StressLevelResult};
 use crate::corpus::ClassLabel;
 use std::io::{self, Write};
 
@@ -110,4 +113,106 @@ impl<'a> Report for CompareAggReport<'a> {
         }
         Ok(())
     }
+}
+
+// ─── stress-test reports ─────────────────────────────────────
+
+/// Per-level report: renders a single concurrency level as a table row.
+pub struct StressLevelReport<'a> {
+    pub name: &'a str,
+    pub level: &'a StressLevelResult,
+}
+
+/// Report for a stress test with a single endpoint.
+pub struct StressReport<'a> {
+    pub levels: &'a [StressLevelResult],
+    pub name: &'a str,
+}
+
+/// Report for a stress test comparing two endpoints.
+pub struct StressCompareReport<'a> {
+    pub target: &'a [StressLevelResult],
+    pub compare: &'a [StressLevelResult],
+}
+
+impl Report for StressLevelReport<'_> {
+    fn render_report(&self, w: &mut dyn Write) -> io::Result<()> {
+        let view = StressSingleView {
+            levels: std::slice::from_ref(self.level),
+        };
+        writeln!(w, "\n── {} concurrency={} ──\n", self.name, self.level.concurrency)?;
+        writeln!(w, "{}", view.render_overall_table(""))?;
+        Ok(())
+    }
+}
+
+impl Report for StressReport<'_> {
+    fn render_report(&self, w: &mut dyn Write) -> io::Result<()> {
+        writeln!(w, "\n══ stress test summary ({}) ══\n", self.name)?;
+
+        let view = StressSingleView {
+            levels: self.levels,
+        };
+        writeln!(w, "{}", view.render_overall_table(""))?;
+
+        render_max_qps(w, self.levels, self.name)?;
+        Ok(())
+    }
+}
+
+impl Report for StressCompareReport<'_> {
+    fn render_report(&self, w: &mut dyn Write) -> io::Result<()> {
+        writeln!(w, "\n══ stress test summary (target vs compare) ══\n")?;
+
+        let view = StressCompareView {
+            target: self.target,
+            compare: self.compare,
+        };
+        writeln!(w, "{}", view.render_overall_table(""))?;
+
+        render_max_qps(w, self.target, "target")?;
+        render_max_qps(w, self.compare, "compare")?;
+
+        writeln!(w, "\n── delta (target vs compare, base=compare) ──\n")?;
+        writeln!(
+            w,
+            "+N% = target is better (higher QPS / lower latency & error%)\n"
+        )?;
+        writeln!(w, "{}", render_stress_delta_table(self.target, self.compare))?;
+
+        Ok(())
+    }
+}
+
+fn render_max_qps(
+    w: &mut dyn Write,
+    levels: &[StressLevelResult],
+    name: &str,
+) -> io::Result<()> {
+    let best = levels
+        .iter()
+        .filter(|l| !l.breached)
+        .max_by(|a, b| {
+            mean(&a.qps_values)
+                .partial_cmp(&mean(&b.qps_values))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+    if let Some(best) = best {
+        writeln!(
+            w,
+            "🏆 {name} max sustainable QPS: {:.1} (at concurrency={}, error%={:.2}%, p50={:.2}ms, p99={:.2}ms)",
+            mean(&best.qps_values),
+            best.concurrency,
+            mean(&best.error_rates),
+            mean(&best.overall_pcts.p50),
+            mean(&best.overall_pcts.p99),
+        )?;
+    } else {
+        writeln!(
+            w,
+            "⚠ {name}: all concurrency levels exceeded the error-rate threshold.",
+        )?;
+    }
+    Ok(())
 }

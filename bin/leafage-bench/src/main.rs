@@ -1,7 +1,8 @@
 mod corpus;
 mod inspect;
 mod run;
-mod bench_runner;
+pub(crate) mod render;
+pub(crate) mod runner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -21,12 +22,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the benchmark against one or two RPC endpoints.
+    /// Run benchmarks (bench or stress sub-mode).
     Run(run::Command),
 
     /// Inspect the corpus file: print summary statistics without running any benchmark.
     Inspect(inspect::Command),
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

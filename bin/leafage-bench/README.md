@@ -14,29 +14,45 @@ cargo build --release -p leafage-bench
 
 ## Usage
 
-### `run` — Run the benchmark
+The CLI has two top-level sub-commands: `run` and `inspect`.
 
-```bash
-./target/release/leafage-bench run \
-  --corpus bin/leafage-bench/corpus/corpus.json \
-  --target http://leafage-evm:8545 \
-  --compare http://geth:8545
-```
+`run` itself has two modes:
+
+- **`run bench`** — Fixed-concurrency benchmark: run N rounds and report latency / QPS.
+- **`run stress`** — Stress-test: ramp concurrency to find the maximum sustainable QPS.
+
+### Common parameters (shared by `bench` and `stress`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--corpus` / `-c` | - | Path to the corpus JSON file (required) |
-| `--target` | - | Primary RPC endpoint URL (leafage-evm) (required) |
+| `--corpus` / `-c` | *(required)* | Path to the corpus JSON file |
+| `--target` | *(required)* | Primary RPC endpoint URL (leafage-evm) |
 | `--compare` | - | Comparison RPC endpoint URL (geth) |
 | `--label` | all | Only run cases with this complexity label: `L1`, `L2`, `L3` |
-| `--concurrency` | 10 | Number of concurrent requests per endpoint |
 | `--requests` | corpus size | Total requests per endpoint per round |
-| `--rounds` | 1 | Number of benchmark rounds |
+| `--rounds` | 1 | Number of benchmark rounds (per concurrency level for stress) |
 | `--seed` | - | Shuffle seed for corpus ordering |
-| `--output-dir` | - | Directory for export files (`summary.json`, `verbose.json`) |
-| `--verbose` | false | Write per-request details to `verbose.json` (requires `--output-dir`) |
 
 All requests use `latest` as the block tag. The per-request RPC timeout is 30 seconds.
+
+### `run bench` — Fixed-concurrency benchmark
+
+```bash
+./target/release/leafage-bench run bench \
+  --corpus bin/leafage-bench/corpus/corpus.json \
+  --target http://leafage-evm:8555 \
+  --compare http://geth:8545 \
+  --concurrency 10 \
+  --rounds 20
+```
+
+Additional parameters for `bench`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--concurrency` | 10 | Number of concurrent requests per endpoint |
+| `--output-dir` | - | Directory for export files (`summary.json`, `verbose.json`) |
+| `--verbose` | false | Write per-request details to `verbose.json` (requires `--output-dir`) |
 
 **Console output**: After each round, a latency table (p50 / p90 / p95 / p99 / p99.9) broken down by tier (L1 / L2 / L3) is printed to stdout. When `--compare` is set, a side-by-side comparison table is shown. For multi-round runs, an aggregated report (mean ± stddev across rounds) is printed at the end.
 
@@ -46,6 +62,26 @@ All requests use `latest` as the block tag. The per-request RPC timeout is 30 se
 |------|-------------|----------|
 | `summary.json` | always | Run metadata, per-round statistics, aggregated statistics (multi-round only) |
 | `verbose.json` | `--verbose` is set | Per-request details: case ID, label, latency, return value / error |
+
+### `run stress` — Stress test
+
+```bash
+./target/release/leafage-bench run stress \
+  --corpus bin/leafage-bench/corpus/corpus.json \
+  --target http://leafage-evm:8555 \
+  --compare http://geth:8545 \
+  --concurrency-levels 100,200,500,1000,2000 \
+  --rounds 3
+```
+
+Additional parameters for `stress`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--concurrency-levels` | `100,200,500,1000,2000` | Comma-separated list of concurrency levels to ramp through |
+| `--max-error-rate` | 1.0 | Maximum tolerable error rate (%). When exceeded, the ramp stops for that endpoint |
+
+The stress test runs each concurrency level in order, executing `--rounds` rounds per level. After all levels are complete, a summary table and a delta comparison table are printed. The delta table shows how much better/worse the target is relative to compare at each concurrency level (`+N%` = target is better).
 
 ### `inspect` — Inspect the corpus
 
@@ -168,13 +204,13 @@ performance differences of 5 %+ between leafage-evm and geth.
 
 Both geth and leafage-evm ran on the **same** AWS EC2 `i3en.2xlarge` instance:
 
-| |                                                                        |
-|---|------------------------------------------------------------------------|
-| **Instance type** | `i3en.2xlarge`                                                         |
+| | |
+|---|---|
+| **Instance type** | `i3en.2xlarge` |
 | **CPU** | Intel Xeon Platinum 8259CL @ 2.50 GHz (4 cores / 8 vCPUs, Hyper-Threading) |
-| **L3 cache** | 35.75 MiB                                                              |
-| **Memory** | 64 GiB                                                                 |
-| **Storage** | EBS (IOPS 3000, throughput 300 MB/s)                                   |
+| **L3 cache** | 35.75 MiB |
+| **Memory** | 64 GiB |
+| **Storage** | EBS (IOPS 3000, throughput 300 MB/s) |
 
 ---
 
@@ -182,7 +218,7 @@ Both geth and leafage-evm ran on the **same** AWS EC2 `i3en.2xlarge` instance:
 
 > **Command**:
 > ```bash
-> cargo run --bin leafage-bench run \
+> cargo run --bin leafage-bench -- run bench \
 >   --corpus ./bin/leafage-bench/corpus/corpus.json \
 >   --target http://<leafage-evm>:8555 \
 >   --compare http://<geth>:8545 \
@@ -291,4 +327,3 @@ standalone
 --warmup-tokens=50000
 --readiness-addr=0.0.0.0:6000
 ```
-
