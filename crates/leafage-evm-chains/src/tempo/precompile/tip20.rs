@@ -594,13 +594,27 @@ impl TIP20Token {
 impl TIP20Token {
     /// Check whether a transfer is authorized by the token's TIP-403 policy.
     ///
-    /// TODO: Connect to TIP403Registry once it is ported. For now, always returns true
-    /// to allow all transfers. The actual Tempo implementation checks:
-    /// - Sender authorization via `TIP403Registry::is_authorized_as(policy_id, from, sender)`
-    /// - Recipient authorization via `TIP403Registry::is_authorized_as(policy_id, to, recipient)`
-    pub fn is_transfer_authorized(&self, _from: Address, _to: Address) -> Result<bool> {
-        // TODO(task-4b): Wire up TIP403Registry cross-precompile call
-        Ok(true)
+    /// Reads the token's `transfer_policy_id`, then checks sender and recipient
+    /// authorization against TIP403Registry.
+    pub fn is_transfer_authorized(&self, from: Address, to: Address) -> Result<bool> {
+        let policy_id = self.transfer_policy_id.read()?;
+        let registry = super::tip403_registry::TIP403Registry::new();
+
+        // T2+ short-circuit: skip recipient check if sender fails
+        let sender_auth = registry.is_authorized_as(
+            policy_id,
+            from,
+            super::tip403_registry::AuthRole::sender(),
+        )?;
+        if !sender_auth {
+            return Ok(false);
+        }
+        let recipient_auth = registry.is_authorized_as(
+            policy_id,
+            to,
+            super::tip403_registry::AuthRole::recipient(),
+        )?;
+        Ok(sender_auth && recipient_auth)
     }
 
     /// Ensures the transfer is authorized by the token's TIP-403 policy.
@@ -848,7 +862,14 @@ impl TIP20Token {
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
 
-        // TODO(task-4b): Validate that the policy exists in TIP403Registry
+        // Validate that the policy exists in TIP403Registry
+        if !super::tip403_registry::TIP403Registry::new().policy_exists(
+            super::tip403_registry::ITIP403Registry::policyExistsCall { policyId: call.newPolicyId },
+        )? {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidTransferPolicyId {}.abi_encode().into(),
+            ));
+        }
         self.transfer_policy_id.write(call.newPolicyId)?;
 
         self.emit_event(ITIP20::TransferPolicyUpdate {
@@ -901,7 +922,10 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::approveCall,
     ) -> Result<bool> {
-        // TODO(task-4b): AccountKeychain spending limit check
+        // AccountKeychain spending limit check for approve
+        let old_allowance = self.get_allowance(msg_sender, call.spender)?;
+        super::account_keychain::AccountKeychain::new()
+            .authorize_approve(msg_sender, self.address, old_allowance, call.amount)?;
         self.set_allowance(msg_sender, call.spender, call.amount)?;
 
         self.emit_event(ITIP20::Approval {
@@ -974,7 +998,9 @@ impl TIP20Token {
         self.check_recipient(call.to)?;
         self.ensure_transfer_authorized(msg_sender, call.to)?;
 
-        // TODO(task-4b): AccountKeychain spending limit check
+        // AccountKeychain spending limit check for transfer
+        super::account_keychain::AccountKeychain::new()
+            .authorize_transfer(msg_sender, self.address, call.amount)?;
         self._transfer(msg_sender, call.to, call.amount)?;
         Ok(true)
     }
@@ -1047,7 +1073,9 @@ impl TIP20Token {
         self.check_recipient(call.to)?;
         self.ensure_transfer_authorized(msg_sender, call.to)?;
 
-        // TODO(task-4b): AccountKeychain spending limit check
+        // AccountKeychain spending limit check for transferWithMemo
+        super::account_keychain::AccountKeychain::new()
+            .authorize_transfer(msg_sender, self.address, call.amount)?;
         self._transfer(msg_sender, call.to, call.amount)?;
 
         self.emit_event(ITIP20::TransferWithMemo {
@@ -1128,7 +1156,17 @@ impl TIP20Token {
         self.check_role(msg_sender, *ISSUER_ROLE)?;
         let total_supply = self.total_supply()?;
 
-        // TODO(task-4b): TIP403Registry mint recipient authorization check
+        // TIP403Registry mint recipient authorization check
+        let policy_id = self.transfer_policy_id.read()?;
+        if !super::tip403_registry::TIP403Registry::new().is_authorized_as(
+            policy_id,
+            to,
+            super::tip403_registry::AuthRole::mint_recipient(),
+        )? {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::PolicyForbids {}.abi_encode().into(),
+            ));
+        }
         let new_supply = total_supply.checked_add(amount).ok_or_else(|| {
             TempoPrecompileError::Fatal("overflow in _mint".to_string())
         })?;
@@ -1203,7 +1241,18 @@ impl TIP20Token {
             ));
         }
 
-        // TODO(task-4b): TIP403Registry sender authorization check
+        // TIP403Registry: verify sender is NOT authorized (burn_blocked targets blacklisted accounts)
+        let policy_id = self.transfer_policy_id.read()?;
+        if super::tip403_registry::TIP403Registry::new().is_authorized_as(
+            policy_id,
+            call.from,
+            super::tip403_registry::AuthRole::sender(),
+        )? {
+            // burn_blocked only works on accounts that are NOT authorized (i.e., blocked)
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::PolicyForbids {}.abi_encode().into(),
+            ));
+        }
         self._transfer(call.from, Address::ZERO, call.amount)?;
 
         let total_supply = self.total_supply()?;
@@ -1268,7 +1317,9 @@ impl TIP20Token {
         }
 
         self.ensure_transfer_authorized(msg_sender, token_address)?;
-        // TODO(task-4b): AccountKeychain spending limit check
+        // AccountKeychain spending limit check for distributeReward
+        super::account_keychain::AccountKeychain::new()
+            .authorize_transfer(msg_sender, self.address, call.amount)?;
         self._transfer(msg_sender, token_address, call.amount)?;
 
         let opted_in_supply = U256::from(self.get_opted_in_supply()?);
