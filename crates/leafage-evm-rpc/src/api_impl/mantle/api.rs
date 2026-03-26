@@ -7,7 +7,7 @@ use leafage_evm_chains::mantle::{MantleHardfork, GAS_ORACLE_ADDR, TOKEN_RATIO_SL
 use leafage_evm_types::CallRequest;
 use op_revm::transaction::OpTxTr;
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
-use revm::context::result::EVMError;
+use revm::context::result::{EVMError, ResultGas};
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
 use revm::inspector::NoOpInspector;
 use revm::ExecuteEvm;
@@ -72,25 +72,25 @@ where
         let final_result = if should_apply_ratio {
             match result.result {
                 ExecutionResult::Success {
-                    gas_used,
-                    gas_refunded,
+                    gas,
                     output,
                     logs,
                     reason,
                 } => ExecutionResult::Success {
-                    gas_used: gas_used * token_ratio,
-                    gas_refunded: gas_refunded * token_ratio,
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
                     output,
                     logs,
                     reason,
                 },
-                ExecutionResult::Revert { gas_used, output } => ExecutionResult::Revert {
-                    gas_used: gas_used * token_ratio,
+                ExecutionResult::Revert { gas, output, logs } => ExecutionResult::Revert {
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
                     output,
+                    logs,
                 },
-                ExecutionResult::Halt { reason, gas_used } => ExecutionResult::Halt {
+                ExecutionResult::Halt { reason, gas, logs } => ExecutionResult::Halt {
                     reason,
-                    gas_used: gas_used * token_ratio,
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    logs,
                 },
             }
         } else {
@@ -137,25 +137,25 @@ where
         let final_result = if should_apply_ratio {
             match result {
                 ExecutionResult::Success {
-                    gas_used,
-                    gas_refunded,
+                    gas,
                     output,
                     logs,
                     reason,
                 } => ExecutionResult::Success {
-                    gas_used: gas_used * token_ratio,
-                    gas_refunded: gas_refunded * token_ratio,
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
                     output,
                     logs,
                     reason,
                 },
-                ExecutionResult::Revert { gas_used, output } => ExecutionResult::Revert {
-                    gas_used: gas_used * token_ratio,
+                ExecutionResult::Revert { gas, output, logs } => ExecutionResult::Revert {
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
                     output,
+                    logs,
                 },
-                ExecutionResult::Halt { reason, gas_used } => ExecutionResult::Halt {
+                ExecutionResult::Halt { reason, gas, logs } => ExecutionResult::Halt {
                     reason,
-                    gas_used: gas_used * token_ratio,
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    logs,
                 },
             }
         } else {

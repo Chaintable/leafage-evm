@@ -134,8 +134,8 @@ where
                 decode_revert_reason(&output).unwrap_or("execution revert".to_string())
             ))
             .into()),
-            ExecutionResult::Halt { reason, gas_used } => {
-                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas_used)).into())
+            ExecutionResult::Halt { reason, gas, .. } => {
+                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.spent())).into())
             }
         }
     }

@@ -50,6 +50,8 @@ pub fn apply_block_overrides<DB>(
         random,
         base_fee,
         block_hash,
+        blob_base_fee: _,
+        beacon_root: _,
     } = overrides;
 
     if let Some(block_hashes) = block_hash {
@@ -126,7 +128,8 @@ where
 
     // Create a new account marked as touched
     let mut acc = Account {
-        info,
+        info: info.clone(),
+        original_info: Box::new(info),
         status: AccountStatus::Touched,
         storage: HashMap::default(),
         transaction_id: 0,

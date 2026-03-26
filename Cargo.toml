@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.91"
 authors = ["leafage-evm Contributors"]
 license = "MIT OR Apache-2.0"
 exclude = ["benches/", "tests/"]
@@ -56,7 +56,7 @@ procfs = "0.17"
 lru = "0.16.0"
 
 # revm
-revm = { version = "33.1.0", features = [
+revm = { version = "36.0.0", features = [
     "std",
     "secp256k1",
     "blst",
@@ -66,7 +66,7 @@ revm = { version = "33.1.0", features = [
     "optional_balance_check",
     "optional_block_gas_limit",
 ] }
-op-revm = { version = "14.1.0", features = [
+op-revm = { version = "17.0.0", features = [
     "std",
     "secp256k1",
     "blst",
@@ -76,8 +76,8 @@ op-revm = { version = "14.1.0", features = [
     "optional_balance_check",
     "optional_block_gas_limit",
 ] }
-revm-inspectors = "0.33.2"
-revm-bytecode = "7.1.1"
+revm-inspectors = "0.36.1"
+revm-bytecode = "9.0.0"
 
 # alloy
 alloy-chains = "0.2.5"
@@ -85,7 +85,7 @@ alloy = { version = "1.1.3", features = ["full"] }
 alloy-rlp = "0.3"
 alloy-rlp-derive = "0.3"
 alloy-hardforks = "0.4"
-alloy-evm = "0.25.2"
+alloy-evm = "0.29.2"
 alloy-sol-types = "1.3"
 alloy-contract = "1.1.3"
 

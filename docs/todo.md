@@ -5,9 +5,9 @@
 1. **不实现 AA tx (0x76) 完整执行路径** — 工作量大（BSC 3-5x），先简单版本上线
 2. **跳过 Fee handler / Fee log** — 与 writer 端 pre_traceMany 行为一致（disable_base_fee）
 3. **Hardfork 策略** — 最小 TempoHardfork 枚举，所有 is_*() 返回 true，只跑最新 spec
-4. **revm 版本** — 不升级 revm（保持 33.1），用 LeafageStorageProvider 适配层桥接
-5. **GasParams** — 不使用 revm 36 的 GasParams API，改为 TempoGasCosts hardcoded 常量
-6. **编译工具链** — 使用 Rust 1.87.0（1.93.1 与 tokio 不兼容）
+4. **revm 版本** — ~~不升级 revm（保持 33.1）~~ 已升级到 revm 36.0.0 (op-revm 17.0.0, revm-inspectors 0.36.1, revm-bytecode 9.0.0, alloy-evm 0.29.2)
+5. **GasParams** — ~~不使用 revm 36 的 GasParams API~~ 已使用 revm 36 原生 GasParams API 设置 Tempo TIP-1000 gas 参数覆盖（TempoEvm::new 中 7 项 override），同时保留 TempoGasCosts 常量供 LeafageStorageProvider 使用
+6. **编译工具链** — ~~使用 Rust 1.87.0~~ 升级到 Rust 1.93.0（revm 36 要求 1.88+, revm-inspectors 0.36.1 要求 1.91+）
 7. **StorageKey for u64** — 为 `u64` 添加 `StorageKey` impl（TIP403Registry 的 `Mapping<u64, PolicyRecord>` 需要）
 8. **AccountKeychain 签名验证不需要 p256/sha2 crate** — leafage 只读取 keychain state，不做签名验证。`validate_keychain_authorization` 验证 key 存在性、revocation、expiry 和 sig_type 匹配，但实际密码学验证在 tx handler 层（不在预编译 scope）
 9. **TempoPrecompileError::under_overflow()** — 添加 Panic(0x11) 辅助方法，TIP403Registry 的 policy counter overflow 需要
@@ -98,6 +98,10 @@
 ## 后续工作（当前 scope 外）
 
 - [ ] AA tx 完整执行路径（如需求升级）
+- [ ] TempoTransaction (type 0x76) 支持 — 批量调用、2D nonce、fee payer、多签名（需自定义 TxEnv + Handler）
 - [ ] Fee log 生成（如 DeBankCore 需要）
 - [ ] Tempo hardfork 动态切换（如需支持历史区块查询）
 - [ ] cargo feature gate `tempo`（减少非 Tempo 链的编译时间）
+- [ ] **estimateGas 与 Tempo writer 端 eth_estimateGas 的差异**:
+  - **caller_gas_allowance**: Tempo writer 用 TIP-20 余额 * SCALING_FACTOR / gas_price 计算 gas 上界，leafage 用 rpc_gas_cap（固定值，不依赖余额）。当前无影响（leafage 不用余额算上界），但如果需要精确匹配 writer 端行为则需适配
+  - **fee overhead**: Tempo writer 的 estimateGas 走完整 TempoEvmHandler（TIP-20 fee 预扣 → EVM 执行 → fee 退还），估算结果包含 handler 层 fee overhead。leafage 用 disable_base_fee=true 的标准 EVM，不含 fee overhead，结果会偏低。需要实现 TempoEvmHandler 才能解决

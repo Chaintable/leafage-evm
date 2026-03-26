@@ -765,7 +765,7 @@ where
             .map_err(|e| e.to_rpc_error())?;
 
         let gas_refund = match res {
-            ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
+            ExecutionResult::Success { gas, .. } => gas.inner_refunded(),
             ExecutionResult::Halt { reason, .. } => {
                 let code = DebankErrorCode::from(reason.clone());
                 return Err(rpc_error_with_code(

@@ -7,6 +7,7 @@ use revm::context::{Evm, TxEnv};
 use revm::context_interface::Block;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::handler::{instructions::EthInstructions, EthPrecompiles};
+use revm::precompile::PrecompileSpecId;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::primitives::TxKind;
 use revm::{Context, MainBuilder, MainContext};
@@ -200,10 +201,11 @@ pub(crate) fn create_main_evm_from_state<StateDB, INSP>(
 where
     StateDB: DatabaseRef,
 {
+    let spec: revm::primitives::hardfork::SpecId = cfg.spec.into();
     Context::mainnet()
         .with_block(block_env)
         .with_cfg(cfg)
         .with_ref_db(state)
         .build_mainnet_with_inspector(inspector)
-        .with_precompiles(EthPrecompiles::default())
+        .with_precompiles(EthPrecompiles::new(spec))
 }

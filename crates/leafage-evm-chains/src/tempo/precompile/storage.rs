@@ -2,29 +2,29 @@
 //!
 //! Provides:
 //! - [`PrecompileStorageProvider`] trait -- low-level storage operations
-//! - [`LeafageStorageProvider`] -- production implementation backed by alloy-evm 0.25.2 EvmInternals
+//! - [`LeafageStorageProvider`] -- production implementation backed by alloy-evm 0.29.2 EvmInternals
 //! - [`StorageCtx`] -- thread-local accessor using `scoped-tls`
 //! - [`CheckpointGuard`] -- RAII guard for atomic state mutation batching
 //!
-//! ## API adaptation notes (alloy-evm 0.25.2 vs Tempo's 0.29)
+//! ## API adaptation notes (alloy-evm 0.29.2)
 //!
-//! - `EvmInternals::new` takes 2 args (journal, block_env) instead of 4
-//! - No `chain_id()` method -- passed explicitly to `LeafageStorageProvider::new`
-//! - No `load_account_mut_skip_cold_load` -- we use `load_account_code` (read-only equivalent)
-//! - No `GasParams` / `GasId` -- we use hardcoded `TempoGasCosts` constants
-//! - No `checkpoint`/`checkpoint_commit`/`checkpoint_revert` on EvmInternals --
-//!   checkpoints are only on JournalTr directly, so we stub them for leafage-evm
-//!   (leafage is read-only, checkpoints are never needed in practice)
+//! - `chain_id` passed explicitly to `LeafageStorageProvider::new` for convenience
+//! - Gas accounting uses hardcoded `TempoGasCosts` constants (matching GasParams overrides)
+//! - `with_account_info` uses `load_account_code` + `JournaledAccountTr::account()` for info access
+//! - Checkpoint operations are stubbed (leafage is read-only, no real rollback needed)
 
 use alloy::primitives::{keccak256, Address, Log, LogData, B256, U256};
 use alloy_evm::EvmInternals;
 use revm::{
     interpreter::gas::{
-        COLD_ACCOUNT_ACCESS_COST_ADDITIONAL, COLD_SLOAD_COST_ADDITIONAL, KECCAK256, KECCAK256WORD,
-        LOG, LOGDATA, LOGTOPIC, WARM_STORAGE_READ_COST, WARM_SSTORE_RESET,
+        COLD_ACCOUNT_ACCESS_COST_ADDITIONAL, COLD_SLOAD_COST, KECCAK256, KECCAK256WORD, LOG,
+        LOGDATA, LOGTOPIC, WARM_STORAGE_READ_COST, WARM_SSTORE_RESET,
     },
     state::Bytecode,
 };
+
+/// COLD_SLOAD_COST - WARM_STORAGE_READ_COST (removed in revm 36, was 2000)
+const COLD_SLOAD_COST_ADDITIONAL: u64 = COLD_SLOAD_COST - WARM_STORAGE_READ_COST;
 use scoped_tls::scoped_thread_local;
 use std::cell::RefCell;
 
@@ -166,14 +166,13 @@ pub trait ContractStorage {
 // LeafageStorageProvider (adapted from EvmPrecompileStorageProvider)
 // ---------------------------------------------------------------------------
 
-/// Production [`PrecompileStorageProvider`] backed by alloy-evm 0.25.2's `EvmInternals`.
+/// Production [`PrecompileStorageProvider`] backed by alloy-evm 0.29.2's `EvmInternals`.
 ///
 /// Adapted from Tempo's `EvmPrecompileStorageProvider` with these key differences:
-/// - `chain_id` is passed explicitly (not available on EvmInternals in 0.25.2)
-/// - Gas accounting uses hardcoded `TempoGasCosts` constants instead of `GasParams`
-/// - `with_account_info` uses `load_account_code` (read-only load + code) instead of
-///   `load_account_mut_skip_cold_load` (which doesn't exist in 0.25.2)
-/// - Checkpoint operations are stubbed (no-op)
+/// - `chain_id` is passed explicitly for convenience
+/// - Gas accounting uses hardcoded `TempoGasCosts` constants (matching GasParams overrides in TempoEvm)
+/// - `with_account_info` uses `load_account_code` + `JournaledAccountTr::account().info`
+/// - Checkpoint operations are stubbed (no-op, leafage is read-only)
 pub struct LeafageStorageProvider<'a> {
     internals: EvmInternals<'a>,
     gas_remaining: u64,
@@ -252,15 +251,12 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         address: Address,
         f: &mut dyn FnMut(&revm::state::AccountInfo),
     ) -> Result<()> {
-        // alloy-evm 0.25.2 does not have `load_account_mut_skip_cold_load`.
-        // We use `load_account_code` which loads account + code (read-only).
-        // Gas: WARM_STORAGE_READ_COST + cold account additional cost if cold.
-        //
-        // We must extract account info and cold flag before calling deduct_gas
-        // to avoid overlapping mutable borrows on self.
-        let result = self.internals.load_account_code(address)?;
-        let is_cold = result.is_cold;
-        let info = result.data.info.clone();
+        // alloy-evm 0.29.2 load_account_code returns StateLoad<Box<dyn JournaledAccountTr>>.
+        // Extract info and cold flag, then drop the borrow before calling deduct_gas.
+        let (info, is_cold) = {
+            let result = self.internals.load_account_code(address)?;
+            (result.data.account().info.clone(), result.is_cold)
+        };
 
         self.deduct_gas(WARM_STORAGE_READ_COST)?;
 

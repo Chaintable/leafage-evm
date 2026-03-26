@@ -6,6 +6,7 @@ use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::MainnetSpecId;
 use revm::{
     context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr, TxEnv},
+    context_interface::cfg::gas_params::{GasId, GasParams},
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
@@ -55,11 +56,25 @@ impl<DB: Database, I> TempoEvm<DB, I> {
         );
         extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
 
+        // Apply Tempo TIP-1000 gas parameter overrides via revm 36 GasParams API.
+        let mut cfg_env = env.cfg_env;
+        let mut gas_params = GasParams::new_spec(cfg_env.spec.into());
+        gas_params.override_gas([
+            (GasId::sstore_set_without_load_cost(), 250_000),
+            (GasId::create(), 500_000),
+            (GasId::tx_create_cost(), 500_000),
+            (GasId::new_account_cost(), 250_000),
+            (GasId::new_account_cost_for_selfdestruct(), 250_000),
+            (GasId::code_deposit_cost(), 1_000),
+            (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+        ]);
+        cfg_env.gas_params = gas_params;
+
         Self {
             inner: EvmCtx {
                 ctx: Context {
                     block: env.block_env,
-                    cfg: env.cfg_env,
+                    cfg: cfg_env,
                     journaled_state: Journal::new(db),
                     tx: Default::default(),
                     chain: Default::default(),

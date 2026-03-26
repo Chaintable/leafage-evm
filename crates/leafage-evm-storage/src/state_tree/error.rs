@@ -20,4 +20,4 @@ impl<DBError> From<DBError> for Error<DBError> {
     }
 }
 
-impl<DBError> DBErrorMarker for Error<DBError> {}
+impl<DBError: Send + Sync + std::fmt::Debug + std::fmt::Display + 'static> DBErrorMarker for Error<DBError> {}
