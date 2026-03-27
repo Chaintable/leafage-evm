@@ -18,8 +18,6 @@ use std::str::FromStr;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-// ─── shared types ────────────────────────────────────────────
-
 #[derive(Debug)]
 pub struct CaseResult {
     #[allow(dead_code)]
@@ -45,8 +43,6 @@ impl CaseResult {
         }
     }
 }
-
-// ─── shared helpers ──────────────────────────────────────────
 
 /// Build an HTTP JSON-RPC client with the default 30 s timeout.
 pub(crate) fn build_client(url: &str) -> Result<HttpClient> {

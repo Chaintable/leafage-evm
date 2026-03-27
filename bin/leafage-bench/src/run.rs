@@ -30,8 +30,6 @@ impl Command {
     }
 }
 
-// ─── common args ─────────────────────────────────────────────
-
 /// Arguments shared by both bench and stress sub-commands.
 #[derive(Debug, Args)]
 pub struct CommonArgs {
@@ -91,8 +89,6 @@ impl CommonArgs {
     }
 }
 
-// ─── bench ───────────────────────────────────────────────────
-
 #[derive(Debug, Args)]
 pub struct BenchCommand {
     #[command(flatten)]
@@ -150,8 +146,6 @@ impl BenchCommand {
         BenchRunner::new(cfg)?.run(corpus).await
     }
 }
-
-// ─── stress ──────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
 pub struct StressCommand {

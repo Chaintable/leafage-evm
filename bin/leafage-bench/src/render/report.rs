@@ -115,8 +115,6 @@ impl<'a> Report for CompareAggReport<'a> {
     }
 }
 
-// ─── stress-test reports ─────────────────────────────────────
-
 /// Per-level report: renders a single concurrency level as a table row.
 pub struct StressLevelReport<'a> {
     pub name: &'a str,

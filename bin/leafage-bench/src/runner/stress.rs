@@ -50,7 +50,6 @@ impl StressRunner {
                 break;
             }
 
-            // --- target ---
             if !target_stopped {
                 let level = Self::run_level(
                     "target", &self.target, corpus, concurrency, requests, self.cfg.rounds,
@@ -65,7 +64,6 @@ impl StressRunner {
                 target_results.push(level);
             }
 
-            // --- compare ---
             if let Some(ref cmp) = self.compare {
                 if !compare_stopped {
                     let level = Self::run_level(
@@ -83,7 +81,6 @@ impl StressRunner {
             }
         }
 
-        // --- final report ---
         let w = &mut io::stdout();
         if compare_results.is_empty() {
             StressReport {

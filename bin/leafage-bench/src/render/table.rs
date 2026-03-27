@@ -283,8 +283,6 @@ fn render_aggregated_compare_table(
     table
 }
 
-// ─── stress-test tables ──────────────────────────────────────
-
 /// Single-endpoint stress table view.
 pub(crate) struct StressSingleView<'a> {
     pub levels: &'a [StressLevelResult],
