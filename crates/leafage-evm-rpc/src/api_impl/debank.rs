@@ -678,6 +678,7 @@ where
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
+        eprintln!("[TEMPO DEBUG] estimate_gas_inner block_num={} block_ts={}", block.header.number, block_env.timestamp);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
@@ -725,10 +726,12 @@ where
                         })
                         .unwrap_or(true);
                     if no_code_callee {
+                        eprintln!("[TEMPO DEBUG] estimate_gas: no_code_callee early path, MIN_TRANSACTION_GAS={}", MIN_TRANSACTION_GAS);
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
                         if let Ok(exec_res) = self.inner.transact(&block_env, &memory_db, tx) {
                             if exec_res.is_success() {
+                                eprintln!("[TEMPO DEBUG] estimate_gas: early return MIN_TRANSACTION_GAS={}", MIN_TRANSACTION_GAS);
                                 return Ok(U256::from(MIN_TRANSACTION_GAS));
                             }
                         }
@@ -870,6 +873,7 @@ where
             highest_gas_limit
         };
 
+        eprintln!("[TEMPO DEBUG] estimate_gas: final_gas={} highest={} buffer={}", final_gas, highest_gas_limit, buffer);
         Ok(U256::from(final_gas))
     }
 

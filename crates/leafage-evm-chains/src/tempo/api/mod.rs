@@ -62,6 +62,9 @@ impl<DB: Database, I> TempoEvm<DB, I> {
         let timestamp = env.block_env.timestamp.saturating_to::<u64>();
         let hardfork = TempoHardfork::from_timestamp(timestamp);
 
+        // DEBUG: log to verify this path is hit and timestamp is correct
+        eprintln!("[TEMPO DEBUG] TempoEvm::new ts={} hf={:?} is_t1={}", timestamp, hardfork, hardfork.is_t1());
+
         // Apply Tempo TIP-1000 gas parameter overrides via revm 36 GasParams API.
         // TIP-1000 was introduced in T1, so only apply overrides for T1+ blocks.
         let mut cfg_env = env.cfg_env;
@@ -78,6 +81,10 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             ]);
         }
         cfg_env.gas_params = gas_params;
+        eprintln!("[TEMPO DEBUG] gas_params sstore={} new_account={} create={}",
+            cfg_env.gas_params.get(GasId::sstore_set_without_load_cost()),
+            cfg_env.gas_params.get(GasId::new_account_cost()),
+            cfg_env.gas_params.get(GasId::create()));
         let spec: revm::primitives::hardfork::SpecId = cfg_env.spec.clone().into();
 
         Self {

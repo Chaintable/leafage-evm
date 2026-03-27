@@ -75,6 +75,12 @@
 - [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证
 - [x] ~~**Cross-precompile stub 评估**~~ — 全部已连接，无残留 stub
 
+### P1 — 上线后
+
+- [ ] **leafage-evm-chains 编译 warning 清理** — 15 个 warning（8 个可自动 fix），`cargo fix --lib -p leafage-evm-chains`
+- [ ] **getBalance/getAddressBalance 返回 Tempo placeholder** — 方案: EvmCfg 加 `virtual_balance: Option<U256>` 字段，EvmStorageWrapper.basic_ref 注入，和 ovm_address 模式一致。Tempo 值: `uint!(4242...4242_U256)`
+- [ ] **0x76 (AA tx) 集成测试** — 需等 leafage 追到 block 10100400+，验证 pre_traceMany/simulateTransactions/estimateGas 对 0x76 交易的行为
+
 ### P2 — 按需
 
 - ~~Fee log 生成~~ — **实测确认**：Tempo writer 的 eth_call / pre_traceMany 无论 gas_price 是否为 0 都不产生 fee log（`disable_base_fee=true` 使 fee handler 始终短路）。leafage 行为一致，无差异
