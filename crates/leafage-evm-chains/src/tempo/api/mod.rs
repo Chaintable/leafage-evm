@@ -1,6 +1,7 @@
 use alloy_evm::precompiles::PrecompilesMap;
 use std::ops::{Deref, DerefMut};
 
+use crate::tempo::block::TempoBlockEnv;
 use crate::tempo::hardfork::TempoHardfork;
 use crate::tempo::precompile::extend_tempo_precompiles;
 use crate::tempo::tx::TempoTxEnv;
@@ -15,7 +16,7 @@ use revm::{
         EthFrame, EvmTr, FrameInitOrResult, FrameResult,
     },
     inspector::InspectorEvmTr,
-    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
+    interpreter::{interpreter::EthInterpreter, Instruction, interpreter_action::FrameInit},
     precompile::{PrecompileSpecId, Precompiles},
     Context, Inspector, Journal,
 };
@@ -23,7 +24,7 @@ use revm::{
 mod exec;
 
 /// Type alias for the default context type of the TempoEvm.
-pub type TempoContext<DB> = Context<BlockEnv, TempoTxEnv, CfgEnv<MainnetSpecId>, DB>;
+pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<MainnetSpecId>, DB>;
 
 /// Tempo EVM implementation.
 ///
@@ -78,6 +79,9 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                 (GasId::new_account_cost_for_selfdestruct(), 250_000),
                 (GasId::code_deposit_cost(), 1_000),
                 (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                // TIP-1000: Auth account creation cost (EIP-7702 auth with nonce==0).
+                // Custom GasId(255), same as Tempo writer: crates/revm/src/gas_params.rs
+                (GasId::new(255), 250_000),
             ]);
         }
         cfg_env.gas_params = gas_params;
@@ -87,10 +91,38 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             cfg_env.gas_params.get(GasId::create()));
         let spec: revm::primitives::hardfork::SpecId = cfg_env.spec.clone().into();
 
+        // Build instruction table with MILLIS_TIMESTAMP opcode for pre-T1C archive mode.
+        let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+        if !hardfork.is_t1c() {
+            // Register MILLIS_TIMESTAMP (0x4F) opcode — active pre-T1C only.
+            // Ported from Tempo writer: crates/revm/src/instructions.rs
+            const MILLIS_TIMESTAMP_OPCODE: u8 = 0x4F;
+            const MILLIS_TIMESTAMP_GAS: u64 = 2;
+            instructions.insert_instruction(
+                MILLIS_TIMESTAMP_OPCODE,
+                Instruction::new(
+                    |ctx: revm::interpreter::InstructionContext<
+                        '_,
+                        TempoContext<DB>,
+                        EthInterpreter,
+                    >| {
+                        revm::interpreter::push!(
+                            ctx.interpreter,
+                            ctx.host.block.timestamp_millis()
+                        );
+                    },
+                    MILLIS_TIMESTAMP_GAS,
+                ),
+            );
+        }
+
         Self {
             inner: EvmCtx {
                 ctx: Context {
-                    block: env.block_env,
+                    block: TempoBlockEnv {
+                        inner: env.block_env,
+                        timestamp_millis_part: 0, // Pipeline does not carry this field.
+                    },
                     cfg: cfg_env,
                     journaled_state: Journal::new(db),
                     tx: Default::default(),
@@ -99,7 +131,7 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: EthInstructions::new_mainnet_with_spec(spec),
+                instruction: instructions,
                 precompiles,
                 frame_stack: Default::default(),
             },
@@ -340,6 +372,265 @@ mod tests {
         assert!(
             gas_post > gas_pre + 200_000,
             "post-T1A gas ({gas_post}) should be >200k more than pre-T1A ({gas_pre}), proving TIP-1000 is active in execution"
+        );
+    }
+
+    // ==================== AA Gas Validation Tests ====================
+    // Ported from Tempo writer: crates/revm/src/handler.rs
+
+    /// Make env with nonce check disabled (simulates eth_call mode).
+    fn make_env_aa(timestamp: u64) -> EvmEnv<MainnetSpecId> {
+        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        cfg.chain_id = 4217;
+        cfg.disable_balance_check = true;
+        cfg.disable_nonce_check = true;
+        cfg.disable_eip3607 = true;
+        cfg.disable_block_gas_limit = true;
+        cfg.disable_base_fee = true;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = revm::primitives::U256::from(timestamp);
+        block_env.gas_limit = 100_000_000;
+        EvmEnv::new(cfg, block_env)
+    }
+
+    /// Helper to create an AA tx with batch calls.
+    fn make_aa_tx(
+        calls: Vec<crate::tempo::tx::TempoCall>,
+        nonce: u64,
+        nonce_key: revm::primitives::U256,
+        gas_limit: u64,
+    ) -> crate::tempo::tx::TempoTxEnv {
+        use revm::primitives::Address;
+        crate::tempo::tx::TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::ZERO,
+                gas_limit,
+                nonce,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(crate::tempo::tx::TempoTxFields {
+                aa_calls: calls,
+                nonce_key,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Helper to create a simple TempoCall targeting an address with given data.
+    fn make_call(to_byte: u8, data: &[u8]) -> crate::tempo::tx::TempoCall {
+        use revm::primitives::{Address, Bytes, TxKind};
+        crate::tempo::tx::TempoCall {
+            to: TxKind::Call(Address::with_last_byte(to_byte)),
+            value: revm::primitives::U256::ZERO,
+            input: Bytes::copy_from_slice(data),
+        }
+    }
+
+    /// AA batch with single empty call: should cost base stipend (21k) + calldata (0).
+    #[test]
+    fn test_aa_gas_single_empty_call() {
+        use revm::primitives::U256;
+
+        let calls = vec![make_call(0x01, &[])];
+        let tx = make_aa_tx(calls, 1, U256::ZERO, 10_000_000);
+
+        let mut evm = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100), // Post-T1A
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let result = evm.transact(tx).expect("AA single call transact");
+        let gas_used = result.result.gas_used();
+
+        // Base stipend = 21000, no per-call cold cost (single call), no calldata.
+        // Execution gas is minimal (CALL to empty account).
+        assert!(
+            gas_used >= 21_000,
+            "AA single call gas ({gas_used}) should be >= 21k base"
+        );
+    }
+
+    /// AA batch with multiple calls: should include per-call cold account cost.
+    #[test]
+    fn test_aa_gas_multi_call_cold_account() {
+        use revm::primitives::U256;
+
+        let calls_1 = vec![make_call(0x01, &[])];
+        let calls_3 = vec![
+            make_call(0x01, &[]),
+            make_call(0x02, &[]),
+            make_call(0x03, &[]),
+        ];
+
+        let tx_1 = make_aa_tx(calls_1, 1, U256::ZERO, 10_000_000);
+        let tx_3 = make_aa_tx(calls_3, 1, U256::ZERO, 10_000_000);
+
+        let mut evm_1 = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_1 = evm_1.transact(tx_1).expect("1-call").result.gas_used();
+
+        let mut evm_3 = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_3 = evm_3.transact(tx_3).expect("3-call").result.gas_used();
+
+        // 3-call should cost more due to 2 * cold_account_cost (2600 each).
+        assert!(
+            gas_3 > gas_1,
+            "3-call gas ({gas_3}) should be > 1-call gas ({gas_1})"
+        );
+    }
+
+    /// AA tx with nonce == 0 on T1+ should add 250k new_account_cost.
+    #[test]
+    fn test_aa_gas_nonce_zero_surcharge() {
+        use revm::primitives::U256;
+
+        let calls = vec![make_call(0x01, &[])];
+
+        // nonce == 0
+        let tx_n0 = make_aa_tx(calls.clone(), 0, U256::ZERO, 10_000_000);
+        // nonce == 1
+        let tx_n1 = make_aa_tx(calls, 1, U256::ZERO, 10_000_000);
+
+        let mut evm_n0 = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_n0 = evm_n0.transact(tx_n0).expect("nonce=0").result.gas_used();
+
+        let mut evm_n1 = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_n1 = evm_n1.transact(tx_n1).expect("nonce=1").result.gas_used();
+
+        // nonce=0 should cost ~250k more (TIP-1000 new_account_cost).
+        let diff = gas_n0.saturating_sub(gas_n1);
+        assert_eq!(
+            diff, 250_000,
+            "nonce=0 surcharge should be exactly 250k, got diff={diff}"
+        );
+    }
+
+    /// AA tx with expiring nonce key (U256::MAX) on T1+ should add EXPIRING_NONCE_GAS (13k).
+    #[test]
+    fn test_aa_gas_expiring_nonce() {
+        use revm::primitives::U256;
+
+        let calls = vec![make_call(0x01, &[])];
+
+        // Normal nonce_key (nonce > 0)
+        let tx_normal = make_aa_tx(calls.clone(), 1, U256::from(1), 10_000_000);
+        // Expiring nonce_key (U256::MAX)
+        let tx_expiring = make_aa_tx(calls, 1, U256::MAX, 10_000_000);
+
+        let mut evm_normal = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_normal = evm_normal.transact(tx_normal).expect("normal nonce").result.gas_used();
+
+        let mut evm_exp = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_exp = evm_exp.transact(tx_expiring).expect("expiring nonce").result.gas_used();
+
+        // Expiring nonce should cost EXPIRING_NONCE_GAS (13k) more than existing nonce key (5k).
+        let diff = gas_exp.saturating_sub(gas_normal);
+        let expected_diff = 13_000 - 5_000; // EXPIRING_NONCE_GAS - gas_existing_nonce_key
+        assert_eq!(
+            diff, expected_diff,
+            "expiring nonce extra gas should be {expected_diff}, got diff={diff}"
+        );
+    }
+
+    /// Pre-T1 AA tx should NOT add TIP-1000 nonce surcharge.
+    #[test]
+    fn test_aa_gas_pre_t1_no_nonce_surcharge() {
+        use revm::primitives::U256;
+
+        let calls = vec![make_call(0x01, &[])];
+
+        // nonce == 0, pre-T1
+        let tx_n0 = make_aa_tx(calls.clone(), 0, U256::ZERO, 10_000_000);
+        // nonce == 1, pre-T1
+        let tx_n1 = make_aa_tx(calls, 1, U256::ZERO, 10_000_000);
+
+        let mut evm_n0 = TempoEvm::new(
+            make_env_aa(1000), // Pre-T1
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_n0 = evm_n0.transact(tx_n0).expect("pre-T1 nonce=0").result.gas_used();
+
+        let mut evm_n1 = TempoEvm::new(
+            make_env_aa(1000), // Pre-T1
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_n1 = evm_n1.transact(tx_n1).expect("pre-T1 nonce=1").result.gas_used();
+
+        // Pre-T1: no TIP-1000 nonce surcharge, so gas should be identical.
+        assert_eq!(
+            gas_n0, gas_n1,
+            "pre-T1 nonce=0 ({gas_n0}) should equal nonce=1 ({gas_n1})"
+        );
+    }
+
+    /// AA tx with calldata should cost more than empty calldata.
+    #[test]
+    fn test_aa_gas_calldata_cost() {
+        use revm::primitives::U256;
+
+        // 100 bytes of non-zero calldata.
+        let data = vec![0xffu8; 100];
+        let calls_with_data = vec![make_call(0x01, &data)];
+        let calls_empty = vec![make_call(0x01, &[])];
+
+        let tx_data = make_aa_tx(calls_with_data, 1, U256::ZERO, 10_000_000);
+        let tx_empty = make_aa_tx(calls_empty, 1, U256::ZERO, 10_000_000);
+
+        let mut evm_data = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_data = evm_data.transact(tx_data).expect("with data").result.gas_used();
+
+        let mut evm_empty = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_empty = evm_empty.transact(tx_empty).expect("empty data").result.gas_used();
+
+        // 100 non-zero bytes = 100 * 4 = 400 tokens, * token_cost.
+        assert!(
+            gas_data > gas_empty,
+            "calldata gas ({gas_data}) should be > empty gas ({gas_empty})"
         );
     }
 }

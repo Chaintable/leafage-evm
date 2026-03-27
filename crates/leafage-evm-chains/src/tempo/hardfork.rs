@@ -80,6 +80,40 @@ impl TempoHardfork {
     pub fn is_t3(&self) -> bool {
         *self >= Self::T3
     }
+
+    /// Gas cost for using an existing 2D nonce key (cold SLOAD + warm SSTORE reset).
+    /// Ported from Tempo writer: crates/chainspec/src/spec.rs
+    pub const fn gas_existing_nonce_key(&self) -> u64 {
+        // T1 value: COLD_SLOAD (2100) + WARM_SSTORE_RESET (2900) = 5000
+        // T2 adds 2 * WARM_SLOAD (100) = 5200
+        match self {
+            Self::Genesis | Self::T1 | Self::T1A | Self::T1B | Self::T1C => {
+                // COLD_SLOAD_COST + WARM_SSTORE_RESET = 2100 + 2900
+                5_000
+            }
+            Self::T2 | Self::T3 => {
+                // T2 adds 2 warm SLOADs for extended nonce key lookup
+                5_200
+            }
+        }
+    }
+
+    /// Gas cost for using a new 2D nonce key (cold SLOAD + SSTORE set for 0 -> non-zero).
+    /// Ported from Tempo writer: crates/chainspec/src/spec.rs
+    pub const fn gas_new_nonce_key(&self) -> u64 {
+        // T1 value: COLD_SLOAD (2100) + SSTORE_SET (20000) = 22100
+        // T2 adds 2 * WARM_SLOAD (100) = 22300
+        match self {
+            Self::Genesis | Self::T1 | Self::T1A | Self::T1B | Self::T1C => {
+                // COLD_SLOAD_COST + SSTORE_SET = 2100 + 20000
+                22_100
+            }
+            Self::T2 | Self::T3 => {
+                // T2 adds 2 warm SLOADs for extended nonce key lookup
+                22_300
+            }
+        }
+    }
 }
 
 impl Default for TempoHardfork {

@@ -77,12 +77,38 @@
 
 ### P1 — 上线后
 
-- [ ] **leafage-evm-chains 编译 warning 清理** — 15 个 warning（8 个可自动 fix），`cargo fix --lib -p leafage-evm-chains`
-- [ ] **getBalance/getAddressBalance 返回 Tempo placeholder** — 方案: EvmCfg 加 `virtual_balance: Option<U256>` 字段，EvmStorageWrapper.basic_ref 注入，和 ovm_address 模式一致。Tempo 值: `uint!(4242...4242_U256)`
+- [x] ~~**leafage-evm-chains 编译 warning 清理**~~ — Tempo 相关 warning 全部清理（`cargo fix` + 手动 dead code/visibility 修复）。剩余 2 个 `deprecated new_mainnet` 是其他链（Cosmos/Mantle），不在 Tempo 范围
+- [x] ~~**getBalance/getAddressBalance 返回 Tempo placeholder**~~ — 已实现：EvmCfg 加 `virtual_balance: Option<U256>`，`get_balance_impl` 和 `debank_get_address_balance_impl` 入口拦截。Tempo 在 build.rs 设置 `NATIVE_BALANCE_PLACEHOLDER`（`uint!(4242...4242_U256)`），与 writer 一致
 - [ ] **0x76 (AA tx) 集成测试** — 需等 leafage 追到 block 10100400+，验证 pre_traceMany/simulateTransactions/estimateGas 对 0x76 交易的行为
+- [x] ~~**TempoHandler `validate_initial_tx_gas` AA 路径**~~ — 已完整实现，与 writer 的 eth_call/estimateGas gas 计算对齐。CallRequest 扩展 `key_type`/`key_data`/`key_id`/`key_authorization`/`tempo_authorization_list` 字段，TempoTxFields 扩展 `sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`。gas 计算包含：base stipend、signature verification（P256 +5k, WebAuthn +5k+calldata, Keychain +3k）、per-call cold account、authorization list（per-auth sig gas + TIP-1000 nonce==0）、key authorization（pre-T1B heuristic / T1B+ storage-based）、calldata tokens、CREATE costs、2D nonce gas（expiring 13k / new_account 250k / existing 5k）。6 个单测覆盖
+- [x] ~~**TempoHandler `validate_env` override**~~ — 已实现：value!=0 拒绝 + AA calls 结构校验（非空、CREATE 规则）。Keychain 版本/subblock/priority fee/time window 为 writer-only 验证，eth_call 模式不需要
+- [x] ~~**TempoHandler `inspect_execution` override**~~ — 已实现：override `InspectorHandler::inspect_execution`，AA batch 每个 sub-call 走 `inspect_run_exec_loop`（inspector-aware frame loop）。`execute_multi_call` 重构为接受 closure 的 free function，`execution()` 和 `inspect_execution()` 共用
 
 ### P2 — 按需
 
+- [x] ~~**预编译内部 gas 动态化**~~ — 已实现：`LeafageStorageProvider` 新增 `sstore_set_cost()` 和 `code_deposit_cost_per_byte()` 方法，根据 `self.spec.is_t1()` 返回 TIP-1000 值或标准 Ethereum 值。sstore、set_code、sstore_refund 三处改为动态调用。pre-T1A trace 内部 gasUsed 现在与 writer 一致
+- [x] ~~**TempoTxEnv AA 扩展字段（gas 相关）**~~ — 已实现 gas 相关字段：`sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`。剩余非 gas 字段（`is_system_tx`, `fee_token`, `valid_after`, `valid_before`, `subblock_metadata`）读节点不需要
+- ~~**ValidatorConfigV2 pre-execution code 注入**~~ — **无需实现**。Writer 在 block execution 的 `apply_pre_execution_changes` 注入 `0xef` bytecode（T2 激活时），产生 state_diff → leafage 通过 pipeline 自动同步。且 T2 尚未激活（`MAINNET_T2_TIME = u64::MAX`）
+- [x] ~~**TempoBlockEnv timestamp_millis_part**~~ — 已实现：`TempoBlockEnv` 替代 `BlockEnv` 作为 `TempoContext` 的 block 类型，`MILLIS_TIMESTAMP` (0x4F) opcode 在 pre-T1C 注册到指令表。`timestamp_millis_part` 默认 0（pipeline 不携带此字段），archive 模式 pre-T1C eth_call 的 0x4F 返回 `timestamp * 1000`
 - ~~Fee log 生成~~ — **实测确认**：Tempo writer 的 eth_call / pre_traceMany 无论 gas_price 是否为 0 都不产生 fee log（`disable_base_fee=true` 使 fee handler 始终短路）。leafage 行为一致，无差异
 - [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
 - ~~cargo feature gate `tempo`~~ — 不做，其他链（BSC/Cosmos/Mantle）也没有 feature gate，保持一致
+
+### Writer-Leafage Handler 差异总览
+
+已分析 Tempo writer Handler 12 个 override 方法 vs leafage 2 个 override:
+
+| Writer 方法 | Leafage | 状态 |
+|---|---|---|
+| validate_initial_tx_gas (标准 tx) | 已实现 | P0 已修 (nonce==0 +250k) |
+| validate_initial_tx_gas (AA tx) | 已实现 | 完成（eth_call 模式，signature/key_auth 默认） |
+| execution (batch dispatch) | 已实现 | 完成 |
+| validate_env (value!=0 + AA 校验) | 已实现 | 完成（value 拒绝 + calls 结构校验） |
+| inspect_execution (AA tracing) | 已实现 | 完成（inspect_run_exec_loop per sub-call） |
+| run (fee loading) | 不需要 | 读节点不需要 fee 系统 |
+| execution_result (TempoHaltReason) | 不需要 | Leafage 无 evm.initial_gas 字段 |
+| apply_eip7702_auth_list | 不需要 | AA EIP-7702 auth 低优先 |
+| validate_against_state_and_deduct_caller | 不需要 | 读节点不需要 fee/nonce 扣减 |
+| reimburse_caller | 不需要 | 读节点不需要 fee 退还 |
+| reward_beneficiary | 不需要 | 读节点不需要矿工奖励 |
+| catch_error | 不需要 | subblock fee 路径不可达 |

@@ -37,31 +37,103 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        use leafage_evm_chains::tempo::tx::{TempoCall, TempoTxFields};
+        use leafage_evm_chains::tempo::tx::{
+            TempoAuthGas, TempoCall, TempoKeyAuthGas, TempoSigType, TempoTxFields,
+        };
         use revm::primitives::TxKind;
 
-        // Extract Tempo-specific fields before consuming the request
+        // Extract Tempo-specific fields before consuming the request.
         let tempo_calls = request.tempo_calls.clone();
         let nonce_key = request.nonce_key;
+        let key_type = request.key_type.clone();
+        let key_data = request.key_data.clone();
+        let key_id = request.key_id;
+        let key_authorization = request.key_authorization.clone();
+        let tempo_authorization_list = request.tempo_authorization_list.clone();
 
-        // Build standard TxEnv
+        // Build standard TxEnv.
         let base =
             create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
 
-        // Build TempoTxFields if batch calls are present
-        let tempo_fields = tempo_calls
-            .filter(|calls| !calls.is_empty())
-            .map(|calls| TempoTxFields {
-                aa_calls: calls
-                    .into_iter()
-                    .map(|c| TempoCall {
-                        to: c.to.unwrap_or(TxKind::Create),
-                        value: c.value.unwrap_or_default(),
-                        input: c.input.into_input().unwrap_or_default(),
-                    })
-                    .collect(),
-                nonce_key: nonce_key.unwrap_or_default(),
+        // Determine if this is an AA transaction (same logic as writer compat.rs:136-144).
+        let has_aa_fields = tempo_calls.as_ref().is_some_and(|c| !c.is_empty())
+            || tempo_authorization_list
+                .as_ref()
+                .is_some_and(|l| !l.is_empty())
+            || nonce_key.is_some()
+            || key_authorization.is_some()
+            || key_id.is_some();
+
+        let tempo_fields = if has_aa_fields {
+            // Parse signature type.
+            let sig_type = key_type
+                .as_deref()
+                .map(TempoSigType::from_str_lossy)
+                .unwrap_or_default();
+
+            // WebAuthn data size for calldata gas.
+            let webauthn_data_size = if sig_type == TempoSigType::WebAuthn {
+                parse_webauthn_size(key_data.as_ref())
+            } else {
+                0
+            };
+
+            // Key authorization gas info.
+            let key_auth = key_authorization.map(|ka| TempoKeyAuthGas {
+                sig_type: ka
+                    .sig_type
+                    .as_deref()
+                    .map(TempoSigType::from_str_lossy)
+                    .unwrap_or_default(),
+                num_limits: ka.num_limits,
             });
+
+            // Tempo authorization list gas info.
+            let auth_list = tempo_authorization_list
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| TempoAuthGas {
+                    sig_type: a
+                        .sig_type
+                        .as_deref()
+                        .map(TempoSigType::from_str_lossy)
+                        .unwrap_or_default(),
+                    nonce: a.nonce,
+                })
+                .collect();
+
+            // Build AA calls from `tempo_calls` + the outer to/value/input (same as writer).
+            let mut aa_calls: Vec<TempoCall> = tempo_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| TempoCall {
+                    to: c.to.unwrap_or(TxKind::Create),
+                    value: c.value.unwrap_or_default(),
+                    input: c.input.into_input().unwrap_or_default(),
+                })
+                .collect();
+
+            // Writer appends outer to/value/input as the last call (compat.rs:158-163).
+            if let Some(to) = base.kind.to() {
+                aa_calls.push(TempoCall {
+                    to: TxKind::Call(*to),
+                    value: base.value,
+                    input: base.data.clone(),
+                });
+            }
+
+            Some(TempoTxFields {
+                aa_calls,
+                nonce_key: nonce_key.unwrap_or_default(),
+                sig_type,
+                is_keychain: key_id.is_some(),
+                webauthn_data_size,
+                key_auth,
+                auth_list,
+            })
+        } else {
+            None
+        };
 
         Ok(TempoTxEnv {
             base,
@@ -124,3 +196,24 @@ impl TxSetter for TempoTxEnv {
 }
 
 impl<DB> ApiCore for TempoApiImpl<DB> where DB: Sync + Send + 'static {}
+
+/// Parse WebAuthn data size from `key_data`.
+/// Mirrors Tempo writer: `create_mock_primitive_signature` in compat.rs.
+/// Format: 1/2/4 bytes BE integer, default 800, clamped to [87, 8192].
+fn parse_webauthn_size(key_data: Option<&alloy::primitives::Bytes>) -> usize {
+    const MIN_WEBAUTHN_SIZE: usize = 87;
+    const DEFAULT_WEBAUTHN_SIZE: usize = 800;
+    const MAX_WEBAUTHN_SIZE: usize = 8192;
+
+    let size = if let Some(data) = key_data {
+        match data.len() {
+            1 => data[0] as usize,
+            2 => u16::from_be_bytes([data[0], data[1]]) as usize,
+            4 => u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize,
+            _ => DEFAULT_WEBAUTHN_SIZE,
+        }
+    } else {
+        DEFAULT_WEBAUTHN_SIZE
+    };
+    size.clamp(MIN_WEBAUTHN_SIZE, MAX_WEBAUTHN_SIZE)
+}

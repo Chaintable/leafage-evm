@@ -270,6 +270,11 @@ pre_traceMany + gas_price=0 → logs count: 0
 
 - [x] ~~**revm gas 参数修正**~~ — 已完成，升级 revm 36.0 + GasParams
 - [x] ~~**estimateGas fee overhead**~~ — 已确认无差异，writer 端 eth_estimateGas 在 `disable_balance_check` 下同样短路 fee handler
+- [x] ~~**validate_initial_tx_gas AA 路径**~~ — 已实现：`validate_aa_initial_tx_gas` + `calculate_aa_batch_intrinsic_gas`，包含 base stipend、per-call cold account、calldata、CREATE、2D nonce gas
+- [x] ~~**validate_env override**~~ — value!=0 拒绝 + AA calls 结构校验
+- [x] ~~**getBalance/getAddressBalance placeholder**~~ — 返回 NATIVE_BALANCE_PLACEHOLDER
+- [ ] **inspect_execution override** — AA batch 内部子调用 tracing
+- [ ] **leafage-evm-chains warning 清理** — 15 个 warning
 
 ### P2 — 按需
 

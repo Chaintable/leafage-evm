@@ -228,6 +228,10 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        // Tempo: return virtual balance placeholder (no native token).
+        if let Some(vb) = self.inner.evm_cfg().virtual_balance {
+            return Ok(vb);
+        }
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,

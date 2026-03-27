@@ -246,6 +246,28 @@ impl<'a> LeafageStorageProvider<'a> {
     pub fn new_max_gas(internals: EvmInternals<'a>, chain_id: u64) -> Self {
         Self::new(internals, u64::MAX, chain_id, false)
     }
+
+    /// SSTORE set cost (0 → non-zero), hardfork-aware.
+    /// TIP-1000 (T1+): 250k. Pre-T1 (standard Ethereum): 20k.
+    #[inline]
+    fn sstore_set_cost(&self) -> u64 {
+        if self.spec.is_t1() {
+            TempoGasCosts::SSTORE_SET // 250_000
+        } else {
+            20_000 // Standard Ethereum SSTORE_SET
+        }
+    }
+
+    /// Code deposit cost per byte, hardfork-aware.
+    /// TIP-1000 (T1+): 1000/byte. Pre-T1 (standard Ethereum): 200/byte.
+    #[inline]
+    fn code_deposit_cost_per_byte(&self) -> u64 {
+        if self.spec.is_t1() {
+            TempoGasCosts::CODE_DEPOSIT_PER_BYTE // 1_000
+        } else {
+            200 // Standard Ethereum CODE_DEPOSIT_BYTE
+        }
+    }
 }
 
 impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
@@ -269,13 +291,14 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
     #[inline]
     fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
-        // Gas: CODE_DEPOSIT_PER_BYTE * code_len
-        let deposit_cost = TempoGasCosts::CODE_DEPOSIT_PER_BYTE
+        // Gas: code_deposit_cost_per_byte * code_len (hardfork-aware)
+        let deposit_cost = self
+            .code_deposit_cost_per_byte()
             .checked_mul(code.len() as u64)
             .ok_or(TempoPrecompileError::OutOfGas)?;
         self.deduct_gas(deposit_cost)?;
 
-        self.internals.set_code(address, code);
+        let _ = self.internals.set_code(address, code);
         Ok(())
     }
 
@@ -333,23 +356,22 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         // For the Tempo chain, SSTORE_SET is 250k (vs Ethereum 20k).
         // We use the standard EIP-2200 gas schedule with Tempo's overridden constants.
         let sstore_data = &result.data;
+        // Hardfork-aware SSTORE_SET cost.
+        let sstore_set = self.sstore_set_cost();
+
         let dynamic_gas = if sstore_data.is_new_eq_present() {
-            // No-op store: 0 additional gas
             0
         } else if sstore_data.is_original_eq_present() {
             if sstore_data.original_value.is_zero() {
-                // 0 -> non-zero: SSTORE_SET cost (Tempo: 250k)
-                TempoGasCosts::SSTORE_SET
+                // 0 -> non-zero: SSTORE_SET cost (hardfork-aware)
+                sstore_set
             } else {
-                // non-zero -> different non-zero: WARM_SSTORE_RESET
                 WARM_SSTORE_RESET
             }
         } else {
-            // Dirty slot: 0 additional gas
             0
         };
 
-        // Cold storage additional cost
         let cold_gas = if result.is_cold {
             COLD_SLOAD_COST_ADDITIONAL
         } else {
@@ -358,8 +380,8 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
         self.deduct_gas(dynamic_gas.saturating_add(cold_gas))?;
 
-        // Refund gas (EIP-3529 style)
-        let refund = sstore_refund(sstore_data);
+        // Refund gas (EIP-3529 style, hardfork-aware)
+        let refund = sstore_refund(sstore_data, sstore_set);
         self.refund_gas(refund);
 
         Ok(())
@@ -439,10 +461,9 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
 /// Computes sstore gas refund following EIP-3529 rules.
 ///
-/// Simplified from Tempo's `GasParams::sstore_refund` -- uses standard Ethereum
-/// constants since Tempo only overrides SSTORE_SET.
+/// `sstore_set` is hardfork-aware: 250k for T1+, 20k pre-T1.
 #[inline]
-fn sstore_refund(result: &revm::interpreter::SStoreResult) -> i64 {
+fn sstore_refund(result: &revm::interpreter::SStoreResult, sstore_set: u64) -> i64 {
     use revm::interpreter::gas::SSTORE_RESET;
 
     if result.is_new_eq_present() {
@@ -457,20 +478,16 @@ fn sstore_refund(result: &revm::interpreter::SStoreResult) -> i64 {
         // Dirty slot: refund for restoring to original
         if !result.original_value.is_zero() {
             if result.present_value.is_zero() {
-                // Was cleared, now being set again -- remove the set refund
                 refund -= SSTORE_RESET as i64;
             } else if result.new_value.is_zero() {
-                // Being cleared -- add clear refund
                 refund += SSTORE_RESET as i64;
             }
         }
         if result.original_value == result.new_value {
-            // Restoring to original value
             if result.original_value.is_zero() {
-                // Was 0 -> X -> 0: refund SSTORE_SET - WARM_STORAGE_READ_COST
-                refund += (TempoGasCosts::SSTORE_SET - WARM_STORAGE_READ_COST) as i64;
+                // Was 0 -> X -> 0: refund sstore_set - WARM_STORAGE_READ_COST
+                refund += (sstore_set - WARM_STORAGE_READ_COST) as i64;
             } else {
-                // Was X -> Y -> X: refund SSTORE_RESET - WARM_STORAGE_READ_COST
                 refund += (SSTORE_RESET - WARM_STORAGE_READ_COST) as i64;
             }
         }

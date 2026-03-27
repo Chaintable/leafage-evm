@@ -23,6 +23,10 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
+    /// Virtual balance returned by getBalance/getAddressBalance.
+    /// When set, all balance queries return this value instead of reading state.
+    /// Used by Tempo (no native token — returns sentinel `4242...4242`).
+    pub virtual_balance: Option<alloy::primitives::U256>,
 }
 
 pub(crate) trait ApiCore: ApiBase + EvmExecutor {}

@@ -12,6 +12,45 @@ pub struct TempoCall {
     pub input: Bytes,
 }
 
+/// Signature type for AA gas estimation.
+/// Ported from Tempo writer: `tempo_primitives::transaction::SignatureType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TempoSigType {
+    #[default]
+    Secp256k1,
+    P256,
+    WebAuthn,
+}
+
+impl TempoSigType {
+    /// Parse from string (case-insensitive). Returns Secp256k1 for unknown values.
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "p256" => Self::P256,
+            "webauthn" => Self::WebAuthn,
+            _ => Self::Secp256k1,
+        }
+    }
+}
+
+/// Key authorization gas info (lightweight).
+#[derive(Clone, Debug, Default)]
+pub struct TempoKeyAuthGas {
+    /// Signature type on the key authorization.
+    pub sig_type: TempoSigType,
+    /// Number of spending limits.
+    pub num_limits: u32,
+}
+
+/// Per-authorization gas info (lightweight).
+#[derive(Clone, Debug, Default)]
+pub struct TempoAuthGas {
+    /// Signature type of this authorization.
+    pub sig_type: TempoSigType,
+    /// Nonce (0 incurs TIP-1000 account creation cost).
+    pub nonce: u64,
+}
+
 /// Extended fields for Tempo transactions (type 0x76).
 #[derive(Clone, Debug, Default)]
 pub struct TempoTxFields {
@@ -19,6 +58,19 @@ pub struct TempoTxFields {
     pub aa_calls: Vec<TempoCall>,
     /// 2D nonce key (0 = protocol nonce, non-zero = NonceManager).
     pub nonce_key: U256,
+
+    // --- Gas estimation fields ---
+
+    /// Signature type of the transaction signer.
+    pub sig_type: TempoSigType,
+    /// Whether this is a Keychain (access key) signature.
+    pub is_keychain: bool,
+    /// WebAuthn data size (for calldata gas). 0 = no WebAuthn data.
+    pub webauthn_data_size: usize,
+    /// Key authorization info (if present).
+    pub key_auth: Option<TempoKeyAuthGas>,
+    /// Tempo authorization list entries for gas calculation.
+    pub auth_list: Vec<TempoAuthGas>,
 }
 
 /// Tempo transaction environment wrapping the standard [`TxEnv`].
@@ -136,6 +188,7 @@ mod tests {
                     input: Bytes::new(),
                 }],
                 nonce_key: U256::ZERO,
+                ..Default::default()
             }),
         };
         assert_eq!(tx.tx_type(), 0x76);

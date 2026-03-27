@@ -1,3 +1,4 @@
+#![allow(private_interfaces)]
 //! On-chain CLOB (Central Limit Order Book) for stablecoin trading.
 //!
 //! Supports limit orders, market swaps, and flip orders across TIP-20 token pairs
@@ -296,13 +297,14 @@ fn compute_book_key(base: Address, quote: Address) -> B256 {
 
 /// A price level in the orderbook with a doubly-linked list of orders.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TickLevel {
+pub(crate) struct TickLevel {
     head: u128,
     tail: u128,
     total_liquidity: u128,
 }
 
 impl TickLevel {
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.head == 0 && self.tail == 0
     }
@@ -365,7 +367,7 @@ impl Storable for TickLevel {
 
 /// An order in the CLOB.
 #[derive(Debug, Clone)]
-struct Order {
+pub(crate) struct Order {
     order_id: u128,
     maker: Address,
     book_key: B256,
@@ -643,7 +645,7 @@ impl Storable for Order {
 ///   - slot+5: bid_bitmap (Mapping<i16, U256>)
 ///   - slot+6: ask_bitmap (Mapping<i16, U256>)
 #[derive(Debug, Clone)]
-struct OrderbookData {
+pub(crate) struct OrderbookData {
     base: Address,
     quote: Address,
     best_bid_tick: i16,
@@ -1104,7 +1106,7 @@ impl StablecoinDEX {
         validate_usd_currency(quote)?;
 
         let book_key = compute_book_key(base, quote);
-        let mut handle = self.book_handle(book_key);
+        let handle = self.book_handle(book_key);
 
         if handle.read_data()?.is_initialized() {
             return Err(err_pair_already_exists());
@@ -1142,7 +1144,7 @@ impl StablecoinDEX {
         let quote_token = TIP20Token::from_address(token)?.quote_token()?;
         let book_key = compute_book_key(token, quote_token);
 
-        let mut handle = self.book_handle(book_key);
+        let handle = self.book_handle(book_key);
         let book = handle.read_data()?;
         self.validate_or_create_pair(&book, token)?;
 
@@ -1247,7 +1249,7 @@ impl StablecoinDEX {
 
         let batch = self.storage.checkpoint();
 
-        let mut handle = self.book_handle(book_key);
+        let handle = self.book_handle(book_key);
         let book = handle.read_data()?;
         self.validate_or_create_pair(&book, token)?;
 
@@ -1468,7 +1470,7 @@ impl StablecoinDEX {
     }
 
     fn get_best_price_level(&self, book_key: B256, is_bid: bool) -> Result<TickLevel> {
-        let mut handle = self.book_handle(book_key);
+        let handle = self.book_handle(book_key);
         let orderbook = handle.read_data()?;
 
         let current_tick = if is_bid {
@@ -1634,7 +1636,7 @@ impl StablecoinDEX {
     fn quote_exact_in(&self, book_key: B256, amount_in: u128, is_bid: bool) -> Result<u128> {
         let mut remaining_in = amount_in;
         let mut amount_out = 0u128;
-        let mut handle = self.book_handle(book_key);
+        let handle = self.book_handle(book_key);
         let orderbook = handle.read_data()?;
 
         let mut current_tick = if is_bid {
@@ -1698,7 +1700,7 @@ impl StablecoinDEX {
     fn quote_exact_out(&self, book_key: B256, amount_out: u128, is_bid: bool) -> Result<u128> {
         let mut remaining_out = amount_out;
         let mut amount_in = 0u128;
-        let mut handle = self.book_handle(book_key);
+        let handle = self.book_handle(book_key);
         let orderbook = handle.read_data()?;
 
         let mut current_tick = if is_bid {
@@ -1833,7 +1835,7 @@ impl StablecoinDEX {
             };
 
             let book_key = compute_book_key(base, _quote);
-            let mut handle = self.book_handle(book_key);
+            let handle = self.book_handle(book_key);
             let orderbook = handle.read_data()?;
 
             if orderbook.base.is_zero() {
@@ -2029,7 +2031,7 @@ impl StablecoinDEX {
             return Err(err_order_does_not_exist());
         }
 
-        let mut handle = self.book_handle(order.book_key);
+        let handle = self.book_handle(order.book_key);
         let book = handle.read_data()?;
         let token = if order.is_bid {
             book.quote
