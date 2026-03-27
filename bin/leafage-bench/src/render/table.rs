@@ -1,5 +1,7 @@
-use crate::bench_runner::render::{fmt_mean_std, format_delta_percent, mean, stddev};
-use crate::bench_runner::summary::{AggregatedPercentiles, AggregatedSummary, Metric, RunSummary};
+use crate::render::{fmt_mean_std, format_delta_percent, mean, stddev};
+use crate::runner::summary::{
+    AggregatedPercentiles, AggregatedSummary, Metric, RunSummary, StressLevelResult,
+};
 use crate::corpus::ClassLabel;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{ContentArrangement, Table};
@@ -280,3 +282,187 @@ fn render_aggregated_compare_table(
 
     table
 }
+
+/// Single-endpoint stress table view.
+pub(crate) struct StressSingleView<'a> {
+    pub levels: &'a [StressLevelResult],
+}
+
+impl TableView for StressSingleView<'_> {
+    fn render_overall_table(&self, _title: &str) -> Table {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header([
+                "concurrency",
+                "QPS (mean±std)",
+                "error% (mean±std)",
+                "p50 ms",
+                "p95 ms",
+                "p99 ms",
+                "p999 ms",
+                "status",
+            ]);
+
+        for level in self.levels {
+            table.add_row([
+                level.concurrency.to_string(),
+                fmt_mean_std(&level.qps_values),
+                fmt_mean_std(&level.error_rates),
+                fmt_mean_std(&level.overall_pcts.p50),
+                fmt_mean_std(&level.overall_pcts.p95),
+                fmt_mean_std(&level.overall_pcts.p99),
+                fmt_mean_std(&level.overall_pcts.p999),
+                if level.breached {
+                    "⚠ breached".into()
+                } else {
+                    "ok".into()
+                },
+            ]);
+        }
+        table
+    }
+
+    fn render_label_table(&self, _label: ClassLabel) -> Option<Table> {
+        None
+    }
+}
+
+/// Two-endpoint stress comparison table view.
+pub(crate) struct StressCompareView<'a> {
+    pub target: &'a [StressLevelResult],
+    pub compare: &'a [StressLevelResult],
+}
+
+impl TableView for StressCompareView<'_> {
+    fn render_overall_table(&self, _title: &str) -> Table {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header([
+                "concurrency",
+                "endpoint",
+                "QPS (mean±std)",
+                "error% (mean±std)",
+                "p50 ms",
+                "p95 ms",
+                "p99 ms",
+                "p999 ms",
+                "status",
+            ]);
+
+        let compare_by_c: std::collections::HashMap<usize, &StressLevelResult> =
+            self.compare.iter().map(|l| (l.concurrency, l)).collect();
+
+        for level in self.target {
+            add_stress_row(&mut table, level, "target");
+
+            if let Some(cmp) = compare_by_c.get(&level.concurrency) {
+                add_stress_row(&mut table, cmp, "compare");
+            }
+        }
+
+        // Compare levels that target didn't reach
+        for level in self.compare {
+            if !self
+                .target
+                .iter()
+                .any(|t| t.concurrency == level.concurrency)
+            {
+                add_stress_row(&mut table, level, "compare");
+            }
+        }
+
+        table
+    }
+
+    fn render_label_table(&self, _label: ClassLabel) -> Option<Table> {
+        None
+    }
+}
+
+/// Render a delta comparison table: one row per shared concurrency level.
+///
+/// All deltas use compare as the base. Positive value = target is better:
+///   - QPS:            `(target − compare) / compare`  → higher target QPS = positive
+///   - latency / err%: `(compare − target) / compare`  → lower target latency = positive
+pub(crate) fn render_stress_delta_table(
+    target: &[StressLevelResult],
+    compare: &[StressLevelResult],
+) -> Table {
+    let compare_by_c: std::collections::HashMap<usize, &StressLevelResult> =
+        compare.iter().map(|l| (l.concurrency, l)).collect();
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header([
+            "concurrency",
+            "QPS Δ%",
+            "error% Δ%",
+            "p50 Δ%",
+            "p95 Δ%",
+            "p99 Δ%",
+            "p999 Δ%",
+        ]);
+
+    for t in target {
+        if let Some(c) = compare_by_c.get(&t.concurrency) {
+            let t_qps = mean(&t.qps_values);
+            let c_qps = mean(&c.qps_values);
+            // QPS: higher is better  → (target − compare) / compare
+            let qps_delta = format_delta_percent(c_qps, t_qps);
+            // latency / error%: lower is better → (compare − target) / compare
+            let err_delta = fmt_lower_is_better(mean(&c.error_rates), mean(&t.error_rates));
+            let p50_delta = fmt_lower_is_better(mean(&c.overall_pcts.p50), mean(&t.overall_pcts.p50));
+            let p95_delta = fmt_lower_is_better(mean(&c.overall_pcts.p95), mean(&t.overall_pcts.p95));
+            let p99_delta = fmt_lower_is_better(mean(&c.overall_pcts.p99), mean(&t.overall_pcts.p99));
+            let p999_delta = fmt_lower_is_better(mean(&c.overall_pcts.p999), mean(&t.overall_pcts.p999));
+
+            table.add_row([
+                t.concurrency.to_string(),
+                qps_delta,
+                err_delta,
+                p50_delta,
+                p95_delta,
+                p99_delta,
+                p999_delta,
+            ]);
+        }
+    }
+
+    table
+}
+
+/// For metrics where lower is better (latency, error%):
+/// delta = (compare − target) / compare × 100
+/// Positive result means target is better (lower value).
+fn fmt_lower_is_better(compare_val: f64, target_val: f64) -> String {
+    if compare_val.abs() < f64::EPSILON {
+        return "-".to_string();
+    }
+    let delta = (compare_val - target_val) / compare_val * 100.0;
+    format!("{:+.2}%", delta)
+}
+
+fn add_stress_row(table: &mut Table, level: &StressLevelResult, endpoint: &str) {
+    table.add_row([
+        level.concurrency.to_string(),
+        endpoint.to_string(),
+        fmt_mean_std(&level.qps_values),
+        fmt_mean_std(&level.error_rates),
+        fmt_mean_std(&level.overall_pcts.p50),
+        fmt_mean_std(&level.overall_pcts.p95),
+        fmt_mean_std(&level.overall_pcts.p99),
+        fmt_mean_std(&level.overall_pcts.p999),
+        if level.breached {
+            "⚠ breached".into()
+        } else {
+            "ok".into()
+        },
+    ]);
+}
+
