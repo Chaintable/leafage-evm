@@ -73,6 +73,7 @@
 ### P0 — 上线前
 
 - [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证
+- [x] ~~**estimateGas no_code_callee 早返回 bug**~~ — 已修复：当 `virtual_balance` 存在时（Tempo 链）跳过 `no_code_callee` 早返回优化，走完整二分搜索路径，确保 nonce==0 surcharge (+250k) 被正确计算
 - [x] ~~**Cross-precompile stub 评估**~~ — 全部已连接，无残留 stub
 
 ### P1 — 上线后

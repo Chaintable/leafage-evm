@@ -721,7 +721,11 @@ where
             &memory_db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        if tx.input().is_empty() {
+        // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
+        // adds 250k gas that this optimization doesn't account for. The early return
+        // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
+        // required gas is 271000+.
+        if self.inner.evm_cfg().virtual_balance.is_none() && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
@@ -730,12 +734,10 @@ where
                         })
                         .unwrap_or(true);
                     if no_code_callee {
-                        eprintln!("[TEMPO DEBUG] estimate_gas: no_code_callee early path, MIN_TRANSACTION_GAS={}", MIN_TRANSACTION_GAS);
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
                         if let Ok(exec_res) = self.inner.transact(&block_env, &memory_db, tx) {
                             if exec_res.is_success() {
-                                eprintln!("[TEMPO DEBUG] estimate_gas: early return MIN_TRANSACTION_GAS={}", MIN_TRANSACTION_GAS);
                                 return Ok(U256::from(MIN_TRANSACTION_GAS));
                             }
                         }
