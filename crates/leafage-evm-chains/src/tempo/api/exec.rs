@@ -42,6 +42,32 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     type Error = EVMError<DB::Error>;
     type HaltReason = revm::context::result::HaltReason;
 
+    /// TIP-1000: Transactions with nonce == 0 require additional `new_account_cost` gas.
+    /// Ported from Tempo writer: crates/revm/src/handler.rs
+    #[inline]
+    fn validate_initial_tx_gas(
+        &self,
+        evm: &mut Self::Evm,
+    ) -> Result<InitialAndFloorGas, Self::Error> {
+        use revm::context_interface::cfg::gas_params::GasId;
+        use revm::context_interface::Cfg;
+
+        // Delegate to mainnet handler for base gas calculation.
+        let mut init_gas = MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
+            .validate_initial_tx_gas(evm)?;
+
+        // TIP-1000: nonce == 0 requires additional new_account_cost (250k gas).
+        let hardfork =
+            crate::tempo::hardfork::TempoHardfork::from_timestamp(
+                evm.ctx().block.timestamp.saturating_to::<u64>(),
+            );
+        if hardfork.is_t1() && evm.ctx().tx.base.nonce == 0 {
+            init_gas.initial_gas += evm.ctx().cfg.gas_params.get(GasId::new_account_cost());
+        }
+
+        Ok(init_gas)
+    }
+
     /// Overridden execution: dispatches to batch path when `aa_calls` is present.
     #[inline]
     fn execution(
