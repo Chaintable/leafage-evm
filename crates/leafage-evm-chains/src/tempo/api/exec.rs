@@ -166,6 +166,17 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             );
             if hardfork.is_t1() && evm.ctx().tx.base.nonce == 0 {
                 init_gas.initial_gas += evm.ctx().cfg.gas_params.get(GasId::new_account_cost());
+
+                // Re-validate gas_limit after adding surcharge.
+                // Without this, gas_limit - init_gas underflows in execution(),
+                // giving the precompile near-infinite gas.
+                let gas_limit = evm.ctx().tx.base.gas_limit;
+                if gas_limit < init_gas.initial_gas {
+                    return Err(EVMError::Custom(format!(
+                        "insufficient gas for intrinsic cost: gas_limit {} < intrinsic_gas {}",
+                        gas_limit, init_gas.initial_gas
+                    )));
+                }
             }
 
             Ok(init_gas)
