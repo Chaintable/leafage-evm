@@ -658,28 +658,40 @@ writer 不支持此方法，仅验证 leafage 端正确性 + 与 eth_call 结果
 
 ## 测试结果概要
 
-测试日期: 2026-03-28, 测试区块高度: leafage 已同步至 ~11.6M (与 writer 同步)
+### 最新全量重测
 
-| 大类 | 测试点 | 通过 | 失败 | 待测 | 已知差异 |
-|------|--------|------|------|------|----------|
-| 0. S3 Pipeline 数据 | 136 | 136 | 0 | 0 | |
-| 1. 基础 RPC | 3 | 2 | 1 | 0 | version: writer 无此方法 |
-| 1b. DebankApi 专有 RPC | 47 | 46 | 0 | 1 | balance 差异已修复 |
-| 2. eth_getBlockByNumber | 66 | 62 | 0 | 0 | txs_count: leafage 不存 tx (设计如此) |
-| 3. 状态查询 | 102 | 102 | 0 | 0 | eth_getBalance 已修复 (NATIVE_BALANCE_PLACEHOLDER) |
-| 4. eth_call TIP20 | 13 | 11 | 2 | 0 | revert error 格式差异 |
-| 5. eth_call 其他预编译 | 17 | 1 | 12 | 4 | revert error code 差异 |
-| 6. eth_call 标准预编译 | 8 | 8 | 0 | 0 | |
-| 7. eth_call 参数变体 | 7 | 7 | 0 | 0 | |
-| 8. estimateGas | 21 | 21 | 0 | 0 | 含 hardfork 跨阶段、from==target warm-up、nonce==0 surcharge |
-| 9. multiCall/contractMultiCall | 20 | 20 | 0 | 0 | 含非空值验证、hardfork 跨阶段、AA 用户 |
-| 10. pre_traceMany | 10 | 10 | 0 | 0 | |
-| 11. 边界条件 | 6 | 5 | 1 | 0 | error code 差异 (缺少 to) |
-| 12. Gas 参数 | 3 | 2 | 0 | 0 | 1 项未执行 |
-| 13. 批量验证 (100 blocks) | 222 | 220 | 0 | 2 | 2 项待批量运行 |
-| **合计** | **681** | **653** | **16** | **7** | **16 失败均为 revert error 格式差异，非功能性问题** |
+测试日期: 2026-03-28, 镜像: amd64-9f74389, 测试区块: 0xA00000 (10485760), leafage 已同步至 ~11.8M
+
+| 大类 | 测试点 | 通过 | 失败 | 已知差异 | 跳过 |
+|------|--------|------|------|----------|------|
+| 0. S3 Pipeline 数据 | 136 | 136 | 0 | 0 | 0 |
+| 1. 基础 RPC | 3 | 2 | 0 | 1 (version) | 0 |
+| 1b. DebankApi 专有 RPC | 47 | 46 | 0 | 1 | 0 |
+| 2. eth_getBlockByNumber | 66 | 62 | 0 | 4 (txs_count) | 0 |
+| 3. 状态查询 | 103 | 103 | 0 | 0 | 0 |
+| 4. eth_call TIP20 | 13 | 11 | 0 | 2 (revert format) | 0 |
+| 5. eth_call 其他预编译 | 41 | 26 | 5 (V2 未初始化) | 10 (revert format) | 0 |
+| 6. eth_call 标准预编译 | 7 | 7 | 0 | 0 | 0 |
+| 7. eth_call 参数变体 | 7 | 7 | 0 | 0 | 0 |
+| 8. estimateGas | 21 | 21 | 0 | 2 (error code) | 0 |
+| 9. multiCall/contractMultiCall | 20 | 20 | 0 | 0 | 0 |
+| 10. pre_traceMany | 10 | 10 | 0 | 0 | 0 |
+| 11. 边界条件 | 6 | 6 | 0 | 1 (error code) | 0 |
+| 12. Gas 参数 | 3 | 2 | 0 | 0 | 1 |
+| 13. 批量验证 (100 blocks) | 222 | 220 | 0 | 0 | 2 |
+| **合计** | **705** | **679** | **5** | **21** | **3** |
+
+**5 个 FAIL 全部是 ValidatorConfigV2 未初始化** (5.0b.8, 5.0b.13, 5.0b.14, 5.6.1, 5.6.2)：writer 对无 code 地址返回空 `0x`，leafage 预编译 dispatch 返回零值填充。T2 激活后自动一致。
+
+**21 个已知差异**：15 项 revert error 格式差异 (writer code:3 vs leafage code:-32603)、4 项 txs_count (设计如此)、1 项 version RPC、1 项 error code (缺少 to)。全部为非功能性差异。
 
 **核心指标: eth_call 返回值、estimateGas gas 值 (含 hardfork/warm-up/nonce surcharge)、contractMultiCall、pre_traceMany 全部与 writer 精确一致。**
+
+### 历史测试记录
+
+初次测试: 2026-03-27, 测试区块高度: 0x3f000 (258048), 镜像: amd64-fbfebd2
+- 合计 658 项, 617 pass, 31 fail, 9 待测
+- 主要 FAIL: eth_getBalance 虚拟 balance (10项), estimateGas gas 差异, revert error 格式
 
 ## 已知差异 (31 项，需 review)
 
