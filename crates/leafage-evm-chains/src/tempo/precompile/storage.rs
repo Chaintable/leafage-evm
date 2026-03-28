@@ -720,3 +720,126 @@ impl Drop for CheckpointGuard {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ReadOnlyStorageProvider — for reading precompile storage outside EVM execution
+// ---------------------------------------------------------------------------
+// Ported from Tempo writer: crates/revm/src/common.rs ReadOnlyStorageProvider
+
+use revm::DatabaseRef;
+
+/// Read-only storage provider for accessing precompile state outside EVM execution.
+///
+/// Used by `caller_gas_allowance` to read TIP-20 balances and FeeManager
+/// preferences during `estimateGas` without starting an EVM context.
+///
+/// Only read operations are supported; all write operations panic.
+pub struct ReadOnlyStorageProvider<'a, DB: DatabaseRef> {
+    db: &'a DB,
+    spec: TempoHardfork,
+    chain_id: u64,
+}
+
+impl<'a, DB: DatabaseRef> ReadOnlyStorageProvider<'a, DB>
+where
+    DB::Error: core::fmt::Debug,
+{
+    pub fn new(db: &'a DB, spec: TempoHardfork, chain_id: u64) -> Self {
+        Self { db, spec, chain_id }
+    }
+}
+
+impl<DB: DatabaseRef> PrecompileStorageProvider for ReadOnlyStorageProvider<'_, DB>
+where
+    DB::Error: core::fmt::Debug,
+{
+    fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+    fn timestamp(&self) -> U256 {
+        U256::ZERO
+    }
+    fn beneficiary(&self) -> Address {
+        Address::ZERO
+    }
+    fn block_number(&self) -> u64 {
+        0
+    }
+    fn set_code(&mut self, _: Address, _: Bytecode) -> Result<()> {
+        unreachable!("read-only provider")
+    }
+    fn with_account_info(
+        &mut self,
+        address: Address,
+        f: &mut dyn FnMut(&revm::state::AccountInfo),
+    ) -> Result<()> {
+        let info = self
+            .db
+            .basic_ref(address)
+            .map_err(|e| TempoPrecompileError::Fatal(format!("basic_ref: {e:?}")))?
+            .unwrap_or_default();
+        f(&info);
+        Ok(())
+    }
+    fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.db
+            .storage_ref(address, key)
+            .map_err(|e| TempoPrecompileError::Fatal(format!("storage_ref: {e:?}")))
+    }
+    fn tload(&mut self, _: Address, _: U256) -> Result<U256> {
+        Ok(U256::ZERO) // transient storage is empty outside execution
+    }
+    fn sstore(&mut self, _: Address, _: U256, _: U256) -> Result<()> {
+        unreachable!("read-only provider")
+    }
+    fn tstore(&mut self, _: Address, _: U256, _: U256) -> Result<()> {
+        unreachable!("read-only provider")
+    }
+    fn emit_event(&mut self, _: Address, _: LogData) -> Result<()> {
+        unreachable!("read-only provider")
+    }
+    fn deduct_gas(&mut self, _: u64) -> Result<()> {
+        Ok(()) // no gas metering in read-only mode
+    }
+    fn refund_gas(&mut self, _: i64) {}
+    fn gas_used(&self) -> u64 {
+        0
+    }
+    fn gas_refunded(&self) -> i64 {
+        0
+    }
+    fn spec(&self) -> TempoHardfork {
+        self.spec
+    }
+    fn is_static(&self) -> bool {
+        true
+    }
+    fn checkpoint(&mut self) -> JournalCheckpoint {
+        unreachable!("read-only provider")
+    }
+    fn checkpoint_commit(&mut self, _: JournalCheckpoint) {
+        unreachable!("read-only provider")
+    }
+    fn checkpoint_revert(&mut self, _: JournalCheckpoint) {
+        unreachable!("read-only provider")
+    }
+}
+
+/// Reads precompile storage in a read-only context, outside EVM execution.
+///
+/// Sets up a `StorageCtx` backed by `ReadOnlyStorageProvider`, executes the
+/// closure, and tears down. Used for `caller_gas_allowance` to read TIP-20
+/// balances and FeeManager preferences.
+pub fn with_read_only_storage_ctx<DB, R>(
+    db: &DB,
+    spec: TempoHardfork,
+    chain_id: u64,
+    f: impl FnOnce() -> R,
+) -> R
+where
+    DB: DatabaseRef,
+    DB::Error: core::fmt::Debug,
+{
+    let mut provider = ReadOnlyStorageProvider::new(db, spec, chain_id);
+    StorageCtx::enter(&mut provider, f)
+}

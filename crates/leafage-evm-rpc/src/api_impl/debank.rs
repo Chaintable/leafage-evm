@@ -746,24 +746,39 @@ where
             }
         }
         if tx.gas_price() > 0 {
-            let caller = memory_db.basic_ref(tx.caller()).map_err(|e| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-            })?;
-            let balance = caller
-                .map(|acc| acc.balance)
-                .unwrap_or_default()
-                .checked_sub(tx.value())
-                .ok_or_else(|| {
-                    rpc_error_with_code(
-                        DebankErrorCode::BalanceExhausted as i32,
-                        "Insufficient funds".to_string(),
-                    )
+            let gas_limit = if let Some(vb) = self.inner.evm_cfg().virtual_balance {
+                // Tempo: read TIP-20 fee token balance for gas cap.
+                // Ported from writer: caller_gas_allowance in crates/node/src/rpc/mod.rs
+                let _ = vb; // virtual_balance presence indicates Tempo chain
+                leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
+                    &memory_db,
+                    tx.caller(),
+                    tx.gas_price(),
+                    block_env.timestamp.saturating_to::<u64>(),
+                    self.inner.evm_cfg().cfg.chain_id,
+                )
+                .unwrap_or(u64::MAX)
+            } else {
+                // Standard chain: native balance / gas_price
+                let caller = memory_db.basic_ref(tx.caller()).map_err(|e| {
+                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
                 })?;
-            let gas_limit: u64 = balance
-                .checked_div(U256::from(tx.gas_price()))
-                .unwrap_or_default()
-                .try_into()
-                .unwrap();
+                let balance = caller
+                    .map(|acc| acc.balance)
+                    .unwrap_or_default()
+                    .checked_sub(tx.value())
+                    .ok_or_else(|| {
+                        rpc_error_with_code(
+                            DebankErrorCode::BalanceExhausted as i32,
+                            "Insufficient funds".to_string(),
+                        )
+                    })?;
+                balance
+                    .checked_div(U256::from(tx.gas_price()))
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap()
+            };
             highest_gas_limit = highest_gas_limit.min(gas_limit);
         }
         tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));
