@@ -1377,6 +1377,18 @@ impl Precompile for ValidatorConfigV2 {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        // Pre-T2: behave like an empty contract (call succeeds, no execution).
+        // V2 is not initialized until T2 activates. Without this check, leafage
+        // dispatches and returns zero-filled ABI responses, while writer returns
+        // empty 0x (matching standard EVM behavior for no-code addresses).
+        // Ported from writer: crates/precompiles/src/validator_config_v2/dispatch.rs:16-21
+        if !self.storage.spec().is_t2() {
+            return Ok(PrecompileOutput::new(
+                self.storage.gas_used(),
+                Default::default(),
+            ));
+        }
+
         dispatch_call(
             calldata,
             IValidatorConfigV2::IValidatorConfigV2Calls::abi_decode,
