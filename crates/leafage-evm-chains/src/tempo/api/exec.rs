@@ -183,6 +183,34 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         }
     }
 
+    /// Pre-execution: standard flow + TIP-20 fee balance warm-up.
+    ///
+    /// Writer's `validate_against_state_and_deduct_caller` reads the caller's TIP-20
+    /// fee token balance through the journal (handler.rs:695), which warms the
+    /// storage slot. This affects subsequent precompile sload gas (cold 2100 → warm 100).
+    ///
+    /// Leafage doesn't need actual fee deduction, but must do the same sload to
+    /// warm the slot and match writer's gas behavior exactly.
+    #[inline]
+    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+        // Standard pre_execution (load accounts, warm coinbase, etc.).
+        let gas = MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
+            .pre_execution(evm)?;
+
+        // Warm the caller's TIP-20 fee token balance slot via journal sload.
+        // Mirrors writer's load_fee_fields + validate_against_state_and_deduct_caller.
+        //
+        // Writer reads get_fee_token (FeeManager.user_tokens[caller]) and
+        // get_token_balance (TIP20.balances[caller]) through the journal before
+        // execution. These sloads warm the storage slots, making subsequent
+        // precompile sloads warm (100 gas) instead of cold (2100 gas).
+        //
+        // Errors are ignored — warm-up is best-effort (EmptyDB in tests, etc.).
+        let _ = warm_fee_token_balance(evm);
+
+        Ok(gas)
+    }
+
     /// Overridden execution: dispatches to batch path when `aa_calls` is present.
     #[inline]
     fn execution(
@@ -213,6 +241,68 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
 // ---------------------------------------------------------------------------
 // AA gas validation — ported from Tempo writer: crates/revm/src/handler.rs
 // ---------------------------------------------------------------------------
+
+/// Warms the caller's TIP-20 fee token balance slot in the journal.
+///
+/// Mirrors writer's `load_fee_fields` + `validate_against_state_and_deduct_caller`:
+/// 1. Reads FeeManager.user_tokens[caller] (slot 1) → determines fee_token
+/// 2. Reads TIP20.balances[caller] (slot 9) of the fee_token
+///
+/// These sloads add entries to the journal's accessed_storage_keys, making
+/// subsequent precompile reads of the same slots warm (100 gas vs 2100 gas).
+///
+/// Returns Ok(()) on success, Err on any DB/journal error. Caller should
+/// ignore errors (warm-up is best-effort).
+fn warm_fee_token_balance<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+) -> Result<(), EVMError<DB::Error>> {
+    use crate::tempo::precompile::{DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS};
+    use revm::context_interface::JournalTr;
+
+    let caller = evm.ctx().tx.base.caller;
+
+    // 1. Read FeeManager.user_tokens[caller] — Mapping<Address,Address> at slot 1
+    let fee_manager_slot = {
+        let mut data = [0u8; 64];
+        data[12..32].copy_from_slice(caller.as_slice());
+        data[63] = 1;
+        revm::primitives::keccak256(&data)
+    };
+    // load_account first to avoid panic on fresh journal
+    let _ = evm
+        .ctx_mut()
+        .journal_mut()
+        .load_account(TIP_FEE_MANAGER_ADDRESS)?;
+    let user_token = evm
+        .ctx_mut()
+        .journal_mut()
+        .sload(TIP_FEE_MANAGER_ADDRESS, fee_manager_slot.into())
+        .map(|r| r.data)?;
+
+    let fee_token = if user_token.is_zero() {
+        DEFAULT_FEE_TOKEN
+    } else {
+        revm::primitives::Address::from_word(user_token.into())
+    };
+
+    // 2. Read TIP20.balances[caller] — Mapping<Address,U256> at slot 9
+    let balance_slot = {
+        let mut data = [0u8; 64];
+        data[12..32].copy_from_slice(caller.as_slice());
+        data[63] = 9;
+        revm::primitives::keccak256(&data)
+    };
+    let _ = evm
+        .ctx_mut()
+        .journal_mut()
+        .load_account(fee_token)?;
+    let _ = evm
+        .ctx_mut()
+        .journal_mut()
+        .sload(fee_token, balance_slot.into())?;
+
+    Ok(())
+}
 
 /// Executes a batch of AA calls atomically.
 ///

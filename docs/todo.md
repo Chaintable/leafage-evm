@@ -75,7 +75,7 @@
 - [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证
 - [x] ~~**estimateGas no_code_callee 早返回 bug**~~ — 已修复：Tempo 链跳过 `no_code_callee` 早返回优化
 - [x] ~~**estimateGas caller_gas_allowance**~~ — 已实现：`ReadOnlyStorageProvider` + `tempo_caller_gas_allowance()` 读 TIP-20 fee token 余额算 gas cap，与 writer 一致
-- ~~**estimateGas 单地址 1564 gas 差异**~~ — **根因已定位，writer 副作用，非 leafage bug**。Writer 的 `caller_gas_allowance` 在 estimateGas 前读 TIP20 `balances[caller]` slot（确定 gas cap），导致该 slot 在后续 EVM 执行中变 warm（100 gas），而 leafage 是 cold（2100 gas）。差值 2100-100=2000 减去其他开销≈1564。仅影响有 TIP-20 余额的地址。Leafage 的 cold sload 是正确行为
+- ~~**estimateGas 单地址 1568 gas 差异**~~ — **Writer 端问题，Leafage 行为正确**。Leafage 对所有地址返回一致的 23982，与 writer 的 0x983b（无余额）一致。Writer 对 0x0cac（有 TIP-20 余额）返回 22414（低 1568），可能是 `caller_gas_allowance` 的 storage read 对后续 EVM 执行产生了副作用。Leafage 无此副作用，行为正确
 - [x] ~~**Cross-precompile stub 评估**~~ — 全部已连接，无残留 stub
 
 ### P1 — 上线后
