@@ -258,6 +258,26 @@ impl<'a> LeafageStorageProvider<'a> {
         }
     }
 
+    /// Constructs a [`GasParams`] matching the TempoEvm configuration for this hardfork.
+    /// Used for SSTORE gas/refund calculations to ensure exact parity with writer.
+    fn tempo_gas_params(&self) -> revm::context_interface::cfg::gas_params::GasParams {
+        use revm::context_interface::cfg::gas_params::{GasId, GasParams};
+        let mut gp = GasParams::new_spec(revm::primitives::hardfork::SpecId::OSAKA);
+        if self.spec.is_t1() {
+            gp.override_gas([
+                (GasId::sstore_set_without_load_cost(), 250_000),
+                (GasId::create(), 500_000),
+                (GasId::tx_create_cost(), 500_000),
+                (GasId::new_account_cost(), 250_000),
+                (GasId::new_account_cost_for_selfdestruct(), 250_000),
+                (GasId::code_deposit_cost(), 1_000),
+                (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                (GasId::new(255), 250_000),
+            ]);
+        }
+        gp
+    }
+
     /// Code deposit cost per byte, hardfork-aware.
     /// TIP-1000 (T1+): 1000/byte. Pre-T1 (standard Ethereum): 200/byte.
     #[inline]
@@ -334,7 +354,6 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
         if result.is_cold {
             self.deduct_gas(COLD_SLOAD_COST_ADDITIONAL)?;
-            eprintln!("[SLOAD] addr={} key={} cold=true gas=2100 val={}", address, key, result.data);
         }
 
         Ok(result.data)
@@ -349,62 +368,21 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     #[inline]
     fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
         let result = self.internals.sstore(address, key, value)?;
-
-        // Static gas
-        self.deduct_gas(WARM_STORAGE_READ_COST)?;
-
-        // Dynamic gas: simplified from Tempo's GasParams.sstore_dynamic_gas
-        // For the Tempo chain, SSTORE_SET is 250k (vs Ethereum 20k).
-        // We use the standard EIP-2200 gas schedule with Tempo's overridden constants.
         let sstore_data = &result.data;
-        // Hardfork-aware SSTORE_SET cost.
-        let sstore_set = self.sstore_set_cost();
 
-        let dynamic_gas = if sstore_data.is_new_eq_present() {
-            0
-        } else if sstore_data.is_original_eq_present() {
-            if sstore_data.original_value.is_zero() {
-                // 0 -> non-zero: SSTORE_SET cost (hardfork-aware)
-                sstore_set
-            } else {
-                WARM_SSTORE_RESET
-            }
-        } else {
-            0
-        };
+        // Use GasParams API for all sstore gas (static + dynamic + cold + refund)
+        // to ensure exact parity with writer's gas_params.sstore_*() methods.
+        let gas_params = self.tempo_gas_params();
 
-        let cold_gas = if result.is_cold {
-            COLD_SLOAD_COST_ADDITIONAL
-        } else {
-            0
-        };
+        // Static gas (sstore_static_gas = WARM_STORAGE_READ_COST = 100 post-Berlin)
+        self.deduct_gas(gas_params.sstore_static_gas())?;
 
-        self.deduct_gas(dynamic_gas.saturating_add(cold_gas))?;
+        // Dynamic gas (sstore_dynamic_gas handles all EIP-2200 cases)
+        let dynamic_gas = gas_params.sstore_dynamic_gas(true, sstore_data, result.is_cold);
+        self.deduct_gas(dynamic_gas)?;
 
-        // Refund gas — delegates to GasParams::sstore_refund() for writer parity.
-        // Construct GasParams matching TempoEvm::new() to ensure identical refund values.
-        let gas_params = {
-            use revm::context_interface::cfg::gas_params::{GasId, GasParams};
-            // Tempo always uses OSAKA spec for GasParams base.
-            let mut gp = GasParams::new_spec(revm::primitives::hardfork::SpecId::OSAKA);
-            if self.spec.is_t1() {
-                gp.override_gas([
-                    (GasId::sstore_set_without_load_cost(), 250_000),
-                    (GasId::create(), 500_000),
-                    (GasId::tx_create_cost(), 500_000),
-                    (GasId::new_account_cost(), 250_000),
-                    (GasId::new_account_cost_for_selfdestruct(), 250_000),
-                    (GasId::code_deposit_cost(), 1_000),
-                    (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
-                    (GasId::new(255), 250_000),
-                ]);
-            }
-            gp
-        };
-        let refund = sstore_refund(sstore_data, &gas_params);
-        eprintln!("[SSTORE] addr={} key={} orig={} present={} new={} cold={} static=100 dynamic={} cold_gas={} refund={} total_refunded={}",
-            address, key, sstore_data.original_value, sstore_data.present_value, sstore_data.new_value,
-            result.is_cold, dynamic_gas, cold_gas, refund, self.gas_refunded.saturating_add(refund));
+        // Refund gas
+        let refund = gas_params.sstore_refund(true, sstore_data);
         self.refund_gas(refund);
 
         Ok(())
@@ -484,19 +462,6 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
 /// Computes sstore gas refund following EIP-3529 rules.
 ///
-/// Delegates to [`GasParams::sstore_refund()`] for exact parity with the writer.
-///
-/// Previously leafage had its own sstore_refund implementation with hardcoded constants,
-/// but dirty-slot refund adjustments (from TIP20 reward accounting SSTOREs) produced
-/// different totals from the writer's GasParams-based calculation. Using the same
-/// GasParams API ensures per-SSTORE refund values are identical.
-#[inline]
-fn sstore_refund(
-    result: &revm::interpreter::SStoreResult,
-    gas_params: &revm::context_interface::cfg::gas_params::GasParams,
-) -> i64 {
-    gas_params.sstore_refund(true, result)
-}
 
 // ---------------------------------------------------------------------------
 // StorageCtx (thread-local accessor)
