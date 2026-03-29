@@ -33,9 +33,15 @@
 1. **第一性原理**: 验证实际内容，不是元信息。比对数据时反序列化后逐字段比对实际值，不能只比长度/大小/数量。比对 state_diff 要解码 RLP 比每个字段，比对 bytecode 要比完整内容（MD5），比对 block header 要逐字段精确值匹配
 2. **值覆盖**: 每个 API 必须覆盖零值、非零值、非默认值。例如 eth_getCode 要测空 code (EOA)、precompile code (0xef)、完整合约 bytecode (18306 chars)
 3. **块高覆盖**: 接受 block 参数的 API 必须测试 genesis (0x0)、早期块 (0x100)、最新块
-4. **地址类型覆盖**: 预编译地址、普通合约地址 (Permit2)、EOA (ecrecover 0x01)
-5. **任何猜想必须验证**: 不能用"可能是"、"应该是"做结论，必须通过读代码、查日志、执行命令确认。未验证的推测必须标注"未验证"
-6. **记录实际值**: 测试结果不能只写 PASS/FAIL，必须记录实际返回值（或摘要），使结果可审计
+4. **Hardfork 覆盖**: 涉及 gas 计算或 EVM 行为的 API 必须覆盖 Tempo 所有 hardfork 阶段。当前 hardfork 及代表区块：
+   - Genesis/T0 (pre-T1): `0x10000` (ts=1768630648) — 标准 gas，无 TIP-1000
+   - T1/T1A: `0x5B8D80` (ts=1771722038) — TIP-1000 gas 生效 (SSTORE 250k, nonce==0 +250k)
+   - T1B: `0x700000` (ts=1772445140) — key authorization gas 切换到 storage-based
+   - T1C: `0x8A0000` (ts=1773366459) — MILLIS_TIMESTAMP opcode 移除，V2 checkpoint 启用
+   - T2: 未激活 (sentinel u64::MAX) — V2 预编译启用
+5. **地址类型覆盖**: 预编译地址、普通合约地址 (Permit2)、EOA (ecrecover 0x01)
+6. **任何猜想必须验证**: 不能用"可能是"、"应该是"做结论，必须通过读代码、查日志、执行命令确认。未验证的推测必须标注"未验证"
+7. **记录实际值**: 测试结果不能只写 PASS/FAIL，必须记录实际返回值（或摘要），使结果可审计
 
 ## 验证方法
 
