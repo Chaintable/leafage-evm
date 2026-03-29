@@ -6,6 +6,7 @@ use revm::{
     context::{BlockEnv, ContextSetters},
     context_interface::{
         cfg::gas_params::{GasId, GasParams},
+        journaled_state::account::JournaledAccountTr,
         result::{EVMError, ExecutionResult, ResultAndState},
         Cfg, ContextTr, JournalTr,
     },
@@ -160,23 +161,32 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             let mut init_gas = MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
                 .validate_initial_tx_gas(evm)?;
 
+            // TIP-1000: EIP-7702 authorization_list entries with nonce==0
+            // require additional auth_account_creation cost (250k gas).
+            // gas_params returns 0 pre-T1, so no hardfork guard needed.
+            let gas_params = &evm.ctx().cfg.gas_params;
+            for auth in &evm.ctx().tx.base.authorization_list {
+                if auth.nonce() == 0 {
+                    init_gas.initial_gas +=
+                        gas_params.get(TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID);
+                }
+            }
+
             // TIP-1000: nonce == 0 requires additional new_account_cost (250k gas).
             let hardfork = TempoHardfork::from_timestamp(
                 evm.ctx().block.timestamp.saturating_to::<u64>(),
             );
             if hardfork.is_t1() && evm.ctx().tx.base.nonce == 0 {
                 init_gas.initial_gas += evm.ctx().cfg.gas_params.get(GasId::new_account_cost());
+            }
 
-                // Re-validate gas_limit after adding surcharge.
-                // Without this, gas_limit - init_gas underflows in execution(),
-                // giving the precompile near-infinite gas.
-                let gas_limit = evm.ctx().tx.base.gas_limit;
-                if gas_limit < init_gas.initial_gas {
-                    return Err(EVMError::Custom(format!(
-                        "insufficient gas for intrinsic cost: gas_limit {} < intrinsic_gas {}",
-                        gas_limit, init_gas.initial_gas
-                    )));
-                }
+            // Re-validate gas_limit after adding surcharges.
+            let gas_limit = evm.ctx().tx.base.gas_limit;
+            if gas_limit < init_gas.initial_gas {
+                return Err(EVMError::Custom(format!(
+                    "insufficient gas for intrinsic cost: gas_limit {} < intrinsic_gas {}",
+                    gas_limit, init_gas.initial_gas
+                )));
             }
 
             Ok(init_gas)
@@ -355,6 +365,22 @@ fn execute_multi_call<DB: Database, INSP>(
 
         if !frame_result.instruction_result().is_ok() {
             evm.ctx_mut().journal_mut().checkpoint_revert(checkpoint);
+
+            // After checkpoint_revert, if the first call was a CREATE using protocol nonce
+            // (nonce_key == 0), the nonce bump from make_create_frame was rolled back.
+            // Re-bump it to match writer behavior (burn the nonce even on failed CREATE).
+            // With 2D nonces (nonce_key != 0), NonceManager handles replay protection,
+            // so we don't need to burn the protocol nonce.
+            let uses_protocol_nonce = evm.ctx().tx.tempo_fields
+                    .as_ref()
+                    .map(|f| f.nonce_key.is_zero())
+                    .unwrap_or(true);
+            if uses_protocol_nonce && calls.first().map(|c| c.to.is_create()).unwrap_or(false) {
+                let caller = evm.ctx().tx.base.caller;
+                if let Ok(mut acc) = evm.ctx_mut().journal_mut().load_account_mut_skip_cold_load(caller, true) {
+                    acc.data.bump_nonce();
+                }
+            }
 
             let gas_spent_by_failed = frame_result.gas().spent();
             let total_gas_spent = (gas_limit - remaining_gas) + gas_spent_by_failed;

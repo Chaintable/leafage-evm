@@ -690,8 +690,95 @@ writer 不支持此方法，仅验证 leafage 端正确性 + 与 eth_call 结果
 | 12.1 | SSTORE gas | 执行含 SSTORE 操作的 eth_call, 对比 gasUsed | 未执行 (eth_call 模式 SSTORE 走 warm 路径，无法直接验证 cold 250k) |
 | 12.2 | CREATE gas | 部署合约的 estimateGas, writer == leafage | PASS (7.7 deploy call 一致，间接确认) |
 | 12.3 | 预编译 call gas | TIP20 balanceOf estimateGas, writer == leafage (已在 8.3 覆盖) | PASS (8.3 已验证) |
+| 12.4 | SSTORE clear refund — TIP20 全额转账 | eth_multiCall @ block 0xb57db8: pathUSD transfer(0x1, 0x192903), from=0x9acd...edcf, 余额 slot 非零→零产生 refund, 对比 gasUsed | **FAIL** — writer=56742, leafage=59142, 差 2400 (SSTORE clear refund 未扣除) |
+| 12.5 | SSTORE clear refund — 链上真实交易 | block 0xb57a98, tx 0xe378e2..., debug_traceTransaction refund=2800, 14 个 SSTORE, receipt gasUsed=1827804 | 基线数据 (真实链上 refund 交易存在) |
+| 12.6 | SSTORE 非零→非零 (无 refund) | eth_multiCall: staking contract 0x528d...577e, selector 0xd371cd50, block 0xb57db8 | PASS — writer=21529, leafage=21529 (无 refund 时 spent==used, 无差异) |
 
 注: TIP-1000 设置 SSTORE=250k, CREATE=500k。直接验证需要构造写入操作，eth_call 模式下 SSTORE 走 warm 路径 (100 gas)，无法直接验证 cold SSTORE 250k。通过 estimateGas 的 gas 值间接确认 GasParams 已生效。
+
+### 12.4 SSTORE clear refund 差异分析
+
+**根因**: revm 36 升级时，`ResultGas` API 变更：
+- `gas.spent()` = 退款前总 gas (gross)
+- `gas.used()` = max(spent - refunded, floor_gas) — 退款后净 gas (等价旧 `gas_used`)
+
+PR 中将旧 `gas_used` 全部替换为 `gas.spent()`，遗漏了 refund 扣除。影响文件：
+- `debank.rs`: 173, 183, 191, 240, 250, 257 (contractMulticall + simulateTransactions)
+- `multi_call.rs`: 77, 87, 95 (eth_multiCall)
+- `pre.rs`: 63, 76, 94, 109, 110, 111 (pre_traceMany)
+
+**影响范围**: 所有链的 contractMulticall/eth_multiCall/pre_traceMany/simulateTransactions 的 gasUsed 字段。仅在调用触发 SSTORE clear (非零→零) 时产生差异。
+
+**修复**: 全局 `gas.spent()` → `gas.used()`。
+
+#### 复现步骤
+
+环境: blockchain-misc-x3, writer=localhost:8566, leafage=localhost:8568
+
+**原理**: pathUSD (TIP20 token 0) 的 transfer(to, amount)，从有余额地址转出全部余额，使 sender 的 balance storage slot 从非零变为零，触发 SSTORE clear refund (2400 gas)。由于 leafage 用 `gas.spent()` 不扣 refund，gasUsed 偏高。
+
+**Step 1**: 确认 sender 在目标 block 的 pathUSD 余额
+```bash
+curl -s http://localhost:8566 -X POST -H 'Content-Type: application/json' -d '{
+  "method": "eth_call",
+  "params": [{
+    "to": "0x20c0000000000000000000000000000000000000",
+    "data": "0x70a082310000000000000000000000009acdf69c1841b4af029c197e798076cace6aedcf"
+  }, "0xb57db8"],
+  "id": 1, "jsonrpc": "2.0"
+}'
+# 期望: 0x...192903 (余额=1648899, 非零)
+```
+
+**Step 2**: 在 writer 和 leafage 分别执行 transfer(0x1, 0x192903) 全额转账
+```bash
+# Writer
+curl -s http://localhost:8566 -X POST -H 'Content-Type: application/json' -d '{
+  "method": "eth_multiCall",
+  "params": [[{
+    "from": "0x9acdf69c1841b4af029c197e798076cace6aedcf",
+    "to": "0x20c0000000000000000000000000000000000000",
+    "data": "0xa9059cbb00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000192903"
+  }], "0xb57db8"],
+  "id": 1, "jsonrpc": "2.0"
+}'
+
+# Leafage
+curl -s http://localhost:8568 -X POST -H 'Content-Type: application/json' -d '{
+  "method": "eth_multiCall",
+  "params": [[{
+    "from": "0x9acdf69c1841b4af029c197e798076cace6aedcf",
+    "to": "0x20c0000000000000000000000000000000000000",
+    "data": "0xa9059cbb00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000192903"
+  }], "0xb57db8"],
+  "id": 1, "jsonrpc": "2.0"
+}'
+```
+
+**Step 3**: 对比 gasUsed
+
+| | gasUsed | 说明 |
+|---|---|---|
+| Writer | 56742 | 正确: spent - refund = 59142 - 2400 |
+| Leafage (修复前) | 59142 | 错误: 直接报 spent(), 未扣 refund |
+| 差值 | 2400 | SSTORE clear refund |
+
+**Step 4 (对照组)**: 非零→非零 SSTORE 无 refund 场景
+```bash
+# 在 writer 和 leafage 分别执行 (block 0xb57db8)
+curl -s http://localhost:{8566,8568} -X POST -H 'Content-Type: application/json' -d '{
+  "method": "eth_multiCall",
+  "params": [[{
+    "from": "0x9acdf69c1841b4af029c197e798076cace6aedcf",
+    "to": "0x528d61ea70d4bd054535beeb5e944142243d577e",
+    "data": "0xd371cd50"
+  }], "0xb57db8"],
+  "id": 1, "jsonrpc": "2.0"
+}'
+# 期望: 两端 gasUsed 均为 21529 (无 refund, spent==used, 无差异)
+```
+
+**修复后预期**: Step 2 两端 gasUsed 均为 56742。
 
 ---
 
@@ -731,11 +818,11 @@ writer 不支持此方法，仅验证 leafage 端正确性 + 与 eth_call 结果
 | 9. multiCall/contractMultiCall | 23 | 23 | 0 | 0 | 0 |
 | 10. pre_traceMany | 14 | 14 | 0 | 0 | 0 |
 | 11. 边界条件 | 6 | 6 | 0 | 1 (error code) | 0 |
-| 12. Gas 参数 | 3 | 2 | 0 | 0 | 1 |
+| 12. Gas 参数 | 6 | 3 | 1 | 0 | 1 |
 | 13. 批量验证 (100 blocks) | 222 | 220 | 0 | 0 | 2 |
-| **合计** | **737** | **714** | **0** | **21** | **3** |
+| **合计** | **740** | **715** | **1** | **21** | **3** |
 
-**0 个 FAIL。** V2 pre-T2 空合约行为已修复 (5.0b.8/13/14, 5.6.1/2 → PASS)。
+**1 个 FAIL (12.4 SSTORE clear refund)。** gas.spent() vs gas.used() — revm 36 升级遗留，影响所有链 gasUsed 字段。
 
 **21 个已知差异**：14 项 revert error 格式差异 (writer code:3 vs leafage code:-32603)、4 项 txs_count (设计如此)、1 项 version RPC、1 项 error code (缺少 to)、1 项 error code (nonce surcharge rejection)。全部为非功能性差异。
 

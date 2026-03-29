@@ -170,7 +170,7 @@ where
                 err: "".to_string(),
                 from_cache: false,
                 result: output.into_data().0.into(),
-                gas_used: gas.spent() as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
             ExecutionResult::Revert {
@@ -180,7 +180,7 @@ where
                 err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
                 result: Bytes::default(),
-                gas_used: gas.spent() as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
             ExecutionResult::Halt { reason, gas, .. } => DebankSingleCallResult {
@@ -188,7 +188,7 @@ where
                 err: format!("Halted: {:?}", reason),
                 from_cache: false,
                 result: Bytes::default(),
-                gas_used: gas.spent() as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
         };
@@ -237,7 +237,7 @@ where
                 let pre_res = DebankSingleSimulateResult {
                     code: DebankErrorCode::EvmRevert as i32,
                     err: reason,
-                    gas_used: gas.spent(),
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res
@@ -247,14 +247,14 @@ where
                 let pre_res = DebankSingleSimulateResult {
                     code: code as i32,
                     err: format!("Halted: {:?}", reason),
-                    gas_used: gas.spent(),
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res
             }
             ExecutionResult::Success { gas, .. } => {
                 let pre_res = DebankSingleSimulateResult {
-                    gas_used: gas.spent(),
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res

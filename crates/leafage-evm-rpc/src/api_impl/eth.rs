@@ -135,7 +135,7 @@ where
             ))
             .into()),
             ExecutionResult::Halt { reason, gas, .. } => {
-                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.spent())).into())
+                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.used())).into())
             }
         }
     }

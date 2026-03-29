@@ -77,19 +77,19 @@ where
                     logs,
                     reason,
                 } => ExecutionResult::Success {
-                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas() * token_ratio, gas.intrinsic_gas() * token_ratio),
                     output,
                     logs,
                     reason,
                 },
                 ExecutionResult::Revert { gas, output, logs } => ExecutionResult::Revert {
-                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas() * token_ratio, gas.intrinsic_gas() * token_ratio),
                     output,
                     logs,
                 },
                 ExecutionResult::Halt { reason, gas, logs } => ExecutionResult::Halt {
                     reason,
-                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas() * token_ratio, gas.intrinsic_gas() * token_ratio),
                     logs,
                 },
             }
@@ -142,19 +142,19 @@ where
                     logs,
                     reason,
                 } => ExecutionResult::Success {
-                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas() * token_ratio, gas.intrinsic_gas() * token_ratio),
                     output,
                     logs,
                     reason,
                 },
                 ExecutionResult::Revert { gas, output, logs } => ExecutionResult::Revert {
-                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas() * token_ratio, gas.intrinsic_gas() * token_ratio),
                     output,
                     logs,
                 },
                 ExecutionResult::Halt { reason, gas, logs } => ExecutionResult::Halt {
                     reason,
-                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas(), gas.intrinsic_gas()),
+                    gas: ResultGas::new(gas.limit() * token_ratio, gas.spent() * token_ratio, gas.inner_refunded() * token_ratio, gas.floor_gas() * token_ratio, gas.intrinsic_gas() * token_ratio),
                     logs,
                 },
             }

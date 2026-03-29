@@ -92,7 +92,7 @@ fn ensure_address_is_ip_port(input: &str) -> std::result::Result<(), String> {
 
 /// On-chain record for a single consensus validator.
 ///
-/// Storage layout (6 slots total, matching `#[derive(Storable)]`):
+/// Storage layout (4 slots total, matching `#[derive(Storable)]`):
 ///   - slot+0: public_key (B256, 32 bytes)
 ///   - slot+1: active (bool, offset 0) + index (u64, offset 1) + validator_address (Address, offset 9) -- packed
 ///   - slot+2: inbound_address (String, dynamic)

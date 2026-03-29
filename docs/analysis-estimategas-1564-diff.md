@@ -68,14 +68,10 @@ Writer  eth_call from=0x0000 gas=22406: FAIL (insufficient gas for intrinsic cos
 
 ## 结论
 
-1. **Leafage 有一个独立 bug**: `eth_call` 路径没有正确应用 TIP-1000 nonce==0 surcharge (250k gas)。这影响所有 nonce=0 地址的 eth_call gas 行为。需要排查为什么 `TempoHandler::validate_initial_tx_gas` 在 eth_call 路径没有生效。
+两个问题均已修复：
 
-2. **1564 gas 差异**的根因需要在修复 eth_call nonce bug 后重新评估 — 当前的对比数据受到这个 bug 的干扰，不能得出可靠结论。
+1. **~~Leafage eth_call nonce==0 surcharge 缺失~~** — 已修复 (exec.rs:164-181)。`TempoHandler::validate_initial_tx_gas` 标准交易路径在 `MainnetHandler` 之后追加 TIP-1000 nonce==0 surcharge 并重新验证 gas_limit。
 
-3. **不是 writer 的 bug** — 之前怀疑 writer 的 `caller_gas_allowance` 污染 warm set 的假设需要更多证据。在修复 leafage eth_call bug 后再对比。
+2. **1564 gas 差异根因: warm/cold storage** — 已修复 (exec.rs `warm_fee_token_balance`)。Writer 的 `pre_execution` 阶段通过 `load_fee_fields` + `validate_against_state_and_deduct_caller` 读取 caller 的 TIP-20 fee token balance，warming 了 storage slot。Leafage 在 `TempoHandler::pre_execution` 中补上了相同的 sload warm-up，消除 cold/warm 2000 gas 差异。修复后 estimateGas 0x0cac 地址与 writer 完全一致。
 
-## 后续行动
-
-1. 排查并修复 leafage eth_call 路径的 nonce==0 surcharge 缺失
-2. 修复后重新测试 0x0cac 地址的 estimateGas 差异
-3. 如果差异消失，说明根因是 eth_call bug；如果仍存在，继续排查 warm/cold 假设
+3. 文档中关于"State cache != journal warm set"的疑问：writer 的 warm-up 不是通过 State cache 而是通过 handler 的 `pre_execution` 阶段的 journal sload，这确实影响 EIP-2929 gas 计费。

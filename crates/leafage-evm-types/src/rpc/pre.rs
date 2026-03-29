@@ -60,7 +60,7 @@ where
                 };
                 let pre_res = PreResult {
                     error: pre_error,
-                    gas_used: gas.spent(),
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res
@@ -73,7 +73,7 @@ where
                 };
                 let pre_res = PreResult {
                     error: pre_error,
-                    gas_used: gas.spent(),
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res
@@ -91,7 +91,7 @@ where
                     log_index += 1;
                 }
                 let pre_res = PreResult {
-                    gas_used: gas.spent(),
+                    gas_used: gas.used(),
                     logs: trace_logs,
                     ..Default::default()
                 };

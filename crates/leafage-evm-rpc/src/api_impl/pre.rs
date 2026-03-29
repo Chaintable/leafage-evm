@@ -106,9 +106,9 @@ where
         let (gas_used, return_value) = match &exec_res {
             ExecutionResult::Success {
                 gas, output, ..
-            } => (gas.spent(), output.data().clone()),
-            ExecutionResult::Revert { gas, output, .. } => (gas.spent(), output.clone()),
-            ExecutionResult::Halt { gas, .. } => (gas.spent(), Bytes::new()),
+            } => (gas.used(), output.data().clone()),
+            ExecutionResult::Revert { gas, output, .. } => (gas.used(), output.clone()),
+            ExecutionResult::Halt { gas, .. } => (gas.used(), Bytes::new()),
         };
 
         // Build geth traces with default options

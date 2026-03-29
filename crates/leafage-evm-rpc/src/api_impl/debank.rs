@@ -725,7 +725,7 @@ where
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
         // required gas is 271000+.
-        if self.inner.evm_cfg().virtual_balance.is_none() && tx.input().is_empty() {
+        if !self.inner.evm_cfg().is_tempo && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
@@ -746,10 +746,9 @@ where
             }
         }
         if tx.gas_price() > 0 {
-            let gas_limit = if let Some(vb) = self.inner.evm_cfg().virtual_balance {
+            let gas_limit = if self.inner.evm_cfg().is_tempo {
                 // Tempo: read TIP-20 fee token balance for gas cap.
                 // Ported from writer: caller_gas_allowance in crates/node/src/rpc/mod.rs
-                let _ = vb; // virtual_balance presence indicates Tempo chain
                 leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
                     &memory_db,
                     tx.caller(),

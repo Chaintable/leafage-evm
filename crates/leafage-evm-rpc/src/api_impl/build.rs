@@ -180,6 +180,7 @@ where
                     estimate_gas_buffer,
                     self.token_collector.clone(),
                 );
+                api_impl.evm_cfg.is_tempo = true;
                 api_impl.evm_cfg.virtual_balance = Some(uint!(4242424242424242424242424242424242424242424242424242424242424242424242424242_U256));
                 let api = Api::new(api_impl);
                 warmup_api(

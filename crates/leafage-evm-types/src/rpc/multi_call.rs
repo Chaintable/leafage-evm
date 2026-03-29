@@ -74,7 +74,7 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
                 err: "".to_string(),
                 from_cache: false,
                 result: output.into_data().0.into(),
-                gas_used: gas.spent() as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
             ExecutionResult::Revert {
@@ -84,7 +84,7 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
                 err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
                 result: Bytes::default(),
-                gas_used: gas.spent() as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
             ExecutionResult::Halt { reason, gas, .. } => SingleCallResult {
@@ -92,7 +92,7 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
                 err: format!("Halted: {:?}", reason),
                 from_cache: false,
                 result: Bytes::default(),
-                gas_used: gas.spent() as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
         };
