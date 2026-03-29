@@ -473,7 +473,11 @@ fn sstore_refund(result: &revm::interpreter::SStoreResult, sstore_set: u64) -> i
     let mut refund: i64 = 0;
 
     if result.is_original_eq_present() {
-        // Clean slot transition
+        // Clean slot transition: original == present, value is being changed.
+        // If clearing to zero, grant SSTORE_CLEARS_SCHEDULE refund.
+        if !result.original_value.is_zero() && result.new_value.is_zero() {
+            refund += (sstore_set - WARM_STORAGE_READ_COST) as i64;
+        }
     } else {
         // Dirty slot: refund for restoring to original
         if !result.original_value.is_zero() {
@@ -501,6 +505,24 @@ fn sstore_refund(result: &revm::interpreter::SStoreResult, sstore_set: u64) -> i
 // ---------------------------------------------------------------------------
 
 scoped_thread_local!(static STORAGE: RefCell<&mut dyn PrecompileStorageProvider>);
+
+/// Thread-local that persists the gas refund from the last precompile execution.
+/// Set by `StorageCtx::enter` on exit, read by `TempoPrecompiles::run()` to
+/// propagate the refund to revm's Gas struct (which `PrecompilesMap` doesn't do).
+thread_local! {
+    static LAST_PRECOMPILE_REFUND: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets the gas refund from the current precompile execution.
+/// Called from the `tempo_precompile!` macro inside `StorageCtx::enter` closure.
+pub fn set_last_precompile_refund(refund: i64) {
+    LAST_PRECOMPILE_REFUND.with(|c| c.set(refund));
+}
+
+/// Returns and resets the gas refund from the last precompile execution.
+pub fn take_last_precompile_refund() -> i64 {
+    LAST_PRECOMPILE_REFUND.with(|c| c.replace(0))
+}
 
 /// Thread-local storage accessor that delegates to the current `PrecompileStorageProvider`.
 ///

@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::tempo::block::TempoBlockEnv;
 use crate::tempo::hardfork::TempoHardfork;
-use crate::tempo::precompile::extend_tempo_precompiles;
+use crate::tempo::precompile::{extend_tempo_precompiles, storage::take_last_precompile_refund};
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::MainnetSpecId;
@@ -13,13 +13,68 @@ use revm::{
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
+        PrecompileProvider,
         EthFrame, EvmTr, FrameInitOrResult, FrameResult,
     },
     inspector::InspectorEvmTr,
-    interpreter::{interpreter::EthInterpreter, Instruction, interpreter_action::FrameInit},
+    interpreter::{interpreter::EthInterpreter, CallInputs, Instruction, InterpreterResult, interpreter_action::FrameInit},
     precompile::{PrecompileSpecId, Precompiles},
+    primitives::Address,
     Context, Inspector, Journal,
 };
+
+/// Wrapper around [`PrecompilesMap`] that propagates gas refunds from custom
+/// precompile SSTORE operations.
+///
+/// Standard Ethereum precompiles are pure functions and never produce gas refunds.
+/// Tempo's custom precompiles (TIP20, FeeManager, etc.) perform SSTORE through the
+/// journal, tracking refunds in [`PrecompileOutput::gas_refunded`]. The upstream
+/// `PrecompilesMap::run()` records `gas_used` but not `gas_refunded` — which is correct
+/// for standard precompiles. This wrapper adds the missing `record_refund()` call
+/// so that SSTORE clear refunds (e.g., balance slot non-zero → zero) propagate to
+/// the execution result's `ResultGas`.
+pub struct TempoPrecompiles(PrecompilesMap);
+
+impl TempoPrecompiles {
+    pub fn new(inner: PrecompilesMap) -> Self {
+        Self(inner)
+    }
+}
+
+impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
+    type Output = InterpreterResult;
+
+    fn set_spec(&mut self, spec: MainnetSpecId) -> bool {
+        PrecompileProvider::<TempoContext<DB>>::set_spec(&mut self.0, spec)
+    }
+
+    fn run(
+        &mut self,
+        context: &mut TempoContext<DB>,
+        inputs: &CallInputs,
+    ) -> Result<Option<InterpreterResult>, String> {
+        let mut result = self.0.run(context, inputs)?;
+        // PrecompilesMap::run() records gas_used but not gas_refunded.
+        // Tempo custom precompiles track SSTORE refunds in the storage layer
+        // and persist the value via thread-local on StorageCtx::enter() exit.
+        // Propagate it to the Gas struct so ResultGas::used() accounts for refunds.
+        let refund = take_last_precompile_refund();
+        if refund != 0 {
+            if let Some(ref mut r) = result {
+                r.gas.record_refund(refund);
+            }
+        }
+        Ok(result)
+    }
+
+    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
+        PrecompileProvider::<TempoContext<DB>>::warm_addresses(&self.0)
+    }
+
+    fn contains(&self, address: &Address) -> bool {
+        PrecompileProvider::<TempoContext<DB>>::contains(&self.0, address)
+    }
+}
 
 mod exec;
 
@@ -40,7 +95,7 @@ pub struct TempoEvm<DB: revm::database::Database, I> {
         TempoContext<DB>,
         I,
         EthInstructions<EthInterpreter, TempoContext<DB>>,
-        PrecompilesMap,
+        TempoPrecompiles,
         EthFrame,
     >,
     pub inspect: bool,
@@ -132,7 +187,7 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                 },
                 inspector,
                 instruction: instructions,
-                precompiles,
+                precompiles: TempoPrecompiles::new(precompiles),
                 frame_stack: Default::default(),
             },
             inspect,
@@ -174,7 +229,7 @@ where
 {
     type Context = TempoContext<DB>;
     type Instructions = EthInstructions<EthInterpreter, TempoContext<DB>>;
-    type Precompiles = PrecompilesMap;
+    type Precompiles = TempoPrecompiles;
     type Frame = EthFrame;
 
     fn all(
@@ -631,6 +686,120 @@ mod tests {
         assert!(
             gas_data > gas_empty,
             "calldata gas ({gas_data}) should be > empty gas ({gas_empty})"
+        );
+    }
+
+    // ==================== Precompile SSTORE Refund Tests ====================
+
+    /// End-to-end: TIP20 transfer that clears sender balance (non-zero → zero)
+    /// must produce a gas refund that propagates through TempoPrecompiles::run()
+    /// to ResultGas, making gas.used() < gas.spent().
+    ///
+    /// This tests the full path:
+    ///   SSTORE in precompile → StorageCtx.refund_gas()
+    ///   → tempo_precompile! macro → set_last_precompile_refund()
+    ///   → TempoPrecompiles::run() → take + record_refund()
+    ///   → ResultGas.used() accounts for refund
+    #[test]
+    fn test_precompile_sstore_refund_e2e() {
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use revm::bytecode::Bytecode;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::{keccak256, Address, Bytes, TxKind, U256};
+        use revm::state::AccountInfo;
+
+        // TIP20 pathUSD precompile address (token 0): 0x20c0...0000
+        let tip20_addr = Address::new({
+            let mut a = [0u8; 20];
+            a[0] = 0x20;
+            a[1] = 0xc0;
+            a
+        });
+
+        let sender = Address::with_last_byte(0xAA);
+        let recipient = Address::with_last_byte(0xBB);
+        let transfer_amount = U256::from(1000u64);
+
+        // --- Set up CacheDB with TIP20 state ---
+        let mut db = CacheDB::new(revm::database::EmptyDB::default());
+
+        // TIP20 must have code to be "initialized" (code_hash != EMPTY)
+        db.insert_account_info(
+            tip20_addr,
+            AccountInfo {
+                code_hash: Bytecode::new_legacy(vec![0xef].into()).hash_slow(),
+                code: Some(Bytecode::new_legacy(vec![0xef].into())),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        // Slot 7: transfer_policy_id = 1 (ALLOW_ALL) packed at byte offset 20.
+        // Packed storage uses little-endian bit layout: value << (offset * 8).
+        // u64 at offset 20: U256::from(1) << 160
+        let slot7_value = U256::from(1u64) << 160;
+        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value).unwrap();
+
+        // Slot 9: balances mapping. balances[sender] = transfer_amount
+        let balance_slot = sender.mapping_slot(U256::from(9));
+        db.insert_account_storage(tip20_addr, balance_slot, transfer_amount).unwrap();
+
+        // Slot 8: total_supply >= transfer_amount (for consistency)
+        db.insert_account_storage(tip20_addr, U256::from(8), transfer_amount).unwrap();
+
+        // Sender account must exist
+        db.insert_account_info(sender, AccountInfo::default());
+
+        // --- Build and execute TIP20 transfer(recipient, amount) ---
+        // Selector: transfer(address,uint256) = 0xa9059cbb
+        let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
+        calldata.extend_from_slice(&{
+            let mut buf = [0u8; 32];
+            buf[12..].copy_from_slice(recipient.as_slice());
+            buf
+        });
+        calldata.extend_from_slice(&transfer_amount.to_be_bytes::<32>());
+
+        let tx = crate::tempo::tx::TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: sender,
+                kind: TxKind::Call(tip20_addr),
+                gas_limit: 10_000_000,
+                chain_id: Some(4217),
+                data: Bytes::from(calldata),
+                ..Default::default()
+            },
+            tempo_fields: None,
+        };
+
+        let mut evm = TempoEvm::new(
+            make_env(1_770_908_400 + 100), // Post-T1A
+            db,
+            NoOpInspector,
+            false,
+        );
+        let result = evm.transact(tx).expect("TIP20 transfer should succeed");
+
+        assert!(
+            result.result.is_success(),
+            "transfer should succeed, got: {:?}",
+            result.result
+        );
+
+        let gas = result.result.gas();
+        // Sender balance went from non-zero to zero → SSTORE clear refund.
+        // gas.used() should be less than gas.spent() by the refund amount.
+        assert!(
+            gas.used() < gas.spent(),
+            "gas.used() ({}) should be < gas.spent() ({}) due to SSTORE clear refund",
+            gas.used(),
+            gas.spent(),
+        );
+
+        let refund = gas.spent() - gas.used();
+        assert!(
+            refund > 0,
+            "refund should be positive, got {refund}"
         );
     }
 }
