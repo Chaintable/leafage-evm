@@ -151,6 +151,8 @@ macro_rules! tempo_precompile {
                         if !output.reverted {
                             output.gas_refunded = refund;
                         }
+                        eprintln!("[PRECOMPILE_OUTPUT] gas_used={} gas_refunded={} reverted={}",
+                            output.gas_used, output.gas_refunded, output.reverted);
                         output
                     })
                 })

@@ -96,6 +96,9 @@
 - ~~Fee log 生成~~ — **实测确认**：Tempo writer 的 eth_call / pre_traceMany 无论 gas_price 是否为 0 都不产生 fee log（`disable_base_fee=true` 使 fee handler 始终短路）。leafage 行为一致，无差异
 - [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
 - ~~cargo feature gate `tempo`~~ — 不做，其他链（BSC/Cosmos/Mantle）也没有 feature gate，保持一致
+- ~~**预编译 SSTORE gas refund 未传播到 ResultGas**~~ — 已修复：两层问题。(1) `sstore_refund()` clean slot (original==present) 非零→零缺少 refund 计算，补上 SSTORE_CLEARS_SCHEDULE (4800)。(2) alloy-evm 的 `PrecompilesMap::run()` 不调 `record_refund()`（标准预编译无 refund），通过 `TempoPrecompiles` wrapper + thread-local 补上传播
+- **AA apply_eip7702_auth_list 未 override** — Writer 对 AA tx (0x76) override `apply_eip7702_auth_list`，将 `tempo_authorization_list` 的 EIP-7702 delegation 应用到 journaled state。Writer 的 eth_call/estimateGas 确实执行此 override（pre_execution 阶段），RPC 传完整 `TempoSignedAuthorization`。Leafage 需要：(1) 扩展 `TempoAuthGasInfo` 加 chain_id/address/y_parity/r/s 字段 (2) 解析为 `RecoveredAuthorization` 放入 `TxEnv.authorization_list` (3) override `apply_eip7702_auth_list` 对 AA tx apply。影响：未上链的新 delegation 在 eth_call 中不生效
+- **AA per-auth keychain gas 缺 3000** — `calculate_aa_batch_intrinsic_gas` 的 per-auth 循环 (exec.rs:636) 只调 `primitive_sig_gas(auth.sig_type)`，缺少 keychain 包装的 KEYCHAIN_VALIDATION_GAS (3000)。需在 `TempoAuthGasInfo` 和 `TempoAuthGas` 加 `is_keychain: bool`，per-auth 循环判断加 3000。实际影响低（RPC 调用方未发送 keychain auth）
 
 ### Writer-Leafage Handler 差异总览
 
