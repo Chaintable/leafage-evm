@@ -769,17 +769,23 @@ impl TIP403Registry {
 
     /// Returns policy data for the given policy ID.
     fn get_policy_data(&self, policy_id: u64) -> Result<PolicyData> {
-        let record = self.policy_records[policy_id].read()?;
+        // Read only the base slot (PolicyData), not the full PolicyRecord
+        // (which includes CompoundPolicyData in a second slot). The compound
+        // data is only needed for compound policy dispatch, not for the base
+        // data check here. Writer reads .base only (handler.rs:638).
+        use crate::tempo::precompile::storage_types::Slot;
+        let base_slot = self.policy_records[policy_id].slot();
+        let data: PolicyData = Slot::new(base_slot, self.address).read()?;
 
         // T2+: verify that the policy id exists
         if self.storage.spec().is_t2()
-            && record.base.is_default()
+            && data.is_default()
             && policy_id >= self.policy_id_counter()?
         {
             return Err(err_policy_not_found());
         }
 
-        Ok(record.base)
+        Ok(data)
     }
 
     fn set_policy_data(&mut self, policy_id: u64, data: PolicyData) -> Result<()> {

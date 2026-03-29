@@ -335,7 +335,6 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
             (result.data.account().info.clone(), result.is_cold)
         };
 
-        eprintln!("[LOAD_ACCOUNT] addr={} cold={}", address, is_cold);
         self.deduct_gas(WARM_STORAGE_READ_COST)?;
 
         if is_cold {
@@ -349,8 +348,6 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     #[inline]
     fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
         let result = self.internals.sload(address, key)?;
-
-        eprintln!("[SLOAD] addr={} key={} cold={} val={}", address, key, result.is_cold, result.data);
 
         // Gas: WARM_STORAGE_READ_COST + cold storage additional cost if cold
         self.deduct_gas(WARM_STORAGE_READ_COST)?;
@@ -374,17 +371,18 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         let sstore_data = &result.data;
 
         // Use GasParams API for all sstore gas (static + dynamic + cold + refund)
+        // to ensure exact parity with writer's gas_params.sstore_*() methods.
         let gas_params = self.tempo_gas_params();
-        let static_gas = gas_params.sstore_static_gas();
+
+        // Static gas (sstore_static_gas = WARM_STORAGE_READ_COST = 100 post-Berlin)
+        self.deduct_gas(gas_params.sstore_static_gas())?;
+
+        // Dynamic gas (sstore_dynamic_gas handles all EIP-2200 cases)
         let dynamic_gas = gas_params.sstore_dynamic_gas(true, sstore_data, result.is_cold);
-        let refund = gas_params.sstore_refund(true, sstore_data);
-
-        eprintln!("[SSTORE] addr={} key={} orig={} present={} new={} cold={} static={} dynamic={} refund={}",
-            address, key, sstore_data.original_value, sstore_data.present_value,
-            sstore_data.new_value, result.is_cold, static_gas, dynamic_gas, refund);
-
-        self.deduct_gas(static_gas)?;
         self.deduct_gas(dynamic_gas)?;
+
+        // Refund gas
+        let refund = gas_params.sstore_refund(true, sstore_data);
         self.refund_gas(refund);
 
         Ok(())
@@ -402,7 +400,6 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         let gas = LOG
             .saturating_add(LOGTOPIC.saturating_mul(event.topics().len() as u64))
             .saturating_add(LOGDATA.saturating_mul(event.data.len() as u64));
-        eprintln!("[LOG] topics={} data_len={} gas={}", event.topics().len(), event.data.len(), gas);
         self.deduct_gas(gas)?;
 
         self.internals.log(Log {
@@ -419,14 +416,12 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
             .gas_remaining
             .checked_sub(gas)
             .ok_or(TempoPrecompileError::OutOfGas)?;
-        eprintln!("[GAS_DEDUCT] -{gas} remaining={} used={}", self.gas_remaining, self.gas_used());
         Ok(())
     }
 
     #[inline]
     fn refund_gas(&mut self, gas: i64) {
         self.gas_refunded = self.gas_refunded.saturating_add(gas);
-        eprintln!("[GAS_REFUND] {gas:+} total_refunded={}", self.gas_refunded);
     }
 
     #[inline]
