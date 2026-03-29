@@ -53,17 +53,13 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
         context: &mut TempoContext<DB>,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
-        let mut result = self.0.run(context, inputs)?;
-        // PrecompilesMap::run() records gas_used but not gas_refunded.
-        // Tempo custom precompiles track SSTORE refunds in the storage layer
-        // and persist the value via thread-local on StorageCtx::enter() exit.
-        // Propagate it to the Gas struct so ResultGas::used() accounts for refunds.
-        let refund = take_last_precompile_refund();
-        if refund != 0 {
-            if let Some(ref mut r) = result {
-                r.gas.record_refund(refund);
-            }
-        }
+        let result = self.0.run(context, inputs)?;
+        // Drain the thread-local refund set by the precompile macro.
+        // We intentionally do NOT call record_refund() here — the writer
+        // also uses PrecompilesMap which doesn't propagate precompile
+        // SSTORE refunds to the Gas struct. Matching writer behavior means
+        // used() == spent() for precompile calls.
+        let _ = take_last_precompile_refund();
         Ok(result)
     }
 
@@ -787,19 +783,14 @@ mod tests {
         );
 
         let gas = result.result.gas();
-        // Sender balance went from non-zero to zero → SSTORE clear refund.
-        // gas.used() should be less than gas.spent() by the refund amount.
-        assert!(
-            gas.used() < gas.spent(),
-            "gas.used() ({}) should be < gas.spent() ({}) due to SSTORE clear refund",
+        // Precompile SSTORE refunds are intentionally NOT propagated to ResultGas
+        // (matching writer behavior — both use alloy-evm PrecompilesMap which
+        // doesn't call record_refund). So used() == spent() for precompile calls.
+        // The GasParams-based sstore gas calculation ensures spent() matches writer.
+        assert_eq!(
             gas.used(),
-            gas.spent(),
-        );
-
-        let refund = gas.spent() - gas.used();
-        assert!(
-            refund > 0,
-            "refund should be positive, got {refund}"
+            gas.spent_sub_refunded(),
+            "precompile gas: used() should equal spent_sub_refunded() (no refund propagation)"
         );
     }
 }
