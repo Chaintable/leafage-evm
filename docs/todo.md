@@ -72,7 +72,7 @@
 
 ### P0 — 上线前
 
-- [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证
+- [x] ~~**集成测试**~~ — 已完成：705 项测试，0 FAIL，15 已知差异（revert format），dev 环境 blockchain-misc-x3 镜像 amd64-234fdd7
 - [x] ~~**estimateGas no_code_callee 早返回 bug**~~ — 已修复：Tempo 链跳过 `no_code_callee` 早返回优化
 - [x] ~~**estimateGas caller_gas_allowance**~~ — 已实现：`ReadOnlyStorageProvider` + `tempo_caller_gas_allowance()` 读 TIP-20 fee token 余额算 gas cap，与 writer 一致
 - ~~**estimateGas 单地址 1568 gas 差异**~~ — **Writer 端问题，Leafage 行为正确**。Leafage 对所有地址返回一致的 23982，与 writer 的 0x983b（无余额）一致。Writer 对 0x0cac（有 TIP-20 余额）返回 22414（低 1568），可能是 `caller_gas_allowance` 的 storage read 对后续 EVM 执行产生了副作用。Leafage 无此副作用，行为正确
@@ -82,7 +82,7 @@
 
 - [x] ~~**leafage-evm-chains 编译 warning 清理**~~ — Tempo 相关 warning 全部清理（`cargo fix` + 手动 dead code/visibility 修复）。剩余 2 个 `deprecated new_mainnet` 是其他链（Cosmos/Mantle），不在 Tempo 范围
 - [x] ~~**getBalance/getAddressBalance 返回 Tempo placeholder**~~ — 已实现：EvmCfg 加 `virtual_balance: Option<U256>`，`get_balance_impl` 和 `debank_get_address_balance_impl` 入口拦截。Tempo 在 build.rs 设置 `NATIVE_BALANCE_PLACEHOLDER`（`uint!(4242...4242_U256)`），与 writer 一致
-- [ ] **0x76 (AA tx) 集成测试** — 需等 leafage 追到 block 10100400+，验证 pre_traceMany/simulateTransactions/estimateGas 对 0x76 交易的行为
+- [x] ~~**0x76 (AA tx) 集成测试**~~ — 已完成：block 0x9A2200 (含 3 笔 AA tx)。AA 用户 eth_call (6/6 PASS)、estimateGas (2/2 PASS)、contractMultiCall batch (PASS)、pre_traceMany 单笔+多笔 output 与 writer eth_call 精确匹配 (4/4 PASS)
 - [x] ~~**TempoHandler `validate_initial_tx_gas` AA 路径**~~ — 已完整实现，与 writer 的 eth_call/estimateGas gas 计算对齐。CallRequest 扩展 `key_type`/`key_data`/`key_id`/`key_authorization`/`tempo_authorization_list` 字段，TempoTxFields 扩展 `sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`。gas 计算包含：base stipend、signature verification（P256 +5k, WebAuthn +5k+calldata, Keychain +3k）、per-call cold account、authorization list（per-auth sig gas + TIP-1000 nonce==0）、key authorization（pre-T1B heuristic / T1B+ storage-based）、calldata tokens、CREATE costs、2D nonce gas（expiring 13k / new_account 250k / existing 5k）。6 个单测覆盖
 - [x] ~~**TempoHandler `validate_env` override**~~ — 已实现：value!=0 拒绝 + AA calls 结构校验（非空、CREATE 规则）。Keychain 版本/subblock/priority fee/time window 为 writer-only 验证，eth_call 模式不需要
 - [x] ~~**TempoHandler `inspect_execution` override**~~ — 已实现：override `InspectorHandler::inspect_execution`，AA batch 每个 sub-call 走 `inspect_run_exec_loop`（inspector-aware frame loop）。`execute_multi_call` 重构为接受 closure 的 free function，`execution()` 和 `inspect_execution()` 共用
