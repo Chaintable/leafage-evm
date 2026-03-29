@@ -334,6 +334,7 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
         if result.is_cold {
             self.deduct_gas(COLD_SLOAD_COST_ADDITIONAL)?;
+            eprintln!("[SLOAD] addr={} key={} cold=true gas=2100 val={}", address, key, result.data);
         }
 
         Ok(result.data)
@@ -401,9 +402,9 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
             gp
         };
         let refund = sstore_refund(sstore_data, &gas_params);
-        eprintln!("[SSTORE_REFUND] addr={} key={} orig={} present={} new={} cold={} refund={} total_refunded={}",
+        eprintln!("[SSTORE] addr={} key={} orig={} present={} new={} cold={} static=100 dynamic={} cold_gas={} refund={} total_refunded={}",
             address, key, sstore_data.original_value, sstore_data.present_value, sstore_data.new_value,
-            result.is_cold, refund, self.gas_refunded.saturating_add(refund));
+            result.is_cold, dynamic_gas, cold_gas, refund, self.gas_refunded.saturating_add(refund));
         self.refund_gas(refund);
 
         Ok(())
