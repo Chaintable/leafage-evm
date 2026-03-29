@@ -189,6 +189,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 )));
             }
 
+            eprintln!("[HANDLER] validate_initial_tx_gas: initial={} floor={}", init_gas.initial_gas, init_gas.floor_gas);
             Ok(init_gas)
         }
     }
@@ -218,6 +219,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         // Errors are ignored — warm-up is best-effort (EmptyDB in tests, etc.).
         let _ = warm_fee_token_balance(evm);
 
+        eprintln!("[HANDLER] pre_execution done, eip7702_refund_gas={}", gas);
         Ok(gas)
     }
 
@@ -294,6 +296,7 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     } else {
         revm::primitives::Address::from_word(user_token.into())
     };
+    eprintln!("[WARM] fee_token={} (user_token_raw={})", fee_token, user_token);
 
     // 2. Read TIP20.balances[caller] — Mapping<Address,U256> at slot 9
     let balance_slot = {
@@ -306,10 +309,11 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         .ctx_mut()
         .journal_mut()
         .load_account(fee_token)?;
-    let _ = evm
+    let balance_result = evm
         .ctx_mut()
         .journal_mut()
         .sload(fee_token, balance_slot.into())?;
+    eprintln!("[WARM] balance_slot={} cold={} val={}", balance_slot, balance_result.is_cold, balance_result.data);
 
     Ok(())
 }

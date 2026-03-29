@@ -59,9 +59,12 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
         // and persist the value via thread-local on StorageCtx::enter() exit.
         // Propagate it to the Gas struct so ResultGas::used() accounts for refunds.
         let refund = take_last_precompile_refund();
-        if refund != 0 {
-            if let Some(ref mut r) = result {
+        if let Some(ref mut r) = result {
+            eprintln!("[TEMPO_PRECOMPILES] run result: gas_spent={} gas_refunded={} thread_local_refund={}",
+                r.gas.spent(), r.gas.refunded(), refund);
+            if refund != 0 {
                 r.gas.record_refund(refund);
+                eprintln!("[TEMPO_PRECOMPILES] after record_refund: gas_refunded={}", r.gas.refunded());
             }
         }
         Ok(result)
