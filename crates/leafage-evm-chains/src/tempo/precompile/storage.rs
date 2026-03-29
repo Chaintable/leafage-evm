@@ -380,8 +380,27 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
         self.deduct_gas(dynamic_gas.saturating_add(cold_gas))?;
 
-        // Refund gas (EIP-3529 style, hardfork-aware)
-        let refund = sstore_refund(sstore_data, sstore_set);
+        // Refund gas — delegates to GasParams::sstore_refund() for writer parity.
+        // Construct GasParams matching TempoEvm::new() to ensure identical refund values.
+        let gas_params = {
+            use revm::context_interface::cfg::gas_params::{GasId, GasParams};
+            // Tempo always uses OSAKA spec for GasParams base.
+            let mut gp = GasParams::new_spec(revm::primitives::hardfork::SpecId::OSAKA);
+            if self.spec.is_t1() {
+                gp.override_gas([
+                    (GasId::sstore_set_without_load_cost(), 250_000),
+                    (GasId::create(), 500_000),
+                    (GasId::tx_create_cost(), 500_000),
+                    (GasId::new_account_cost(), 250_000),
+                    (GasId::new_account_cost_for_selfdestruct(), 250_000),
+                    (GasId::code_deposit_cost(), 1_000),
+                    (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                    (GasId::new(255), 250_000),
+                ]);
+            }
+            gp
+        };
+        let refund = sstore_refund(sstore_data, &gas_params);
         self.refund_gas(refund);
 
         Ok(())
@@ -461,47 +480,18 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
 /// Computes sstore gas refund following EIP-3529 rules.
 ///
-/// `sstore_set` is hardfork-aware: 250k for T1+, 20k pre-T1.
+/// Delegates to [`GasParams::sstore_refund()`] for exact parity with the writer.
+///
+/// Previously leafage had its own sstore_refund implementation with hardcoded constants,
+/// but dirty-slot refund adjustments (from TIP20 reward accounting SSTOREs) produced
+/// different totals from the writer's GasParams-based calculation. Using the same
+/// GasParams API ensures per-SSTORE refund values are identical.
 #[inline]
-fn sstore_refund(result: &revm::interpreter::SStoreResult, sstore_set: u64) -> i64 {
-    use revm::interpreter::gas::{ACCESS_LIST_STORAGE_KEY, COLD_SLOAD_COST, SSTORE_RESET};
-
-    if result.is_new_eq_present() {
-        return 0;
-    }
-
-    let mut refund: i64 = 0;
-
-    if result.is_original_eq_present() {
-        // Clean slot transition: original == present, value is being changed.
-        // If clearing to zero, grant SSTORE_CLEARS_SCHEDULE refund (EIP-3529).
-        // SSTORE_CLEARS_SCHEDULE = SSTORE_RESET - COLD_SLOAD_COST + ACCESS_LIST_STORAGE_KEY
-        // This does NOT use sstore_set (TIP-1000 250k) — the refund schedule uses
-        // SSTORE_RESET (5000) which is not overridden by TIP-1000.
-        if !result.original_value.is_zero() && result.new_value.is_zero() {
-            // SSTORE_CLEARS_SCHEDULE = SSTORE_RESET(5000) - COLD_SLOAD_COST(2100) + ACCESS_LIST_STORAGE_KEY(1900) = 4800
-            refund += (SSTORE_RESET - COLD_SLOAD_COST + ACCESS_LIST_STORAGE_KEY) as i64;
-        }
-    } else {
-        // Dirty slot: refund for restoring to original
-        if !result.original_value.is_zero() {
-            if result.present_value.is_zero() {
-                refund -= SSTORE_RESET as i64;
-            } else if result.new_value.is_zero() {
-                refund += SSTORE_RESET as i64;
-            }
-        }
-        if result.original_value == result.new_value {
-            if result.original_value.is_zero() {
-                // Was 0 -> X -> 0: refund sstore_set - WARM_STORAGE_READ_COST
-                refund += (sstore_set - WARM_STORAGE_READ_COST) as i64;
-            } else {
-                refund += (SSTORE_RESET - WARM_STORAGE_READ_COST) as i64;
-            }
-        }
-    }
-
-    refund
+fn sstore_refund(
+    result: &revm::interpreter::SStoreResult,
+    gas_params: &revm::context_interface::cfg::gas_params::GasParams,
+) -> i64 {
+    gas_params.sstore_refund(true, result)
 }
 
 // ---------------------------------------------------------------------------
