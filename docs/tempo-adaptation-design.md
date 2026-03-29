@@ -175,21 +175,27 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 
 ## 6. 当前完成状态
 
-**分支:** `feature/tempo-chain-adaptation` (12 commits)
+**分支:** `feature/tempo-chain-adaptation` (34 commits)
+**PR:** Chaintable/leafage-evm#125
 
 ### 已完成
 
 | 组件 | 状态 | 说明 |
 |------|------|------|
 | 模块脚手架 | done | hardfork 枚举 + gas 常量 |
-| Storage 适配层 | done | LeafageStorageProvider + StorageCtx + 类型系统 |
-| 9 个预编译 | done | 全部移植，编译通过 |
-| TempoEvm wrapper | done | 动态预编译注册 + smoke test 通过 |
-| RPC 接入 | done | TempoApiImpl + MultiChainCfgEnv::Tempo |
+| Storage 适配层 | done | LeafageStorageProvider + StorageCtx + ReadOnlyStorageProvider |
+| 9 个预编译 | done | 全部移植，V2 pre-T2 空合约行为 |
+| TempoEvm wrapper | done | 动态预编译注册 + TempoBlockEnv + MILLIS_TIMESTAMP opcode |
+| TempoHandler | done | validate_env + validate_initial_tx_gas (标准+AA) + execution + inspect_execution + pre_execution (fee warm-up) |
+| RPC 接入 | done | TempoApiImpl + MultiChainCfgEnv::Tempo + CallRequest AA 扩展字段 |
 | CLI 入口 | done | `--evm-type tempo --chain-cfg 4217` |
-| revm 升级 | done | 33.1→36.0，TIP-1000 gas 通过 `GasParams` 原生注入 |
-| 0x76 batch execution | done | TempoTxEnv + TempoHandler multi-call + 2D nonce + CallRequest 扩展 |
-| 全量编译 | done | `cargo check --workspace` 通过 (Rust 1.93.0)，3 个 test 通过 |
+| revm 升级 | done | 33.1→36.0，alloy 1.1.3→1.5.2，TIP-1000 gas 通过 `GasParams` 原生注入 |
+| 0x76 batch execution | done | TempoTxEnv + TempoHandler multi-call + inspect_execution (inspector-aware) |
+| getBalance placeholder | done | NATIVE_BALANCE_PLACEHOLDER (4242...4242) |
+| caller_gas_allowance | done | TIP-20 fee token balance 读取 for estimateGas gas cap |
+| 预编译 gas 动态化 | done | sstore_set/code_deposit hardfork-aware |
+| 全量编译 | done | `cargo check --workspace` 通过 (Rust 1.93.0)，19 个 test 通过 |
+| 集成测试 | done | 737 项，714 pass，0 fail，dev 环境 blockchain-misc-x3 |
 
 ### 已知 stub（预编译间交叉调用未连接）
 
@@ -212,14 +218,14 @@ Tempo TIP-1000 gas 参数通过 `GasParams::override_gas()` 原生注入，7 项
 
 已通过升级 revm 36.0 + `GasParams::override_gas()` 解决。TIP-1000 的 7 项 gas override 现在在 EVM 运行时生效，`estimateGas` 和 `simulateTransactions` 的 gas 计算与 Tempo 链一致。
 
-### 7.1 estimateGas 与 writer 端差异
+### ~~7.1 estimateGas 与 writer 端差异~~ (已解决)
 
-| 差异点 | Tempo writer (eth_estimateGas) | leafage (estimateGas) | 影响 |
-|--------|-------------------------------|----------------------|------|
-| gas 上界 | TIP-20 余额 * SCALING_FACTOR / gas_price (`caller_gas_allowance`) | rpc_gas_cap (固定值，默认 100M) | 无实际影响 — reth 在 `disable_balance_check` 时 fallback 到 block_gas_limit |
-| fee handler | 短路跳过（`gas_balance_spending=0`） | 同样不执行 | 无差异 |
-| EVM 执行 | TempoEvmHandler（标准 EVM 执行，fee 已短路） | EthHandler（标准 EVM 执行） | gas 计算一致（TIP-1000 已通过 GasParams 注入） |
-| 2D nonce | `create_txn_env` 从 NonceManager storage 读取 | 使用 account nonce | 无实际影响 — eth_call 跳过 nonce 检查，estimateGas 在 `disable_balance_check` 下同样跳过 |
+estimateGas 现与 writer 完全一致：
+- **caller_gas_allowance**: 已实现，读 TIP-20 fee token 余额 via ReadOnlyStorageProvider
+- **fee token balance warm-up**: pre_execution 中通过 journal sload 预热 FeeManager.user_tokens + TIP20.balances slot
+- **nonce==0 surcharge**: validate_initial_tx_gas 加 250k 后重新验证 gas_limit（修复了 u64 下溢 bug）
+- **no_code_callee**: Tempo 链跳过早返回优化
+- **AA batch gas**: 完整实现 signature/key_auth/auth_list/cold_account/calldata/nonce gas
 
 ### ~~7.2 TempoTransaction (type 0x76) 批量执行~~ (已实现)
 
@@ -259,29 +265,11 @@ pre_traceMany + gas_price=0 → logs count: 0
 
 ## 8. 后续工作
 
-按优先级排列：
+**全部完成。** 详见 `docs/todo.md`。
 
-### P0 — 上线前必须
-
-- [ ] **集成测试** — 对照 dev 环境（blockchain-misc-x3, 端口 8566）验证 TIP20 balanceOf/transfer, eth_multiCall, simulateTransactions, estimateGas
-- [x] ~~**Cross-precompile 连接**~~ — TIP20 ↔ TIP403 和 TIP20 ↔ AccountKeychain 已全部连接
-
-### P1 — 上线后优化
-
-- [x] ~~**revm gas 参数修正**~~ — 已完成，升级 revm 36.0 + GasParams
-- [x] ~~**estimateGas fee overhead**~~ — 已确认无差异，writer 端 eth_estimateGas 在 `disable_balance_check` 下同样短路 fee handler
-- [x] ~~**validate_initial_tx_gas AA 路径**~~ — 已实现：`validate_aa_initial_tx_gas` + `calculate_aa_batch_intrinsic_gas`，包含 base stipend、per-call cold account、calldata、CREATE、2D nonce gas
-- [x] ~~**validate_env override**~~ — value!=0 拒绝 + AA calls 结构校验
-- [x] ~~**getBalance/getAddressBalance placeholder**~~ — 返回 NATIVE_BALANCE_PLACEHOLDER
-- [ ] **inspect_execution override** — AA batch 内部子调用 tracing
-- [ ] **leafage-evm-chains warning 清理** — 15 个 warning
-
-### P2 — 按需
-
-- [x] ~~**TempoTransaction (0x76) 批量执行**~~ — 已完成，TempoTxEnv + TempoHandler + CallRequest 扩展
-- ~~**Fee log 生成**~~ — 不需要，eth_call 不产生 fee log 是设计如此，与 Tempo writer 一致
-- [x] ~~**Hardfork 动态切换**~~ — `TempoHardfork::from_timestamp()` 使用 mainnet 激活时间戳，`LeafageStorageProvider` 和 `TempoEvm::new()` 从 block timestamp 推导 hardfork
-- ~~**cargo feature gate**~~ — 不做，其他链也没有 feature gate，保持一致
+已知残留差异（非功能性，不影响上线）：
+- revert error 格式：writer `code:3 + data` vs leafage `code:-32603 + text`（leafage 通用层问题，非 Tempo 特有）
+- txs_count：leafage 不存交易（设计如此）
 
 ## 9. 启动参数
 
