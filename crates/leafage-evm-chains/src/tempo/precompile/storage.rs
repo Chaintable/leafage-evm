@@ -464,7 +464,7 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 /// `sstore_set` is hardfork-aware: 250k for T1+, 20k pre-T1.
 #[inline]
 fn sstore_refund(result: &revm::interpreter::SStoreResult, sstore_set: u64) -> i64 {
-    use revm::interpreter::gas::SSTORE_RESET;
+    use revm::interpreter::gas::{ACCESS_LIST_STORAGE_KEY, COLD_SLOAD_COST, SSTORE_RESET};
 
     if result.is_new_eq_present() {
         return 0;
@@ -474,9 +474,13 @@ fn sstore_refund(result: &revm::interpreter::SStoreResult, sstore_set: u64) -> i
 
     if result.is_original_eq_present() {
         // Clean slot transition: original == present, value is being changed.
-        // If clearing to zero, grant SSTORE_CLEARS_SCHEDULE refund.
+        // If clearing to zero, grant SSTORE_CLEARS_SCHEDULE refund (EIP-3529).
+        // SSTORE_CLEARS_SCHEDULE = SSTORE_RESET - COLD_SLOAD_COST + ACCESS_LIST_STORAGE_KEY
+        // This does NOT use sstore_set (TIP-1000 250k) — the refund schedule uses
+        // SSTORE_RESET (5000) which is not overridden by TIP-1000.
         if !result.original_value.is_zero() && result.new_value.is_zero() {
-            refund += (sstore_set - WARM_STORAGE_READ_COST) as i64;
+            // SSTORE_CLEARS_SCHEDULE = SSTORE_RESET(5000) - COLD_SLOAD_COST(2100) + ACCESS_LIST_STORAGE_KEY(1900) = 4800
+            refund += (SSTORE_RESET - COLD_SLOAD_COST + ACCESS_LIST_STORAGE_KEY) as i64;
         }
     } else {
         // Dirty slot: refund for restoring to original
