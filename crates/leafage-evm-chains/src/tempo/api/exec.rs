@@ -157,14 +157,36 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             // AA transaction — use batch gas calculation.
             validate_aa_initial_tx_gas(evm)
         } else {
-            // Standard transaction — delegate to mainnet handler.
-            let mut init_gas = MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-                .validate_initial_tx_gas(evm)?;
+            // Standard transaction — use GasParams::initial_tx_gas() instead of
+            // MainnetHandler (which uses hardcoded constants from SpecId, ignoring
+            // TIP-1000 overrides like tx_create_cost=500k).
+            // Ported from writer: handler.rs:1337
+            use revm::context_interface::transaction::{AccessListItemTr, Transaction};
+            let tx = &evm.ctx().tx.base;
+            let gas_params = &evm.ctx().cfg.gas_params;
+
+            let (acc, storage) = if tx.tx_type() != revm::context_interface::transaction::TransactionType::Legacy {
+                tx.access_list()
+                    .map(|al| {
+                        al.fold((0u64, 0u64), |(a, s), item| {
+                            (a + 1, s + item.storage_slots().count() as u64)
+                        })
+                    })
+                    .unwrap_or_default()
+            } else {
+                (0, 0)
+            };
+
+            let mut init_gas = gas_params.initial_tx_gas(
+                tx.input(),
+                tx.kind().is_create(),
+                acc,
+                storage,
+                tx.authorization_list.len() as u64,
+            );
 
             // TIP-1000: EIP-7702 authorization_list entries with nonce==0
             // require additional auth_account_creation cost (250k gas).
-            // gas_params returns 0 pre-T1, so no hardfork guard needed.
-            let gas_params = &evm.ctx().cfg.gas_params;
             for auth in &evm.ctx().tx.base.authorization_list {
                 if auth.nonce() == 0 {
                     init_gas.initial_gas +=
