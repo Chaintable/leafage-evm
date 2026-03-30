@@ -600,13 +600,14 @@ impl TIP20Token {
         let policy_id = self.transfer_policy_id.read()?;
         let registry = super::tip403_registry::TIP403Registry::new();
 
-        // T2+ short-circuit: skip recipient check if sender fails
+        // T2+ short-circuit: skip recipient check if sender fails.
+        // Pre-T2: always evaluate both sender and recipient (matching writer).
         let sender_auth = registry.is_authorized_as(
             policy_id,
             from,
             super::tip403_registry::AuthRole::sender(),
         )?;
-        if !sender_auth {
+        if self.storage.spec().is_t2() && !sender_auth {
             return Ok(false);
         }
         let recipient_auth = registry.is_authorized_as(
@@ -1226,9 +1227,11 @@ impl TIP20Token {
             return Ok(());
         }
 
-        // Refund spending limit
-        super::account_keychain::AccountKeychain::new()
-            .refund_spending_limit(to, self.address, refund)?;
+        // Refund spending limit (T1C+, matching writer tip20/mod.rs:1046)
+        if self.storage.spec().is_t1c() {
+            super::account_keychain::AccountKeychain::new()
+                .refund_spending_limit(to, self.address, refund)?;
+        }
 
         self.handle_rewards_on_transfer(TIP_FEE_MANAGER_ADDRESS, to, refund)?;
 

@@ -749,12 +749,16 @@ where
             let gas_limit = if self.inner.evm_cfg().is_tempo {
                 // Tempo: read TIP-20 fee token balance for gas cap.
                 // Ported from writer: caller_gas_allowance in crates/node/src/rpc/mod.rs
+                // Use fee_payer (sponsor) if specified, otherwise caller.
+                // Use fee_token override if specified.
+                let payer = request.fee_payer.unwrap_or(tx.caller());
                 leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
                     &memory_db,
-                    tx.caller(),
+                    payer,
                     tx.gas_price(),
                     block_env.timestamp.saturating_to::<u64>(),
                     self.inner.evm_cfg().cfg.chain_id,
+                    request.fee_token,
                 )
                 .unwrap_or(u64::MAX)
             } else {

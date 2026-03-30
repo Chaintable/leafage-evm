@@ -50,6 +50,10 @@ where
         let key_id = request.key_id;
         let key_authorization = request.key_authorization.clone();
         let tempo_authorization_list = request.tempo_authorization_list.clone();
+        let fee_token = request.fee_token;
+        let fee_payer = request.fee_payer;
+        let valid_after = request.valid_after;
+        let valid_before = request.valid_before;
 
         // Build standard TxEnv.
         let base =
@@ -88,7 +92,7 @@ where
                 num_limits: ka.num_limits,
             });
 
-            // Tempo authorization list gas info.
+            // Tempo authorization list: gas info + optional delegation fields.
             let auth_list = tempo_authorization_list
                 .unwrap_or_default()
                 .into_iter()
@@ -99,6 +103,10 @@ where
                         .map(TempoSigType::from_str_lossy)
                         .unwrap_or_default(),
                     nonce: a.nonce,
+                    is_keychain: a.is_keychain,
+                    authority: a.authority,
+                    delegate: a.address,
+                    chain_id: a.chain_id,
                 })
                 .collect();
 
@@ -130,6 +138,11 @@ where
                 webauthn_data_size,
                 key_auth,
                 auth_list,
+                key_id,
+                fee_token,
+                fee_payer,
+                valid_after,
+                valid_before,
             })
         } else {
             None

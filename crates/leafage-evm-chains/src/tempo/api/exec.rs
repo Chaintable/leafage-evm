@@ -52,6 +52,37 @@ const KEY_AUTH_PER_LIMIT_GAS: u64 = 22_000;
 /// Same as Tempo writer: crates/revm/src/gas_params.rs `GasId::new(255)`.
 const TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID: GasId = GasId::new(255);
 
+// ---------------------------------------------------------------------------
+// EIP-7702 delegation helper for AA auth list
+// ---------------------------------------------------------------------------
+
+/// Lightweight EIP-7702 delegation entry for `apply_auth_list`.
+///
+/// Implements `AuthorizationTr` with authority provided directly (no signature recovery).
+/// Used in the `apply_eip7702_auth_list` override for AA transactions where the
+/// RPC caller provides authority + delegate addresses explicitly.
+struct TempoAuthDelegation {
+    authority: revm::primitives::Address,
+    delegate: revm::primitives::Address,
+    chain_id: U256,
+    nonce: u64,
+}
+
+impl revm::context_interface::transaction::eip7702::AuthorizationTr for TempoAuthDelegation {
+    fn authority(&self) -> Option<revm::primitives::Address> {
+        Some(self.authority)
+    }
+    fn chain_id(&self) -> U256 {
+        self.chain_id
+    }
+    fn nonce(&self) -> u64 {
+        self.nonce
+    }
+    fn address(&self) -> revm::primitives::Address {
+        self.delegate
+    }
+}
+
 /// Tempo handler — wraps [`MainnetHandler`] with batch execution support.
 ///
 /// For standard (non-batch) transactions, delegates to [`MainnetHandler`].
@@ -126,8 +157,12 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 }
             }
 
-            // Note: keychain version, subblock, priority fee, and time window validations
-            // are skipped — leafage eth_call mode has no real signatures, no subblock txs,
+            // Validate time window (ported from writer: handler.rs:1755-1782).
+            let block_ts: u64 = evm.ctx().block.timestamp.saturating_to();
+            validate_time_window(fields.valid_after, fields.valid_before, block_ts)?;
+
+            // Note: keychain version, subblock, and priority fee validations are skipped —
+            // leafage eth_call mode has no real signatures, no subblock txs,
             // and disable_base_fee=true. These checks are writer-only concerns.
         }
 
@@ -240,7 +275,93 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         // Errors are ignored — warm-up is best-effort (EmptyDB in tests, etc.).
         let _ = warm_fee_token_balance(evm);
 
+        // Set tx_origin in AccountKeychain transient storage for spending limit checks.
+        // Writer does this in validate_against_state_and_deduct_caller (handler.rs:677-683)
+        // for ALL transactions. Without it, tx_origin stays Address::ZERO and
+        // authorize_transfer/authorize_approve/refund_spending_limit skip enforcement.
+        set_keychain_tx_origin(evm);
+
+        // Set transaction_key if this is an access key (keychain) transaction.
+        // Writer: handler.rs:1128-1133 — sets transaction_key when signature is Keychain.
+        // Without this, transaction_key stays ZERO and TIP20 authorize_transfer/
+        // authorize_approve/refund_spending_limit skip spending limit enforcement.
+        if let Some(key_id) = evm
+            .ctx()
+            .tx
+            .tempo_fields
+            .as_ref()
+            .and_then(|f| f.key_id)
+        {
+            set_keychain_transaction_key(evm, key_id);
+        }
+
         Ok(gas)
+    }
+
+    /// Applies EIP-7702 delegations from AA authorization list.
+    ///
+    /// Writer: handler.rs:620-665. For AA txs (0x76), applies tempo_authorization_list
+    /// entries as EIP-7702 delegations. Each entry with `authority` + `delegate` fields
+    /// sets the authority's code to `0xef0100 || delegate` in the journal.
+    ///
+    /// Entries without delegation fields (gas-only) are skipped.
+    /// T1+: no refund (matching writer behavior).
+    #[inline]
+    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+        let has_aa_delegations = evm
+            .ctx()
+            .tx
+            .tempo_fields
+            .as_ref()
+            .map(|f| f.auth_list.iter().any(|a| a.authority.is_some() && a.delegate.is_some()))
+            .unwrap_or(false);
+
+        if !has_aa_delegations {
+            // No AA delegation entries — use default EIP-7702 path (handles type 0x04).
+            return MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
+                .apply_eip7702_auth_list(evm);
+        }
+
+        // Build delegation entries from auth_list items that have authority + delegate.
+        let delegations: Vec<TempoAuthDelegation> = evm
+            .ctx()
+            .tx
+            .tempo_fields
+            .as_ref()
+            .unwrap()
+            .auth_list
+            .iter()
+            .filter_map(|auth| {
+                let authority = auth.authority?;
+                let delegate = auth.delegate?;
+                let chain_id = auth.chain_id.unwrap_or(U256::from(evm.ctx().cfg.chain_id));
+                Some(TempoAuthDelegation {
+                    authority,
+                    delegate,
+                    chain_id,
+                    nonce: auth.nonce,
+                })
+            })
+            .collect();
+
+        let chain_id = evm.ctx().cfg.chain_id;
+        let refund_per_auth = evm.ctx().cfg.gas_params.tx_eip7702_auth_refund();
+
+        let refunded = revm::handler::pre_execution::apply_auth_list::<_, Self::Error>(
+            chain_id,
+            refund_per_auth,
+            delegations.iter(),
+            evm.ctx_mut().journal_mut(),
+        )?;
+
+        // TIP-1000: no refund on T1+ (matching writer handler.rs:660).
+        let hardfork = crate::tempo::hardfork::TempoHardfork::from_timestamp(
+            evm.ctx().block.timestamp.saturating_to::<u64>(),
+        );
+        if hardfork.is_t1() {
+            return Ok(0);
+        }
+        Ok(refunded)
     }
 
     /// Overridden execution: dispatches to batch path when `aa_calls` is present.
@@ -273,6 +394,36 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
 // ---------------------------------------------------------------------------
 // AA gas validation — ported from Tempo writer: crates/revm/src/handler.rs
 // ---------------------------------------------------------------------------
+
+/// Validates the time window for AA transactions.
+///
+/// Ported from Tempo writer: handler.rs:1755-1782 `validate_time_window`.
+/// - `valid_after`: block_timestamp must be >= valid_after
+/// - `valid_before`: block_timestamp must be < valid_before
+#[inline]
+fn validate_time_window<E: core::fmt::Debug>(
+    valid_after: Option<u64>,
+    valid_before: Option<u64>,
+    block_timestamp: u64,
+) -> Result<(), EVMError<E>> {
+    if let Some(after) = valid_after {
+        if block_timestamp < after {
+            return Err(EVMError::Custom(format!(
+                "transaction not yet valid: block_timestamp ({}) < valid_after ({})",
+                block_timestamp, after
+            )));
+        }
+    }
+    if let Some(before) = valid_before {
+        if block_timestamp >= before {
+            return Err(EVMError::Custom(format!(
+                "transaction expired: block_timestamp ({}) >= valid_before ({})",
+                block_timestamp, before
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Warms the caller's TIP-20 fee token balance slot in the journal.
 ///
@@ -334,6 +485,45 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         .sload(fee_token, balance_slot.into())?;
 
     Ok(())
+}
+
+/// Sets `tx_origin` in AccountKeychain transient storage (slot 3).
+///
+/// Writer does this for every transaction in `validate_against_state_and_deduct_caller`
+/// (handler.rs:677-683). Precompiles read `tx_origin` via `tload` to enforce spending
+/// limits: `authorize_transfer`, `authorize_approve`, and `refund_spending_limit` all
+/// skip enforcement when `account != tx_origin`. Without this, `tx_origin` stays
+/// `Address::ZERO` and spending limits are never applied.
+#[inline]
+fn set_keychain_tx_origin<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
+    use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+    use revm::context_interface::JournalTr;
+
+    let caller = evm.ctx().tx.base.caller;
+    // tx_origin = Slot::new(U256::from(3), ACCOUNT_KEYCHAIN_ADDRESS)
+    // tstore is infallible on the journal (no DB access needed).
+    evm.ctx_mut()
+        .journal_mut()
+        .tstore(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3), caller.into_word().into());
+}
+
+/// Sets `transaction_key` in AccountKeychain transient storage (slot 2).
+///
+/// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:1128-1133)
+/// when the transaction uses a Keychain signature. TIP20 `authorize_transfer` and
+/// `authorize_approve` check `transaction_key`: when it's non-zero, spending limits
+/// for that access key are enforced.
+#[inline]
+fn set_keychain_transaction_key<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+    key_id: revm::primitives::Address,
+) {
+    use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+    use revm::context_interface::JournalTr;
+
+    evm.ctx_mut()
+        .journal_mut()
+        .tstore(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2), key_id.into_word().into());
 }
 
 /// Executes a batch of AA calls atomically.
@@ -655,7 +845,12 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
         auth_list.len() as u64 * gas_params.tx_eip7702_per_empty_account_cost();
 
     for auth in auth_list {
-        gas.initial_gas += primitive_sig_gas(auth.sig_type, 0);
+        let auth_sig_gas = primitive_sig_gas(auth.sig_type, 0);
+        gas.initial_gas += if auth.is_keychain {
+            auth_sig_gas + KEYCHAIN_VALIDATION_GAS
+        } else {
+            auth_sig_gas
+        };
         // TIP-1000: auth with nonce==0 incurs 250k account creation cost.
         if auth.nonce == 0 {
             gas.initial_gas += gas_params.get(TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID);
@@ -820,4 +1015,288 @@ where
     DB: Database + DatabaseCommit,
     INSP: Inspector<TempoContext<DB>>,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::api::TempoEvm;
+    use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+    use alloy_evm::EvmEnv;
+    use leafage_evm_types::MainnetSpecId;
+    use revm::context::{BlockEnv, CfgEnv};
+    use revm::database::EmptyDB;
+    use revm::inspector::NoOpInspector;
+    use revm::primitives::Address;
+
+    fn make_evm() -> TempoEvm<EmptyDB, NoOpInspector> {
+        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        cfg.chain_id = 4217;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64); // Post-T1A
+        block_env.gas_limit = 100_000_000;
+        let env = EvmEnv::new(cfg, block_env);
+        TempoEvm::new(env, EmptyDB::default(), NoOpInspector, false)
+    }
+
+    #[test]
+    fn test_set_keychain_tx_origin_writes_caller_to_transient_storage() {
+        let caller = Address::with_last_byte(0xAA);
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.base.caller = caller;
+
+        // Before: slot 3 should be zero (transient storage default)
+        let before = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3));
+        assert_eq!(before, U256::ZERO, "tx_origin should be zero before set");
+
+        // Act
+        set_keychain_tx_origin(&mut evm);
+
+        // After: slot 3 should contain the caller address
+        let after = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3));
+        let expected: U256 = caller.into_word().into();
+        assert_eq!(after, expected, "tx_origin should equal caller after set");
+    }
+
+    #[test]
+    fn test_set_keychain_tx_origin_zero_caller() {
+        let mut evm = make_evm();
+        // caller defaults to Address::ZERO
+        assert_eq!(evm.inner.ctx.tx.base.caller, Address::ZERO);
+
+        set_keychain_tx_origin(&mut evm);
+
+        // tstore with zero value removes the entry, tload returns zero
+        let after = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3));
+        assert_eq!(after, U256::ZERO, "zero caller should result in zero tx_origin");
+    }
+
+    // ==================== set_transaction_key tests ====================
+
+    #[test]
+    fn test_set_keychain_transaction_key_writes_to_slot_2() {
+        let key_id = Address::with_last_byte(0xBB);
+        let mut evm = make_evm();
+
+        let before = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2));
+        assert_eq!(before, U256::ZERO, "transaction_key should be zero before set");
+
+        set_keychain_transaction_key(&mut evm, key_id);
+
+        let after = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2));
+        let expected: U256 = key_id.into_word().into();
+        assert_eq!(after, expected, "transaction_key should equal key_id after set");
+    }
+
+    #[test]
+    fn test_set_keychain_transaction_key_not_set_without_key_id() {
+        let mut evm = make_evm();
+        // No key_id → set_keychain_transaction_key not called
+        // Verify slot 2 stays zero
+        let val = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2));
+        assert_eq!(val, U256::ZERO, "transaction_key should be zero when key_id absent");
+    }
+
+    // ==================== validate_time_window tests ====================
+
+    #[test]
+    fn test_validate_time_window_rejects_early() {
+        let result = validate_time_window::<std::convert::Infallible>(
+            Some(2000), // valid_after = 2000
+            None,
+            1000, // block_ts = 1000 < 2000
+        );
+        assert!(result.is_err(), "should reject: block_ts < valid_after");
+    }
+
+    #[test]
+    fn test_validate_time_window_rejects_expired() {
+        let result = validate_time_window::<std::convert::Infallible>(
+            None,
+            Some(1000), // valid_before = 1000
+            1000,       // block_ts = 1000 >= 1000
+        );
+        assert!(result.is_err(), "should reject: block_ts >= valid_before");
+    }
+
+    #[test]
+    fn test_validate_time_window_passes_in_range() {
+        let result = validate_time_window::<std::convert::Infallible>(
+            Some(1000), // valid_after = 1000
+            Some(2000), // valid_before = 2000
+            1500,       // block_ts = 1500 (in range)
+        );
+        assert!(result.is_ok(), "should pass: valid_after <= block_ts < valid_before");
+    }
+
+    #[test]
+    fn test_validate_time_window_none_skips() {
+        let result = validate_time_window::<std::convert::Infallible>(None, None, 999999);
+        assert!(result.is_ok(), "should pass when both are None");
+    }
+
+    // ==================== per-auth keychain gas test ====================
+
+    #[test]
+    fn test_aa_gas_per_auth_keychain_adds_3000() {
+        use crate::tempo::tx::{TempoAuthGas, TempoCall, TempoSigType, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind};
+
+        let fields_no_keychain = TempoTxFields {
+            aa_calls: vec![TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }],
+            auth_list: vec![TempoAuthGas {
+                sig_type: TempoSigType::Secp256k1,
+                nonce: 1,
+                is_keychain: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let fields_keychain = TempoTxFields {
+            aa_calls: vec![TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }],
+            auth_list: vec![TempoAuthGas {
+                sig_type: TempoSigType::Secp256k1,
+                nonce: 1,
+                is_keychain: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.base.gas_limit = 10_000_000;
+        let gas_params = &evm.inner.ctx.cfg.gas_params;
+        let hardfork = crate::tempo::hardfork::TempoHardfork::from_timestamp(1_770_908_500);
+
+        evm.inner.ctx.tx.tempo_fields = Some(fields_no_keychain.clone());
+        let gas_no_kc = calculate_aa_batch_intrinsic_gas(
+            evm.ctx().tx.tempo_fields.as_ref().unwrap(),
+            gas_params,
+            &evm,
+            hardfork,
+        )
+        .unwrap();
+
+        evm.inner.ctx.tx.tempo_fields = Some(fields_keychain.clone());
+        let gas_kc = calculate_aa_batch_intrinsic_gas(
+            evm.ctx().tx.tempo_fields.as_ref().unwrap(),
+            gas_params,
+            &evm,
+            hardfork,
+        )
+        .unwrap();
+
+        assert_eq!(
+            gas_kc.initial_gas - gas_no_kc.initial_gas,
+            KEYCHAIN_VALIDATION_GAS,
+            "keychain auth should add exactly {} gas",
+            KEYCHAIN_VALIDATION_GAS
+        );
+    }
+
+    // ==================== apply_eip7702_auth_list test ====================
+
+    #[test]
+    fn test_apply_eip7702_auth_list_sets_delegation_code() {
+        use crate::tempo::tx::{TempoAuthGas, TempoTxFields};
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::Address;
+        use revm::state::AccountInfo;
+
+        let authority = Address::with_last_byte(0xAA);
+        let delegate = Address::with_last_byte(0xDD);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        // Authority must exist with nonce=0 (matching auth nonce).
+        db.insert_account_info(authority, AccountInfo { nonce: 0, ..Default::default() });
+
+        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        cfg.chain_id = 4217;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64);
+        block_env.gas_limit = 100_000_000;
+        let env = EvmEnv::new(cfg, block_env);
+        let mut evm = TempoEvm::new(env, db, NoOpInspector, false);
+
+        evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+            auth_list: vec![TempoAuthGas {
+                nonce: 0,
+                authority: Some(authority),
+                delegate: Some(delegate),
+                chain_id: Some(U256::from(4217)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let handler = TempoHandler::<_, NoOpInspector>::new();
+        let refund = handler.apply_eip7702_auth_list(&mut evm).unwrap();
+
+        // T1+ → no refund
+        assert_eq!(refund, 0, "T1+ should return 0 refund");
+
+        // Verify authority's code is set to EIP-7702 delegation.
+        use revm::context_interface::JournalTr;
+        let acc = evm.inner.ctx.journal_mut().load_account(authority).unwrap();
+        let code = acc.data.info.code.as_ref().expect("authority should have code");
+        assert!(
+            code.is_eip7702(),
+            "authority's code should be EIP-7702 delegation, got: {:?}",
+            code
+        );
+    }
+
+    #[test]
+    fn test_apply_eip7702_auth_list_skips_gas_only_entries() {
+        use crate::tempo::tx::{TempoAuthGas, TempoTxFields};
+
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+            auth_list: vec![TempoAuthGas {
+                nonce: 1,
+                is_keychain: false,
+                // No authority/delegate → gas-only entry
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let handler = TempoHandler::<_, NoOpInspector>::new();
+        // Should not panic and should delegate to MainnetHandler (which returns 0 for non-0x04)
+        let result = handler.apply_eip7702_auth_list(&mut evm);
+        assert!(result.is_ok());
+    }
 }

@@ -793,4 +793,110 @@ mod tests {
             "precompile gas: used() should equal spent_sub_refunded() (no refund propagation)"
         );
     }
+
+    /// Verify `is_transfer_authorized` T2 short-circuit behavior.
+    ///
+    /// Setup: TIP20 with WHITELIST policy, sender NOT in whitelist (denied).
+    /// - Pre-T2 (T1C): both sender and recipient `is_authorized_as` run.
+    /// - Post-T2: sender fails → short-circuit, recipient check skipped.
+    ///
+    /// Gas should differ: post-T2 saves ~one policy_data sload + one policy_set sload.
+    /// NOTE: Currently T2=u64::MAX (not activated). When T2 timestamp is set,
+    /// update MAINNET_T2_TIME and this test becomes a live regression test.
+    #[test]
+    fn test_is_transfer_authorized_t2_short_circuit() {
+        use crate::tempo::hardfork::TempoHardfork;
+        use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+        use crate::tempo::precompile::tip20::TIP20Token;
+        use crate::tempo::precompile::TIP403_REGISTRY_ADDRESS;
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::{keccak256, Address, U256};
+
+        let tip20_addr = Address::new({
+            let mut a = [0u8; 20];
+            a[0] = 0x20;
+            a[1] = 0xc0;
+            a
+        });
+        let sender = Address::with_last_byte(0xAA);
+        let recipient = Address::with_last_byte(0xBB);
+
+        let mut db = CacheDB::new(revm::database::EmptyDB::default());
+
+        // TIP20 must have code (initialized)
+        db.insert_account_info(
+            tip20_addr,
+            revm::state::AccountInfo {
+                code_hash: revm::bytecode::Bytecode::new_legacy(vec![0xef].into()).hash_slow(),
+                code: Some(revm::bytecode::Bytecode::new_legacy(vec![0xef].into())),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        // Slot 7: transfer_policy_id = 2 (custom policy, not builtin) packed at byte offset 20.
+        let policy_id: u64 = 2;
+        let slot7_value = U256::from(policy_id) << 160;
+        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value).unwrap();
+
+        // TIP403Registry must have code (initialized)
+        db.insert_account_info(
+            TIP403_REGISTRY_ADDRESS,
+            revm::state::AccountInfo {
+                code_hash: revm::bytecode::Bytecode::new_legacy(vec![0xef].into()).hash_slow(),
+                code: Some(revm::bytecode::Bytecode::new_legacy(vec![0xef].into())),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        // policy_id_counter (slot 0) = 3 (policies 0,1,2 exist)
+        db.insert_account_storage(TIP403_REGISTRY_ADDRESS, U256::from(0), U256::from(3)).unwrap();
+
+        // policy_records[2].base = PolicyData { policy_type: WHITELIST(0), admin: 0x01 }
+        // Slot: keccak256(abi.encode(2, 1))
+        let policy_record_slot = U256::from(policy_id).mapping_slot(U256::from(1));
+        // Packed: byte 31 = policy_type (0 = WHITELIST), bytes 11..31 = admin
+        let mut policy_data_bytes = [0u8; 32];
+        policy_data_bytes[31] = 0; // WHITELIST
+        policy_data_bytes[30] = 0x01; // admin = Address::with_last_byte(0x01)
+        db.insert_account_storage(
+            TIP403_REGISTRY_ADDRESS,
+            policy_record_slot,
+            U256::from_be_bytes(policy_data_bytes),
+        ).unwrap();
+
+        // policy_set[2][sender] = false (NOT whitelisted → denied)
+        // Slot: keccak256(abi.encode(sender, keccak256(abi.encode(2, 2))))
+        let policy_set_outer = U256::from(policy_id).mapping_slot(U256::from(2));
+        let policy_set_sender = sender.mapping_slot(policy_set_outer);
+        // Don't insert → default 0 = false = not in whitelist
+
+        // policy_set[2][recipient] = true (whitelisted → authorized)
+        let policy_set_recipient = recipient.mapping_slot(policy_set_outer);
+        db.insert_account_storage(
+            TIP403_REGISTRY_ADDRESS,
+            policy_set_recipient,
+            U256::from(1),
+        ).unwrap();
+
+        // --- Pre-T2 (T1C): both sender and recipient checks run ---
+        let result_pre_t2 = with_read_only_storage_ctx(&db, TempoHardfork::T1C, 4217, || {
+            TIP20Token::from_address_unchecked(tip20_addr)
+                .is_transfer_authorized(sender, recipient)
+        });
+        assert_eq!(result_pre_t2.unwrap(), false, "pre-T2: sender denied → false");
+
+        // --- Post-T2: sender fails → short-circuit, recipient not checked ---
+        let result_t2 = with_read_only_storage_ctx(&db, TempoHardfork::T2, 4217, || {
+            TIP20Token::from_address_unchecked(tip20_addr)
+                .is_transfer_authorized(sender, recipient)
+        });
+        assert_eq!(result_t2.unwrap(), false, "T2: sender denied → short-circuit → false");
+
+        // Both return false, but gas differs:
+        // Pre-T2: reads policy_data + policy_set[sender] + policy_data + policy_set[recipient]
+        // Post-T2: reads policy_data + policy_set[sender] only (short-circuit)
+    }
 }

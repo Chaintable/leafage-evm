@@ -42,13 +42,24 @@ pub struct TempoKeyAuthGas {
     pub num_limits: u32,
 }
 
-/// Per-authorization gas info (lightweight).
+/// Per-authorization gas info with optional EIP-7702 delegation data.
 #[derive(Clone, Debug, Default)]
 pub struct TempoAuthGas {
     /// Signature type of this authorization.
     pub sig_type: TempoSigType,
     /// Nonce (0 incurs TIP-1000 account creation cost).
     pub nonce: u64,
+    /// Whether this authorization uses a Keychain signature (+3000 gas).
+    pub is_keychain: bool,
+
+    // --- EIP-7702 delegation (optional) ---
+
+    /// Authority address (the EOA whose code gets delegated).
+    pub authority: Option<Address>,
+    /// Delegate address (the contract to set as delegation target).
+    pub delegate: Option<Address>,
+    /// Chain ID for the authorization.
+    pub chain_id: Option<U256>,
 }
 
 /// Extended fields for Tempo transactions (type 0x76).
@@ -71,6 +82,21 @@ pub struct TempoTxFields {
     pub key_auth: Option<TempoKeyAuthGas>,
     /// Tempo authorization list entries for gas calculation.
     pub auth_list: Vec<TempoAuthGas>,
+
+    // --- Transaction-level fields ---
+
+    /// Access key ID for keychain transactions. When present, sets transaction_key
+    /// in AccountKeychain transient storage (slot 2) for spending limit enforcement.
+    pub key_id: Option<Address>,
+    /// Fee token override. When present, used instead of stored fee token preference
+    /// for estimateGas gas cap calculation.
+    pub fee_token: Option<Address>,
+    /// Fee payer (sponsor) address. When present, sponsor's balance determines gas cap.
+    pub fee_payer: Option<Address>,
+    /// Earliest valid timestamp (seconds). Rejects if block_timestamp < valid_after.
+    pub valid_after: Option<u64>,
+    /// Latest valid timestamp (seconds). Rejects if block_timestamp >= valid_before.
+    pub valid_before: Option<u64>,
 }
 
 /// Tempo transaction environment wrapping the standard [`TxEnv`].

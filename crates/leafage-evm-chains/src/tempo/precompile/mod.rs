@@ -334,12 +334,23 @@ const TEMPO_GAS_PRICE_SCALING_FACTOR: alloy::primitives::U256 =
 ///
 /// Returns `fee_token_balance * SCALING_FACTOR / gas_price`.
 /// Returns `None` if gas_price is 0 or on any storage read error.
+/// Computes the maximum gas the caller can afford, based on TIP-20 fee token balance.
+///
+/// Ported from Tempo writer: `crates/node/src/rpc/mod.rs::caller_gas_allowance`.
+///
+/// # Arguments
+/// - `payer` -- address whose balance determines the gas cap (caller or sponsor)
+/// - `fee_token_override` -- explicit fee token; skips FeeManager lookup when Some
+///
+/// Returns `fee_token_balance * SCALING_FACTOR / gas_price`.
+/// Returns `None` if gas_price is 0 or on any storage read error.
 pub fn tempo_caller_gas_allowance<DB: revm::DatabaseRef>(
     db: &DB,
-    caller: alloy::primitives::Address,
+    payer: alloy::primitives::Address,
     gas_price: u128,
     timestamp: u64,
     chain_id: u64,
+    fee_token_override: Option<alloy::primitives::Address>,
 ) -> Option<u64>
 where
     DB::Error: core::fmt::Debug,
@@ -352,29 +363,29 @@ where
 
     let spec = TempoHardfork::from_timestamp(timestamp);
 
-    // Simplified fee token resolution:
-    // 1. Read user_tokens[caller] from FeeManager
-    // 2. If zero, fallback to DEFAULT_FEE_TOKEN (PATH_USD)
-    //
-    // Writer has 5-tier priority (tx.fee_token → setUserToken decode → user_tokens →
-    // TIP20 inference → DEX inference → default). For estimateGas without tx context,
-    // reading stored preference + default covers the common case.
-    let fee_token = storage::with_read_only_storage_ctx(db, spec, chain_id, || {
-        let user_token = fee_manager::TipFeeManager::new()
-            .user_tokens[caller]
-            .read()
-            .ok()?;
-        if user_token.is_zero() {
-            Some(DEFAULT_FEE_TOKEN)
-        } else {
-            Some(user_token)
-        }
-    })?;
+    // Fee token resolution:
+    // If fee_token_override is provided (from tx.fee_token), use it directly.
+    // Otherwise, read stored preference from FeeManager, fallback to DEFAULT_FEE_TOKEN.
+    let fee_token = if let Some(override_token) = fee_token_override {
+        override_token
+    } else {
+        storage::with_read_only_storage_ctx(db, spec, chain_id, || {
+            let user_token = fee_manager::TipFeeManager::new()
+                .user_tokens[payer]
+                .read()
+                .ok()?;
+            if user_token.is_zero() {
+                Some(DEFAULT_FEE_TOKEN)
+            } else {
+                Some(user_token)
+            }
+        })?
+    };
 
-    // Read TIP-20 balance of fee token for caller.
+    // Read TIP-20 balance of fee token for payer.
     let balance = storage::with_read_only_storage_ctx(db, spec, chain_id, || {
         tip20::TIP20Token::from_address_unchecked(fee_token)
-            .balances[caller]
+            .balances[payer]
             .read()
             .ok()
     })?;
