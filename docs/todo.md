@@ -90,31 +90,32 @@
 ### P2 — 按需
 
 - [x] ~~**预编译内部 gas 动态化**~~ — 已实现：`LeafageStorageProvider` 新增 `sstore_set_cost()` 和 `code_deposit_cost_per_byte()` 方法，根据 `self.spec.is_t1()` 返回 TIP-1000 值或标准 Ethereum 值。sstore、set_code、sstore_refund 三处改为动态调用。pre-T1A trace 内部 gasUsed 现在与 writer 一致
-- [x] ~~**TempoTxEnv AA 扩展字段（gas 相关）**~~ — 已实现 gas 相关字段：`sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`。剩余非 gas 字段（`is_system_tx`, `fee_token`, `valid_after`, `valid_before`, `subblock_metadata`）读节点不需要
+- [x] ~~**TempoTxEnv AA 扩展字段**~~ — 已实现全部字段：gas 字段（`sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`）+ tx 字段（`key_id`/`fee_token`/`fee_payer`/`valid_after`/`valid_before`）。`is_system_tx`/`subblock_metadata` 读节点不需要
 - ~~**ValidatorConfigV2 pre-execution code 注入**~~ — **无需实现**。Writer 在 block execution 的 `apply_pre_execution_changes` 注入 `0xef` bytecode（T2 激活时），产生 state_diff → leafage 通过 pipeline 自动同步。且 T2 尚未激活（`MAINNET_T2_TIME = u64::MAX`）
 - [x] ~~**TempoBlockEnv timestamp_millis_part**~~ — 已实现：`TempoBlockEnv` 替代 `BlockEnv` 作为 `TempoContext` 的 block 类型，`MILLIS_TIMESTAMP` (0x4F) opcode 在 pre-T1C 注册到指令表。`timestamp_millis_part` 默认 0（pipeline 不携带此字段），archive 模式 pre-T1C eth_call 的 0x4F 返回 `timestamp * 1000`
 - ~~Fee log 生成~~ — **实测确认**：Tempo writer 的 eth_call / pre_traceMany 无论 gas_price 是否为 0 都不产生 fee log（`disable_base_fee=true` 使 fee handler 始终短路）。leafage 行为一致，无差异
 - [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
 - ~~cargo feature gate `tempo`~~ — 不做，其他链（BSC/Cosmos/Mantle）也没有 feature gate，保持一致
 - ~~**预编译 SSTORE gas refund 未传播到 ResultGas**~~ — 已修复：两层问题。(1) `sstore_refund()` clean slot (original==present) 非零→零缺少 refund 计算，补上 SSTORE_CLEARS_SCHEDULE (4800)。(2) alloy-evm 的 `PrecompilesMap::run()` 不调 `record_refund()`（标准预编译无 refund），通过 `TempoPrecompiles` wrapper + thread-local 补上传播
-- **AA apply_eip7702_auth_list 未 override** — Writer 对 AA tx (0x76) override `apply_eip7702_auth_list`，将 `tempo_authorization_list` 的 EIP-7702 delegation 应用到 journaled state。Writer 的 eth_call/estimateGas 确实执行此 override（pre_execution 阶段），RPC 传完整 `TempoSignedAuthorization`。Leafage 需要：(1) 扩展 `TempoAuthGasInfo` 加 chain_id/address/y_parity/r/s 字段 (2) 解析为 `RecoveredAuthorization` 放入 `TxEnv.authorization_list` (3) override `apply_eip7702_auth_list` 对 AA tx apply。影响：未上链的新 delegation 在 eth_call 中不生效
-- **AA per-auth keychain gas 缺 3000** — `calculate_aa_batch_intrinsic_gas` 的 per-auth 循环 (exec.rs:636) 只调 `primitive_sig_gas(auth.sig_type)`，缺少 keychain 包装的 KEYCHAIN_VALIDATION_GAS (3000)。需在 `TempoAuthGasInfo` 和 `TempoAuthGas` 加 `is_keychain: bool`，per-auth 循环判断加 3000。实际影响低（RPC 调用方未发送 keychain auth）
+- [x] ~~**AA apply_eip7702_auth_list override**~~ — 已实现：`TempoHandler::apply_eip7702_auth_list` override，从 `aaAuthorizationList` 的 `authority`+`address` 字段构建 `TempoAuthDelegation`（实现 `AuthorizationTr`），调用 `revm::handler::pre_execution::apply_auth_list` 应用 delegation。RPC 调用方直接提供 authority 地址（不需要签名恢复）。T1+ 无 refund
+- [x] ~~**AA per-auth keychain gas +3000**~~ — 已修复：`TempoAuthGas` 加 `is_keychain: bool`，per-auth 循环判断加 `KEYCHAIN_VALIDATION_GAS` (3000)。同时 `TempoAuthGasInfo` RPC 类型加 `is_keychain` 字段
 
 ### Writer-Leafage Handler 差异总览
 
-已分析 Tempo writer Handler 12 个 override 方法 vs leafage 2 个 override:
+Tempo writer Handler 12 个 override 方法 vs leafage 7 个 override:
 
 | Writer 方法 | Leafage | 状态 |
 |---|---|---|
-| validate_initial_tx_gas (标准 tx) | 已实现 | P0 已修 (nonce==0 +250k) |
-| validate_initial_tx_gas (AA tx) | 已实现 | 完成（eth_call 模式，signature/key_auth 默认） |
-| execution (batch dispatch) | 已实现 | 完成 |
-| validate_env (value!=0 + AA 校验) | 已实现 | 完成（value 拒绝 + calls 结构校验） |
+| validate_env (value!=0 + AA 校验) | 已实现 | 完成（value 拒绝 + calls 结构 + time window） |
+| validate_initial_tx_gas (标准 tx) | 已实现 | 完成 (nonce==0 +250k, GasParams) |
+| validate_initial_tx_gas (AA tx) | 已实现 | 完成（per-auth keychain +3000, key_auth, 2D nonce） |
+| pre_execution (warm-up + keychain) | 已实现 | 完成（warm fee token + set_tx_origin + set_transaction_key） |
+| apply_eip7702_auth_list | 已实现 | 完成（TempoAuthDelegation, authority+address 直接提供） |
+| execution (batch dispatch) | 已实现 | 完成（execute_multi_call, checkpoint/revert） |
 | inspect_execution (AA tracing) | 已实现 | 完成（inspect_run_exec_loop per sub-call） |
 | run (fee loading) | 不需要 | 读节点不需要 fee 系统 |
 | execution_result (TempoHaltReason) | 不需要 | Leafage 无 evm.initial_gas 字段 |
-| apply_eip7702_auth_list | 不需要 | AA EIP-7702 auth 低优先 |
-| validate_against_state_and_deduct_caller | 不需要 | 读节点不需要 fee/nonce 扣减 |
+| validate_against_state_and_deduct_caller | 不需要 | 读节点不需要 fee/nonce 扣减（关键逻辑已移至 pre_execution） |
 | reimburse_caller | 不需要 | 读节点不需要 fee 退还 |
 | reward_beneficiary | 不需要 | 读节点不需要矿工奖励 |
 | catch_error | 不需要 | subblock fee 路径不可达 |
