@@ -12,13 +12,15 @@ use std::ops::{Deref, DerefMut};
 /// `tempo_authorization_list`) mirror Tempo writer's `TempoTransactionRequest`
 /// to ensure gas calculation parity for AA transactions.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CallRequest {
     #[serde(flatten)]
     pub inner: TransactionRequest,
 
     /// Tempo batch calls for AA tx (type 0x76).
     /// Each call in the batch is executed atomically.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Writer field name: `calls` (camelCase identity).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "calls")]
     pub tempo_calls: Option<Vec<TransactionRequest>>,
 
     /// Tempo 2D nonce key. When non-zero, nonce is read from NonceManager precompile.
@@ -87,6 +89,7 @@ pub struct CallRequest {
 /// Full `SignedKeyAuthorization` has complex nested types; this captures
 /// only the fields that affect gas: the signature type and limits count.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TempoKeyAuthGasInfo {
     /// Signature type on the key authorization ("secp256k1", "p256", "webauthn").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +107,7 @@ pub struct TempoKeyAuthGasInfo {
 /// Optional delegation fields (`authority`, `address`, `chain_id`) enable EIP-7702
 /// code delegation in eth_call when provided.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TempoAuthGasInfo {
     /// Signature type ("secp256k1", "p256", "webauthn").
     #[serde(default, skip_serializing_if = "Option::is_none")]

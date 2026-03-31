@@ -99,6 +99,7 @@
 - ~~**预编译 SSTORE gas refund 未传播到 ResultGas**~~ — 已修复：两层问题。(1) `sstore_refund()` clean slot (original==present) 非零→零缺少 refund 计算，补上 SSTORE_CLEARS_SCHEDULE (4800)。(2) alloy-evm 的 `PrecompilesMap::run()` 不调 `record_refund()`（标准预编译无 refund），通过 `TempoPrecompiles` wrapper + thread-local 补上传播
 - [x] ~~**AA apply_eip7702_auth_list override**~~ — 已实现：`TempoHandler::apply_eip7702_auth_list` override，从 `aaAuthorizationList` 的 `authority`+`address` 字段构建 `TempoAuthDelegation`（实现 `AuthorizationTr`），调用 `revm::handler::pre_execution::apply_auth_list` 应用 delegation。RPC 调用方直接提供 authority 地址（不需要签名恢复）。T1+ 无 refund
 - [x] ~~**AA per-auth keychain gas +3000**~~ — 已修复：`TempoAuthGas` 加 `is_keychain: bool`，per-auth 循环判断加 `KEYCHAIN_VALIDATION_GAS` (3000)。同时 `TempoAuthGasInfo` RPC 类型加 `is_keychain` 字段
+- **feePayerSignature 签名恢复** — Writer 接受 `feePayerSignature: Signature`，通过 `TempoTransaction.recover_fee_payer(sender)` (RLP 编码 + ecrecover) 恢复 sponsor 地址。Leafage 用 `feePayer: Address` 直接提供地址（无 TempoTransaction RLP 依赖）。如需完全兼容 writer RPC 格式，需引入 tempo_primitives 的 RLP 编码逻辑做签名恢复
 
 ### Writer-Leafage Handler 差异总览
 
