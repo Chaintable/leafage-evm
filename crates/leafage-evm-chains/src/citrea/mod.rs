@@ -2,7 +2,6 @@ mod api;
 mod config;
 mod handler;
 mod hardforks;
-pub mod l1_fee;
 mod precompile;
 
 pub use api::{CitreaContext, CitreaEvm};

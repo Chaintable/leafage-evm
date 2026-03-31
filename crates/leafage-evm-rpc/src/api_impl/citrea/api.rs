@@ -2,7 +2,6 @@ use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::citrea::l1_fee::{BROTLI_COMPRESSION_PERCENTAGE, L1_FEE_OVERHEAD};
 use leafage_evm_chains::citrea::{CitreaEvm, CitreaEvmConfig, CitreaHardfork};
 use leafage_evm_types::{BlockEnv, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
@@ -73,46 +72,6 @@ where
         let mut evm = CitreaEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
         evm.inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)))
-    }
-
-    fn estimate_l1_overhead<StateDB>(
-        &self,
-        block_env: &BlockEnv,
-        state: StateDB,
-        tx: Self::Tx,
-    ) -> u64
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        let l1_fee_rate = self
-            .evm_cfg
-            .custom_cfg
-            .as_ref()
-            .map(|cfg| cfg.l1_fee_rate)
-            .unwrap_or(0);
-        if l1_fee_rate == 0 {
-            return 0;
-        }
-        let base_fee = block_env.basefee;
-        if base_fee == 0 {
-            return 0;
-        }
-
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
-        let wrap_database_ref = WrapDatabaseRef(state);
-        let mut evm = CitreaEvm::new(evm_env, wrap_database_ref, NoOpInspector {}, false);
-
-        let diff_size = match evm.transact_with_diff_size(tx) {
-            Ok((_, diff_size)) => diff_size,
-            Err(_) => return 0,
-        };
-
-        let compressed =
-            (diff_size * BROTLI_COMPRESSION_PERCENTAGE / 100 + L1_FEE_OVERHEAD) as u128;
-        let l1_fee = l1_fee_rate * compressed;
-        let base_fee_u128 = base_fee as u128;
-        ((l1_fee + base_fee_u128 - 1) / base_fee_u128) as u64
     }
 }
 

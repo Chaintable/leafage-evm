@@ -1,12 +1,9 @@
 use crate::citrea::api::{CitreaContext, CitreaEvm};
 use crate::citrea::handler::CitreaHandler;
-use crate::citrea::l1_fee::calc_diff_size;
 use alloy_evm::Database;
-use revm::context::journal::inner::JournalInner;
 use revm::context::{ContextSetters, TxEnv};
 use revm::handler::Handler;
 use revm::inspector::InspectorHandler;
-use revm::JournalEntry;
 use revm::{
     context::BlockEnv,
     context_interface::{
@@ -55,30 +52,6 @@ where
 {
     fn commit(&mut self, state: Self::State) {
         self.inner.ctx.db_mut().commit(state);
-    }
-}
-
-impl<DB, INSP> CitreaEvm<DB, INSP>
-where
-    DB: Database,
-{
-    /// Run a transaction and return `(ExecutionResult, diff_size)`.
-    ///
-    /// `diff_size` is computed from the journal *before* finalization and
-    /// represents the estimated L1 state-diff size in bytes.
-    pub fn transact_with_diff_size(
-        &mut self,
-        tx: TxEnv,
-    ) -> Result<(ExecutionResult, usize), EVMError<DB::Error>> {
-        self.inner.ctx.set_tx(tx);
-        let result = CitreaHandler::default().run(self)?;
-
-        let caller = self.inner.ctx.tx.caller;
-        let journal_inner: &JournalInner<JournalEntry> = &self.inner.ctx.journaled_state;
-        let diff_size = calc_diff_size(journal_inner, &caller);
-
-        let _ = self.finalize();
-        Ok((result, diff_size))
     }
 }
 
