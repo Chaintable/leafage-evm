@@ -682,7 +682,6 @@ where
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
-        eprintln!("[TEMPO DEBUG] estimate_gas_inner block_num={} block_ts={}", block.header.number, block_env.timestamp);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
@@ -897,7 +896,6 @@ where
             highest_gas_limit
         };
 
-        eprintln!("[TEMPO DEBUG] estimate_gas: final_gas={} highest={} buffer={}", final_gas, highest_gas_limit, buffer);
         Ok(U256::from(final_gas))
     }
 

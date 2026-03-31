@@ -166,15 +166,10 @@ where
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        eprintln!("[TEMPO DEBUG] TempoApiImpl::transact block_ts={}", block_env.timestamp);
         let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
         let wrap_database_ref = WrapDatabaseRef(state);
         let mut evm = TempoEvm::new(evm_env, wrap_database_ref, NoOpInspector {}, false);
-        let result = evm.transact(tx).map(|res| {
-            eprintln!("[TEMPO DEBUG] transact gas_used={}", res.result.gas_used());
-            res.result.into()
-        });
-        result
+        evm.transact(tx).map(|res| res.result.into())
     }
 
     fn inspect_tx_commit<StateDB, R, F>(
