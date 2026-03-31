@@ -159,7 +159,15 @@ where
             acc.mark_created();
             Some(state)
         }
-        (None, Some(state)) => Some(state),
+        (None, Some(state)) => {
+            // revm 36: empty+touched accounts are cleared by EIP-161 on commit.
+            // Mark as Created so State::commit() preserves the stateDiff storage
+            // instead of discarding it via touch_empty_eip161().
+            if acc.info.is_empty() && !state.is_empty() {
+                acc.mark_created();
+            }
+            Some(state)
+        }
     };
 
     if let Some(state) = storage_diff {
