@@ -109,6 +109,7 @@ num-bigint = "0.4"
 elliptic-curve = "0.13"
 sha2 = "0.10"
 bech32 = "0.11"
+k256 = { version = "0.13", features = ["schnorr"] }
 
 pprof = { version = "0.11", features = ["flamegraph"] }
 
