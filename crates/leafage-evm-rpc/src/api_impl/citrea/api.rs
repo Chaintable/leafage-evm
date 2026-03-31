@@ -1,8 +1,9 @@
+use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::citrea::{CitreaEvm, CitreaEvmConfig, CitreaHardfork};
+use leafage_evm_chains::citrea::{CitreaEvm, CitreaHardfork};
 use leafage_evm_types::{BlockEnv, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context::TxEnv;
@@ -12,7 +13,7 @@ use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
-type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, CitreaEvmConfig>;
+type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, NoneEvmCustomConfig>;
 
 impl<DB> EvmExecutor for CitreaApiImpl<DB>
 where

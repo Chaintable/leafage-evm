@@ -14,7 +14,7 @@ use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
-use leafage_evm_chains::citrea::{CitreaEvmConfig, CitreaHardfork};
+use leafage_evm_chains::citrea::CitreaHardfork;
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -420,14 +420,7 @@ impl Command {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
-                let custom_evm_cfg = custom_evm_cfg
-                    .map(|str| {
-                        serde_json::from_str::<CitreaEvmConfig>(&str).map_err(|err| {
-                            anyhow!("cannot parse citrea custom evm config: {}", err)
-                        })
-                    })
-                    .transpose()?;
-                Ok(MultiChainCfgEnv::Citrea((chain_cfg, custom_evm_cfg)))
+                Ok(MultiChainCfgEnv::Citrea(chain_cfg))
             }
             _ => bail!("Unsupported evm type"),
         }
