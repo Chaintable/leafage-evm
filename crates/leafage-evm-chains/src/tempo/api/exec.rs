@@ -129,6 +129,11 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             ));
         }
 
+        // Tempo system transactions (from=0x0, gas_limit=0) skip all validation.
+        if evm.ctx().tx.base.caller.is_zero() && evm.ctx().tx.base.gas_limit == 0 {
+            return Ok(());
+        }
+
         // Standard validation (chain_id, gas limits, tx type, etc.).
         MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default().validate_env(evm)?;
 
@@ -187,6 +192,13 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .tempo_fields
             .as_ref()
             .is_some_and(|f| !f.aa_calls.is_empty());
+
+        // Tempo system transactions (from=0x0, gas_limit=0) skip intrinsic gas validation.
+        // Writer handles these in apply_pre_execution_changes with unlimited gas.
+        // Leafage may encounter them in simulateTransactions when replaying block traces.
+        if evm.ctx().tx.base.caller.is_zero() && evm.ctx().tx.base.gas_limit == 0 {
+            return Ok(InitialAndFloorGas::default());
+        }
 
         if is_aa {
             // AA transaction — use batch gas calculation.
