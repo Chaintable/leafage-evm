@@ -4,7 +4,7 @@ use revm::handler::EthPrecompiles;
 use revm::precompile::{PrecompileSpecId, Precompiles};
 
 mod bech32;
-mod p256;
+pub(crate) mod p256;
 
 pub struct CosmosPrecompiles {
     inner: EthPrecompiles,

@@ -1,4 +1,4 @@
-use leafage_evm_types::{Address};
+use leafage_evm_types::Address;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

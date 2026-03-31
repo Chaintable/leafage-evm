@@ -170,7 +170,9 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             tx_fee = tx_fee.saturating_add(data_fee);
         }
 
-        let mut system_account = ctx.journal_mut().load_account_mut_optional_code(SYSTEM_ADDRESS, false)?;
+        let mut system_account = ctx
+            .journal_mut()
+            .load_account_mut_optional_code(SYSTEM_ADDRESS, false)?;
         system_account.data.incr_balance(tx_fee);
         Ok(())
     }

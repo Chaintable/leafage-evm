@@ -25,7 +25,9 @@ pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile = Precompile::new(
 );
 
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile = Precompile::new(
-    PrecompileId::Custom(Cow::Borrowed("BSC_COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ")),
+    PrecompileId::Custom(Cow::Borrowed(
+        "BSC_COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ",
+    )),
     u64_to_address(103),
     cometbft_light_block_validation_run_before_hertz,
 );
