@@ -24,8 +24,9 @@ impl CitreaPrecompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Precompiles::new(PrecompileSpecId::BERLIN).clone();
+            precompiles.extend(revm::precompile::bls12_381::precompiles());
             precompiles.extend([
-                crate::cosmos::precompile::p256::P256_VERIFY,
+                revm::precompile::secp256r1::P256VERIFY,
                 schnorr::SCHNORR_VERIFY,
             ]);
             Box::new(precompiles)
