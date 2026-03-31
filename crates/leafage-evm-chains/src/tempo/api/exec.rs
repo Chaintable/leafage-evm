@@ -770,13 +770,13 @@ fn primitive_sig_gas(sig_type: TempoSigType, webauthn_data_size: usize) -> u64 {
     }
 }
 
-/// Returns the standard tx token cost (16 gas per token).
-/// Equivalent to `gas_params.tx_token_cost()` but as a standalone const
-/// since we don't have GasParams in the sig gas helper.
+/// Returns the standard tx token cost (4 gas per token).
+/// Matches revm's STANDARD_TOKEN_COST (context-interface/cfg/gas.rs).
+/// Note: non-zero bytes cost 16 gas each = 4 tokens * 4 gas/token.
+/// `get_tokens_in_calldata_istanbul` already converts bytes to tokens.
 #[inline]
 fn gas_params_tx_token_cost() -> u64 {
-    // Standard value from revm GasParams::tx_token_cost() for post-Istanbul.
-    16
+    4
 }
 
 /// Gas for AA transaction signature (may include Keychain overhead).
