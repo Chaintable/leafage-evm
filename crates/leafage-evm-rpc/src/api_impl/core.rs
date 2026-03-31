@@ -3,6 +3,7 @@ use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
+use leafage_evm_chains::citrea::{CitreaEvmConfig, CitreaHardfork};
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
@@ -62,9 +63,9 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
     /// Calls EIP-2935 blockhashes and EIP-4788 beacon root system contracts.
     fn apply_pre_execution_changes<StateDB>(
         &self,
-        header: impl BlockHeader,
-        block_env: &BlockEnv,
-        state: &mut StateDB,
+        _header: impl BlockHeader,
+        _block_env: &BlockEnv,
+        _state: &mut StateDB,
     ) -> RpcResult<()>
     where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
@@ -101,6 +102,19 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
+
+    fn estimate_l1_overhead<StateDB>(
+        &self,
+        _block_env: &BlockEnv,
+        _state: StateDB,
+        _tx: Self::Tx,
+    ) -> u64
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        0
+    }
 }
 
 pub(crate) trait TxSetter {
@@ -138,6 +152,7 @@ pub enum MultiChainCfgEnv {
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
+    Citrea((CfgEnv<CitreaHardfork>, Option<CitreaEvmConfig>)),
 }
 
 impl MultiChainCfgEnv {
@@ -148,6 +163,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Citrea(cfg) => cfg.0.chain_id,
         }
     }
 }
