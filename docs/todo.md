@@ -100,6 +100,8 @@
 - [x] ~~**AA apply_eip7702_auth_list override**~~ — 已实现：`TempoHandler::apply_eip7702_auth_list` override，从 `aaAuthorizationList` 的 `authority`+`address` 字段构建 `TempoAuthDelegation`（实现 `AuthorizationTr`），调用 `revm::handler::pre_execution::apply_auth_list` 应用 delegation。RPC 调用方直接提供 authority 地址（不需要签名恢复）。T1+ 无 refund
 - [x] ~~**AA per-auth keychain gas +3000**~~ — 已修复：`TempoAuthGas` 加 `is_keychain: bool`，per-auth 循环判断加 `KEYCHAIN_VALIDATION_GAS` (3000)。同时 `TempoAuthGasInfo` RPC 类型加 `is_keychain` 字段
 - **feePayerSignature 签名恢复** — Writer 接受 `feePayerSignature: Signature`，通过 `TempoTransaction.recover_fee_payer(sender)` (RLP 编码 + ecrecover) 恢复 sponsor 地址。Leafage 用 `feePayer: Address` 直接提供地址（无 TempoTransaction RLP 依赖）。如需完全兼容 writer RPC 格式，需引入 tempo_primitives 的 RLP 编码逻辑做签名恢复
+- **P1: 2D nonce (nonceKey>0) 执行 gas 缺 ~250k** — Writer 在 `validate_against_state_and_deduct_caller` 中对 2D nonce 调用 `NonceManager.get_nonce()` + `increment_nonce()` 预编译操作，消耗 ~250k gas（cold SLOAD + SSTORE on T1+）。Leafage pre_execution 没有 NonceManager 交互。此 gas 出现在 pre_traceMany/simulateTransactions 的执行结果中。测试数据：nonceKey=0x1 时 Writer=273270 vs Leafage=28270 (diff=245000)
+- **P1: webAuthn keyType gas 过高 +37k** — Leafage 对 keyType=webAuthn 的 gas 计算为 77742，Writer 为 40638 (diff=+37104)。需排查 `webauthn_data_size` 默认值和 mock data 构造逻辑是否与 writer 一致。可能是 `key_data` 未传时默认 size 计算差异
 
 ### Writer-Leafage Handler 差异总览
 
