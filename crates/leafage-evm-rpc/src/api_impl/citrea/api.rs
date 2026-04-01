@@ -1,17 +1,15 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
+use crate::api_impl::citrea::evm::create_citrea_evm_from_state;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
-use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::citrea::{CitreaEvm, CitreaHardfork};
+use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context::TxEnv;
-use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
-use std::fmt::Debug;
 
 type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, NoneEvmCustomConfig>;
 
@@ -33,7 +31,7 @@ where
         create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)
     }
 
-    fn transact<StateDB: DatabaseRef + Debug>(
+    fn transact<StateDB: DatabaseRef>(
         &self,
         block_env: &BlockEnv,
         state: StateDB,
@@ -41,17 +39,21 @@ where
     ) -> Result<
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
-    >
-    where
-        StateDB::Error: Sync + Send + 'static,
-    {
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
-        let wrap_database_ref = WrapDatabaseRef(state);
-        let mut evm = CitreaEvm::new(evm_env, wrap_database_ref, NoOpInspector {}, false);
+    > {
+        let mut evm = create_citrea_evm_from_state(
+            block_env.clone(),
+            self.evm_cfg.cfg.clone(),
+            state,
+            NoOpInspector {},
+        );
         evm.transact(tx).map(|res| res.result.into())
     }
 
-    fn inspect_tx_commit<StateDB, R, F>(
+    fn inspect_tx_commit<
+        StateDB: DatabaseRef + DatabaseCommit,
+        R,
+        F: FnOnce(TracingInspector) -> R,
+    >(
         &self,
         block_env: &BlockEnv,
         state: StateDB,
@@ -61,16 +63,14 @@ where
     ) -> Result<
         (ExecutionResult<Self::EvmHaltReason>, R),
         EVMError<StateDB::Error, Self::TransactionError>,
-    >
-    where
-        StateDB: DatabaseCommit + DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-        F: FnOnce(TracingInspector) -> R,
-    {
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
-        let wrap_database_ref = WrapDatabaseRef(state);
+    > {
         let mut inspector = TracingInspector::new(inspector_cfg);
-        let mut evm = CitreaEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
+        let mut evm = create_citrea_evm_from_state(
+            block_env.clone(),
+            self.evm_cfg.cfg.clone(),
+            state,
+            &mut inspector,
+        );
         evm.inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)))
     }
