@@ -1,21 +1,43 @@
 # Leafage
 
-Scalable, lightweight, and modular EVM state query infrastructure.
+Scalable, lightweight, and modular infrastructure for EVM state queries and block data distribution.
 
 ## Overview
 
-Leafage is a distributed architecture that **decouples EVM state querying from block synchronization**. Instead of querying a monolithic full node that handles consensus, execution, P2P networking, and RPC all in one process, Leafage splits the pipeline: one full node executes blocks and exports state diffs, which are then distributed via Kafka + S3 to any number of lightweight query nodes.
+Leafage is a **purpose-built EVM node architecture for massive-scale products**. It is a distributed system that **decouples EVM state querying from block synchronization** and **records complete block execution data for external consumption** — designed from the ground up for teams that need to serve millions of state queries per day across multiple chains, and for data platforms that need structured access to transactions, call traces, and event logs without running their own full nodes.
 
-The result: horizontally scalable EVM state queries with ~90GB storage per node instead of 1.3TB+, minute-level cold start, and zero interference between block sync and RPC workloads.
+Instead of querying a monolithic full node that handles consensus, execution, P2P networking, and RPC all in one process, Leafage splits the pipeline: one full node executes blocks and exports execution data, which is then distributed via Kafka + S3 to two classes of consumers. Lightweight query nodes (leafage-evm) receive state diffs for RPC serving. External analytics platforms and business applications receive structured block data — transactions, call traces, and event logs — as JSON+gzip files on S3, ready for ingestion into data warehouses and big-data pipelines.
+
+The result: horizontally scalable EVM state queries with ~90GB storage per node instead of 1.3TB+, minute-level cold start, zero interference between block sync and RPC workloads, and a built-in data distribution layer that makes complete block execution data accessible to any downstream system.
+
+### The problem: scaling Geth doesn't scale
+
+The standard approach to scaling EVM state queries is straightforward — run more Geth nodes. But at production scale, this approach breaks down in fundamental ways:
+
+**Massive resource waste.** Each Geth full node requires 1.3TB+ of storage on Ethereum mainnet, with Archive nodes reaching 2–6.5TB. Scaling to 100+ nodes means provisioning 130TB+ of largely redundant data — every node stores the same blocks, transactions, receipts, and state. CPU and memory costs compound similarly: every node independently executes every block (CPU-intensive EVM computation), maintains its own Merkle Patricia Trie (memory-intensive state tree), and runs P2P networking and transaction pool management — all of which are irrelevant to serving RPC queries.
+
+**Bandwidth explosion.** Every Geth node participates in P2P gossip, independently discovering and downloading blocks from the network. At 100+ nodes, the aggregate P2P bandwidth consumption becomes enormous — the same block data is fetched over the network hundreds of times. This not only wastes bandwidth but can also cause issues with P2P peer limits and network congestion.
+
+**State inconsistency across replicas.** P2P synchronization is inherently non-deterministic. Different nodes receive blocks at different times, process reorgs independently, and may temporarily sit at different chain heights. For applications that query multiple nodes behind a load balancer, this means the same `eth_call` can return different results depending on which node handles the request — a critical problem for DeFi protocols and data platforms that require consistent reads.
+
+**Coupled workloads with mutual interference.** In a monolithic Geth node, block synchronization (CPU-heavy EVM execution + disk-heavy state writes) and RPC query serving share the same process, memory, and disk I/O. A spike in query traffic slows down sync; a heavy sync period degrades query latency. There is no way to independently scale or isolate these workloads.
+
+**Slow recovery and scaling.** When a Geth node fails, replacing it requires hours to days of chain resync or snapshot import. Scaling out to handle traffic spikes is equally slow — you cannot spin up a new full node in minutes. This makes the fleet brittle and unresponsive to demand changes.
+
+**No built-in data export for analytics.** Geth has no pipeline for delivering structured block data to external systems. Extracting transactions, call traces, and event logs at scale requires calling expensive RPCs like `debug_traceBlock` — which contend with production query traffic and do not scale horizontally. Teams that need this data for analytics, compliance, or business intelligence end up building and maintaining custom ETL infrastructure on top of an API that was never designed for bulk export.
+
+These are the problems Leafage was built to solve — replacing the "scale by cloning full nodes" model with a distributed architecture that eliminates redundancy, guarantees consistency, scales query capacity independently of execution, and provides a built-in data distribution layer for external consumers.
 
 ### What is Leafage?
 
-Leafage is a collection of five components that together form a complete EVM state query stack:
+Leafage answers the problems above by splitting the monolithic full node into a distributed pipeline. Instead of every node independently syncing, storing, and serving the same data, Leafage uses **one** full node for execution and exports the results to **any number** of lightweight, specialized consumers — eliminating redundant storage, guaranteeing cross-replica consistency via Kafka, isolating sync from query workloads, enabling minute-level recovery from S3 snapshots, and providing a built-in data export layer for analytics.
+
+It is a collection of five components that together form a complete EVM state query and block data distribution stack:
 
 | Component | Language | Role |
 |-----------|----------|------|
 | **go-ethereum-x** | Go | Modified Geth that exports state diffs during block execution |
-| **pipeline** | Go | Serializes and distributes execution data via Kafka + S3 |
+| **pipeline** | Go | Serializes and distributes execution data via Kafka + S3: state diffs to leafage-evm, block data (txs/traces/events) to external consumers |
 | **consistency_checker** | Go | Validates block consistency across replicas and publishes confirmed notifications to external consumers |
 | **leafage-evm** | Rust | Lightweight EVM executor that consumes state diffs and serves RPC queries |
 | **nodex-proxy** | Go | JSON-RPC gateway with service discovery, load balancing, and smart routing |
@@ -24,25 +46,29 @@ The project is licensed under MIT OR Apache-2.0.
 
 ### Goals
 
-**Horizontal scalability.** Adding query capacity should be as simple as launching a new leafage-evm instance — no full chain resync, no 1TB+ disk provisioning, no hours of waiting.
+**Horizontal scalability.** Adding query capacity should be as simple as launching a new leafage-evm instance — no full chain resync, no 1TB+ disk provisioning, no hours of waiting. Only one full node syncs via P2P; all query nodes consume from Kafka + S3, eliminating the redundant bandwidth of 100+ nodes each pulling the same blocks from the network.
 
-**Resource isolation.** Block synchronization (CPU-intensive EVM execution + disk-intensive state writes) and RPC queries should never compete for resources. Leafage runs them in separate processes, on separate machines if needed.
+**Resource isolation.** Block synchronization (CPU-intensive EVM execution + disk-intensive state writes) and RPC queries should never compete for resources. Leafage runs them in separate processes, on separate machines if needed — a query traffic spike will never slow down sync, and vice versa.
 
-**Storage efficiency.** Query nodes only need account state (balance, nonce, code, storage). Transactions, receipts, and logs are irrelevant for `eth_call` and can be discarded — reducing storage from 1.3TB+ to 90GB.
+**Cross-replica consistency.** All query nodes consume from the same Kafka stream and apply the same blocks in the same order. No P2P non-determinism, no height divergence behind a load balancer — the same `eth_call` returns the same result regardless of which node handles it.
 
-**Multi-chain with a unified stack.** The same architecture, deployment tools, and monitoring system covers Ethereum, Optimism, BSC, Cosmos EVM, and Mantle. Switch chains with a single `--evm-type` flag.
+**Lightweight resource footprint.** leafage-evm does not execute blocks, does not maintain a Merkle Patricia Trie, and does not run P2P networking — eliminating the CPU, memory, and disk overhead that dominates a Geth full node. Query nodes only need account state (balance, nonce, code, storage); transactions, receipts, and logs are irrelevant for `eth_call` and can be discarded — reducing storage from 1.3TB+ to 90GB, with proportionally lower CPU and memory requirements.
 
 **Fast recovery.** A failed node should be replaceable in minutes (S3 snapshot + Kafka catch-up), not hours (P2P resync).
+
+**Built-in data distribution.** Pipeline records complete block execution data (transactions, call traces, event logs) and uploads it to S3 as structured JSON+gzip — no custom ETL pipelines, no expensive `debug_traceBlock` calls contending with production traffic.
+
+**Multi-chain with a unified stack.** The same architecture, deployment tools, and monitoring system covers Ethereum, Optimism, BSC, Cosmos EVM, and Mantle. Switch chains with a single `--evm-type` flag.
 
 ### Who is this for?
 
 **DeFi protocols and wallets** that need high-throughput `eth_call`, `eth_estimateGas`, and batch contract calls across multiple chains.
 
-**Data platforms** that run millions of state queries per day and need to scale query capacity independently of execution.
+**Data platforms and analytics teams** that need structured access to block execution data — transactions, call traces, and event logs — without running full nodes or maintaining custom ETL pipelines. Pipeline's external S3 bucket delivers this data as JSON+gzip files ready for warehouse ingestion.
 
 **Infrastructure teams** managing multi-chain deployments that want a unified, observable architecture instead of maintaining separate full nodes for each chain.
 
-If your bottleneck is EVM state query throughput and you're tired of scaling by adding more full nodes, Leafage is for you.
+If your bottleneck is EVM state query throughput, or you need reliable access to structured block data at scale, Leafage is for you.
 
 ## Architecture
 
