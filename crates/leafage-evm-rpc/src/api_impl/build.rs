@@ -158,6 +158,7 @@ where
                 run_chain_setup!(env, custom_evm_cfg)
             }
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Citrea(env) => run_chain_setup!(env, None),
         };
 
         let handle = server.start(rpc_module);

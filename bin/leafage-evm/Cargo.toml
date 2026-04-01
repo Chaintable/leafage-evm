@@ -12,6 +12,7 @@ exclude.workspace = true
 leafage-evm-storage.workspace = true
 leafage-evm-types.workspace = true
 leafage-evm-rpc.workspace = true
+leafage-evm-chains.workspace = true
 anyhow.workspace = true
 jsonrpsee.workspace = true
 revm.workspace = true
