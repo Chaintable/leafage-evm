@@ -100,10 +100,10 @@
 - [x] ~~**AA apply_eip7702_auth_list override**~~ — 已实现：`TempoHandler::apply_eip7702_auth_list` override，从 `aaAuthorizationList` 的 `authority`+`address` 字段构建 `TempoAuthDelegation`（实现 `AuthorizationTr`），调用 `revm::handler::pre_execution::apply_auth_list` 应用 delegation。RPC 调用方直接提供 authority 地址（不需要签名恢复）。T1+ 无 refund
 - [x] ~~**AA per-auth keychain gas +3000**~~ — 已修复：`TempoAuthGas` 加 `is_keychain: bool`，per-auth 循环判断加 `KEYCHAIN_VALIDATION_GAS` (3000)。同时 `TempoAuthGasInfo` RPC 类型加 `is_keychain` 字段
 - **feePayerSignature 签名恢复** — Writer 接受 `feePayerSignature: Signature`，通过 `TempoTransaction.recover_fee_payer(sender)` (RLP 编码 + ecrecover) 恢复 sponsor 地址。Leafage 用 `feePayer: Address` 直接提供地址（无 TempoTransaction RLP 依赖）。如需完全兼容 writer RPC 格式，需引入 tempo_primitives 的 RLP 编码逻辑做签名恢复
-- **P1: 2D nonce (nonceKey>0) 执行 gas 缺 ~250k** — Writer 在 `validate_against_state_and_deduct_caller` 中对 2D nonce 调用 `NonceManager.get_nonce()` + `increment_nonce()` 预编译操作，消耗 ~250k gas（cold SLOAD + SSTORE on T1+）。Leafage pre_execution 没有 NonceManager 交互。此 gas 出现在 pre_traceMany/simulateTransactions 的执行结果中。测试数据：nonceKey=0x1 时 Writer=273270 vs Leafage=28270 (diff=245000)
-- **P1: webAuthn keyType gas 过高 +37k** — Leafage 对 keyType=webAuthn 的 gas 计算为 77742，Writer 为 40638 (diff=+37104)。需排查 `webauthn_data_size` 默认值和 mock data 构造逻辑是否与 writer 一致。可能是 `key_data` 未传时默认 size 计算差异
-- **P2: keyId 未校验 key 存在** — Writer 对 keyId 指向不存在的 key 返回 `KeyNotFound` 错误，Leafage 只加 +3000 gas 不校验。设计差异（读节点无法执行 keychain 验证），但应记录。测试数据：keyId=0x01 时 Writer=error, Leafage=26270
-- **P2: AA batch revert trace 差异** — 原子回滚时 Writer pre_traceMany 返回 gasUsed=0 + 空 traces，Leafage 返回实际 gasUsed=26424 + 完整子调用 traces。Leafage 行为对调试更有利，但与 writer 不一致
+- [x] ~~**P1: 2D nonce (nonceKey>0) intrinsic gas 缺 ~250k**~~ — 已修复：根因不是 NonceManager 预编译调用，而是 `create_mainnet_txn_env` 总是从 DB 读 nonce 忽略 request 值。AA sender 显式设 nonce=0（nonceKey>0 时 bypass protocol nonce），但 DB nonce>0 导致 TIP-1000 `nonce==0` 分支未命中（5k 而非 250k）。修复：优先用 request.nonce，fallback DB
+- [x] ~~**P1: webAuthn keyType gas 过高 +37k**~~ — 已修复：`gas_params_tx_token_cost()` 硬编码为 16（NON_ZERO_BYTE_DATA_COST），应为 4（STANDARD_TOKEN_COST）。`get_tokens_in_calldata_istanbul` 已将字节转为 token（非零字节=4 token），再乘 16 导致 4 倍过高。修复：改为 4
+- **P2: keyId 未校验 key 存在（保持现状）** — Writer 对 keyId 指向不存在的 key 返回 `KeyNotFound` 错误（pre_execution 阶段），Leafage 只加 +3000 gas 不校验（错误在 TIP20 execution 阶段暴露）。分析：block replay 场景 key 在链上已验证过；eth_call 场景两边都会失败（错误信息不同但结果一致）。不修，设计差异
+- **P2: AA batch revert trace 差异（保持现状）** — Writer pre_traceMany 对 Revert 返回 gasUsed=0 + 空 traces（debank-rpc/src/pre.rs:92 `Err(PreError)` 丢弃 traces），Leafage 返回实际 gasUsed + 完整 traces。根因：Writer `trace_transaction` match ExecutionResult 时 Revert 分支转为 PreError（丢弃 inspector traces），Success 分支才返回 traces。Leafage 行为更准确（保留链上实际 gas 消耗 + 调试信息）。不修
 
 ### Writer-Leafage Handler 差异总览
 
