@@ -579,8 +579,9 @@ mod tests {
 
         // Normal nonce_key (nonce > 0)
         let tx_normal = make_aa_tx(calls.clone(), 1, U256::from(1), 10_000_000);
-        // Expiring nonce_key (U256::MAX)
-        let tx_expiring = make_aa_tx(calls, 1, U256::MAX, 10_000_000);
+        // Expiring nonce_key (U256::MAX) — requires valid_before to be set.
+        let mut tx_expiring = make_aa_tx(calls, 1, U256::MAX, 10_000_000);
+        tx_expiring.tempo_fields.as_mut().unwrap().valid_before = Some(u64::MAX);
 
         let mut evm_normal = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),

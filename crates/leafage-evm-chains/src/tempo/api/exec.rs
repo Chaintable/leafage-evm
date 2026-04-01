@@ -166,6 +166,14 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             let block_ts: u64 = evm.ctx().block.timestamp.saturating_to();
             validate_time_window(fields.valid_after, fields.valid_before, block_ts)?;
 
+            // Expiring nonce (nonceKey=MAX) requires validBefore to be set.
+            // Ported from writer: handler.rs validate_env expiring nonce check.
+            if fields.nonce_key == U256::MAX && fields.valid_before.is_none() {
+                return Err(EVMError::Custom(
+                    "expiring nonce transaction requires valid_before to be set".into(),
+                ));
+            }
+
             // Note: keychain version, subblock, and priority fee validations are skipped —
             // leafage eth_call mode has no real signatures, no subblock txs,
             // and disable_base_fee=true. These checks are writer-only concerns.
