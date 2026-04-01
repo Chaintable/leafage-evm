@@ -104,6 +104,10 @@
 - [x] ~~**P1: webAuthn keyType gas 过高 +37k**~~ — 已修复：`gas_params_tx_token_cost()` 硬编码为 16（NON_ZERO_BYTE_DATA_COST），应为 4（STANDARD_TOKEN_COST）。`get_tokens_in_calldata_istanbul` 已将字节转为 token（非零字节=4 token），再乘 16 导致 4 倍过高。修复：改为 4
 - **P2: keyId 未校验 key 存在（保持现状）** — Writer 对 keyId 指向不存在的 key 返回 `KeyNotFound` 错误（pre_execution 阶段），Leafage 只加 +3000 gas 不校验（错误在 TIP20 execution 阶段暴露）。分析：block replay 场景 key 在链上已验证过；eth_call 场景两边都会失败（错误信息不同但结果一致）。不修，设计差异
 - **P2: AA batch revert trace 差异（保持现状）** — Writer pre_traceMany 对 Revert 返回 gasUsed=0 + 空 traces（debank-rpc/src/pre.rs:92 `Err(PreError)` 丢弃 traces），Leafage 返回实际 gasUsed + 完整 traces。根因：Writer `trace_transaction` match ExecutionResult 时 Revert 分支转为 PreError（丢弃 inspector traces），Success 分支才返回 traces。Leafage 行为更准确（保留链上实际 gas 消耗 + 调试信息）。不修
+- [x] ~~**P1: expiring nonce 缺 validBefore 校验**~~ — 已修复：validate_env 中 nonceKey=MAX 时检查 valid_before.is_none() 则拒绝
+- **P2: calls value!=0 未提前拒绝** — Writer 在 validate_env 对 AA call 的 value!=0 返回 "value transfer not allowed"（gas=0）。Leafage 不检查 call-level value（只检查 tx-level），执行后 OutOfFunds（gas=21160）。两者都拒绝但错误不同
+- **P2: unknown keyType fallback** — Writer 对未知 keyType 返回 rpc 错误。Leafage `from_str_lossy` fallback 为 secp256k1。考虑加严格校验
+- **P2: isKeychain +3000 差异** — Writer 不读 RPC 的 isKeychain 字段（从签名类型推断），Leafage 信任 RPC 传入值加 +3000。设计选择差异，Leafage 对 gas estimation 更准确
 
 ### Writer-Leafage Handler 差异总览
 
