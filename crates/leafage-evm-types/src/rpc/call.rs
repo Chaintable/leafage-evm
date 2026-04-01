@@ -67,11 +67,17 @@ pub struct CallRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_token: Option<Address>,
 
-    /// Fee payer (sponsor) address. When specified, the sponsor's fee token balance
-    /// is used for the estimateGas gas cap instead of the caller's.
-    /// Writer recovers this from fee_payer_signature; for RPC we accept it directly.
+    /// Fee payer (sponsor) address. When specified directly, the sponsor's fee token
+    /// balance is used for the estimateGas gas cap instead of the caller's.
+    /// If `feePayerSignature` is also present, the recovered address takes priority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_payer: Option<Address>,
+
+    /// Fee payer signature for sponsored transactions (matches writer wire format).
+    /// When present, leafage recovers the sponsor address via ecrecover over the
+    /// fee_payer_signature_hash of the full transaction fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_payer_signature: Option<alloy::primitives::Signature>,
 
     /// Earliest block timestamp at which this AA transaction is valid (seconds).
     /// If block_timestamp < valid_after, eth_call/estimateGas returns an error.

@@ -750,7 +750,40 @@ where
                 // Ported from writer: caller_gas_allowance in crates/node/src/rpc/mod.rs
                 // Use fee_payer (sponsor) if specified, otherwise caller.
                 // Use fee_token override if specified.
-                let payer = request.fee_payer.unwrap_or(tx.caller());
+                // Resolve fee payer: feePayerSignature (recover) > feePayer (direct) > caller.
+                let payer = if let Some(sig) = &request.fee_payer_signature {
+                    use leafage_evm_chains::tempo::fee_payer::{self as fp, Call as FpCall};
+                    let calls: Vec<FpCall> = request.tempo_calls.as_ref()
+                        .map(|cs| cs.iter().map(|c| {
+                            let to = c.to.as_ref().and_then(|t| t.to().copied());
+                            FpCall {
+                                to,
+                                value: c.value.unwrap_or_default(),
+                                input: c.input.clone().into_input().unwrap_or_default(),
+                            }
+                        }).collect())
+                        .unwrap_or_default();
+                    let access_list = alloy::eips::eip2930::AccessList::default();
+                    fp::recover_fee_payer(
+                        sig,
+                        self.inner.evm_cfg().cfg.chain_id,
+                        tx.max_priority_fee_per_gas().unwrap_or(0),
+                        tx.max_fee_per_gas(),
+                        tx.gas_limit(),
+                        &calls,
+                        &access_list,
+                        request.nonce_key.unwrap_or_default(),
+                        tx.nonce(),
+                        request.valid_before,
+                        request.valid_after,
+                        request.fee_token,
+                        tx.caller(),
+                        &[], // TODO: full TempoSignedAuthorization when available
+                        None, // TODO: full SignedKeyAuthorization when available
+                    ).unwrap_or(tx.caller())
+                } else {
+                    request.fee_payer.unwrap_or(tx.caller())
+                };
                 leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
                     &memory_db,
                     payer,
