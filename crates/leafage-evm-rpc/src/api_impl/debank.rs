@@ -862,9 +862,6 @@ where
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
-        let l1_overhead =
-            self.inner
-                .estimate_l1_overhead(&block_env, &memory_db, tx.clone());
         let buffer = self.inner.evm_cfg().estimate_gas_buffer;
         let final_gas = if buffer > 100 {
             let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
@@ -873,7 +870,7 @@ where
             highest_gas_limit
         };
 
-        Ok(U256::from(final_gas.saturating_add(l1_overhead)))
+        Ok(U256::from(final_gas))
     }
 
     async fn debank_estimate_gas_impl(

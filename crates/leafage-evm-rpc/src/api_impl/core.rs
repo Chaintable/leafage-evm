@@ -103,18 +103,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 
-    fn estimate_l1_overhead<StateDB>(
-        &self,
-        _block_env: &BlockEnv,
-        _state: StateDB,
-        _tx: Self::Tx,
-    ) -> u64
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        0
-    }
 }
 
 pub(crate) trait TxSetter {
