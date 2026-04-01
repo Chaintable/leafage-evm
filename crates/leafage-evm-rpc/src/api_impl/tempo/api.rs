@@ -33,7 +33,7 @@ where
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
         block_env: &BlockEnv,
-        request: CallRequest,
+        mut request: CallRequest,
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
@@ -54,6 +54,26 @@ where
         let fee_payer = request.fee_payer;
         let valid_after = request.valid_after;
         let valid_before = request.valid_before;
+
+        // Auto-fill 2D nonce from NonceManager storage when not provided.
+        // Ported from writer compat.rs:309-324.
+        if let Some(nk) = nonce_key {
+            if !nk.is_zero() && request.inner.nonce.is_none() {
+                use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+                use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
+                let nonce = if nk == revm::primitives::U256::MAX {
+                    0u64 // expiring nonce must be 0
+                } else {
+                    let caller = request.inner.from.unwrap_or_default();
+                    let slot = caller.mapping_slot(revm::primitives::U256::ZERO);
+                    let slot = nk.mapping_slot(slot);
+                    db.storage_ref(NONCE_PRECOMPILE_ADDRESS, slot)
+                        .map(|v| v.saturating_to::<u64>())
+                        .unwrap_or(0)
+                };
+                request.inner.nonce = Some(nonce);
+            }
+        }
 
         // Build standard TxEnv.
         let base =

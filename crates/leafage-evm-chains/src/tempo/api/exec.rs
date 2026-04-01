@@ -272,6 +272,13 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     /// warm the slot and match writer's gas behavior exactly.
     #[inline]
     fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+        // For 2D nonce AA (nonceKey > 0), disable protocol nonce check.
+        // Writer bypasses it in validate_against_state_and_deduct_caller.
+        // Without this, tx.nonce (from NonceManager, may be 0) != account.nonce → NonceTooLow.
+        if evm.ctx().tx.tempo_fields.as_ref().is_some_and(|f| !f.nonce_key.is_zero()) {
+            evm.ctx_mut().cfg.disable_nonce_check = true;
+        }
+
         // Standard pre_execution (load accounts, warm coinbase, etc.).
         let gas = MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
             .pre_execution(evm)?;
@@ -655,6 +662,7 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
     let hardfork = TempoHardfork::from_timestamp(
         evm.ctx().block.timestamp.saturating_to::<u64>(),
     );
+
     let gas_params = &evm.ctx().cfg.gas_params;
     let gas_limit = evm.ctx().tx.base.gas_limit;
     let nonce = evm.ctx().tx.base.nonce;
@@ -681,9 +689,17 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
     }
 
     // Calculate batch intrinsic gas.
-    let mut batch_gas = calculate_aa_batch_intrinsic_gas(tempo_fields, gas_params, evm, hardfork)?;
+    let mut batch_gas = calculate_aa_batch_intrinsic_gas(tempo_fields, &gas_params, evm, hardfork)?;
 
     // Calculate 2D nonce gas based on hardfork and nonce_key.
+    // For nonceKey > 0, the relevant nonce is the 2D nonce from NonceManager storage,
+    // NOT the protocol nonce (tx.base.nonce). Writer uses tx.nonce which comes from the
+    // signed transaction (explicitly set by the AA sender). Leafage reads from DB.
+    // Read the 2D nonce from NonceManager to determine new_account vs existing_key gas.
+    // For nonceKey > 0, read the 2D nonce from NonceManager storage to determine
+    // whether this is a new nonce key (nonce==0 → +250k) or existing (→ +5k).
+    // Writer uses tx.nonce (from signed tx where sender explicitly sets nonce=0 for new keys).
+    // Leafage reads from storage since tx.nonce comes from DB (protocol nonce, not 2D nonce).
     let mut nonce_2d_gas: u64 = 0;
 
     if hardfork.is_t1() {
