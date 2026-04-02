@@ -213,13 +213,25 @@ impl Storable for PolicyData {
 
 impl PolicyData {
     /// Decodes the raw `policy_type` u8 to a `PolicyType` enum.
+    ///
+    /// Pre-T2: COMPOUND (2) is rejected (it did not exist yet); unknown values
+    ///         produce `UnderOverflow` to match the original writer panic behavior.
+    /// T2+: all three known variants are accepted; unknown values produce
+    ///       `InvalidPolicyType`.
     fn policy_type(&self) -> Result<ITIP403Registry::PolicyType> {
-        // leafage always runs T2+
-        match self.policy_type {
-            0 => Ok(ITIP403Registry::PolicyType::WHITELIST),
-            1 => Ok(ITIP403Registry::PolicyType::BLACKLIST),
-            2 => Ok(ITIP403Registry::PolicyType::COMPOUND),
-            _ => Err(err_invalid_policy_type()),
+        let is_t2 = StorageCtx::default().spec().is_t2();
+
+        // try_into uses the sol!-generated TryFrom<u8> impl
+        let ty: core::result::Result<ITIP403Registry::PolicyType, _> =
+            self.policy_type.try_into();
+
+        match ty {
+            Ok(t) if is_t2 || t != ITIP403Registry::PolicyType::COMPOUND => Ok(t),
+            _ => Err(if is_t2 {
+                err_invalid_policy_type()
+            } else {
+                TempoPrecompileError::under_overflow()
+            }),
         }
     }
 
@@ -406,12 +418,35 @@ impl TIP403Registry {
         Ok(call.policyId < counter)
     }
 
-    /// Returns the type and admin of a policy.
+    /// Returns the type and admin of a policy. Reverts if the policy does not exist or has an
+    /// invalid type.
     pub fn policy_data(
         &self,
         call: ITIP403Registry::policyDataCall,
     ) -> Result<ITIP403Registry::policyDataReturn> {
-        // T2+: verify policy exists via get_policy_data
+        if self.storage.spec().is_t2() {
+            // Built-in policies are virtual (not stored), and match the `PolicyType`:
+            //  - 0: REJECT_ALL_POLICY_ID -> WHITELIST
+            //  - 1: ALLOW_ALL_POLICY_ID  -> BLACKLIST
+            if self.builtin_authorization(call.policyId).is_some() {
+                let policy_type: ITIP403Registry::PolicyType = (call.policyId as u8)
+                    .try_into()
+                    .map_err(|_| err_invalid_policy_type())?;
+                return Ok(ITIP403Registry::policyDataReturn {
+                    policyType: policy_type,
+                    admin: Address::ZERO,
+                });
+            }
+        } else {
+            // Pre-T2: check existence before reading
+            if !self.policy_exists(ITIP403Registry::policyExistsCall {
+                policyId: call.policyId,
+            })? {
+                return Err(err_policy_not_found());
+            }
+        }
+
+        // Get policy data and verify that the policy id exists (T2+)
         let data = self.get_policy_data(call.policyId)?;
 
         Ok(ITIP403Registry::policyDataReturn {
@@ -827,21 +862,36 @@ impl ContractStorage for TIP403Registry {
 // ===========================================================================
 
 /// Validates that a PolicyType is simple and returns its u8 discriminant.
+///
+/// Pre-T2: Converts COMPOUND (and any unknown variant) to 255 to match original
+///          ABI decoding behavior (legacy bug-compatible).
+/// T2+: Only allows WHITELIST and BLACKLIST.
 fn ensure_is_simple(policy_type: &ITIP403Registry::PolicyType) -> Result<u8> {
     match policy_type {
         ITIP403Registry::PolicyType::WHITELIST | ITIP403Registry::PolicyType::BLACKLIST => {
             Ok(*policy_type as u8)
         }
-        // T2+: reject COMPOUND and __Invalid for simple policy creation
-        _ => Err(err_incompatible_policy_type()),
+        _ => {
+            if StorageCtx::default().spec().is_t2() {
+                Err(err_incompatible_policy_type())
+            } else {
+                // Pre-T2: store as 255 (legacy __Invalid discriminant)
+                Ok(255u8)
+            }
+        }
     }
 }
 
 /// Returns `true` if the error indicates a failed policy lookup.
 #[allow(dead_code)]
 pub fn is_policy_lookup_error(e: &TempoPrecompileError) -> bool {
-    // T2+: typed TIP403 errors
-    *e == err_invalid_policy_type() || *e == err_policy_not_found()
+    if StorageCtx::default().spec().is_t2() {
+        // T2+: typed TIP403 errors
+        *e == err_invalid_policy_type() || *e == err_policy_not_found()
+    } else {
+        // Pre-T2: legacy Panic(UnderOverflow) sentinel
+        *e == TempoPrecompileError::under_overflow()
+    }
 }
 
 // ===========================================================================

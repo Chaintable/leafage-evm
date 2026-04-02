@@ -232,7 +232,6 @@ pub struct AccountKeychain {
     // Slot 2: transaction_key (transient)
     pub(crate) transaction_key: Slot<Address>,
     // Slot 3: tx_origin (transient)
-    #[allow(dead_code)]
     pub(crate) tx_origin: Slot<Address>,
 
     pub address: Address,
@@ -276,17 +275,33 @@ impl AccountKeychain {
         keccak256(data)
     }
 
+    /// Ensures admin operations are authorized for this caller.
+    ///
+    /// Rules:
+    /// - transaction must be signed by the main key (`transaction_key == Address::ZERO`)
+    /// - T2+: caller must match tx.origin (prevents confused-deputy self-administration)
+    fn ensure_admin_caller(&self, msg_sender: Address) -> Result<()> {
+        if !self.transaction_key.t_read()?.is_zero() {
+            return Err(err_unauthorized_caller());
+        }
+
+        if self.storage.spec().is_t2() {
+            let tx_origin = self.tx_origin.t_read()?;
+            if tx_origin.is_zero() || tx_origin != msg_sender {
+                return Err(err_unauthorized_caller());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Registers a new access key with signature type, expiry, and optional per-token spending limits.
     pub fn authorize_key(
         &mut self,
         msg_sender: Address,
         call: IAccountKeychain::authorizeKeyCall,
     ) -> Result<()> {
-        // Check that the transaction key is zero (main key only)
-        let transaction_key = self.transaction_key.t_read()?;
-        if transaction_key != Address::ZERO {
-            return Err(err_unauthorized_caller());
-        }
+        self.ensure_admin_caller(msg_sender)?;
 
         if call.keyId == Address::ZERO {
             return Err(err_zero_public_key());
@@ -349,10 +364,7 @@ impl AccountKeychain {
         msg_sender: Address,
         call: IAccountKeychain::revokeKeyCall,
     ) -> Result<()> {
-        let transaction_key = self.transaction_key.t_read()?;
-        if transaction_key != Address::ZERO {
-            return Err(err_unauthorized_caller());
-        }
+        self.ensure_admin_caller(msg_sender)?;
 
         let key = self.keys[msg_sender][call.keyId].read()?;
         if key.expiry == 0 {
@@ -377,10 +389,7 @@ impl AccountKeychain {
         msg_sender: Address,
         call: IAccountKeychain::updateSpendingLimitCall,
     ) -> Result<()> {
-        let transaction_key = self.transaction_key.t_read()?;
-        if transaction_key != Address::ZERO {
-            return Err(err_unauthorized_caller());
-        }
+        self.ensure_admin_caller(msg_sender)?;
 
         let mut key = self.load_active_key(msg_sender, call.keyId)?;
 
@@ -440,16 +449,18 @@ impl AccountKeychain {
         })
     }
 
-    /// Returns the remaining spending limit for a key-token pair.
+    /// Returns the remaining spending limit for a key-token pair, or zero if the key
+    /// doesn't exist or has been revoked (T2+).
     pub fn get_remaining_limit(
         &self,
         call: IAccountKeychain::getRemainingLimitCall,
     ) -> Result<U256> {
         // T2+: return zero if key doesn't exist or has been revoked
-        // leafage always runs latest spec
-        let key = self.keys[call.account][call.keyId].read()?;
-        if key.expiry == 0 || key.is_revoked {
-            return Ok(U256::ZERO);
+        if self.storage.spec().is_t2() {
+            let key = self.keys[call.account][call.keyId].read()?;
+            if key.expiry == 0 || key.is_revoked {
+                return Ok(U256::ZERO);
+            }
         }
 
         let limit_key = Self::spending_limit_key(call.account, call.keyId);
@@ -471,7 +482,6 @@ impl AccountKeychain {
     }
 
     /// Sets the transaction origin for the current transaction.
-    #[allow(dead_code)]
     pub fn set_tx_origin(&mut self, origin: Address) -> Result<()> {
         self.tx_origin.t_write(origin)
     }

@@ -30,9 +30,8 @@ const MAINNET_T1_TIME: u64 = 1_770_908_400;
 const MAINNET_T1A_TIME: u64 = 1_770_908_400;
 const MAINNET_T1B_TIME: u64 = 1_771_858_800;
 const MAINNET_T1C_TIME: u64 = 1_773_327_600;
-// T2 is not yet scheduled on mainnet. Use u64::MAX as sentinel so that
-// `from_timestamp` never returns T2 until an activation time is set.
-const MAINNET_T2_TIME: u64 = u64::MAX;
+// T2 activated on mainnet: 2026-03-31 14:00 UTC (from presto.json genesis).
+const MAINNET_T2_TIME: u64 = 1_774_965_600;
 
 impl TempoHardfork {
     /// Determine the active hardfork for a given block timestamp.
@@ -177,10 +176,15 @@ mod tests {
     }
 
     #[test]
-    fn from_timestamp_t2_not_scheduled() {
-        // T2 is not yet scheduled (sentinel u64::MAX), so T1C stays active
+    fn from_timestamp_t2_activated() {
+        // T2 activated at 1774965600 (2026-03-31 14:00 UTC)
         assert_eq!(
-            TempoHardfork::from_timestamp(MAINNET_T1C_TIME + 100_000_000),
+            TempoHardfork::from_timestamp(MAINNET_T2_TIME),
+            TempoHardfork::T2
+        );
+        // Before T2: still T1C
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T2_TIME - 1),
             TempoHardfork::T1C
         );
     }
