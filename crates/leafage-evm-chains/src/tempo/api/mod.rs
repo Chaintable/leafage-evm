@@ -1270,4 +1270,68 @@ mod tests {
             "3-call gas ({gas_3}) should exceed 1-call gas ({gas_1}), proving accumulation"
         );
     }
+
+    /// Compare VCV2 gas WITH and WITHOUT load_account warm-up, BOTH at T2 timestamp.
+    #[test]
+    fn test_t2_vcv2_warm_account_effect() {
+        use crate::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS;
+        use revm::bytecode::Bytecode;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::{Address, Bytes, TxKind};
+        use revm::state::AccountInfo;
+
+        let vcv2 = VALIDATOR_CONFIG_V2_ADDRESS;
+        // owner() selector
+        let calldata = Bytes::from_static(&[0x8d, 0xa5, 0xcb, 0x5b]);
+
+        // Both at T2 timestamp — compare with and without pre-warmed VCV2 account
+        let make_tx = |cd: Bytes| crate::tempo::tx::TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0xAA),
+                kind: TxKind::Call(vcv2),
+                gas_limit: 10_000_000,
+                chain_id: Some(4217),
+                data: cd,
+                ..Default::default()
+            },
+            tempo_fields: None,
+        };
+
+        // WITHOUT pre-warm: normal T2 execution
+        let db1 = CacheDB::new(revm::database::EmptyDB::default());
+        let mut evm1 = TempoEvm::new(
+            make_env(1_774_965_700),
+            db1,
+            revm::inspector::NoOpInspector,
+            false,
+        );
+        let gas_cold = evm1.transact(make_tx(calldata.clone())).expect("cold").result.gas_used();
+
+        // WITH pre-warm: insert VCV2 into CacheDB before EVM construction
+        let mut db2 = CacheDB::new(revm::database::EmptyDB::default());
+        db2.insert_account_info(
+            vcv2,
+            revm::state::AccountInfo {
+                code_hash: revm::bytecode::Bytecode::new_legacy(
+                    alloy::primitives::Bytes::from_static(&[0xef]),
+                ).hash_slow(),
+                code: Some(revm::bytecode::Bytecode::new_legacy(
+                    alloy::primitives::Bytes::from_static(&[0xef]),
+                )),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+        let mut evm2 = TempoEvm::new(
+            make_env(1_774_965_700),
+            db2,
+            revm::inspector::NoOpInspector,
+            false,
+        );
+        let gas_warm = evm2.transact(make_tx(calldata)).expect("warm").result.gas_used();
+
+        eprintln!("VCV2 T2 gas: cold={gas_cold} warm={gas_warm}");
+        // Code/account presence does NOT affect precompile gas — dispatch by address.
+        assert_eq!(gas_cold, gas_warm, "VCV2 code presence should not affect precompile gas");
+    }
 }

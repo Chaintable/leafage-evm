@@ -13,6 +13,76 @@ use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
+/// DB wrapper that injects `0xef` bytecode for ValidatorConfigV2 at T2+ blocks.
+///
+/// Writer injects this code via `apply_pre_execution_changes` at the T2 activation
+/// block. Pipeline may not sync this state change. This wrapper transparently makes
+/// VCV2 appear to have code, fixing the +2100 cold-access gas diff.
+#[derive(Debug)]
+struct Vcv2CodeInjector<DB> {
+    inner: DB,
+    is_t2: bool,
+}
+
+impl<DB> Vcv2CodeInjector<DB> {
+    fn new(inner: DB, block_timestamp: u64) -> Self {
+        let is_t2 = leafage_evm_chains::tempo::hardfork::TempoHardfork::from_timestamp(
+            block_timestamp,
+        )
+        .is_t2();
+        Self { inner, is_t2 }
+    }
+}
+
+impl<DB: DatabaseCommit> DatabaseCommit for Vcv2CodeInjector<DB> {
+    fn commit(&mut self, changes: revm::state::EvmState) {
+        self.inner.commit(changes);
+    }
+}
+
+impl<DB: DatabaseRef> DatabaseRef for Vcv2CodeInjector<DB> {
+    type Error = DB::Error;
+
+    fn basic_ref(
+        &self,
+        address: revm::primitives::Address,
+    ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        let mut info = self.inner.basic_ref(address)?;
+        if self.is_t2
+            && address == leafage_evm_chains::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS
+        {
+            let code = revm::bytecode::Bytecode::new_legacy(
+                alloy::primitives::Bytes::from_static(&[0xef]),
+            );
+            let acc = info.get_or_insert_with(Default::default);
+            if acc.is_empty_code_hash() {
+                acc.code_hash = code.hash_slow();
+                acc.code = Some(code);
+            }
+        }
+        Ok(info)
+    }
+
+    fn code_by_hash_ref(
+        &self,
+        code_hash: revm::primitives::B256,
+    ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        self.inner.code_by_hash_ref(code_hash)
+    }
+
+    fn storage_ref(
+        &self,
+        address: revm::primitives::Address,
+        index: revm::primitives::U256,
+    ) -> Result<revm::primitives::U256, Self::Error> {
+        self.inner.storage_ref(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<revm::primitives::B256, Self::Error> {
+        self.inner.block_hash_ref(number)
+    }
+}
+
 /// Marker type to differentiate `TempoApiImpl` from `MainnetApiImpl`.
 ///
 /// Both use `MainnetSpecId`, but Rust's type system requires distinct types
@@ -174,6 +244,53 @@ where
         })
     }
 
+    fn apply_pre_execution_changes<StateDB>(
+        &self,
+        _header: impl alloy::consensus::BlockHeader,
+        block_env: &BlockEnv,
+        state: &mut StateDB,
+    ) -> RpcResult<()>
+    where
+        StateDB: revm::DatabaseCommit + revm::DatabaseRef + core::fmt::Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        use leafage_evm_chains::tempo::hardfork::TempoHardfork;
+        use leafage_evm_chains::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS;
+
+        // T2: inject 0xef bytecode into ValidatorConfigV2 if not already present.
+        // Writer does this in apply_pre_execution_changes at T2 activation.
+        // Pipeline may not sync this code change, so we inject it on every T2+ call.
+        let ts: u64 = block_env.timestamp.saturating_to();
+        if TempoHardfork::from_timestamp(ts).is_t2() {
+            let has_code = state
+                .basic_ref(VALIDATOR_CONFIG_V2_ADDRESS)
+                .ok()
+                .flatten()
+                .map(|acc| !acc.is_empty_code_hash())
+                .unwrap_or(false);
+            if !has_code {
+                use revm::state::{Account, AccountInfo, AccountStatus};
+                use revm::bytecode::Bytecode;
+                let code = Bytecode::new_legacy(alloy::primitives::Bytes::from_static(&[0xef]));
+                let mut acc = Account {
+                    info: AccountInfo {
+                        code_hash: code.hash_slow(),
+                        code: Some(code),
+                        nonce: 1,
+                        ..Default::default()
+                    },
+                    status: AccountStatus::Touched,
+                    ..Default::default()
+                };
+                acc.mark_created();
+                let mut changes = revm::state::EvmState::default();
+                changes.insert(VALIDATOR_CONFIG_V2_ADDRESS, acc);
+                state.commit(changes);
+            }
+        }
+        Ok(())
+    }
+
     fn transact<StateDB: DatabaseRef + Debug>(
         &self,
         block_env: &BlockEnv,
@@ -187,7 +304,9 @@ where
         StateDB::Error: Sync + Send + 'static,
     {
         let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
-        let wrap_database_ref = WrapDatabaseRef(state);
+        let ts: u64 = block_env.timestamp.saturating_to();
+        let db = Vcv2CodeInjector::new(state, ts);
+        let wrap_database_ref = WrapDatabaseRef(db);
         let mut evm = TempoEvm::new(evm_env, wrap_database_ref, NoOpInspector {}, false);
         evm.transact(tx).map(|res| res.result.into())
     }
@@ -209,7 +328,9 @@ where
         F: FnOnce(TracingInspector) -> R,
     {
         let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
-        let wrap_database_ref = WrapDatabaseRef(state);
+        let ts: u64 = block_env.timestamp.saturating_to();
+        let db = Vcv2CodeInjector::new(state, ts);
+        let wrap_database_ref = WrapDatabaseRef(db);
         let mut inspector = TracingInspector::new(inspector_cfg);
         let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
         evm.inspect_tx_commit(tx)
@@ -244,4 +365,103 @@ fn parse_webauthn_size(key_data: Option<&alloy::primitives::Bytes>) -> usize {
         DEFAULT_WEBAUTHN_SIZE
     };
     size.clamp(MIN_WEBAUTHN_SIZE, MAX_WEBAUTHN_SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_chains::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS;
+    use revm::database::EmptyDB;
+
+    #[test]
+    fn test_vcv2_injector_t2_injects_code_for_missing_account() {
+        // EmptyDB returns None for all accounts
+        let db = EmptyDB::default();
+        let injector = Vcv2CodeInjector::new(db, 1_774_965_700); // T2+
+
+        let info = injector.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap();
+        assert!(info.is_some(), "VCV2 should have info at T2");
+        let acc = info.unwrap();
+        assert!(!acc.is_empty_code_hash(), "VCV2 should have code at T2");
+        assert_eq!(
+            acc.code.as_ref().map(|c| c.original_byte_slice()),
+            Some(&[0xef][..]),
+            "VCV2 code should be 0xef"
+        );
+    }
+
+    #[test]
+    fn test_vcv2_injector_pre_t2_no_injection() {
+        let db = EmptyDB::default();
+        let injector = Vcv2CodeInjector::new(db, 1_774_965_599); // pre-T2
+
+        let info = injector.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap();
+        assert!(info.is_none(), "VCV2 should be None pre-T2 on EmptyDB");
+    }
+
+    #[test]
+    fn test_vcv2_injector_other_address_passthrough() {
+        let db = EmptyDB::default();
+        let injector = Vcv2CodeInjector::new(db, 1_774_965_700); // T2+
+        let other = revm::primitives::Address::with_last_byte(0x42);
+
+        let info = injector.basic_ref(other).unwrap();
+        assert!(info.is_none(), "other address should still be None");
+    }
+
+    #[test]
+    fn test_vcv2_injector_existing_account_with_code_untouched() {
+        use revm::database::in_memory_db::CacheDB;
+        use revm::state::AccountInfo;
+        use revm::bytecode::Bytecode;
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        // Pre-populate VCV2 with existing code
+        let existing_code = Bytecode::new_legacy(alloy::primitives::Bytes::from_static(&[0xfe]));
+        db.insert_account_info(
+            VALIDATOR_CONFIG_V2_ADDRESS,
+            AccountInfo {
+                code_hash: existing_code.hash_slow(),
+                code: Some(existing_code.clone()),
+                nonce: 5,
+                ..Default::default()
+            },
+        );
+
+        let injector = Vcv2CodeInjector::new(&db, 1_774_965_700); // T2+
+        let info = injector.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap();
+        let acc = info.unwrap();
+        assert_eq!(acc.nonce, 5, "nonce should be preserved");
+        assert_eq!(
+            acc.code.as_ref().map(|c| c.original_byte_slice()),
+            Some(&[0xfe][..]),
+            "existing code should NOT be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_vcv2_injector_existing_empty_account_gets_code() {
+        use revm::database::in_memory_db::CacheDB;
+        use revm::state::AccountInfo;
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        // VCV2 exists in DB but without code (pipeline state)
+        db.insert_account_info(
+            VALIDATOR_CONFIG_V2_ADDRESS,
+            AccountInfo {
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        let injector = Vcv2CodeInjector::new(&db, 1_774_965_700); // T2+
+        let info = injector.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap();
+        let acc = info.unwrap();
+        assert_eq!(acc.nonce, 1, "nonce should be preserved");
+        assert_eq!(
+            acc.code.as_ref().map(|c| c.original_byte_slice()),
+            Some(&[0xef][..]),
+            "empty-code account should get 0xef injected"
+        );
+    }
 }

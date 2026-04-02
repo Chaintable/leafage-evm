@@ -628,19 +628,23 @@ impl ValidatorConfigV2 {
     // View methods
     // =========================================================================
 
-    /// Returns the current owner.
+    /// Returns the current owner (reads only slot+0, not entire Config).
+    /// Writer: `self.config.owner.read()` — single slot read.
     pub fn owner(&self) -> Result<Address> {
-        let config: Config = self.config.read()?;
-        Ok(config.owner)
+        use super::storage_types::Slot;
+        let owner_slot: Slot<Address> = Slot::new(U256::from(0), self.address);
+        owner_slot.read()
     }
 
     /// Returns the block height at which the contract was initialized.
+    /// Reads slot+1 (Config packed field at offset 1).
     pub fn get_initialized_at_height(&self) -> Result<u64> {
         let config: Config = self.config.read()?;
         Ok(config.init_at_height)
     }
 
     /// Returns whether V2 has been initialized.
+    /// Reads slot+1 (Config packed field at offset 0).
     pub fn is_initialized(&self) -> Result<bool> {
         let config: Config = self.config.read()?;
         Ok(config.is_init)
