@@ -24,6 +24,7 @@ pub(crate) use core::{ApiCore, EvmExecutor};
 mod mainnet;
 
 mod bsc;
+mod citrea;
 mod op;
 mod mantle;
 mod warmup;

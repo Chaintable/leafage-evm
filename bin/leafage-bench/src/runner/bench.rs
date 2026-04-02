@@ -1,64 +1,25 @@
-pub(crate) mod export;
-pub(crate) mod render;
-mod summary;
-
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use crate::bench_runner::export::{
+use crate::render::report::{CompareAggReport, CompareReport, Report, SummaryReport};
+use crate::runner::export::{
     AggSummaryOutput, AggregatedOutput, BenchmarkOutput, RoundOutput, RunMetadata, SummaryOutput,
     VerboseOutput, VerboseRound,
 };
-use crate::bench_runner::render::report::{CompareAggReport, CompareReport, Report, SummaryReport};
-use crate::bench_runner::summary::{AggregatedSummary, RunSummary};
-use crate::corpus::Corpus;
-use crate::corpus::{ClassLabel, CorpusCase};
+use crate::runner::summary::{AggregatedSummary, RunSummary};
+use crate::runner::{build_client, run_cases, CaseResult};
+use crate::corpus::{Corpus, CorpusCase};
 use anyhow::Result;
-use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_rpc::EthApiClient;
-use leafage_evm_types::{BlockId, Bytes};
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::SeedableRng;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-
-#[derive(Debug)]
-pub struct CaseResult {
-    #[allow(dead_code)]
-    pub case_id: String,
-    pub label: ClassLabel,
-    pub latency: Duration,
-    pub outcome: Outcome,
-}
-
-pub type Outcome = std::result::Result<Bytes, jsonrpsee::core::client::error::Error>;
-
-impl CaseResult {
-    pub fn is_ok(&self) -> bool {
-        match self.outcome {
-            Ok(_) => true,
-            Err(ref err) => match err {
-                jsonrpsee::core::client::error::Error::Call(call_err) => {
-                    let msg = call_err.message();
-                    msg.contains("execution reverted") || msg.contains("Reverted")
-                }
-                _ => false,
-            },
-        }
-    }
-}
+use jsonrpsee::http_client::HttpClient;
+use std::time::Duration;
 
 /// Options passed from CLI into the benchmark runner.
-pub struct RunConfig {
+pub struct BenchConfig {
     pub requests: Option<usize>,
     pub shuffle_seed: Option<u64>,
     pub rounds: usize,
     pub output_dir: Option<PathBuf>,
     pub verbose: bool,
-    // metadata fields for JSON export
     pub target_url: String,
     pub compare_url: Option<String>,
     pub concurrency: usize,
@@ -67,45 +28,31 @@ pub struct RunConfig {
 }
 
 pub struct BenchRunner {
-    /// Primary endpoint client (leafage-evm).
     target: HttpClient,
-    /// Optional comparison endpoint client (geth).
     compare: Option<HttpClient>,
-    cfg: RunConfig,
+    cfg: BenchConfig,
 }
 
-/// Result of a single benchmark round.
 struct RoundResult {
     target: (Vec<CaseResult>, Duration),
     compare: Option<(Vec<CaseResult>, Duration)>,
 }
 
 impl BenchRunner {
-    pub fn new(cfg: RunConfig) -> Result<Self> {
-        let build = |url: &str| -> Result<HttpClient> {
-            Ok(HttpClientBuilder::default()
-                .request_timeout(Duration::from_secs(30))
-                .build(url)?)
-        };
+    pub fn new(cfg: BenchConfig) -> Result<Self> {
         Ok(Self {
-            target: build(cfg.target_url.as_str())?,
+            target: build_client(cfg.target_url.as_str())?,
             compare: cfg
                 .compare_url
                 .as_ref()
-                .map(|url| build(url.as_str()))
+                .map(|url| build_client(url.as_str()))
                 .transpose()?,
             cfg,
         })
     }
 
-    pub async fn run(&self, mut corpus: Corpus) -> Result<()> {
+    pub async fn run(&self, corpus: Corpus) -> Result<()> {
         let metadata: RunMetadata = (&self.cfg).into();
-
-        if let Some(seed) = self.cfg.shuffle_seed {
-            let mut rng = StdRng::seed_from_u64(seed);
-            corpus.cases.shuffle(&mut rng);
-        }
-
         let rounds = self.cfg.rounds;
 
         let mut verbose_rounds: Vec<VerboseRound> = Vec::with_capacity(rounds);
@@ -126,8 +73,8 @@ impl BenchRunner {
             verbose_rounds.push(verbose);
             benchmark_output.rounds.push(output);
             target_summaries.push(target_summary);
-            if let Some(compare_summary) = compare_summary {
-                compare_summaries.push(compare_summary);
+            if let Some(cs) = compare_summary {
+                compare_summaries.push(cs);
             }
         }
 
@@ -137,7 +84,8 @@ impl BenchRunner {
             Some(compare_summaries.as_slice())
         };
         self.render_final_report(&target_summaries, compare_ref)?;
-        benchmark_output.aggregated = Self::build_aggregated_output(&target_summaries, compare_ref);
+        benchmark_output.aggregated =
+            Self::build_aggregated_output(&target_summaries, compare_ref);
 
         self.write_benchmark_output(&benchmark_output, &verbose_rounds.into())
             .await?;
@@ -145,27 +93,20 @@ impl BenchRunner {
         Ok(())
     }
 
-    /// Run a single round against the target (and optionally the compare) endpoint.
     async fn run_round(&self, cases: &[CorpusCase]) -> Result<RoundResult> {
-        let total_requests = self.resolve_total_requests();
+        let total = self.resolve_total_requests();
 
         let target = run_cases(
             self.target.clone(),
             cases.to_vec(),
             self.cfg.concurrency,
-            total_requests,
+            total,
         )
         .await?;
 
-        let compare = if let Some(ref cmp_client) = self.compare {
+        let compare = if let Some(ref cmp) = self.compare {
             Some(
-                run_cases(
-                    cmp_client.clone(),
-                    cases.to_vec(),
-                    self.cfg.concurrency,
-                    total_requests,
-                )
-                .await?,
+                run_cases(cmp.clone(), cases.to_vec(), self.cfg.concurrency, total).await?,
             )
         } else {
             None
@@ -174,7 +115,6 @@ impl BenchRunner {
         Ok(RoundResult { target, compare })
     }
 
-    /// Process raw round results into verbose output, round output, and summaries.
     fn process_round(
         &self,
         round: usize,
@@ -239,7 +179,7 @@ impl BenchRunner {
             if !dir.exists() {
                 tokio::fs::create_dir_all(dir).await?;
             }
-            export::write_outputs(dir, output, verbose, self.cfg.verbose).await?;
+            crate::runner::export::write_outputs(dir, output, verbose, self.cfg.verbose).await?;
         }
         Ok(())
     }
@@ -276,7 +216,6 @@ impl BenchRunner {
             };
             report.render_report(w)?;
         } else {
-            // Multi-round target only
             agg_target.render_report(w)?;
         }
 
@@ -287,7 +226,6 @@ impl BenchRunner {
         target_summaries: &[RunSummary],
         compare_summaries: Option<&[RunSummary]>,
     ) -> Option<AggregatedOutput> {
-        // Only produce aggregated output for multi-round runs
         if target_summaries.len() <= 1 {
             return None;
         }
@@ -306,43 +244,3 @@ impl BenchRunner {
     }
 }
 
-/// Dispatch all cases to `client` with bounded concurrency.
-async fn run_cases(
-    client: HttpClient,
-    cases: Vec<CorpusCase>,
-    concurrency: usize,
-    total_requests: usize,
-) -> Result<(Vec<CaseResult>, Duration)> {
-    let sem = Arc::new(Semaphore::new(concurrency));
-    let mut set = JoinSet::new();
-    let wall_start = Instant::now();
-
-    for i in 0..total_requests {
-        let case = &cases[i % cases.len()];
-        let client = client.clone();
-        let sem = Arc::clone(&sem);
-        let case_id = case.case_id.clone();
-        let label = case.classification.label;
-        let request = case.request.clone();
-        let block_id = BlockId::latest();
-
-        set.spawn(async move {
-            let _permit = sem.acquire_owned().await?;
-            let start = Instant::now();
-            let outcome = client.call(request, block_id, None, None).await;
-            Ok::<CaseResult, anyhow::Error>(CaseResult {
-                case_id,
-                label,
-                latency: start.elapsed(),
-                outcome,
-            })
-        });
-    }
-
-    let mut results = Vec::with_capacity(total_requests);
-    while let Some(res) = set.join_next().await {
-        results.push(res??);
-    }
-
-    Ok((results, wall_start.elapsed()))
-}

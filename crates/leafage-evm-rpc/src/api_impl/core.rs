@@ -3,6 +3,7 @@ use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
+use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
@@ -69,9 +70,9 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
     /// Calls EIP-2935 blockhashes and EIP-4788 beacon root system contracts.
     fn apply_pre_execution_changes<StateDB>(
         &self,
-        header: impl BlockHeader,
-        block_env: &BlockEnv,
-        state: &mut StateDB,
+        _header: impl BlockHeader,
+        _block_env: &BlockEnv,
+        _state: &mut StateDB,
     ) -> RpcResult<()>
     where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
@@ -108,6 +109,7 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
+
 }
 
 pub(crate) trait TxSetter {
@@ -146,6 +148,7 @@ pub enum MultiChainCfgEnv {
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
     Tempo(CfgEnv<MainnetSpecId>),
+    Citrea(CfgEnv<CitreaHardfork>),
 }
 
 impl MultiChainCfgEnv {
@@ -157,6 +160,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }
     }
 }

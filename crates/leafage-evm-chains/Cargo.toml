@@ -30,6 +30,7 @@ secp256k1 = { workspace = true, features = [
 p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
 num-bigint.workspace = true
 bech32.workspace = true
+k256.workspace = true
 
 #only use in bsc precompile
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }

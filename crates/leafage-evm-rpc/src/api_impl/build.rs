@@ -191,6 +191,7 @@ where
                 .await;
                 register_api(&mut rpc_module, api)?;
             }
+            MultiChainCfgEnv::Citrea(env) => run_chain_setup!(env, None),
         };
 
         let handle = server.start(rpc_module);
