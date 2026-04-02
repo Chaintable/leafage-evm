@@ -1335,4 +1335,298 @@ mod tests {
         let result = handler.apply_eip7702_auth_list(&mut evm);
         assert!(result.is_ok());
     }
+
+    // ==================== validate_env rejection tests ====================
+
+    /// Helper: construct an AA tx for validate_env tests.
+    fn make_aa_tx_for_validate(
+        calls: Vec<crate::tempo::tx::TempoCall>,
+    ) -> crate::tempo::tx::TempoTxEnv {
+        use crate::tempo::tx::{TempoTxEnv, TempoTxFields};
+        use revm::primitives::Address;
+        TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0x01),
+                gas_limit: 10_000_000,
+                nonce: 1,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: calls,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn test_validate_env_rejects_value_transfer() {
+        use crate::tempo::tx::TempoTxEnv;
+
+        let mut evm = make_evm();
+        let tx = TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0x01),
+                gas_limit: 10_000_000,
+                value: U256::from(1u64), // non-zero value
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: None,
+        };
+        let result = evm.transact(tx);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("value transfer not allowed"),
+            "expected 'value transfer not allowed', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_env_rejects_empty_calls() {
+        let mut evm = make_evm();
+        let tx = make_aa_tx_for_validate(vec![]); // empty aa_calls
+        let result = evm.transact(tx);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("AA calls list cannot be empty"),
+            "expected 'AA calls list cannot be empty', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_env_rejects_create_not_first() {
+        use crate::tempo::tx::TempoCall;
+        use revm::primitives::{Bytes, TxKind};
+
+        let mut evm = make_evm();
+        let calls = vec![
+            TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+            TempoCall {
+                to: TxKind::Create, // CREATE as second call
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+        ];
+        let tx = make_aa_tx_for_validate(calls);
+        let result = evm.transact(tx);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("only the first call"),
+            "expected 'only the first call', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_env_rejects_create_with_auth_list() {
+        use crate::tempo::tx::{TempoAuthGas, TempoCall, TempoTxEnv, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind};
+
+        let mut evm = make_evm();
+        let tx = TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0x01),
+                gas_limit: 10_000_000,
+                nonce: 1,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: vec![TempoCall {
+                    to: TxKind::Create,
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                }],
+                auth_list: vec![TempoAuthGas {
+                    sig_type: crate::tempo::tx::TempoSigType::Secp256k1,
+                    nonce: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let result = evm.transact(tx);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("calls cannot contain CREATE when authorization list"),
+            "expected 'calls cannot contain CREATE when authorization list', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_env_rejects_expiring_nonce_without_valid_before() {
+        use crate::tempo::tx::{TempoCall, TempoTxEnv, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind};
+
+        let mut evm = make_evm();
+        let tx = TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0x01),
+                gas_limit: 10_000_000,
+                nonce: 1,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: vec![TempoCall {
+                    to: TxKind::Call(Address::with_last_byte(0x01)),
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                }],
+                nonce_key: U256::MAX,      // expiring nonce
+                valid_before: None,         // missing valid_before
+                ..Default::default()
+            }),
+        };
+        let result = evm.transact(tx);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expiring nonce transaction requires valid_before"),
+            "expected 'expiring nonce transaction requires valid_before', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_env_allows_system_tx() {
+        use crate::tempo::tx::TempoTxEnv;
+
+        let mut evm = make_evm();
+        // System tx: caller = Address::ZERO, gas_limit = 0
+        let tx = TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::ZERO,
+                gas_limit: 0,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: None,
+        };
+        // System tx should pass validate_env (though execution may fail later)
+        // We only check it doesn't fail at the validate_env step.
+        // transact() calls validate_env first, then validate_initial_tx_gas, etc.
+        // System tx has gas_limit=0, validate_initial_tx_gas returns default (0).
+        // Execution with 0 gas will hit OOG, but that's a Halt, not an Err.
+        let result = evm.transact(tx);
+        // Should not be an Err from validate_env — it should be Ok (possibly with a Halt)
+        assert!(
+            result.is_ok(),
+            "system tx should not error at validate_env, got: {:?}",
+            result.err()
+        );
+    }
+
+    // ==================== key authorization gas tests ====================
+
+    #[test]
+    fn test_aa_gas_key_authorization() {
+        use crate::tempo::tx::{TempoCall, TempoKeyAuthGas, TempoSigType, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind};
+
+        let make_fields = |key_auth: Option<TempoKeyAuthGas>| TempoTxFields {
+            aa_calls: vec![TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }],
+            key_auth,
+            ..Default::default()
+        };
+
+        let fields_none = make_fields(None);
+        let fields_with = make_fields(Some(TempoKeyAuthGas {
+            sig_type: TempoSigType::Secp256k1,
+            num_limits: 0,
+        }));
+
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.base.gas_limit = 10_000_000;
+        let gas_params = &evm.inner.ctx.cfg.gas_params;
+        let hardfork = crate::tempo::hardfork::TempoHardfork::from_timestamp(1_770_908_500);
+
+        evm.inner.ctx.tx.tempo_fields = Some(fields_none.clone());
+        let gas_none = calculate_aa_batch_intrinsic_gas(
+            evm.ctx().tx.tempo_fields.as_ref().unwrap(),
+            gas_params,
+            &evm,
+            hardfork,
+        )
+        .unwrap();
+
+        evm.inner.ctx.tx.tempo_fields = Some(fields_with.clone());
+        let gas_with = calculate_aa_batch_intrinsic_gas(
+            evm.ctx().tx.tempo_fields.as_ref().unwrap(),
+            gas_params,
+            &evm,
+            hardfork,
+        )
+        .unwrap();
+
+        // key_auth with secp256k1 and 0 limits:
+        // key_auth_gas = ECRECOVER_GAS + primitive_sig_gas(Secp256k1, 0) + KEY_AUTH_BASE_GAS
+        //              = 3000 + 0 + 27000 = 30000
+        let expected_diff = KEY_AUTH_BASE_GAS + ECRECOVER_GAS;
+        assert_eq!(
+            gas_with.initial_gas - gas_none.initial_gas,
+            expected_diff,
+            "key_auth (secp256k1, 0 limits) should add {} gas",
+            expected_diff
+        );
+    }
+
+    #[test]
+    fn test_aa_gas_key_authorization_with_limits() {
+        use crate::tempo::tx::{TempoCall, TempoKeyAuthGas, TempoSigType, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind};
+
+        let make_fields = |num_limits: u32| TempoTxFields {
+            aa_calls: vec![TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }],
+            key_auth: Some(TempoKeyAuthGas {
+                sig_type: TempoSigType::Secp256k1,
+                num_limits,
+            }),
+            ..Default::default()
+        };
+
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.base.gas_limit = 10_000_000;
+        let gas_params = &evm.inner.ctx.cfg.gas_params;
+        let hardfork = crate::tempo::hardfork::TempoHardfork::from_timestamp(1_770_908_500);
+
+        evm.inner.ctx.tx.tempo_fields = Some(make_fields(0));
+        let gas_0 = calculate_aa_batch_intrinsic_gas(
+            evm.ctx().tx.tempo_fields.as_ref().unwrap(),
+            gas_params,
+            &evm,
+            hardfork,
+        )
+        .unwrap();
+
+        evm.inner.ctx.tx.tempo_fields = Some(make_fields(3));
+        let gas_3 = calculate_aa_batch_intrinsic_gas(
+            evm.ctx().tx.tempo_fields.as_ref().unwrap(),
+            gas_params,
+            &evm,
+            hardfork,
+        )
+        .unwrap();
+
+        // Pre-T1B: each limit costs KEY_AUTH_PER_LIMIT_GAS (22000).
+        // With 3 limits: 3 * 22000 = 66000 more than 0 limits.
+        let expected_diff = 3 * KEY_AUTH_PER_LIMIT_GAS;
+        assert_eq!(
+            gas_3.initial_gas - gas_0.initial_gas,
+            expected_diff,
+            "3 limits should add {} gas (3 * {})",
+            expected_diff,
+            KEY_AUTH_PER_LIMIT_GAS
+        );
+    }
 }

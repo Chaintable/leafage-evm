@@ -1072,4 +1072,202 @@ mod tests {
             other => panic!("T2: expected Revert(UnauthorizedCaller), got: {other:?}"),
         }
     }
+
+    // ==================== AA batch execution semantics tests ====================
+
+    /// AA batch with a failing sub-call: entire batch reverts atomically.
+    ///
+    /// Setup: TIP20 token with sender balance = 1000. Two calls:
+    ///   1. transfer(valid_recipient, 500) — would succeed in isolation
+    ///   2. transfer(valid_recipient, 501) — exceeds remaining balance → fails
+    ///
+    /// Since sub-call 2 fails, the entire batch reverts via checkpoint_revert.
+    /// Sender's balance must remain unchanged (1000), proving atomicity.
+    #[test]
+    fn test_aa_batch_atomic_revert() {
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use crate::tempo::tx::{TempoCall, TempoTxEnv, TempoTxFields};
+        use revm::bytecode::Bytecode;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::{Address, Bytes, TxKind, U256};
+        use revm::state::AccountInfo;
+
+        // TIP20 pathUSD precompile address (token 0): 0x20c0...0000
+        let tip20_addr = Address::new({
+            let mut a = [0u8; 20];
+            a[0] = 0x20;
+            a[1] = 0xc0;
+            a
+        });
+
+        let sender = Address::with_last_byte(0xAA);
+        let recipient = Address::with_last_byte(0xBB);
+        let initial_balance = U256::from(1000u64);
+
+        // --- Set up CacheDB with TIP20 state ---
+        let mut db = CacheDB::new(revm::database::EmptyDB::default());
+
+        db.insert_account_info(
+            tip20_addr,
+            AccountInfo {
+                code_hash: Bytecode::new_legacy(vec![0xef].into()).hash_slow(),
+                code: Some(Bytecode::new_legacy(vec![0xef].into())),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        // Slot 7: transfer_policy_id = 1 (ALLOW_ALL) packed at byte offset 20.
+        let slot7_value = U256::from(1u64) << 160;
+        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value).unwrap();
+
+        // Slot 9: balances[sender] = 1000
+        let balance_slot = sender.mapping_slot(U256::from(9));
+        db.insert_account_storage(tip20_addr, balance_slot, initial_balance).unwrap();
+
+        // Slot 8: total_supply >= balance
+        db.insert_account_storage(tip20_addr, U256::from(8), initial_balance).unwrap();
+
+        db.insert_account_info(sender, AccountInfo::default());
+
+        // --- Build AA batch: 2 transfers, second exceeds balance ---
+        // transfer(address,uint256) = 0xa9059cbb
+        let make_transfer_calldata = |amount: U256| -> Bytes {
+            let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
+            data.extend_from_slice(&{
+                let mut buf = [0u8; 32];
+                buf[12..].copy_from_slice(recipient.as_slice());
+                buf
+            });
+            data.extend_from_slice(&amount.to_be_bytes::<32>());
+            Bytes::from(data)
+        };
+
+        let calls = vec![
+            TempoCall {
+                to: TxKind::Call(tip20_addr),
+                value: U256::ZERO,
+                input: make_transfer_calldata(U256::from(500u64)),
+            },
+            TempoCall {
+                to: TxKind::Call(tip20_addr),
+                value: U256::ZERO,
+                input: make_transfer_calldata(U256::from(501u64)), // exceeds remaining 500
+            },
+        ];
+
+        let tx = TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: sender,
+                gas_limit: 10_000_000,
+                nonce: 1,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: calls,
+                ..Default::default()
+            }),
+        };
+
+        let mut evm = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100), // Post-T1A
+            db,
+            NoOpInspector,
+            false,
+        );
+        let result = evm.transact(tx).expect("AA batch transact should not Err");
+
+        // The batch should have reverted (second call fails).
+        assert!(
+            matches!(result.result, revm::context_interface::result::ExecutionResult::Revert { .. }),
+            "expected Revert from failing batch, got: {:?}",
+            result.result
+        );
+
+        // Verify sender's balance is unchanged in the state diff.
+        // After revert, state changes from call 1 are rolled back,
+        // so the sender balance slot should either not appear in state
+        // or appear with its original value.
+        let tip20_state = result.state.get(&tip20_addr);
+        if let Some(account) = tip20_state {
+            let balance_slot_u256 = sender.mapping_slot(U256::from(9));
+            if let Some(slot) = account.storage.get(&balance_slot_u256) {
+                // present_value should equal original (1000) after revert
+                assert_eq!(
+                    slot.present_value, initial_balance,
+                    "sender balance should be unchanged after atomic revert"
+                );
+            }
+        }
+    }
+
+    /// AA batch with multiple calls: gas accumulates across sub-calls.
+    ///
+    /// Single empty call vs. three empty calls to different addresses.
+    /// Three calls cost more due to additional CALL opcodes.
+    #[test]
+    fn test_aa_batch_gas_accumulation() {
+        use crate::tempo::tx::{TempoCall, TempoTxEnv, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind, U256};
+
+        let single_call = vec![TempoCall {
+            to: TxKind::Call(Address::with_last_byte(0x01)),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }];
+
+        let triple_call = vec![
+            TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+            TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x02)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+            TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x03)),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+        ];
+
+        let make_tx = |calls: Vec<TempoCall>| TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::ZERO,
+                gas_limit: 10_000_000,
+                nonce: 1,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: calls,
+                ..Default::default()
+            }),
+        };
+
+        let mut evm_1 = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_1 = evm_1.transact(make_tx(single_call)).expect("single call").result.gas_used();
+
+        let mut evm_3 = TempoEvm::new(
+            make_env_aa(1_770_908_400 + 100),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_3 = evm_3.transact(make_tx(triple_call)).expect("triple call").result.gas_used();
+
+        assert!(
+            gas_3 > gas_1,
+            "3-call gas ({gas_3}) should exceed 1-call gas ({gas_1}), proving accumulation"
+        );
+    }
 }
