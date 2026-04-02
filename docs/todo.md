@@ -91,7 +91,8 @@
 
 - [x] ~~**预编译内部 gas 动态化**~~ — 已实现：`LeafageStorageProvider` 新增 `sstore_set_cost()` 和 `code_deposit_cost_per_byte()` 方法，根据 `self.spec.is_t1()` 返回 TIP-1000 值或标准 Ethereum 值。sstore、set_code、sstore_refund 三处改为动态调用。pre-T1A trace 内部 gasUsed 现在与 writer 一致
 - [x] ~~**TempoTxEnv AA 扩展字段**~~ — 已实现全部字段：gas 字段（`sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`）+ tx 字段（`key_id`/`fee_token`/`fee_payer`/`valid_after`/`valid_before`）。`is_system_tx`/`subblock_metadata` 读节点不需要
-- **ValidatorConfigV2 pre-execution code 注入** — T2 已激活 (block 0xbb88b3, ts=1774965600)。Writer 注入 `0xef` bytecode，但 leafage pipeline 未同步此 code（eth_getCode: W=0xef, L=0x）。eth_call 返回值正确（precompile lookup by address），仅 eth_multiCall gasUsed 偏高 2100。需排查 pipeline 对 `apply_pre_execution_changes` code 变更的处理
+- [x] ~~**ValidatorConfigV2 gasUsed +2100**~~ — 已修复：根因是 `owner()` 读整个 Config struct（2 slots），writer 只读 owner 字段（1 slot）。修复为单 slot 读取。Vcv2CodeInjector DB wrapper 注入 0xef code 确保 EVM 执行路径正确
+- **VCV2 eth_getCode 返回 0x（KNOWN_DIFF）** — pipeline 未同步 `apply_pre_execution_changes` 的 code 注入。eth_getCode 直接读 StateDB 不走 EVM 执行路径，Vcv2CodeInjector 不生效。仅影响 eth_getCode 查询，不影响 eth_call/multiCall/pre_traceMany 的执行和 gas
 - [x] ~~**TempoBlockEnv timestamp_millis_part**~~ — 已实现：`TempoBlockEnv` 替代 `BlockEnv` 作为 `TempoContext` 的 block 类型，`MILLIS_TIMESTAMP` (0x4F) opcode 在 pre-T1C 注册到指令表。`timestamp_millis_part` 默认 0（pipeline 不携带此字段），archive 模式 pre-T1C eth_call 的 0x4F 返回 `timestamp * 1000`
 - ~~Fee log 生成~~ — **实测确认**：Tempo writer 的 eth_call / pre_traceMany 无论 gas_price 是否为 0 都不产生 fee log（`disable_base_fee=true` 使 fee handler 始终短路）。leafage 行为一致，无差异
 - [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
