@@ -34,8 +34,8 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-#[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "citrea"], default_value = "mainnet")]
-evm_type: String,
+    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea"], default_value = "mainnet")]
+    evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
     ///
@@ -298,6 +298,9 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "op" {
         return Ok(10);
     }
+    if arg == "tempo" {
+        return Ok(4217);
+    }
     if arg.parse::<u64>().is_ok() {
         return Ok(arg.parse().unwrap());
     } else {
@@ -411,6 +414,16 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mantle(chain_cfg))
+            }
+            "tempo" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Tempo(chain_cfg))
             }
             "citrea" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));

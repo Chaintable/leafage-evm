@@ -29,6 +29,7 @@ mod op;
 mod mantle;
 mod warmup;
 mod cosmos;
+mod tempo;
 
 pub(crate) mod token_collector;
 pub use token_collector::TokenCollector;

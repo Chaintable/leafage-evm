@@ -1,6 +1,8 @@
 use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
+use super::api_impl::NoneEvmCustomConfig;
+use super::tempo::api::TempoEvmCustomConfig;
 use super::token_collector::TokenCollector;
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
@@ -151,13 +153,44 @@ where
         }
 
         match self.cfg.clone() {
-            MultiChainCfgEnv::Mainnet(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Mainnet(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None),
             MultiChainCfgEnv::Bsc(env) => run_chain_setup!(env, None),
             MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Tempo(env) => {
+                // Tempo: set virtual balance placeholder (no native token).
+                // Writer returns this for all eth_getBalance calls.
+                // Ported from: crates/node/src/rpc/mod.rs NATIVE_BALANCE_PLACEHOLDER
+                use alloy::primitives::uint;
+                let mut api_impl = ApiImpl::new(
+                    self.db,
+                    env,
+                    None::<TempoEvmCustomConfig>,
+                    self.ovm_address.clone(),
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                    version.clone(),
+                    estimate_gas_buffer,
+                    self.token_collector.clone(),
+                );
+                api_impl.evm_cfg.is_tempo = true;
+                api_impl.evm_cfg.virtual_balance = Some(uint!(4242424242424242424242424242424242424242424242424242424242424242424242424242_U256));
+                let api = Api::new(api_impl);
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
+                register_api(&mut rpc_module, api)?;
+            }
             MultiChainCfgEnv::Citrea(env) => run_chain_setup!(env, None),
         };
 

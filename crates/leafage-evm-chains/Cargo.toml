@@ -41,6 +41,8 @@ tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = 
     "secp256k1",
 ] }
 bytes = "1.10.1"
+scoped-tls = "1.0"
+ed25519-consensus = { workspace = true }
 
 [dev-dependencies]
 elliptic-curve.workspace = true

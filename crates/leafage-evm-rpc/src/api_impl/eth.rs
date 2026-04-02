@@ -134,8 +134,8 @@ where
                 decode_revert_reason(&output).unwrap_or("execution revert".to_string())
             ))
             .into()),
-            ExecutionResult::Halt { reason, gas_used } => {
-                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas_used)).into())
+            ExecutionResult::Halt { reason, gas, .. } => {
+                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.used())).into())
             }
         }
     }
@@ -387,6 +387,10 @@ where
     }
 
     fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
+        // Tempo: return virtual balance placeholder (no native token).
+        if let Some(vb) = self.inner.evm_cfg().virtual_balance {
+            return Ok(vb);
+        }
         let state: Option<_> = self
             .inner
             .db()

@@ -68,31 +68,31 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
     fn from(exec_res: ExecutionResult<T>) -> Self {
         let res = match exec_res {
             ExecutionResult::Success {
-                output, gas_used, ..
+                output, gas, ..
             } => SingleCallResult {
                 code: MultiCallErrorCode::Success as i32,
                 err: "".to_string(),
                 from_cache: false,
                 result: output.into_data().0.into(),
-                gas_used: gas_used as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
             ExecutionResult::Revert {
-                output, gas_used, ..
+                output, gas, ..
             } => SingleCallResult {
                 code: MultiCallErrorCode::EVMReverted as i32,
                 err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
                 result: Bytes::default(),
-                gas_used: gas_used as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
-            ExecutionResult::Halt { reason, gas_used } => SingleCallResult {
+            ExecutionResult::Halt { reason, gas, .. } => SingleCallResult {
                 code: MultiCallErrorCode::EVMCancelled as i32,
                 err: format!("Halted: {:?}", reason),
                 from_cache: false,
                 result: Bytes::default(),
-                gas_used: gas_used as i64,
+                gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
         };

@@ -3,4 +3,5 @@
 /test
 /.idea
 bench-result/
+.claude/
 .sisyphus/

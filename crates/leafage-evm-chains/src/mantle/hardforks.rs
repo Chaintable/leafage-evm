@@ -1,4 +1,5 @@
 use leafage_evm_types::{CfgEnv, OpSpecId};
+use revm::primitives::hardfork::SpecId;
 use std::ops::{Deref, DerefMut};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,9 +31,15 @@ impl From<MantleHardfork> for OpSpecId {
     }
 }
 
+impl From<MantleHardfork> for SpecId {
+    fn from(spec: MantleHardfork) -> Self {
+        OpSpecId::from(spec).into()
+    }
+}
+
 impl MantleHardfork {
     pub fn convert_cfg_env(cfg: CfgEnv<MantleHardfork>) -> CfgEnv<OpSpecId> {
-        let spec = cfg.spec.into();
-        cfg.with_spec(spec)
+        let spec: OpSpecId = cfg.spec.into();
+        cfg.with_spec_and_mainnet_gas_params(spec)
     }
 }

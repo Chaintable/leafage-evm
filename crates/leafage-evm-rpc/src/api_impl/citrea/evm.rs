@@ -26,7 +26,7 @@ where
 {
     let spec = cfg.spec;
     let eth_precompiles: EthPrecompiles = CitreaPrecompiles::new(spec).into();
-    let mainnet_cfg = cfg.with_spec(MainnetSpecId::from(spec));
+    let mainnet_cfg = cfg.with_spec_and_mainnet_gas_params(MainnetSpecId::from(spec));
     Context::mainnet()
         .with_block(block_env)
         .with_cfg(mainnet_cfg)

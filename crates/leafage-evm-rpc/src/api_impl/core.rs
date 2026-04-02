@@ -24,6 +24,13 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
+    /// Whether this is a Tempo chain (chain ID 4217).
+    /// Controls Tempo-specific RPC behavior: TIP-20 gas estimation, no_code_callee skip, etc.
+    pub is_tempo: bool,
+    /// Virtual balance returned by getBalance/getAddressBalance.
+    /// When set, all balance queries return this value instead of reading state.
+    /// Used by Tempo (no native token — returns sentinel `4242...4242`).
+    pub virtual_balance: Option<alloy::primitives::U256>,
 }
 
 pub(crate) trait ApiCore: ApiBase + EvmExecutor {}
@@ -140,6 +147,7 @@ pub enum MultiChainCfgEnv {
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
+    Tempo(CfgEnv<MainnetSpecId>),
     Citrea(CfgEnv<CitreaHardfork>),
 }
 
@@ -151,6 +159,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }
     }

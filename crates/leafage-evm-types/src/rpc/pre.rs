@@ -52,7 +52,7 @@ where
 {
     fn from(exec_res: ExecutionResult<T>) -> Self {
         match exec_res {
-            ExecutionResult::Revert { gas_used, output } => {
+            ExecutionResult::Revert { gas, output, .. } => {
                 let reason = decode_revert_reason(&output).unwrap_or("execution revert".to_string());
                 let pre_error = PreError {
                     msg: reason,
@@ -60,12 +60,12 @@ where
                 };
                 let pre_res = PreResult {
                     error: pre_error,
-                    gas_used,
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res
             }
-            ExecutionResult::Halt { reason, gas_used } => {
+            ExecutionResult::Halt { reason, gas, .. } => {
                 let code = PreErrorCode::from(reason.clone()) as i64;
                 let pre_error = PreError {
                     msg: format!("{:?}", reason),
@@ -73,12 +73,12 @@ where
                 };
                 let pre_res = PreResult {
                     error: pre_error,
-                    gas_used,
+                    gas_used: gas.used(),
                     ..Default::default()
                 };
                 pre_res
             }
-            ExecutionResult::Success { gas_used, logs, .. } => {
+            ExecutionResult::Success { gas, logs, .. } => {
                 let mut trace_logs = vec![];
                 let mut log_index = 0;
                 for log in logs {
@@ -91,7 +91,7 @@ where
                     log_index += 1;
                 }
                 let pre_res = PreResult {
-                    gas_used,
+                    gas_used: gas.used(),
                     logs: trace_logs,
                     ..Default::default()
                 };
