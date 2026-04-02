@@ -72,7 +72,7 @@
 
 ### P0 — 上线前
 
-- [x] ~~**集成测试**~~ — 已完成：705 项测试，0 FAIL，15 已知差异（revert format），dev 环境 blockchain-misc-x3 镜像 amd64-234fdd7
+- [x] ~~**集成测试**~~ — 已完成：781 项测试（含 Section 14 T2 Hardfork 41 项），0 FAIL，23 已知差异。12.4 SSTORE refund 已修复。T2 boundary (block 0xbb88b3) 全 5 个 hardfork 阶段覆盖。VCV2 0xef code 未同步 (pipeline 问题，非 leafage bug)
 - [x] ~~**estimateGas no_code_callee 早返回 bug**~~ — 已修复：Tempo 链跳过 `no_code_callee` 早返回优化
 - [x] ~~**estimateGas caller_gas_allowance**~~ — 已实现：`ReadOnlyStorageProvider` + `tempo_caller_gas_allowance()` 读 TIP-20 fee token 余额算 gas cap，与 writer 一致
 - ~~**estimateGas 单地址 1568 gas 差异**~~ — **Writer 端问题，Leafage 行为正确**。Leafage 对所有地址返回一致的 23982，与 writer 的 0x983b（无余额）一致。Writer 对 0x0cac（有 TIP-20 余额）返回 22414（低 1568），可能是 `caller_gas_allowance` 的 storage read 对后续 EVM 执行产生了副作用。Leafage 无此副作用，行为正确
@@ -91,7 +91,7 @@
 
 - [x] ~~**预编译内部 gas 动态化**~~ — 已实现：`LeafageStorageProvider` 新增 `sstore_set_cost()` 和 `code_deposit_cost_per_byte()` 方法，根据 `self.spec.is_t1()` 返回 TIP-1000 值或标准 Ethereum 值。sstore、set_code、sstore_refund 三处改为动态调用。pre-T1A trace 内部 gasUsed 现在与 writer 一致
 - [x] ~~**TempoTxEnv AA 扩展字段**~~ — 已实现全部字段：gas 字段（`sig_type`/`is_keychain`/`webauthn_data_size`/`key_auth`/`auth_list`）+ tx 字段（`key_id`/`fee_token`/`fee_payer`/`valid_after`/`valid_before`）。`is_system_tx`/`subblock_metadata` 读节点不需要
-- ~~**ValidatorConfigV2 pre-execution code 注入**~~ — **无需实现**。Writer 在 block execution 的 `apply_pre_execution_changes` 注入 `0xef` bytecode（T2 激活时），产生 state_diff → leafage 通过 pipeline 自动同步。且 T2 尚未激活（`MAINNET_T2_TIME = u64::MAX`）
+- **ValidatorConfigV2 pre-execution code 注入** — T2 已激活 (block 0xbb88b3, ts=1774965600)。Writer 注入 `0xef` bytecode，但 leafage pipeline 未同步此 code（eth_getCode: W=0xef, L=0x）。eth_call 返回值正确（precompile lookup by address），仅 eth_multiCall gasUsed 偏高 2100。需排查 pipeline 对 `apply_pre_execution_changes` code 变更的处理
 - [x] ~~**TempoBlockEnv timestamp_millis_part**~~ — 已实现：`TempoBlockEnv` 替代 `BlockEnv` 作为 `TempoContext` 的 block 类型，`MILLIS_TIMESTAMP` (0x4F) opcode 在 pre-T1C 注册到指令表。`timestamp_millis_part` 默认 0（pipeline 不携带此字段），archive 模式 pre-T1C eth_call 的 0x4F 返回 `timestamp * 1000`
 - ~~Fee log 生成~~ — **实测确认**：Tempo writer 的 eth_call / pre_traceMany 无论 gas_price 是否为 0 都不产生 fee log（`disable_base_fee=true` 使 fee handler 始终短路）。leafage 行为一致，无差异
 - [x] ~~Tempo hardfork 动态切换（如需 archive 模式）~~ — 已实现：`TempoHardfork::from_timestamp()` + `LeafageStorageProvider` 从 block timestamp 推导 + `TempoEvm::new()` 条件 GasParams
