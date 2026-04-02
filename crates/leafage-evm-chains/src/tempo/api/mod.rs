@@ -893,4 +893,183 @@ mod tests {
         // Pre-T2: reads policy_data + policy_set[sender] + policy_data + policy_set[recipient]
         // Post-T2: reads policy_data + policy_set[sender] only (short-circuit)
     }
+
+    // ==================== T2 Hardfork Tests ====================
+
+    /// T2 nonce gas repricing: existing_nonce_key and new_nonce_key each gain +200.
+    ///
+    /// T1C: existing=5000, new=22100
+    /// T2:  existing=5200, new=22300
+    ///
+    /// Executes AA txs at T1C and T2 timestamps with a nonzero nonce_key and
+    /// nonzero nonce (existing key path). The T2 tx should cost exactly 200 more.
+    #[test]
+    fn test_t2_nonce_gas_repricing() {
+        use revm::primitives::U256;
+
+        let pre_t2_ts = 1_773_327_600 + 100;  // T1C era
+        let post_t2_ts = 1_774_965_600 + 100;  // T2 era
+
+        let calls = vec![make_call(0x01, &[])];
+
+        // nonce_key = 1 (nonzero), nonce = 1 (existing key path)
+        let tx_pre = make_aa_tx(calls.clone(), 1, U256::from(1), 10_000_000);
+        let tx_post = make_aa_tx(calls, 1, U256::from(1), 10_000_000);
+
+        let mut evm_pre = TempoEvm::new(
+            make_env_aa(pre_t2_ts),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_pre = evm_pre.transact(tx_pre).expect("T1C transact").result.gas_used();
+
+        let mut evm_post = TempoEvm::new(
+            make_env_aa(post_t2_ts),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_post = evm_post.transact(tx_post).expect("T2 transact").result.gas_used();
+
+        // T2 existing nonce key costs 5200 vs T1C 5000 → exactly +200.
+        let diff = gas_post.saturating_sub(gas_pre);
+        assert_eq!(
+            diff, 200,
+            "T2 existing nonce gas should be +200 vs T1C, got diff={diff} (pre={gas_pre}, post={gas_post})"
+        );
+    }
+
+    /// T2 hardfork gas parameter values in TempoHardfork.
+    ///
+    /// Verifies `gas_existing_nonce_key` and `gas_new_nonce_key` return the
+    /// correct values for each era.
+    #[test]
+    fn test_t2_hardfork_gas_params() {
+        let t1c = TempoHardfork::T1C;
+        let t2 = TempoHardfork::T2;
+
+        // T1C nonce gas
+        assert_eq!(t1c.gas_existing_nonce_key(), 5_000, "T1C existing nonce key gas");
+        assert_eq!(t1c.gas_new_nonce_key(), 22_100, "T1C new nonce key gas");
+
+        // T2 nonce gas: each +200
+        assert_eq!(t2.gas_existing_nonce_key(), 5_200, "T2 existing nonce key gas");
+        assert_eq!(t2.gas_new_nonce_key(), 22_300, "T2 new nonce key gas");
+
+        // Deltas
+        assert_eq!(
+            t2.gas_existing_nonce_key() - t1c.gas_existing_nonce_key(),
+            200,
+            "existing nonce key delta should be +200"
+        );
+        assert_eq!(
+            t2.gas_new_nonce_key() - t1c.gas_new_nonce_key(),
+            200,
+            "new nonce key delta should be +200"
+        );
+    }
+
+    /// T2 hardfork gas params applied in TempoEvm constructor.
+    ///
+    /// TempoEvm at T2 timestamp should still have TIP-1000 gas overrides
+    /// (same as T1+), since T2 >= T1. Verifies the constructor propagates them.
+    #[test]
+    fn test_t2_evm_gas_params_applied() {
+        let evm = TempoEvm::new(
+            make_env(1_774_965_600 + 100), // T2 era
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gp = &evm.inner.ctx.cfg.gas_params;
+
+        // TIP-1000 overrides should still be active at T2
+        assert_eq!(gp.get(GasId::sstore_set_without_load_cost()), 250_000, "T2 SSTORE set should be 250k");
+        assert_eq!(gp.get(GasId::create()), 500_000, "T2 CREATE should be 500k");
+        assert_eq!(gp.get(GasId::tx_create_cost()), 500_000, "T2 tx_create should be 500k");
+        assert_eq!(gp.get(GasId::new_account_cost()), 250_000, "T2 new_account should be 250k");
+        assert_eq!(gp.get(GasId::code_deposit_cost()), 1_000, "T2 code_deposit should be 1k/byte");
+    }
+
+    /// T2 `ensure_admin_caller` requires tx_origin == msg_sender.
+    ///
+    /// Tests through `authorize_key` which calls `ensure_admin_caller` first.
+    /// In `with_read_only_storage_ctx`, tload() returns ZERO for all transient slots,
+    /// so `transaction_key = ZERO` (main key, passes) and `tx_origin = ZERO`.
+    ///
+    /// Pre-T2: admin check passes (no tx_origin verification), then fails at
+    ///         `expiry <= timestamp` with `ExpiryInPast`.
+    /// T2: admin check itself fails because `tx_origin == ZERO != msg_sender`,
+    ///     returning `UnauthorizedCaller` before reaching expiry check.
+    #[test]
+    fn test_t2_account_keychain_admin_requires_tx_origin() {
+        use alloy::sol_types::SolError;
+        use crate::tempo::precompile::account_keychain::{AccountKeychain, IAccountKeychain};
+        use crate::tempo::precompile::error::TempoPrecompileError;
+        use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+        use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::Address;
+
+        let msg_sender = Address::with_last_byte(0xAA);
+        let key_id = Address::with_last_byte(0x01);
+
+        let mut db = CacheDB::new(revm::database::EmptyDB::default());
+
+        // AccountKeychain must have code (initialized)
+        db.insert_account_info(
+            ACCOUNT_KEYCHAIN_ADDRESS,
+            revm::state::AccountInfo {
+                code_hash: revm::bytecode::Bytecode::new_legacy(vec![0xef].into()).hash_slow(),
+                code: Some(revm::bytecode::Bytecode::new_legacy(vec![0xef].into())),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        // Build an authorize_key call. expiry=0 so pre-T2 hits ExpiryInPast after
+        // admin check succeeds. keyId is nonzero to avoid ZeroPublicKey error.
+        let call = IAccountKeychain::authorizeKeyCall {
+            keyId: key_id,
+            signatureType: IAccountKeychain::SignatureType::Secp256k1,
+            expiry: 0,
+            enforceLimits: false,
+            limits: vec![],
+        };
+
+        // Pre-T2 (T1C): admin check passes (no tx_origin gate), fails at ExpiryInPast.
+        let result_pre_t2 = with_read_only_storage_ctx(&db, TempoHardfork::T1C, 4217, || {
+            let mut keychain = AccountKeychain::new();
+            keychain.authorize_key(msg_sender, call.clone())
+        });
+        match &result_pre_t2 {
+            Err(TempoPrecompileError::Revert(data)) => {
+                let expected = IAccountKeychain::ExpiryInPast {}.abi_encode();
+                assert_eq!(
+                    data.as_ref(),
+                    expected.as_slice(),
+                    "pre-T2: should fail with ExpiryInPast (admin check passed), got different revert"
+                );
+            }
+            other => panic!("pre-T2: expected Revert(ExpiryInPast), got: {other:?}"),
+        }
+
+        // T2: admin check fails at tx_origin gate → UnauthorizedCaller.
+        let result_t2 = with_read_only_storage_ctx(&db, TempoHardfork::T2, 4217, || {
+            let mut keychain = AccountKeychain::new();
+            keychain.authorize_key(msg_sender, call.clone())
+        });
+        match &result_t2 {
+            Err(TempoPrecompileError::Revert(data)) => {
+                let expected = IAccountKeychain::UnauthorizedCaller {}.abi_encode();
+                assert_eq!(
+                    data.as_ref(),
+                    expected.as_slice(),
+                    "T2: should fail with UnauthorizedCaller (tx_origin=ZERO), got different revert"
+                );
+            }
+            other => panic!("T2: expected Revert(UnauthorizedCaller), got: {other:?}"),
+        }
+    }
 }
