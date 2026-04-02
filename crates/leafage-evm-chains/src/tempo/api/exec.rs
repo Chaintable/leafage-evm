@@ -302,6 +302,12 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         // Errors are ignored — warm-up is best-effort (EmptyDB in tests, etc.).
         let _ = warm_fee_token_balance(evm);
 
+        // Increment 2D nonce in NonceManager for AA txs with nonceKey > 0.
+        // Writer does this in validate_against_state_and_deduct_caller (handler.rs:854-860).
+        // Without this, multi-tx batches (pre_traceMany) don't accumulate nonce state,
+        // causing every tx to see nonce=0 and trigger 250k new_account_cost.
+        increment_2d_nonce_if_needed(evm);
+
         // Set tx_origin in AccountKeychain transient storage for spending limit checks.
         // Writer does this in validate_against_state_and_deduct_caller (handler.rs:677-683)
         // for ALL transactions. Without it, tx_origin stays Address::ZERO and
@@ -522,6 +528,60 @@ fn warm_fee_token_balance<DB: Database, INSP>(
 /// skip enforcement when `account != tx_origin`. Without this, `tx_origin` stays
 /// `Address::ZERO` and spending limits are never applied.
 #[inline]
+/// Increments the 2D nonce in NonceManager for AA txs with nonceKey > 0.
+///
+/// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:854-860)
+/// via `StorageCtx::enter_evm`. Leafage uses direct journal sload/sstore.
+///
+/// This is critical for multi-tx batches (pre_traceMany): without it, every tx
+/// sees nonce=0 in NonceManager and triggers the 250k new_account_cost surcharge.
+/// With it, the first tx increments nonce to 1, subsequent txs see nonce=1 and
+/// only pay the 5k existing_nonce_key cost.
+#[inline]
+fn increment_2d_nonce_if_needed<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
+    use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+    use crate::tempo::precompile::storage_types::StorageKey;
+    use revm::context_interface::JournalTr;
+
+    let nonce_key = evm
+        .ctx()
+        .tx
+        .tempo_fields
+        .as_ref()
+        .map(|f| f.nonce_key)
+        .unwrap_or_default();
+
+    // Only for 2D nonce (nonceKey > 0, not expiring nonce MAX)
+    if nonce_key.is_zero() || nonce_key == U256::MAX {
+        return;
+    }
+
+    let caller = evm.ctx().tx.base.caller;
+    let slot = caller.mapping_slot(U256::ZERO);
+    let slot = nonce_key.mapping_slot(slot);
+
+    // load_account first to ensure NonceManager is in journal
+    let _ = evm
+        .ctx_mut()
+        .journal_mut()
+        .load_account(NONCE_PRECOMPILE_ADDRESS);
+
+    // sload current nonce
+    let current = evm
+        .ctx_mut()
+        .journal_mut()
+        .sload(NONCE_PRECOMPILE_ADDRESS, slot)
+        .map(|r| r.data.saturating_to::<u64>())
+        .unwrap_or(0);
+
+    // sstore incremented nonce
+    let _ = evm.ctx_mut().journal_mut().sstore(
+        NONCE_PRECOMPILE_ADDRESS,
+        slot,
+        U256::from(current + 1),
+    );
+}
+
 fn set_keychain_tx_origin<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
     use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
     use revm::context_interface::JournalTr;
@@ -1628,5 +1688,79 @@ mod tests {
             expected_diff,
             KEY_AUTH_PER_LIMIT_GAS
         );
+    }
+
+    // ==================== 2D nonce increment tests ====================
+
+    #[test]
+    fn test_increment_2d_nonce_writes_to_journal() {
+        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use revm::context_interface::JournalTr;
+
+        let caller = Address::with_last_byte(0xAA);
+        let nonce_key = U256::from(1);
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.base.caller = caller;
+        evm.inner.ctx.tx.tempo_fields = Some(crate::tempo::tx::TempoTxFields {
+            nonce_key,
+            ..Default::default()
+        });
+
+        // Before: nonce should be 0
+        let slot = caller.mapping_slot(U256::ZERO);
+        let slot = nonce_key.mapping_slot(slot);
+        let _ = evm.inner.ctx.journal_mut().load_account(NONCE_PRECOMPILE_ADDRESS);
+        let before = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .sload(NONCE_PRECOMPILE_ADDRESS, slot)
+            .map(|r| r.data.saturating_to::<u64>())
+            .unwrap_or(0);
+        assert_eq!(before, 0, "nonce should be 0 before increment");
+
+        // Act
+        increment_2d_nonce_if_needed(&mut evm);
+
+        // After: nonce should be 1
+        let after = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .sload(NONCE_PRECOMPILE_ADDRESS, slot)
+            .map(|r| r.data.saturating_to::<u64>())
+            .unwrap_or(0);
+        assert_eq!(after, 1, "nonce should be 1 after increment");
+    }
+
+    #[test]
+    fn test_increment_2d_nonce_skips_protocol_nonce() {
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.tempo_fields = Some(crate::tempo::tx::TempoTxFields {
+            nonce_key: U256::ZERO, // protocol nonce
+            ..Default::default()
+        });
+        // Should not panic or modify anything
+        increment_2d_nonce_if_needed(&mut evm);
+    }
+
+    #[test]
+    fn test_increment_2d_nonce_skips_expiring_nonce() {
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.tempo_fields = Some(crate::tempo::tx::TempoTxFields {
+            nonce_key: U256::MAX, // expiring nonce
+            ..Default::default()
+        });
+        // Should not panic or modify anything
+        increment_2d_nonce_if_needed(&mut evm);
+    }
+
+    #[test]
+    fn test_increment_2d_nonce_no_tempo_fields() {
+        let mut evm = make_evm();
+        // No tempo_fields at all (standard tx)
+        increment_2d_nonce_if_needed(&mut evm);
+        // Should not panic
     }
 }
