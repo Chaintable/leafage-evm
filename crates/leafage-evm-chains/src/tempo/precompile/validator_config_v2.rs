@@ -41,7 +41,7 @@ use super::storage_types::{
 };
 use super::validator_config::ValidatorConfig;
 use super::{
-    dispatch_call, fill_precompile_output, input_cost, mutate, mutate_void, view, Precompile,
+    dispatch_call, input_cost, mutate, mutate_void, view, Precompile,
     VALIDATOR_CONFIG_V2_ADDRESS,
 };
 

@@ -28,7 +28,7 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 use std::collections::HashSet;
 
 use super::error::{Result, TempoPrecompileError};
@@ -40,9 +40,9 @@ use super::storage_types::{
 use super::tip20::{is_tip20_prefix, TIP20Token};
 use super::tip20_factory::TIP20Factory;
 use super::tip403_registry::{is_policy_lookup_error, AuthRole, TIP403Registry};
-use super::{dispatch_call,
-    fill_precompile_output, input_cost, mutate, mutate_void, view, Precompile,
-    STABLECOIN_DEX_ADDRESS, PATH_USD_ADDRESS,
+use super::{
+    dispatch_call, input_cost, mutate, mutate_void, view, Precompile, PATH_USD_ADDRESS,
+    STABLECOIN_DEX_ADDRESS,
 };
 
 // ===========================================================================
@@ -958,8 +958,7 @@ impl StablecoinDEX {
 
     #[allow(dead_code)]
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the stablecoin DEX precompile.
@@ -1725,9 +1724,8 @@ impl StablecoinDEX {
             }
 
             let (fill_amount, amount_in_tick) = if is_bid {
-                let base_needed =
-                    quote_to_base(remaining_out, current_tick, RoundingDirection::Up)
-                        .ok_or(TempoPrecompileError::under_overflow())?;
+                let base_needed = quote_to_base(remaining_out, current_tick, RoundingDirection::Up)
+                    .ok_or(TempoPrecompileError::under_overflow())?;
                 let fill_amount = base_needed.min(level.total_liquidity);
                 (fill_amount, fill_amount)
             } else {
@@ -2009,9 +2007,8 @@ impl StablecoinDEX {
         // Refund tokens to maker
         let orderbook = handle.read_data()?;
         if order.is_bid {
-            let quote_amount =
-                base_to_quote(order.remaining, order.tick, RoundingDirection::Up)
-                    .ok_or(TempoPrecompileError::under_overflow())?;
+            let quote_amount = base_to_quote(order.remaining, order.tick, RoundingDirection::Up)
+                .ok_or(TempoPrecompileError::under_overflow())?;
             self.increment_balance(order.maker, orderbook.quote, quote_amount)?;
         } else {
             self.increment_balance(order.maker, orderbook.base, order.remaining)?;
@@ -2033,11 +2030,7 @@ impl StablecoinDEX {
 
         let handle = self.book_handle(order.book_key);
         let book = handle.read_data()?;
-        let token = if order.is_bid {
-            book.quote
-        } else {
-            book.base
-        };
+        let token = if order.is_bid { book.quote } else { book.base };
 
         let policy_id = TIP20Token::from_address(token)?.transfer_policy_id()?;
         match TIP403Registry::new().is_authorized_as(policy_id, order.maker, AuthRole::sender()) {
@@ -2079,7 +2072,6 @@ impl ContractStorage for StablecoinDEX {
 // ===========================================================================
 // Dispatch
 // ===========================================================================
-
 
 impl Precompile for StablecoinDEX {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
@@ -2183,12 +2175,8 @@ impl Precompile for StablecoinDEX {
                         self.quote_swap_exact_amount_out(c.tokenIn, c.tokenOut, c.amountOut)
                     })
                 }
-                IStablecoinDEX::IStablecoinDEXCalls::MIN_TICK(call) => {
-                    view(call, |_| Ok(MIN_TICK))
-                }
-                IStablecoinDEX::IStablecoinDEXCalls::MAX_TICK(call) => {
-                    view(call, |_| Ok(MAX_TICK))
-                }
+                IStablecoinDEX::IStablecoinDEXCalls::MIN_TICK(call) => view(call, |_| Ok(MIN_TICK)),
+                IStablecoinDEX::IStablecoinDEXCalls::MAX_TICK(call) => view(call, |_| Ok(MAX_TICK)),
                 IStablecoinDEX::IStablecoinDEXCalls::TICK_SPACING(call) => {
                     view(call, |_| Ok(TICK_SPACING))
                 }

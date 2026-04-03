@@ -15,15 +15,12 @@
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{Handler, Mapping, Slot};
-use super::{
-    dispatch_call, fill_precompile_output, input_cost, view, Precompile,
-    NONCE_PRECOMPILE_ADDRESS,
-};
+use super::{dispatch_call, input_cost, view, Precompile, NONCE_PRECOMPILE_ADDRESS};
 
 // ===========================================================================
 // Constants
@@ -94,8 +91,7 @@ impl NonceManager {
     }
 
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the nonce manager precompile storage layout.
@@ -159,8 +155,7 @@ impl NonceManager {
         let now: u64 = self.storage.timestamp().saturating_to();
 
         // 1. Validate expiry window: must be in (now, now + max_skew]
-        if valid_before <= now
-            || valid_before > now.saturating_add(EXPIRING_NONCE_MAX_EXPIRY_SECS)
+        if valid_before <= now || valid_before > now.saturating_add(EXPIRING_NONCE_MAX_EXPIRY_SECS)
         {
             return Err(TempoPrecompileError::Revert(
                 INonce::InvalidExpiringNonceExpiry {}.abi_encode().into(),

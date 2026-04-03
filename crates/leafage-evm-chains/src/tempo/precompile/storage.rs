@@ -18,7 +18,7 @@ use alloy_evm::EvmInternals;
 use revm::{
     interpreter::gas::{
         COLD_ACCOUNT_ACCESS_COST_ADDITIONAL, COLD_SLOAD_COST, KECCAK256, KECCAK256WORD, LOG,
-        LOGDATA, LOGTOPIC, WARM_STORAGE_READ_COST, WARM_SSTORE_RESET,
+        LOGDATA, LOGTOPIC, WARM_STORAGE_READ_COST,
     },
     state::Bytecode,
 };
@@ -249,6 +249,7 @@ impl<'a> LeafageStorageProvider<'a> {
 
     /// SSTORE set cost (0 → non-zero), hardfork-aware.
     /// TIP-1000 (T1+): 250k. Pre-T1 (standard Ethereum): 20k.
+    #[allow(dead_code)]
     #[inline]
     fn sstore_set_cost(&self) -> u64 {
         if self.spec.is_t1() {
@@ -460,18 +461,12 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     }
 }
 
-/// Computes sstore gas refund following EIP-3529 rules.
-///
-
 // ---------------------------------------------------------------------------
 // StorageCtx (thread-local accessor)
 // ---------------------------------------------------------------------------
 
 scoped_thread_local!(static STORAGE: RefCell<&mut dyn PrecompileStorageProvider>);
 
-/// Thread-local that persists the gas refund from the last precompile execution.
-/// Set by `StorageCtx::enter` on exit, read by `TempoPrecompiles::run()` to
-/// propagate the refund to revm's Gas struct (which `PrecompilesMap` doesn't do).
 thread_local! {
     static LAST_PRECOMPILE_REFUND: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }

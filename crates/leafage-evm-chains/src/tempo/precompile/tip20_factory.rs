@@ -9,14 +9,13 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx};
 use super::tip20::{is_tip20_prefix, TIP20Token, ITIP20};
-use super::{dispatch_call,
-    fill_precompile_output, input_cost, mutate, view, Precompile, PATH_USD_ADDRESS,
-    TIP20_FACTORY_ADDRESS,
+use super::{
+    dispatch_call, input_cost, mutate, view, Precompile, PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS,
 };
 
 // ===========================================================================
@@ -113,8 +112,7 @@ impl TIP20Factory {
     }
 
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the TIP-20 factory precompile.

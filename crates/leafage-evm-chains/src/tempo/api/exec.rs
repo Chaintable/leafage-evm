@@ -520,14 +520,6 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     Ok(())
 }
 
-/// Sets `tx_origin` in AccountKeychain transient storage (slot 3).
-///
-/// Writer does this for every transaction in `validate_against_state_and_deduct_caller`
-/// (handler.rs:677-683). Precompiles read `tx_origin` via `tload` to enforce spending
-/// limits: `authorize_transfer`, `authorize_approve`, and `refund_spending_limit` all
-/// skip enforcement when `account != tx_origin`. Without this, `tx_origin` stays
-/// `Address::ZERO` and spending limits are never applied.
-#[inline]
 /// Increments the 2D nonce in NonceManager for AA txs with nonceKey > 0.
 ///
 /// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:854-860)

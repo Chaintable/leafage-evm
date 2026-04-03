@@ -1,9 +1,9 @@
-use super::ApiImpl;
-#[cfg(target_os = "linux")]
-use super::{InterceptorConfig, InterceptorLayer};
 use super::api_impl::NoneEvmCustomConfig;
 use super::tempo::api::TempoEvmCustomConfig;
 use super::token_collector::TokenCollector;
+use super::ApiImpl;
+#[cfg(target_os = "linux")]
+use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
@@ -165,7 +165,7 @@ where
             MultiChainCfgEnv::Tempo(env) => {
                 // Tempo: set virtual balance placeholder (no native token).
                 // Writer returns this for all eth_getBalance calls.
-                let mut api_impl = ApiImpl::new(
+                let api_impl = ApiImpl::new(
                     self.db,
                     env,
                     Some(TempoEvmCustomConfig),
