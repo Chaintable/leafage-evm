@@ -228,9 +228,8 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        // Tempo: return virtual balance placeholder (no native token).
-        if self.inner.evm_cfg().is_tempo() {
-            return Ok(leafage_evm_chains::tempo::VIRTUAL_BALANCE);
+        if let Some(vb) = self.inner.virtual_balance() {
+            return Ok(vb);
         }
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
@@ -724,7 +723,7 @@ where
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
         // required gas is 271000+.
-        if !self.inner.evm_cfg().is_tempo() && tx.input().is_empty() {
+        if self.inner.virtual_balance().is_none() && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account

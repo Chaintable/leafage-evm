@@ -27,12 +27,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub custom_cfg: Option<CustomCfg>,
 }
 
-impl<S, C> EvmCfg<S, C> {
-    pub fn is_tempo(&self) -> bool {
-        self.cfg.chain_id == leafage_evm_chains::tempo::CHAIN_ID
-    }
-}
-
 pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasFeeHandler {}
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
@@ -52,6 +46,10 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 }
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
+    fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
+        None
+    }
+
     fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,
