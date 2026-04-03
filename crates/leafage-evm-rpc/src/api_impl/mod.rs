@@ -19,7 +19,7 @@ pub use interceptor::{InterceptorConfig, InterceptorLayer};
 
 mod core;
 pub use core::MultiChainCfgEnv;
-pub(crate) use core::{ApiCore, EvmExecutor};
+pub(crate) use core::{ApiCore, EvmExecutor, GasProvider};
 
 mod mainnet;
 

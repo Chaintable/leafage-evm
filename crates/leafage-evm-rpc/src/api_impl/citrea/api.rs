@@ -1,7 +1,7 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::citrea::evm::create_citrea_evm_from_state;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
-use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
+use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor, GasProvider};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest};
@@ -12,6 +12,8 @@ use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, NoneEvmCustomConfig>;
+
+impl<DB> GasProvider for CitreaApiImpl<DB> where DB: Sync + Send + 'static {}
 
 impl<DB> EvmExecutor for CitreaApiImpl<DB>
 where

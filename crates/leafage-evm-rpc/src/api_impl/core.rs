@@ -33,7 +33,7 @@ impl<S, C> EvmCfg<S, C> {
     }
 }
 
-pub(crate) trait ApiCore: ApiBase + EvmExecutor {}
+pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasProvider {}
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
@@ -51,6 +51,38 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn token_collector(&self) -> Option<&TokenCollector>;
 }
 
+pub(crate) trait GasProvider: Sync + Send + 'static {
+    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
+        &self,
+        _request: &CallRequest,
+        tx: &Tx,
+        db: &StateDB,
+        _block_env: &BlockEnv,
+    ) -> RpcResult<u64> {
+        use crate::error::rpc_error_with_code;
+        use leafage_evm_types::DebankErrorCode;
+
+        let caller = db.basic_ref(tx.caller()).map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+        let balance = caller
+            .map(|acc| acc.balance)
+            .unwrap_or_default()
+            .checked_sub(tx.value())
+            .ok_or_else(|| {
+                rpc_error_with_code(
+                    DebankErrorCode::BalanceExhausted as i32,
+                    "Insufficient funds".to_string(),
+                )
+            })?;
+        Ok(balance
+            .checked_div(alloy::primitives::U256::from(tx.gas_price()))
+            .unwrap_or_default()
+            .try_into()
+            .unwrap())
+    }
+}
+
 pub(crate) trait EvmExecutor: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
 
@@ -66,8 +98,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         chain_id: u64,
     ) -> RpcResult<Self::Tx>;
 
-    /// Apply pre-execution changes before transaction execution.
-    /// Calls EIP-2935 blockhashes and EIP-4788 beacon root system contracts.
     fn apply_pre_execution_changes<StateDB>(
         &self,
         _header: impl BlockHeader,
@@ -109,36 +139,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
-
-    fn gas_allowance<StateDB: DatabaseRef>(
-        &self,
-        _request: &CallRequest,
-        tx: &Self::Tx,
-        db: &StateDB,
-        _block_env: &BlockEnv,
-    ) -> RpcResult<u64> {
-        use crate::error::rpc_error_with_code;
-        use leafage_evm_types::DebankErrorCode;
-
-        let caller = db.basic_ref(tx.caller()).map_err(|e| {
-            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-        })?;
-        let balance = caller
-            .map(|acc| acc.balance)
-            .unwrap_or_default()
-            .checked_sub(tx.value())
-            .ok_or_else(|| {
-                rpc_error_with_code(
-                    DebankErrorCode::BalanceExhausted as i32,
-                    "Insufficient funds".to_string(),
-                )
-            })?;
-        Ok(balance
-            .checked_div(alloy::primitives::U256::from(tx.gas_price()))
-            .unwrap_or_default()
-            .try_into()
-            .unwrap_or(u64::MAX))
-    }
 }
 
 pub(crate) trait TxSetter {

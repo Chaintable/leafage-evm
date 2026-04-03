@@ -1,4 +1,5 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, TxSetter};
+use crate::api_impl::core::{ApiCore, EvmExecutor, GasProvider, TxSetter};
+use revm::context::Transaction as TransactionTrait;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
@@ -337,10 +338,16 @@ where
             .map(|res| (res.into(), inspector_collect(inspector)))
     }
 
-    fn gas_allowance<StateDB: DatabaseRef>(
+}
+
+impl<DB> GasProvider for TempoApiImpl<DB>
+where
+    DB: Sync + Send + 'static,
+{
+    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
         &self,
         request: &CallRequest,
-        tx: &Self::Tx,
+        tx: &Tx,
         db: &StateDB,
         block_env: &BlockEnv,
     ) -> RpcResult<u64> {
@@ -367,28 +374,28 @@ where
             fp::recover_fee_payer(
                 sig,
                 self.evm_cfg.cfg.chain_id,
-                tx.base.gas_priority_fee.unwrap_or(0),
-                tx.base.gas_price,
-                tx.base.gas_limit,
+                tx.max_priority_fee_per_gas().unwrap_or(0),
+                tx.max_fee_per_gas(),
+                tx.gas_limit(),
                 &calls,
                 &access_list,
                 te.and_then(|t| t.nonce_key).unwrap_or_default(),
-                tx.base.nonce,
+                tx.nonce(),
                 te.and_then(|t| t.valid_before),
                 te.and_then(|t| t.valid_after),
                 te.and_then(|t| t.fee_token),
-                tx.base.caller,
+                tx.caller(),
                 &[],
                 None,
             )
-            .unwrap_or(tx.base.caller)
+            .unwrap_or(tx.caller())
         } else {
-            te.and_then(|t| t.fee_payer).unwrap_or(tx.base.caller)
+            te.and_then(|t| t.fee_payer).unwrap_or(tx.caller())
         };
         Ok(leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
             db,
             payer,
-            tx.base.gas_price,
+            tx.gas_price(),
             block_env.timestamp.saturating_to::<u64>(),
             self.evm_cfg.cfg.chain_id,
             te.and_then(|t| t.fee_token),
