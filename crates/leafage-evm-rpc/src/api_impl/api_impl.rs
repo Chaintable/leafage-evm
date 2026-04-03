@@ -41,8 +41,6 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 version,
                 estimate_gas_buffer,
                 custom_cfg,
-                is_tempo: false,
-                virtual_balance: None,
             },
             historical_client,
             historical_height,

@@ -388,8 +388,8 @@ where
 
     fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
         // Tempo: return virtual balance placeholder (no native token).
-        if let Some(vb) = self.inner.evm_cfg().virtual_balance {
-            return Ok(vb);
+        if self.inner.evm_cfg().is_tempo() {
+            return Ok(leafage_evm_chains::tempo::VIRTUAL_BALANCE);
         }
         let state: Option<_> = self
             .inner

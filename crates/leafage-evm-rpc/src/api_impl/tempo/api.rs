@@ -5,7 +5,8 @@ use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::tempo::tx::TempoTxEnv;
 use leafage_evm_chains::tempo::TempoEvm;
-use leafage_evm_types::{BlockEnv, CallRequest, MainnetSpecId};
+use leafage_evm_chains::tempo::hardfork::TempoHardfork;
+use leafage_evm_types::{BlockEnv, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
@@ -85,12 +86,10 @@ impl<DB: DatabaseRef> DatabaseRef for Vcv2CodeInjector<DB> {
 
 /// Marker type to differentiate `TempoApiImpl` from `MainnetApiImpl`.
 ///
-/// Both use `MainnetSpecId`, but Rust's type system requires distinct types
-/// for separate `EvmExecutor` implementations.
 #[derive(Debug, Clone)]
 pub struct TempoEvmCustomConfig;
 
-type TempoApiImpl<DB> = ApiImpl<DB, MainnetSpecId, TempoEvmCustomConfig>;
+type TempoApiImpl<DB> = ApiImpl<DB, TempoHardfork, TempoEvmCustomConfig>;
 
 impl<DB> EvmExecutor for TempoApiImpl<DB>
 where
@@ -113,17 +112,18 @@ where
         use revm::primitives::TxKind;
 
         // Extract Tempo-specific fields before consuming the request.
-        let tempo_calls = request.tempo_calls.clone();
-        let nonce_key = request.nonce_key;
-        let key_type = request.key_type.clone();
-        let key_data = request.key_data.clone();
-        let key_id = request.key_id;
-        let key_authorization = request.key_authorization.clone();
-        let tempo_authorization_list = request.tempo_authorization_list.clone();
-        let fee_token = request.fee_token;
-        let fee_payer = request.fee_payer;
-        let valid_after = request.valid_after;
-        let valid_before = request.valid_before;
+        let te = request.tempo.clone().unwrap_or_default();
+        let tempo_calls = te.tempo_calls;
+        let nonce_key = te.nonce_key;
+        let key_type = te.key_type;
+        let key_data = te.key_data;
+        let key_id = te.key_id;
+        let key_authorization = te.key_authorization;
+        let tempo_authorization_list = te.tempo_authorization_list;
+        let fee_token = te.fee_token;
+        let fee_payer = te.fee_payer;
+        let valid_after = te.valid_after;
+        let valid_before = te.valid_before;
 
         // Auto-fill 2D nonce from NonceManager storage when not provided.
         // Ported from writer compat.rs:309-324.
@@ -335,6 +335,64 @@ where
         let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
         evm.inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)))
+    }
+
+    fn estimate_gas_cap<StateDB: DatabaseRef>(
+        &self,
+        request: &CallRequest,
+        tx: &Self::Tx,
+        db: &StateDB,
+        block_env: &BlockEnv,
+    ) -> Option<u64> {
+        use leafage_evm_chains::tempo::fee_payer::{self as fp, Call as FpCall};
+
+        let te = request.tempo.as_ref();
+        let payer = if let Some(sig) = te.and_then(|t| t.fee_payer_signature.as_ref()) {
+            let calls: Vec<FpCall> = te
+                .and_then(|t| t.tempo_calls.as_ref())
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| {
+                            let to = c.to.as_ref().and_then(|t| t.to().copied());
+                            FpCall {
+                                to,
+                                value: c.value.unwrap_or_default(),
+                                input: c.input.clone().into_input().unwrap_or_default(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let access_list = alloy::eips::eip2930::AccessList::default();
+            fp::recover_fee_payer(
+                sig,
+                self.evm_cfg.cfg.chain_id,
+                tx.base.gas_priority_fee.unwrap_or(0),
+                tx.base.gas_price,
+                tx.base.gas_limit,
+                &calls,
+                &access_list,
+                te.and_then(|t| t.nonce_key).unwrap_or_default(),
+                tx.base.nonce,
+                te.and_then(|t| t.valid_before),
+                te.and_then(|t| t.valid_after),
+                te.and_then(|t| t.fee_token),
+                tx.base.caller,
+                &[],
+                None,
+            )
+            .unwrap_or(tx.base.caller)
+        } else {
+            te.and_then(|t| t.fee_payer).unwrap_or(tx.base.caller)
+        };
+        leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
+            db,
+            payer,
+            tx.base.gas_price,
+            block_env.timestamp.saturating_to::<u64>(),
+            self.evm_cfg.cfg.chain_id,
+            te.and_then(|t| t.fee_token),
+        )
     }
 }
 

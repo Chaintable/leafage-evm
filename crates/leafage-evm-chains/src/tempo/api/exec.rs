@@ -1119,14 +1119,14 @@ mod tests {
     use crate::tempo::api::TempoEvm;
     use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
     use alloy_evm::EvmEnv;
-    use leafage_evm_types::MainnetSpecId;
+    use crate::tempo::hardfork::TempoHardfork;
     use revm::context::{BlockEnv, CfgEnv};
     use revm::database::EmptyDB;
     use revm::inspector::NoOpInspector;
     use revm::primitives::Address;
 
     fn make_evm() -> TempoEvm<EmptyDB, NoOpInspector> {
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
         cfg.chain_id = 4217;
         let mut block_env = BlockEnv::default();
         block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64); // Post-T1A
@@ -1339,7 +1339,7 @@ mod tests {
         // Authority must exist with nonce=0 (matching auth nonce).
         db.insert_account_info(authority, AccountInfo { nonce: 0, ..Default::default() });
 
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
         cfg.chain_id = 4217;
         let mut block_env = BlockEnv::default();
         block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64);

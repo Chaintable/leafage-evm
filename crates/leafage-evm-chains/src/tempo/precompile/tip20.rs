@@ -45,7 +45,7 @@ use super::storage::{ContractStorage, StorageCtx, StorageOps};
 use super::storage_types::{
     BytesLikeHandler, FromWord, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
 };
-use super::{
+use super::{dispatch_call,
     fill_precompile_output, input_cost, metadata, mutate, mutate_void, view, Precompile,
     STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
 };
@@ -1832,42 +1832,6 @@ impl TIP20Call {
             ITIP20::ITIP20Calls::abi_decode(calldata).map(Self::TIP20)
         }
     }
-}
-
-/// Dispatches calldata, handling selector validation and ABI decode errors.
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        // T1+: return reverted output for missing selector
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-/// Returns an ABI-encoded `UnknownFunctionSelector` revert.
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
 }
 
 impl Precompile for TIP20Token {

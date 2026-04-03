@@ -1,3 +1,10 @@
+pub const CHAIN_ID: u64 = 4217;
+
+/// Virtual balance returned by getBalance (Tempo has no native token).
+pub const VIRTUAL_BALANCE: alloy::primitives::U256 = alloy::primitives::uint!(
+    4242424242424242424242424242424242424242424242424242424242424242424242424242_U256
+);
+
 pub mod api;
 pub use api::TempoEvm;
 

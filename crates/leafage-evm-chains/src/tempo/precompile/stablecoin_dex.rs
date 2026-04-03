@@ -40,7 +40,7 @@ use super::storage_types::{
 use super::tip20::{is_tip20_prefix, TIP20Token};
 use super::tip20_factory::TIP20Factory;
 use super::tip403_registry::{is_policy_lookup_error, AuthRole, TIP403Registry};
-use super::{
+use super::{dispatch_call,
     fill_precompile_output, input_cost, mutate, mutate_void, view, Precompile,
     STABLECOIN_DEX_ADDRESS, PATH_USD_ADDRESS,
 };
@@ -2080,38 +2080,6 @@ impl ContractStorage for StablecoinDEX {
 // Dispatch
 // ===========================================================================
 
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
 
 impl Precompile for StablecoinDEX {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {

@@ -416,7 +416,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mantle(chain_cfg))
             }
             "tempo" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+                let mut chain_cfg = CfgEnv::new_with_spec(leafage_evm_chains::tempo::hardfork::TempoHardfork::default());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;

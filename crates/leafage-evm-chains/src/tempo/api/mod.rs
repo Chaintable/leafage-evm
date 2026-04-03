@@ -6,7 +6,6 @@ use crate::tempo::hardfork::TempoHardfork;
 use crate::tempo::precompile::{extend_tempo_precompiles, storage::take_last_precompile_refund};
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
-use leafage_evm_types::MainnetSpecId;
 use revm::{
     context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
     context_interface::cfg::gas_params::{GasId, GasParams},
@@ -44,7 +43,7 @@ impl TempoPrecompiles {
 impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     type Output = InterpreterResult;
 
-    fn set_spec(&mut self, spec: MainnetSpecId) -> bool {
+    fn set_spec(&mut self, spec: TempoHardfork) -> bool {
         PrecompileProvider::<TempoContext<DB>>::set_spec(&mut self.0, spec)
     }
 
@@ -75,7 +74,7 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
 mod exec;
 
 /// Type alias for the default context type of the TempoEvm.
-pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<MainnetSpecId>, DB>;
+pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<TempoHardfork>, DB>;
 
 /// Tempo EVM implementation.
 ///
@@ -104,20 +103,22 @@ impl<DB: Database, I> TempoEvm<DB, I> {
     /// 1. Loads standard Ethereum precompiles for the given spec
     /// 2. Extends them with all 9 Tempo precompiles via [`extend_tempo_precompiles`]
     /// 3. Builds the EVM context with the merged precompile set
-    pub fn new(env: EvmEnv<MainnetSpecId>, db: DB, inspector: I, inspect: bool) -> Self {
+    pub fn new(env: EvmEnv<TempoHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
         let mut precompiles = PrecompilesMap::from_static(
-            Precompiles::new(PrecompileSpecId::from_spec_id(env.cfg_env.spec)),
+            Precompiles::new(PrecompileSpecId::from_spec_id(env.cfg_env.spec.into())),
         );
         extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
 
-        // Determine active hardfork from block timestamp for archive mode support.
+        let mut cfg_env = env.cfg_env;
+        // Determine hardfork from block timestamp for archive mode support.
+        // The initial cfg_env.spec may be set to default (T3) from CLI;
+        // override it with the actual hardfork for the requested block.
         let timestamp = env.block_env.timestamp.saturating_to::<u64>();
         let hardfork = TempoHardfork::from_timestamp(timestamp);
+        cfg_env.spec = hardfork;
 
-        // Apply Tempo TIP-1000 gas parameter overrides via revm 36 GasParams API.
-        // TIP-1000 was introduced in T1, so only apply overrides for T1+ blocks.
-        let mut cfg_env = env.cfg_env;
-        let mut gas_params = GasParams::new_spec(cfg_env.spec.into());
+        // Apply Tempo TIP-1000 gas parameter overrides (T1+).
+        let mut gas_params = GasParams::new_spec(hardfork.into());
         if hardfork.is_t1() {
             gas_params.override_gas([
                 (GasId::sstore_set_without_load_cost(), 250_000),
@@ -307,15 +308,15 @@ mod tests {
     #[test]
     fn test_tempo_evm_constructs() {
         let env = EvmEnv::new(
-            CfgEnv::new_with_spec(MainnetSpecId::PRAGUE),
+            CfgEnv::new_with_spec(TempoHardfork::default()),
             BlockEnv::default(),
         );
         // Should not panic -- verifies precompile registration works
         let _evm = TempoEvm::new(env, EmptyDB::default(), NoOpInspector, false);
     }
 
-    fn make_env(timestamp: u64) -> EvmEnv<MainnetSpecId> {
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+    fn make_env(timestamp: u64) -> EvmEnv<TempoHardfork> {
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::from_timestamp(timestamp));
         cfg.chain_id = 4217;
         cfg.disable_balance_check = true;
         cfg.disable_eip3607 = true;
@@ -355,6 +356,65 @@ mod tests {
         assert_eq!(gp.get(GasId::new_account_cost_for_selfdestruct()), 250_000, "T1+ selfdestruct new_account should be 250k");
         assert_eq!(gp.get(GasId::code_deposit_cost()), 1_000, "T1+ code_deposit should be 1k/byte");
         assert_eq!(gp.tx_eip7702_per_empty_account_cost(), 12_500, "T1+ eip7702 should be 12.5k");
+    }
+
+    /// Helper: build env with default spec + given timestamp (simulates CLI entry).
+    fn make_env_default_spec(timestamp: u64) -> EvmEnv<TempoHardfork> {
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
+        cfg.chain_id = 4217;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = revm::primitives::U256::from(timestamp);
+        block_env.gas_limit = 100_000_000;
+        EvmEnv::new(cfg, block_env)
+    }
+
+    /// Verify spec override: default spec + pre-T1A timestamp -> Genesis.
+    #[test]
+    fn test_spec_override_genesis() {
+        let evm = TempoEvm::new(make_env_default_spec(1000), EmptyDB::default(), NoOpInspector, false);
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::Genesis);
+        assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()), 25_000);
+    }
+
+    /// Verify spec override: default spec + T1A timestamp -> T1A with TIP-1000.
+    #[test]
+    fn test_spec_override_t1a() {
+        let evm = TempoEvm::new(make_env_default_spec(1_770_908_400), EmptyDB::default(), NoOpInspector, false);
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T1A);
+        assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()), 250_000);
+        assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::sstore_set_without_load_cost()), 250_000);
+    }
+
+    /// Verify spec override: default spec + T2 timestamp -> T2, nonce gas updated.
+    #[test]
+    fn test_spec_override_t2() {
+        let evm = TempoEvm::new(make_env_default_spec(1_774_965_600), EmptyDB::default(), NoOpInspector, false);
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T2);
+        assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()), 250_000);
+    }
+
+    /// Verify: when timestamp matches default spec (T2), spec is not wrongly changed.
+    #[test]
+    fn test_spec_override_no_downgrade() {
+        let evm = TempoEvm::new(make_env_default_spec(1_774_965_600 + 1000), EmptyDB::default(), NoOpInspector, false);
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T2);
+    }
+
+    /// All TempoHardfork variants map to PRAGUE SpecId.
+    #[test]
+    fn test_hardfork_maps_to_prague() {
+        use revm::primitives::hardfork::SpecId;
+        for hf in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T1,
+            TempoHardfork::T1A,
+            TempoHardfork::T1B,
+            TempoHardfork::T1C,
+            TempoHardfork::T2,
+            TempoHardfork::T3,
+        ] {
+            assert_eq!(SpecId::from(hf), SpecId::PRAGUE, "{hf:?} should map to PRAGUE");
+        }
     }
 
     /// Verify actual EVM execution gas differs between pre-T1A and post-T1A.
@@ -423,8 +483,8 @@ mod tests {
     // Ported from Tempo writer: crates/revm/src/handler.rs
 
     /// Make env with nonce check disabled (simulates eth_call mode).
-    fn make_env_aa(timestamp: u64) -> EvmEnv<MainnetSpecId> {
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+    fn make_env_aa(timestamp: u64) -> EvmEnv<TempoHardfork> {
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::from_timestamp(timestamp));
         cfg.chain_id = 4217;
         cfg.disable_balance_check = true;
         cfg.disable_nonce_check = true;
