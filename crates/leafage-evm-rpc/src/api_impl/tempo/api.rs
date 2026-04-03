@@ -343,7 +343,7 @@ where
         tx: &Self::Tx,
         db: &StateDB,
         block_env: &BlockEnv,
-    ) -> Option<u64> {
+    ) -> RpcResult<u64> {
         use leafage_evm_chains::tempo::fee_payer::{self as fp, Call as FpCall};
 
         let te = request.tempo.as_ref();
@@ -385,7 +385,7 @@ where
         } else {
             te.and_then(|t| t.fee_payer).unwrap_or(tx.base.caller)
         };
-        leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
+        Ok(leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
             db,
             payer,
             tx.base.gas_price,
@@ -393,6 +393,7 @@ where
             self.evm_cfg.cfg.chain_id,
             te.and_then(|t| t.fee_token),
         )
+        .unwrap_or(u64::MAX))
     }
 }
 

@@ -116,20 +116,28 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         tx: &Self::Tx,
         db: &StateDB,
         _block_env: &BlockEnv,
-    ) -> Option<u64> {
-        let caller = db.basic_ref(tx.caller()).ok()??;
-        let balance = caller.balance.checked_sub(tx.value())?;
-        let gas_price = tx.gas_price();
-        if gas_price == 0 {
-            return None;
-        }
-        Some(
-            balance
-                .checked_div(alloy::primitives::U256::from(gas_price))
-                .unwrap_or_default()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        )
+    ) -> RpcResult<u64> {
+        use crate::error::rpc_error_with_code;
+        use leafage_evm_types::DebankErrorCode;
+
+        let caller = db.basic_ref(tx.caller()).map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+        let balance = caller
+            .map(|acc| acc.balance)
+            .unwrap_or_default()
+            .checked_sub(tx.value())
+            .ok_or_else(|| {
+                rpc_error_with_code(
+                    DebankErrorCode::BalanceExhausted as i32,
+                    "Insufficient funds".to_string(),
+                )
+            })?;
+        Ok(balance
+            .checked_div(alloy::primitives::U256::from(tx.gas_price()))
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(u64::MAX))
     }
 }
 
