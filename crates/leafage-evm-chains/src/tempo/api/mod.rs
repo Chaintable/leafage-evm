@@ -110,14 +110,9 @@ impl<DB: Database, I> TempoEvm<DB, I> {
         extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
 
         let mut cfg_env = env.cfg_env;
-        // Determine hardfork from block timestamp for archive mode support.
-        // The initial cfg_env.spec may be set to default (T3) from CLI;
-        // override it with the actual hardfork for the requested block.
         let timestamp = env.block_env.timestamp.saturating_to::<u64>();
         let hardfork = TempoHardfork::from_timestamp(timestamp);
         cfg_env.spec = hardfork;
-
-        // Apply Tempo TIP-1000 gas parameter overrides (T1+).
         let mut gas_params = GasParams::new_spec(hardfork.into());
         if hardfork.is_t1() {
             gas_params.override_gas([
@@ -358,7 +353,6 @@ mod tests {
         assert_eq!(gp.tx_eip7702_per_empty_account_cost(), 12_500, "T1+ eip7702 should be 12.5k");
     }
 
-    /// Helper: build env with default spec + given timestamp (simulates CLI entry).
     fn make_env_default_spec(timestamp: u64) -> EvmEnv<TempoHardfork> {
         let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
         cfg.chain_id = 4217;
@@ -368,7 +362,6 @@ mod tests {
         EvmEnv::new(cfg, block_env)
     }
 
-    /// Verify spec override: default spec + pre-T1A timestamp -> Genesis.
     #[test]
     fn test_spec_override_genesis() {
         let evm = TempoEvm::new(make_env_default_spec(1000), EmptyDB::default(), NoOpInspector, false);
@@ -376,7 +369,6 @@ mod tests {
         assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()), 25_000);
     }
 
-    /// Verify spec override: default spec + T1A timestamp -> T1A with TIP-1000.
     #[test]
     fn test_spec_override_t1a() {
         let evm = TempoEvm::new(make_env_default_spec(1_770_908_400), EmptyDB::default(), NoOpInspector, false);
@@ -385,7 +377,6 @@ mod tests {
         assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::sstore_set_without_load_cost()), 250_000);
     }
 
-    /// Verify spec override: default spec + T2 timestamp -> T2, nonce gas updated.
     #[test]
     fn test_spec_override_t2() {
         let evm = TempoEvm::new(make_env_default_spec(1_774_965_600), EmptyDB::default(), NoOpInspector, false);
@@ -393,14 +384,12 @@ mod tests {
         assert_eq!(evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()), 250_000);
     }
 
-    /// Verify: when timestamp matches default spec (T2), spec is not wrongly changed.
     #[test]
     fn test_spec_override_no_downgrade() {
         let evm = TempoEvm::new(make_env_default_spec(1_774_965_600 + 1000), EmptyDB::default(), NoOpInspector, false);
         assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T2);
     }
 
-    /// All TempoHardfork variants map to PRAGUE SpecId.
     #[test]
     fn test_hardfork_maps_to_prague() {
         use revm::primitives::hardfork::SpecId;

@@ -116,9 +116,6 @@ impl TempoHardfork {
     }
 }
 
-/// Tempo EVM supports EIP-7702 (0x76 AA tx) from genesis, so all hardfork variants
-/// map to PRAGUE (which includes EIP-7702 gas params). Tempo-specific gas overrides
-/// are applied in TempoHandler.
 impl From<TempoHardfork> for revm::primitives::hardfork::SpecId {
     fn from(_: TempoHardfork) -> Self {
         Self::PRAGUE

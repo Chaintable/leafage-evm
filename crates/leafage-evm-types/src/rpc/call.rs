@@ -3,8 +3,6 @@ use alloy::rpc::types::TransactionRequest;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-/// Extended `TransactionRequest` with optional Tempo-specific fields.
-/// Derefs to `TransactionRequest` for transparent field access.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallRequest {
@@ -15,7 +13,6 @@ pub struct CallRequest {
     pub tempo: Option<TempoCallExtension>,
 }
 
-/// Tempo-specific extension fields for 0x76 AA tx, gas estimation, fee payer, and time window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoCallExtension {
@@ -60,7 +57,6 @@ pub struct TempoCallExtension {
     pub valid_before: Option<u64>,
 }
 
-/// Key authorization gas info: signature type + spending limits count.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoKeyAuthGasInfo {
@@ -71,7 +67,6 @@ pub struct TempoKeyAuthGasInfo {
     pub num_limits: u32,
 }
 
-/// Per-authorization gas info with optional EIP-7702 delegation fields.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoAuthGasInfo {
@@ -188,8 +183,6 @@ mod tests {
         });
 
         let req: CallRequest = serde_json::from_value(json).expect("should deserialize standard request");
-        // With flatten, Option<TempoCallExtension> deserializes to Some(default) when no tempo
-        // fields are present. Verify all fields are None/default.
         let t = req.tempo.unwrap_or_default();
         assert!(t.tempo_calls.is_none());
         assert!(t.nonce_key.is_none());

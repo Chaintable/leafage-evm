@@ -110,8 +110,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 
-    /// Calculate gas cap from payer's balance for estimateGas.
-    /// Default: (native_balance - value) / gas_price.
     fn estimate_gas_cap<StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,

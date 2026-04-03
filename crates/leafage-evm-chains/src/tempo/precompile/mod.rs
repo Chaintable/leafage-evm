@@ -227,7 +227,6 @@ pub fn fill_precompile_output(
     output
 }
 
-/// Common dispatch helper shared by all Tempo precompiles.
 pub fn dispatch_call<T>(
     calldata: &[u8],
     decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
