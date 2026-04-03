@@ -1,6 +1,6 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
-    ApiCore, EvmExecutor, GasProvider, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::op::evm::{create_op_evm_from_state, create_op_txn_env};
 use crate::api_impl::ApiImpl;
@@ -18,7 +18,7 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type OpApiImpl<DB> = ApiImpl<DB, OpSpecId, NoneEvmCustomConfig>;
 
-impl<DB> GasProvider for OpApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for OpApiImpl<DB> where DB: Sync + Send + 'static {}
 
 impl<DB> EvmExecutor for OpApiImpl<DB>
 where

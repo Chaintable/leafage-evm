@@ -1,6 +1,6 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
-    ApiCore, EvmExecutor, GasProvider, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
@@ -63,7 +63,7 @@ where
     }
 }
 
-impl<DB> GasProvider for MainnetApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for MainnetApiImpl<DB> where DB: Sync + Send + 'static {}
 
 impl<DB> EvmExecutor for MainnetApiImpl<DB>
 where

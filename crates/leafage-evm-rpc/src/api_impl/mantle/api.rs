@@ -1,5 +1,5 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasProvider, TxSetter};
+use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mantle::evm::{create_mantle_evm_from_state, create_mantle_txn_env};
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
@@ -39,7 +39,7 @@ fn get_token_ratio<DB: DatabaseRef>(db: &DB) -> u64 {
     }
 }
 
-impl<DB> GasProvider for MantleApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for MantleApiImpl<DB> where DB: Sync + Send + 'static {}
 
 impl<DB> EvmExecutor for MantleApiImpl<DB>
 where

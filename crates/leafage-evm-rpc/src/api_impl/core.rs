@@ -33,7 +33,7 @@ impl<S, C> EvmCfg<S, C> {
     }
 }
 
-pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasProvider {}
+pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasFeeHandler {}
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
@@ -51,7 +51,7 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn token_collector(&self) -> Option<&TokenCollector>;
 }
 
-pub(crate) trait GasProvider: Sync + Send + 'static {
+pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,

@@ -1,4 +1,4 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasProvider, TxSetter};
+use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use revm::context::Transaction as TransactionTrait;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
@@ -340,7 +340,7 @@ where
 
 }
 
-impl<DB> GasProvider for TempoApiImpl<DB>
+impl<DB> GasFeeHandler for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {
