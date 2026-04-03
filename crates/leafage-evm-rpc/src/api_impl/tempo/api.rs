@@ -337,7 +337,7 @@ where
             .map(|res| (res.into(), inspector_collect(inspector)))
     }
 
-    fn estimate_gas_cap<StateDB: DatabaseRef>(
+    fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         request: &CallRequest,
         tx: &Self::Tx,

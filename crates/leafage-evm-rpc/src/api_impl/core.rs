@@ -110,7 +110,7 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 
-    fn estimate_gas_cap<StateDB: DatabaseRef>(
+    fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,
         tx: &Self::Tx,

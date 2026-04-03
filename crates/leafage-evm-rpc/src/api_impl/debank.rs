@@ -747,7 +747,7 @@ where
         if tx.gas_price() > 0 {
             let gas_limit = self
                 .inner
-                .estimate_gas_cap(&request, &tx, &memory_db, &block_env)
+                .gas_allowance(&request, &tx, &memory_db, &block_env)
                 .unwrap_or(u64::MAX);
             highest_gas_limit = highest_gas_limit.min(gas_limit);
         }
