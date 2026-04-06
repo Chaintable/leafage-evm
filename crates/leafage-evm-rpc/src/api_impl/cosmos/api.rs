@@ -1,5 +1,5 @@
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
-use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
+use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor, GasFeeHandler};
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::cosmos::{CosmosEvm, CosmosEvmConfig, CosmosHardfork};
@@ -13,6 +13,8 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
 type CosmosApiImpl<DB> = ApiImpl<DB, CosmosHardfork, CosmosEvmConfig>;
+
+impl<DB> GasFeeHandler for CosmosApiImpl<DB> where DB: Sync + Send + 'static {}
 
 impl<DB> EvmExecutor for CosmosApiImpl<DB>
 where

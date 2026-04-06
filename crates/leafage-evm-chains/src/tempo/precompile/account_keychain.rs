@@ -24,16 +24,15 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
-use super::storage::{ContractStorage, StorageCtx};
 use super::storage::StorageOps;
-use super::storage_types::{
-    Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
-};
+use super::storage::{ContractStorage, StorageCtx};
+use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::{
-    fill_precompile_output, input_cost, mutate_void, view, Precompile, ACCOUNT_KEYCHAIN_ADDRESS,
+    dispatch_call,  input_cost, mutate_void, view, Precompile,
+    ACCOUNT_KEYCHAIN_ADDRESS,
 };
 
 // ===========================================================================
@@ -126,11 +125,19 @@ fn err_key_expired() -> TempoPrecompileError {
 }
 
 fn err_spending_limit_exceeded() -> TempoPrecompileError {
-    TempoPrecompileError::Revert(IAccountKeychain::SpendingLimitExceeded {}.abi_encode().into())
+    TempoPrecompileError::Revert(
+        IAccountKeychain::SpendingLimitExceeded {}
+            .abi_encode()
+            .into(),
+    )
 }
 
 fn err_invalid_signature_type() -> TempoPrecompileError {
-    TempoPrecompileError::Revert(IAccountKeychain::InvalidSignatureType {}.abi_encode().into())
+    TempoPrecompileError::Revert(
+        IAccountKeychain::InvalidSignatureType {}
+            .abi_encode()
+            .into(),
+    )
 }
 
 fn err_zero_public_key() -> TempoPrecompileError {
@@ -258,8 +265,7 @@ impl AccountKeychain {
     }
 
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the account keychain precompile.
@@ -416,10 +422,7 @@ impl AccountKeychain {
     }
 
     /// Returns key info for the given account-key pair.
-    pub fn get_key(
-        &self,
-        call: IAccountKeychain::getKeyCall,
-    ) -> Result<IAccountKeychain::KeyInfo> {
+    pub fn get_key(&self, call: IAccountKeychain::getKeyCall) -> Result<IAccountKeychain::KeyInfo> {
         let key = self.keys[call.account][call.keyId].read()?;
 
         // Key doesn't exist if expiry == 0, or key has been revoked
@@ -658,39 +661,6 @@ impl ContractStorage for AccountKeychain {
 // Dispatch
 // ===========================================================================
 
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
-
 impl Precompile for AccountKeychain {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
@@ -702,9 +672,7 @@ impl Precompile for AccountKeychain {
             IAccountKeychain::IAccountKeychainCalls::abi_decode,
             |call| match call {
                 IAccountKeychain::IAccountKeychainCalls::authorizeKey(call) => {
-                    mutate_void(call, msg_sender, |sender, c| {
-                        self.authorize_key(sender, c)
-                    })
+                    mutate_void(call, msg_sender, |sender, c| self.authorize_key(sender, c))
                 }
                 IAccountKeychain::IAccountKeychainCalls::revokeKey(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.revoke_key(sender, c))

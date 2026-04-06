@@ -19,16 +19,16 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
-use super::storage::{ContractStorage, StorageCtx};
 use super::storage::StorageOps;
+use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::tip20::TIP20Token;
 use super::{
-    fill_precompile_output, input_cost, metadata, mutate, mutate_void, view, Precompile,
-    DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS,
+    dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile, DEFAULT_FEE_TOKEN,
+    TIP_FEE_MANAGER_ADDRESS,
 };
 
 // ===========================================================================
@@ -229,8 +229,7 @@ impl TipFeeManager {
     }
 
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the fee manager precompile.
@@ -370,11 +369,9 @@ impl TipFeeManager {
             return Ok(());
         }
         let collected_fees = self.collected_fees[validator][token].read()?;
-        self.collected_fees[validator][token].write(
-            collected_fees.checked_add(amount).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in increment_collected_fees".into())
-            })?,
-        )
+        self.collected_fees[validator][token].write(collected_fees.checked_add(amount).ok_or_else(
+            || TempoPrecompileError::Fatal("overflow in increment_collected_fees".into()),
+        )?)
     }
 
     /// Transfers a validator's accumulated fee balance and zeroes the ledger.
@@ -407,10 +404,7 @@ impl TipFeeManager {
     }
 
     /// Reads the stored fee token preference for a validator, defaulting to `DEFAULT_FEE_TOKEN`.
-    pub fn validator_tokens_view(
-        &self,
-        call: IFeeManager::validatorTokensCall,
-    ) -> Result<Address> {
+    pub fn validator_tokens_view(&self, call: IFeeManager::validatorTokensCall) -> Result<Address> {
         let token = self.validator_tokens[call.validator].read()?;
         if token.is_zero() {
             Ok(DEFAULT_FEE_TOKEN)
@@ -472,9 +466,7 @@ impl TipFeeManager {
             .checked_mul(N)
             .and_then(|product| product.checked_div(SCALE))
             .and_then(|result| result.checked_add(U256::from(1)))
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in rebalance_swap".into())
-            })?;
+            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in rebalance_swap".into()))?;
 
         let amount_in_u128: u128 = amount_in.try_into().map_err(|_| {
             TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
@@ -492,9 +484,12 @@ impl TipFeeManager {
                 )
             })?;
 
-        pool.reserve_user_token = pool.reserve_user_token.checked_sub(amount_out_u128).ok_or_else(
-            || TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into()),
-        )?;
+        pool.reserve_user_token = pool
+            .reserve_user_token
+            .checked_sub(amount_out_u128)
+            .ok_or_else(|| {
+                TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
+            })?;
 
         self.pools[pool_id].write(pool)?;
 
@@ -555,9 +550,9 @@ impl TipFeeManager {
 
         let liquidity = if pool.reserve_user_token == 0 && pool.reserve_validator_token == 0 {
             let two = U256::from(2);
-            let half_amount = amount_validator_token.checked_div(two).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in mint".into())
-            })?;
+            let half_amount = amount_validator_token
+                .checked_div(two)
+                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint".into()))?;
 
             if half_amount <= MIN_LIQUIDITY {
                 return Err(TempoPrecompileError::Revert(
@@ -565,9 +560,9 @@ impl TipFeeManager {
                 ));
             }
 
-            total_supply_val = total_supply_val.checked_add(MIN_LIQUIDITY).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in mint".into())
-            })?;
+            total_supply_val = total_supply_val
+                .checked_add(MIN_LIQUIDITY)
+                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint".into()))?;
             self.total_supply[pool_id].write(total_supply_val)?;
 
             half_amount.checked_sub(MIN_LIQUIDITY).ok_or_else(|| {
@@ -588,9 +583,7 @@ impl TipFeeManager {
             let denom = U256::from(pool.reserve_validator_token)
                 .checked_add(product)
                 .ok_or_else(|| {
-                    TempoPrecompileError::Revert(
-                        ITIPFeeAMM::InvalidAmount {}.abi_encode().into(),
-                    )
+                    TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
                 })?;
 
             if denom.is_zero() {
@@ -630,22 +623,20 @@ impl TipFeeManager {
             .reserve_validator_token
             .checked_add(validator_amount)
             .ok_or_else(|| {
-                TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
-            })?;
+            TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
+        })?;
 
         self.pools[pool_id].write(pool)?;
 
-        self.total_supply[pool_id].write(
-            total_supply_val.checked_add(liquidity).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in mint total_supply".into())
-            })?,
-        )?;
+        self.total_supply[pool_id].write(total_supply_val.checked_add(liquidity).ok_or_else(
+            || TempoPrecompileError::Fatal("overflow in mint total_supply".into()),
+        )?)?;
 
         let balance = self.liquidity_balances[pool_id][to].read()?;
         self.liquidity_balances[pool_id][to].write(
-            balance.checked_add(liquidity).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in mint balance".into())
-            })?,
+            balance
+                .checked_add(liquidity)
+                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint balance".into()))?,
         )?;
 
         self.emit_event(ITIPFeeAMM::Mint {
@@ -698,27 +689,21 @@ impl TipFeeManager {
         let amount_user_token = liquidity
             .checked_mul(U256::from(pool.reserve_user_token))
             .and_then(|p| p.checked_div(total_supply_val))
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in burn amounts".into())
-            })?;
+            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
         let amount_validator_token = liquidity
             .checked_mul(U256::from(pool.reserve_validator_token))
             .and_then(|p| p.checked_div(total_supply_val))
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in burn amounts".into())
-            })?;
+            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
 
         // Update balances and supply
         self.liquidity_balances[pool_id][msg_sender].write(
-            balance.checked_sub(liquidity).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in burn balance".into())
-            })?,
+            balance
+                .checked_sub(liquidity)
+                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn balance".into()))?,
         )?;
-        self.total_supply[pool_id].write(
-            total_supply_val.checked_sub(liquidity).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in burn total_supply".into())
-            })?,
-        )?;
+        self.total_supply[pool_id].write(total_supply_val.checked_sub(liquidity).ok_or_else(
+            || TempoPrecompileError::Fatal("overflow in burn total_supply".into()),
+        )?)?;
 
         // Update reserves
         let user_amount: u128 = amount_user_token.try_into().map_err(|_| {
@@ -728,21 +713,20 @@ impl TipFeeManager {
             TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
         })?;
 
-        pool.reserve_user_token = pool.reserve_user_token.checked_sub(user_amount).ok_or_else(
-            || {
+        pool.reserve_user_token = pool
+            .reserve_user_token
+            .checked_sub(user_amount)
+            .ok_or_else(|| {
                 TempoPrecompileError::Revert(
                     ITIPFeeAMM::InsufficientReserves {}.abi_encode().into(),
                 )
-            },
-        )?;
-        pool.reserve_validator_token =
-            pool.reserve_validator_token
-                .checked_sub(validator_amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Revert(
-                        ITIPFeeAMM::InsufficientReserves {}.abi_encode().into(),
-                    )
-                })?;
+            })?;
+        pool.reserve_validator_token = pool
+            .reserve_validator_token
+            .checked_sub(validator_amount)
+            .ok_or_else(|| {
+            TempoPrecompileError::Revert(ITIPFeeAMM::InsufficientReserves {}.abi_encode().into())
+        })?;
         self.pools[pool_id].write(pool)?;
 
         // Transfer pool tokens to the burn recipient
@@ -793,12 +777,12 @@ impl TipFeeManager {
             ));
         }
 
-        let amount_in_u128: u128 = amount_in.try_into().map_err(|_| {
-            TempoPrecompileError::Fatal("overflow in execute_fee_swap".into())
-        })?;
-        let amount_out_u128: u128 = amount_out.try_into().map_err(|_| {
-            TempoPrecompileError::Fatal("overflow in execute_fee_swap".into())
-        })?;
+        let amount_in_u128: u128 = amount_in
+            .try_into()
+            .map_err(|_| TempoPrecompileError::Fatal("overflow in execute_fee_swap".into()))?;
+        let amount_out_u128: u128 = amount_out
+            .try_into()
+            .map_err(|_| TempoPrecompileError::Fatal("overflow in execute_fee_swap".into()))?;
 
         pool.reserve_user_token = pool
             .reserve_user_token
@@ -874,38 +858,6 @@ impl TipFeeManagerCall {
 }
 
 /// Dispatches calldata, handling selector validation and ABI decode errors.
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
 
 impl Precompile for TipFeeManager {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
@@ -918,9 +870,9 @@ impl Precompile for TipFeeManager {
             TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::userTokens(call)) => {
                 view(call, |c| self.user_tokens_view(c))
             }
-            TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::validatorTokens(
-                call,
-            )) => view(call, |c| self.validator_tokens_view(c)),
+            TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::validatorTokens(call)) => {
+                view(call, |c| self.validator_tokens_view(c))
+            }
             TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::collectedFees(call)) => {
                 view(call, |c| self.collected_fees[c.validator][c.token].read())
             }
@@ -935,11 +887,11 @@ impl Precompile for TipFeeManager {
             TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::setUserToken(call)) => {
                 mutate_void(call, msg_sender, |s, c| self.set_user_token(s, c))
             }
-            TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::distributeFees(
-                call,
-            )) => mutate_void(call, msg_sender, |_, c| {
-                self.distribute_fees(c.validator, c.token)
-            }),
+            TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::distributeFees(call)) => {
+                mutate_void(call, msg_sender, |_, c| {
+                    self.distribute_fees(c.validator, c.token)
+                })
+            }
 
             // ITIPFeeAMM metadata functions
             TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::M(_)) => {
@@ -959,24 +911,20 @@ impl Precompile for TipFeeManager {
             TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::getPoolId(call)) => {
                 view(call, |c| Ok(self.pool_id(c.userToken, c.validatorToken)))
             }
-            TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::getPool(call)) => {
-                view(call, |c| {
-                    let pool = self.get_pool(c)?;
-                    Ok(ITIPFeeAMM::Pool {
-                        reserveUserToken: pool.reserve_user_token,
-                        reserveValidatorToken: pool.reserve_validator_token,
-                    })
+            TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::getPool(call)) => view(call, |c| {
+                let pool = self.get_pool(c)?;
+                Ok(ITIPFeeAMM::Pool {
+                    reserveUserToken: pool.reserve_user_token,
+                    reserveValidatorToken: pool.reserve_validator_token,
                 })
-            }
-            TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::pools(call)) => {
-                view(call, |c| {
-                    let pool = self.pools[c.poolId].read()?;
-                    Ok(ITIPFeeAMM::Pool {
-                        reserveUserToken: pool.reserve_user_token,
-                        reserveValidatorToken: pool.reserve_validator_token,
-                    })
+            }),
+            TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::pools(call)) => view(call, |c| {
+                let pool = self.pools[c.poolId].read()?;
+                Ok(ITIPFeeAMM::Pool {
+                    reserveUserToken: pool.reserve_user_token,
+                    reserveValidatorToken: pool.reserve_validator_token,
                 })
-            }
+            }),
             TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::totalSupply(call)) => {
                 view(call, |c| self.total_supply[c.poolId].read())
             }
@@ -987,7 +935,13 @@ impl Precompile for TipFeeManager {
             // ITIPFeeAMM mutate functions
             TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::mint(call)) => {
                 mutate(call, msg_sender, |s, c| {
-                    self.mint(s, c.userToken, c.validatorToken, c.amountValidatorToken, c.to)
+                    self.mint(
+                        s,
+                        c.userToken,
+                        c.validatorToken,
+                        c.amountValidatorToken,
+                        c.to,
+                    )
                 })
             }
             TipFeeManagerCall::Amm(ITIPFeeAMM::ITIPFeeAMMCalls::burn(call)) => {

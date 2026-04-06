@@ -15,17 +15,14 @@
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
-use super::storage::{ContractStorage, StorageCtx};
 use super::storage::StorageOps;
-use super::storage_types::{
-    Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
-};
+use super::storage::{ContractStorage, StorageCtx};
+use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::{
-    fill_precompile_output, input_cost, mutate, mutate_void, view, Precompile,
-    TIP403_REGISTRY_ADDRESS,
+    dispatch_call, input_cost, mutate, mutate_void, view, Precompile, TIP403_REGISTRY_ADDRESS,
 };
 
 // ===========================================================================
@@ -102,7 +99,11 @@ fn err_invalid_policy_type() -> TempoPrecompileError {
 }
 
 fn err_incompatible_policy_type() -> TempoPrecompileError {
-    TempoPrecompileError::Revert(ITIP403Registry::IncompatiblePolicyType {}.abi_encode().into())
+    TempoPrecompileError::Revert(
+        ITIP403Registry::IncompatiblePolicyType {}
+            .abi_encode()
+            .into(),
+    )
 }
 
 // ===========================================================================
@@ -222,8 +223,7 @@ impl PolicyData {
         let is_t2 = StorageCtx::default().spec().is_t2();
 
         // try_into uses the sol!-generated TryFrom<u8> impl
-        let ty: core::result::Result<ITIP403Registry::PolicyType, _> =
-            self.policy_type.try_into();
+        let ty: core::result::Result<ITIP403Registry::PolicyType, _> = self.policy_type.try_into();
 
         match ty {
             Ok(t) if is_t2 || t != ITIP403Registry::PolicyType::COMPOUND => Ok(t),
@@ -339,8 +339,7 @@ impl StorableType for PolicyRecord {
 impl Storable for PolicyRecord {
     fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
         let base = PolicyData::load(storage, slot, LayoutCtx::FULL)?;
-        let compound =
-            CompoundPolicyData::load(storage, slot + U256::from(1), LayoutCtx::FULL)?;
+        let compound = CompoundPolicyData::load(storage, slot + U256::from(1), LayoutCtx::FULL)?;
         Ok(Self { base, compound })
     }
 
@@ -392,8 +391,7 @@ impl TIP403Registry {
     }
 
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the TIP-403 registry precompile.
@@ -407,10 +405,7 @@ impl TIP403Registry {
     }
 
     /// Returns `true` if the given policy ID exists.
-    pub fn policy_exists(
-        &self,
-        call: ITIP403Registry::policyExistsCall,
-    ) -> Result<bool> {
+    pub fn policy_exists(&self, call: ITIP403Registry::policyExistsCall) -> Result<bool> {
         if self.builtin_authorization(call.policyId).is_some() {
             return Ok(true);
         }
@@ -703,12 +698,7 @@ impl TIP403Registry {
     }
 
     /// Core role-based authorization check (TIP-1015).
-    pub fn is_authorized_as(
-        &self,
-        policy_id: u64,
-        user: Address,
-        role: AuthRole,
-    ) -> Result<bool> {
+    pub fn is_authorized_as(&self, policy_id: u64, user: Address, role: AuthRole) -> Result<bool> {
         if let Some(auth) = self.builtin_authorization(policy_id) {
             return Ok(auth);
         }
@@ -719,9 +709,7 @@ impl TIP403Registry {
             let record = self.policy_records[policy_id].read()?;
             let compound = record.compound;
             return match role {
-                AuthRole::Sender => {
-                    self.is_authorized_simple(compound.sender_policy_id, user)
-                }
+                AuthRole::Sender => self.is_authorized_simple(compound.sender_policy_id, user),
                 AuthRole::Recipient => {
                     self.is_authorized_simple(compound.recipient_policy_id, user)
                 }
@@ -730,8 +718,7 @@ impl TIP403Registry {
                 }
                 AuthRole::Transfer => {
                     // T2+: short-circuit if sender fails
-                    let sender_auth =
-                        self.is_authorized_simple(compound.sender_policy_id, user)?;
+                    let sender_auth = self.is_authorized_simple(compound.sender_policy_id, user)?;
                     if self.storage.spec().is_t2() && !sender_auth {
                         return Ok(false);
                     }
@@ -765,12 +752,7 @@ impl TIP403Registry {
     }
 
     /// Authorization check for simple (non-compound) policies.
-    fn is_simple(
-        &self,
-        policy_id: u64,
-        user: Address,
-        data: &PolicyData,
-    ) -> Result<bool> {
+    fn is_simple(&self, policy_id: u64, user: Address, data: &PolicyData) -> Result<bool> {
         // Read policy_set BEFORE checking policy type to match original gas consumption
         let is_in_set = self.policy_set[policy_id][user].read()?;
 
@@ -830,12 +812,7 @@ impl TIP403Registry {
         self.policy_records[policy_id].write(record)
     }
 
-    fn set_policy_set(
-        &mut self,
-        policy_id: u64,
-        account: Address,
-        value: bool,
-    ) -> Result<()> {
+    fn set_policy_set(&mut self, policy_id: u64, account: Address, value: bool) -> Result<()> {
         self.policy_set[policy_id][account].write(value)
     }
 }
@@ -898,39 +875,6 @@ pub fn is_policy_lookup_error(e: &TempoPrecompileError) -> bool {
 // Dispatch
 // ===========================================================================
 
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
-
 impl Precompile for TIP403Registry {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
@@ -984,20 +928,14 @@ impl Precompile for TIP403Registry {
                     mutate_void(call, msg_sender, |s, c| self.set_policy_admin(s, c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::modifyPolicyWhitelist(call) => {
-                    mutate_void(call, msg_sender, |s, c| {
-                        self.modify_policy_whitelist(s, c)
-                    })
+                    mutate_void(call, msg_sender, |s, c| self.modify_policy_whitelist(s, c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::modifyPolicyBlacklist(call) => {
-                    mutate_void(call, msg_sender, |s, c| {
-                        self.modify_policy_blacklist(s, c)
-                    })
+                    mutate_void(call, msg_sender, |s, c| self.modify_policy_blacklist(s, c))
                 }
                 // TIP-1015: T2+ only (leafage always runs T2+)
                 ITIP403Registry::ITIP403RegistryCalls::createCompoundPolicy(call) => {
-                    mutate(call, msg_sender, |s, c| {
-                        self.create_compound_policy(s, c)
-                    })
+                    mutate(call, msg_sender, |s, c| self.create_compound_policy(s, c))
                 }
             },
         )

@@ -4,7 +4,6 @@ use crate::error::internal_rpc_err;
 use crate::DebankApiServer;
 use alloy::core::sol;
 use alloy::primitives::TxKind;
-use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};

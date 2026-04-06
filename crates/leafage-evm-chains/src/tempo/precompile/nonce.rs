@@ -15,14 +15,12 @@
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{Handler, Mapping, Slot};
-use super::{
-    fill_precompile_output, input_cost, view, Precompile, NONCE_PRECOMPILE_ADDRESS,
-};
+use super::{dispatch_call, input_cost, view, Precompile, NONCE_PRECOMPILE_ADDRESS};
 
 // ===========================================================================
 // Constants
@@ -93,8 +91,7 @@ impl NonceManager {
     }
 
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the nonce manager precompile storage layout.
@@ -158,8 +155,7 @@ impl NonceManager {
         let now: u64 = self.storage.timestamp().saturating_to();
 
         // 1. Validate expiry window: must be in (now, now + max_skew]
-        if valid_before <= now
-            || valid_before > now.saturating_add(EXPIRING_NONCE_MAX_EXPIRY_SECS)
+        if valid_before <= now || valid_before > now.saturating_add(EXPIRING_NONCE_MAX_EXPIRY_SECS)
         {
             return Err(TempoPrecompileError::Revert(
                 INonce::InvalidExpiringNonceExpiry {}.abi_encode().into(),
@@ -227,41 +223,6 @@ impl ContractStorage for NonceManager {
 // ===========================================================================
 // Dispatch
 // ===========================================================================
-
-/// Dispatches calldata, handling selector validation and ABI decode errors.
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-/// Returns an ABI-encoded `UnknownFunctionSelector` revert.
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
 
 impl Precompile for NonceManager {
     fn call(&mut self, calldata: &[u8], _msg_sender: Address) -> PrecompileResult {

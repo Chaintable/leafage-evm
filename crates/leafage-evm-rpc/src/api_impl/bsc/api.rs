@@ -1,5 +1,5 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
-use crate::api_impl::core::{ApiCore, EvmExecutor, TxSetter};
+use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
@@ -14,6 +14,8 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
 type BscApiImpl<DB> = ApiImpl<DB, BscHardfork, NoneEvmCustomConfig>;
+
+impl<DB> GasFeeHandler for BscApiImpl<DB> where DB: Sync + Send + 'static {}
 
 impl<DB> EvmExecutor for BscApiImpl<DB>
 where

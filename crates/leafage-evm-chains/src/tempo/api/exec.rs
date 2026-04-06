@@ -520,14 +520,6 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     Ok(())
 }
 
-/// Sets `tx_origin` in AccountKeychain transient storage (slot 3).
-///
-/// Writer does this for every transaction in `validate_against_state_and_deduct_caller`
-/// (handler.rs:677-683). Precompiles read `tx_origin` via `tload` to enforce spending
-/// limits: `authorize_transfer`, `authorize_approve`, and `refund_spending_limit` all
-/// skip enforcement when `account != tx_origin`. Without this, `tx_origin` stays
-/// `Address::ZERO` and spending limits are never applied.
-#[inline]
 /// Increments the 2D nonce in NonceManager for AA txs with nonceKey > 0.
 ///
 /// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:854-860)
@@ -1119,14 +1111,14 @@ mod tests {
     use crate::tempo::api::TempoEvm;
     use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
     use alloy_evm::EvmEnv;
-    use leafage_evm_types::MainnetSpecId;
+    use crate::tempo::hardfork::TempoHardfork;
     use revm::context::{BlockEnv, CfgEnv};
     use revm::database::EmptyDB;
     use revm::inspector::NoOpInspector;
     use revm::primitives::Address;
 
     fn make_evm() -> TempoEvm<EmptyDB, NoOpInspector> {
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
         cfg.chain_id = 4217;
         let mut block_env = BlockEnv::default();
         block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64); // Post-T1A
@@ -1339,7 +1331,7 @@ mod tests {
         // Authority must exist with nonce=0 (matching auth nonce).
         db.insert_account_info(authority, AccountInfo { nonce: 0, ..Default::default() });
 
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
         cfg.chain_id = 4217;
         let mut block_env = BlockEnv::default();
         block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64);

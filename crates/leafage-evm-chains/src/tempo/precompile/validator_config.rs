@@ -13,17 +13,15 @@
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
-use super::storage::{ContractStorage, StorageCtx};
 use super::storage::StorageOps;
+use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{
     Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType, VecHandler,
 };
-use super::{
-    fill_precompile_output, input_cost, mutate_void, view, Precompile, VALIDATOR_CONFIG_ADDRESS,
-};
+use super::{dispatch_call, input_cost, mutate_void, view, Precompile, VALIDATOR_CONFIG_ADDRESS};
 
 // ===========================================================================
 // Solidity ABI types
@@ -244,8 +242,7 @@ impl ValidatorConfig {
 
     #[allow(dead_code)]
     fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 
     /// Initializes the validator config precompile with an owner.
@@ -292,19 +289,16 @@ impl ValidatorConfig {
                 // Encode as Panic(0x32) for array out of bounds
                 Bytes::from_static(&[
                     0x4e, 0x48, 0x7b, 0x71, // Panic selector
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x32,
                 ]),
             )),
         }
     }
 
     /// Returns the full Validator record for the given address.
-    pub fn validators(
-        &self,
-        validator: Address,
-    ) -> Result<IValidatorConfig::Validator> {
+    pub fn validators(&self, validator: Address) -> Result<IValidatorConfig::Validator> {
         let v = self.validators[validator].read()?;
         Ok(IValidatorConfig::Validator {
             publicKey: v.public_key,
@@ -433,8 +427,7 @@ impl ValidatorConfig {
                 ));
             }
 
-            self.validators_array[old_validator.index as usize]
-                .write(call.newValidatorAddress)?;
+            self.validators_array[old_validator.index as usize].write(call.newValidatorAddress)?;
             self.validators[sender].delete()?;
         }
 
@@ -501,9 +494,7 @@ impl ValidatorConfig {
         self.check_owner(sender)?;
 
         let index: usize = call.index.try_into().map_err(|_| {
-            TempoPrecompileError::Revert(
-                IValidatorConfig::ValidatorNotFound {}.abi_encode().into(),
-            )
+            TempoPrecompileError::Revert(IValidatorConfig::ValidatorNotFound {}.abi_encode().into())
         })?;
         let validator_address = match self.validators_array.at(index)? {
             Some(elem) => elem.read()?,
@@ -557,38 +548,6 @@ impl ContractStorage for ValidatorConfig {
 // ===========================================================================
 
 /// Dispatches calldata, handling selector validation and ABI decode errors.
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
 
 impl Precompile for ValidatorConfig {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
@@ -613,15 +572,12 @@ impl Precompile for ValidatorConfig {
                 IValidatorConfig::IValidatorConfigCalls::validatorsArray(call) => {
                     view(call, |c| {
                         let index = u64::try_from(c.index).map_err(|_| {
-                            TempoPrecompileError::Revert(
-                                Bytes::from_static(&[
-                                    0x4e, 0x48, 0x7b, 0x71, // Panic selector
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32,
-                                ]),
-                            )
+                            TempoPrecompileError::Revert(Bytes::from_static(&[
+                                0x4e, 0x48, 0x7b, 0x71, // Panic selector
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32,
+                            ]))
                         })?;
                         self.validators_array(index)
                     })
@@ -641,9 +597,7 @@ impl Precompile for ValidatorConfig {
                     mutate_void(call, msg_sender, |s, c| self.update_validator(s, c))
                 }
                 IValidatorConfig::IValidatorConfigCalls::changeValidatorStatus(call) => {
-                    mutate_void(call, msg_sender, |s, c| {
-                        self.change_validator_status(s, c)
-                    })
+                    mutate_void(call, msg_sender, |s, c| self.change_validator_status(s, c))
                 }
                 IValidatorConfig::IValidatorConfigCalls::changeValidatorStatusByIndex(call) => {
                     // Leafage always runs latest spec, so this is always available

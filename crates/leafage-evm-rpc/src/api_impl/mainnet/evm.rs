@@ -1,4 +1,4 @@
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::invalid_params_rpc_err;
 use alloy::consensus::TxType;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::Either;
@@ -8,7 +8,6 @@ use revm::context::{Evm, TxEnv};
 use revm::context_interface::Block;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::handler::{instructions::EthInstructions, EthPrecompiles};
-use revm::precompile::PrecompileSpecId;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::primitives::TxKind;
 use revm::{Context, MainBuilder, MainContext};
@@ -136,7 +135,8 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
     )
     .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
 
-    let max_gas_limit = cfg_env.tx_gas_limit_cap
+    let max_gas_limit = cfg_env
+        .tx_gas_limit_cap
         .filter(|&cap| cap != 0)
         .unwrap_or(block_env.gas_limit);
 

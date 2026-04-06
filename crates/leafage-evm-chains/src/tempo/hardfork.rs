@@ -10,13 +10,14 @@
 /// - T1B: 1771858800 (Feb 23, 2026 15:00 UTC)
 /// - T1C: 1773327600 (Mar 12, 2026 15:00 UTC)
 /// - T2: not yet scheduled
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TempoHardfork {
     Genesis,
     T1,
     T1A,
     T1B,
     T1C,
+    #[default]
     T2,
     T3,
 }
@@ -115,11 +116,9 @@ impl TempoHardfork {
     }
 }
 
-impl Default for TempoHardfork {
-    /// Returns the latest hardfork (`T3`) for cases where timestamp is not
-    /// available. This preserves the original "always latest spec" behavior.
-    fn default() -> Self {
-        Self::T3
+impl From<TempoHardfork> for revm::primitives::hardfork::SpecId {
+    fn from(_: TempoHardfork) -> Self {
+        Self::PRAGUE
     }
 }
 
@@ -214,10 +213,10 @@ mod tests {
     }
 
     #[test]
-    fn default_is_latest() {
+    fn default_is_latest_activated() {
         let hf = TempoHardfork::default();
-        assert_eq!(hf, TempoHardfork::T3);
+        assert_eq!(hf, TempoHardfork::T2);
         assert!(hf.is_t2());
-        assert!(hf.is_t3());
+        assert!(!hf.is_t3());
     }
 }

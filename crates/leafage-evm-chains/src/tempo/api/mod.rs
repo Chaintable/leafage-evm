@@ -6,18 +6,19 @@ use crate::tempo::hardfork::TempoHardfork;
 use crate::tempo::precompile::{extend_tempo_precompiles, storage::take_last_precompile_refund};
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
-use leafage_evm_types::MainnetSpecId;
 use revm::{
-    context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
+    context::{CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
     context_interface::cfg::gas_params::{GasId, GasParams},
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
-        PrecompileProvider,
-        EthFrame, EvmTr, FrameInitOrResult, FrameResult,
+        EthFrame, EvmTr, FrameInitOrResult, FrameResult, PrecompileProvider,
     },
     inspector::InspectorEvmTr,
-    interpreter::{interpreter::EthInterpreter, CallInputs, Instruction, InterpreterResult, interpreter_action::FrameInit},
+    interpreter::{
+        interpreter::EthInterpreter, interpreter_action::FrameInit, CallInputs, Instruction,
+        InterpreterResult,
+    },
     precompile::{PrecompileSpecId, Precompiles},
     primitives::Address,
     Context, Inspector, Journal,
@@ -44,7 +45,7 @@ impl TempoPrecompiles {
 impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     type Output = InterpreterResult;
 
-    fn set_spec(&mut self, spec: MainnetSpecId) -> bool {
+    fn set_spec(&mut self, spec: TempoHardfork) -> bool {
         PrecompileProvider::<TempoContext<DB>>::set_spec(&mut self.0, spec)
     }
 
@@ -75,7 +76,7 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
 mod exec;
 
 /// Type alias for the default context type of the TempoEvm.
-pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<MainnetSpecId>, DB>;
+pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<TempoHardfork>, DB>;
 
 /// Tempo EVM implementation.
 ///
@@ -104,20 +105,17 @@ impl<DB: Database, I> TempoEvm<DB, I> {
     /// 1. Loads standard Ethereum precompiles for the given spec
     /// 2. Extends them with all 9 Tempo precompiles via [`extend_tempo_precompiles`]
     /// 3. Builds the EVM context with the merged precompile set
-    pub fn new(env: EvmEnv<MainnetSpecId>, db: DB, inspector: I, inspect: bool) -> Self {
-        let mut precompiles = PrecompilesMap::from_static(
-            Precompiles::new(PrecompileSpecId::from_spec_id(env.cfg_env.spec)),
-        );
+    pub fn new(env: EvmEnv<TempoHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
+        let mut precompiles = PrecompilesMap::from_static(Precompiles::new(
+            PrecompileSpecId::from_spec_id(env.cfg_env.spec.into()),
+        ));
         extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
 
-        // Determine active hardfork from block timestamp for archive mode support.
+        let mut cfg_env = env.cfg_env;
         let timestamp = env.block_env.timestamp.saturating_to::<u64>();
         let hardfork = TempoHardfork::from_timestamp(timestamp);
-
-        // Apply Tempo TIP-1000 gas parameter overrides via revm 36 GasParams API.
-        // TIP-1000 was introduced in T1, so only apply overrides for T1+ blocks.
-        let mut cfg_env = env.cfg_env;
-        let mut gas_params = GasParams::new_spec(cfg_env.spec.into());
+        cfg_env.spec = hardfork;
+        let mut gas_params = GasParams::new_spec(hardfork.into());
         if hardfork.is_t1() {
             gas_params.override_gas([
                 (GasId::sstore_set_without_load_cost(), 250_000),
@@ -307,15 +305,15 @@ mod tests {
     #[test]
     fn test_tempo_evm_constructs() {
         let env = EvmEnv::new(
-            CfgEnv::new_with_spec(MainnetSpecId::PRAGUE),
+            CfgEnv::new_with_spec(TempoHardfork::default()),
             BlockEnv::default(),
         );
         // Should not panic -- verifies precompile registration works
         let _evm = TempoEvm::new(env, EmptyDB::default(), NoOpInspector, false);
     }
 
-    fn make_env(timestamp: u64) -> EvmEnv<MainnetSpecId> {
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+    fn make_env(timestamp: u64) -> EvmEnv<TempoHardfork> {
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::from_timestamp(timestamp));
         cfg.chain_id = 4217;
         cfg.disable_balance_check = true;
         cfg.disable_eip3607 = true;
@@ -337,8 +335,16 @@ mod tests {
         // Pre-T1A: standard gas (T0/Genesis defaults)
         let evm_pre = TempoEvm::new(make_env(1000), EmptyDB::default(), NoOpInspector, false);
         let gp = &evm_pre.inner.ctx.cfg.gas_params;
-        assert_eq!(gp.get(GasId::new_account_cost()), 25_000, "pre-T1A new_account should be 25k");
-        assert_eq!(gp.tx_eip7702_per_empty_account_cost(), 25_000, "pre-T1A eip7702 should be 25k");
+        assert_eq!(
+            gp.get(GasId::new_account_cost()),
+            25_000,
+            "pre-T1A new_account should be 25k"
+        );
+        assert_eq!(
+            gp.tx_eip7702_per_empty_account_cost(),
+            25_000,
+            "pre-T1A eip7702 should be 25k"
+        );
 
         // Post-T1A: TIP-1000 gas overrides
         let evm_post = TempoEvm::new(
@@ -348,13 +354,134 @@ mod tests {
             false,
         );
         let gp = &evm_post.inner.ctx.cfg.gas_params;
-        assert_eq!(gp.get(GasId::sstore_set_without_load_cost()), 250_000, "T1+ SSTORE set should be 250k");
-        assert_eq!(gp.get(GasId::create()), 500_000, "T1+ CREATE should be 500k");
-        assert_eq!(gp.get(GasId::tx_create_cost()), 500_000, "T1+ tx_create should be 500k");
-        assert_eq!(gp.get(GasId::new_account_cost()), 250_000, "T1+ new_account should be 250k");
-        assert_eq!(gp.get(GasId::new_account_cost_for_selfdestruct()), 250_000, "T1+ selfdestruct new_account should be 250k");
-        assert_eq!(gp.get(GasId::code_deposit_cost()), 1_000, "T1+ code_deposit should be 1k/byte");
-        assert_eq!(gp.tx_eip7702_per_empty_account_cost(), 12_500, "T1+ eip7702 should be 12.5k");
+        assert_eq!(
+            gp.get(GasId::sstore_set_without_load_cost()),
+            250_000,
+            "T1+ SSTORE set should be 250k"
+        );
+        assert_eq!(
+            gp.get(GasId::create()),
+            500_000,
+            "T1+ CREATE should be 500k"
+        );
+        assert_eq!(
+            gp.get(GasId::tx_create_cost()),
+            500_000,
+            "T1+ tx_create should be 500k"
+        );
+        assert_eq!(
+            gp.get(GasId::new_account_cost()),
+            250_000,
+            "T1+ new_account should be 250k"
+        );
+        assert_eq!(
+            gp.get(GasId::new_account_cost_for_selfdestruct()),
+            250_000,
+            "T1+ selfdestruct new_account should be 250k"
+        );
+        assert_eq!(
+            gp.get(GasId::code_deposit_cost()),
+            1_000,
+            "T1+ code_deposit should be 1k/byte"
+        );
+        assert_eq!(
+            gp.tx_eip7702_per_empty_account_cost(),
+            12_500,
+            "T1+ eip7702 should be 12.5k"
+        );
+    }
+
+    fn make_env_default_spec(timestamp: u64) -> EvmEnv<TempoHardfork> {
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
+        cfg.chain_id = 4217;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = revm::primitives::U256::from(timestamp);
+        block_env.gas_limit = 100_000_000;
+        EvmEnv::new(cfg, block_env)
+    }
+
+    #[test]
+    fn test_spec_override_genesis() {
+        let evm = TempoEvm::new(
+            make_env_default_spec(1000),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::Genesis);
+        assert_eq!(
+            evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()),
+            25_000
+        );
+    }
+
+    #[test]
+    fn test_spec_override_t1a() {
+        let evm = TempoEvm::new(
+            make_env_default_spec(1_770_908_400),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T1A);
+        assert_eq!(
+            evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()),
+            250_000
+        );
+        assert_eq!(
+            evm.inner
+                .ctx
+                .cfg
+                .gas_params
+                .get(GasId::sstore_set_without_load_cost()),
+            250_000
+        );
+    }
+
+    #[test]
+    fn test_spec_override_t2() {
+        let evm = TempoEvm::new(
+            make_env_default_spec(1_774_965_600),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T2);
+        assert_eq!(
+            evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()),
+            250_000
+        );
+    }
+
+    #[test]
+    fn test_spec_override_no_downgrade() {
+        let evm = TempoEvm::new(
+            make_env_default_spec(1_774_965_600 + 1000),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T2);
+    }
+
+    #[test]
+    fn test_hardfork_maps_to_prague() {
+        use revm::primitives::hardfork::SpecId;
+        for hf in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T1,
+            TempoHardfork::T1A,
+            TempoHardfork::T1B,
+            TempoHardfork::T1C,
+            TempoHardfork::T2,
+            TempoHardfork::T3,
+        ] {
+            assert_eq!(
+                SpecId::from(hf),
+                SpecId::PRAGUE,
+                "{hf:?} should map to PRAGUE"
+            );
+        }
     }
 
     /// Verify actual EVM execution gas differs between pre-T1A and post-T1A.
@@ -423,8 +550,8 @@ mod tests {
     // Ported from Tempo writer: crates/revm/src/handler.rs
 
     /// Make env with nonce check disabled (simulates eth_call mode).
-    fn make_env_aa(timestamp: u64) -> EvmEnv<MainnetSpecId> {
-        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+    fn make_env_aa(timestamp: u64) -> EvmEnv<TempoHardfork> {
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::from_timestamp(timestamp));
         cfg.chain_id = 4217;
         cfg.disable_balance_check = true;
         cfg.disable_nonce_check = true;
@@ -589,7 +716,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_normal = evm_normal.transact(tx_normal).expect("normal nonce").result.gas_used();
+        let gas_normal = evm_normal
+            .transact(tx_normal)
+            .expect("normal nonce")
+            .result
+            .gas_used();
 
         let mut evm_exp = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -597,7 +728,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_exp = evm_exp.transact(tx_expiring).expect("expiring nonce").result.gas_used();
+        let gas_exp = evm_exp
+            .transact(tx_expiring)
+            .expect("expiring nonce")
+            .result
+            .gas_used();
 
         // Expiring nonce should cost EXPIRING_NONCE_GAS (13k) more than existing nonce key (5k).
         let diff = gas_exp.saturating_sub(gas_normal);
@@ -626,7 +761,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_n0 = evm_n0.transact(tx_n0).expect("pre-T1 nonce=0").result.gas_used();
+        let gas_n0 = evm_n0
+            .transact(tx_n0)
+            .expect("pre-T1 nonce=0")
+            .result
+            .gas_used();
 
         let mut evm_n1 = TempoEvm::new(
             make_env_aa(1000), // Pre-T1
@@ -634,7 +773,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_n1 = evm_n1.transact(tx_n1).expect("pre-T1 nonce=1").result.gas_used();
+        let gas_n1 = evm_n1
+            .transact(tx_n1)
+            .expect("pre-T1 nonce=1")
+            .result
+            .gas_used();
 
         // Pre-T1: no TIP-1000 nonce surcharge, so gas should be identical.
         assert_eq!(
@@ -662,7 +805,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_data = evm_data.transact(tx_data).expect("with data").result.gas_used();
+        let gas_data = evm_data
+            .transact(tx_data)
+            .expect("with data")
+            .result
+            .gas_used();
 
         let mut evm_empty = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -670,7 +817,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_empty = evm_empty.transact(tx_empty).expect("empty data").result.gas_used();
+        let gas_empty = evm_empty
+            .transact(tx_empty)
+            .expect("empty data")
+            .result
+            .gas_used();
 
         // 100 non-zero bytes = 100 * 4 = 400 tokens, * token_cost.
         assert!(
@@ -728,14 +879,17 @@ mod tests {
         // Packed storage uses little-endian bit layout: value << (offset * 8).
         // u64 at offset 20: U256::from(1) << 160
         let slot7_value = U256::from(1u64) << 160;
-        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value).unwrap();
+        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value)
+            .unwrap();
 
         // Slot 9: balances mapping. balances[sender] = transfer_amount
         let balance_slot = sender.mapping_slot(U256::from(9));
-        db.insert_account_storage(tip20_addr, balance_slot, transfer_amount).unwrap();
+        db.insert_account_storage(tip20_addr, balance_slot, transfer_amount)
+            .unwrap();
 
         // Slot 8: total_supply >= transfer_amount (for consistency)
-        db.insert_account_storage(tip20_addr, U256::from(8), transfer_amount).unwrap();
+        db.insert_account_storage(tip20_addr, U256::from(8), transfer_amount)
+            .unwrap();
 
         // Sender account must exist
         db.insert_account_info(sender, AccountInfo::default());
@@ -801,9 +955,9 @@ mod tests {
     fn test_is_transfer_authorized_t2_short_circuit() {
         use crate::tempo::hardfork::TempoHardfork;
         use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+        use crate::tempo::precompile::storage_types::StorageKey;
         use crate::tempo::precompile::tip20::TIP20Token;
         use crate::tempo::precompile::TIP403_REGISTRY_ADDRESS;
-        use crate::tempo::precompile::storage_types::StorageKey;
         use revm::database::in_memory_db::CacheDB;
         use revm::primitives::{keccak256, Address, U256};
 
@@ -832,7 +986,8 @@ mod tests {
         // Slot 7: transfer_policy_id = 2 (custom policy, not builtin) packed at byte offset 20.
         let policy_id: u64 = 2;
         let slot7_value = U256::from(policy_id) << 160;
-        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value).unwrap();
+        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value)
+            .unwrap();
 
         // TIP403Registry must have code (initialized)
         db.insert_account_info(
@@ -846,7 +1001,8 @@ mod tests {
         );
 
         // policy_id_counter (slot 0) = 3 (policies 0,1,2 exist)
-        db.insert_account_storage(TIP403_REGISTRY_ADDRESS, U256::from(0), U256::from(3)).unwrap();
+        db.insert_account_storage(TIP403_REGISTRY_ADDRESS, U256::from(0), U256::from(3))
+            .unwrap();
 
         // policy_records[2].base = PolicyData { policy_type: WHITELIST(0), admin: 0x01 }
         // Slot: keccak256(abi.encode(2, 1))
@@ -859,7 +1015,8 @@ mod tests {
             TIP403_REGISTRY_ADDRESS,
             policy_record_slot,
             U256::from_be_bytes(policy_data_bytes),
-        ).unwrap();
+        )
+        .unwrap();
 
         // policy_set[2][sender] = false (NOT whitelisted → denied)
         // Slot: keccak256(abi.encode(sender, keccak256(abi.encode(2, 2))))
@@ -869,25 +1026,28 @@ mod tests {
 
         // policy_set[2][recipient] = true (whitelisted → authorized)
         let policy_set_recipient = recipient.mapping_slot(policy_set_outer);
-        db.insert_account_storage(
-            TIP403_REGISTRY_ADDRESS,
-            policy_set_recipient,
-            U256::from(1),
-        ).unwrap();
+        db.insert_account_storage(TIP403_REGISTRY_ADDRESS, policy_set_recipient, U256::from(1))
+            .unwrap();
 
         // --- Pre-T2 (T1C): both sender and recipient checks run ---
         let result_pre_t2 = with_read_only_storage_ctx(&db, TempoHardfork::T1C, 4217, || {
-            TIP20Token::from_address_unchecked(tip20_addr)
-                .is_transfer_authorized(sender, recipient)
+            TIP20Token::from_address_unchecked(tip20_addr).is_transfer_authorized(sender, recipient)
         });
-        assert_eq!(result_pre_t2.unwrap(), false, "pre-T2: sender denied → false");
+        assert_eq!(
+            result_pre_t2.unwrap(),
+            false,
+            "pre-T2: sender denied → false"
+        );
 
         // --- Post-T2: sender fails → short-circuit, recipient not checked ---
         let result_t2 = with_read_only_storage_ctx(&db, TempoHardfork::T2, 4217, || {
-            TIP20Token::from_address_unchecked(tip20_addr)
-                .is_transfer_authorized(sender, recipient)
+            TIP20Token::from_address_unchecked(tip20_addr).is_transfer_authorized(sender, recipient)
         });
-        assert_eq!(result_t2.unwrap(), false, "T2: sender denied → short-circuit → false");
+        assert_eq!(
+            result_t2.unwrap(),
+            false,
+            "T2: sender denied → short-circuit → false"
+        );
 
         // Both return false, but gas differs:
         // Pre-T2: reads policy_data + policy_set[sender] + policy_data + policy_set[recipient]
@@ -907,8 +1067,8 @@ mod tests {
     fn test_t2_nonce_gas_repricing() {
         use revm::primitives::U256;
 
-        let pre_t2_ts = 1_773_327_600 + 100;  // T1C era
-        let post_t2_ts = 1_774_965_600 + 100;  // T2 era
+        let pre_t2_ts = 1_773_327_600 + 100; // T1C era
+        let post_t2_ts = 1_774_965_600 + 100; // T2 era
 
         let calls = vec![make_call(0x01, &[])];
 
@@ -922,7 +1082,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_pre = evm_pre.transact(tx_pre).expect("T1C transact").result.gas_used();
+        let gas_pre = evm_pre
+            .transact(tx_pre)
+            .expect("T1C transact")
+            .result
+            .gas_used();
 
         let mut evm_post = TempoEvm::new(
             make_env_aa(post_t2_ts),
@@ -930,7 +1094,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_post = evm_post.transact(tx_post).expect("T2 transact").result.gas_used();
+        let gas_post = evm_post
+            .transact(tx_post)
+            .expect("T2 transact")
+            .result
+            .gas_used();
 
         // T2 existing nonce key costs 5200 vs T1C 5000 → exactly +200.
         let diff = gas_post.saturating_sub(gas_pre);
@@ -950,11 +1118,19 @@ mod tests {
         let t2 = TempoHardfork::T2;
 
         // T1C nonce gas
-        assert_eq!(t1c.gas_existing_nonce_key(), 5_000, "T1C existing nonce key gas");
+        assert_eq!(
+            t1c.gas_existing_nonce_key(),
+            5_000,
+            "T1C existing nonce key gas"
+        );
         assert_eq!(t1c.gas_new_nonce_key(), 22_100, "T1C new nonce key gas");
 
         // T2 nonce gas: each +200
-        assert_eq!(t2.gas_existing_nonce_key(), 5_200, "T2 existing nonce key gas");
+        assert_eq!(
+            t2.gas_existing_nonce_key(),
+            5_200,
+            "T2 existing nonce key gas"
+        );
         assert_eq!(t2.gas_new_nonce_key(), 22_300, "T2 new nonce key gas");
 
         // Deltas
@@ -985,11 +1161,27 @@ mod tests {
         let gp = &evm.inner.ctx.cfg.gas_params;
 
         // TIP-1000 overrides should still be active at T2
-        assert_eq!(gp.get(GasId::sstore_set_without_load_cost()), 250_000, "T2 SSTORE set should be 250k");
+        assert_eq!(
+            gp.get(GasId::sstore_set_without_load_cost()),
+            250_000,
+            "T2 SSTORE set should be 250k"
+        );
         assert_eq!(gp.get(GasId::create()), 500_000, "T2 CREATE should be 500k");
-        assert_eq!(gp.get(GasId::tx_create_cost()), 500_000, "T2 tx_create should be 500k");
-        assert_eq!(gp.get(GasId::new_account_cost()), 250_000, "T2 new_account should be 250k");
-        assert_eq!(gp.get(GasId::code_deposit_cost()), 1_000, "T2 code_deposit should be 1k/byte");
+        assert_eq!(
+            gp.get(GasId::tx_create_cost()),
+            500_000,
+            "T2 tx_create should be 500k"
+        );
+        assert_eq!(
+            gp.get(GasId::new_account_cost()),
+            250_000,
+            "T2 new_account should be 250k"
+        );
+        assert_eq!(
+            gp.get(GasId::code_deposit_cost()),
+            1_000,
+            "T2 code_deposit should be 1k/byte"
+        );
     }
 
     /// T2 `ensure_admin_caller` requires tx_origin == msg_sender.
@@ -1004,11 +1196,11 @@ mod tests {
     ///     returning `UnauthorizedCaller` before reaching expiry check.
     #[test]
     fn test_t2_account_keychain_admin_requires_tx_origin() {
-        use alloy::sol_types::SolError;
         use crate::tempo::precompile::account_keychain::{AccountKeychain, IAccountKeychain};
         use crate::tempo::precompile::error::TempoPrecompileError;
         use crate::tempo::precompile::storage::with_read_only_storage_ctx;
         use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+        use alloy::sol_types::SolError;
         use revm::database::in_memory_db::CacheDB;
         use revm::primitives::Address;
 
@@ -1119,14 +1311,17 @@ mod tests {
 
         // Slot 7: transfer_policy_id = 1 (ALLOW_ALL) packed at byte offset 20.
         let slot7_value = U256::from(1u64) << 160;
-        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value).unwrap();
+        db.insert_account_storage(tip20_addr, U256::from(7), slot7_value)
+            .unwrap();
 
         // Slot 9: balances[sender] = 1000
         let balance_slot = sender.mapping_slot(U256::from(9));
-        db.insert_account_storage(tip20_addr, balance_slot, initial_balance).unwrap();
+        db.insert_account_storage(tip20_addr, balance_slot, initial_balance)
+            .unwrap();
 
         // Slot 8: total_supply >= balance
-        db.insert_account_storage(tip20_addr, U256::from(8), initial_balance).unwrap();
+        db.insert_account_storage(tip20_addr, U256::from(8), initial_balance)
+            .unwrap();
 
         db.insert_account_info(sender, AccountInfo::default());
 
@@ -1180,7 +1375,10 @@ mod tests {
 
         // The batch should have reverted (second call fails).
         assert!(
-            matches!(result.result, revm::context_interface::result::ExecutionResult::Revert { .. }),
+            matches!(
+                result.result,
+                revm::context_interface::result::ExecutionResult::Revert { .. }
+            ),
             "expected Revert from failing batch, got: {:?}",
             result.result
         );
@@ -1255,7 +1453,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_1 = evm_1.transact(make_tx(single_call)).expect("single call").result.gas_used();
+        let gas_1 = evm_1
+            .transact(make_tx(single_call))
+            .expect("single call")
+            .result
+            .gas_used();
 
         let mut evm_3 = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -1263,7 +1465,11 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_3 = evm_3.transact(make_tx(triple_call)).expect("triple call").result.gas_used();
+        let gas_3 = evm_3
+            .transact(make_tx(triple_call))
+            .expect("triple call")
+            .result
+            .gas_used();
 
         assert!(
             gas_3 > gas_1,
@@ -1305,7 +1511,11 @@ mod tests {
             revm::inspector::NoOpInspector,
             false,
         );
-        let gas_cold = evm1.transact(make_tx(calldata.clone())).expect("cold").result.gas_used();
+        let gas_cold = evm1
+            .transact(make_tx(calldata.clone()))
+            .expect("cold")
+            .result
+            .gas_used();
 
         // WITH pre-warm: insert VCV2 into CacheDB before EVM construction
         let mut db2 = CacheDB::new(revm::database::EmptyDB::default());
@@ -1314,7 +1524,8 @@ mod tests {
             revm::state::AccountInfo {
                 code_hash: revm::bytecode::Bytecode::new_legacy(
                     alloy::primitives::Bytes::from_static(&[0xef]),
-                ).hash_slow(),
+                )
+                .hash_slow(),
                 code: Some(revm::bytecode::Bytecode::new_legacy(
                     alloy::primitives::Bytes::from_static(&[0xef]),
                 )),
@@ -1328,10 +1539,17 @@ mod tests {
             revm::inspector::NoOpInspector,
             false,
         );
-        let gas_warm = evm2.transact(make_tx(calldata)).expect("warm").result.gas_used();
+        let gas_warm = evm2
+            .transact(make_tx(calldata))
+            .expect("warm")
+            .result
+            .gas_used();
 
         eprintln!("VCV2 T2 gas: cold={gas_cold} warm={gas_warm}");
         // Code/account presence does NOT affect precompile gas — dispatch by address.
-        assert_eq!(gas_cold, gas_warm, "VCV2 code presence should not affect precompile gas");
+        assert_eq!(
+            gas_cold, gas_warm,
+            "VCV2 code presence should not affect precompile gas"
+        );
     }
 }

@@ -228,8 +228,7 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        // Tempo: return virtual balance placeholder (no native token).
-        if let Some(vb) = self.inner.evm_cfg().virtual_balance {
+        if let Some(vb) = self.inner.virtual_balance() {
             return Ok(vb);
         }
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
@@ -724,7 +723,7 @@ where
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
         // required gas is 271000+.
-        if !self.inner.evm_cfg().is_tempo && tx.input().is_empty() {
+        if self.inner.virtual_balance().is_none() && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
@@ -745,75 +744,9 @@ where
             }
         }
         if tx.gas_price() > 0 {
-            let gas_limit = if self.inner.evm_cfg().is_tempo {
-                // Tempo: read TIP-20 fee token balance for gas cap.
-                // Ported from writer: caller_gas_allowance in crates/node/src/rpc/mod.rs
-                // Use fee_payer (sponsor) if specified, otherwise caller.
-                // Use fee_token override if specified.
-                // Resolve fee payer: feePayerSignature (recover) > feePayer (direct) > caller.
-                let payer = if let Some(sig) = &request.fee_payer_signature {
-                    use leafage_evm_chains::tempo::fee_payer::{self as fp, Call as FpCall};
-                    let calls: Vec<FpCall> = request.tempo_calls.as_ref()
-                        .map(|cs| cs.iter().map(|c| {
-                            let to = c.to.as_ref().and_then(|t| t.to().copied());
-                            FpCall {
-                                to,
-                                value: c.value.unwrap_or_default(),
-                                input: c.input.clone().into_input().unwrap_or_default(),
-                            }
-                        }).collect())
-                        .unwrap_or_default();
-                    let access_list = alloy::eips::eip2930::AccessList::default();
-                    fp::recover_fee_payer(
-                        sig,
-                        self.inner.evm_cfg().cfg.chain_id,
-                        tx.max_priority_fee_per_gas().unwrap_or(0),
-                        tx.max_fee_per_gas(),
-                        tx.gas_limit(),
-                        &calls,
-                        &access_list,
-                        request.nonce_key.unwrap_or_default(),
-                        tx.nonce(),
-                        request.valid_before,
-                        request.valid_after,
-                        request.fee_token,
-                        tx.caller(),
-                        &[], // TODO: full TempoSignedAuthorization when available
-                        None, // TODO: full SignedKeyAuthorization when available
-                    ).unwrap_or(tx.caller())
-                } else {
-                    request.fee_payer.unwrap_or(tx.caller())
-                };
-                leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
-                    &memory_db,
-                    payer,
-                    tx.gas_price(),
-                    block_env.timestamp.saturating_to::<u64>(),
-                    self.inner.evm_cfg().cfg.chain_id,
-                    request.fee_token,
-                )
-                .unwrap_or(u64::MAX)
-            } else {
-                // Standard chain: native balance / gas_price
-                let caller = memory_db.basic_ref(tx.caller()).map_err(|e| {
-                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-                })?;
-                let balance = caller
-                    .map(|acc| acc.balance)
-                    .unwrap_or_default()
-                    .checked_sub(tx.value())
-                    .ok_or_else(|| {
-                        rpc_error_with_code(
-                            DebankErrorCode::BalanceExhausted as i32,
-                            "Insufficient funds".to_string(),
-                        )
-                    })?;
-                balance
-                    .checked_div(U256::from(tx.gas_price()))
-                    .unwrap_or_default()
-                    .try_into()
-                    .unwrap()
-            };
+            let gas_limit = self
+                .inner
+                .gas_allowance(&request, &tx, &memory_db, &block_env)?;
             highest_gas_limit = highest_gas_limit.min(gas_limit);
         }
         tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));

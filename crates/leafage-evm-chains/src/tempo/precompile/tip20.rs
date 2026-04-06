@@ -37,7 +37,7 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 use std::sync::LazyLock;
 
 use super::error::{Result, TempoPrecompileError};
@@ -46,7 +46,7 @@ use super::storage_types::{
     BytesLikeHandler, FromWord, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
 };
 use super::{
-    fill_precompile_output, input_cost, metadata, mutate, mutate_void, view, Precompile,
+    dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile,
     STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
 };
 
@@ -81,8 +81,7 @@ pub static UNPAUSE_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"UNPAUSE_R
 /// Role hash for minting new tokens.
 pub static ISSUER_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"ISSUER_ROLE"));
 /// Role hash that prevents an account from burning tokens.
-pub static BURN_BLOCKED_ROLE: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"BURN_BLOCKED_ROLE"));
+pub static BURN_BLOCKED_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"BURN_BLOCKED_ROLE"));
 
 /// Returns true if the address has the TIP20 prefix.
 pub fn is_tip20_prefix(token: Address) -> bool {
@@ -364,18 +363,13 @@ impl TIP20Token {
     }
 
     fn __initialize(&mut self) -> Result<()> {
-        let bytecode =
-            revm::state::Bytecode::new_legacy(Bytes::from_static(&[0xef]));
+        let bytecode = revm::state::Bytecode::new_legacy(Bytes::from_static(&[0xef]));
         self.storage.set_code(self.address, bytecode)?;
         Ok(())
     }
 
-    fn emit_event(
-        &mut self,
-        event: impl alloy::primitives::IntoLogData,
-    ) -> Result<()> {
-        self.storage
-            .emit_event(self.address, event.into_log_data())
+    fn emit_event(&mut self, event: impl alloy::primitives::IntoLogData) -> Result<()> {
+        self.storage.emit_event(self.address, event.into_log_data())
     }
 }
 
@@ -554,12 +548,7 @@ impl TIP20Token {
         self.allowances[owner][spender].read()
     }
 
-    fn set_allowance(
-        &mut self,
-        owner: Address,
-        spender: Address,
-        amount: U256,
-    ) -> Result<()> {
+    fn set_allowance(&mut self, owner: Address, spender: Address, amount: U256) -> Result<()> {
         self.allowances[owner][spender].write(amount)
     }
 
@@ -640,11 +629,7 @@ impl TIP20Token {
     }
 
     /// Grants `DEFAULT_ADMIN_ROLE` to `admin`. Used during token initialization.
-    pub fn grant_default_admin(
-        &mut self,
-        msg_sender: Address,
-        admin: Address,
-    ) -> Result<()> {
+    pub fn grant_default_admin(&mut self, msg_sender: Address, admin: Address) -> Result<()> {
         self.grant_role_internal(admin, DEFAULT_ADMIN_ROLE)?;
 
         self.emit_event(IRolesAuth::RoleMembershipUpdated {
@@ -841,11 +826,7 @@ impl TIP20Token {
     }
 
     /// Unpauses token transfers.
-    pub fn unpause(
-        &mut self,
-        msg_sender: Address,
-        _call: ITIP20::unpauseCall,
-    ) -> Result<()> {
+    pub fn unpause(&mut self, msg_sender: Address, _call: ITIP20::unpauseCall) -> Result<()> {
         self.check_role(msg_sender, *UNPAUSE_ROLE)?;
         self.paused.write(false)?;
 
@@ -865,7 +846,9 @@ impl TIP20Token {
 
         // Validate that the policy exists in TIP403Registry
         if !super::tip403_registry::TIP403Registry::new().policy_exists(
-            super::tip403_registry::ITIP403Registry::policyExistsCall { policyId: call.newPolicyId },
+            super::tip403_registry::ITIP403Registry::policyExistsCall {
+                policyId: call.newPolicyId,
+            },
         )? {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::InvalidTransferPolicyId {}.abi_encode().into(),
@@ -950,15 +933,15 @@ impl TIP20Token {
     }
 
     /// Sets `spender`'s allowance to `amount` for the caller's tokens.
-    pub fn approve(
-        &mut self,
-        msg_sender: Address,
-        call: ITIP20::approveCall,
-    ) -> Result<bool> {
+    pub fn approve(&mut self, msg_sender: Address, call: ITIP20::approveCall) -> Result<bool> {
         // AccountKeychain spending limit check for approve
         let old_allowance = self.get_allowance(msg_sender, call.spender)?;
-        super::account_keychain::AccountKeychain::new()
-            .authorize_approve(msg_sender, self.address, old_allowance, call.amount)?;
+        super::account_keychain::AccountKeychain::new().authorize_approve(
+            msg_sender,
+            self.address,
+            old_allowance,
+            call.amount,
+        )?;
         self.set_allowance(msg_sender, call.spender, call.amount)?;
 
         self.emit_event(ITIP20::Approval {
@@ -1043,18 +1026,17 @@ impl TIP20Token {
     }
 
     /// Transfers `amount` tokens from the caller to `to`.
-    pub fn transfer(
-        &mut self,
-        msg_sender: Address,
-        call: ITIP20::transferCall,
-    ) -> Result<bool> {
+    pub fn transfer(&mut self, msg_sender: Address, call: ITIP20::transferCall) -> Result<bool> {
         self.check_not_paused()?;
         self.check_recipient(call.to)?;
         self.ensure_transfer_authorized(msg_sender, call.to)?;
 
         // AccountKeychain spending limit check for transfer
-        super::account_keychain::AccountKeychain::new()
-            .authorize_transfer(msg_sender, self.address, call.amount)?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            msg_sender,
+            self.address,
+            call.amount,
+        )?;
         self._transfer(msg_sender, call.to, call.amount)?;
         Ok(true)
     }
@@ -1106,9 +1088,7 @@ impl TIP20Token {
 
         if allowed != U256::MAX {
             let new_allowance = allowed.checked_sub(amount).ok_or_else(|| {
-                TempoPrecompileError::Revert(
-                    ITIP20::InsufficientAllowance {}.abi_encode().into(),
-                )
+                TempoPrecompileError::Revert(ITIP20::InsufficientAllowance {}.abi_encode().into())
             })?;
             self.set_allowance(from, msg_sender, new_allowance)?;
         }
@@ -1128,8 +1108,11 @@ impl TIP20Token {
         self.ensure_transfer_authorized(msg_sender, call.to)?;
 
         // AccountKeychain spending limit check for transferWithMemo
-        super::account_keychain::AccountKeychain::new()
-            .authorize_transfer(msg_sender, self.address, call.amount)?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            msg_sender,
+            self.address,
+            call.amount,
+        )?;
         self._transfer(msg_sender, call.to, call.amount)?;
 
         self.emit_event(ITIP20::TransferWithMemo {
@@ -1153,8 +1136,11 @@ impl TIP20Token {
         self.check_recipient(to)?;
         self.ensure_transfer_authorized(from, to)?;
         // AccountKeychain spending limit
-        super::account_keychain::AccountKeychain::new()
-            .authorize_transfer(from, self.address, amount)?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            from,
+            self.address,
+            amount,
+        )?;
         self._transfer(from, to, amount)?;
         Ok(true)
     }
@@ -1180,8 +1166,11 @@ impl TIP20Token {
         }
 
         // AccountKeychain spending limit
-        super::account_keychain::AccountKeychain::new()
-            .authorize_transfer(from, self.address, amount)?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            from,
+            self.address,
+            amount,
+        )?;
 
         self.handle_rewards_on_transfer(from, TIP_FEE_MANAGER_ADDRESS, amount)?;
 
@@ -1200,9 +1189,7 @@ impl TIP20Token {
 
         let to_balance = self.get_balance(TIP_FEE_MANAGER_ADDRESS)?;
         let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
-            TempoPrecompileError::Revert(
-                ITIP20::SupplyCapExceeded {}.abi_encode().into(),
-            )
+            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
         })?;
         self.set_balance(TIP_FEE_MANAGER_ADDRESS, new_to_balance)
     }
@@ -1229,8 +1216,11 @@ impl TIP20Token {
 
         // Refund spending limit (T1C+, matching writer tip20/mod.rs:1046)
         if self.storage.spec().is_t1c() {
-            super::account_keychain::AccountKeychain::new()
-                .refund_spending_limit(to, self.address, refund)?;
+            super::account_keychain::AccountKeychain::new().refund_spending_limit(
+                to,
+                self.address,
+                refund,
+            )?;
         }
 
         self.handle_rewards_on_transfer(TIP_FEE_MANAGER_ADDRESS, to, refund)?;
@@ -1251,9 +1241,7 @@ impl TIP20Token {
 
         let to_balance = self.get_balance(to)?;
         let new_to_balance = to_balance.checked_add(refund).ok_or_else(|| {
-            TempoPrecompileError::Revert(
-                ITIP20::SupplyCapExceeded {}.abi_encode().into(),
-            )
+            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
         })?;
         self.set_balance(to, new_to_balance)?;
 
@@ -1281,16 +1269,16 @@ impl TIP20Token {
 
         self.handle_rewards_on_transfer(from, to, amount)?;
 
-        let new_from_balance = from_balance.checked_sub(amount).ok_or_else(|| {
-            TempoPrecompileError::Fatal("underflow in _transfer".to_string())
-        })?;
+        let new_from_balance = from_balance
+            .checked_sub(amount)
+            .ok_or_else(|| TempoPrecompileError::Fatal("underflow in _transfer".to_string()))?;
         self.set_balance(from, new_from_balance)?;
 
         if to != Address::ZERO {
             let to_balance = self.get_balance(to)?;
-            let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in _transfer".to_string())
-            })?;
+            let new_to_balance = to_balance
+                .checked_add(amount)
+                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _transfer".to_string()))?;
             self.set_balance(to, new_to_balance)?;
         }
 
@@ -1298,11 +1286,7 @@ impl TIP20Token {
     }
 
     /// Mints `amount` tokens to the specified `to` address.
-    pub fn mint(
-        &mut self,
-        msg_sender: Address,
-        call: ITIP20::mintCall,
-    ) -> Result<()> {
+    pub fn mint(&mut self, msg_sender: Address, call: ITIP20::mintCall) -> Result<()> {
         self._mint(msg_sender, call.to, call.amount)?;
         self.emit_event(ITIP20::Mint {
             to: call.to,
@@ -1345,9 +1329,9 @@ impl TIP20Token {
                 ITIP20::PolicyForbids {}.abi_encode().into(),
             ));
         }
-        let new_supply = total_supply.checked_add(amount).ok_or_else(|| {
-            TempoPrecompileError::Fatal("overflow in _mint".to_string())
-        })?;
+        let new_supply = total_supply
+            .checked_add(amount)
+            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
 
         let supply_cap = self.supply_cap()?;
         if new_supply > supply_cap {
@@ -1360,9 +1344,9 @@ impl TIP20Token {
 
         self.set_total_supply(new_supply)?;
         let to_balance = self.get_balance(to)?;
-        let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
-            TempoPrecompileError::Fatal("overflow in _mint".to_string())
-        })?;
+        let new_to_balance = to_balance
+            .checked_add(amount)
+            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
         self.set_balance(to, new_to_balance)?;
 
         self.emit_event(ITIP20::Transfer {
@@ -1373,11 +1357,7 @@ impl TIP20Token {
     }
 
     /// Burns `amount` from the caller's balance and reduces total supply.
-    pub fn burn(
-        &mut self,
-        msg_sender: Address,
-        call: ITIP20::burnCall,
-    ) -> Result<()> {
+    pub fn burn(&mut self, msg_sender: Address, call: ITIP20::burnCall) -> Result<()> {
         self._burn(msg_sender, call.amount)?;
         self.emit_event(ITIP20::Burn {
             from: msg_sender,
@@ -1496,8 +1476,11 @@ impl TIP20Token {
 
         self.ensure_transfer_authorized(msg_sender, token_address)?;
         // AccountKeychain spending limit check for distributeReward
-        super::account_keychain::AccountKeychain::new()
-            .authorize_transfer(msg_sender, self.address, call.amount)?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            msg_sender,
+            self.address,
+            call.amount,
+        )?;
         self._transfer(msg_sender, token_address, call.amount)?;
 
         let opted_in_supply = U256::from(self.get_opted_in_supply()?);
@@ -1549,19 +1532,17 @@ impl TIP20Token {
                     })?;
 
                 if cached_delegate == holder {
-                    info.reward_balance = info.reward_balance.checked_add(reward).ok_or_else(
-                        || TempoPrecompileError::Fatal("overflow in update_rewards".to_string()),
-                    )?;
+                    info.reward_balance =
+                        info.reward_balance.checked_add(reward).ok_or_else(|| {
+                            TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
+                        })?;
                 } else {
-                    let mut delegate_info =
-                        self.user_reward_info[cached_delegate].read()?;
+                    let mut delegate_info = self.user_reward_info[cached_delegate].read()?;
                     delegate_info.reward_balance = delegate_info
                         .reward_balance
                         .checked_add(reward)
                         .ok_or_else(|| {
-                            TempoPrecompileError::Fatal(
-                                "overflow in update_rewards".to_string(),
-                            )
+                            TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
                         })?;
                     self.user_reward_info[cached_delegate].write(delegate_info)?;
                 }
@@ -1592,28 +1573,20 @@ impl TIP20Token {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_sub(holder_balance)
                     .ok_or_else(|| {
-                        TempoPrecompileError::Fatal(
-                            "underflow in set_reward_recipient".to_string(),
-                        )
+                        TempoPrecompileError::Fatal("underflow in set_reward_recipient".to_string())
                     })?;
                 self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in set_reward_recipient".to_string(),
-                    )
+                    TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
                 })?)?;
             }
         } else if call.recipient != Address::ZERO {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(holder_balance)
                 .ok_or_else(|| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in set_reward_recipient".to_string(),
-                    )
+                    TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
                 })?;
             self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal(
-                    "overflow in set_reward_recipient".to_string(),
-                )
+                TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
             })?)?;
         }
 
@@ -1641,9 +1614,9 @@ impl TIP20Token {
         let max_amount = amount.min(contract_balance);
 
         let reward_recipient = info.reward_recipient;
-        info.reward_balance = amount.checked_sub(max_amount).ok_or_else(|| {
-            TempoPrecompileError::Fatal("underflow in claim_rewards".to_string())
-        })?;
+        info.reward_balance = amount
+            .checked_sub(max_amount)
+            .ok_or_else(|| TempoPrecompileError::Fatal("underflow in claim_rewards".to_string()))?;
         self.user_reward_info[msg_sender].write(info)?;
 
         if max_amount > U256::ZERO {
@@ -1734,9 +1707,7 @@ impl TIP20Token {
                     )
                 })?;
             self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal(
-                    "overflow in handle_rewards_on_transfer".to_string(),
-                )
+                TempoPrecompileError::Fatal("overflow in handle_rewards_on_transfer".to_string())
             })?)?;
         }
 
@@ -1751,14 +1722,10 @@ impl TIP20Token {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(amount)
                 .ok_or_else(|| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in handle_rewards_on_mint".to_string(),
-                    )
+                    TempoPrecompileError::Fatal("overflow in handle_rewards_on_mint".to_string())
                 })?;
             self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal(
-                    "overflow in handle_rewards_on_mint".to_string(),
-                )
+                TempoPrecompileError::Fatal("overflow in handle_rewards_on_mint".to_string())
             })?)?;
         }
 
@@ -1783,9 +1750,7 @@ impl TIP20Token {
                 let reward_per_token_delta = global_reward_per_token
                     .checked_sub(info.reward_per_token)
                     .ok_or_else(|| {
-                        TempoPrecompileError::Fatal(
-                            "underflow in get_pending_rewards".to_string(),
-                        )
+                        TempoPrecompileError::Fatal("underflow in get_pending_rewards".to_string())
                     })?;
 
                 if reward_per_token_delta > U256::ZERO {
@@ -1798,9 +1763,7 @@ impl TIP20Token {
                             )
                         })?;
                     pending = pending.checked_add(accrued).ok_or_else(|| {
-                        TempoPrecompileError::Fatal(
-                            "overflow in get_pending_rewards".to_string(),
-                        )
+                        TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string())
                     })?;
                 }
             }
@@ -1834,42 +1797,6 @@ impl TIP20Call {
     }
 }
 
-/// Dispatches calldata, handling selector validation and ABI decode errors.
-fn dispatch_call<T>(
-    calldata: &[u8],
-    decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
-    f: impl FnOnce(T) -> PrecompileResult,
-) -> PrecompileResult {
-    let storage = StorageCtx::default();
-
-    if calldata.len() < 4 {
-        // T1+: return reverted output for missing selector
-        return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        ));
-    }
-
-    let result = decode(calldata);
-
-    match result {
-        Ok(call) => f(call).map(|res| fill_precompile_output(res, &storage)),
-        Err(alloy::sol_types::Error::UnknownSelector { selector, .. }) => {
-            unknown_selector(*selector, storage.gas_used())
-                .map(|res| fill_precompile_output(res, &storage))
-        }
-        Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
-            &storage,
-        )),
-    }
-}
-
-/// Returns an ABI-encoded `UnknownFunctionSelector` revert.
-fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
-}
-
 impl Precompile for TIP20Token {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
@@ -1878,10 +1805,8 @@ impl Precompile for TIP20Token {
 
         // Ensure that the token is initialized (has bytecode)
         if !self.is_initialized().unwrap_or(false) {
-            return TempoPrecompileError::Revert(
-                ITIP20::Uninitialized {}.abi_encode().into(),
-            )
-            .into_precompile_result(self.storage.gas_used());
+            return TempoPrecompileError::Revert(ITIP20::Uninitialized {}.abi_encode().into())
+                .into_precompile_result(self.storage.gas_used());
         }
 
         dispatch_call(calldata, TIP20Call::decode, |call| match call {
@@ -2007,12 +1932,9 @@ impl Precompile for TIP20Token {
             TIP20Call::TIP20(ITIP20::ITIP20Calls::optedInSupply(call)) => {
                 view(call, |_| self.get_opted_in_supply())
             }
-            TIP20Call::TIP20(ITIP20::ITIP20Calls::userRewardInfo(call)) => {
-                view(call, |c| {
-                    self.get_user_reward_info(c.account)
-                        .map(|info| info.into())
-                })
-            }
+            TIP20Call::TIP20(ITIP20::ITIP20Calls::userRewardInfo(call)) => view(call, |c| {
+                self.get_user_reward_info(c.account).map(|info| info.into())
+            }),
             TIP20Call::TIP20(ITIP20::ITIP20Calls::getPendingRewards(call)) => {
                 view(call, |c| self.get_pending_rewards(c.account))
             }
@@ -2021,9 +1943,7 @@ impl Precompile for TIP20Token {
             TIP20Call::TIP20(ITIP20::ITIP20Calls::permit(call)) => {
                 mutate_void(call, msg_sender, |_s, c| self.permit(c))
             }
-            TIP20Call::TIP20(ITIP20::ITIP20Calls::nonces(call)) => {
-                view(call, |c| self.nonces(c))
-            }
+            TIP20Call::TIP20(ITIP20::ITIP20Calls::nonces(call)) => view(call, |c| self.nonces(c)),
             TIP20Call::TIP20(ITIP20::ITIP20Calls::DOMAIN_SEPARATOR(call)) => {
                 view(call, |_| self.domain_separator())
             }

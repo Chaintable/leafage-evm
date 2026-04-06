@@ -16,6 +16,7 @@ use revm::{
     interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
     Context, Inspector, Journal,
 };
+use revm::primitives::hardfork::SpecId;
 
 mod exec;
 
@@ -56,7 +57,7 @@ impl<DB: Database, I> BscEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: EthInstructions::new_mainnet(),
+                instruction: EthInstructions::new_mainnet_with_spec(SpecId::default()),
                 precompiles,
                 frame_stack: Default::default(),
             },
