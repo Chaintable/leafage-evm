@@ -13,6 +13,17 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 - **多数据库后端**：RocksDB（默认）、MDBX
 - **数据迁移**：支持从 Geth 快照导入初始状态
 
+## 支持的写节点仓库
+
+任何兼容 EVM 的链都有可能获得支持。目前已支持以下链：
+
+| 链 | 仓库 |
+|----|------|
+| ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
+| AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
+| OP Stack (OP, Base 等) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
+| Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
+
 ## 支持的 JSON-RPC 方法
 
 ### eth_*
@@ -226,17 +237,6 @@ leafage-evm 支持两种状态更新方式：
 
 - **Kafka + S3（主要方式）**：通过 Kafka 接收区块变更通知，从 S3 获取区块信息和状态差异
 - **HTTP（备用方式）**：轮询修改版 Geth 的 `trace_debankBlock` RPC 接口
-
-### 支持的写节点仓库
-
-任何兼容 EVM 的链都有可能获得支持。目前已支持以下链：
-
-| 链 | 仓库 |
-|----|------|
-| ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
-| AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
-| OP Stack (OP, Base 等) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
-| Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
 
 ## 项目结构
 
