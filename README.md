@@ -227,6 +227,17 @@ leafage-evm supports two modes for receiving state updates:
 - **Kafka + S3 (Primary)**: Receives block change notifications via Kafka, fetches block info and state diffs from S3
 - **HTTP (Fallback)**: Polls `trace_debankBlock` RPC from a modified Geth instance
 
+### Supported Write Node Repositories
+
+Any EVM-compatible chain can potentially be supported. The following chains are currently supported:
+
+| Chain | Repository |
+|-------|------------|
+| ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
+| AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
+| OP Stack (OP, Base, etc.) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
+| Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
+
 ## Project Structure
 
 ```
