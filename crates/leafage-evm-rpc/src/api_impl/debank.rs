@@ -862,7 +862,17 @@ where
             highest_gas_limit
         };
 
-        Ok(U256::from(final_gas))
+        let mut overhead_tx = tx.clone();
+        overhead_tx.set_gas_limit(final_gas);
+        let l1_overhead = self.inner.estimate_l1_gas_overhead(
+            &block,
+            final_gas,
+            overhead_tx,
+            &memory_db,
+            &block_env,
+        )?;
+
+        Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }
 
     async fn debank_estimate_gas_impl(

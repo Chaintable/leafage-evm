@@ -1,4 +1,4 @@
-use leafage_evm_chains::citrea::{CitreaHardfork, CitreaPrecompiles};
+use leafage_evm_chains::citrea::{CitreaHandlerEvm, CitreaHardfork, CitreaPrecompiles};
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};
 use revm::context::{Evm, TxEnv};
 use revm::database::{DatabaseRef, WrapDatabaseRef};
@@ -33,4 +33,24 @@ where
         .with_ref_db(state)
         .build_mainnet_with_inspector(inspector)
         .with_precompiles(eth_precompiles)
+}
+
+pub(crate) fn create_citrea_handler_evm<StateDB, INSP>(
+    block_env: BlockEnv,
+    cfg: CfgEnv<CitreaHardfork>,
+    state: StateDB,
+    inspector: INSP,
+    l1_fee_rate: u128,
+) -> CitreaHandlerEvm<WrapDatabaseRef<StateDB>, INSP>
+where
+    StateDB: DatabaseRef + std::fmt::Debug,
+    StateDB::Error: std::fmt::Debug,
+{
+    CitreaHandlerEvm::new(
+        block_env,
+        cfg,
+        WrapDatabaseRef(state),
+        inspector,
+        l1_fee_rate,
+    )
 }

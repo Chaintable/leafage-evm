@@ -7,7 +7,7 @@ use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
@@ -137,6 +137,21 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
+
+    fn estimate_l1_gas_overhead<StateDB: DatabaseRef>(
+        &self,
+        _block: &BlockInfo,
+        _gas_used: u64,
+        _tx: Self::Tx,
+        _db: StateDB,
+        _block_env: &BlockEnv,
+    ) -> RpcResult<u64>
+    where
+        StateDB: std::fmt::Debug,
+        StateDB::Error: std::fmt::Debug,
+    {
+        Ok(0)
+    }
 }
 
 pub(crate) trait TxSetter {
