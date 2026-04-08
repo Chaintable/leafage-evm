@@ -1,11 +1,9 @@
+mod api;
+mod handler;
 mod hardforks;
+pub mod l1_fee;
 mod precompile;
 
-pub mod api;
-pub use api::{CitreaChain, CitreaHandlerEvm, TxInfo};
-
-pub(crate) mod handler;
-pub(crate) mod l1_fee;
-
+pub use api::{CitreaContext, CitreaEvm};
 pub use hardforks::CitreaHardfork;
 pub use precompile::CitreaPrecompiles;

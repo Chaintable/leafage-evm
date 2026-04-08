@@ -79,21 +79,6 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
             .try_into()
             .unwrap())
     }
-
-    fn estimate_l1_gas_overhead<Tx: TransactionTrait, StateDB: DatabaseRef>(
-        &self,
-        _block: &BlockInfo,
-        _gas_used: u64,
-        _tx: Tx,
-        _db: StateDB,
-        _block_env: &BlockEnv,
-    ) -> RpcResult<u64>
-    where
-        StateDB: std::fmt::Debug,
-        StateDB::Error: std::fmt::Debug,
-    {
-        Ok(0)
-    }
 }
 
 pub(crate) trait EvmExecutor: Sync + Send + 'static {
@@ -152,6 +137,20 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
+
+    fn estimate_l1_overhead<StateDB>(
+        &self,
+        _block: &BlockInfo,
+        _block_env: &BlockEnv,
+        _state: StateDB,
+        _tx: Self::Tx,
+    ) -> u64
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        0
+    }
 }
 
 pub(crate) trait TxSetter {

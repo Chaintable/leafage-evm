@@ -1,189 +1,186 @@
-//! L1 fee calculation for Citrea DA (data availability) costs.
-//!
-//! Walks EVM journal entries to estimate the state diff size produced by a
-//! transaction, then applies brotli-like compression ratios to derive the
-//! L1 data posting cost.
-
+use revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
+use revm::primitives::{Address, KECCAK_EMPTY, U256};
+use revm::JournalEntry;
 use std::collections::{BTreeMap, BTreeSet};
+use alloy_evm::Database;
+use revm::context::{ContextTr, Transaction};
+use revm::context::transaction::AuthorizationTr;
+use leafage_evm_types::Bytecode;
+use crate::citrea::CitreaContext;
 
-use leafage_evm_types::Address;
-use revm::context_interface::journaled_state::entry::JournalEntry;
-use revm::primitives::KECCAK_EMPTY;
+const ACCOUNT_IDX_KEY_SIZE: usize = 24;
+const ACCOUNT_IDX_SIZE: usize = 8;
+const DB_ACCOUNT_SIZE_EOA: usize = 41;
+const DB_ACCOUNT_SIZE_CONTRACT: usize = 73;
+const DB_ACCOUNT_KEY_SIZE: usize = 12;
+const STORAGE_KEY_SIZE: usize = 36;
+const STORAGE_VALUE_SIZE: usize = 32;
 
-// ── Compression / sizing constants ──────────────────────────────────
+pub const L1_FEE_OVERHEAD: usize = 2;
+pub const BROTLI_COMPRESSION_PERCENTAGE: usize = 48;
+const STORAGE_DISCOUNTED_PERCENTAGE: usize = 66;
+const ACCOUNT_DISCOUNTED_PERCENTAGE: usize = 32;
 
-/// Brotli compression ratio numerator (48%).
-pub(crate) const BROTLI_COMPRESSION_PERCENTAGE: u64 = 48;
+/// Calculates the diff of the modified state.
+pub(crate) fn calc_diff_size<DB>(context: &mut CitreaContext<DB>) -> usize
+where
+    DB: Database,
+{
+    let (journaled_state, tx) = (&context.journaled_state, &context.tx);
 
-/// Fixed overhead added after compression (bytes).
-pub(crate) const BROTLI_EXTRA_BYTES: u64 = 2;
+    // For each call there is a journal entry.
+    // We need to iterate over all journal entries to get the size of the diff.
+    let journal = journaled_state.journal.iter();
+    let state = &journaled_state.state;
 
-/// Weight for account-info diffs in the final size calculation (32%).
-const ACCOUNT_DIFF_WEIGHT: u64 = 32;
+    #[derive(Default)]
+    struct AccountChange<'a> {
+        storage_changes: BTreeSet<&'a U256>,
+        account_info_changed: bool, // implies balance, nonce or code_hash changed
+    }
 
-/// Weight for storage diffs in the final size calculation (66%).
-const STORAGE_DIFF_WEIGHT: u64 = 66;
+    let mut account_changes: BTreeMap<&Address, AccountChange<'_>> = BTreeMap::new();
 
-/// Byte size of a single storage key+value diff entry (36-byte key + 32-byte value).
-const STORAGE_ENTRY_SIZE: u64 = 68;
+    // tx.from always has `account_info_changed` because its nonce is incremented
+    let tx_caller = tx.caller();
+    let from = account_changes.entry(&tx_caller).or_default();
+    from.account_info_changed = true;
 
-/// Byte size of an account-info diff for accounts without code (nonce + balance + flags).
-const ACCOUNT_INFO_SIZE_NO_CODE: u64 = 41;
+    // Special handling for eip7702 transactions
+    // as there is no journal entry for changes on the authority
 
-/// Byte size of an account-info diff for accounts with code (adds code_hash).
-const ACCOUNT_INFO_SIZE_WITH_CODE: u64 = 73;
+    // collecting then consuming the iterator
+    // to avoid borrowing issues
+    // also not doing tx type check as authorization_list will return empty list
+    let auths = tx
+        .authorization_list()
+        .filter_map(|auth| {
+            let delegated_to = auth.address();
+            let authority = auth.authority();
+            authority.map(|authority| (authority, delegated_to))
+        })
+        .collect::<Vec<_>>();
 
-/// Fixed per-account overhead in the diff encoding.
-const ACCOUNT_DIFF_OVERHEAD: u64 = 12;
-
-/// Fixed byte cost for a newly created account (address + metadata).
-const NEW_ACCOUNT_SIZE: u64 = 32;
-
-// ── Per-account tracking ────────────────────────────────────────────
-
-/// Per-account change tracking used by [`calc_diff_size`].
-struct AccountChanges {
-    info_changed: bool,
-    storage_keys: BTreeSet<revm::primitives::StorageKey>,
-}
-
-impl Default for AccountChanges {
-    fn default() -> Self {
-        Self {
-            info_changed: false,
-            storage_keys: BTreeSet::new(),
+    for (authority, delegated_to) in &auths {
+        // if returns None, the authorization failed at one of the following checks:
+        // - if the chain id check failed
+        // - if nonce was u64::MAX
+        // - if the signer couldn't be recovered <-- this case is not possible as we checked this on the above
+        //   if let
+        if let Some(authority_in_state) = journaled_state.state.get(authority) {
+            // if the final code of the authority is equal to delegated address
+            // or the delegated address is zero and the account code hash is KECCAK_EMPTY
+            // we know the authorization went through
+            if (delegated_to == &Address::ZERO && authority_in_state.info.code_hash == KECCAK_EMPTY)
+                || authority_in_state
+                .info
+                .code
+                .as_ref()
+                .is_some_and(|code| *code == Bytecode::new_eip7702(*delegated_to))
+            {
+                // we set account changed for the authority
+                let account = account_changes.entry(authority).or_default();
+                account.account_info_changed = true;
+            }
         }
     }
-}
-
-// ── calc_diff_size ──────────────────────────────────────────────────
-
-/// Calculates the uncompressed diff size from journal entries.
-///
-/// Walks every journal entry to determine which accounts had info changes
-/// (nonce, balance, code) and which storage keys were modified. The caller
-/// address is always marked as info-changed (nonce increment).
-///
-/// The final size is a weighted sum:
-///   - account_diff × 32% + storage_diff × 66% + new_account_diff
-pub(crate) fn calc_diff_size(
-    journal: &[JournalEntry],
-    state: &revm::state::EvmState,
-    caller: Address,
-) -> u64 {
-    let mut changes: BTreeMap<Address, AccountChanges> = BTreeMap::new();
-    let mut new_accounts: BTreeSet<Address> = BTreeSet::new();
-
-    // Caller always has info changed (nonce increment).
-    changes.entry(caller).or_default().info_changed = true;
 
     for entry in journal {
         match entry {
-            JournalEntry::NonceChange { address, .. } | JournalEntry::NonceBump { address } => {
-                changes.entry(*address).or_default().info_changed = true;
+            JournalEntry::NonceChange { address, .. } => {
+                let account = account_changes.entry(address).or_default();
+                account.account_info_changed = true;
             }
             JournalEntry::BalanceTransfer { from, to, .. } => {
-                changes.entry(*from).or_default().info_changed = true;
-                changes.entry(*to).or_default().info_changed = true;
-            }
-            JournalEntry::BalanceChange { address, .. } => {
-                changes.entry(*address).or_default().info_changed = true;
+                // No need to check balance for 0 value sent, revm does not add it to the journal
+                let from = account_changes.entry(from).or_default();
+                from.account_info_changed = true;
+                let to = account_changes.entry(to).or_default();
+                to.account_info_changed = true;
             }
             JournalEntry::StorageChanged { address, key, .. } => {
-                changes
-                    .entry(*address)
-                    .or_default()
-                    .storage_keys
-                    .insert(*key);
+                let account = account_changes.entry(address).or_default();
+                account.storage_changes.insert(key);
             }
             JournalEntry::CodeChange { address } => {
-                changes.entry(*address).or_default().info_changed = true;
+                let account = account_changes.entry(address).or_default();
+                account.account_info_changed = true;
             }
+            // Only added to the journal on smart contract creation
             JournalEntry::AccountCreated { address, .. } => {
-                changes.entry(*address).or_default().info_changed = true;
-                new_accounts.insert(*address);
+                let account = account_changes.entry(address).or_default();
+                account.account_info_changed = true;
             }
             JournalEntry::AccountDestroyed {
                 address,
                 target,
+                destroyed_status,
                 had_balance,
-                ..
             } => {
-                changes.entry(*address).or_default().info_changed = true;
-                if !had_balance.is_zero() {
-                    changes.entry(*target).or_default().info_changed = true;
+                // This event is produced only if acc.is_created() || !is_cancun_enabled
+                // State is not changed:
+                // * if we are after Cancun upgrade and
+                // * Selfdestruct account that is created in the same transaction and
+                // * Specify the target is same as selfdestructed account. The balance stays unchanged.
+
+                if matches!(destroyed_status, SelfdestructionRevertStatus::RepeatedSelfdestruction){
+                    // It was already destroyed before in the log, no need to do anything.
+                    continue;
+                }
+
+                // transferred balance causes account diff change on target
+                if address != target && !had_balance.is_zero() {
+                    // mark changes to the target account
+                    let target = account_changes.entry(target).or_default();
+                    target.account_info_changed = true;
                 }
             }
-            // Warm/touch/transient entries do not affect state diff.
-            JournalEntry::AccountWarmed { .. }
-            | JournalEntry::AccountTouched { .. }
-            | JournalEntry::StorageWarmed { .. }
-            | JournalEntry::TransientStorageChange { .. } => {}
+            _ => {}
         }
     }
 
-    // Calculate sizes.
-    let mut account_diff: u64 = 0;
-    let mut storage_diff: u64 = 0;
+    // Check if it's a new address to charge for new index
+    let mut addresses_to_check = Vec::with_capacity(account_changes.len());
 
-    for (addr, change) in &changes {
-        if change.info_changed {
-            let has_code = state
-                .get(addr)
-                .map(|acc| acc.info.code_hash != KECCAK_EMPTY)
-                .unwrap_or(false);
+    let mut account_based_diff = 0usize;
+    let mut storage_based_diff = 0usize;
 
-            let db_size = if has_code {
-                ACCOUNT_INFO_SIZE_WITH_CODE
-            } else {
-                ACCOUNT_INFO_SIZE_NO_CODE
+    for (addr, account) in account_changes {
+        // cloning addresses to avoid borrowing issues
+        addresses_to_check.push(*addr);
+
+        // Apply size of account_info
+        if account.account_info_changed {
+            let db_account_size = {
+                let account = &state[addr];
+                if account.info.code_hash == KECCAK_EMPTY {
+                    DB_ACCOUNT_SIZE_EOA
+                } else {
+                    DB_ACCOUNT_SIZE_CONTRACT
+                }
             };
-            account_diff += db_size + ACCOUNT_DIFF_OVERHEAD;
+            // Account size is added because when any of those changes the db account is written to the state
+            // because these fields are part of the account info and not state values
+            account_based_diff += db_account_size + DB_ACCOUNT_KEY_SIZE;
         }
 
-        storage_diff += STORAGE_ENTRY_SIZE * change.storage_keys.len() as u64;
+        // Apply size of changed slots
+        let slot_size = STORAGE_KEY_SIZE + STORAGE_VALUE_SIZE; // key + value;
+
+        storage_based_diff += slot_size * account.storage_changes.len();
+
+        // No checks on code change as it is not part of the state diff
+    }
+    let mut new_account_based_diff = 0usize;
+    for addr in addresses_to_check {
+        if context.db_mut().basic(addr).ok().flatten().is_none(){
+            new_account_based_diff += ACCOUNT_IDX_KEY_SIZE + ACCOUNT_IDX_SIZE;
+        }
     }
 
-    let new_account_diff = NEW_ACCOUNT_SIZE * new_accounts.len() as u64;
-
-    // Weighted sum: account_diff * 32% + storage_diff * 66% + new_account_diff.
-    (account_diff * ACCOUNT_DIFF_WEIGHT / 100)
-        + (storage_diff * STORAGE_DIFF_WEIGHT / 100)
-        + new_account_diff
+    // final diff size
+    (account_based_diff * ACCOUNT_DISCOUNTED_PERCENTAGE / 100)
+        + (storage_based_diff * STORAGE_DISCOUNTED_PERCENTAGE / 100)
+        + new_account_based_diff
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty_journal_has_caller_diff() {
-        let caller = Address::ZERO;
-        let state = revm::state::EvmState::default();
-        let journal = vec![];
-        let size = calc_diff_size(&journal, &state, caller);
-        // Caller always counted: (41 + 12) * 32 / 100 = 16
-        assert_eq!(
-            size,
-            (ACCOUNT_INFO_SIZE_NO_CODE + ACCOUNT_DIFF_OVERHEAD) * ACCOUNT_DIFF_WEIGHT / 100
-        );
-    }
-
-    #[test]
-    fn test_storage_change_counted() {
-        let caller = Address::ZERO;
-        let addr = Address::repeat_byte(1);
-        let state = revm::state::EvmState::default();
-        let journal = vec![JournalEntry::StorageChanged {
-            address: addr,
-            key: Default::default(),
-            had_value: Default::default(),
-        }];
-        let size = calc_diff_size(&journal, &state, caller);
-        // caller account_diff + 1 storage entry
-        let expected_account =
-            (ACCOUNT_INFO_SIZE_NO_CODE + ACCOUNT_DIFF_OVERHEAD) * ACCOUNT_DIFF_WEIGHT / 100;
-        let expected_storage = STORAGE_ENTRY_SIZE * STORAGE_DIFF_WEIGHT / 100;
-        assert_eq!(size, expected_account + expected_storage);
-    }
-}

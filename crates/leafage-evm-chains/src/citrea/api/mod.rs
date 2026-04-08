@@ -1,133 +1,94 @@
-use std::ops::{Deref, DerefMut};
-
+use crate::citrea::{CitreaHardfork, CitreaPrecompiles};
 use alloy_evm::precompiles::PrecompilesMap;
-use alloy_evm::Database;
-use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId, U256};
-use revm::context::{Evm as EvmCtx, FrameStack};
-use revm::context_interface::JournalTr;
+use alloy_evm::{Database, EvmEnv};
+use leafage_evm_types::{BlockEnv, CfgEnv};
+use revm::context::{Context, FrameStack, JournalTr};
+use revm::context::{Evm, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
-use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult};
+use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, FrameTr};
 use revm::inspector::InspectorEvmTr;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::primitives::hardfork::SpecId;
-use revm::{Context, Inspector, Journal};
-
-use crate::citrea::precompile::CitreaPrecompiles;
-use crate::citrea::CitreaHardfork;
+use revm::{Inspector, Journal};
+use std::ops::{Deref, DerefMut};
 
 mod exec;
 
-// ── Chain extension context ─────────────────────────────────────────
+pub type CitreaContext<DB> = Context<BlockEnv, TxEnv, CfgEnv<CitreaHardfork>, DB>;
 
-/// Holds per-transaction L1 fee info collected during handler execution.
-#[derive(Debug, Clone, Default)]
-pub struct TxInfo {
-    /// Raw L1 fee in wei, computed from diff_size * l1_fee_rate.
-    pub l1_fee: U256,
-    /// Estimated diff size in bytes (after compression weighting).
-    pub diff_size: u64,
-}
-
-/// Chain extension stored in `Context.chain`.
-/// Provides the L1 fee rate and collects tx-level L1 fee info.
-#[derive(Debug, Clone, Default)]
-pub struct CitreaChain {
-    /// L1 fee rate (wei per byte of DA data).
-    pub l1_fee_rate: u128,
-    /// Per-transaction info populated after execution.
-    pub tx_info: TxInfo,
-}
-
-// ── Context + EVM types ─────────────────────────────────────────────
-
-/// Context type with CitreaChain as the chain extension.
-pub type CitreaHandlerContext<DB> =
-    Context<BlockEnv, revm::context::TxEnv, CfgEnv<MainnetSpecId>, DB, Journal<DB>, CitreaChain>;
-
-/// Citrea handler EVM wrapping the revm EvmCtx with CitreaChain.
-#[allow(missing_debug_implementations)]
-pub struct CitreaHandlerEvm<DB: revm::database::Database, I> {
-    pub inner: EvmCtx<
-        CitreaHandlerContext<DB>,
+pub struct CitreaEvm<DB: revm::database::Database, I> {
+    pub inner: Evm<
+        CitreaContext<DB>,
         I,
-        EthInstructions<EthInterpreter, CitreaHandlerContext<DB>>,
+        EthInstructions<EthInterpreter, CitreaContext<DB>>,
         PrecompilesMap,
         EthFrame,
     >,
+    pub inspect: bool,
 }
 
-impl<DB: Database, I> CitreaHandlerEvm<DB, I> {
-    /// Creates a new [`CitreaHandlerEvm`].
-    pub fn new(
-        block_env: BlockEnv,
-        cfg: CfgEnv<CitreaHardfork>,
-        db: DB,
-        inspector: I,
-        l1_fee_rate: u128,
-    ) -> Self {
-        let spec = cfg.spec;
-        let precompiles = PrecompilesMap::from_static(CitreaPrecompiles::new(spec).precompiles());
-        let mainnet_cfg = cfg.with_spec_and_mainnet_gas_params(MainnetSpecId::from(spec));
-
+impl<DB: Database, I> CitreaEvm<DB, I> {
+    /// Creates a new [`CitreaEvm`].
+    pub fn new(env: EvmEnv<CitreaHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
+        let citrea_precompiles = CitreaPrecompiles::new(env.cfg_env.spec);
+        let precompiles = PrecompilesMap::from_static(citrea_precompiles.precompiles());
+        let spec: revm::primitives::hardfork::SpecId = env.cfg_env.spec.clone().into();
         Self {
-            inner: EvmCtx {
+            inner: Evm {
                 ctx: Context {
-                    block: block_env,
-                    cfg: mainnet_cfg,
+                    block: env.block_env,
+                    cfg: env.cfg_env,
                     journaled_state: Journal::new(db),
                     tx: Default::default(),
-                    chain: CitreaChain {
-                        l1_fee_rate,
-                        tx_info: TxInfo::default(),
-                    },
+                    chain: Default::default(),
                     local: Default::default(),
                     error: Ok(()),
                 },
                 inspector,
-                instruction: EthInstructions::new_mainnet_with_spec(SpecId::default()),
+                instruction: EthInstructions::new_mainnet_with_spec(spec),
                 precompiles,
                 frame_stack: Default::default(),
             },
+            inspect,
         }
     }
-
-    /// Returns a reference to the chain extension.
-    pub fn citrea_chain(&self) -> &CitreaChain {
-        &self.inner.ctx.chain
-    }
-
-    /// Returns a reference to the collected tx info after execution.
-    pub fn tx_info(&self) -> &TxInfo {
-        &self.inner.ctx.chain.tx_info
-    }
 }
 
-impl<DB: Database, I> Deref for CitreaHandlerEvm<DB, I> {
-    type Target = CitreaHandlerContext<DB>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
+impl<DB: Database, I> CitreaEvm<DB, I> {
+    /// Provides a reference to the EVM context.
+    pub const fn ctx(&self) -> &CitreaContext<DB> {
         &self.inner.ctx
     }
-}
 
-impl<DB: Database, I> DerefMut for CitreaHandlerEvm<DB, I> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
+    /// Provides a mutable reference to the EVM context.
+    pub fn ctx_mut(&mut self) -> &mut CitreaContext<DB> {
         &mut self.inner.ctx
     }
 }
 
-// ── EvmTr implementation ────────────────────────────────────────────
+impl<DB: Database, I> Deref for CitreaEvm<DB, I> {
+    type Target = CitreaContext<DB>;
 
-impl<DB, INSP> EvmTr for CitreaHandlerEvm<DB, INSP>
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.ctx()
+    }
+}
+
+impl<DB: Database, I> DerefMut for CitreaEvm<DB, I> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ctx_mut()
+    }
+}
+
+impl<DB, INSP> EvmTr for CitreaEvm<DB, INSP>
 where
     DB: Database,
 {
-    type Context = CitreaHandlerContext<DB>;
-    type Instructions = EthInstructions<EthInterpreter, CitreaHandlerContext<DB>>;
+    type Context = CitreaContext<DB>;
+    type Instructions = EthInstructions<EthInterpreter, CitreaContext<DB>>;
     type Precompiles = PrecompilesMap;
     type Frame = EthFrame;
 
@@ -174,12 +135,10 @@ where
     }
 }
 
-// ── InspectorEvmTr implementation ───────────────────────────────────
-
-impl<DB, INSP> InspectorEvmTr for CitreaHandlerEvm<DB, INSP>
+impl<DB, INSP> InspectorEvmTr for CitreaEvm<DB, INSP>
 where
     DB: Database,
-    INSP: Inspector<CitreaHandlerContext<DB>, EthInterpreter>,
+    INSP: Inspector<CitreaContext<DB>, EthInterpreter>,
 {
     type Inspector = INSP;
 
@@ -205,5 +164,12 @@ where
         &mut Self::Inspector,
     ) {
         self.inner.all_mut_inspector()
+    }
+
+    fn inspect_frame_init(
+        &mut self,
+        frame_init: <Self::Frame as FrameTr>::FrameInit,
+    ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        self.inner.inspect_frame_init(frame_init)
     }
 }

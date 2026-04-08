@@ -864,13 +864,7 @@ where
 
         let mut overhead_tx = tx.clone();
         overhead_tx.set_gas_limit(final_gas);
-        let l1_overhead = self.inner.estimate_l1_gas_overhead(
-            &block,
-            final_gas,
-            overhead_tx,
-            &memory_db,
-            &block_env,
-        )?;
+        let l1_overhead = self.inner.estimate_l1_overhead(&block, &block_env, &memory_db, overhead_tx);
 
         Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }
