@@ -13,7 +13,74 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, NoneEvmCustomConfig>;
 
-impl<DB> GasFeeHandler for CitreaApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for CitreaApiImpl<DB>
+where
+    DB: Sync + Send + 'static,
+{
+    fn estimate_l1_gas_overhead<Tx, StateDB>(
+        &self,
+        block: &BlockInfo,
+        _gas_used: u64,
+        tx: Tx,
+        db: StateDB,
+        block_env: &BlockEnv,
+    ) -> RpcResult<u64>
+    where
+        Tx: revm::context::Transaction,
+        StateDB: DatabaseRef + std::fmt::Debug,
+        StateDB::Error: std::fmt::Debug,
+    {
+        let l1_fee_rate = extract_l1_fee_rate(block);
+        if l1_fee_rate == 0 {
+            return Ok(0);
+        }
+
+        let tx_env = TxEnv {
+            caller: tx.caller(),
+            gas_limit: tx.gas_limit(),
+            gas_price: tx.gas_price(),
+            value: tx.value(),
+            data: tx.input().clone(),
+            kind: tx.kind(),
+            nonce: tx.nonce(),
+            chain_id: tx.chain_id(),
+            ..Default::default()
+        };
+
+        let mut evm = create_citrea_handler_evm(
+            block_env.clone(),
+            self.evm_cfg.cfg.clone(),
+            db,
+            NoOpInspector {},
+            l1_fee_rate,
+        );
+
+        let result = evm.transact(tx_env).map_err(|e| {
+            crate::error::rpc_error_with_code(
+                leafage_evm_types::DebankErrorCode::EvmFailed as i32,
+                format!("L1 fee estimation failed: {e:?}"),
+            )
+        })?;
+
+        if !result.result.is_success() {
+            return Ok(0);
+        }
+
+        let tx_info = evm.tx_info();
+        let l1_fee = tx_info.l1_fee;
+        if l1_fee.is_zero() {
+            return Ok(0);
+        }
+
+        let base_fee = U256::from(block_env.basefee);
+        let effective_price = base_fee.max(U256::from(1));
+
+        let overhead = l1_fee.checked_div(effective_price).unwrap_or(U256::ZERO);
+        let overhead = overhead.saturating_add(U256::from(1));
+
+        Ok(overhead.try_into().unwrap_or(u64::MAX))
+    }
+}
 
 impl<DB> EvmExecutor for CitreaApiImpl<DB>
 where
@@ -75,57 +142,6 @@ where
         );
         evm.inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)))
-    }
-
-    fn estimate_l1_gas_overhead<StateDB: DatabaseRef>(
-        &self,
-        block: &BlockInfo,
-        _gas_used: u64,
-        tx: Self::Tx,
-        db: StateDB,
-        block_env: &BlockEnv,
-    ) -> RpcResult<u64>
-    where
-        StateDB: std::fmt::Debug,
-        StateDB::Error: std::fmt::Debug,
-    {
-        let l1_fee_rate = extract_l1_fee_rate(block);
-        if l1_fee_rate == 0 {
-            return Ok(0);
-        }
-
-        let mut evm = create_citrea_handler_evm(
-            block_env.clone(),
-            self.evm_cfg.cfg.clone(),
-            db,
-            NoOpInspector {},
-            l1_fee_rate,
-        );
-
-        let result = evm.transact(tx).map_err(|e| {
-            crate::error::rpc_error_with_code(
-                leafage_evm_types::DebankErrorCode::EvmFailed as i32,
-                format!("L1 fee estimation failed: {e:?}"),
-            )
-        })?;
-
-        if !result.result.is_success() {
-            return Ok(0);
-        }
-
-        let tx_info = evm.tx_info();
-        let l1_fee = tx_info.l1_fee;
-        if l1_fee.is_zero() {
-            return Ok(0);
-        }
-
-        let base_fee = U256::from(block_env.basefee);
-        let effective_price = base_fee.max(U256::from(1));
-
-        let overhead = l1_fee.checked_div(effective_price).unwrap_or(U256::ZERO);
-        let overhead = overhead.saturating_add(U256::from(1));
-
-        Ok(overhead.try_into().unwrap_or(u64::MAX))
     }
 }
 
