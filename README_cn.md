@@ -229,6 +229,8 @@ leafage-evm 支持两种状态更新方式：
 
 ### 支持的写节点仓库
 
+任何兼容 EVM 的链都有可能获得支持。目前已支持以下链：
+
 | 链 | 仓库 |
 |----|------|
 | ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |

@@ -229,6 +229,8 @@ leafage-evm supports two modes for receiving state updates:
 
 ### Supported Write Node Repositories
 
+Any EVM-compatible chain can potentially be supported. The following chains are currently supported:
+
 | Chain | Repository |
 |-------|------------|
 | ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
