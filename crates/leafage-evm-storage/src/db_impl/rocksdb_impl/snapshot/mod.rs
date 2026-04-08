@@ -396,8 +396,8 @@ fn rocksdb_column_options(shared_cache: &Cache) -> Options {
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
-                                                              // Disable TTL-based compaction to avoid unnecessary full rewrites of old
-                                                              // SST files (default 30 days from optimize_level_style_compaction).
+    // Disable TTL-based compaction to avoid unnecessary full rewrites of old
+    // SST files (default 30 days from optimize_level_style_compaction).
     cf_opts.set_ttl(0);
     cf_opts
 }
