@@ -9,12 +9,12 @@ use alloy_evm::Database;
 use leafage_evm_types::{Address, U256};
 use revm::{
     context::{
-        result::{EVMError, ExecutionResult, FromStringError, HaltReason},
+        result::{EVMError, ExecutionResult, FromStringError, HaltReason, ResultGas},
         transaction::TransactionType,
         Cfg, ContextError, ContextTr, LocalContextTr, Transaction,
     },
-    context_interface::{transaction::eip7702::AuthorizationTr, JournalTr},
-    handler::{EthFrame, EvmTr, FrameResult, Handler, MainnetHandler},
+    context_interface::{journaled_state::account::JournaledAccountTr, transaction::eip7702::AuthorizationTr, JournalTr},
+    handler::{EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
     primitives::hardfork::SpecId,
@@ -91,7 +91,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             let authority_acc = journal.load_account_with_code(authority)?;
 
             // 5. Verify the code of `authority` is either empty or already delegated.
-            if let Some(bytecode) = &authority_acc.info.code {
+            if let Some(bytecode) = &authority_acc.data.info.code {
                 // if it is not empty and it is not eip7702
                 if !bytecode.is_empty() && !bytecode.is_eip7702() {
                     continue;
@@ -100,13 +100,13 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
             // 6. Verify the nonce of `authority` is equal to `nonce`. In case `authority` does not
             //    exist in the trie, verify that `nonce` is equal to `0`.
-            if authorization.nonce() != authority_acc.info.nonce {
+            if authorization.nonce() != authority_acc.data.info.nonce {
                 continue;
             }
 
             // 7. Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the global refund counter
             //    if `authority` exists in the trie.
-            if !(authority_acc.is_empty() && authority_acc.is_loaded_as_not_existing_not_touched())
+            if !(authority_acc.data.is_empty() && authority_acc.data.is_loaded_as_not_existing_not_touched())
             {
                 refunded_accounts += 1;
             }
@@ -132,7 +132,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
     fn validate_initial_tx_gas(
         &self,
-        evm: &Self::Evm,
+        evm: &mut Self::Evm,
     ) -> Result<revm::interpreter::InitialAndFloorGas, Self::Error> {
         let ctx = evm.ctx_ref();
         let tx = ctx.tx();
@@ -164,7 +164,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let mut tx_fee = U256::from(gas.spent() - gas.refunded() as u64) * effective_gas_price;
 
         // EIP-4844
-        let is_cancun = SpecId::from(ctx.cfg().spec()).is_enabled_in(SpecId::CANCUN);
+        let is_cancun = SpecId::from(ctx.cfg().spec().clone()).is_enabled_in(SpecId::CANCUN);
         if is_cancun {
             let data_fee = U256::from(tx.total_blob_gas()) * ctx.blob_gasprice();
             tx_fee = tx_fee.saturating_add(data_fee);
@@ -180,7 +180,8 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     fn execution_result(
         &mut self,
         evm: &mut Self::Evm,
-        result: FrameResult,
+        result: <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
+        mut result_gas: ResultGas,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         match core::mem::replace(evm.ctx().error(), Ok(())) {
             Err(ContextError::Db(e)) => return Err(e.into()),
@@ -188,13 +189,11 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             Ok(_) => (),
         }
 
-        // used gas with refund calculated.
-        let gas_refunded = if evm.ctx().tx().is_system_transaction {
-            0
-        } else {
-            result.gas().refunded() as u64
-        };
-        let final_gas_used = result.gas().spent() - gas_refunded;
+        // For system transactions, zero out refund.
+        if evm.ctx().tx().is_system_transaction {
+            result_gas = ResultGas::new(result_gas.limit(), result_gas.spent(), 0, 0, 0);
+        }
+
         let output = result.output();
         let instruction_result = result.into_interpreter_result();
 
@@ -204,18 +203,19 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let result = match SuccessOrHalt::from(instruction_result.result) {
             SuccessOrHalt::Success(reason) => ExecutionResult::Success {
                 reason,
-                gas_used: final_gas_used,
-                gas_refunded,
+                gas: result_gas,
                 logs,
                 output,
             },
             SuccessOrHalt::Revert => ExecutionResult::Revert {
-                gas_used: final_gas_used,
+                gas: result_gas,
+                logs,
                 output: output.into_data(),
             },
             SuccessOrHalt::Halt(reason) => ExecutionResult::Halt {
                 reason,
-                gas_used: final_gas_used,
+                gas: result_gas,
+                logs,
             },
             // Only two internal return flags.
             flag @ (SuccessOrHalt::FatalExternalError | SuccessOrHalt::Internal(_)) => {

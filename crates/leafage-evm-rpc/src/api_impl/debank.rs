@@ -228,6 +228,9 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        if let Some(vb) = self.inner.virtual_balance() {
+            return Ok(vb);
+        }
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
@@ -716,7 +719,11 @@ where
             &memory_db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        if tx.input().is_empty() {
+        // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
+        // adds 250k gas that this optimization doesn't account for. The early return
+        // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
+        // required gas is 271000+.
+        if self.inner.virtual_balance().is_none() && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
@@ -737,24 +744,9 @@ where
             }
         }
         if tx.gas_price() > 0 {
-            let caller = memory_db.basic_ref(tx.caller()).map_err(|e| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-            })?;
-            let balance = caller
-                .map(|acc| acc.balance)
-                .unwrap_or_default()
-                .checked_sub(tx.value())
-                .ok_or_else(|| {
-                    rpc_error_with_code(
-                        DebankErrorCode::BalanceExhausted as i32,
-                        "Insufficient funds".to_string(),
-                    )
-                })?;
-            let gas_limit: u64 = balance
-                .checked_div(U256::from(tx.gas_price()))
-                .unwrap_or_default()
-                .try_into()
-                .unwrap();
+            let gas_limit = self
+                .inner
+                .gas_allowance(&request, &tx, &memory_db, &block_env)?;
             highest_gas_limit = highest_gas_limit.min(gas_limit);
         }
         tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));
@@ -765,7 +757,7 @@ where
             .map_err(|e| e.to_rpc_error())?;
 
         let gas_refund = match res {
-            ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
+            ExecutionResult::Success { gas, .. } => gas.inner_refunded(),
             ExecutionResult::Halt { reason, .. } => {
                 let code = DebankErrorCode::from(reason.clone());
                 return Err(rpc_error_with_code(

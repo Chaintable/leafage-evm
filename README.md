@@ -13,6 +13,17 @@ leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/
 - **Multiple Database Backends**: RocksDB (default), MDBX
 - **Data Migration**: Import initial state from Geth snapshots
 
+## Supported Write Node Repositories
+
+Any EVM-compatible chain can potentially be supported. The following chains are currently supported:
+
+| Chain | Repository |
+|-------|------------|
+| ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
+| AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
+| OP Stack (OP, Base, etc.) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
+| Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
+
 ## Supported JSON-RPC Methods
 
 ### eth_*

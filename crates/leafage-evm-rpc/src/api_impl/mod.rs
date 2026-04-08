@@ -19,7 +19,7 @@ pub use interceptor::{InterceptorConfig, InterceptorLayer};
 
 mod core;
 pub use core::MultiChainCfgEnv;
-pub(crate) use core::{ApiCore, EvmExecutor};
+pub(crate) use core::{ApiCore, EvmExecutor, GasFeeHandler};
 
 mod mainnet;
 
@@ -29,6 +29,7 @@ mod op;
 mod mantle;
 mod warmup;
 mod cosmos;
+mod tempo;
 
 pub(crate) mod token_collector;
 pub use token_collector::TokenCollector;

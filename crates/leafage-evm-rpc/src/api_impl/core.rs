@@ -6,6 +6,7 @@ use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::mantle::MantleHardfork;
+use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -26,7 +27,7 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub custom_cfg: Option<CustomCfg>,
 }
 
-pub(crate) trait ApiCore: ApiBase + EvmExecutor {}
+pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasFeeHandler {}
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
@@ -44,6 +45,42 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn token_collector(&self) -> Option<&TokenCollector>;
 }
 
+pub(crate) trait GasFeeHandler: Sync + Send + 'static {
+    fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
+        None
+    }
+
+    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
+        &self,
+        _request: &CallRequest,
+        tx: &Tx,
+        db: &StateDB,
+        _block_env: &BlockEnv,
+    ) -> RpcResult<u64> {
+        use crate::error::rpc_error_with_code;
+        use leafage_evm_types::DebankErrorCode;
+
+        let caller = db.basic_ref(tx.caller()).map_err(|e| {
+            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+        })?;
+        let balance = caller
+            .map(|acc| acc.balance)
+            .unwrap_or_default()
+            .checked_sub(tx.value())
+            .ok_or_else(|| {
+                rpc_error_with_code(
+                    DebankErrorCode::BalanceExhausted as i32,
+                    "Insufficient funds".to_string(),
+                )
+            })?;
+        Ok(balance
+            .checked_div(alloy::primitives::U256::from(tx.gas_price()))
+            .unwrap_or_default()
+            .try_into()
+            .unwrap())
+    }
+}
+
 pub(crate) trait EvmExecutor: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
 
@@ -59,8 +96,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         chain_id: u64,
     ) -> RpcResult<Self::Tx>;
 
-    /// Apply pre-execution changes before transaction execution.
-    /// Calls EIP-2935 blockhashes and EIP-4788 beacon root system contracts.
     fn apply_pre_execution_changes<StateDB>(
         &self,
         _header: impl BlockHeader,
@@ -102,7 +137,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
-
 }
 
 pub(crate) trait TxSetter {
@@ -140,6 +174,7 @@ pub enum MultiChainCfgEnv {
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
+    Tempo(CfgEnv<TempoHardfork>),
     Citrea(CfgEnv<CitreaHardfork>),
 }
 
@@ -151,6 +186,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }
     }

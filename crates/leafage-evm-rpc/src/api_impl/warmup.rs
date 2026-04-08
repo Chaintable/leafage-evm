@@ -4,7 +4,6 @@ use crate::error::internal_rpc_err;
 use crate::DebankApiServer;
 use alloy::core::sol;
 use alloy::primitives::TxKind;
-use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
@@ -57,11 +56,12 @@ where
             let calls: Vec<_> = transactions
                 .into_iter()
                 .map(|tx| {
-                    let mut transaction_request: TransactionRequest = tx.into();
-                    transaction_request.gas_price = Some(0);
-                    transaction_request.max_fee_per_gas = None;
-                    transaction_request.max_priority_fee_per_gas = None;
-                    transaction_request
+                    let mut request = CallRequest::default();
+                    request.inner = tx.into();
+                    request.gas_price = Some(0);
+                    request.max_fee_per_gas = None;
+                    request.max_priority_fee_per_gas = None;
+                    request
                 })
                 .collect();
             if let Err(err) = self
@@ -91,11 +91,9 @@ where
             let requests = erc20_addresses
                 .iter()
                 .map(|address| {
-                    let request = CallRequest {
-                        to: TxKind::Call(*address).into(),
-                        input: input.abi_encode().into(),
-                        ..Default::default()
-                    };
+                    let mut request = CallRequest::default();
+                    request.to = TxKind::Call(*address).into();
+                    request.input = input.abi_encode().into();
                     request
                 })
                 .collect();

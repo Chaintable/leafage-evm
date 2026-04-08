@@ -29,6 +29,7 @@ pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
                 blob_gasprice,
             }
         }),
+        slot_num: Default::default(),
     }
 }
 
@@ -80,6 +81,7 @@ impl From<NewAccount> for AccountInfo {
             nonce: val.nonce,
             code_hash: val.code_hash.0.into(),
             code: None,
+            account_id: Default::default(),
         }
     }
 }

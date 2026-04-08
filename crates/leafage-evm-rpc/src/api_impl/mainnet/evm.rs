@@ -1,5 +1,6 @@
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::invalid_params_rpc_err;
 use alloy::consensus::TxType;
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::Either;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, MainnetSpecId, H256, U256};
@@ -101,7 +102,7 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         TxType::Legacy
     } as u8;
 
-    let CallRequest {
+    let TransactionRequest {
         from,
         to,
         gas_price,
@@ -111,12 +112,13 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         gas,
         value,
         input,
+        nonce,
         mut chain_id,
         access_list,
         blob_versioned_hashes,
         authorization_list,
         ..
-    } = request;
+    } = request.inner;
 
     let CallFees {
         max_priority_fee_per_gas,
@@ -133,7 +135,8 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
     )
     .ok_or_else(|| invalid_params_rpc_err("Invalid fee parameters"))?;
 
-    let max_gas_limit = cfg_env.tx_gas_limit_cap
+    let max_gas_limit = cfg_env
+        .tx_gas_limit_cap
         .filter(|&cap| cap != 0)
         .unwrap_or(block_env.gas_limit);
 
@@ -145,11 +148,14 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         chain_id = Some(origin_chain_id);
     }
 
-    let nonce = db
-        .basic_ref(caller)
-        .map_err(|_| internal_rpc_err("get nonce failed"))?
-        .map(|acc| acc.nonce)
-        .unwrap_or_default();
+    // Use request nonce if provided; otherwise fetch from DB.
+    // Critical for Tempo 0x76 AA: nonce_key>0 bypasses protocol nonce check,
+    // sender may set nonce=0 explicitly. TIP-1000 gas depends on nonce==0.
+    let nonce = nonce.unwrap_or_else(|| {
+        db.basic_ref(caller)
+            .map(|acc| acc.map(|a| a.nonce).unwrap_or_default())
+            .unwrap_or_default()
+    });
 
     let env = TxEnv {
         tx_type,
@@ -200,10 +206,11 @@ pub(crate) fn create_main_evm_from_state<StateDB, INSP>(
 where
     StateDB: DatabaseRef,
 {
+    let spec: revm::primitives::hardfork::SpecId = cfg.spec.into();
     Context::mainnet()
         .with_block(block_env)
         .with_cfg(cfg)
         .with_ref_db(state)
         .build_mainnet_with_inspector(inspector)
-        .with_precompiles(EthPrecompiles::default())
+        .with_precompiles(EthPrecompiles::new(spec))
 }
