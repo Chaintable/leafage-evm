@@ -27,8 +27,8 @@ use crate::metrics::STORAGE_METRICS;
 use alloy::primitives::B64;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount, H256,
-    KECCAK256_EMPTY, U256,
+    Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
+    H256, KECCAK256_EMPTY, U256,
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
@@ -455,7 +455,7 @@ impl DataBaseRef {
         Ok(block_hash)
     }
 
-    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -474,34 +474,41 @@ impl DataBaseRef {
             return Ok(None);
         }
         let block_info_bytes = block_info_bytes.unwrap();
-        let mut block_header = RawHeader::decode(&mut block_info_bytes.as_ref());
-        if block_header.is_err() {
-            let buf = &mut block_info_bytes.as_ref();
-            let rlp_head = alloy_rlp::Header::decode(buf)?;
-            if !rlp_head.list {
-                Err(alloy_rlp::Error::NonCanonicalSingleByte)?;
+        let buf = &mut block_info_bytes.as_ref();
+        let block_header = match RawHeader::decode(buf) {
+            Ok(header) => header,
+            Err(_) => {
+                *buf = block_info_bytes.as_ref();
+                let rlp_head = alloy_rlp::Header::decode(buf)?;
+                if !rlp_head.list {
+                    Err(alloy_rlp::Error::NonCanonicalSingleByte)?;
+                }
+                RawHeader {
+                    parent_hash: Decodable::decode(buf)?,
+                    ommers_hash: Decodable::decode(buf)?,
+                    beneficiary: Decodable::decode(buf)?,
+                    state_root: Decodable::decode(buf)?,
+                    transactions_root: Decodable::decode(buf)?,
+                    receipts_root: Decodable::decode(buf)?,
+                    logs_bloom: Decodable::decode(buf)?,
+                    difficulty: Decodable::decode(buf)?,
+                    number: u64::decode(buf)?,
+                    gas_limit: u64::decode(buf)?,
+                    gas_used: u64::decode(buf)?,
+                    timestamp: Decodable::decode(buf)?,
+                    extra_data: Decodable::decode(buf)?,
+                    mix_hash: Decodable::decode(buf)?,
+                    nonce: B64::decode(buf)?,
+                    ..Default::default()
+                }
             }
-            let header = RawHeader {
-                parent_hash: Decodable::decode(buf)?,
-                ommers_hash: Decodable::decode(buf)?,
-                beneficiary: Decodable::decode(buf)?,
-                state_root: Decodable::decode(buf)?,
-                transactions_root: Decodable::decode(buf)?,
-                receipts_root: Decodable::decode(buf)?,
-                logs_bloom: Decodable::decode(buf)?,
-                difficulty: Decodable::decode(buf)?,
-                number: u64::decode(buf)?,
-                gas_limit: u64::decode(buf)?,
-                gas_used: u64::decode(buf)?,
-                timestamp: Decodable::decode(buf)?,
-                extra_data: Decodable::decode(buf)?,
-                mix_hash: Decodable::decode(buf)?,
-                nonce: B64::decode(buf)?,
-                ..Default::default()
-            };
-            block_header = Ok(header);
-        }
-        let block_header = block_header.unwrap();
+        };
+        // After RLP decode, remaining bytes (if any) are JSON-encoded OtherFields
+        let other = if buf.is_empty() {
+            Default::default()
+        } else {
+            serde_json::from_slice(buf).unwrap_or_default()
+        };
         let block = Block {
             header: Header {
                 hash: block_hash,
@@ -510,7 +517,10 @@ impl DataBaseRef {
             },
             ..Default::default()
         };
-        Ok(Some(block))
+        Ok(Some(BlockInfo {
+            inner: block,
+            other,
+        }))
     }
 
     pub fn read_latest_block_hash(&self) -> Result<H256, Error> {
@@ -741,7 +751,7 @@ impl LatestStateDBIterator for DataBaseRef {
 }
 
 impl BlockIterator for DataBaseRef {
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Error>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, Error>> {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -765,7 +775,7 @@ impl BlockIterator for DataBaseRef {
                     },
                     ..Default::default()
                 };
-                Ok(block)
+                Ok(BlockInfo::new(block))
             })
     }
 
@@ -801,7 +811,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                 if header.is_none() {
                     return Ok(None);
                 }
-                block_header = Some(header.unwrap().header);
+                block_header = Some(header.unwrap().header.clone());
                 block_num = block_header.as_ref().unwrap().number;
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
@@ -819,7 +829,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                             if header.is_none() {
                                 return Ok(None);
                             }
-                            block_header = Some(header.unwrap().header);
+                            block_header = Some(header.unwrap().header.clone());
                         }
                         None => {
                             // Empty database: return a StateDB with no cached
@@ -839,7 +849,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                     if header.is_none() {
                         return Ok(None);
                     }
-                    block_header = Some(header.unwrap().header);
+                    block_header = Some(header.unwrap().header.clone());
                 }
                 _ => return Err(Error::UnsupportedBlockId(block_id)),
             },
@@ -1084,13 +1094,13 @@ impl StateDBRead for StateDB {
         self.db.read_block_hash(block_num)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
         if let Some(h) = &self.block_header {
             if block_hash == h.hash {
-                return Ok(Some(Block {
+                return Ok(Some(BlockInfo::new(Block {
                     header: h.clone(),
                     ..Default::default()
-                }));
+                })));
             }
         }
         self.db.read_block_info(block_hash)
@@ -1122,7 +1132,7 @@ impl StateDBWrite for StateDB {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), Error> {
         self.db.write_block_info(batch, block_info)
     }
@@ -1203,7 +1213,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
             .db
@@ -1211,8 +1221,14 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_info.header.hash.into();
         let mut block_info_bytes = Vec::new();
-        let block_header: RawHeader = block_info.header.inner;
+        let block_header: RawHeader = block_info.header.inner.clone();
         block_header.encode(&mut block_info_bytes);
+        if !block_info.other.is_empty() {
+            let other_bytes = serde_json::to_vec(&block_info.other).map_err(|e| {
+                Error::UnSupported(format!("Failed to serialize other fields: {}", e))
+            })?;
+            block_info_bytes.extend_from_slice(&other_bytes);
+        }
         batch.put_cf(
             block_hash_to_block_info_cf,
             block_hash_bytes,

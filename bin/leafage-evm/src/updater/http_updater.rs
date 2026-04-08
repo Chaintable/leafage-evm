@@ -3,7 +3,7 @@ use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, DebankOutPut};
+use leafage_evm_types::{Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, DebankOutPut};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -101,7 +101,7 @@ where
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
-            let block_info = Block::empty(debank_output.header);
+            let block_info = BlockInfo::new(Block::empty(debank_output.header));
             self.tree.update_block(block_info, block_storage_diff)?;
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                             block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);

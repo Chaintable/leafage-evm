@@ -3,7 +3,7 @@ use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::TraceApiClient;
 use leafage_evm_storage::EvmStorageWrite;
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff};
+use leafage_evm_types::{Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff};
 use tracing::info;
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
@@ -26,7 +26,7 @@ where
             .rpc_client
             .debank_block(BlockId::Number(BlockNumberOrTag::Number(0)))
             .await?;
-        let block_info = Block::empty(debank_output.header.clone());
+        let block_info = BlockInfo::new(Block::empty(debank_output.header.clone()));
         let block_diff: BlockStorageDiff =
             BlockStorageDiff::decode(&mut debank_output.state_diff.as_ref())?;
         self.db.update_block(block_info.clone(), block_diff)?;

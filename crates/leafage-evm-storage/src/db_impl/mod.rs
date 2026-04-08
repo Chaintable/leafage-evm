@@ -15,7 +15,7 @@ pub use rocksdb;
 pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, RocksDBStorage};
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
-use leafage_evm_types::{Block, BlockId, Bytes, NewAccount, H256, U256};
+use leafage_evm_types::{BlockId, BlockInfo, Bytes, NewAccount, H256, U256};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -138,7 +138,7 @@ impl LatestStateDBIterator for MultiStorage {
 }
 
 impl BlockIterator for MultiStorage {
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, StorageError>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, StorageError>> {
         match self {
             MultiStorage::RocksDBState(db) => {
                 Box::new(db.block_info_iter()) as Box<dyn Iterator<Item = _>>
@@ -231,7 +231,7 @@ impl StateDBRead for MultiStateDB {
         }
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, StorageError> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, StorageError> {
         match self {
             MultiStateDB::RocksDBState(db) => db.read_block_info(block_hash),
             MultiStateDB::RocksDBArchive(db) => db.read_block_info(block_hash),
@@ -301,7 +301,7 @@ impl StateDBWrite for MultiStateDB {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), StorageError> {
         match (self, batch) {
             (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
