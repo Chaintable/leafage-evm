@@ -28,7 +28,6 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 | Oasys | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator) |
 | Kava | [Chaintable/kava](https://github.com/Chaintable/kava) |
 | IoTeX | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x) |
-| Shibarium | [Chaintable/bor](https://github.com/Chaintable/bor) |
 
 ## 支持的 JSON-RPC 方法
 
