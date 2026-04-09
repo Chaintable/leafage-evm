@@ -7,6 +7,8 @@ use revm::context_interface::block::BlobExcessGasAndPrice;
 use serde::{Deserialize, Serialize};
 
 pub type BlockInfo = WithOtherFields<Block<H256>>;
+pub type HeaderInfo = WithOtherFields<Header>;
+
 
 pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
     BlockEnv {
@@ -35,7 +37,7 @@ pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebankOutPut {
-    pub header: Header,
+    pub header: HeaderInfo,
     /// RLP encoded BlockStorageDiff
     pub state_diff: Bytes,
 }
