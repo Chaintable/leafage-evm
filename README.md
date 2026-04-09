@@ -23,6 +23,11 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
 | OP Stack (OP, Base, etc.) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
 | Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
+| Tempo | [Chaintable/tempo](https://github.com/Chaintable/tempo) |
+| Bitlayer | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2) |
+| Oasys | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator) |
+| Kava | [Chaintable/kava](https://github.com/Chaintable/kava) |
+| IoTeX | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x) |
 
 ## Supported JSON-RPC Methods
 
