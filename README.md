@@ -28,7 +28,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | Oasys | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator) |
 | Kava | [Chaintable/kava](https://github.com/Chaintable/kava) |
 | IoTeX | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x) |
-| Shibarium | [Chaintable/shib-bor](https://github.com/Chaintable/shib-bor) |
+| Shibarium | [Chaintable/bor](https://github.com/Chaintable/bor) |
 
 ## Supported JSON-RPC Methods
 
