@@ -25,8 +25,8 @@ use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, Bytes, Header, NewAccount, SlimAccount, H256,
-    KECCAK256_EMPTY, U256,
+    BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
+    U256,
 };
 use libmdbx::{
     Cursor, DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode,
@@ -114,7 +114,8 @@ pub struct StateDB {
     db: Arc<DataBase>,
     block_num: u64,
     /// `None` when the database is empty (no blocks committed yet).
-    block_header: Option<Header>,
+    /// Stores full BlockInfo to preserve `other` fields (e.g. l1FeeRate).
+    cached_block_info: Option<BlockInfo>,
 }
 
 impl Clone for StateDB {
@@ -122,7 +123,7 @@ impl Clone for StateDB {
         Self {
             db: self.db.clone(),
             block_num: self.block_num,
-            block_header: self.block_header.clone(),
+            cached_block_info: self.cached_block_info.clone(),
         }
     }
 }
@@ -131,7 +132,7 @@ impl Debug for StateDB {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateDB")
             .field("block_num", &self.block_num)
-            .field("block_header", &self.block_header)
+            .field("cached_block_info", &self.cached_block_info)
             .finish()
     }
 }
@@ -306,7 +307,7 @@ impl DataBase {
     }
 
     /// Read block info by block hash
-    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
         let start = std::time::Instant::now();
         let txn = self
             .env
@@ -331,7 +332,7 @@ impl DataBase {
 
         match block_info_bytes {
             Some(bytes) => {
-                let block_info = from_slice::<Block<H256>>(&bytes)?;
+                let block_info = from_slice::<BlockInfo>(&bytes)?;
                 Ok(Some(block_info))
             }
             None => Ok(None),
@@ -462,9 +463,9 @@ fn decode_code(
 
 fn decode_block_info(
     result: libmdbx::Result<(Cow<'_, [u8]>, Cow<'_, [u8]>)>,
-) -> Result<Block<H256>, Error> {
+) -> Result<BlockInfo, Error> {
     let (_, value) = result.map_err(|e| Error::UnSupported(format!("Iterator error: {}", e)))?;
-    from_slice::<Block<H256>>(&value)
+    from_slice::<BlockInfo>(&value)
         .map_err(|e| Error::UnSupported(format!("Failed to decode block info: {}", e)))
 }
 
@@ -622,7 +623,7 @@ impl LatestStateDBIterator for DataBase {
 // ===== BlockIterator Implementation =====
 
 impl BlockIterator for DataBase {
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Error>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, Error>> {
         match create_cursor(&self.env, StorageTable::BlockHashToBlockInfo) {
             Ok(cursor) => {
                 Box::new(cursor.iter_slices().map(decode_block_info)) as Box<dyn Iterator<Item = _>>
@@ -648,16 +649,17 @@ impl StateDBProvider for Arc<DataBase> {
 
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;
-        let block_header: Option<Header>;
+        let cached_block_info: Option<BlockInfo>;
 
         match block_id {
             BlockId::Hash(hash) => {
-                let header = self.read_block_info(hash.block_hash)?;
-                if header.is_none() {
+                let info = self.read_block_info(hash.block_hash)?;
+                if info.is_none() {
                     return Ok(None);
                 }
-                block_header = Some(header.unwrap().header);
-                block_num = block_header.as_ref().unwrap().number;
+                let info = info.unwrap();
+                block_num = info.header.number;
+                cached_block_info = Some(info);
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
@@ -669,17 +671,15 @@ impl StateDBProvider for Arc<DataBase> {
                             if block_hash == H256::ZERO {
                                 return Ok(None);
                             }
-                            let header = self.read_block_info(block_hash)?;
-                            if header.is_none() {
+                            let info = self.read_block_info(block_hash)?;
+                            if info.is_none() {
                                 return Ok(None);
                             }
-                            block_header = Some(header.unwrap().header);
+                            cached_block_info = Some(info.unwrap());
                         }
                         None => {
-                            // Empty database: return a StateDB with no cached
-                            // header so initialize_check can write the genesis block.
                             block_num = 0;
-                            block_header = None;
+                            cached_block_info = None;
                         }
                     }
                 }
@@ -689,11 +689,11 @@ impl StateDBProvider for Arc<DataBase> {
                     if block_hash == H256::ZERO {
                         return Ok(None);
                     }
-                    let header = self.read_block_info(block_hash)?;
-                    if header.is_none() {
+                    let info = self.read_block_info(block_hash)?;
+                    if info.is_none() {
                         return Ok(None);
                     }
-                    block_header = Some(header.unwrap().header);
+                    cached_block_info = Some(info.unwrap());
                 }
                 _ => return Err(Error::UnsupportedBlockId(block_id)),
             },
@@ -702,7 +702,7 @@ impl StateDBProvider for Arc<DataBase> {
         Ok(Some(StateDB {
             db: self.clone(),
             block_num,
-            block_header,
+            cached_block_info,
         }))
     }
 }
@@ -711,28 +711,25 @@ impl StateDBProvider for Arc<DataBase> {
 
 impl StateDBRead for StateDB {
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        match &self.block_header {
-            Some(h) => Ok(h.hash),
+        match &self.cached_block_info {
+            Some(info) => Ok(info.header.hash),
             None => self.db.read_latest_block_hash(),
         }
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
-        if let Some(h) = &self.block_header {
-            if block_hash == h.hash {
-                return Ok(Some(Block {
-                    header: h.clone(),
-                    ..Default::default()
-                }));
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+        if let Some(info) = &self.cached_block_info {
+            if block_hash == info.header.hash {
+                return Ok(Some(info.clone()));
             }
         }
         self.db.read_block_info(block_hash)
     }
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        if let Some(h) = &self.block_header {
+        if let Some(info) = &self.cached_block_info {
             if block_num == self.block_num {
-                return Ok(h.hash);
+                return Ok(info.header.hash);
             }
         }
         self.db.read_block_hash(block_num)
@@ -892,7 +889,7 @@ impl StateDBWrite for StateDB {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), Error> {
         self.db.write_block_info(batch, block_info)
     }
@@ -1002,7 +999,7 @@ impl StateDBWrite for Arc<DataBase> {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), Error> {
         let block_info_bytes = to_vec(&block_info)
             .map_err(|e| Error::UnSupported(format!("Failed to serialize block info: {}", e)))?;
@@ -1121,9 +1118,9 @@ impl StateDBWrite for Arc<DataBase> {
 
             for (key, value_opt) in &batch.account_cache {
                 let value = value_opt.as_deref().unwrap_or(&[]);
-                cursor.put(key, value, WriteFlags::UPSERT).map_err(|e| {
-                    Error::UnSupported(format!("Failed to write account: {}", e))
-                })?;
+                cursor
+                    .put(key, value, WriteFlags::UPSERT)
+                    .map_err(|e| Error::UnSupported(format!("Failed to write account: {}", e)))?;
             }
         }
 
@@ -1144,9 +1141,9 @@ impl StateDBWrite for Arc<DataBase> {
             })?;
 
             for (key, value) in &batch.storage_cache {
-                cursor.put(key, value, WriteFlags::UPSERT).map_err(|e| {
-                    Error::UnSupported(format!("Failed to write storage: {}", e))
-                })?;
+                cursor
+                    .put(key, value, WriteFlags::UPSERT)
+                    .map_err(|e| Error::UnSupported(format!("Failed to write storage: {}", e)))?;
             }
         }
 

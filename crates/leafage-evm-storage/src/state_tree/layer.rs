@@ -1,6 +1,6 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::state_tree::error::Error;
-use leafage_evm_types::{AccountInfo, Block, BlockStorageDiff, Bytecode, H256, U256};
+use leafage_evm_types::{AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, H256, U256};
 use quick_cache::sync::Cache;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -181,7 +181,7 @@ impl CacheDiskLayer {
 /// It stores the diff of the EVM.
 #[derive(Debug)]
 pub struct DiffLayer {
-    pub block_info: Arc<Block<H256>>,
+    pub block_info: Arc<BlockInfo>,
     pub block_diff: Arc<BlockStorageDiff>,
     pub accounts: HashMap<H256, Option<AccountInfo>>,
     pub storage: HashMap<(H256, H256), U256>,
@@ -189,23 +189,23 @@ pub struct DiffLayer {
     pub next: RwLock<Arc<LinkedDiffLayer>>,
 }
 
-impl From<(Block<H256>, BlockStorageDiff, Arc<LinkedDiffLayer>)> for DiffLayer {
+impl From<(BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer>)> for DiffLayer {
     fn from(
-        (block_info, block_diff, db): (Block<H256>, BlockStorageDiff, Arc<LinkedDiffLayer>),
+        (block_info, block_diff, db): (BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer>),
     ) -> Self {
         Self::new(block_info, block_diff, db)
     }
 }
 
-impl Into<(Block<H256>, BlockStorageDiff)> for &DiffLayer {
-    fn into(self) -> (Block<H256>, BlockStorageDiff) {
+impl Into<(BlockInfo, BlockStorageDiff)> for &DiffLayer {
+    fn into(self) -> (BlockInfo, BlockStorageDiff) {
         self.storage_diff()
     }
 }
 
 impl DiffLayer {
     pub fn new(
-        block_info: Block<H256>,
+        block_info: BlockInfo,
         block_diff: BlockStorageDiff,
         next: Arc<LinkedDiffLayer>,
     ) -> Self {
@@ -241,7 +241,7 @@ impl DiffLayer {
         }
     }
 
-    fn storage_diff(&self) -> (Block<H256>, BlockStorageDiff) {
+    fn storage_diff(&self) -> (BlockInfo, BlockStorageDiff) {
         (
             self.block_info.as_ref().clone(),
             self.block_diff.as_ref().clone(),
@@ -402,7 +402,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
 impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
     type Error = Error<StateDB::Error>;
 
-    fn block_info_arc(&self) -> Result<Arc<Block<H256>>, Self::Error> {
+    fn block_info_arc(&self) -> Result<Arc<BlockInfo>, Self::Error> {
         match self.memory_layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {

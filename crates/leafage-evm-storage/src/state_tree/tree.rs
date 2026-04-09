@@ -4,7 +4,7 @@ use crate::interface::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrite
 use crate::metrics::BLOCK_METRICS;
 use crate::state_tree::error::Error;
 use crate::state_tree::layer::{CacheDiskLayer, DiffLayer, HybridStateDB, LinkedDiffLayer};
-use leafage_evm_types::{Block, BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
+use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
@@ -126,7 +126,7 @@ where
     /// update_block updates the state of the StateTree.
     fn update_block(
         &self,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         if self
@@ -195,7 +195,7 @@ where
         }
     }
 
-    fn last_committed_block(&self) -> Result<Option<Block<H256>>, Self::Error> {
+    fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error> {
         let latest_statedb = self
             .db
             .state_at(BlockId::Number(BlockNumberOrTag::Latest))?
@@ -216,7 +216,7 @@ where
     fn get_block_by_id_arc(
         &self,
         block_id: BlockId,
-    ) -> Result<Option<Arc<Block<H256>>>, Self::Error> {
+    ) -> Result<Option<Arc<BlockInfo>>, Self::Error> {
         let memory_layer = match block_id {
             BlockId::Hash(hash) => {
                 if let Some(memory_layer) = self

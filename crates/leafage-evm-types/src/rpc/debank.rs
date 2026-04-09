@@ -1,4 +1,4 @@
-use crate::{Address, Block, BlockId, Bytes, H256, U256};
+use crate::{Address, Block, BlockId, BlockInfo, Bytes, H256, U256};
 use alloy::primitives::{BlockHash, TxKind};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::decode_revert_reason;
@@ -283,6 +283,21 @@ pub struct DebankBlock {
 
 impl<T> From<Arc<Block<T>>> for DebankBlock {
     fn from(block: Arc<Block<T>>) -> Self {
+        DebankBlock {
+            id: block.header.hash,
+            height: block.header.number,
+            timestamp: block.header.timestamp,
+            parent_id: block.header.parent_hash,
+            base_fee_per_gas: block.header.base_fee_per_gas.unwrap_or_default(),
+            miner: block.header.beneficiary,
+            gas_limit: block.header.gas_limit,
+            gas_used: block.header.gas_used,
+        }
+    }
+}
+
+impl From<Arc<BlockInfo>> for DebankBlock {
+    fn from(block: Arc<BlockInfo>) -> Self {
         DebankBlock {
             id: block.header.hash,
             height: block.header.number,

@@ -10,7 +10,7 @@ use leafage_evm_storage::{
     rocksdb, ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
     MDBXSyncMode, StateDBWrite, StorageKind,
 };
-use leafage_evm_types::{Block, BlockStorageDiff, H256};
+use leafage_evm_types::{BlockInfo, BlockStorageDiff, H256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -124,7 +124,7 @@ pub struct Command {
 struct BlockData {
     block_num: u64,
     block_hash: H256,
-    block_info: Block<H256>,
+    block_info: BlockInfo,
     block_diff: BlockStorageDiff,
 }
 
@@ -149,7 +149,7 @@ impl ArchiveStorage {
         }
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, anyhow::Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, anyhow::Error> {
         match self {
             ArchiveStorage::RocksDB(db) => Ok(db.read_block_info(block_hash)?),
             ArchiveStorage::MDBX(db) => Ok(db.read_block_info(block_hash)?),
@@ -201,7 +201,7 @@ impl ArchiveStorage {
     fn write_block_info(
         &self,
         batch: &mut ArchiveWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), anyhow::Error> {
         match (self, batch) {
             (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {

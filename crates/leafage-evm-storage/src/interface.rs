@@ -1,7 +1,7 @@
 use alloy::primitives::keccak256;
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Address, Block, BlockId, BlockStorageDiff, Bytecode, H256, U256,
+    AccountInfo, Address, BlockId, BlockInfo, BlockStorageDiff, Bytecode, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
 use revm::DatabaseRef;
@@ -27,11 +27,11 @@ pub trait StateDB {
 pub trait BlockContext {
     type Error: std::error::Error + Send + Sync + 'static;
     // Block ctx related
-    fn block_info(&self) -> Result<Block<H256>, Self::Error> {
+    fn block_info(&self) -> Result<BlockInfo, Self::Error> {
         Ok(self.block_info_arc()?.as_ref().clone())
     }
 
-    fn block_info_arc(&self) -> Result<Arc<Block<H256>>, Self::Error> {
+    fn block_info_arc(&self) -> Result<Arc<BlockInfo>, Self::Error> {
         Ok(Arc::new(self.block_info()?))
     }
 
@@ -57,7 +57,7 @@ pub struct TxContext {
 pub trait BlockIndex {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn get_block_by_id(&self, block_id: BlockId) -> Result<Option<Block<H256>>, Self::Error> {
+    fn get_block_by_id(&self, block_id: BlockId) -> Result<Option<BlockInfo>, Self::Error> {
         self.get_block_by_id_arc(block_id)
             .map(|b| b.map(|b| b.as_ref().clone()))
     }
@@ -65,7 +65,7 @@ pub trait BlockIndex {
     fn get_block_by_id_arc(
         &self,
         block_id: BlockId,
-    ) -> Result<Option<Arc<Block<H256>>>, Self::Error> {
+    ) -> Result<Option<Arc<BlockInfo>>, Self::Error> {
         self.get_block_by_id(block_id)
             .map(|b| b.map(|b| Arc::new(b)))
     }
@@ -180,11 +180,11 @@ pub trait EvmStorageWrite {
     type Error: std::error::Error + Send + Sync + 'static;
     fn update_block(
         &self,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error>;
 
-    fn last_committed_block(&self) -> Result<Option<Block<H256>>, Self::Error>;
+    fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error>;
 }
 
 #[cfg(test)]

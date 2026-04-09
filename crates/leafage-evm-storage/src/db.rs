@@ -3,14 +3,14 @@ use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::metrics::STORAGE_METRICS;
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Block, BlockId, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
+    AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
 use std::fmt::Debug;
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockIterator: Send + Sync + 'static {
     /// block num -> block info
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, StorageError>>;
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, StorageError>>;
 
     /// block num -> block hash
     fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), StorageError>>;
@@ -23,7 +23,7 @@ pub trait StateDBRead {
     fn read_latest_block_hash(&self) -> Result<H256, StorageError>;
 
     /// block hash -> block info
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, StorageError>;
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, StorageError>;
 
     /// block num -> block hash
     fn read_block_hash(&self, block_num: u64) -> Result<H256, StorageError>;
@@ -69,7 +69,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), StorageError>;
 
     /// block num -> block hash
@@ -130,7 +130,7 @@ where
 {
     type Error = StorageError;
 
-    fn block_info(&self) -> Result<Block<H256>, Self::Error> {
+    fn block_info(&self) -> Result<BlockInfo, Self::Error> {
         let latest_block_hash = self.0.read_latest_block_hash()?;
         Ok(self.0.read_block_info(latest_block_hash)?.unwrap())
     }
@@ -178,7 +178,7 @@ where
 
     fn update_block(
         &self,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
         let start = std::time::Instant::now();
@@ -220,7 +220,7 @@ where
         Ok(())
     }
 
-    fn last_committed_block(&self) -> Result<Option<Block<H256>>, Self::Error> {
+    fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error> {
         let latest_block_hash = self.0.read_latest_block_hash()?;
         Ok(self.0.read_block_info(latest_block_hash)?)
     }

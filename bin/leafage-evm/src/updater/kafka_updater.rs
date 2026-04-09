@@ -7,7 +7,7 @@ use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{
-    Block, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, H256,
+    BlockInfo, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, H256,
 };
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
@@ -24,7 +24,7 @@ use tracing::{debug, error, info};
 #[derive(Debug, Clone)]
 struct BlockContextWithOffset {
     block_diff: BlockStorageDiff,
-    block_info: Block<H256>,
+    block_info: BlockInfo,
     offset: i64,
 }
 
@@ -106,7 +106,7 @@ where
     }
 
     #[inline]
-    async fn get_block_info(&self, block_hash: H256) -> Result<Block<H256>> {
+    async fn get_block_info(&self, block_hash: H256) -> Result<BlockInfo> {
         if let Some(block_ctx) = self.hash_to_blockctx.lock().unwrap().get(&block_hash) {
             return Ok(block_ctx.block_info.clone());
         }

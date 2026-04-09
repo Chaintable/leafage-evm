@@ -21,7 +21,8 @@ use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256,
+    BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
+    U256,
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
@@ -121,7 +122,7 @@ impl StateDBRead for DataBase {
         Ok(block_hash)
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -141,7 +142,7 @@ impl StateDBRead for DataBase {
         }
         let block_info_bytes = block_info_bytes.unwrap();
         let block_info_slice = block_info_bytes.as_ref();
-        let block_info = from_slice::<Block<H256>>(block_info_slice)?;
+        let block_info = from_slice::<BlockInfo>(block_info_slice)?;
         Ok(Some(block_info))
     }
 
@@ -273,7 +274,7 @@ impl StateDBWrite for DataBase {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), Error> {
         let block_hash_to_block_info_cf = self
             .db
@@ -634,7 +635,7 @@ impl LatestStateDBIterator for DataBase {
 }
 
 impl BlockIterator for DataBase {
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Error>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, Error>> {
         let block_hash_to_block_info_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
@@ -646,7 +647,7 @@ impl BlockIterator for DataBase {
         );
         iter.map(|item| {
             let (_, value) = item?;
-            let block_info: Block<H256> = from_slice(value.as_ref())?;
+            let block_info: BlockInfo = from_slice(value.as_ref())?;
             Ok(block_info)
         })
     }

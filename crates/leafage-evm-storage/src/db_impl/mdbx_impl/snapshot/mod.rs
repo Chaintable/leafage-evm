@@ -22,7 +22,8 @@ use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY, U256,
+    BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
+    U256,
 };
 use libmdbx::{
     Cursor, DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode,
@@ -287,9 +288,9 @@ fn decode_storage(
 
 fn decode_block_info(
     result: libmdbx::Result<(Cow<'_, [u8]>, Cow<'_, [u8]>)>,
-) -> Result<Block<H256>, Error> {
+) -> Result<BlockInfo, Error> {
     let (_, value) = result.map_err(|e| Error::UnSupported(format!("Iterator error: {}", e)))?;
-    from_slice::<Block<H256>>(&value)
+    from_slice::<BlockInfo>(&value)
         .map_err(|e| Error::UnSupported(format!("Failed to decode block info: {}", e)))
 }
 
@@ -318,37 +319,47 @@ fn create_cursor(env: &Environment, table: StorageTable) -> Result<Cursor<RO>, E
 impl LatestStateDBIterator for DataBase {
     fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
         match create_cursor(&self.env, StorageTable::AddressToAccount) {
-            Ok(cursor) => Box::new(cursor.iter_slices().map(decode_account)) as Box<dyn Iterator<Item = _>>,
+            Ok(cursor) => {
+                Box::new(cursor.iter_slices().map(decode_account)) as Box<dyn Iterator<Item = _>>
+            }
             Err(e) => Box::new(std::iter::once(Err(e))) as Box<dyn Iterator<Item = _>>,
         }
     }
 
     fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Error>> {
         match create_cursor(&self.env, StorageTable::HashToCode) {
-            Ok(cursor) => Box::new(cursor.iter_slices().map(decode_code)) as Box<dyn Iterator<Item = _>>,
+            Ok(cursor) => {
+                Box::new(cursor.iter_slices().map(decode_code)) as Box<dyn Iterator<Item = _>>
+            }
             Err(e) => Box::new(std::iter::once(Err(e))) as Box<dyn Iterator<Item = _>>,
         }
     }
 
     fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
         match create_cursor(&self.env, StorageTable::AddressToStorage) {
-            Ok(cursor) => Box::new(cursor.iter_slices().map(decode_storage)) as Box<dyn Iterator<Item = _>>,
+            Ok(cursor) => {
+                Box::new(cursor.iter_slices().map(decode_storage)) as Box<dyn Iterator<Item = _>>
+            }
             Err(e) => Box::new(std::iter::once(Err(e))) as Box<dyn Iterator<Item = _>>,
         }
     }
 }
 
 impl BlockIterator for DataBase {
-    fn block_info_iter(&self) -> impl Iterator<Item = Result<Block<H256>, Error>> {
+    fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, Error>> {
         match create_cursor(&self.env, StorageTable::BlockHashToBlockInfo) {
-            Ok(cursor) => Box::new(cursor.iter_slices().map(decode_block_info)) as Box<dyn Iterator<Item = _>>,
+            Ok(cursor) => {
+                Box::new(cursor.iter_slices().map(decode_block_info)) as Box<dyn Iterator<Item = _>>
+            }
             Err(e) => Box::new(std::iter::once(Err(e))) as Box<dyn Iterator<Item = _>>,
         }
     }
 
     fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Error>> {
         match create_cursor(&self.env, StorageTable::BlockNumToBlockHash) {
-            Ok(cursor) => Box::new(cursor.iter_slices().map(decode_block_hash)) as Box<dyn Iterator<Item = _>>,
+            Ok(cursor) => {
+                Box::new(cursor.iter_slices().map(decode_block_hash)) as Box<dyn Iterator<Item = _>>
+            }
             Err(e) => Box::new(std::iter::once(Err(e))) as Box<dyn Iterator<Item = _>>,
         }
     }
@@ -407,7 +418,7 @@ impl StateDBRead for StateDB {
         }
     }
 
-    fn read_block_info(&self, block_hash: H256) -> Result<Option<Block<H256>>, Error> {
+    fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
         let start = std::time::Instant::now();
 
         let dbi = self
@@ -428,7 +439,7 @@ impl StateDBRead for StateDB {
 
         match block_info_bytes {
             Some(bytes) => {
-                let block_info = from_slice::<Block<H256>>(&bytes)?;
+                let block_info = from_slice::<BlockInfo>(&bytes)?;
                 Ok(Some(block_info))
             }
             None => Ok(None),
@@ -592,7 +603,7 @@ impl StateDBWrite for StateDB {
     fn write_block_info(
         &self,
         batch: &mut Self::DBWriteBatch,
-        block_info: Block<H256>,
+        block_info: BlockInfo,
     ) -> Result<(), Error> {
         let dbi = self
             .dbis
