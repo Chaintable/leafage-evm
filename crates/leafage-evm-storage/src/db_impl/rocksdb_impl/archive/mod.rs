@@ -766,7 +766,15 @@ impl BlockIterator for DataBaseRef {
                 }
                 let (key, value) = item.unwrap();
                 let block_hash = H256::from_slice(key.as_ref());
-                let block_header: RawHeader = RawHeader::decode(&mut value.as_ref()).unwrap();
+                let buf = &mut value.as_ref();
+                let block_header: RawHeader = RawHeader::decode(buf).map_err(|e| {
+                    Error::UnSupported(format!("Failed to decode block header: {}", e))
+                })?;
+                let other = if buf.is_empty() {
+                    Default::default()
+                } else {
+                    serde_json::from_slice(buf).unwrap_or_default()
+                };
                 let block = Block {
                     header: Header {
                         hash: block_hash,
@@ -775,7 +783,10 @@ impl BlockIterator for DataBaseRef {
                     },
                     ..Default::default()
                 };
-                Ok(BlockInfo::new(block))
+                Ok(BlockInfo {
+                    inner: block,
+                    other,
+                })
             })
     }
 
@@ -804,19 +815,19 @@ impl StateDBProvider for Arc<DataBaseRef> {
     type StateDBReadWrite = StateDB;
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;
-        let block_header: Option<Header>;
+        let cached_block_info: Option<BlockInfo>;
         match block_id {
             BlockId::Hash(hash) => {
-                let header = self.read_block_info(hash.block_hash)?;
-                if header.is_none() {
+                let info = self.read_block_info(hash.block_hash)?;
+                if info.is_none() {
                     return Ok(None);
                 }
-                block_header = Some(header.unwrap().header.clone());
-                block_num = block_header.as_ref().unwrap().number;
+                let info = info.unwrap();
+                block_num = info.header.number;
+                cached_block_info = Some(info);
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    // Get the real latest block number instead of using u64::MAX
                     let latest_block_num = self.read_latest_block_num()?;
                     match latest_block_num {
                         Some(num) => {
@@ -825,17 +836,15 @@ impl StateDBProvider for Arc<DataBaseRef> {
                             if block_hash == H256::ZERO {
                                 return Ok(None);
                             }
-                            let header = self.read_block_info(block_hash)?;
-                            if header.is_none() {
+                            let info = self.read_block_info(block_hash)?;
+                            if info.is_none() {
                                 return Ok(None);
                             }
-                            block_header = Some(header.unwrap().header.clone());
+                            cached_block_info = Some(info.unwrap());
                         }
                         None => {
-                            // Empty database: return a StateDB with no cached
-                            // header so initialize_check can write the genesis block.
                             block_num = 0;
-                            block_header = None;
+                            cached_block_info = None;
                         }
                     }
                 }
@@ -845,11 +854,11 @@ impl StateDBProvider for Arc<DataBaseRef> {
                     if block_hash == H256::ZERO {
                         return Ok(None);
                     }
-                    let header = self.read_block_info(block_hash)?;
-                    if header.is_none() {
+                    let info = self.read_block_info(block_hash)?;
+                    if info.is_none() {
                         return Ok(None);
                     }
-                    block_header = Some(header.unwrap().header.clone());
+                    cached_block_info = Some(info.unwrap());
                 }
                 _ => return Err(Error::UnsupportedBlockId(block_id)),
             },
@@ -887,7 +896,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
         Ok(Some(StateDB {
             db: self.clone(),
             block_num,
-            block_header,
+            block_info: cached_block_info,
             iterators,
             tracker_id,
             timed_out,
@@ -899,7 +908,8 @@ pub struct StateDB {
     db: Arc<DataBaseRef>,
     block_num: u64,
     /// `None` when the database is empty (no blocks committed yet).
-    block_header: Option<Header>,
+    /// Stores full BlockInfo to preserve `other` fields (e.g. l1FeeRate).
+    block_info: Option<BlockInfo>,
     /// Shared iterators
     iterators: Arc<SharedIterators>,
     /// Tracker ID for iterator lifecycle management
@@ -946,7 +956,7 @@ impl Clone for StateDB {
         Self {
             db: self.db.clone(),
             block_num: self.block_num,
-            block_header: self.block_header.clone(),
+            block_info: self.block_info.clone(),
             iterators,
             tracker_id,
             timed_out,
@@ -958,7 +968,7 @@ impl Debug for StateDB {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateDB")
             .field("block_num", &self.block_num)
-            .field("block_header", &self.block_header)
+            .field("block_info", &self.block_info)
             .finish()
     }
 }
@@ -1086,28 +1096,25 @@ impl StateDBRead for StateDB {
     }
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
-        if let Some(h) = &self.block_header {
+        if let Some(info) = &self.block_info {
             if block_num == self.block_num {
-                return Ok(h.hash);
+                return Ok(info.header.hash);
             }
         }
         self.db.read_block_hash(block_num)
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
-        if let Some(h) = &self.block_header {
-            if block_hash == h.hash {
-                return Ok(Some(BlockInfo::new(Block {
-                    header: h.clone(),
-                    ..Default::default()
-                })));
+        if let Some(info) = &self.block_info {
+            if block_hash == info.header.hash {
+                return Ok(Some(info.clone()));
             }
         }
         self.db.read_block_info(block_hash)
     }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
-        match &self.block_header {
-            Some(h) => Ok(h.hash),
+        match &self.block_info {
+            Some(info) => Ok(info.header.hash),
             None => self.db.read_latest_block_hash(),
         }
     }
@@ -1326,5 +1333,231 @@ impl StateDBWrite for Arc<DataBaseRef> {
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
         self.db.write(batch)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::serde::OtherFields;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn make_block_info_with_other() -> BlockInfo {
+        let block_json = json!({
+            "hash":"0x321040cad932841b60186b937dd7b05a9a19a7b5a4d9f34e6f824f3b98346c5c",
+            "parentHash":"0xcc4374d84f296ed5b45631fdafc7b788ea6070080c8d2a39447229af5fe779b5",
+            "sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "miner":"0x3100000000000000000000000000000000000005",
+            "stateRoot":"0x8c0c93b3d3e3fbc8f39151adf14d6beee4cf1b2268f6ed0da6043ad3c8505cff",
+            "transactionsRoot":"0xad8a61086a9fb2b79c10e248dcedef3d2d07082e518ca04ab966d4b5e6df6684",
+            "receiptsRoot":"0xd7382684c788e295ee56dfd7fc0503becf28766585400cee47ce3eb1b790e4d8",
+            "logsBloom":"0x00000000000000000000000000000000000000000000000000400000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000800000000000080000000000000000000000000000000000400000000000008400000000000000000002000000000000000400000000000140000000000000002000000000000000000000000040000000010000000002000000000004000000000000000000000000000000000000000000000400000000000000000000000000080000000000000000000000000000000000440000000000000000000000000000000020000000000000000000000000000000000000000",
+            "difficulty":"0x0",
+            "number":"0x1",
+            "gasLimit":"0x989680",
+            "gasUsed":"0x5a444",
+            "timestamp":"0x692608fb",
+            "extraData":"0x",
+            "mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "nonce":"0x0000000000000000",
+            "baseFeePerGas":"0x342770c0",
+            "withdrawalsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "blobGasUsed":"0x0",
+            "excessBlobGas":"0x0",
+            "parentBeaconBlockRoot":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "requestsHash":"0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "l1FeeRate":"0xdf847580"
+        });
+        serde_json::from_value::<BlockInfo>(block_json).unwrap()
+    }
+
+    /// Simulate the write_block_info encoding: RLP(RawHeader) + JSON(other)
+    fn encode_block_info(block_info: &BlockInfo) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let raw_header: RawHeader = block_info.header.inner.clone();
+        raw_header.encode(&mut bytes);
+        if !block_info.other.is_empty() {
+            let other_bytes = serde_json::to_vec(&block_info.other).unwrap();
+            bytes.extend_from_slice(&other_bytes);
+        }
+        bytes
+    }
+
+    /// Simulate the read_block_info decoding: RLP decode + JSON other
+    fn decode_block_info_bytes(
+        block_hash: H256,
+        data: &[u8],
+    ) -> Result<BlockInfo, Box<dyn std::error::Error>> {
+        let buf = &mut &data[..];
+        let block_header = RawHeader::decode(buf)?;
+        let other: OtherFields = if buf.is_empty() {
+            Default::default()
+        } else {
+            serde_json::from_slice(buf).unwrap_or_default()
+        };
+        let block = Block {
+            header: Header {
+                hash: block_hash,
+                inner: block_header,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Ok(BlockInfo {
+            inner: block,
+            other,
+        })
+    }
+
+    #[test]
+    fn test_archive_block_info_roundtrip_preserves_other_fields() {
+        let original = make_block_info_with_other();
+
+        assert!(
+            !original.other.is_empty(),
+            "test data should have other fields"
+        );
+        assert!(
+            original.other.get("l1FeeRate").is_some(),
+            "test data should have l1FeeRate"
+        );
+
+        let encoded = encode_block_info(&original);
+        let decoded =
+            decode_block_info_bytes(original.header.hash, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.header.inner.number, original.header.inner.number);
+        assert_eq!(
+            decoded.header.inner.base_fee_per_gas,
+            original.header.inner.base_fee_per_gas
+        );
+        assert_eq!(
+            decoded.header.inner.requests_hash,
+            original.header.inner.requests_hash
+        );
+
+        assert!(
+            !decoded.other.is_empty(),
+            "decoded block should preserve other fields"
+        );
+        assert_eq!(
+            decoded.other.get("l1FeeRate"),
+            original.other.get("l1FeeRate"),
+            "l1FeeRate should survive roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_archive_block_info_roundtrip_without_other_fields() {
+        let block = Block {
+            header: Header {
+                hash: H256::ZERO,
+                inner: RawHeader {
+                    number: 42,
+                    gas_limit: 10_000_000,
+                    base_fee_per_gas: Some(1_000_000_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let original = BlockInfo::new(block);
+        assert!(original.other.is_empty());
+
+        let encoded = encode_block_info(&original);
+        let decoded = decode_block_info_bytes(H256::ZERO, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.header.inner.number, 42);
+        assert_eq!(decoded.header.inner.gas_limit, 10_000_000);
+        assert!(decoded.other.is_empty());
+    }
+
+    #[test]
+    fn test_cached_block_info_preserves_other_fields() {
+        let original = make_block_info_with_other();
+        let cached = Some(original.clone());
+
+        let block_hash = original.header.hash;
+        let result = cached
+            .as_ref()
+            .filter(|info| info.header.hash == block_hash)
+            .cloned();
+
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(
+            result.other.get("l1FeeRate"),
+            original.other.get("l1FeeRate"),
+            "cached block_info should preserve l1FeeRate"
+        );
+    }
+
+    #[test]
+    fn test_block_info_iter_decode_preserves_other_fields() {
+        let original = make_block_info_with_other();
+        let encoded = encode_block_info(&original);
+
+        let buf = &mut encoded.as_slice();
+        let block_header: RawHeader = RawHeader::decode(buf).unwrap();
+        let other: OtherFields = if buf.is_empty() {
+            Default::default()
+        } else {
+            serde_json::from_slice(buf).unwrap_or_default()
+        };
+        let block = Block {
+            header: Header {
+                hash: original.header.hash,
+                inner: block_header,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let decoded = BlockInfo {
+            inner: block,
+            other,
+        };
+
+        assert_eq!(
+            decoded.other.get("l1FeeRate"),
+            original.other.get("l1FeeRate"),
+            "iter decode should preserve l1FeeRate"
+        );
+    }
+
+    #[test]
+    fn test_multiple_other_fields_roundtrip() {
+        let block = Block {
+            header: Header {
+                hash: H256::ZERO,
+                inner: RawHeader {
+                    number: 100,
+                    base_fee_per_gas: Some(875_000_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut other_map = BTreeMap::new();
+        other_map.insert(
+            "l1FeeRate".to_string(),
+            serde_json::Value::String("0xdf847580".to_string()),
+        );
+        other_map.insert(
+            "customField".to_string(),
+            serde_json::Value::String("0xdeadbeef".to_string()),
+        );
+        let original = BlockInfo {
+            inner: block,
+            other: serde_json::from_value(serde_json::to_value(&other_map).unwrap()).unwrap(),
+        };
+
+        let encoded = encode_block_info(&original);
+        let decoded = decode_block_info_bytes(H256::ZERO, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.other.get("l1FeeRate"), original.other.get("l1FeeRate"));
+        assert_eq!(decoded.other.get("customField"), original.other.get("customField"));
     }
 }
