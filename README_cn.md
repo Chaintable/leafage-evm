@@ -23,6 +23,12 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 | AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
 | OP Stack (OP, Base 等) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
 | Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
+| Tempo | [Chaintable/reth-x](https://github.com/Chaintable/reth-x) |
+| Bitlayer | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2) |
+| Oasys | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator) |
+| Kava | [Chaintable/kava](https://github.com/Chaintable/kava) |
+| IoTeX | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x) |
+| Shibarium | [Chaintable/shib-bor](https://github.com/Chaintable/shib-bor) |
 
 ## 支持的 JSON-RPC 方法
 
