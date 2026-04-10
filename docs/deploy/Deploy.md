@@ -46,10 +46,59 @@ Modified Geth client for execution layer:
 Lightweight EVM executor for state queries:
 
 - **Image**: `294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/leafage-evm-x:amd64-chaintable-v102-debank-7`
+- **Typical Resources**: 4 CPU / 16GB memory
 - **Port Mapping**: 8659 → 8659
 - **Features**:
   - Receives block state updates from geth
   - Provides `eth_call`, `eth_estimateGas` and other query APIs
+
+> **Scaling**: QPS scales approximately linearly with the number of CPU cores — each request is handled by an independent worker with little cross-core contention. For higher throughput, increase the CPU allocation (e.g., 8c/32G, 16c/64G) and memory roughly proportionally.
+
+## Resource Requirements
+
+A typical single-host production deployment requires the following resources.
+
+### CPU & Memory
+
+| Service | CPU | Memory |
+|---------|-----|--------|
+| beacon (Lighthouse) | 4 cores | 12 GB |
+| geth (full sync + archive) | 4 cores | 24 GB |
+| leafage-evm-x-eth | 4 cores | 16 GB |
+| **Total** | **12 cores** | **52 GB** |
+
+leafage-evm QPS scales approximately linearly with CPU cores. To serve higher query throughput, scale the `leafage-evm-x-eth` CPU allocation up (and memory roughly proportionally) — the other two services can stay at their baseline.
+
+### Disk
+
+SSD is strongly recommended; archive mode in particular requires sustained high random-read/write IOPS. Expected usage at current mainnet head:
+
+| Component | Size |
+|-----------|------|
+| beacon + geth (archive mode) | ~850 GB |
+| leafage-evm (archive mode)   | ~450 GB |
+| leafage-evm (state-only mode) | ~150 GB |
+
+Total disk footprint:
+- **~1.3 TB** — geth archive + leafage archive
+- **~1.0 TB** — geth archive + leafage state-only
+
+Leave additional headroom (20–30%) for ongoing chain growth, compaction, and snapshots.
+
+**IOPS requirement**: at least **3000 IOPS** per volume. On AWS, **EBS gp3** is a good baseline — it provisions 3000 IOPS and 125 MB/s throughput by default at any volume size, which is sufficient for a steady-state node (processing one block every ~12s).
+
+During the bring-up window the disk is under heavier pressure than steady state, in two phases:
+
+1. **Snapshot extraction** — downloading and `unzstd`-decompressing the ~850 GB / ~450 GB snapshots is bound by **sequential write throughput**; gp3's default 125 MB/s is the bottleneck.
+2. **Catch-up after snapshot restore** — the snapshot height lags the chain head by hours to days of blocks, and the node replays them far faster than real-time, which drives **random-read/write IOPS** well above steady state.
+
+To shorten this one-time bring-up window (or to handle heavier query load later), provision additional IOPS/throughput on gp3, or step up to `io2`.
+
+### Network
+
+- Stable outbound connectivity to the Ethereum P2P network (geth)
+- Access to the beacon checkpoint sync URL (`https://mainnet.checkpoint.sigp.io`)
+- Access to AWS S3 for the initial snapshot download (optional, speeds up first sync)
 
 ## Quick Start
 
@@ -74,10 +123,8 @@ The script handles directory creation, JWT generation, snapshot download & extra
 
 1. **Docker** and **Docker Compose** installed
 2. **AWS CLI**, **zstd**, and **openssl** installed (for snapshot download and JWT generation)
-3. **Storage**:
-   - Geth archive mode + Lighthouse: ~850GB
-   - leafage-evm: ~450GB (archive) or ~150GB (state)
-4. **Network**: Access to Ethereum P2P network and checkpoint sync URL
+3. **Hardware**: see [Resource Requirements](#resource-requirements) for CPU, memory, and disk sizing
+4. **Network**: access to the Ethereum P2P network and the beacon checkpoint sync URL
 
 ## Configuration
 
