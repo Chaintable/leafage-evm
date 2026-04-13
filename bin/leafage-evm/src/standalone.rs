@@ -77,11 +77,19 @@ pub struct Command {
     rpc_addr: Option<String>,
 
     /// addr to listen on
-    /// Default: 8545  
+    /// Default: 8545
     ///
     /// This addr is used for the HTTP-RPC server
     #[arg(long, default_value = "0.0.0.0:8545")]
     listen_addr: String,
+
+    /// External WebSocket endpoint for subscribing to block notifications.
+    /// Default: ""
+    ///
+    /// When set, the node subscribes to new block notifications via this WS
+    /// endpoint as a replacement for kafka-based block delivery. Empty means disabled.
+    #[arg(long, default_value = "")]
+    ws_addr: String,
 
     /// The maximum number of concurrent connections.
     /// Default: 5000
@@ -598,9 +606,11 @@ impl Command {
             )
             .await?;
 
+        let ws_url = Some(self.ws_addr.clone()).filter(|s| !s.is_empty());
         let updater_handle = updater_build(
             tree.clone(),
             self.rpc_addr.clone(),
+            ws_url,
             self.kafka_s3_config.clone(),
             self.update_interval,
             self.diff_depth_limit,

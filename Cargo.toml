@@ -44,6 +44,7 @@ once_cell = "1.19.0"
 futures = "0.3.30"
 hyper = "1.6"
 rdkafka = "0.36.2"
+tokio-tungstenite = "0.28"
 aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
 flate2 = "1.0.34"

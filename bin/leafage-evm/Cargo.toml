@@ -29,6 +29,7 @@ jemalloc_pprof = { workspace = true, features = ["symbolize"] }
 hyper.workspace = true
 alloy-rlp.workspace = true
 rdkafka.workspace = true
+tokio-tungstenite.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
 flate2.workspace = true
