@@ -3,7 +3,7 @@ use crate::citrea::handler::CitreaHandler;
 use crate::citrea::l1_fee::calc_diff_size;
 use alloy_evm::Database;
 use revm::context::{ContextSetters, TxEnv};
-use revm::handler::{EvmTr, Handler};
+use revm::handler::Handler;
 use revm::inspector::InspectorHandler;
 use revm::{
     context::BlockEnv,
@@ -62,18 +62,38 @@ where
 {
     /// Run a transaction and return `(ExecutionResult, diff_size)`.
     ///
-    /// `diff_size` is computed from the journal *before* finalization and
-    /// represents the estimated L1 state-diff size in bytes.
+    /// `diff_size` is computed from the journal *before* `execution_result`
+    /// commits the transaction (which clears journal entries).
     pub fn transact_with_diff_size(
         &mut self,
         tx: TxEnv,
     ) -> Result<(ExecutionResult, usize), EVMError<DB::Error>> {
         self.inner.ctx.set_tx(tx);
-        let result = CitreaHandler::default().run(self)?;
+        let mut handler = CitreaHandler::default();
 
-        let diff_size = calc_diff_size(self.inner.ctx());
+        let result = self.run_with_diff_size(&mut handler);
+        match result {
+            ok @ Ok(_) => ok,
+            Err(e) => handler.catch_error(self, e).map(|r| (r, 0)),
+        }
+    }
 
-        let _ = self.finalize();
+    /// Decomposed handler pipeline that captures diff_size between
+    /// `post_execution` and `execution_result` (before journal commit).
+    fn run_with_diff_size(
+        &mut self,
+        handler: &mut CitreaHandler<DB, INSP>,
+    ) -> Result<(ExecutionResult, usize), EVMError<DB::Error>> {
+        let init_and_floor_gas = handler.validate(self)?;
+        let eip7702_refund = handler.pre_execution(self)? as i64;
+        let mut exec_result = handler.execution(self, &init_and_floor_gas)?;
+        let result_gas =
+            handler.post_execution(self, &mut exec_result, init_and_floor_gas, eip7702_refund)?;
+
+        // Capture diff_size while journal entries are still intact
+        let diff_size = calc_diff_size(&mut self.inner.ctx);
+
+        let result = handler.execution_result(self, exec_result, result_gas)?;
         Ok((result, diff_size))
     }
 }
