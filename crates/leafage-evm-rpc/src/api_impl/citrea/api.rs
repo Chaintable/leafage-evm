@@ -2,7 +2,9 @@ use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
 use alloy_evm::EvmEnv;
-use leafage_evm_chains::citrea::l1_fee::{BROTLI_COMPRESSION_PERCENTAGE, L1_FEE_OVERHEAD};
+use leafage_evm_chains::citrea::l1_fee::{
+    BROTLI_COMPRESSION_PERCENTAGE, L1_FEE_OVERHEAD, SYSTEM_SIGNER,
+};
 use leafage_evm_chains::citrea::{CitreaEvm, CitreaHardfork};
 use leafage_evm_storage::EvmStorageRead;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
@@ -10,16 +12,11 @@ use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransa
 use revm::context::TxEnv;
 use revm::database::{CacheDB, WrapDatabaseRef};
 use revm::inspector::NoOpInspector;
-use revm::primitives::{address, Address};
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
 type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, NoneEvmCustomConfig>;
-
-/// System signer address — system transactions from this address are not charged L1 fees.
-/// See: https://github.com/chainwayxyz/citrea/blob/main/crates/evm/src/evm/system_events.rs
-const SYSTEM_SIGNER: Address = address!("deaddeaddeaddeaddeaddeaddeaddeaddeaddead");
 
 /// Extract L1 fee rate from block's extra fields.
 fn extract_l1_fee_rate(block: &BlockInfo) -> u128 {
