@@ -18,7 +18,7 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type OpApiImpl<DB> = ApiImpl<DB, OpSpecId, NoneEvmCustomConfig>;
 
-impl<DB> GasFeeHandler for OpApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for OpApiImpl<DB> where DB: Sync + Send + 'static { type Tx = OpTransaction<TxEnv>; }
 
 impl<DB> EvmExecutor for OpApiImpl<DB>
 where

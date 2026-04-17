@@ -24,7 +24,6 @@ impl<C> Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead,
-    C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     PreErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
@@ -234,7 +233,7 @@ impl<C> PreApiServer for Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead,
-    C::Tx: TransactionTrait + TxSetter + Clone,
+    <C as EvmExecutor>::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     PreErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,

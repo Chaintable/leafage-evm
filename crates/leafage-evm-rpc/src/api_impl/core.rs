@@ -27,7 +27,10 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub custom_cfg: Option<CustomCfg>,
 }
 
-pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasFeeHandler {}
+pub(crate) trait ApiCore:
+    ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
+{
+}
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
@@ -46,14 +49,15 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 }
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
+    type Tx: TxSetter + TransactionTrait + Clone;
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         None
     }
 
-    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
+    fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,
-        tx: &Tx,
+        tx: &Self::Tx,
         db: &StateDB,
         _block_env: &BlockEnv,
     ) -> RpcResult<u64> {
@@ -78,6 +82,20 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
             .unwrap_or_default()
             .try_into()
             .unwrap())
+    }
+
+    fn estimate_l1_overhead<StateDB: DatabaseRef>(
+        &self,
+        _block: &BlockInfo,
+        _block_env: &BlockEnv,
+        _tx: Self::Tx,
+        _state: &StateDB,
+    ) -> u64
+    where
+        StateDB::Error: Sync + Send + 'static,
+        StateDB: Debug,
+    {
+        0
     }
 }
 
@@ -137,20 +155,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
-
-    fn estimate_l1_overhead<StateDB>(
-        &self,
-        _block: &BlockInfo,
-        _block_env: &BlockEnv,
-        _state: StateDB,
-        _tx: Self::Tx,
-    ) -> u64
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        0
-    }
 }
 
 pub(crate) trait TxSetter {

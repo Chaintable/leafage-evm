@@ -4,10 +4,11 @@ use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
 use alloy_evm::EvmEnv;
 use leafage_evm_chains::citrea::l1_fee::{BROTLI_COMPRESSION_PERCENTAGE, L1_FEE_OVERHEAD};
 use leafage_evm_chains::citrea::{CitreaEvm, CitreaHardfork};
+use leafage_evm_storage::EvmStorageRead;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context::TxEnv;
-use revm::database::WrapDatabaseRef;
+use revm::database::{CacheDB, WrapDatabaseRef};
 use revm::inspector::NoOpInspector;
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
@@ -35,7 +36,7 @@ fn extract_l1_fee_rate(block: &BlockInfo) -> u128 {
 
 impl<DB> EvmExecutor for CitreaApiImpl<DB>
 where
-    DB: Sync + Send + 'static,
+    DB: Sync + Send + 'static + EvmStorageRead,
 {
     type Tx = TxEnv;
     type TransactionError = InvalidTransaction;
@@ -97,28 +98,41 @@ where
         evm.inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)))
     }
+}
 
-    fn estimate_l1_overhead<StateDB>(
+impl<DB> crate::api_impl::core::GasFeeHandler for CitreaApiImpl<DB>
+where
+    DB: Sync + Send + 'static + EvmStorageRead,
+{
+    type Tx = TxEnv;
+
+    fn estimate_l1_overhead<StateDB: DatabaseRef>(
         &self,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        state: StateDB,
         tx: Self::Tx,
+        state: &StateDB,
     ) -> u64
     where
-        StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
+        StateDB: Debug,
     {
         let l1_fee_rate = extract_l1_fee_rate(block);
         if l1_fee_rate == 0 {
             return 0;
         }
 
+        let mut cfg_env = self.evm_cfg.cfg.clone();
+        cfg_env.disable_nonce_check = true;
+        cfg_env.disable_balance_check = true;
+        cfg_env.disable_base_fee = true;
+
         let env = EvmEnv {
             block_env: block_env.clone(),
-            cfg_env: self.evm_cfg.cfg.clone(),
+            cfg_env,
         };
-        let mut evm = CitreaEvm::new(env, WrapDatabaseRef(state), NoOpInspector {}, false);
+        let fresh_db = CacheDB::new(WrapDatabaseRef(state));
+        let mut evm = CitreaEvm::new(env, fresh_db, NoOpInspector {}, false);
 
         let result = match evm.transact_with_diff_size(tx) {
             Ok(r) => r,
@@ -141,6 +155,4 @@ where
     }
 }
 
-impl<DB> crate::api_impl::core::GasFeeHandler for CitreaApiImpl<DB> where DB: Sync + Send + 'static {}
-
-impl<DB> ApiCore for CitreaApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> ApiCore for CitreaApiImpl<DB> where DB: Sync + Send + 'static + EvmStorageRead {}

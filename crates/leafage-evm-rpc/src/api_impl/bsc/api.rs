@@ -15,7 +15,7 @@ use std::fmt::Debug;
 
 type BscApiImpl<DB> = ApiImpl<DB, BscHardfork, NoneEvmCustomConfig>;
 
-impl<DB> GasFeeHandler for BscApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for BscApiImpl<DB> where DB: Sync + Send + 'static { type Tx = BscTxEnv; }
 
 impl<DB> EvmExecutor for BscApiImpl<DB>
 where

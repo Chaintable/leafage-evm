@@ -63,7 +63,7 @@ where
     }
 }
 
-impl<DB> GasFeeHandler for MainnetApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for MainnetApiImpl<DB> where DB: Sync + Send + 'static { type Tx = TxEnv; }
 
 impl<DB> EvmExecutor for MainnetApiImpl<DB>
 where
