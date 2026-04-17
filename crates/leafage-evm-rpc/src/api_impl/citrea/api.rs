@@ -2,7 +2,9 @@ use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor};
 use alloy_evm::EvmEnv;
-use leafage_evm_chains::citrea::l1_fee::{BROTLI_COMPRESSION_PERCENTAGE, L1_FEE_OVERHEAD};
+use leafage_evm_chains::citrea::l1_fee::{
+    BROTLI_COMPRESSION_PERCENTAGE, L1_FEE_OVERHEAD, SYSTEM_SIGNER,
+};
 use leafage_evm_chains::citrea::{CitreaEvm, CitreaHardfork};
 use leafage_evm_storage::EvmStorageRead;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
@@ -117,6 +119,10 @@ where
         StateDB::Error: Sync + Send + 'static,
         StateDB: Debug,
     {
+        if tx.caller == SYSTEM_SIGNER {
+            return 0;
+        }
+
         let l1_fee_rate = extract_l1_fee_rate(block);
         if l1_fee_rate == 0 {
             return 0;
