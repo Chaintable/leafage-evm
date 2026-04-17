@@ -14,7 +14,12 @@ use std::fmt::Debug;
 
 type CosmosApiImpl<DB> = ApiImpl<DB, CosmosHardfork, CosmosEvmConfig>;
 
-impl<DB> GasFeeHandler for CosmosApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for CosmosApiImpl<DB>
+where
+    DB: Sync + Send + 'static,
+{
+    type Tx = TxEnv;
+}
 
 impl<DB> EvmExecutor for CosmosApiImpl<DB>
 where

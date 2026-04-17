@@ -39,7 +39,7 @@ fn get_token_ratio<DB: DatabaseRef>(db: &DB) -> u64 {
     }
 }
 
-impl<DB> GasFeeHandler for MantleApiImpl<DB> where DB: Sync + Send + 'static {}
+impl<DB> GasFeeHandler for MantleApiImpl<DB> where DB: Sync + Send + 'static { type Tx = OpTransaction<TxEnv>; }
 
 impl<DB> EvmExecutor for MantleApiImpl<DB>
 where

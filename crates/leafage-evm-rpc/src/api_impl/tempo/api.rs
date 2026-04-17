@@ -344,14 +344,17 @@ impl<DB> GasFeeHandler for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {
+
+    type Tx = TempoTxEnv;
+
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         Some(leafage_evm_chains::tempo::VIRTUAL_BALANCE)
     }
 
-    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
+    fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         request: &CallRequest,
-        tx: &Tx,
+        tx: &Self::Tx,
         db: &StateDB,
         block_env: &BlockEnv,
     ) -> RpcResult<u64> {

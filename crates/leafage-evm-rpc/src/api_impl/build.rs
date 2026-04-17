@@ -7,7 +7,7 @@ use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
-    ToJsonRpcError, TxSetter,
+    ToJsonRpcError,
 };
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
@@ -204,7 +204,6 @@ async fn warmup_api<A>(
 ) where
     A: ApiCore,
     A::DB: EvmStorageRead + BlockIndex,
-    A::Tx: TxSetter + Clone,
     A::TransactionError: ToJsonRpcError + GetTransactionError,
     A::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
