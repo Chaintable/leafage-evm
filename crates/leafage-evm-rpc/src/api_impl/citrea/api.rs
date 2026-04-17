@@ -10,11 +10,16 @@ use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransa
 use revm::context::TxEnv;
 use revm::database::{CacheDB, WrapDatabaseRef};
 use revm::inspector::NoOpInspector;
+use revm::primitives::{address, Address};
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
 type CitreaApiImpl<DB> = ApiImpl<DB, CitreaHardfork, NoneEvmCustomConfig>;
+
+/// System signer address — system transactions from this address are not charged L1 fees.
+/// See: https://github.com/chainwayxyz/citrea/blob/main/crates/evm/src/evm/system_events.rs
+const SYSTEM_SIGNER: Address = address!("deaddeaddeaddeaddeaddeaddeaddeaddeaddead");
 
 /// Extract L1 fee rate from block's extra fields.
 fn extract_l1_fee_rate(block: &BlockInfo) -> u128 {
@@ -117,6 +122,10 @@ where
         StateDB::Error: Sync + Send + 'static,
         StateDB: Debug,
     {
+        if tx.caller == SYSTEM_SIGNER {
+            return 0;
+        }
+
         let l1_fee_rate = extract_l1_fee_rate(block);
         if l1_fee_rate == 0 {
             return 0;
