@@ -19,15 +19,24 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 
 | 链 | 仓库 |
 |----|------|
-| ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
-| AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
-| OP Stack (OP, Base 等) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
-| Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
-| Tempo | [Chaintable/tempo](https://github.com/Chaintable/tempo) |
-| Bitlayer | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2) |
-| Oasys | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator) |
-| Kava | [Chaintable/kava](https://github.com/Chaintable/kava) |
-| IoTeX | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x) |
+| ETH                       | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)           |
+| AVAX                      | [Chaintable/coreth](https://github.com/Chaintable/coreth)                     |
+| OP Stack (OP, Base, etc.) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                   |
+| Arb                       | [Chaintable/nitro](https://github.com/Chaintable/nitro)                       |
+| Gnosis                    | [Chaintable/erigon](https://github.com/Chaintable/erigon)                     |
+| Tempo                     | [Chaintable/tempo](https://github.com/Chaintable/tempo)                       |
+| Bitlayer                  | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)           |
+| Oasys                     | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)   |
+| Kava                      | [Chaintable/kava](https://github.com/Chaintable/kava)                         |
+| IoTeX                     | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)         |
+| Scrl                      | [Chaintable/go-ethereum-scrl](https://github.com/chaintable/go-ethereum-scrl) |
+| Bera                      | [Chaintable/bera-geth](https://github.com/chaintable/bera-geth)               |
+| Story                     | [Chaintable/story-geth](https://github.com/chaintable/story-geth)             |
+| Tac                       | [Chaintable/tacchain](https://github.com/chaintable/tacchain)                 |
+| Mitosis                   | [Chaintable/reth-mitosis](https://github.com/chaintable/reth-mitosis)         |
+| Megaeth                   | [Chaintable/mega-reth](https://github.com/chaintable/mega-reth)               |
+| XDC                       | [Chaintable/XDPoSChain](https://github.com/chaintable/XDPoSChain)             |
+| Citrea                    | [Chaintable/citrea](https://github.com/chaintable/citrea)                     |
 
 ## 支持的 JSON-RPC 方法
 
