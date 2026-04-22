@@ -8,7 +8,7 @@ use revm::handler::{EvmTr, Handler};
 use revm::inspector::InspectorHandler;
 use revm::{
     context::BlockEnv,
-    context_interface::result::{EVMError, ExecutionResult, ResultAndState},
+    context_interface::result::{EVMError, ExecResultAndState, ExecutionResult},
     inspector::{InspectCommitEvm, InspectEvm, Inspector},
     state::EvmState,
     DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
@@ -38,10 +38,10 @@ where
         self.inner.finalize()
     }
 
-    fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
+    fn replay(&mut self) -> Result<ExecResultAndState<Self::ExecutionResult>, Self::Error> {
         HemiHandler::default().run(self).map(|result| {
             let state = self.finalize();
-            ResultAndState::new(result, state)
+            ExecResultAndState::new(result, state)
         })
     }
 }
