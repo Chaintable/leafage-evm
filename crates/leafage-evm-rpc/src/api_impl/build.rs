@@ -226,6 +226,9 @@ where
             MultiChainCfgEnv::Polygon(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
+            MultiChainCfgEnv::Hemi(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Tempo(env) => {
                 // Tempo: set virtual balance placeholder (no native token).
                 // Writer returns this for all eth_getBalance calls.
