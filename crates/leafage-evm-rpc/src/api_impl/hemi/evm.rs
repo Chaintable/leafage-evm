@@ -6,6 +6,7 @@ use op_revm::{precompiles::OpPrecompiles, L1BlockInfo, OpBuilder, OpTransaction}
 use revm::context::TxEnv;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::Context;
+use std::fmt::Debug;
 
 pub(crate) fn create_hemi_txn_env<ODB: DatabaseRef, SpecId>(
     block_env: &BlockEnv,
@@ -29,7 +30,7 @@ pub(crate) fn create_hemi_evm_from_state<StateDB, INSP>(
     inspector: INSP,
 ) -> HemiEvm<WrapDatabaseRef<StateDB>, INSP>
 where
-    StateDB: DatabaseRef,
+    StateDB: DatabaseRef + Debug,
 {
     let inner = Context::op()
         .with_block(block_env)

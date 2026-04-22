@@ -1,6 +1,6 @@
 use crate::hemi::api::{HemiEvm, HemiOpContext};
 use alloy_evm::Database;
-use op_revm::OpHaltReason;
+use op_revm::{OpHaltReason, OpTransactionError};
 use revm::context::result::EVMError;
 use revm::handler::{EthFrame, Handler};
 use revm::inspector::InspectorHandler;
@@ -27,7 +27,7 @@ impl<DB: revm::database::Database, INSP> Default for HemiHandler<DB, INSP> {
 
 impl<DB: Database, INSP> Handler for HemiHandler<DB, INSP> {
     type Evm = HemiEvm<DB, INSP>;
-    type Error = EVMError<DB::Error>;
+    type Error = EVMError<DB::Error, OpTransactionError>;
     type HaltReason = OpHaltReason;
 }
 
