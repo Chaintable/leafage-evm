@@ -1,7 +1,7 @@
 use crate::hemi::api::HemiEvm;
 use crate::hemi::handler::HemiHandler;
 use alloy_evm::Database;
-use op_revm::{OpHaltReason, OpTransaction};
+use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::{ContextSetters, TxEnv};
 use revm::context_interface::ContextTr;
 use revm::handler::{EvmTr, Handler};
@@ -20,7 +20,7 @@ where
 {
     type ExecutionResult = ExecutionResult<OpHaltReason>;
     type State = EvmState;
-    type Error = EVMError<DB::Error>;
+    type Error = EVMError<DB::Error, OpTransactionError>;
     type Tx = OpTransaction<TxEnv>;
     type Block = BlockEnv;
 
