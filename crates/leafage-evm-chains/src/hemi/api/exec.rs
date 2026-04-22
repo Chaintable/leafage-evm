@@ -3,6 +3,7 @@ use crate::hemi::handler::HemiHandler;
 use alloy_evm::Database;
 use op_revm::{OpHaltReason, OpTransaction};
 use revm::context::{ContextSetters, TxEnv};
+use revm::context_interface::ContextTr;
 use revm::handler::{EvmTr, Handler};
 use revm::inspector::InspectorHandler;
 use revm::{
@@ -37,7 +38,7 @@ where
         self.inner.finalize()
     }
 
-    fn replay(&mut self) -> Result<ResultAndState<Self::ExecutionResult>, Self::Error> {
+    fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
         HemiHandler::default().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
@@ -50,8 +51,7 @@ where
     DB: Database + DatabaseCommit,
 {
     fn commit(&mut self, state: Self::State) {
-        let (ctx, _, _, _) = self.inner.all_mut();
-        ctx.db_mut().commit(state);
+        self.inner.0.ctx.db_mut().commit(state);
     }
 }
 
