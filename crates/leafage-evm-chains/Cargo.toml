@@ -17,6 +17,7 @@ alloy-sol-types.workspace = true
 alloy-contract.workspace = true
 serde.workspace = true
 revm.workspace = true
+op-revm.workspace = true
 leafage-evm-types.workspace = true
 once_cell.workspace = true
 bls_on_arkworks.workspace = true

@@ -26,6 +26,7 @@ mod mainnet;
 mod bsc;
 mod citrea;
 mod op;
+mod hemi;
 mod mantle;
 mod warmup;
 mod cosmos;

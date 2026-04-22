@@ -5,6 +5,7 @@ use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
+use leafage_evm_chains::hemi::HemiHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
@@ -192,6 +193,7 @@ pub enum MultiChainCfgEnv {
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Mantle(CfgEnv<MantleHardfork>),
+    Hemi(CfgEnv<HemiHardfork>),
     Tempo(CfgEnv<TempoHardfork>),
     Citrea(CfgEnv<CitreaHardfork>),
 }
@@ -204,6 +206,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Hemi(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }

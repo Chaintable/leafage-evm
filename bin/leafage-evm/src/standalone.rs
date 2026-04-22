@@ -15,6 +15,7 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use leafage_evm_chains::citrea::CitreaHardfork;
+use leafage_evm_chains::hemi::HemiHardfork;
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -34,7 +35,7 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea"], default_value = "mainnet")]
+    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "hemi"], default_value = "mainnet")]
     evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
@@ -434,6 +435,16 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Citrea(chain_cfg))
+            }
+            "hemi" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(HemiHardfork::from(OpSpecId::OSAKA));
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Hemi(chain_cfg))
             }
             _ => bail!("Unsupported evm type"),
         }
