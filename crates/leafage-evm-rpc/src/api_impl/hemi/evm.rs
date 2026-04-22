@@ -2,7 +2,7 @@ use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::hemi::{HemiEvm, HemiHardfork};
 use leafage_evm_types::{BlockEnv, CallRequest, CfgEnv, OpSpecId};
-use op_revm::{precompiles::OpPrecompiles, L1BlockInfo, OpBuilder, OpTransaction};
+use op_revm::{precompiles::OpPrecompiles, DefaultOp, OpBuilder, OpTransaction};
 use revm::context::TxEnv;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::Context;
