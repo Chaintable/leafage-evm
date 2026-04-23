@@ -12,8 +12,10 @@ Under stress testing with ramped concurrency from 100 to 10,000 concurrent conne
 | **p50 latency @ 10k** | 120.29 ms | 158.59 ms | **+24% better** |
 | **p99 latency @ 10k** | 158.19 ms | 237.47 ms | **+33% better** |
 | **Error rate** | 0.00% | 0.00% | —               |
+| **CPU usage (mean)** | 6.6% | 42.6% | **−85% lower**  |
+| **Memory usage (mean)** | 3.82 GB | 22.03 GB | **−83% lower**  |
 
-leafage-evm remains stable under high concurrency and sustains >11k QPS, while geth stays below 8k QPS and shows significantly higher latency under heavy load.
+leafage-evm remains stable under high concurrency and sustains >11k QPS, while geth stays below 8k QPS and shows significantly higher latency under heavy load. Resource consumption is also dramatically lower: leafage-evm uses ~85% less CPU and ~83% less memory than geth under the same workload.
 
 ---
 
