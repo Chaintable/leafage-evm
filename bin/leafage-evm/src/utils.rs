@@ -30,6 +30,15 @@ pub struct KafkaS3Config {
     pub version: String,
 }
 
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GatewayObjectConfig {
+    pub base_url: String,
+    pub chain_id: String,
+    #[serde(default)]
+    pub version: String,
+}
+
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,

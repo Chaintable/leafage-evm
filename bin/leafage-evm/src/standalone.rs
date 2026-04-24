@@ -3,7 +3,7 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
+use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -161,6 +161,11 @@ pub struct Command {
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
 
+    /// The gateway object config path
+    /// Default: None
+    #[arg(long, value_parser = parse_gateway_object_config, value_name = "GATEWAY_OBJECT_CONFIG_PATH")]
+    gateway_object_config: Option<GatewayObjectConfig>,
+
     /// The etcd register config path
     /// Default: None
     ///
@@ -314,6 +319,17 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     } else {
         bail!("invalid chain cfg: {}", arg);
     }
+}
+
+fn parse_gateway_object_config(arg: &str) -> Result<GatewayObjectConfig> {
+    let cfg: GatewayObjectConfig;
+    if std::path::Path::new(arg).exists() {
+        let file = std::fs::File::open(arg)?;
+        cfg = serde_json::from_reader(file)?;
+    } else {
+        cfg = serde_json::from_str(arg)?;
+    }
+    Ok(cfg)
 }
 
 fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
@@ -612,6 +628,7 @@ impl Command {
             self.rpc_addr.clone(),
             ws_url,
             self.kafka_s3_config.clone(),
+            self.gateway_object_config.clone(),
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,

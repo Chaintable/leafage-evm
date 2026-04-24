@@ -38,5 +38,6 @@ metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
 metrics.workspace = true
 futures.workspace = true
 lru.workspace = true
+reqwest.workspace = true
 axum.workspace = true
 pprof = { workspace = true, features = ["cpp", "prost-codec"] }
