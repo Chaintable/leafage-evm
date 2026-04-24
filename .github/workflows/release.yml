@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set revision
-        run: echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
 
       # ---------- Docker ----------
       - name: Set up Buildx
