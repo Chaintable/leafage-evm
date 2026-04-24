@@ -1,99 +1,113 @@
-name: "Build new artifacts"
+name: build
 
 on:
   pull_request:
-    branches:
-      - 'main'
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 env:
-  REGISTRY: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com
+  REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
+  IMAGE_NAME: leafage-evm-x
 
 jobs:
-  make-artifacts:
+  build:
+    name: build-${{ matrix.arch }}
     strategy:
+      fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: [self-hosted, "${{ matrix.arch }}"]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
 
-      - name: Set env
-        run: |
-          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-  
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+      - name: Set revision
+        run: echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Clean 
-        run: |
-          docker system prune -a -f
+      # ---------- Docker ----------
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Output tags
-        id: meta
-        run: |
-          echo ::set-output name=tags::${REGISTRY}/leafage-evm-x:${{ matrix.arch }}-${REVISION}
-
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ap-northeast-1
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
 
-      - name: Login to Amazon ECR
-        id: login-ecr
+      - name: Login to Public ECR
+        if: github.event_name != 'pull_request'
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build Docker Image
-        uses: docker/build-push-action@v5
         with:
-          file: Dockerfile
+          registry-type: public
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REVISION }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
           provenance: false
-          
-      - name: comment PR
-        uses: unsplash/comment-on-pr@master
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          msg: ":tada: Image `${{ env.REGISTRY }}/leafage-evm-x:${{ matrix.arch }}-${{ env.REVISION }}`, Image `${{ env.REGISTRY }}/leafage-evm-op-x:${{ matrix.arch }}-${{ env.REVISION }} were builded"
-          check_for_duplicate_msg: true
-        continue-on-error: true
+          sbom: false
 
+  manifest:
+    name: merge-manifest
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
 
-  merge-docker-manifest:
-    runs-on: [self-hosted]
-    needs: make-artifacts
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set env
-        run: |
-          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+      - name: Set revision
+        run: echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ap-northeast-1
-          
-      - name: Login to Amazon ECR
-        id: login-ecr
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to Public ECR
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
-      - name: Merge manifest
+      - name: Create and push multi-arch manifest
         run: |
-          docker pull --platform=linux/amd64 ${REGISTRY}/leafage-evm-x:amd64-${REVISION}
-          docker pull --platform=linux/arm64 ${REGISTRY}/leafage-evm-x:arm64-${REVISION}
-          docker buildx imagetools create --tag ${REGISTRY}/leafage-evm-x:${REVISION} ${REGISTRY}/leafage-evm-x:amd64-${REVISION} ${REGISTRY}/leafage-evm-x:arm64-${REVISION}
-
+          docker buildx imagetools create \
+            -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
+            -t ${REGISTRY}/${IMAGE_NAME}:latest \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64
