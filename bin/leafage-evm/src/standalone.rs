@@ -350,19 +350,31 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
-/// Resolve a u8 spec_id CLI value into a [`MainnetSpecId`].
+/// Resolve a u8 `--spec-id` CLI value into a typed EVM spec.
 ///
-/// `u8::MAX` (255) is the sentinel for "use the evm-type's built-in default" —
-/// passing `--spec-id=255` (or omitting the flag) keeps current hardcoded behavior.
-/// Any other value must map to a valid [`MainnetSpecId`] variant; otherwise return an error.
-fn resolve_mainnet_spec(spec_id: u8, default: MainnetSpecId) -> Result<MainnetSpecId> {
+/// Generic over the spec enum so the same helper works for [`MainnetSpecId`],
+/// [`OpSpecId`], or any other `TryFrom<u8>`-implementing spec used by an evm-type
+/// branch in [`Command::build_chain_cfg_env`].
+///
+/// `u8::MAX` (255, the CLI default sentinel) means "use the evm-type's built-in
+/// default" — passing `--spec-id=255` or omitting the flag keeps current
+/// hardcoded behavior. Any other value must map to a valid variant of `T`;
+/// otherwise an error is returned.
+///
+/// `type_label` is included in the error message to help operators identify the
+/// evm-type and its valid spec_id range.
+fn resolve_spec<T>(spec_id: u8, default: T, type_label: &str) -> Result<T>
+where
+    T: TryFrom<u8>,
+{
     if spec_id == u8::MAX {
         return Ok(default);
     }
-    MainnetSpecId::try_from(spec_id).map_err(|_| {
+    T::try_from(spec_id).map_err(|_| {
         anyhow!(
-            "invalid --spec-id {} for mainnet evm-type (valid: 0..=20, e.g. 11=BERLIN, 17=CANCUN, 18=PRAGUE, 20=AMSTERDAM)",
-            spec_id
+            "invalid --spec-id {} for {} evm-type",
+            spec_id,
+            type_label
         )
     })
 }
@@ -379,7 +391,11 @@ impl Command {
                 // For chains that haven't activated all post-Berlin hardforks (e.g. Kava is at
                 // Berlin), pass --spec-id=17 (CANCUN) or lower to avoid spurious EIP-7623
                 // calldata floor enforcement (PRAGUE=18 and above).
-                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::AMSTERDAM)?;
+                let spec = resolve_spec(
+                    self.spec_id,
+                    MainnetSpecId::AMSTERDAM,
+                    "mainnet (valid: 0..=20, e.g. 11=BERLIN, 17=CANCUN, 18=PRAGUE, 20=AMSTERDAM)",
+                )?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
