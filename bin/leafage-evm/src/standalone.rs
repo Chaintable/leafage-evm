@@ -350,6 +350,23 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
+/// Resolve a u8 spec_id CLI value into a [`MainnetSpecId`].
+///
+/// `u8::MAX` (255) is the sentinel for "use the evm-type's built-in default" —
+/// passing `--spec-id=255` (or omitting the flag) keeps current hardcoded behavior.
+/// Any other value must map to a valid [`MainnetSpecId`] variant; otherwise return an error.
+fn resolve_mainnet_spec(spec_id: u8, default: MainnetSpecId) -> Result<MainnetSpecId> {
+    if spec_id == u8::MAX {
+        return Ok(default);
+    }
+    MainnetSpecId::try_from(spec_id).map_err(|_| {
+        anyhow!(
+            "invalid --spec-id {} for mainnet evm-type (valid: 0..=20, e.g. 11=BERLIN, 17=CANCUN, 18=PRAGUE, 20=AMSTERDAM)",
+            spec_id
+        )
+    })
+}
+
 impl Command {
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
@@ -358,8 +375,12 @@ impl Command {
         let gas_cap = self.rpc_gas_cap;
         match evm_type.as_str() {
             "mainnet" => {
-                // Use AMSTERDAM (latest) spec for mainnet
-                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
+                // Default spec is AMSTERDAM (latest); --spec-id can override per-chain.
+                // For chains that haven't activated all post-Berlin hardforks (e.g. Kava is at
+                // Berlin), pass --spec-id=17 (CANCUN) or lower to avoid spurious EIP-7623
+                // calldata floor enforcement (PRAGUE=18 and above).
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::AMSTERDAM)?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
