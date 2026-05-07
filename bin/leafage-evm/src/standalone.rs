@@ -34,7 +34,7 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea"], default_value = "mainnet")]
+    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "iotex"], default_value = "mainnet")]
     evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
