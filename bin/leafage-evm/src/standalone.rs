@@ -350,6 +350,15 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
+/// Resolve `--spec-id` to a typed EVM spec; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
+fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Result<T> {
+    if spec_id == u8::MAX {
+        return Ok(default);
+    }
+    T::try_from(spec_id)
+        .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
+}
+
 impl Command {
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
@@ -358,8 +367,8 @@ impl Command {
         let gas_cap = self.rpc_gas_cap;
         match evm_type.as_str() {
             "mainnet" => {
-                // Use AMSTERDAM (latest) spec for mainnet
-                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
