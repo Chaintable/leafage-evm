@@ -95,6 +95,30 @@ fn rocksdb_read_options() -> ReadOptions {
     read_options
 }
 
+#[inline]
+fn encode_block_num(block_num: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&block_num.to_be_bytes());
+    bytes
+}
+
+#[inline]
+fn encode_account_key(address: H256, block_num: u64) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(address.as_slice());
+    key[32..64].copy_from_slice(&encode_block_num(block_num));
+    key
+}
+
+#[inline]
+fn encode_storage_key(address: H256, storage_key: H256, block_num: u64) -> [u8; 96] {
+    let mut key = [0u8; 96];
+    key[..32].copy_from_slice(address.as_slice());
+    key[32..64].copy_from_slice(storage_key.as_slice());
+    key[64..96].copy_from_slice(&encode_block_num(block_num));
+    key
+}
+
 impl StorageTypeColumn {
     fn to_str(&self) -> &'static str {
         match self {
@@ -134,6 +158,22 @@ struct DataBaseInner {
 #[derive(Debug)]
 pub struct DataBaseRef {
     db: &'static DB,
+}
+
+pub struct ArchiveRocksDBWriteBatch {
+    inner: WriteBatch,
+    account_writes: Vec<([u8; 64], Vec<u8>)>,
+    storage_writes: Vec<([u8; 96], [u8; 32])>,
+}
+
+impl ArchiveRocksDBWriteBatch {
+    fn new() -> Self {
+        Self {
+            inner: WriteBatch::default(),
+            account_writes: Vec::new(),
+            storage_writes: Vec::new(),
+        }
+    }
 }
 
 impl Drop for DataBaseRef {
@@ -438,7 +478,7 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let block_num_bytes = encode_block_num(block_num);
         let block_hash_bytes = self.db.get_pinned_cf_opt(
             block_num_to_block_hash_cf,
             block_num_bytes,
@@ -529,11 +569,9 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        let block_hash_bytes = self.db.get_cf_opt(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            &rocksdb_read_options(),
-        )?;
+        let block_hash_bytes =
+            self.db
+                .get_cf_opt(latest_block_hash_cf, [1u8], &rocksdb_read_options())?;
         STORAGE_METRICS
             .read_latest_block_hash_latency
             .record(start.elapsed().as_secs_f64());
@@ -1002,7 +1040,7 @@ impl StateDBRead for StateDB {
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
-        let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
+        let target_key = encode_account_key(address, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -1010,7 +1048,7 @@ impl StateDBRead for StateDB {
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        account_iter.seek_for_prev([address_bytes.as_ref(), &block_num_bytes].concat());
+        account_iter.seek_for_prev(target_key);
         STORAGE_METRICS
             .read_account_latency
             .record(start.elapsed().as_secs_f64());
@@ -1043,7 +1081,7 @@ impl StateDBRead for StateDB {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let key_bytes: [u8; 32] = key.into();
-        let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
+        let target_key = encode_storage_key(address, key, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -1051,8 +1089,7 @@ impl StateDBRead for StateDB {
         let storage_iter = storage_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        storage_iter
-            .seek_for_prev([address_bytes.as_ref(), key_bytes.as_ref(), &block_num_bytes].concat());
+        storage_iter.seek_for_prev(target_key);
         STORAGE_METRICS
             .read_storage_latency
             .record(start.elapsed().as_secs_f64());
@@ -1121,9 +1158,9 @@ impl StateDBRead for StateDB {
 }
 /// StateDB delegates all write operations to Arc<DataBaseRef>
 impl StateDBWrite for StateDB {
-    type DBWriteBatch = WriteBatch;
+    type DBWriteBatch = ArchiveRocksDBWriteBatch;
 
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Error> {
         self.db.prepare_write_batch()
     }
 
@@ -1191,10 +1228,10 @@ impl StateDBWrite for StateDB {
 /// Direct write implementation for `Arc<DataBaseRef>` without needing a StateDB instance.
 /// This is useful for bulk initialization where we don't need read capabilities.
 impl StateDBWrite for Arc<DataBaseRef> {
-    type DBWriteBatch = WriteBatch;
+    type DBWriteBatch = ArchiveRocksDBWriteBatch;
 
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
-        Ok(WriteBatch::default())
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Error> {
+        Ok(ArchiveRocksDBWriteBatch::new())
     }
 
     fn write_block_hash(
@@ -1208,8 +1245,8 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_hash.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-        batch.put_cf(
+        let block_num_bytes = encode_block_num(block_num);
+        batch.inner.put_cf(
             block_num_to_block_hash_cf,
             block_num_bytes,
             block_hash_bytes,
@@ -1236,7 +1273,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
             })?;
             block_info_bytes.extend_from_slice(&other_bytes);
         }
-        batch.put_cf(
+        batch.inner.put_cf(
             block_hash_to_block_info_cf,
             block_hash_bytes,
             block_info_bytes,
@@ -1251,28 +1288,15 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
-        let address_to_account_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-            .unwrap();
-        let address_bytes = address.as_slice();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let account_key = encode_account_key(address, block_num);
 
         if let Some(raw_account) = raw_account {
             let raw_account: SlimAccount = raw_account.into();
             let mut raw_account_bytes = Vec::new();
             raw_account.encode(&mut raw_account_bytes);
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &block_num_bytes].concat(),
-                &raw_account_bytes,
-            );
+            batch.account_writes.push((account_key, raw_account_bytes));
         } else {
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &block_num_bytes].concat(),
-                &[],
-            );
+            batch.account_writes.push((account_key, Vec::new()));
         }
         Ok(())
     }
@@ -1285,20 +1309,10 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
-        let address_to_storage_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-        let address_bytes = address.as_slice();
-        let key_bytes: [u8; 32] = key.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let storage_key = encode_storage_key(address, key, block_num);
         let value_bytes: [u8; 32] = value.to_be_bytes();
 
-        batch.put_cf(
-            address_to_storage_cf,
-            [address_bytes, &key_bytes, &block_num_bytes].concat(),
-            value_bytes,
-        );
+        batch.storage_writes.push((storage_key, value_bytes));
         Ok(())
     }
 
@@ -1313,7 +1327,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
         let code_hash_bytes = code_hash.as_slice();
-        batch.put_cf(address_to_code_cf, code_hash_bytes, code);
+        batch
+            .inner
+            .put_cf(address_to_code_cf, code_hash_bytes, code);
         Ok(())
     }
 
@@ -1326,12 +1342,64 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_slice());
+        batch
+            .inner
+            .put_cf(latest_block_hash_cf, [1u8], block_hash.as_slice());
         Ok(())
     }
 
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
-        self.db.write(batch)?;
+    fn commit(&self, mut batch: Self::DBWriteBatch) -> Result<(), Error> {
+        if !batch.account_writes.is_empty() {
+            let address_to_account_cf = self
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            // Stable sort by key: equal keys keep insertion order, so the last
+            // write per key is naturally the last entry within its run.
+            batch.account_writes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut last_write: Option<([u8; 64], Vec<u8>)> = None;
+            for (key, value) in batch.account_writes {
+                if let Some((prev_key, prev_value)) = last_write.take() {
+                    if prev_key != key {
+                        batch
+                            .inner
+                            .put_cf(address_to_account_cf, prev_key, prev_value);
+                    }
+                }
+                last_write = Some((key, value));
+            }
+            if let Some((key, value)) = last_write {
+                batch.inner.put_cf(address_to_account_cf, key, value);
+            }
+        }
+
+        if !batch.storage_writes.is_empty() {
+            let address_to_storage_cf = self
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            // Stable sort by key: equal keys keep insertion order, so the last
+            // write per key is naturally the last entry within its run.
+            batch.storage_writes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut last_write: Option<([u8; 96], [u8; 32])> = None;
+            for (key, value) in batch.storage_writes {
+                if let Some((prev_key, prev_value)) = last_write.take() {
+                    if prev_key != key {
+                        batch
+                            .inner
+                            .put_cf(address_to_storage_cf, prev_key, prev_value);
+                    }
+                }
+                last_write = Some((key, value));
+            }
+            if let Some((key, value)) = last_write {
+                batch.inner.put_cf(address_to_storage_cf, key, value);
+            }
+        }
+
+        self.db.write(batch.inner)?;
         Ok(())
     }
 }
@@ -1557,7 +1625,13 @@ mod tests {
         let encoded = encode_block_info(&original);
         let decoded = decode_block_info_bytes(H256::ZERO, &encoded).expect("decode should succeed");
 
-        assert_eq!(decoded.other.get("l1FeeRate"), original.other.get("l1FeeRate"));
-        assert_eq!(decoded.other.get("customField"), original.other.get("customField"));
+        assert_eq!(
+            decoded.other.get("l1FeeRate"),
+            original.other.get("l1FeeRate")
+        );
+        assert_eq!(
+            decoded.other.get("customField"),
+            original.other.get("customField")
+        );
     }
 }

@@ -251,7 +251,8 @@ impl StateDBRead for MultiStateDB {
 }
 
 pub enum MultiWriteBatch {
-    RocksDBBatch(rocksdb::WriteBatch),
+    RocksDBStateBatch(rocksdb::WriteBatch),
+    RocksDBArchiveBatch(<ArchiveStateDB as StateDBWrite>::DBWriteBatch),
     MDBXBatch(MDBXWriteBatch),
     MDBXArchiveBatch(MDBXArchiveWriteBatch),
 }
@@ -261,12 +262,12 @@ impl StateDBWrite for MultiStateDB {
 
     fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, StorageError> {
         match self {
-            MultiStateDB::RocksDBState(db) => {
-                Ok(MultiWriteBatch::RocksDBBatch(db.prepare_write_batch()?))
-            }
-            MultiStateDB::RocksDBArchive(db) => {
-                Ok(MultiWriteBatch::RocksDBBatch(db.prepare_write_batch()?))
-            }
+            MultiStateDB::RocksDBState(db) => Ok(MultiWriteBatch::RocksDBStateBatch(
+                db.prepare_write_batch()?,
+            )),
+            MultiStateDB::RocksDBArchive(db) => Ok(MultiWriteBatch::RocksDBArchiveBatch(
+                db.prepare_write_batch()?,
+            )),
             MultiStateDB::MDBXState(db) => {
                 Ok(MultiWriteBatch::MDBXBatch(db.prepare_write_batch()?))
             }
@@ -282,10 +283,10 @@ impl StateDBWrite for MultiStateDB {
         block_hash: H256,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_latest_block_hash(b, block_hash)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_latest_block_hash(b, block_hash)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -304,10 +305,10 @@ impl StateDBWrite for MultiStateDB {
         block_info: BlockInfo,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_block_info(b, block_info)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_block_info(b, block_info)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -327,10 +328,10 @@ impl StateDBWrite for MultiStateDB {
         block_hash: H256,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_block_hash(b, block_num, block_hash)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_block_hash(b, block_num, block_hash)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -351,10 +352,10 @@ impl StateDBWrite for MultiStateDB {
         raw_account: Option<NewAccount>,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_account(b, address, block_num, raw_account)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_account(b, address, block_num, raw_account)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -374,10 +375,10 @@ impl StateDBWrite for MultiStateDB {
         code: Bytes,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_code(b, code_hash, code)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_code(b, code_hash, code)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -399,10 +400,10 @@ impl StateDBWrite for MultiStateDB {
         value: U256,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_storage(b, address, key, block_num, value)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_storage(b, address, key, block_num, value)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -417,8 +418,10 @@ impl StateDBWrite for MultiStateDB {
 
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => db.commit(b),
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => db.commit(b),
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => db.commit(b),
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
+                db.commit(b)
+            }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => db.commit(b),
             (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => db.commit(b),
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),

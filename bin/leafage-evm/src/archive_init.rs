@@ -7,7 +7,7 @@ use clap::Parser;
 use futures::{stream, StreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
-    rocksdb, ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
+    ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
     MDBXSyncMode, StateDBWrite, StorageKind,
 };
 use leafage_evm_types::{BlockInfo, BlockStorageDiff, H256};
@@ -111,7 +111,8 @@ pub struct Command {
     #[arg(long, value_enum, default_value = "utterly-no-sync")]
     mdbx_sync_mode: MdbxSyncMode,
 
-    /// Max concurrent tasks for fetching and writing
+    /// Max concurrent fetch tasks. Also used as the bounded channel capacity
+    /// between fetchers and the database writer.
     #[arg(long, default_value = "256")]
     max_tasks: usize,
 
@@ -136,8 +137,10 @@ enum ArchiveStorage {
 }
 
 /// Unified write batch abstraction
+type RocksDBArchiveWriteBatch = <Arc<ArchiveRocksDBStorage> as StateDBWrite>::DBWriteBatch;
+
 enum ArchiveWriteBatch {
-    RocksDB(rocksdb::WriteBatch),
+    RocksDB(RocksDBArchiveWriteBatch),
     MDBX(MDBXArchiveWriteBatch),
 }
 
@@ -301,6 +304,9 @@ impl Command {
         if self.checkpoint_interval == 0 {
             anyhow::bail!("checkpoint_interval must be greater than 0");
         }
+        if self.max_tasks == 0 {
+            anyhow::bail!("max_tasks must be greater than 0");
+        }
 
         // Initialize S3 client
         let s3_config = aws_config::load_from_env().await;
@@ -358,15 +364,15 @@ impl Command {
 
         let overall_start = Instant::now();
 
-        // Create channel for sending BlockData to checkpoint worker
-        let (tx, rx) = mpsc::unbounded_channel::<BlockData>();
+        // Create a bounded channel so fetchers cannot run arbitrarily far ahead
+        // of the single ordered database writer.
+        let (tx, rx) = mpsc::channel::<BlockData>(self.max_tasks);
 
         // Spawn checkpoint worker
         let checkpoint_worker = Self::spawn_checkpoint_worker(
             rx,
             db.clone(),
             start_block,
-            self.end_block,
             total_blocks,
             overall_start,
             self.checkpoint_interval,
@@ -412,6 +418,7 @@ impl Command {
                 async move {
                     // Send block data to checkpoint worker for writing
                     tx.send(block_data)
+                        .await
                         .expect("Checkpoint worker channel closed");
                 }
             })
@@ -460,23 +467,21 @@ impl Command {
     /// Spawn checkpoint worker that handles block writing, max_contiguous tracking, checkpoint commits, and progress logging.
     ///
     /// Performance optimizations:
-    /// 1. Uses cursor-based writes instead of direct transaction puts
-    /// 2. MDBX batch automatically sorts account/storage writes at commit time
-    /// 3. Uses APPEND mode for strictly increasing keys (block_num)
+    /// 1. Keeps fetchers bounded by writer throughput
+    /// 2. Runs blocking database writes off the async runtime
+    /// 3. Sorts account/storage writes inside archive batches before commit
+    /// 4. Prefers APPEND where keys are strictly increasing, falling back to UPSERT
     fn spawn_checkpoint_worker(
-        mut rx: mpsc::UnboundedReceiver<BlockData>,
+        mut rx: mpsc::Receiver<BlockData>,
         db: Arc<ArchiveStorage>,
         start_block: u64,
-        end_block: u64,
         total_blocks: u64,
         overall_start: Instant,
         checkpoint_interval: u64,
     ) -> tokio::task::JoinHandle<(u64, u64)> {
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             // Pending blocks waiting to be written (out-of-order arrivals)
             let mut pending_blocks: BTreeMap<u64, BlockData> = BTreeMap::new();
-            // Track written block hashes for checkpoint commits
-            let mut written_hashes: BTreeMap<u64, H256> = BTreeMap::new();
             // Use Option to correctly handle start_block = 0 case
             let mut max_contiguous: Option<u64> = if start_block == 0 {
                 None
@@ -486,17 +491,30 @@ impl Command {
             let mut last_checkpoint_num = start_block.saturating_sub(1) / checkpoint_interval;
             let mut count: u64 = 0;
             let mut written_count: u64 = 0;
+            let mut batch_dirty = false;
+            let mut last_written_hash: Option<H256> = None;
 
             // Current batch for accumulating writes
             let mut current_batch = db
                 .prepare_write_batch()
                 .expect("Failed to prepare initial batch");
 
-            while let Some(block_data) = rx.recv().await {
+            while let Some(block_data) = rx.blocking_recv() {
                 count += 1;
+                let block_num = block_data.block_num;
 
                 // Store the block data
-                pending_blocks.insert(block_data.block_num, block_data);
+                if max_contiguous.is_some_and(|mc| block_num <= mc) {
+                    warn!(target: "archive_init",
+                        "Duplicate block {} received after it was already written; ignoring",
+                        block_num);
+                    continue;
+                }
+                if pending_blocks.insert(block_num, block_data).is_some() {
+                    warn!(target: "archive_init",
+                        "Duplicate pending block {} received; replacing previous data",
+                        block_num);
+                }
 
                 // Write blocks in order starting from max_contiguous + 1 (or start_block)
                 let write_start = match max_contiguous {
@@ -507,57 +525,48 @@ impl Command {
                 // Write all consecutive blocks we have
                 let mut next_to_write = write_start;
                 while let Some(block) = pending_blocks.remove(&next_to_write) {
-                    // Write block data to batch (MDBX will sort at commit time)
-                    Self::write_block_to_batch(&db, &mut current_batch, &block)
+                    let block_hash = block.block_hash;
+
+                    // Write block data to batch (archive batches sort at commit time)
+                    Self::write_block_to_batch(&db, &mut current_batch, block)
                         .expect("Failed to write block to batch");
 
-                    // Track the block hash for checkpoint commits
-                    written_hashes.insert(next_to_write, block.block_hash);
                     max_contiguous = Some(next_to_write);
                     written_count += 1;
-                    next_to_write += 1;
-                }
+                    batch_dirty = true;
+                    last_written_hash = Some(block_hash);
 
-                // Check if we should commit at checkpoint boundary
-                if let Some(mc) = max_contiguous {
-                    let current_checkpoint_num = mc / checkpoint_interval;
+                    let current_checkpoint_num = next_to_write / checkpoint_interval;
                     if current_checkpoint_num > last_checkpoint_num {
-                        // Write latest_block_hash using the correct checkpoint block hash
-                        let checkpoint_block = current_checkpoint_num * checkpoint_interval;
-                        if let Some(&checkpoint_hash) = written_hashes.get(&checkpoint_block) {
-                            db.write_latest_block_hash(&mut current_batch, checkpoint_hash)
-                                .expect("Failed to write latest block hash");
-                        }
-
-                        // Commit the batch (MDBX will sort account/storage writes here)
+                        db.write_latest_block_hash(&mut current_batch, block_hash)
+                            .expect("Failed to write latest block hash");
                         db.commit(current_batch).expect("Failed to commit batch");
 
                         last_checkpoint_num = current_checkpoint_num;
+                        batch_dirty = false;
                         info!(target: "archive_init",
-                            "Checkpoint committed at block {} (written: {}, max_contiguous: {})",
-                            checkpoint_block, written_count, mc);
+                            "Checkpoint committed at block {} (written: {})",
+                            next_to_write, written_count);
 
-                        // Clean up old hashes to save memory (keep only hashes after checkpoint)
-                        written_hashes.retain(|&k, _| k > checkpoint_block);
-
-                        // Prepare new batch for next interval
                         current_batch = db
                             .prepare_write_batch()
                             .expect("Failed to prepare new batch");
                     }
+
+                    next_to_write += 1;
                 }
 
                 // Log progress every 100 blocks received
                 if count % 100 == 0 {
                     let elapsed = overall_start.elapsed().as_secs_f64();
                     let blocks_per_sec = count as f64 / elapsed;
-                    let remaining = total_blocks - count;
+                    let remaining = total_blocks.saturating_sub(count);
                     let eta_secs = if blocks_per_sec > 0.0 {
                         (remaining as f64 / blocks_per_sec) as u64
                     } else {
                         0
                     };
-                    let progress_pct = (count * 100) / total_blocks;
+                    let progress_pct = (count.min(total_blocks) * 100) / total_blocks;
                     let mc_display = max_contiguous.map(|v| v as i64).unwrap_or(-1);
                     let pending_count = pending_blocks.len();
 
@@ -571,58 +580,56 @@ impl Command {
             // Write final checkpoint - commit any remaining blocks in batch
             let final_contiguous = max_contiguous.unwrap_or(start_block.saturating_sub(1));
 
-            if final_contiguous >= end_block {
-                // Use the end_block hash for final checkpoint
-                if let Some(&end_block_hash) = written_hashes.get(&end_block) {
-                    db.write_latest_block_hash(&mut current_batch, end_block_hash)
+            if batch_dirty {
+                if let Some(last_hash) = last_written_hash {
+                    db.write_latest_block_hash(&mut current_batch, last_hash)
                         .expect("Failed to write final latest block hash");
                 }
                 db.commit(current_batch)
                     .expect("Failed to commit final batch");
-                info!(target: "archive_init", "Final checkpoint written at block {}", end_block);
+                info!(target: "archive_init", "Final checkpoint written at block {}", final_contiguous);
             } else {
-                // Commit remaining blocks even if not at end_block
-                db.commit(current_batch)
-                    .expect("Failed to commit remaining batch");
+                // No pending writes. Dropping the prepared batch aborts the empty
+                // MDBX transaction before the final database sync.
+                drop(current_batch);
             }
             db.flush().expect("Failed to flush database");
 
-            (count, final_contiguous)
+            (written_count, final_contiguous)
         })
     }
 
     /// Write a single block to the provided batch (without committing).
-    /// For MDBX, account and storage writes are cached and sorted at commit time.
+    /// Account and storage writes are cached and sorted by archive batches at commit time.
     fn write_block_to_batch(
         db: &Arc<ArchiveStorage>,
         batch: &mut ArchiveWriteBatch,
-        block_data: &BlockData,
+        block_data: BlockData,
     ) -> Result<()> {
         let block_num = block_data.block_num;
+        let block_hash = block_data.block_hash;
+        let block_info = block_data.block_info;
+        let block_diff = block_data.block_diff;
 
         // Write block hash mapping
-        db.write_block_hash(
-            batch,
-            block_data.block_info.header.number,
-            block_data.block_hash,
-        )?;
+        db.write_block_hash(batch, block_info.header.number, block_hash)?;
 
         // Write block info
-        db.write_block_info(batch, block_data.block_info.clone())?;
+        db.write_block_info(batch, block_info)?;
 
         // Write deleted accounts
-        for account in &block_data.block_diff.deleted_accounts {
-            db.write_account(batch, *account, block_num, None)?;
+        for account in block_diff.deleted_accounts {
+            db.write_account(batch, account, block_num, None)?;
         }
 
         // Write new accounts
-        for account in &block_data.block_diff.new_accounts {
-            db.write_account(batch, account.address, block_num, Some(account.clone()))?;
+        for account in block_diff.new_accounts {
+            db.write_account(batch, account.address, block_num, Some(account))?;
         }
 
         // Write storage diffs
-        for account_diff in &block_data.block_diff.storage_diffs {
-            for pair in &account_diff.diffs {
+        for account_diff in block_diff.storage_diffs {
+            for pair in account_diff.diffs {
                 db.write_storage(
                     batch,
                     account_diff.address,
@@ -634,8 +641,8 @@ impl Command {
         }
 
         // Write new codes
-        for new_code in &block_data.block_diff.new_codes {
-            db.write_code(batch, new_code.code_hash, new_code.code.clone())?;
+        for new_code in block_diff.new_codes {
+            db.write_code(batch, new_code.code_hash, new_code.code)?;
         }
 
         Ok(())
