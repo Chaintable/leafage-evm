@@ -1,6 +1,6 @@
 use crate::iotex::IotexHardfork;
 use alloy_evm::{Database, EvmEnv};
-use leafage_evm_types::{Address, BlockEnv, CfgEnv};
+use leafage_evm_types::{BlockEnv, CfgEnv};
 use revm::context::{Context, ContextError, FrameStack};
 use revm::context::{Evm, JournalTr, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
@@ -113,7 +113,7 @@ where
         &mut self,
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        self.check_unsupported_precompiles(&frame_input.frame_input)?;
+        check_unsupported_precompiles(&frame_input.frame_input)?;
         self.inner.frame_init(frame_input)
     }
 
@@ -166,27 +166,97 @@ where
         &mut self,
         frame_init: <Self::Frame as FrameTr>::FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        self.check_unsupported_precompiles(&frame_init.frame_input)?;
+        check_unsupported_precompiles(&frame_init.frame_input)?;
         self.inner.inspect_frame_init(frame_init)
     }
 }
 
-impl<DB, INSP> IotexEvm<DB, INSP>
-where
-    DB: Database,
-{
-    fn check_unsupported_precompiles<D>(
-        &self,
-        frame_input: &FrameInput,
-    ) -> Result<(), ContextError<D>> {
-        if let FrameInput::Call(ref call) = frame_input {
-            if super::precompile::is_unsupported(&call.bytecode_address) {
-                return Err(ContextError::Custom(format!(
-                    "unsupported precompile address: {}",
-                    Address::from(call.bytecode_address)
-                )));
-            }
+/// Short-circuits an EVM frame whose `bytecode_address` is one of the IoTeX
+/// protocol addresses (see `iotex/precompile.rs`). The error string format
+/// must stay in sync with the parser at
+/// `leafage-evm-rpc/src/api_impl/api_impl.rs::ToJsonRpcError for EVMError`,
+/// which uses `starts_with("unsupported precompile address: ")` and then
+/// `Address::from_str` on the remainder. Tests below pin that contract.
+///
+/// Free function (vs. cosmos's `&self` method) because IoTeX's check has no
+/// per-instance state — cosmos needs `&self` for `self.config.native_token`.
+fn check_unsupported_precompiles<D>(frame_input: &FrameInput) -> Result<(), ContextError<D>> {
+    if let FrameInput::Call(ref call) = frame_input {
+        if super::precompile::is_unsupported(&call.bytecode_address) {
+            return Err(ContextError::Custom(format!(
+                "unsupported precompile address: {}",
+                call.bytecode_address
+            )));
         }
-        Ok(())
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_types::Address;
+    use revm::interpreter::{CallInput, CallInputs, CallScheme, CallValue};
+    use std::str::FromStr;
+
+    fn build_call_to(addr: Address) -> FrameInput {
+        FrameInput::Call(Box::new(CallInputs {
+            input: CallInput::default(),
+            return_memory_offset: 0..0,
+            gas_limit: 0,
+            bytecode_address: addr,
+            known_bytecode: None,
+            target_address: addr,
+            caller: Address::ZERO,
+            value: CallValue::default(),
+            scheme: CallScheme::Call,
+            is_static: false,
+        }))
+    }
+
+    /// End-to-end frame_init guard: a call whose bytecode_address is a
+    /// protocol address must short-circuit with a ContextError::Custom that
+    /// the api_impl.rs parser can round-trip back to the original address.
+    /// Catches both routing regressions (frame_init forgets to call the
+    /// guard) and wire-format drift (api_impl.rs::ToJsonRpcError can no
+    /// longer parse the message).
+    #[test]
+    fn frame_init_short_circuits_on_protocol_addr() {
+        let addr = Address::from_str("0xa576c141e5659137ddda4223d209d4744b2106be").unwrap();
+        let frame = build_call_to(addr);
+
+        let result: Result<(), ContextError<()>> = check_unsupported_precompiles(&frame);
+        let msg = match result {
+            Err(ContextError::Custom(m)) => m,
+            other => panic!("expected ContextError::Custom, got {:?}", other),
+        };
+
+        // Mirror api_impl/api_impl.rs::ToJsonRpcError for EVMError parser.
+        assert!(
+            msg.starts_with("unsupported precompile address: "),
+            "wire prefix changed: {msg}"
+        );
+        let parsed = msg.split(": ").nth(1).expect("address segment present");
+        let recovered = Address::from_str(parsed).expect("address parseable");
+        assert_eq!(recovered, addr, "address round-trip mismatch");
+    }
+
+    /// Negative case: regular addresses pass through cleanly.
+    #[test]
+    fn frame_init_passthrough_for_regular_addr() {
+        let addr = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
+        let frame = build_call_to(addr);
+
+        let result: Result<(), ContextError<()>> = check_unsupported_precompiles(&frame);
+        assert!(result.is_ok(), "regular addr should pass: {:?}", result);
+    }
+
+    /// FrameInput::Empty / FrameInput::Create are not subject to the check
+    /// (Create has no bytecode_address; Empty has no payload).
+    #[test]
+    fn non_call_frames_pass_through() {
+        let result: Result<(), ContextError<()>> =
+            check_unsupported_precompiles(&FrameInput::Empty);
+        assert!(result.is_ok());
     }
 }
