@@ -297,6 +297,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::context::BlockEnv;
     use revm::context_interface::cfg::gas_params::GasId;
     use revm::database::EmptyDB;
     use revm::inspector::NoOpInspector;
