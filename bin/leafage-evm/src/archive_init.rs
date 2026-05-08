@@ -7,10 +7,11 @@ use clap::Parser;
 use futures::{stream, StreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
-    ArchiveRocksDBStorage, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch,
-    MDBXSyncMode, StateDBWrite, StorageKind,
+    encode_account_key, encode_slim_account, encode_storage_key, ArchiveRocksDBStorage,
+    MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXSyncMode, StateDBWrite,
+    StorageKind,
 };
-use leafage_evm_types::{BlockInfo, BlockStorageDiff, H256};
+use leafage_evm_types::{BlockInfo, NewCode, H256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,12 +122,22 @@ pub struct Command {
     checkpoint_interval: u64,
 }
 
-/// Data fetched for a single block, to be written by checkpoint worker
-struct BlockData {
+/// Data fetched and pre-encoded for a single block, to be written by the
+/// checkpoint worker.
+///
+/// All key/value byte encoding (account/storage) happens inside the fetcher
+/// task so the writer thread only does sort + cursor put + commit.
+struct EncodedBlockData {
     block_num: u64,
     block_hash: H256,
     block_info: BlockInfo,
-    block_diff: BlockStorageDiff,
+    /// Pre-encoded account writes: `(address(32) || block_num(32), Some(rlp(SlimAccount)))`
+    /// or `(.., None)` for deletions.
+    accounts: Vec<([u8; 64], Option<Vec<u8>>)>,
+    /// Pre-encoded storage writes: `(address(32) || key(32) || block_num(32), value_be_bytes(32))`.
+    storage: Vec<([u8; 96], [u8; 32])>,
+    /// New code blobs to write under `HashToCode`.
+    codes: Vec<NewCode>,
 }
 
 /// Unified archive storage abstraction
@@ -217,41 +228,31 @@ impl ArchiveStorage {
         }
     }
 
-    fn write_account(
+    /// Append pre-encoded account entries to the deferred cache (no encoding,
+    /// no per-entry trait dispatch on the writer thread).
+    fn extend_account_writes(
         &self,
         batch: &mut ArchiveWriteBatch,
-        address: H256,
-        block_num: u64,
-        raw_account: Option<leafage_evm_types::NewAccount>,
+        items: Vec<([u8; 64], Option<Vec<u8>>)>,
     ) -> Result<(), anyhow::Error> {
-        match (self, batch) {
-            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
-                Ok(db.write_account(b, address, block_num, raw_account)?)
-            }
-            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
-                Ok(db.write_account(b, address, block_num, raw_account)?)
-            }
-            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        match batch {
+            ArchiveWriteBatch::RocksDB(b) => b.extend_account_writes(items),
+            ArchiveWriteBatch::MDBX(b) => b.extend_account_writes(items),
         }
+        Ok(())
     }
 
-    fn write_storage(
+    /// Append pre-encoded storage entries to the deferred cache.
+    fn extend_storage_writes(
         &self,
         batch: &mut ArchiveWriteBatch,
-        address: H256,
-        key: H256,
-        block_num: u64,
-        value: leafage_evm_types::U256,
+        items: Vec<([u8; 96], [u8; 32])>,
     ) -> Result<(), anyhow::Error> {
-        match (self, batch) {
-            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
-                Ok(db.write_storage(b, address, key, block_num, value)?)
-            }
-            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
-                Ok(db.write_storage(b, address, key, block_num, value)?)
-            }
-            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        match batch {
+            ArchiveWriteBatch::RocksDB(b) => b.extend_storage_writes(items),
+            ArchiveWriteBatch::MDBX(b) => b.extend_storage_writes(items),
         }
+        Ok(())
     }
 
     fn write_code(
@@ -318,11 +319,15 @@ impl Command {
         // Open archive database based on db type
         let db = Arc::new(match self.db_type {
             StorageKind::Rocksdb => {
-                info!(target: "archive_init", "Opening RocksDB archive database with cache_size: {}MB", self.db_cache);
-                ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open(
+                info!(target: "archive_init",
+                    "Opening RocksDB archive database (bulk-load mode) with cache_size: {}MB",
+                    self.db_cache);
+                // Bulk-load mode: WAL off, L0/pending-compaction throttles off,
+                // auto-compactions off. Safe because archive data is replayable
+                // from S3 on crash, and we run a manual compact() at the end.
+                ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open_for_bulk_load(
                     &self.db_path,
                     self.db_cache,
-                    true, // disable_auto_compactions for faster bulk writes
                 )))
             }
             StorageKind::MDBX => {
@@ -366,7 +371,7 @@ impl Command {
 
         // Create a bounded channel so fetchers cannot run arbitrarily far ahead
         // of the single ordered database writer.
-        let (tx, rx) = mpsc::channel::<BlockData>(self.max_tasks);
+        let (tx, rx) = mpsc::channel::<EncodedBlockData>(self.max_tasks);
 
         // Spawn checkpoint worker
         let checkpoint_worker = Self::spawn_checkpoint_worker(
@@ -472,7 +477,7 @@ impl Command {
     /// 3. Sorts account/storage writes inside archive batches before commit
     /// 4. Prefers APPEND where keys are strictly increasing, falling back to UPSERT
     fn spawn_checkpoint_worker(
-        mut rx: mpsc::Receiver<BlockData>,
+        mut rx: mpsc::Receiver<EncodedBlockData>,
         db: Arc<ArchiveStorage>,
         start_block: u64,
         total_blocks: u64,
@@ -481,7 +486,7 @@ impl Command {
     ) -> tokio::task::JoinHandle<(u64, u64)> {
         tokio::task::spawn_blocking(move || {
             // Pending blocks waiting to be written (out-of-order arrivals)
-            let mut pending_blocks: BTreeMap<u64, BlockData> = BTreeMap::new();
+            let mut pending_blocks: BTreeMap<u64, EncodedBlockData> = BTreeMap::new();
             // Use Option to correctly handle start_block = 0 case
             let mut max_contiguous: Option<u64> = if start_block == 0 {
                 None
@@ -600,49 +605,32 @@ impl Command {
     }
 
     /// Write a single block to the provided batch (without committing).
-    /// Account and storage writes are cached and sorted by archive batches at commit time.
+    ///
+    /// Account/storage entries are pre-encoded by the fetcher and pushed
+    /// straight into the batch's deferred cache here. Block-info / block-hash
+    /// / code writes go through the regular trait API.
     fn write_block_to_batch(
         db: &Arc<ArchiveStorage>,
         batch: &mut ArchiveWriteBatch,
-        block_data: BlockData,
+        block: EncodedBlockData,
     ) -> Result<()> {
-        let block_num = block_data.block_num;
-        let block_hash = block_data.block_hash;
-        let block_info = block_data.block_info;
-        let block_diff = block_data.block_diff;
+        let EncodedBlockData {
+            block_num: _,
+            block_hash,
+            block_info,
+            accounts,
+            storage,
+            codes,
+        } = block;
 
-        // Write block hash mapping
         db.write_block_hash(batch, block_info.header.number, block_hash)?;
-
-        // Write block info
         db.write_block_info(batch, block_info)?;
 
-        // Write deleted accounts
-        for account in block_diff.deleted_accounts {
-            db.write_account(batch, account, block_num, None)?;
-        }
+        db.extend_account_writes(batch, accounts)?;
+        db.extend_storage_writes(batch, storage)?;
 
-        // Write new accounts
-        for account in block_diff.new_accounts {
-            db.write_account(batch, account.address, block_num, Some(account))?;
-        }
-
-        // Write storage diffs
-        for account_diff in block_diff.storage_diffs {
-            for pair in account_diff.diffs {
-                db.write_storage(
-                    batch,
-                    account_diff.address,
-                    pair.index,
-                    block_num,
-                    pair.value,
-                )?;
-            }
-        }
-
-        // Write new codes
-        for new_code in block_diff.new_codes {
-            db.write_code(batch, new_code.code_hash, new_code.code)?;
+        for code in codes {
+            db.write_code(batch, code.code_hash, code.code)?;
         }
 
         Ok(())
@@ -684,7 +672,7 @@ impl Command {
         chain_id: String,
         version: String,
         block_num: u64,
-    ) -> BlockData {
+    ) -> EncodedBlockData {
         let mut last_error = String::new();
 
         for attempt in 1..=MAX_RETRIES {
@@ -719,7 +707,12 @@ impl Command {
         );
     }
 
-    /// Fetch block data from RPC/S3 (writing is done by checkpoint worker)
+    /// Fetch block data from RPC/S3 and pre-encode it for the writer.
+    ///
+    /// Encoding (`encode_account_key`, `encode_storage_key`, RLP of
+    /// `SlimAccount`, `U256::to_be_bytes`) runs here so it scales with the
+    /// fetcher concurrency rather than serializing on the single writer
+    /// thread.
     async fn fetch_block(
         rpc_client: Option<HttpClient>,
         s3_client: Client,
@@ -728,8 +721,7 @@ impl Command {
         chain_id: String,
         version: String,
         block_num: u64,
-    ) -> Result<BlockData> {
-        // Fetch block data
+    ) -> Result<EncodedBlockData> {
         let (block_info, block_diff) = if block_num == 0 {
             // Genesis block has no parent
             s3_get_block_info_and_diff_by_number_for_genesis(
@@ -757,11 +749,39 @@ impl Command {
 
         let block_hash = block_info.header.hash;
 
-        Ok(BlockData {
+        let mut accounts = Vec::with_capacity(
+            block_diff.deleted_accounts.len() + block_diff.new_accounts.len(),
+        );
+        for address in block_diff.deleted_accounts {
+            accounts.push((encode_account_key(address, block_num), None));
+        }
+        for account in block_diff.new_accounts {
+            let key = encode_account_key(account.address, block_num);
+            let value = encode_slim_account(account);
+            accounts.push((key, Some(value)));
+        }
+
+        let storage_count: usize = block_diff
+            .storage_diffs
+            .iter()
+            .map(|d| d.diffs.len())
+            .sum();
+        let mut storage = Vec::with_capacity(storage_count);
+        for account_diff in block_diff.storage_diffs {
+            for pair in account_diff.diffs {
+                let key = encode_storage_key(account_diff.address, pair.index, block_num);
+                let value: [u8; 32] = pair.value.to_be_bytes();
+                storage.push((key, value));
+            }
+        }
+
+        Ok(EncodedBlockData {
             block_num,
             block_hash,
             block_info,
-            block_diff,
+            accounts,
+            storage,
+            codes: block_diff.new_codes,
         })
     }
 }

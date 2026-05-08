@@ -1,11 +1,16 @@
 //! Database implementation for EVM storage.
 
+mod archive_encoding;
 mod rocksdb_impl;
 
 mod mdbx_impl;
 
 mod error;
 
+pub use archive_encoding::{
+    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+    ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,
+};
 pub use error::Error as StorageError;
 pub use mdbx_impl::{
     MDBXArchiveOptions, MDBXArchiveStateDB, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXStateDB,

@@ -21,9 +21,12 @@
 
 use super::{default_page_size, DEFAULT_MAX_READERS, GIGABYTE, MEGABYTE, TERABYTE};
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::archive_encoding::{
+    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+};
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use leafage_evm_types::{
     BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
     U256,
@@ -158,6 +161,29 @@ pub struct MDBXWriteBatch {
     account_cache: Vec<([u8; 64], Option<Vec<u8>>)>,
     /// Cached storage writes: (encoded_key, value_bytes)
     storage_cache: Vec<([u8; 96], [u8; 32])>,
+}
+
+impl MDBXWriteBatch {
+    /// Append pre-encoded account writes to the deferred cache. Allows callers to
+    /// run key/value encoding off the writer thread (e.g. in fetcher tasks during
+    /// archive bulk ingest) and then hand the prepared entries to the batch.
+    #[inline]
+    pub fn extend_account_writes<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = ([u8; 64], Option<Vec<u8>>)>,
+    {
+        self.account_cache.extend(items);
+    }
+
+    /// Append pre-encoded storage writes to the deferred cache. See
+    /// [`extend_account_writes`](Self::extend_account_writes).
+    #[inline]
+    pub fn extend_storage_writes<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = ([u8; 96], [u8; 32])>,
+    {
+        self.storage_cache.extend(items);
+    }
 }
 
 // ===== DataBase Implementation =====
@@ -381,32 +407,6 @@ impl DataBase {
 }
 
 // ===== Helper Functions =====
-
-#[inline]
-fn encode_block_num(block_num: u64) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[24..32].copy_from_slice(&block_num.to_be_bytes());
-    bytes
-}
-
-// Encode account key: address(32) || block_num(32)
-#[inline]
-fn encode_account_key(address: H256, block_num: u64) -> [u8; 64] {
-    let mut key = [0u8; 64];
-    key[..32].copy_from_slice(address.as_slice());
-    key[32..64].copy_from_slice(&encode_block_num(block_num));
-    key
-}
-
-// Encode storage key: address(32) || storage_key(32) || block_num(32)
-#[inline]
-fn encode_storage_key(address: H256, storage_key: H256, block_num: u64) -> [u8; 96] {
-    let mut key = [0u8; 96];
-    key[..32].copy_from_slice(address.as_slice());
-    key[32..64].copy_from_slice(storage_key.as_slice());
-    key[64..96].copy_from_slice(&encode_block_num(block_num));
-    key
-}
 
 /// Simulate seek_for_prev for MDBX cursor.
 ///
@@ -1068,17 +1068,8 @@ impl StateDBWrite for Arc<DataBase> {
         block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
-        // Key format: address(32) || block_num(32)
         let key = encode_account_key(address, block_num);
-
-        // Encode value and cache for deferred sorted write
-        let value = raw_account.map(|acc| {
-            let slim_account: SlimAccount = acc.into();
-            let mut bytes = Vec::new();
-            slim_account.encode(&mut bytes);
-            bytes
-        });
-
+        let value = raw_account.map(encode_slim_account);
         batch.account_cache.push((key, value));
         Ok(())
     }
@@ -1108,11 +1099,8 @@ impl StateDBWrite for Arc<DataBase> {
         block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
-        // Key format: address(32) || storage_key(32) || block_num(32)
         let storage_key = encode_storage_key(address, key, block_num);
         let value_bytes: [u8; 32] = value.to_be_bytes();
-
-        // Cache for deferred sorted write
         batch.storage_cache.push((storage_key, value_bytes));
         Ok(())
     }
