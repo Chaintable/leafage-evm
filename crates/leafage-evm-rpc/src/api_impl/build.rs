@@ -161,6 +161,7 @@ where
             MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
+            MultiChainCfgEnv::Iotex(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
             MultiChainCfgEnv::Tempo(env) => {
                 // Tempo: set virtual balance placeholder (no native token).
