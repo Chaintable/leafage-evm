@@ -264,17 +264,24 @@ fn rocksdb_column_options(
         cf_opts.set_hard_pending_compaction_bytes_limit(0);
     }
 
-    // Set compression based on data characteristics.
-    // NOTE: optimize_level_style_compaction() populates compression_per_level
+    // The compression policy is identical across normal and bulk-load opens.
+    // The previous policy made the shallow levels uncompressed in normal mode
+    // (for hot-read latency) but compressed in bulk-load mode. That asymmetry
+    // caused a pathological expansion when a bulk-loaded DB was reopened in
+    // normal mode for compaction: SSTs written as LZ4 at flush were rewritten
+    // as None one level down during cascade, inflating disk by ~1.7× until
+    // data reached the next compressed level. LZ4 decompresses at ~4 GB/s,
+    // comparable to or faster than NVMe sequential read, so compressing the
+    // shallow levels has negligible read-latency cost in practice.
+    //
+    // NOTE on dynamic levels: this CF enables level_compaction_dynamic_level_bytes,
+    // so the physical level numbers below the flush level shift with DB size.
+    // What matters is that the flush output (compression_per_level[0]) and all
+    // deeper levels reachable via cascade are set consistently — they are.
+    //
+    // NOTE on overrides: optimize_level_style_compaction() populates compression_per_level
     // (L0-L1: None, L2+: LZ4), which takes precedence over set_compression_type().
     // We must use set_compression_per_level() to override it reliably.
-    //
-    // Under bulk_load auto-compaction is disabled and all writes pile up in L0
-    // until the final manual compact(). With the default "L0/L1 = None" policy
-    // that means the entire archive is held uncompressed on disk during ingest,
-    // which can balloon to 2-3x of the post-compact footprint. Under bulk_load
-    // we therefore compress L0/L1 too — flushes pay an extra LZ4/ZSTD encode,
-    // but ingest doesn't read L0, so there is no latency cost.
     match compression {
         CfCompression::None => {
             cf_opts.set_compression_per_level(&[
@@ -288,15 +295,9 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Lz4 => {
-            let l0_l1 = if bulk_load {
-                rocksdb::DBCompressionType::Lz4
-            } else {
-                // Hot read levels uncompressed in normal mode.
-                rocksdb::DBCompressionType::None
-            };
             cf_opts.set_compression_per_level(&[
-                l0_l1,
-                l0_l1,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
@@ -305,15 +306,11 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Zstd => {
-            // bulk_load: L0 = LZ4 (fast encode on flush), L1+ = ZSTD.
-            // normal:    L0 = None (hot reads), L1 = LZ4, L2+ = ZSTD.
-            let l0 = if bulk_load {
-                rocksdb::DBCompressionType::Lz4
-            } else {
-                rocksdb::DBCompressionType::None
-            };
+            // Shallow levels (flush output and one cascade below) use LZ4 for
+            // cheap encode; deeper levels switch to ZSTD for better ratio on
+            // data that is rewritten less often.
             cf_opts.set_compression_per_level(&[
-                l0,
+                rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
@@ -321,12 +318,7 @@ fn rocksdb_column_options(
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
             ]);
-            // Enable ZSTD dictionary compression for better compression of similar data patterns
-            // - max_train_bytes: bytes to sample for dictionary training (1MB)
-            // - zstd_max_train_bytes: same as above for ZSTD specifically
-            cf_opts.set_zstd_max_train_bytes(1024 * 1024); // 1MB training data
-                                                           // compression_opts: (window_bits, level, strategy, max_dict_bytes)
-                                                           // max_dict_bytes: dictionary size (16KB is a good default)
+            cf_opts.set_zstd_max_train_bytes(1024 * 1024);
             cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
         }
     }
@@ -405,15 +397,13 @@ impl DataBaseRef {
     ///   pending-compaction-byte limits are still disabled, so background
     ///   compaction never back-pressures the writer.
     /// - WAL disabled on `commit`.
-    /// - L0/L1 compressed (see `rocksdb_column_options`) so the SSTs that
-    ///   sit in L0 before auto-compaction picks them up are already small.
     ///
     /// Only safe when the source data is replayable on crash (e.g. archive
     /// ingest from S3). A crash before the final flush still loses every
     /// memtable that hasn't been flushed (no WAL fallback); resume relies on
     /// `latest_block_hash` rolling back to the last persisted checkpoint.
     /// The caller still runs the final `compact()` to consolidate into
-    /// deeper levels with normal-mode compression.
+    /// deeper levels.
     pub fn open_for_bulk_load<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
         warn!(
             target = "rocksdb",
