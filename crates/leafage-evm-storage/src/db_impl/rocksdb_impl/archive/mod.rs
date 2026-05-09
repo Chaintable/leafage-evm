@@ -268,6 +268,16 @@ fn rocksdb_column_options(
         cf_opts.set_level_zero_stop_writes_trigger(i32::MAX);
         cf_opts.set_soft_pending_compaction_bytes_limit(0);
         cf_opts.set_hard_pending_compaction_bytes_limit(0);
+        // Push the L0 → L1 compaction trigger from the default 4 files up to
+        // 50 so background compaction stops competing with the WAL writer
+        // for disk bandwidth on slower NVMes. Observed on a ~150 MB/s NVMe:
+        // ingest at 1024-block checkpoints had compaction reading ~40 MB/s
+        // and writing ~30 MB/s while the WAL writer needed ~250 MB/checkpoint
+        // → checkpoint stalls 14s. Letting L0 grow to 50 files frees disk
+        // bandwidth for the WAL/flush path; the deferred compaction work is
+        // picked up by the final manual compact() the caller runs at end of
+        // ingest.
+        cf_opts.set_level_zero_file_num_compaction_trigger(50);
     }
 
     // The compression policy is identical across normal and bulk-load opens.
@@ -335,6 +345,10 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.set_write_buffer_size(1 << 28); // e.g., 256MB
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
+    // Compress WAL records. With per-checkpoint sync enabled during archive
+    // bulk-load, WAL fsync traffic competes with compaction for NVMe
+    // bandwidth; LZ4 shrinks each record ~2-3x for negligible CPU cost.
+    opts.set_wal_compression_type(rocksdb::DBCompressionType::Lz4);
     // Background concurrency. The previous value (2) covered flush + a single
     // compaction job, which serialised L0 → L1 across CFs and bottlenecked
     // archive bulk-load; standalone reads/writes also benefit from faster
