@@ -260,6 +260,13 @@ fn rocksdb_column_options(
     // NOTE: optimize_level_style_compaction() populates compression_per_level
     // (L0-L1: None, L2+: LZ4), which takes precedence over set_compression_type().
     // We must use set_compression_per_level() to override it reliably.
+    //
+    // Under bulk_load auto-compaction is disabled and all writes pile up in L0
+    // until the final manual compact(). With the default "L0/L1 = None" policy
+    // that means the entire archive is held uncompressed on disk during ingest,
+    // which can balloon to 2-3x of the post-compact footprint. Under bulk_load
+    // we therefore compress L0/L1 too — flushes pay an extra LZ4/ZSTD encode,
+    // but ingest doesn't read L0, so there is no latency cost.
     match compression {
         CfCompression::None => {
             cf_opts.set_compression_per_level(&[
@@ -273,10 +280,15 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Lz4 => {
-            // L0-L1: no compression (frequently accessed), L2+: LZ4
+            let l0_l1 = if bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                // Hot read levels uncompressed in normal mode.
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::None,
-                rocksdb::DBCompressionType::None,
+                l0_l1,
+                l0_l1,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
@@ -285,9 +297,15 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Zstd => {
-            // L0-L1: LZ4 (fast), L2+: ZSTD (high compression for large code blobs)
+            // bulk_load: L0 = LZ4 (fast encode on flush), L1+ = ZSTD.
+            // normal:    L0 = None (hot reads), L1 = LZ4, L2+ = ZSTD.
+            let l0 = if bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::None,
+                l0,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
