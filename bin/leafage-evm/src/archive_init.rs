@@ -549,6 +549,16 @@ impl Command {
                         db.write_latest_block_hash(&mut current_batch, block_hash)
                             .expect("Failed to write latest block hash");
                         db.commit(current_batch).expect("Failed to commit batch");
+                        // Force durability so the resume pointer survives a
+                        // mid-ingest crash. Without WAL (bulk-load) and with
+                        // UtterlyNoSync MDBX, commit() lands in memory only;
+                        // the LatestBlockHash CF in particular is too small to
+                        // ever trigger memtable auto-flush. flush() flushes
+                        // every CF in the right order (content CFs first,
+                        // pointer last) so a crash mid-flush either recovers
+                        // to an earlier checkpoint or to this one — never to
+                        // a pointer that outruns its content.
+                        db.flush().expect("Failed to flush at checkpoint");
 
                         last_checkpoint_num = current_checkpoint_num;
                         batch_dirty = false;
