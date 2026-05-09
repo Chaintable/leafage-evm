@@ -382,22 +382,36 @@ impl DataBaseRef {
     }
 
     /// Open the archive RocksDB tuned for bulk ingest:
-    /// - `disable_auto_compactions = true` (caller is responsible for the
-    ///   final `compact()`)
-    /// - WAL disabled on `commit`
-    /// - L0 slowdown/stop and pending-compaction byte throttles disabled
+    /// - `disable_auto_compactions = false` — RocksDB drains L0 → L1 in the
+    ///   background as files accumulate, so disk doesn't grow unbounded
+    ///   during long ingests. The L0 slowdown/stop triggers and the
+    ///   pending-compaction-byte limits are still disabled, so background
+    ///   compaction never back-pressures the writer.
+    /// - WAL disabled on `commit`.
+    /// - L0/L1 compressed (see `rocksdb_column_options`) so the SSTs that
+    ///   sit in L0 before auto-compaction picks them up are already small.
     ///
     /// Only safe when the source data is replayable on crash (e.g. archive
-    /// ingest from S3). The caller MUST run `compact()` before re-opening
-    /// the database in normal mode, otherwise reads will see a flat L0.
+    /// ingest from S3). A crash before the final flush still loses every
+    /// memtable that hasn't been flushed (no WAL fallback); resume relies on
+    /// `latest_block_hash` rolling back to the last persisted checkpoint.
+    /// The caller still runs the final `compact()` to consolidate into
+    /// deeper levels with normal-mode compression.
     pub fn open_for_bulk_load<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
         warn!(
             target = "rocksdb",
-            "Opening RocksDB archive in BULK-LOAD mode: WAL disabled, auto compactions disabled, \
-             L0/pending-compaction throttles disabled. Crash before final compact() may lose \
-             writes since the last flush; the source data must be replayable to recover."
+            "Opening RocksDB archive in BULK-LOAD mode: WAL disabled, \
+             L0/pending-compaction throttles disabled (auto compactions still on). \
+             Crash before final compact() may lose writes since the last flush; \
+             the source data must be replayable to recover."
         );
-        Self::open_inner(path, cache_size, true, true)
+        // Note: disable_auto_compactions = false. Earlier revisions disabled
+        // auto compactions and tried to do periodic manual compactions, but
+        // every `compact_range_cf(.., None, None)` is a full-range manual
+        // compaction (work proportional to total written so far), so periodic
+        // calls produced O(N²) total compaction work. Letting RocksDB do
+        // incremental L0 → L1 in the background keeps each step bounded.
+        Self::open_inner(path, cache_size, false, true)
     }
 
     fn open_inner<P: AsRef<Path>>(

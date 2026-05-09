@@ -322,9 +322,12 @@ impl Command {
                 info!(target: "archive_init",
                     "Opening RocksDB archive database (bulk-load mode) with cache_size: {}MB",
                     self.db_cache);
-                // Bulk-load mode: WAL off, L0/pending-compaction throttles off,
-                // auto-compactions off. Safe because archive data is replayable
-                // from S3 on crash, and we run a manual compact() at the end.
+                // Bulk-load mode: WAL off, L0/pending-compaction throttles off.
+                // Auto-compactions stay ON so RocksDB drains L0 → L1 in the
+                // background; the throttles are off so a slow compaction never
+                // back-pressures the writer. Safe because archive data is
+                // replayable from S3 on crash, and we still run a final
+                // manual compact() at the end to consolidate into deep levels.
                 ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open_for_bulk_load(
                     &self.db_path,
                     self.db_cache,
