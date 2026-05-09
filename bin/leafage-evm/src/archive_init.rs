@@ -272,10 +272,22 @@ impl ArchiveStorage {
         }
     }
 
-    fn commit(&self, batch: ArchiveWriteBatch) -> Result<(), anyhow::Error> {
+    /// Commit the batch and ensure durability before returning. For RocksDB
+    /// this fsyncs the WAL segment for this batch (so a crash resumes from
+    /// here, not earlier). For MDBX this commits, then explicitly syncs the
+    /// environment (covers UtterlyNoSync mode where commit alone doesn't
+    /// flush to disk).
+    fn commit_sync(&self, batch: ArchiveWriteBatch) -> Result<(), anyhow::Error> {
         match (self, batch) {
-            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => Ok(db.commit(b)?),
-            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => Ok(db.commit(b)?),
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(mut b)) => {
+                b.set_sync(true);
+                Ok(db.commit(b)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                db.commit(b)?;
+                db.sync(true)?;
+                Ok(())
+            }
             _ => Err(anyhow::anyhow!("Batch type mismatch")),
         }
     }
@@ -548,17 +560,14 @@ impl Command {
                     if current_checkpoint_num > last_checkpoint_num {
                         db.write_latest_block_hash(&mut current_batch, block_hash)
                             .expect("Failed to write latest block hash");
-                        db.commit(current_batch).expect("Failed to commit batch");
-                        // Force durability so the resume pointer survives a
-                        // mid-ingest crash. Without WAL (bulk-load) and with
-                        // UtterlyNoSync MDBX, commit() lands in memory only;
-                        // the LatestBlockHash CF in particular is too small to
-                        // ever trigger memtable auto-flush. flush() flushes
-                        // every CF in the right order (content CFs first,
-                        // pointer last) so a crash mid-flush either recovers
-                        // to an earlier checkpoint or to this one — never to
-                        // a pointer that outruns its content.
-                        db.flush().expect("Failed to flush at checkpoint");
+                        // commit_sync fsyncs the WAL (RocksDB) or env (MDBX)
+                        // before returning, so a mid-ingest crash resumes from
+                        // here. Replaces the previous explicit flush() which
+                        // forced a synchronous memtable→SST conversion across
+                        // every CF (~18s per checkpoint). WAL fsync is ms-level
+                        // and replay on reopen restores the memtables.
+                        db.commit_sync(current_batch)
+                            .expect("Failed to commit batch (sync)");
 
                         last_checkpoint_num = current_checkpoint_num;
                         batch_dirty = false;
@@ -603,8 +612,8 @@ impl Command {
                     db.write_latest_block_hash(&mut current_batch, last_hash)
                         .expect("Failed to write final latest block hash");
                 }
-                db.commit(current_batch)
-                    .expect("Failed to commit final batch");
+                db.commit_sync(current_batch)
+                    .expect("Failed to commit final batch (sync)");
                 info!(target: "archive_init", "Final checkpoint written at block {}", final_contiguous);
             } else {
                 // No pending writes. Dropping the prepared batch aborts the empty

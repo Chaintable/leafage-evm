@@ -137,17 +137,17 @@ struct DataBaseInner {
 #[derive(Debug)]
 pub struct DataBaseRef {
     db: &'static DB,
-    /// When true, [`commit`](Self::commit) goes through [`DB::write_opt`] with
-    /// `WriteOptions::disable_wal(true)`. Used by archive bulk-load (where
-    /// data is replayable from the source on crash) to skip WAL append per
-    /// commit.
-    disable_wal: bool,
 }
 
 pub struct ArchiveRocksDBWriteBatch {
     inner: WriteBatch,
     account_writes: Vec<([u8; 64], Vec<u8>)>,
     storage_writes: Vec<([u8; 96], [u8; 32])>,
+    /// When true, the underlying `write_opt` is called with `sync=true`,
+    /// forcing fsync of the WAL segment for this batch before returning.
+    /// Used by archive ingest at checkpoint boundaries to make the resume
+    /// pointer durable without paying for fsync on every commit.
+    sync: bool,
 }
 
 impl ArchiveRocksDBWriteBatch {
@@ -156,7 +156,15 @@ impl ArchiveRocksDBWriteBatch {
             inner: WriteBatch::default(),
             account_writes: Vec::new(),
             storage_writes: Vec::new(),
+            sync: false,
         }
+    }
+
+    /// Mark this batch as a sync commit: fsync the WAL before `commit()`
+    /// returns. Without this, the WAL append is buffered and a power loss
+    /// could lose the most recent commits.
+    pub fn set_sync(&mut self, sync: bool) {
+        self.sync = sync;
     }
 
     /// Append pre-encoded account writes to the deferred cache. `None` is
@@ -362,13 +370,13 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
 }
 
 impl DataBaseRef {
-    /// Open the archive RocksDB. Set `disable_auto_compactions=true` for bulk
-    /// ingest if you also plan to run a manual `compact()` at the end; this
-    /// keeps the same WAL/throttle behavior as production reads.
+    /// Open the archive RocksDB with default throttles. Set
+    /// `disable_auto_compactions=true` if a caller plans to run its own
+    /// manual `compact()` and doesn't want background work in between.
     ///
-    /// For archive-init (where data is replayable on crash), prefer
-    /// [`Self::open_for_bulk_load`] which additionally disables WAL and the
-    /// L0 / pending-compaction throttles.
+    /// For archive-init bulk ingest, prefer [`Self::open_for_bulk_load`]
+    /// which disables the L0 / pending-compaction throttles so the writer
+    /// is never back-pressured by lagging compaction.
     pub fn open<P: AsRef<Path>>(
         path: P,
         cache_size: usize,
@@ -378,26 +386,21 @@ impl DataBaseRef {
     }
 
     /// Open the archive RocksDB tuned for bulk ingest:
-    /// - `disable_auto_compactions = false` — RocksDB drains L0 → L1 in the
-    ///   background as files accumulate, so disk doesn't grow unbounded
-    ///   during long ingests. The L0 slowdown/stop triggers and the
-    ///   pending-compaction-byte limits are still disabled, so background
-    ///   compaction never back-pressures the writer.
-    /// - WAL disabled on `commit`.
-    ///
-    /// Only safe when the source data is replayable on crash (e.g. archive
-    /// ingest from S3). A crash before the final flush still loses every
-    /// memtable that hasn't been flushed (no WAL fallback); resume relies on
-    /// `latest_block_hash` rolling back to the last persisted checkpoint.
-    /// The caller still runs the final `compact()` to consolidate into
-    /// deeper levels.
+    /// - Auto-compactions ON: RocksDB drains L0 → L1 in the background as
+    ///   files accumulate, so disk doesn't grow unbounded during long
+    ///   ingests.
+    /// - L0 slowdown/stop triggers and pending-compaction byte limits
+    ///   disabled: background compaction never back-pressures the writer.
+    /// - WAL is on (same as `open()`); callers wanting durable resume
+    ///   should mark each checkpoint batch as `set_sync(true)` so the WAL
+    ///   is fsynced before the commit returns.
     pub fn open_for_bulk_load<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
         warn!(
             target = "rocksdb",
-            "Opening RocksDB archive in BULK-LOAD mode: WAL disabled, \
-             L0/pending-compaction throttles disabled (auto compactions still on). \
-             Crash before final compact() may lose writes since the last flush; \
-             the source data must be replayable to recover."
+            "Opening RocksDB archive in BULK-LOAD mode: \
+             L0/pending-compaction throttles disabled (auto compactions still on, \
+             WAL still on). Caller is expected to drive durability by calling \
+             commit() with sync=true on checkpoint batches."
         );
         // Note: disable_auto_compactions = false. Earlier revisions disabled
         // auto compactions and tried to do periodic manual compactions, but
@@ -562,7 +565,6 @@ impl DataBaseRef {
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
         Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
-            disable_wal: bulk_load,
         }
     }
 }
@@ -1510,13 +1512,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
             }
         }
 
-        if self.disable_wal {
-            let mut wo = WriteOptions::default();
-            wo.disable_wal(true);
-            self.db.write_opt(batch.inner, &wo)?;
-        } else {
-            self.db.write(batch.inner)?;
-        }
+        let mut wo = WriteOptions::default();
+        wo.set_sync(batch.sync);
+        self.db.write_opt(batch.inner, &wo)?;
         Ok(())
     }
 }
