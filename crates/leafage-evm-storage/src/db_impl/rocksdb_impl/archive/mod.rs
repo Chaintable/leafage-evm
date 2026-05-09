@@ -198,11 +198,9 @@ unsafe impl Sync for DataBaseInner {}
 /// Compression type for column families
 #[derive(Clone, Copy)]
 enum CfCompression {
-    /// No compression (small values, not worth compressing)
+    /// No compression — only used for tiny CFs where the encode CPU isn't worth it.
     None,
-    /// LZ4 compression (good balance of speed and compression)
-    Lz4,
-    /// ZSTD compression (high compression ratio for large values like code)
+    /// LZ4 at shallow levels (cheap flush), ZSTD with dict at deep levels for ratio.
     Zstd,
 }
 
@@ -292,17 +290,6 @@ fn rocksdb_column_options(
                 rocksdb::DBCompressionType::None,
                 rocksdb::DBCompressionType::None,
                 rocksdb::DBCompressionType::None,
-            ]);
-        }
-        CfCompression::Lz4 => {
-            cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::Lz4,
-                rocksdb::DBCompressionType::Lz4,
-                rocksdb::DBCompressionType::Lz4,
-                rocksdb::DBCompressionType::Lz4,
-                rocksdb::DBCompressionType::Lz4,
-                rocksdb::DBCompressionType::Lz4,
-                rocksdb::DBCompressionType::Lz4,
             ]);
         }
         CfCompression::Zstd => {
@@ -450,14 +437,16 @@ impl DataBaseRef {
                 bulk_load,
             ),
         );
-        // BlockHashToBlockInfo: ~500 bytes value, LZ4 compression
+        // BlockHashToBlockInfo: ~500 bytes structured value (RLP block info).
+        // ZSTD with dict at deep levels for better ratio on repeated patterns;
+        // shallow levels stay LZ4 for cheap flush.
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 0,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                CfCompression::Zstd,
                 bulk_load,
             ),
         );
@@ -472,27 +461,30 @@ impl DataBaseRef {
                 bulk_load,
             ),
         );
-        // AddressToAccount: ~100 bytes value, LZ4 compression
+        // AddressToAccount: ~100 bytes RLP slim account. ZSTD with dict at
+        // deep levels captures repeating RLP framing and zero-padding; shallow
+        // levels stay LZ4 for cheap flush.
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 32,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                CfCompression::Zstd,
                 bulk_load,
             ),
         );
-        // AddressToStorage: 32 bytes value, but 96-byte keys have high prefix
-        // redundancy. LZ4 at deeper levels reduces disk usage with negligible
-        // CPU overhead.
+        // AddressToStorage: 32-byte values are high-entropy, but 96-byte keys
+        // have heavy address+slot prefix redundancy when sorted. ZSTD with
+        // dict at deep levels squeezes more out of that redundancy than LZ4;
+        // shallow levels stay LZ4 for cheap flush.
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 64,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                CfCompression::Zstd,
                 bulk_load,
             ),
         );
