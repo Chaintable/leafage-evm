@@ -236,6 +236,14 @@ fn rocksdb_column_options(
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
+    // Allow the writer to roll into a fresh memtable while older ones are
+    // still being flushed (default is 2). Helps under sustained write load
+    // such as archive bulk-load.
+    cf_opts.set_max_write_buffer_number(4);
+    // Larger SST files = fewer files at every level = less metadata,
+    // smaller index/bloom overhead, fewer files for compaction to track.
+    // Default is 64MB; bump to 128MB.
+    cf_opts.set_target_file_size_base(128 << 20);
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
     // Disable TTL-based compaction. Archive data is immutable — recompacting
     // old SST files just because they exceed 30 days (the default set by
@@ -244,14 +252,14 @@ fn rocksdb_column_options(
     cf_opts.set_ttl(0);
 
     if bulk_load {
-        // Auto-compaction is off during archive bulk load, so L0 grows monotonically
-        // and would otherwise trigger the default slowdown/stop write triggers
-        // (20/24 files), back-pressuring the writer for the entire ingest.
-        // The final manual compact() reorganises everything.
+        // Disable every back-pressure mechanism on the writer thread. Auto
+        // compaction still runs in the background to drain L0 → L1
+        // incrementally, but if it can't keep up the writer must NOT be
+        // throttled — archive ingest treats the source as replayable and
+        // would rather pay the disk cost than slow down.
+        // (Defaults: slowdown 20 files, stop 24 files, soft 64GB, hard 256GB.)
         cf_opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
         cf_opts.set_level_zero_stop_writes_trigger(i32::MAX);
-        // Same idea for the byte-based pending-compaction throttles
-        // (defaults 64GB/256GB).
         cf_opts.set_soft_pending_compaction_bytes_limit(0);
         cf_opts.set_hard_pending_compaction_bytes_limit(0);
     }
@@ -333,11 +341,20 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.create_if_missing(true);
     opts.set_use_fsync(false);
     opts.set_keep_log_file_num(1);
-    opts.set_bytes_per_sync(1 << 20); // e.g., 1MB
+    // Larger sync chunks: amortise the per-fsync cost during heavy writes
+    // (archive bulk-load and background compaction) at the small cost of a
+    // slightly larger window of dirty pages on crash.
+    opts.set_bytes_per_sync(4 << 20); // 4MB
     opts.set_write_buffer_size(1 << 28); // e.g., 256MB
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
-    opts.increase_parallelism(2);
+    // Background concurrency. The previous value (2) covered flush + a single
+    // compaction job, which serialised L0 → L1 across CFs and bottlenecked
+    // archive bulk-load; standalone reads/writes also benefit from faster
+    // background compaction. `max_subcompactions` lets a single big
+    // compaction (e.g. AddressToStorage) split into parallel ranges.
+    opts.increase_parallelism(8);
+    opts.set_max_subcompactions(4);
     opts.set_use_direct_io_for_flush_and_compaction(true);
     opts.set_disable_auto_compactions(disable_auto_compactions);
 
