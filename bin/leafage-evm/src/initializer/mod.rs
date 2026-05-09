@@ -4,6 +4,9 @@ pub use http_initializer::Initializer as HttpInitializer;
 mod kafka_initializer;
 pub use kafka_initializer::Initializer as KafkaInitializer;
 
+mod snapshot_initializer;
+pub use snapshot_initializer::Initializer as SnapshotInitializer;
+
 use crate::utils::KafkaS3Config;
 use anyhow::{Ok, Result};
 use leafage_evm_storage::EvmStorageWrite;

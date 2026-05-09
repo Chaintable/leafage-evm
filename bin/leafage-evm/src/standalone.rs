@@ -1,9 +1,9 @@
-use crate::initializer::initialize_check;
+use crate::initializer::{initialize_check, SnapshotInitializer};
 use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config};
+use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config, SnapshotConfig};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -165,6 +165,15 @@ pub struct Command {
     /// Default: None
     #[arg(long, value_parser = parse_gateway_object_config, value_name = "GATEWAY_OBJECT_CONFIG_PATH")]
     gateway_object_config: Option<GatewayObjectConfig>,
+
+    /// The R2 snapshot config path or inline JSON
+    /// Default: None
+    ///
+    /// When set and the local db directory is empty, leafage will fetch
+    /// the latest snapshot from R2 and lay it onto db_path before opening
+    /// the storage. db_path 已存在数据时会跳过恢复直接进入主流程。
+    #[arg(long, value_parser = parse_snapshot_config, value_name = "SNAPSHOT_CONFIG_PATH")]
+    snapshot_config: Option<SnapshotConfig>,
 
     /// The etcd register config path
     /// Default: None
@@ -330,6 +339,27 @@ fn parse_gateway_object_config(arg: &str) -> Result<GatewayObjectConfig> {
         cfg = serde_json::from_str(arg)?;
     }
     Ok(cfg)
+}
+
+fn parse_snapshot_config(arg: &str) -> Result<SnapshotConfig> {
+    let cfg: SnapshotConfig;
+    if std::path::Path::new(arg).exists() {
+        let file = std::fs::File::open(arg)?;
+        cfg = serde_json::from_reader(file)?;
+    } else {
+        cfg = serde_json::from_str(arg)?;
+    }
+    Ok(cfg)
+}
+
+fn is_db_path_empty(path: &std::path::Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    if !path.is_dir() {
+        anyhow::bail!("db_path {:?} exists but is not a directory", path);
+    }
+    Ok(std::fs::read_dir(path)?.next().is_none())
 }
 
 fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
@@ -542,6 +572,16 @@ impl Command {
                 "ROCKSDB_ITERATOR_TIMEOUT_SECS",
                 self.iterator_timeout_secs.to_string(),
             );
+        }
+
+        if let Some(snapshot_cfg) = self.snapshot_config.clone() {
+            if is_db_path_empty(self.db_path.as_path())? {
+                info!(target: "updater", "db_path {:?} is empty, restoring from R2 snapshot", self.db_path);
+                let initializer = SnapshotInitializer::new(snapshot_cfg, self.db_path.clone())?;
+                initializer.restore().await?;
+            } else {
+                info!(target: "updater", "db_path {:?} not empty, skip snapshot restore", self.db_path);
+            }
         }
 
         let db = MultiStorage::open(
