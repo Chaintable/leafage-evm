@@ -307,6 +307,528 @@ impl ArchiveStorage {
     }
 }
 
+// ===== RocksDB SST ingest pipeline =====
+//
+// The default RocksDB write path goes block_data → WriteBatch → memtable →
+// (optional) WAL fsync at checkpoint. For archive bulk-load that path's
+// per-checkpoint cost is dominated by memtable insert (millions of skiplist
+// inserts) and WAL append (~1 GB sequential write per 1024-block batch),
+// neither of which is necessary for a one-shot, replayable ingest.
+//
+// This pipeline replaces the path with a fan-out:
+//
+//   fetcher → batch_accumulator → ingest_dispatcher (N workers) → watermark_advancer
+//
+// `batch_accumulator` reorders out-of-order fetcher output by block_num,
+// accumulates `checkpoint_interval` blocks per batch, and emits one
+// `BatchPayload` per batch.
+//
+// `ingest_dispatcher` runs up to `INGEST_WORKER_COUNT` workers in parallel.
+// Each worker sorts its batch's pre-encoded account/storage writes, builds
+// per-CF SST files via `SstFileWriter`, and ingests them via
+// `ingest_external_file_cf` (which bypasses memtable and WAL entirely; the
+// files are atomically registered in the MANIFEST and physically moved into
+// the DB's data directory).
+//
+// `watermark_advancer` collects worker completions, drains them in `batch_seq`
+// order (so completions can arrive in any order), commits each batch's small
+// CFs (block_info / block_num→hash / code) via the regular WriteBatch path,
+// and only on the last batch of each in-order drain marks the WriteBatch
+// `set_sync(true)` and writes `latest_block_hash`. The single WAL fsync per
+// drain is the only durability fence; on crash, resume reads
+// `latest_block_hash`, recomputes start_block = N+1, and re-ingests blocks
+// > N. Re-ingest produces SSTs whose keys collide with previously-ingested
+// SSTs, but RocksDB assigns a strictly later global seqno to the new files,
+// so `read_merge` correctly returns the new value; the final manual
+// `compact()` collapses the duplicates.
+//
+// Correctness invariant: account_key = `address(32) || block_num(32 BE)` and
+// storage_key = `address(32) || slot(32) || block_num(32 BE)` are unique
+// within and across batches (block_num appears in the key, and within one
+// block the upstream tracer guarantees `deleted_accounts ∩ new_accounts = ∅`).
+// `dedup_keep_last_sorted` is applied defensively after sort to make the
+// SstFileWriter's strictly-increasing-key contract robust against any
+// unexpected duplicates.
+
+const INGEST_WORKER_COUNT: usize = 4;
+const INGEST_TMP_SUBDIR: &str = ".ingest_tmp";
+
+/// One checkpoint's worth of writes, handed off from the accumulator to a
+/// worker. Workers consume `account_writes` / `storage_writes`, build SSTs,
+/// and ingest them; `small_writes` is passed through unchanged for the
+/// advancer to commit.
+struct BatchPayload {
+    batch_seq: u64,
+    last_block_num: u64,
+    last_block_hash: H256,
+    blocks_in_batch: u64,
+    account_writes: Vec<([u8; 64], Vec<u8>)>,
+    storage_writes: Vec<([u8; 96], [u8; 32])>,
+    small_writes: RocksDBArchiveWriteBatch,
+}
+
+/// Worker → advancer message. Carries everything the advancer needs to finish
+/// the batch's commit (small writes + the resume-pointer info), plus per-stage
+/// timing collected by the worker.
+struct BatchCompletion {
+    batch_seq: u64,
+    last_block_num: u64,
+    last_block_hash: H256,
+    blocks_in_batch: u64,
+    small_writes: RocksDBArchiveWriteBatch,
+    timings: BatchTimings,
+}
+
+/// Per-batch stage timing + size accounting. Worker fills in `sort_dedup_us`,
+/// `write_sst_us`, and `ingest_us`; advancer fills in `commit_us`. Used both
+/// for per-batch info logging and end-of-run aggregate summary.
+#[derive(Default, Clone, Copy)]
+struct BatchTimings {
+    /// `sort_by` + `dedup_keep_last_sorted` for account + storage combined.
+    sort_dedup_us: u64,
+    /// `write_account_sst` + `write_storage_sst` combined (SstFileWriter
+    /// streaming write to disk, includes LZ4 encoding).
+    write_sst_us: u64,
+    /// `ingest_account_ssts` + `ingest_storage_ssts` combined (RocksDB
+    /// MANIFEST update + file rename via `move_files=true`; serialized on the
+    /// DB internal mutex).
+    ingest_us: u64,
+    /// Advancer's `StateDBWrite::commit` for the small WriteBatch
+    /// (block_info + block_hash + code; the last batch in each drain also
+    /// includes `latest_block_hash` and pays the WAL fsync).
+    commit_us: u64,
+    account_count: u64,
+    storage_count: u64,
+    account_bytes: u64,
+    storage_bytes: u64,
+}
+
+impl BatchTimings {
+    fn add(&mut self, other: &BatchTimings) {
+        self.sort_dedup_us += other.sort_dedup_us;
+        self.write_sst_us += other.write_sst_us;
+        self.ingest_us += other.ingest_us;
+        self.commit_us += other.commit_us;
+        self.account_count += other.account_count;
+        self.storage_count += other.storage_count;
+        self.account_bytes += other.account_bytes;
+        self.storage_bytes += other.storage_bytes;
+    }
+}
+
+/// Sort-then-keep-last on a sorted Vec of (key, value) pairs. Equal-key runs
+/// collapse to the rightmost entry. Defensive against any upstream invariant
+/// drift that would otherwise violate `SstFileWriter`'s strictly-increasing
+/// key contract.
+fn dedup_keep_last_sorted<K: Eq, V>(v: &mut Vec<(K, V)>) {
+    if v.len() <= 1 {
+        return;
+    }
+    let mut w: usize = 0;
+    let mut r: usize = 0;
+    while r < v.len() {
+        let mut e = r;
+        while e + 1 < v.len() && v[e + 1].0 == v[r].0 {
+            e += 1;
+        }
+        if w != e {
+            v.swap(w, e);
+        }
+        w += 1;
+        r = e + 1;
+    }
+    v.truncate(w);
+}
+
+/// Drain `EncodedBlockData` from the fetcher channel, reorder by block_num,
+/// and emit one `BatchPayload` per `checkpoint_interval` blocks. The final
+/// partial batch (blocks past the last checkpoint boundary) is emitted on
+/// drain. Returns the highest contiguously-absorbed block number.
+fn spawn_rocksdb_batch_accumulator(
+    mut block_rx: mpsc::Receiver<EncodedBlockData>,
+    batch_tx: mpsc::Sender<BatchPayload>,
+    db: Arc<ArchiveRocksDBStorage>,
+    start_block: u64,
+    checkpoint_interval: u64,
+) -> tokio::task::JoinHandle<u64> {
+    tokio::task::spawn_blocking(move || {
+        let mut pending: BTreeMap<u64, EncodedBlockData> = BTreeMap::new();
+        let mut max_contiguous: Option<u64> = if start_block == 0 {
+            None
+        } else {
+            Some(start_block - 1)
+        };
+        let mut last_checkpoint_num = start_block.saturating_sub(1) / checkpoint_interval;
+        let mut batch_seq: u64 = 0;
+
+        let mut acc_writes: Vec<([u8; 64], Vec<u8>)> = Vec::new();
+        let mut sto_writes: Vec<([u8; 96], [u8; 32])> = Vec::new();
+        let mut small = db
+            .prepare_write_batch()
+            .expect("Failed to prepare initial small batch");
+        let mut blocks_in_batch: u64 = 0;
+        let mut last_block_hash_in_batch: Option<H256> = None;
+        let mut last_block_num_in_batch: u64 = 0;
+
+        while let Some(block) = block_rx.blocking_recv() {
+            let bn = block.block_num;
+            if max_contiguous.is_some_and(|mc| bn <= mc) {
+                warn!(target: "archive_init",
+                    "Duplicate block {} received after it was already absorbed; ignoring", bn);
+                continue;
+            }
+            if pending.insert(bn, block).is_some() {
+                warn!(target: "archive_init",
+                    "Duplicate pending block {} received; replacing previous", bn);
+            }
+
+            let mut next = max_contiguous.map(|mc| mc + 1).unwrap_or(start_block);
+            while let Some(b) = pending.remove(&next) {
+                let bh = b.block_hash;
+                let bnum = b.block_num;
+
+                StateDBWrite::write_block_hash(
+                    &db,
+                    &mut small,
+                    b.block_info.header.number,
+                    bh,
+                )
+                .expect("write_block_hash");
+                StateDBWrite::write_block_info(&db, &mut small, b.block_info)
+                    .expect("write_block_info");
+                acc_writes.extend(
+                    b.accounts
+                        .into_iter()
+                        .map(|(k, v)| (k, v.unwrap_or_default())),
+                );
+                sto_writes.extend(b.storage);
+                for code in b.codes {
+                    StateDBWrite::write_code(&db, &mut small, code.code_hash, code.code)
+                        .expect("write_code");
+                }
+
+                max_contiguous = Some(bnum);
+                blocks_in_batch += 1;
+                last_block_hash_in_batch = Some(bh);
+                last_block_num_in_batch = bnum;
+
+                let chk = bnum / checkpoint_interval;
+                if chk > last_checkpoint_num {
+                    let payload = BatchPayload {
+                        batch_seq,
+                        last_block_num: last_block_num_in_batch,
+                        last_block_hash: last_block_hash_in_batch.expect("hash set"),
+                        blocks_in_batch,
+                        account_writes: std::mem::take(&mut acc_writes),
+                        storage_writes: std::mem::take(&mut sto_writes),
+                        small_writes: std::mem::replace(
+                            &mut small,
+                            db.prepare_write_batch().expect("prepare next small"),
+                        ),
+                    };
+                    if batch_tx.blocking_send(payload).is_err() {
+                        // Worker pool dropped the receiver: pipeline aborted.
+                        return max_contiguous.unwrap_or(start_block.saturating_sub(1));
+                    }
+                    batch_seq += 1;
+                    last_checkpoint_num = chk;
+                    blocks_in_batch = 0;
+                    last_block_hash_in_batch = None;
+                }
+
+                next += 1;
+            }
+        }
+
+        if blocks_in_batch > 0 {
+            let payload = BatchPayload {
+                batch_seq,
+                last_block_num: last_block_num_in_batch,
+                last_block_hash: last_block_hash_in_batch.expect("hash set"),
+                blocks_in_batch,
+                account_writes: std::mem::take(&mut acc_writes),
+                storage_writes: std::mem::take(&mut sto_writes),
+                small_writes: small,
+            };
+            let _ = batch_tx.blocking_send(payload);
+        }
+
+        max_contiguous.unwrap_or(start_block.saturating_sub(1))
+    })
+}
+
+/// CPU + disk work: sort the deferred writes, build SST files, ingest them.
+/// Runs on tokio's blocking pool; ingest serializes on RocksDB's internal
+/// mutex but each call is fast (no memtable flush since these CFs aren't
+/// written through memtable).
+fn ingest_worker_process(
+    db: Arc<ArchiveRocksDBStorage>,
+    tmp_dir: PathBuf,
+    mut payload: BatchPayload,
+) -> Result<BatchCompletion> {
+    let mut timings = BatchTimings::default();
+
+    // Pre-stage byte/count accounting before any consume. Each account
+    // tuple = 64-byte key + Vec<u8> value (RLP slim account, ~50–100B).
+    // Each storage tuple = 96-byte key + 32-byte value.
+    timings.account_count = payload.account_writes.len() as u64;
+    timings.storage_count = payload.storage_writes.len() as u64;
+    timings.account_bytes = payload
+        .account_writes
+        .iter()
+        .map(|(k, v)| (k.len() + v.len()) as u64)
+        .sum();
+    timings.storage_bytes = payload
+        .storage_writes
+        .iter()
+        .map(|(k, v)| (k.len() + v.len()) as u64)
+        .sum();
+
+    // STABLE sort: when the same key appears more than once within a batch,
+    // the last write must win (matches the legacy WriteBatch path's semantics
+    // at archive/mod.rs:1573 and 1598). An unstable sort would leave equal
+    // keys in arbitrary order, so `dedup_keep_last_sorted` could keep an
+    // earlier write instead of the latest one. The runtime cost difference vs
+    // unstable is small (sort_by uses Timsort, ~1.5–2× of pdqsort on random
+    // data of this size); correctness wins. The underlying invariant
+    // (BlockStorageDiff produces unique keys per block) is upstream and not
+    // statically enforced, so we don't rely on it.
+    let sort_t = Instant::now();
+    payload.account_writes.sort_by(|a, b| a.0.cmp(&b.0));
+    dedup_keep_last_sorted(&mut payload.account_writes);
+    payload.storage_writes.sort_by(|a, b| a.0.cmp(&b.0));
+    dedup_keep_last_sorted(&mut payload.storage_writes);
+    timings.sort_dedup_us = sort_t.elapsed().as_micros() as u64;
+
+    let acc_path = tmp_dir.join(format!("acc_{:020}.sst", payload.batch_seq));
+    let sto_path = tmp_dir.join(format!("sto_{:020}.sst", payload.batch_seq));
+
+    let write_t = Instant::now();
+    if !payload.account_writes.is_empty() {
+        db.write_account_sst(&acc_path, &payload.account_writes)
+            .map_err(|e| anyhow::anyhow!("write_account_sst failed: {e}"))?;
+    }
+    if !payload.storage_writes.is_empty() {
+        db.write_storage_sst(&sto_path, &payload.storage_writes)
+            .map_err(|e| anyhow::anyhow!("write_storage_sst failed: {e}"))?;
+    }
+    timings.write_sst_us = write_t.elapsed().as_micros() as u64;
+
+    let ingest_t = Instant::now();
+    if !payload.account_writes.is_empty() {
+        db.ingest_account_ssts(vec![acc_path])
+            .map_err(|e| anyhow::anyhow!("ingest_account_ssts failed: {e}"))?;
+    }
+    if !payload.storage_writes.is_empty() {
+        db.ingest_storage_ssts(vec![sto_path])
+            .map_err(|e| anyhow::anyhow!("ingest_storage_ssts failed: {e}"))?;
+    }
+    timings.ingest_us = ingest_t.elapsed().as_micros() as u64;
+
+    Ok(BatchCompletion {
+        batch_seq: payload.batch_seq,
+        last_block_num: payload.last_block_num,
+        last_block_hash: payload.last_block_hash,
+        blocks_in_batch: payload.blocks_in_batch,
+        small_writes: payload.small_writes,
+        timings,
+    })
+}
+
+/// Bounded worker pool: at most `worker_count` ingest workers in flight.
+/// Workers complete out of order; the advancer is responsible for re-ordering
+/// by `batch_seq`. Worker errors abort the pipeline by dropping the
+/// completion channel, propagating the failure through the rest of the
+/// pipeline.
+fn spawn_rocksdb_ingest_dispatcher(
+    mut batch_rx: mpsc::Receiver<BatchPayload>,
+    completion_tx: mpsc::Sender<BatchCompletion>,
+    db: Arc<ArchiveRocksDBStorage>,
+    tmp_dir: PathBuf,
+    worker_count: usize,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> =
+            tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                done = tasks.join_next(), if tasks.len() >= worker_count => {
+                    let res = done.expect("len >= worker_count > 0");
+                    let comp = res
+                        .map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
+                    if completion_tx.send(comp).await.is_err() {
+                        return Err(anyhow::anyhow!(
+                            "watermark advancer dropped completion channel"
+                        ));
+                    }
+                }
+                batch = batch_rx.recv() => {
+                    match batch {
+                        Some(b) => {
+                            let db_clone = db.clone();
+                            let tmp_clone = tmp_dir.clone();
+                            tasks.spawn_blocking(move || {
+                                ingest_worker_process(db_clone, tmp_clone, b)
+                            });
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        while let Some(res) = tasks.join_next().await {
+            let comp = res
+                .map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
+            if completion_tx.send(comp).await.is_err() {
+                return Err(anyhow::anyhow!(
+                    "watermark advancer dropped completion channel"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Drain `BatchCompletion`s in `batch_seq` order. For each in-order drain,
+/// commit every batch's small writes (block_info / hash / code); on the last
+/// batch of the drain, also write `latest_block_hash` and mark the
+/// WriteBatch `set_sync(true)` so the trailing WAL fsync covers all
+/// preceding non-synced writes (WAL is sequential).
+fn spawn_rocksdb_watermark_advancer(
+    mut completion_rx: mpsc::Receiver<BatchCompletion>,
+    db: Arc<ArchiveRocksDBStorage>,
+    start_block: u64,
+    overall_start: Instant,
+    total_blocks: u64,
+) -> tokio::task::JoinHandle<(u64, u64)> {
+    tokio::task::spawn_blocking(move || {
+        let mut pending: BTreeMap<u64, BatchCompletion> = BTreeMap::new();
+        let mut next_seq: u64 = 0;
+        let mut written_count: u64 = 0;
+        let mut final_contiguous = start_block.saturating_sub(1);
+        let mut last_progress_log = Instant::now();
+
+        // Aggregate stage timings across all committed batches; emitted as a
+        // summary line at end of run for tuning.
+        let mut total_timings = BatchTimings::default();
+        let mut total_batches: u64 = 0;
+
+        while let Some(comp) = completion_rx.blocking_recv() {
+            pending.insert(comp.batch_seq, comp);
+
+            let mut drained: Vec<BatchCompletion> = Vec::new();
+            while let Some(c) = pending.remove(&next_seq) {
+                drained.push(c);
+                next_seq += 1;
+            }
+            if drained.is_empty() {
+                continue;
+            }
+
+            let last_idx = drained.len() - 1;
+            for (i, mut comp) in drained.into_iter().enumerate() {
+                let is_last = i == last_idx;
+                if is_last {
+                    StateDBWrite::write_latest_block_hash(
+                        &db,
+                        &mut comp.small_writes,
+                        comp.last_block_hash,
+                    )
+                    .expect("write_latest_block_hash");
+                    comp.small_writes.set_sync(true);
+                    final_contiguous = comp.last_block_num;
+                }
+
+                let commit_t = Instant::now();
+                StateDBWrite::commit(&db, comp.small_writes).expect("small batch commit");
+                comp.timings.commit_us = commit_t.elapsed().as_micros() as u64;
+
+                written_count += comp.blocks_in_batch;
+                total_timings.add(&comp.timings);
+                total_batches += 1;
+
+                let total_us = comp.timings.sort_dedup_us
+                    + comp.timings.write_sst_us
+                    + comp.timings.ingest_us
+                    + comp.timings.commit_us;
+                info!(target: "archive_init",
+                    "batch_seq={} last_block={} accs={} stos={} acc={}MB sto={}MB | sort={}ms write_sst={}ms ingest={}ms commit{}={}ms total={}ms",
+                    comp.batch_seq,
+                    comp.last_block_num,
+                    comp.timings.account_count,
+                    comp.timings.storage_count,
+                    comp.timings.account_bytes / (1024 * 1024),
+                    comp.timings.storage_bytes / (1024 * 1024),
+                    comp.timings.sort_dedup_us / 1000,
+                    comp.timings.write_sst_us / 1000,
+                    comp.timings.ingest_us / 1000,
+                    if is_last { "(sync)" } else { "" },
+                    comp.timings.commit_us / 1000,
+                    total_us / 1000,
+                );
+            }
+
+            if last_progress_log.elapsed() >= Duration::from_secs(1) {
+                let elapsed = overall_start.elapsed().as_secs_f64();
+                let bps = if elapsed > 0.0 {
+                    written_count as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let remaining = total_blocks.saturating_sub(written_count);
+                let eta = if bps > 0.0 {
+                    (remaining as f64 / bps) as u64
+                } else {
+                    0
+                };
+                let pct = (written_count.min(total_blocks) * 100) / total_blocks.max(1);
+                info!(target: "archive_init",
+                    "Progress: {}% ({}/{}) | Pending: {} | Speed: {:.1} blocks/s | ETA: {}s",
+                    pct, written_count, total_blocks, pending.len(), bps, eta);
+                last_progress_log = Instant::now();
+            }
+        }
+
+        if !pending.is_empty() {
+            warn!(target: "archive_init",
+                "{} batches arrived but never reached the in-order prefix; expected next_seq = {}",
+                pending.len(), next_seq);
+        }
+
+        if total_batches > 0 {
+            // Aggregate stage breakdown across the entire run. With N>1
+            // workers the per-stage `*_us` totals are the *sum* across batches
+            // (wall-clock through the pipeline is much shorter because
+            // workers run in parallel). The numbers compare stages against
+            // each other, not against wall time.
+            let sd = total_timings.sort_dedup_us / 1000;
+            let ws = total_timings.write_sst_us / 1000;
+            let ig = total_timings.ingest_us / 1000;
+            let cm = total_timings.commit_us / 1000;
+            let sum = (sd + ws + ig + cm).max(1);
+            info!(target: "archive_init",
+                "Stage totals (summed across {} batches; multi-worker overlap not reflected): \
+                 sort+dedup {}ms ({}%) | write_sst {}ms ({}%) | ingest {}ms ({}%) | small commit+fsync {}ms ({}%)",
+                total_batches,
+                sd, sd * 100 / sum,
+                ws, ws * 100 / sum,
+                ig, ig * 100 / sum,
+                cm, cm * 100 / sum,
+            );
+            info!(target: "archive_init",
+                "Volume totals: accounts {} ({}MB) | storage {} ({}MB)",
+                total_timings.account_count,
+                total_timings.account_bytes / (1024 * 1024),
+                total_timings.storage_count,
+                total_timings.storage_bytes / (1024 * 1024),
+            );
+        }
+
+        (written_count, final_contiguous)
+    })
+}
+
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
         info!(target: "archive_init", "Starting archive initialization");
@@ -384,71 +906,150 @@ impl Command {
 
         let overall_start = Instant::now();
 
-        // Create a bounded channel so fetchers cannot run arbitrarily far ahead
-        // of the single ordered database writer.
-        let (tx, rx) = mpsc::channel::<EncodedBlockData>(self.max_tasks);
-
-        // Spawn checkpoint worker
-        let checkpoint_worker = Self::spawn_checkpoint_worker(
-            rx,
-            db.clone(),
-            start_block,
-            total_blocks,
-            overall_start,
-            self.checkpoint_interval,
-        );
-
-        // Create stream of block heights
-        let blocks = stream::iter(start_block..=self.end_block);
-
-        // Capture variables for the async block
+        // Capture variables for the fetcher async block
         let rpc_client = Some(rpc_client);
         let bucket = self.s3_bucket.clone();
         let outer_bucket = self.s3_outer_bucket.clone();
         let chain_id = self.s3_chain_id.clone();
         let version = self.s3_version.clone();
         let max_tasks = self.max_tasks;
+        let blocks = stream::iter(start_block..=self.end_block);
 
-        // Process blocks concurrently with buffer_unordered (fetch only)
-        blocks
-            .map(|block_num| {
-                let rpc = rpc_client.clone();
-                let s3 = s3_client.clone();
-                let bucket = bucket.clone();
-                let outer_bucket = outer_bucket.clone();
-                let chain_id = chain_id.clone();
-                let version = version.clone();
+        // Branch on backend: RocksDB uses the SST ingest pipeline, MDBX keeps
+        // the existing single-threaded checkpoint worker (MDBX has neither
+        // SstFileWriter nor a comparable bulk-load path).
+        let (final_success, final_contiguous) = match &*db {
+            ArchiveStorage::RocksDB(rocks) => {
+                let rocks = rocks.clone();
 
-                async move {
-                    Self::fetch_block_with_retry(
-                        rpc,
-                        s3,
-                        bucket,
-                        outer_bucket,
-                        chain_id,
-                        version,
-                        block_num,
-                    )
-                    .await
+                // Prepare temp dir for SST files. Same filesystem as the DB so
+                // `IngestExternalFileOptions::set_move_files(true)` can rename
+                // instead of copy. Wipe any leftover from a previous failed
+                // run before starting (only ingest temp files live here).
+                let tmp_dir = self.db_path.join(INGEST_TMP_SUBDIR);
+                if tmp_dir.exists() {
+                    std::fs::remove_dir_all(&tmp_dir)?;
                 }
-            })
-            .buffer_unordered(max_tasks)
-            .for_each(|block_data| {
-                let tx = tx.clone();
-                async move {
-                    // Send block data to checkpoint worker for writing
-                    tx.send(block_data)
-                        .await
-                        .expect("Checkpoint worker channel closed");
-                }
-            })
-            .await;
+                std::fs::create_dir_all(&tmp_dir)?;
 
-        // Drop the sender to signal completion to the checkpoint worker
-        drop(tx);
+                let (block_tx, block_rx) =
+                    mpsc::channel::<EncodedBlockData>(self.max_tasks);
+                let (batch_tx, batch_rx) =
+                    mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
+                let (completion_tx, completion_rx) =
+                    mpsc::channel::<BatchCompletion>(INGEST_WORKER_COUNT + 1);
 
-        // Wait for checkpoint worker to finish and get final stats
-        let (final_success, final_contiguous) = checkpoint_worker.await?;
+                let accumulator_handle = spawn_rocksdb_batch_accumulator(
+                    block_rx,
+                    batch_tx,
+                    rocks.clone(),
+                    start_block,
+                    self.checkpoint_interval,
+                );
+                let dispatcher_handle = spawn_rocksdb_ingest_dispatcher(
+                    batch_rx,
+                    completion_tx,
+                    rocks.clone(),
+                    tmp_dir.clone(),
+                    INGEST_WORKER_COUNT,
+                );
+                let advancer_handle = spawn_rocksdb_watermark_advancer(
+                    completion_rx,
+                    rocks.clone(),
+                    start_block,
+                    overall_start,
+                    total_blocks,
+                );
+
+                blocks
+                    .map(|block_num| {
+                        let rpc = rpc_client.clone();
+                        let s3 = s3_client.clone();
+                        let bucket = bucket.clone();
+                        let outer_bucket = outer_bucket.clone();
+                        let chain_id = chain_id.clone();
+                        let version = version.clone();
+                        async move {
+                            Self::fetch_block_with_retry(
+                                rpc,
+                                s3,
+                                bucket,
+                                outer_bucket,
+                                chain_id,
+                                version,
+                                block_num,
+                            )
+                            .await
+                        }
+                    })
+                    .buffer_unordered(max_tasks)
+                    .for_each(|block_data| {
+                        let tx = block_tx.clone();
+                        async move {
+                            tx.send(block_data)
+                                .await
+                                .expect("Batch accumulator channel closed");
+                        }
+                    })
+                    .await;
+                drop(block_tx);
+
+                let _accumulator_high_water = accumulator_handle.await?;
+                dispatcher_handle.await??;
+                let stats = advancer_handle.await?;
+
+                // Best-effort cleanup; orphan files will be wiped at next
+                // archive-init startup anyway.
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                stats
+            }
+            ArchiveStorage::MDBX(_) => {
+                let (tx, rx) = mpsc::channel::<EncodedBlockData>(self.max_tasks);
+                let checkpoint_worker = Self::spawn_checkpoint_worker(
+                    rx,
+                    db.clone(),
+                    start_block,
+                    total_blocks,
+                    overall_start,
+                    self.checkpoint_interval,
+                );
+
+                blocks
+                    .map(|block_num| {
+                        let rpc = rpc_client.clone();
+                        let s3 = s3_client.clone();
+                        let bucket = bucket.clone();
+                        let outer_bucket = outer_bucket.clone();
+                        let chain_id = chain_id.clone();
+                        let version = version.clone();
+                        async move {
+                            Self::fetch_block_with_retry(
+                                rpc,
+                                s3,
+                                bucket,
+                                outer_bucket,
+                                chain_id,
+                                version,
+                                block_num,
+                            )
+                            .await
+                        }
+                    })
+                    .buffer_unordered(max_tasks)
+                    .for_each(|block_data| {
+                        let tx = tx.clone();
+                        async move {
+                            tx.send(block_data)
+                                .await
+                                .expect("Checkpoint worker channel closed");
+                        }
+                    })
+                    .await;
+                drop(tx);
+
+                checkpoint_worker.await?
+            }
+        };
 
         let total_time = overall_start.elapsed().as_secs_f64();
         let avg_speed = final_success as f64 / total_time;
