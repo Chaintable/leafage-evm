@@ -39,22 +39,6 @@ pub struct GatewayObjectConfig {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct SnapshotConfig {
-    pub endpoint: String,
-    pub bucket: String,
-    pub namespace: String,
-    pub component: String,
-    #[serde(default)]
-    pub region: String,
-    #[serde(default)]
-    pub access_key_id: String,
-    #[serde(default)]
-    pub secret_access_key: String,
-    #[serde(default)]
-    pub concurrency: usize,
-}
-
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,

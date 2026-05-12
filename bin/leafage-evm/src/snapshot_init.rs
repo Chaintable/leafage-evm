@@ -1,9 +1,9 @@
-use crate::utils::SnapshotConfig;
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::Client;
+use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
@@ -15,6 +15,22 @@ const LATEST_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
 const LATEST_RETRY_MAX_DELAY_MS: u64 = 60_000;
 const LATEST_RETRY_MAX_ATTEMPTS: usize = 6;
 const PER_FILE_MAX_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct SnapshotConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub namespace: String,
+    pub component: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub concurrency: usize,
+}
 
 #[derive(Debug, Deserialize)]
 struct R2Manifest {
@@ -32,7 +48,7 @@ struct R2Manifest {
     created_at: String,
 }
 
-pub struct Initializer {
+struct Initializer {
     cfg: SnapshotConfig,
     db_path: PathBuf,
     s3_client: Client,
@@ -40,7 +56,7 @@ pub struct Initializer {
 }
 
 impl Initializer {
-    pub fn new(cfg: SnapshotConfig, db_path: PathBuf) -> Result<Self> {
+    fn new(cfg: SnapshotConfig, db_path: PathBuf) -> Result<Self> {
         if cfg.endpoint.is_empty() {
             anyhow::bail!("snapshot_config.endpoint is required");
         }
@@ -99,12 +115,12 @@ impl Initializer {
         })
     }
 
-    pub async fn restore(&self) -> Result<()> {
+    async fn restore(&self) -> Result<()> {
         let chain_prefix = format!("{}/{}", self.cfg.namespace, self.cfg.component);
         let latest_key = format!("{}/latest.json", chain_prefix);
 
         info!(
-            target: "snapshot_initializer",
+            target: "snapshot_init",
             "fetching latest manifest bucket={} key={}",
             self.cfg.bucket, latest_key,
         );
@@ -113,7 +129,7 @@ impl Initializer {
             .await
             .context("fetch latest.json")?;
         info!(
-            target: "snapshot_initializer",
+            target: "snapshot_init",
             "manifest snap_id={} file_count={} total_size_bytes={} created_at={}",
             manifest.snap_id, manifest.file_count, manifest.total_size_bytes, manifest.created_at,
         );
@@ -148,7 +164,7 @@ impl Initializer {
         }
 
         info!(
-            target: "snapshot_initializer",
+            target: "snapshot_init",
             "listing objects under {}",
             manifest.files_prefix,
         );
@@ -169,7 +185,7 @@ impl Initializer {
             .with_context(|| format!("mkdir {:?}", self.db_path))?;
 
         info!(
-            target: "snapshot_initializer",
+            target: "snapshot_init",
             "downloading {} files into {:?} concurrency={}",
             keys.len(),
             self.db_path,
@@ -187,7 +203,7 @@ impl Initializer {
             );
         }
         info!(
-            target: "snapshot_initializer",
+            target: "snapshot_init",
             "snapshot restore complete: {} files written",
             downloaded,
         );
@@ -206,7 +222,7 @@ impl Initializer {
                 }
                 Err(err) => {
                     warn!(
-                        target: "snapshot_initializer",
+                        target: "snapshot_init",
                         "latest.json fetch attempt {}/{} failed: {:#}",
                         attempt, LATEST_RETRY_MAX_ATTEMPTS, err,
                     );
@@ -307,7 +323,7 @@ impl Initializer {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     warn!(
-                        target: "snapshot_initializer",
+                        target: "snapshot_init",
                         "download {} attempt {}/{} failed: {:#}",
                         key, attempt, PER_FILE_MAX_ATTEMPTS, err,
                     );
@@ -337,6 +353,42 @@ impl Initializer {
             .await
             .with_context(|| format!("write {:?}", local_path))?;
         file.flush().await?;
+        Ok(())
+    }
+}
+
+/// `leafage-evm snapshot-init` command
+#[derive(Debug, Parser)]
+pub(crate) struct Command {
+    /// The path to the database directory to populate.
+    #[arg(long, value_name = "PATH")]
+    db_path: PathBuf,
+
+    /// The R2 snapshot config path or inline JSON.
+    #[arg(long, value_parser = parse_snapshot_config, value_name = "SNAPSHOT_CONFIG_PATH")]
+    snapshot_config: SnapshotConfig,
+}
+
+fn parse_snapshot_config(arg: &str) -> Result<SnapshotConfig> {
+    let cfg: SnapshotConfig = if std::path::Path::new(arg).exists() {
+        let file = std::fs::File::open(arg)?;
+        serde_json::from_reader(file)?
+    } else {
+        serde_json::from_str(arg)?
+    };
+    Ok(cfg)
+}
+
+impl Command {
+    pub(crate) async fn run(&mut self) -> Result<()> {
+        info!(
+            target: "snapshot_init",
+            "starting snapshot-init db_path={:?}",
+            self.db_path,
+        );
+        let initializer = Initializer::new(self.snapshot_config.clone(), self.db_path.clone())?;
+        initializer.restore().await?;
+        info!(target: "snapshot_init", "snapshot-init finished");
         Ok(())
     }
 }
