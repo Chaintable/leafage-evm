@@ -4,6 +4,7 @@ mod db_migrate;
 mod initializer;
 mod register;
 mod runner;
+mod snapshot_init;
 mod standalone;
 mod updater;
 mod utils;
