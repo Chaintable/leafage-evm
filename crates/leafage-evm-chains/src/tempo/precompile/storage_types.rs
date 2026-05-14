@@ -1403,3 +1403,242 @@ where
         })
     }
 }
+
+// ===========================================================================
+// Set<T> -- OpenZeppelin EnumerableSet for EVM storage
+// ===========================================================================
+//
+// Storage layout (mirrors writer crates/precompiles/src/storage/types/set.rs):
+//   base_slot: length (U256) + values array data at keccak256(base_slot)
+//   base_slot + 1: positions mapping (T -> u32, 1-indexed; 0 = not present)
+//
+// Read path is the leafage hot path (state diffs from writer populate storage,
+// eth_call reads). Write paths are simplified relative to writer:
+//   - `insert` and `remove` are implemented (used by setCallScopes full-replace)
+//   - swap-and-pop on remove follows OZ semantics
+
+/// Read-only in-memory snapshot of an [`SetHandler`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Set<T>(Vec<T>);
+
+impl<T> Set<T> {
+    #[inline]
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> From<Set<T>> for Vec<T> {
+    #[inline]
+    fn from(set: Set<T>) -> Self {
+        set.0
+    }
+}
+
+impl<T: Eq + Hash + Clone> From<Vec<T>> for Set<T> {
+    /// Creates a set from a vector, deduplicating while preserving first-occurrence order.
+    fn from(vec: Vec<T>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::with_capacity(vec.len());
+        for item in vec {
+            if seen.insert(item.clone()) {
+                deduped.push(item);
+            }
+        }
+        Self(deduped)
+    }
+}
+
+impl<T> IntoIterator for Set<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Handler for storage operations on a `Set<T>`.
+///
+/// Layout (`base_slot` is the U256 reserved for the set):
+/// - `base_slot`: vec length; values data at `keccak256(base_slot)` (via `VecHandler`)
+/// - `base_slot + 1`: `Mapping<T, u32>` for OZ EnumerableSet positions (1-indexed, 0 = absent)
+pub struct SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    values: VecHandler<T>,
+    positions: Mapping<T, u32>,
+    base_slot: U256,
+    address: Address,
+}
+
+/// Set occupies 2 reserved slots; values + positions are then placed at hashed
+/// derived slots. Layout-equivalent to writer `crates/precompiles/src/storage/types/set.rs`.
+impl<T> StorableType for Set<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    const LAYOUT: Layout = Layout::Slots(2);
+    const IS_DYNAMIC: bool = true;
+    type Handler = SetHandler<T>;
+
+    fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
+        SetHandler::new(slot, address)
+    }
+}
+
+impl<T> Storable for Set<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+    T::Handler: Handler<T>,
+{
+    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let values: Vec<T> = Vec::load(storage, slot, LayoutCtx::FULL)?;
+        Ok(Self(values))
+    }
+
+    /// Writes the set's values vector and length. The positions mapping at
+    /// `slot + 1` is NOT updated here — it is only used by single-element
+    /// `contains` / `insert` / `remove` paths. Full-replace writes via this
+    /// `store` (e.g. nested via parent struct `Storable::store`) skip them;
+    /// callers that need `contains` correctness afterwards must use
+    /// `SetHandler::write` which keeps positions in sync.
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        Vec::store(&self.0, storage, slot, LayoutCtx::FULL)
+    }
+}
+
+#[inline]
+fn checked_position(index: usize) -> Result<u32> {
+    u32::try_from(index)
+        .ok()
+        .and_then(|i| i.checked_add(1))
+        .ok_or_else(|| TempoPrecompileError::Fatal("Set position overflow".into()))
+}
+
+impl<T> SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    pub fn new(base_slot: U256, address: Address) -> Self {
+        Self {
+            values: VecHandler::new(base_slot, address),
+            positions: Mapping::new(base_slot + U256::ONE, address),
+            base_slot,
+            address,
+        }
+    }
+
+    /// Returns the base storage slot.
+    #[inline]
+    pub fn base_slot(&self) -> U256 {
+        self.base_slot
+    }
+
+    /// Returns the number of elements in the set.
+    pub fn len(&self) -> Result<usize> {
+        self.values.len()
+    }
+
+    /// Returns whether the set is empty.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Returns true if `value` is in the set.
+    pub fn contains(&self, value: &T) -> Result<bool> {
+        Ok(self.positions.at(value).read()? != 0)
+    }
+
+    /// Returns the value at the given index, or `None` if OOB.
+    pub fn at(&self, index: usize) -> Result<Option<T>>
+    where
+        T::Handler: Handler<T>,
+    {
+        if index >= self.len()? {
+            return Ok(None);
+        }
+        Ok(Some(self.values[index].read()?))
+    }
+}
+
+impl<T> Handler<Set<T>> for SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+    T::Handler: Handler<T>,
+{
+    fn read(&self) -> Result<Set<T>> {
+        let len = self.len()?;
+        let mut vec = Vec::with_capacity(len);
+        for i in 0..len {
+            vec.push(self.values[i].read()?);
+        }
+        Ok(Set(vec))
+    }
+
+    fn write(&mut self, value: Set<T>) -> Result<()> {
+        let old_len = self.values.len()?;
+        let new_vec: Vec<T> = value.into();
+        let new_len = new_vec.len();
+
+        // Clear old positions.
+        for i in 0..old_len {
+            let old_value = self.values[i].read()?;
+            self.positions.at_mut(&old_value).delete()?;
+        }
+
+        // Write new values + positions (1-indexed).
+        for (index, new_value) in new_vec.into_iter().enumerate() {
+            self.positions
+                .at_mut(&new_value)
+                .write(checked_position(index)?)?;
+            self.values[index].write(new_value)?;
+        }
+
+        // Update length.
+        Slot::<U256>::new(self.base_slot, self.address).write(U256::from(new_len))?;
+
+        // Clear leftover value slots if shrinking.
+        for i in new_len..old_len {
+            self.values[i].delete()?;
+        }
+
+        Ok(())
+    }
+
+    fn delete(&mut self) -> Result<()> {
+        let len = self.len()?;
+        for i in 0..len {
+            let value = self.values[i].read()?;
+            self.positions.at_mut(&value).delete()?;
+        }
+        self.values.delete()
+    }
+
+    fn t_read(&self) -> Result<Set<T>> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+    fn t_write(&mut self, _value: Set<T>) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+    fn t_delete(&mut self) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+}

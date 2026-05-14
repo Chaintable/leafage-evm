@@ -53,6 +53,18 @@ alloy::sol! {
             uint256 amount;
         }
 
+        /// Selector-level recipient rule (TIP-1011, T3+).
+        struct SelectorRule {
+            bytes4 selector;
+            address[] recipients;
+        }
+
+        /// Per-target call scope (TIP-1011, T3+).
+        struct CallScope {
+            address target;
+            SelectorRule[] selectorRules;
+        }
+
         struct KeyInfo {
             SignatureType signatureType;
             address keyId;
@@ -83,6 +95,12 @@ alloy::sol! {
 
         function getKey(address account, address keyId) external view returns (KeyInfo memory);
 
+        /// (TIP-1011, T3+) Replace the call scopes for a given access key.
+        function setCallScopes(address keyId, CallScope[] calldata scopes) external;
+
+        /// (TIP-1011, T3+) Returns the call scopes for `(account, keyId)`.
+        function getCallScope(address account, address keyId) external view returns (CallScope[] memory);
+
         function getRemainingLimit(
             address account,
             address keyId,
@@ -101,6 +119,8 @@ alloy::sol! {
         error ExpiryInPast();
         error KeyAlreadyRevoked();
         error SignatureTypeMismatch(uint8 expected, uint8 actual);
+        /// (TIP-1011, T3+) Raised by setCallScopes / validate_call_scopes.
+        error InvalidCallScope();
     }
 }
 
@@ -240,6 +260,38 @@ pub struct AccountKeychain {
     pub(crate) transaction_key: Slot<Address>,
     // Slot 3: tx_origin (transient)
     pub(crate) tx_origin: Slot<Address>,
+    // Slot 4 (T3+, TIP-1011): call_scopes[hash(account, keyId)] -> KeyScope
+    //
+    // Per-entry layout (mirrors writer Solidity `mapping(bytes32 => KeyScope)`,
+    // 4 reserved slots starting at `keccak256(key . slot_be_32)`):
+    //     +0: is_scoped (bool)
+    //     +1, +2: targets Set<Address> (length at +1, positions Mapping base at +2)
+    //     +3: target_scopes Mapping<Address, TargetScope> base slot
+    //   target_scopes[t] (3 slots): selectors Set<bytes4> at +0,+1 ; selector_scopes Mapping at +2
+    //     selector_scopes[s] (2 slots): recipients Set<Address> at +0,+1
+    //
+    // The setCallScopes / getCallScope dispatch entries below are *framework
+    // stubs* that revert NotImplemented. Wiring them up to actually read/write
+    // this layout requires three leafage framework extensions that are out of
+    // scope for the current PR:
+    //
+    //   1. `FixedBytes<4>` impls of `StorageKey + Storable + StorableType +
+    //      Packable + FromWord + sealed::OnlyPrimitives` so SetHandler<bytes4>
+    //      can store the per-target selector set with the same on-chain layout
+    //      as writer.
+    //   2. A per-contract `StorageOps` adapter around `StorageCtx` so the
+    //      free-standing `Set::load` / `SetHandler::write` calls can run under
+    //      a specific contract address (currently `Slot` / `Mapping` are the
+    //      only types that hold an address).
+    //   3. `TempoAddressExt` import path and `tip20_factory.is_tip20(address)`
+    //      method visibility, so the T3 stateful target check works.
+    //
+    // Until those are in place, reading a writer state diff that contains
+    // `call_scopes[k]` entries via leafage will return `Vec::new()` from
+    // `getCallScope` (treated as "no scope set") rather than the actual
+    // configured scopes. AA tx that don't configure call scopes are
+    // unaffected.
+    pub(crate) call_scope_base: U256,
 
     pub address: Address,
     pub storage: StorageCtx,
@@ -253,6 +305,7 @@ impl AccountKeychain {
             spending_limits: Mapping::new(U256::from(1), address),
             transaction_key: Slot::new(U256::from(2), address),
             tx_origin: Slot::new(U256::from(3), address),
+            call_scope_base: U256::from(4),
             address,
             storage: StorageCtx::default(),
         }
@@ -690,6 +743,22 @@ impl Precompile for AccountKeychain {
                 }
                 IAccountKeychain::IAccountKeychainCalls::getTransactionKey(call) => {
                     view(call, |c| self.get_transaction_key(c, msg_sender))
+                }
+                IAccountKeychain::IAccountKeychainCalls::setCallScopes(call) => {
+                    // T3+ framework stub — see KeyScope storage-layout comment
+                    // above. Reverts InvalidCallScope until the leafage Set /
+                    // FixedBytes<4> framework extensions land.
+                    mutate_void(call, msg_sender, |_sender, _c| {
+                        Err(TempoPrecompileError::Revert(
+                            IAccountKeychain::InvalidCallScope {}.abi_encode().into(),
+                        ))
+                    })
+                }
+                IAccountKeychain::IAccountKeychainCalls::getCallScope(call) => {
+                    // T3+ framework stub — returns an empty scope list. Once
+                    // the storage-read path is wired this should call into the
+                    // KeyScope layout described above.
+                    view(call, |_c| Ok(Vec::<IAccountKeychain::CallScope>::new()))
                 }
             },
         )
