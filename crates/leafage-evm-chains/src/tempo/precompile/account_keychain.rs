@@ -22,16 +22,23 @@
 //! validation, which is not triggered by eth_call. The precompile only stores/reads key
 //! metadata (including signature type for type-matching checks).
 
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
-use alloy::sol_types::{SolError, SolInterface};
+use std::collections::HashSet;
+
+use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
 use super::storage::{ContractStorage, StorageCtx};
-use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
+use super::storage_types::{
+    Handler, Layout, LayoutCtx, Mapping, Set as StorageSet, SetHandler, Slot, Storable,
+    StorableType, StorageKey,
+};
+use super::tip20::ITIP20;
+use super::tip20_factory::TIP20Factory;
 use super::{
-    dispatch_call,  input_cost, mutate_void, view, Precompile,
+    dispatch_call, input_cost, mutate_void, view, Precompile,
     ACCOUNT_KEYCHAIN_ADDRESS,
 };
 
@@ -95,11 +102,24 @@ alloy::sol! {
 
         function getKey(address account, address keyId) external view returns (KeyInfo memory);
 
-        /// (TIP-1011, T3+) Replace the call scopes for a given access key.
-        function setCallScopes(address keyId, CallScope[] calldata scopes) external;
+        /// (TIP-1011, T3+) Set or replace allowed calls for one or more key+target pairs.
+        function setAllowedCalls(
+            address keyId,
+            CallScope[] calldata scopes
+        ) external;
 
-        /// (TIP-1011, T3+) Returns the call scopes for `(account, keyId)`.
-        function getCallScope(address account, address keyId) external view returns (CallScope[] memory);
+        /// (TIP-1011, T3+) Remove any configured call scope for a key+target pair.
+        function removeAllowedCalls(address keyId, address target) external;
+
+        /// (TIP-1011, T3+) Returns whether the key is call-scoped and the configured scopes.
+        ///
+        /// `isScoped = false` means unrestricted. `isScoped = true && scopes.length == 0`
+        /// means scoped deny-all. Missing, revoked, or expired keys report scoped deny-all
+        /// so this getter never exposes stale persisted scope state.
+        function getAllowedCalls(
+            address account,
+            address keyId
+        ) external view returns (bool isScoped, CallScope[] memory scopes);
 
         function getRemainingLimit(
             address account,
@@ -178,6 +198,29 @@ fn err_signature_type_mismatch(expected: u8, actual: u8) -> TempoPrecompileError
         IAccountKeychain::SignatureTypeMismatch { expected, actual }
             .abi_encode()
             .into(),
+    )
+}
+
+fn err_invalid_call_scope() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(IAccountKeychain::InvalidCallScope {}.abi_encode().into())
+}
+
+// ===========================================================================
+// TIP-1011 — constrained TIP-20 selectors for recipient-restricted rules
+// ===========================================================================
+
+const TIP20_TRANSFER_SELECTOR: [u8; 4] = ITIP20::transferCall::SELECTOR;
+const TIP20_APPROVE_SELECTOR: [u8; 4] = ITIP20::approveCall::SELECTOR;
+const TIP20_TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = ITIP20::transferWithMemoCall::SELECTOR;
+
+/// Returns true if `selector` is one of TIP-20's recipient-bearing selectors
+/// (`transfer`, `approve`, `transferWithMemo`). Mirrors writer
+/// `account_keychain/mod.rs::is_constrained_tip20_selector`.
+#[inline]
+fn is_constrained_tip20_selector(selector: [u8; 4]) -> bool {
+    matches!(
+        selector,
+        TIP20_TRANSFER_SELECTOR | TIP20_APPROVE_SELECTOR | TIP20_TRANSFER_WITH_MEMO_SELECTOR
     )
 }
 
@@ -260,37 +303,19 @@ pub struct AccountKeychain {
     pub(crate) transaction_key: Slot<Address>,
     // Slot 3: tx_origin (transient)
     pub(crate) tx_origin: Slot<Address>,
-    // Slot 4 (T3+, TIP-1011): call_scopes[hash(account, keyId)] -> KeyScope
+    // Slot 4 (T3+, TIP-1011): key_scopes[hash(account, keyId)] -> KeyScope
     //
-    // Per-entry layout (mirrors writer Solidity `mapping(bytes32 => KeyScope)`,
+    // Per-entry layout (mirrors writer's `#[derive(Storable)]` for KeyScope;
     // 4 reserved slots starting at `keccak256(key . slot_be_32)`):
     //     +0: is_scoped (bool)
-    //     +1, +2: targets Set<Address> (length at +1, positions Mapping base at +2)
+    //     +1, +2: targets Set<Address> (vec length at +1, positions Mapping at +2)
     //     +3: target_scopes Mapping<Address, TargetScope> base slot
     //   target_scopes[t] (3 slots): selectors Set<bytes4> at +0,+1 ; selector_scopes Mapping at +2
     //     selector_scopes[s] (2 slots): recipients Set<Address> at +0,+1
     //
-    // The setCallScopes / getCallScope dispatch entries below are *framework
-    // stubs* that revert NotImplemented. Wiring them up to actually read/write
-    // this layout requires three leafage framework extensions that are out of
-    // scope for the current PR:
-    //
-    //   1. `FixedBytes<4>` impls of `StorageKey + Storable + StorableType +
-    //      Packable + FromWord + sealed::OnlyPrimitives` so SetHandler<bytes4>
-    //      can store the per-target selector set with the same on-chain layout
-    //      as writer.
-    //   2. A per-contract `StorageOps` adapter around `StorageCtx` so the
-    //      free-standing `Set::load` / `SetHandler::write` calls can run under
-    //      a specific contract address (currently `Slot` / `Mapping` are the
-    //      only types that hold an address).
-    //   3. `TempoAddressExt` import path and `tip20_factory.is_tip20(address)`
-    //      method visibility, so the T3 stateful target check works.
-    //
-    // Until those are in place, reading a writer state diff that contains
-    // `call_scopes[k]` entries via leafage will return `Vec::new()` from
-    // `getCallScope` (treated as "no scope set") rather than the actual
-    // configured scopes. AA tx that don't configure call scopes are
-    // unaffected.
+    // Reads and writes are wired in via helper functions (`key_scope_base`,
+    // `target_scope_base`, `selector_scope_base`) that compute the nested
+    // base slot and pass it to a fresh `SetHandler`/`Slot`/`Mapping` instance.
     pub(crate) call_scope_base: U256,
 
     pub address: Address,
@@ -691,6 +716,344 @@ impl AccountKeychain {
 
         self.verify_and_update_spending(account, transaction_key, token, approval_increase)
     }
+
+    // -----------------------------------------------------------------------
+    // CallScope (TIP-1011, T3+) — slot computation helpers
+    // -----------------------------------------------------------------------
+    //
+    // Slot map (recap of the `call_scope_base` field doc):
+    //
+    //   key_scope_base(key_hash):
+    //     +0  is_scoped              (bool)
+    //     +1  targets vec length     | Set<Address>
+    //     +2  targets positions base | Mapping<Address, u32>
+    //     +3  target_scopes base     | Mapping<Address, TargetScope>
+    //
+    //   target_scope_base(key_hash, target):
+    //     +0  selectors vec length          | Set<FixedBytes<4>>
+    //     +1  selectors positions base      | Mapping<FixedBytes<4>, u32>
+    //     +2  selector_scopes base          | Mapping<FixedBytes<4>, SelectorScope>
+    //
+    //   selector_scope_base(key_hash, target, selector):
+    //     +0  recipients vec length         | Set<Address>
+    //     +1  recipients positions base     | Mapping<Address, u32>
+
+    #[inline]
+    fn key_scope_base(&self, key_hash: B256) -> U256 {
+        key_hash.mapping_slot(self.call_scope_base)
+    }
+
+    fn is_scoped_slot(&self, key_hash: B256) -> Slot<bool> {
+        Slot::new(self.key_scope_base(key_hash), self.address)
+    }
+
+    fn targets_handler(&self, key_hash: B256) -> SetHandler<Address> {
+        SetHandler::new(self.key_scope_base(key_hash) + U256::ONE, self.address)
+    }
+
+    #[inline]
+    fn target_scope_base(&self, key_hash: B256, target: Address) -> U256 {
+        let target_scopes_map_base = self.key_scope_base(key_hash) + U256::from(3u8);
+        target.mapping_slot(target_scopes_map_base)
+    }
+
+    fn selectors_handler(&self, key_hash: B256, target: Address) -> SetHandler<FixedBytes<4>> {
+        SetHandler::new(self.target_scope_base(key_hash, target), self.address)
+    }
+
+    #[inline]
+    fn selector_scope_base(
+        &self,
+        key_hash: B256,
+        target: Address,
+        selector: FixedBytes<4>,
+    ) -> U256 {
+        let selector_scopes_map_base = self.target_scope_base(key_hash, target) + U256::from(2u8);
+        selector.mapping_slot(selector_scopes_map_base)
+    }
+
+    fn recipients_handler(
+        &self,
+        key_hash: B256,
+        target: Address,
+        selector: FixedBytes<4>,
+    ) -> SetHandler<Address> {
+        SetHandler::new(
+            self.selector_scope_base(key_hash, target, selector),
+            self.address,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // CallScope — public dispatch entries
+    // -----------------------------------------------------------------------
+
+    /// (T3+) Set or replace allowed calls for one or more (key, target) pairs.
+    /// Mirrors writer `account_keychain/mod.rs:462-487 set_allowed_calls`.
+    pub fn set_allowed_calls(
+        &mut self,
+        msg_sender: Address,
+        call: IAccountKeychain::setAllowedCallsCall,
+    ) -> Result<()> {
+        if !self.storage.spec().is_t3() {
+            return Err(err_invalid_call_scope());
+        }
+        self.ensure_admin_caller(msg_sender)?;
+
+        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let key = self.load_active_key(msg_sender, call.keyId)?;
+        if current_timestamp >= key.expiry {
+            return Err(err_key_expired());
+        }
+
+        let key_hash = Self::spending_limit_key(msg_sender, call.keyId);
+        let scopes = call.scopes;
+        if scopes.is_empty() {
+            return Err(err_invalid_call_scope());
+        }
+
+        self.validate_call_scopes(&scopes)?;
+
+        for scope in &scopes {
+            self.upsert_target_scope(key_hash, scope)?;
+        }
+
+        self.is_scoped_slot(key_hash).write(true)
+    }
+
+    /// (T3+) Remove any configured call scope for a (key, target) pair.
+    /// Mirrors writer `account_keychain/mod.rs:489-509 remove_allowed_calls`.
+    pub fn remove_allowed_calls(
+        &mut self,
+        msg_sender: Address,
+        call: IAccountKeychain::removeAllowedCallsCall,
+    ) -> Result<()> {
+        self.ensure_admin_caller(msg_sender)?;
+
+        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        self.load_active_key(msg_sender, call.keyId)?;
+        if current_timestamp >= self.keys[msg_sender][call.keyId].read()?.expiry {
+            return Err(err_key_expired());
+        }
+
+        let key_hash = Self::spending_limit_key(msg_sender, call.keyId);
+        if !self.is_scoped_slot(key_hash).read()? {
+            return Ok(());
+        }
+
+        self.remove_target_scope(key_hash, call.target)
+    }
+
+    /// (T3+) Returns whether the key is call-scoped + the configured scopes.
+    /// Mirrors writer `account_keychain/mod.rs:516-584 get_allowed_calls`.
+    pub fn get_allowed_calls(
+        &self,
+        call: IAccountKeychain::getAllowedCallsCall,
+    ) -> Result<IAccountKeychain::getAllowedCallsReturn> {
+        if call.keyId.is_zero() {
+            return Ok(IAccountKeychain::getAllowedCallsReturn {
+                isScoped: false,
+                scopes: Vec::new(),
+            });
+        }
+
+        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let key = self.keys[call.account][call.keyId].read()?;
+        if key.expiry == 0 || key.is_revoked || current_timestamp >= key.expiry {
+            return Ok(IAccountKeychain::getAllowedCallsReturn {
+                isScoped: true,
+                scopes: Vec::new(),
+            });
+        }
+
+        let key_hash = Self::spending_limit_key(call.account, call.keyId);
+        let is_scoped = self.is_scoped_slot(key_hash).read()?;
+
+        if !is_scoped {
+            return Ok(IAccountKeychain::getAllowedCallsReturn {
+                isScoped: false,
+                scopes: Vec::new(),
+            });
+        }
+
+        let targets = self.targets_handler(key_hash).read()?;
+        let mut scopes = Vec::new();
+        for target in targets.into_inner() {
+            let selectors = self.selectors_handler(key_hash, target).read()?;
+
+            let scope = if selectors.as_slice().is_empty() {
+                IAccountKeychain::CallScope {
+                    target,
+                    selectorRules: Vec::new(),
+                }
+            } else {
+                let mut rules = Vec::new();
+                for selector in selectors.into_inner() {
+                    let recipients = self
+                        .recipients_handler(key_hash, target, selector)
+                        .read()?;
+                    rules.push(IAccountKeychain::SelectorRule {
+                        selector,
+                        recipients: recipients.into_inner(),
+                    });
+                }
+                IAccountKeychain::CallScope {
+                    target,
+                    selectorRules: rules,
+                }
+            };
+            scopes.push(scope);
+        }
+
+        Ok(IAccountKeychain::getAllowedCallsReturn {
+            isScoped: true,
+            scopes,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // CallScope — internal mutators / validators
+    // -----------------------------------------------------------------------
+
+    /// Creates or replaces one target scope, including all nested selector rules.
+    /// Mirrors writer `account_keychain/mod.rs:826-869 upsert_target_scope`.
+    fn upsert_target_scope(
+        &mut self,
+        key_hash: B256,
+        scope: &IAccountKeychain::CallScope,
+    ) -> Result<()> {
+        let target = scope.target;
+
+        // Pre-T4: validate per-scope inline (T4 short-circuits to format check
+        // only, performed up front in `validate_call_scopes`). FU-5 wires the
+        // hardfork-specific TIP20 lookup; for now the T3 path is delegated to
+        // `validate_call_scope` which falls back to format checks.
+        if !self.storage.spec().is_t4() {
+            self.validate_call_scope(scope)?;
+        }
+
+        self.targets_handler(key_hash).insert(target)?;
+        self.clear_target_selectors(key_hash, target)?;
+
+        if scope.selectorRules.is_empty() {
+            // Keeping the target while clearing nested selector rows
+            // intentionally widens this target to allow-all selectors.
+            return Ok(());
+        }
+
+        for rule in &scope.selectorRules {
+            let selector = rule.selector;
+            self.selectors_handler(key_hash, target).insert(selector)?;
+
+            if rule.recipients.is_empty() {
+                if !self.storage.spec().is_t4() {
+                    // Pre-T4 storage-touch parity with writer.
+                    self.recipients_handler(key_hash, target, selector).delete()?;
+                }
+            } else {
+                self.recipients_handler(key_hash, target, selector)
+                    .write(StorageSet::from(rule.recipients.clone()))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clears the selectors set (and any per-selector recipient rows) for one target.
+    /// Mirrors writer `account_keychain/mod.rs:798-824 clear_target_selectors`.
+    fn clear_target_selectors(&mut self, key_hash: B256, target: Address) -> Result<()> {
+        let mut selectors = self.selectors_handler(key_hash, target);
+        let snapshot = selectors.read()?;
+        for selector in snapshot.into_inner() {
+            self.recipients_handler(key_hash, target, selector).delete()?;
+        }
+        selectors.delete()
+    }
+
+    /// Removes one (key, target) pair from the scope tree.
+    /// Mirrors writer `account_keychain/mod.rs:777-797 remove_target_scope`.
+    fn remove_target_scope(&mut self, key_hash: B256, target: Address) -> Result<()> {
+        self.clear_target_selectors(key_hash, target)?;
+        self.targets_handler(key_hash).remove(&target)?;
+        Ok(())
+    }
+
+    /// Validates a list of `CallScope`s before persistence. Rejects duplicate
+    /// targets and (post-T4) runs per-scope validation up front. Mirrors writer
+    /// `account_keychain/mod.rs:871-885 validate_call_scopes`.
+    fn validate_call_scopes(&self, scopes: &[IAccountKeychain::CallScope]) -> Result<()> {
+        let mut seen_targets = HashSet::new();
+        for scope in scopes {
+            if !seen_targets.insert(scope.target) {
+                return Err(err_invalid_call_scope());
+            }
+            if self.storage.spec().is_t4() {
+                self.validate_call_scope(scope)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates a single `CallScope`: zero-target rejected, then per-selector
+    /// rules. Mirrors writer `account_keychain/mod.rs:887-900 validate_call_scope`.
+    fn validate_call_scope(&self, scope: &IAccountKeychain::CallScope) -> Result<()> {
+        if scope.target.is_zero() {
+            return Err(err_invalid_call_scope());
+        }
+        if !scope.selectorRules.is_empty() {
+            self.validate_selector_rules(scope.target, &scope.selectorRules)?;
+        }
+        Ok(())
+    }
+
+    /// Validates per-selector recipient rules for one target. Rejects duplicate
+    /// selectors, duplicate recipients, zero recipients, and recipient-bearing
+    /// rules on non-TIP-20 targets. Mirrors writer
+    /// `account_keychain/mod.rs:902-947 validate_selector_rules`.
+    ///
+    /// **NOTE**: This commit lands the T3 path that defers the TIP20 lookup to
+    /// the writer's stateful `TIP20Factory::is_tip20` (a storage probe).
+    /// FU-5 (next commit) flips to the T4 stateless `Address::is_tip20` format
+    /// check when running on T4+.
+    fn validate_selector_rules(
+        &self,
+        target: Address,
+        rules: &[IAccountKeychain::SelectorRule],
+    ) -> Result<()> {
+        let mut cached_is_tip20: Option<bool> = None;
+        let mut is_tip20 = || -> Result<bool> {
+            if let Some(v) = cached_is_tip20 {
+                return Ok(v);
+            }
+            let v = TIP20Factory::new().is_tip20(target)?;
+            cached_is_tip20 = Some(v);
+            Ok(v)
+        };
+
+        let mut selectors = HashSet::new();
+        for rule in rules {
+            if !selectors.insert(rule.selector) {
+                return Err(err_invalid_call_scope());
+            }
+
+            if rule.recipients.is_empty() {
+                continue;
+            }
+
+            if !is_constrained_tip20_selector(*rule.selector) || !is_tip20()? {
+                return Err(err_invalid_call_scope());
+            }
+
+            let mut unique_recipients = HashSet::new();
+            for recipient in &rule.recipients {
+                if recipient.is_zero() || !unique_recipients.insert(*recipient) {
+                    return Err(err_invalid_call_scope());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl ContractStorage for AccountKeychain {
@@ -744,23 +1107,87 @@ impl Precompile for AccountKeychain {
                 IAccountKeychain::IAccountKeychainCalls::getTransactionKey(call) => {
                     view(call, |c| self.get_transaction_key(c, msg_sender))
                 }
-                IAccountKeychain::IAccountKeychainCalls::setCallScopes(call) => {
-                    // T3+ framework stub — see KeyScope storage-layout comment
-                    // above. Reverts InvalidCallScope until the leafage Set /
-                    // FixedBytes<4> framework extensions land.
-                    mutate_void(call, msg_sender, |_sender, _c| {
-                        Err(TempoPrecompileError::Revert(
-                            IAccountKeychain::InvalidCallScope {}.abi_encode().into(),
-                        ))
+                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls(call) => {
+                    mutate_void(call, msg_sender, |sender, c| self.set_allowed_calls(sender, c))
+                }
+                IAccountKeychain::IAccountKeychainCalls::removeAllowedCalls(call) => {
+                    mutate_void(call, msg_sender, |sender, c| {
+                        self.remove_allowed_calls(sender, c)
                     })
                 }
-                IAccountKeychain::IAccountKeychainCalls::getCallScope(call) => {
-                    // T3+ framework stub — returns an empty scope list. Once
-                    // the storage-read path is wired this should call into the
-                    // KeyScope layout described above.
-                    view(call, |_c| Ok(Vec::<IAccountKeychain::CallScope>::new()))
+                IAccountKeychain::IAccountKeychainCalls::getAllowedCalls(call) => {
+                    view(call, |c| self.get_allowed_calls(c))
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn constrained_tip20_selectors_match_writer() {
+        assert!(is_constrained_tip20_selector(TIP20_TRANSFER_SELECTOR));
+        assert!(is_constrained_tip20_selector(TIP20_APPROVE_SELECTOR));
+        assert!(is_constrained_tip20_selector(TIP20_TRANSFER_WITH_MEMO_SELECTOR));
+        assert!(!is_constrained_tip20_selector([0xab, 0xcd, 0xef, 0x01]));
+        // transferFrom is intentionally NOT constrained (no recipient field).
+        let transfer_from_sel = ITIP20::transferFromCall::SELECTOR;
+        assert!(!is_constrained_tip20_selector(transfer_from_sel));
+    }
+
+    #[test]
+    fn key_scope_base_matches_keccak_of_left_padded_key_and_slot4() {
+        let kc = AccountKeychain::new();
+        let key_hash = B256::repeat_byte(0xAB);
+
+        let computed = kc.key_scope_base(key_hash);
+
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(key_hash.as_slice());
+        buf[32..].copy_from_slice(&U256::from(4u8).to_be_bytes::<32>());
+        let expected = U256::from_be_bytes(keccak256(buf).0);
+
+        assert_eq!(computed, expected, "key_scope_base = keccak(key || slot4)");
+    }
+
+    #[test]
+    fn target_scope_base_uses_left_padded_address_at_map_offset_3() {
+        let kc = AccountKeychain::new();
+        let key_hash = B256::repeat_byte(0xCD);
+        let target = address!("0x20C0000000000000000000000000000000000042");
+
+        let computed = kc.target_scope_base(key_hash, target);
+
+        let target_scopes_map_base = kc.key_scope_base(key_hash) + U256::from(3u8);
+        let mut buf = [0u8; 64];
+        buf[12..32].copy_from_slice(target.as_slice());
+        buf[32..].copy_from_slice(&target_scopes_map_base.to_be_bytes::<32>());
+        let expected = U256::from_be_bytes(keccak256(buf).0);
+
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn selector_scope_base_uses_left_padded_selector_at_map_offset_2() {
+        let kc = AccountKeychain::new();
+        let key_hash = B256::repeat_byte(0xEF);
+        let target = address!("0x20C0000000000000000000000000000000000042");
+        let selector = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+
+        let computed = kc.selector_scope_base(key_hash, target, selector);
+
+        let selector_scopes_map_base =
+            kc.target_scope_base(key_hash, target) + U256::from(2u8);
+        let mut buf = [0u8; 64];
+        // FixedBytes<4> mapping_slot left-pads (matches storage_types FixedBytes<4>::as_storage_bytes).
+        buf[28..32].copy_from_slice(&selector.0);
+        buf[32..].copy_from_slice(&selector_scopes_map_base.to_be_bytes::<32>());
+        let expected = U256::from_be_bytes(keccak256(buf).0);
+
+        assert_eq!(computed, expected);
     }
 }

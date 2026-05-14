@@ -1620,6 +1620,50 @@ where
         }
         Ok(Some(self.values[index].read()?))
     }
+
+    /// Inserts `value`. Returns `true` if newly added, `false` if already present.
+    /// Mirrors writer single-element `Set::insert` behaviour (OZ EnumerableSet).
+    pub fn insert(&mut self, value: T) -> Result<bool>
+    where
+        T::Handler: Handler<T>,
+    {
+        if self.contains(&value)? {
+            return Ok(false);
+        }
+        let len = self.len()?;
+        self.values.push(value.clone())?;
+        self.positions
+            .at_mut(&value)
+            .write(checked_position(len)?)?;
+        Ok(true)
+    }
+
+    /// Removes `value` via OZ EnumerableSet swap-and-pop. Returns `true` if it
+    /// was present, `false` otherwise. Mirrors writer `Set::remove`.
+    pub fn remove(&mut self, value: &T) -> Result<bool>
+    where
+        T::Handler: Handler<T>,
+    {
+        let pos = self.positions.at(value).read()?;
+        if pos == 0 {
+            return Ok(false);
+        }
+        let to_remove_idx = (pos - 1) as usize;
+        let last_idx = self.len()?.saturating_sub(1);
+
+        if to_remove_idx != last_idx {
+            let last_value = self.values[last_idx].read()?;
+            self.values[to_remove_idx].write(last_value.clone())?;
+            self.positions
+                .at_mut(&last_value)
+                .write(checked_position(to_remove_idx)?)?;
+        }
+
+        self.values[last_idx].delete()?;
+        self.values.pop()?;
+        self.positions.at_mut(value).delete()?;
+        Ok(true)
+    }
 }
 
 impl<T> Handler<Set<T>> for SetHandler<T>
