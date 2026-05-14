@@ -32,7 +32,7 @@ use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
 use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{
-    Handler, Layout, LayoutCtx, Mapping, Set as StorageSet, SetHandler, Slot, Storable,
+    packing, Handler, Layout, LayoutCtx, Mapping, Set as StorageSet, SetHandler, Slot, Storable,
     StorableType, StorageKey,
 };
 use super::tip20::ITIP20;
@@ -142,6 +142,8 @@ alloy::sol! {
         error SignatureTypeMismatch(uint8 expected, uint8 actual);
         /// (TIP-1011, T3+) Raised by setCallScopes / validate_call_scopes.
         error InvalidCallScope();
+        /// (T3+) Spending limit value exceeds the TIP-20 `u128` supply range.
+        error InvalidSpendingLimit();
     }
 }
 
@@ -204,6 +206,12 @@ fn err_signature_type_mismatch(expected: u8, actual: u8) -> TempoPrecompileError
 
 fn err_invalid_call_scope() -> TempoPrecompileError {
     TempoPrecompileError::Revert(IAccountKeychain::InvalidCallScope {}.abi_encode().into())
+}
+
+fn err_invalid_spending_limit() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        IAccountKeychain::InvalidSpendingLimit {}.abi_encode().into(),
+    )
 }
 
 // ===========================================================================
@@ -291,6 +299,214 @@ impl Storable for AuthorizedKey {
 }
 
 // ===========================================================================
+// SpendingLimitState (T3+ periodic spending limit) — 2-slot layout
+// ===========================================================================
+//
+// Mirrors writer `crates/precompiles/src/account_keychain/mod.rs:130-146`
+// `#[derive(Storable)]` for the `SpendingLimitState` struct. Pre-T3 stored
+// only `remaining` (slot+0 U256). T3+ extends with three packed fields in
+// slot+1:
+//
+//   slot+0:  remaining (U256, full slot)
+//   slot+1:  packed { max u128 @ bytes 0..16, period u64 @ bytes 16..24,
+//                     period_end u64 @ bytes 24..32 }
+//
+// Pre-T3 data (slot+1 == 0) decodes as max=0, period=0, period_end=0 —
+// matches writer's non-periodic semantic.
+
+/// Per-token spending limit row for an access key (T3+: full 4 fields).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpendingLimitState {
+    /// Remaining amount available to spend within the current window.
+    pub remaining: U256,
+    /// Configured cap, capped to TIP-20's `u128` supply range on T3+.
+    pub max: u128,
+    /// Period length in seconds. `0` means non-periodic / one-shot.
+    pub period: u64,
+    /// End timestamp of the current rolling window.
+    pub period_end: u64,
+}
+
+const SPENDING_LIMIT_MAX_OFFSET: usize = 0;
+const SPENDING_LIMIT_PERIOD_OFFSET: usize = 16;
+const SPENDING_LIMIT_PERIOD_END_OFFSET: usize = 24;
+const SPENDING_LIMIT_MAX_BYTES: usize = 16;
+const SPENDING_LIMIT_PERIOD_BYTES: usize = 8;
+const SPENDING_LIMIT_PERIOD_END_BYTES: usize = 8;
+
+impl StorableType for SpendingLimitState {
+    const LAYOUT: Layout = Layout::Slots(2);
+    type Handler = SpendingLimitStateHandler;
+
+    fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
+        SpendingLimitStateHandler::new(slot, address)
+    }
+}
+
+impl Storable for SpendingLimitState {
+    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let remaining = storage.load(slot)?;
+        let packed = storage.load(slot + U256::ONE)?;
+        let max = packing::extract_from_word::<u128>(
+            packed,
+            SPENDING_LIMIT_MAX_OFFSET,
+            SPENDING_LIMIT_MAX_BYTES,
+        )?;
+        let period = packing::extract_from_word::<u64>(
+            packed,
+            SPENDING_LIMIT_PERIOD_OFFSET,
+            SPENDING_LIMIT_PERIOD_BYTES,
+        )?;
+        let period_end = packing::extract_from_word::<u64>(
+            packed,
+            SPENDING_LIMIT_PERIOD_END_OFFSET,
+            SPENDING_LIMIT_PERIOD_END_BYTES,
+        )?;
+        Ok(Self {
+            remaining,
+            max,
+            period,
+            period_end,
+        })
+    }
+
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        storage.store(slot, self.remaining)?;
+        let mut packed = U256::ZERO;
+        packed = packing::insert_into_word(
+            packed,
+            &self.max,
+            SPENDING_LIMIT_MAX_OFFSET,
+            SPENDING_LIMIT_MAX_BYTES,
+        )?;
+        packed = packing::insert_into_word(
+            packed,
+            &self.period,
+            SPENDING_LIMIT_PERIOD_OFFSET,
+            SPENDING_LIMIT_PERIOD_BYTES,
+        )?;
+        packed = packing::insert_into_word(
+            packed,
+            &self.period_end,
+            SPENDING_LIMIT_PERIOD_END_OFFSET,
+            SPENDING_LIMIT_PERIOD_END_BYTES,
+        )?;
+        storage.store(slot + U256::ONE, packed)
+    }
+
+    fn delete<S: StorageOps>(storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        storage.store(slot, U256::ZERO)?;
+        storage.store(slot + U256::ONE, U256::ZERO)
+    }
+}
+
+/// Field-level handler for [`SpendingLimitState`]. Each field is exposed as a
+/// `Slot<T>` with the right packed offset so callers can read or write one
+/// field without touching the others (mirrors writer's auto-derived
+/// `SpendingLimitStateHandler`).
+pub struct SpendingLimitStateHandler {
+    /// `remaining` at slot+0 (full U256 slot).
+    pub remaining: Slot<U256>,
+    /// `max` at slot+1, packed offset 0 (16 bytes).
+    pub max: Slot<u128>,
+    /// `period` at slot+1, packed offset 16 (8 bytes).
+    pub period: Slot<u64>,
+    /// `period_end` at slot+1, packed offset 24 (8 bytes).
+    pub period_end: Slot<u64>,
+    base_slot: U256,
+    address: Address,
+}
+
+impl SpendingLimitStateHandler {
+    fn new(base_slot: U256, address: Address) -> Self {
+        let packed_slot = base_slot + U256::ONE;
+        Self {
+            remaining: Slot::new(base_slot, address),
+            max: Slot::new_with_ctx(
+                packed_slot,
+                LayoutCtx::packed(SPENDING_LIMIT_MAX_OFFSET),
+                address,
+            ),
+            period: Slot::new_with_ctx(
+                packed_slot,
+                LayoutCtx::packed(SPENDING_LIMIT_PERIOD_OFFSET),
+                address,
+            ),
+            period_end: Slot::new_with_ctx(
+                packed_slot,
+                LayoutCtx::packed(SPENDING_LIMIT_PERIOD_END_OFFSET),
+                address,
+            ),
+            base_slot,
+            address,
+        }
+    }
+}
+
+impl Handler<SpendingLimitState> for SpendingLimitStateHandler {
+    fn read(&self) -> Result<SpendingLimitState> {
+        Ok(SpendingLimitState {
+            remaining: self.remaining.read()?,
+            max: self.max.read()?,
+            period: self.period.read()?,
+            period_end: self.period_end.read()?,
+        })
+    }
+
+    fn write(&mut self, value: SpendingLimitState) -> Result<()> {
+        // Write the packed slot in one shot to match writer's auto-derive
+        // (which avoids 3 RMW SSTOREs for the packed fields).
+        self.remaining.write(value.remaining)?;
+        let mut packed = U256::ZERO;
+        packed = packing::insert_into_word(
+            packed,
+            &value.max,
+            SPENDING_LIMIT_MAX_OFFSET,
+            SPENDING_LIMIT_MAX_BYTES,
+        )?;
+        packed = packing::insert_into_word(
+            packed,
+            &value.period,
+            SPENDING_LIMIT_PERIOD_OFFSET,
+            SPENDING_LIMIT_PERIOD_BYTES,
+        )?;
+        packed = packing::insert_into_word(
+            packed,
+            &value.period_end,
+            SPENDING_LIMIT_PERIOD_END_OFFSET,
+            SPENDING_LIMIT_PERIOD_END_BYTES,
+        )?;
+        let mut packed_slot = Slot::<U256>::new(self.base_slot + U256::ONE, self.address);
+        packed_slot.write(packed)
+    }
+
+    fn delete(&mut self) -> Result<()> {
+        let mut slot0 = Slot::<U256>::new(self.base_slot, self.address);
+        slot0.write(U256::ZERO)?;
+        let mut slot1 = Slot::<U256>::new(self.base_slot + U256::ONE, self.address);
+        slot1.write(U256::ZERO)
+    }
+
+    fn t_read(&self) -> Result<SpendingLimitState> {
+        Err(TempoPrecompileError::Fatal(
+            "SpendingLimitState does not support transient storage".into(),
+        ))
+    }
+
+    fn t_write(&mut self, _value: SpendingLimitState) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "SpendingLimitState does not support transient storage".into(),
+        ))
+    }
+
+    fn t_delete(&mut self) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "SpendingLimitState does not support transient storage".into(),
+        ))
+    }
+}
+
+// ===========================================================================
 // AccountKeychain struct
 // ===========================================================================
 
@@ -298,8 +514,10 @@ impl Storable for AuthorizedKey {
 pub struct AccountKeychain {
     // Slot 0: keys[account][keyId] -> AuthorizedKey
     pub(crate) keys: Mapping<Address, Mapping<Address, AuthorizedKey>>,
-    // Slot 1: spending_limits[hash(account,keyId)][token] -> amount
-    pub(crate) spending_limits: Mapping<B256, Mapping<Address, U256>>,
+    // Slot 1: spending_limits[hash(account,keyId)][token] -> SpendingLimitState
+    // (pre-T3: only `.remaining` is meaningful; T3+ adds max/period/period_end
+    //  packed in slot+1)
+    pub(crate) spending_limits: Mapping<B256, Mapping<Address, SpendingLimitState>>,
     // Slot 2: transaction_key (transient)
     pub(crate) transaction_key: Slot<Address>,
     // Slot 3: tx_origin (transient)
@@ -358,6 +576,16 @@ impl AccountKeychain {
         data[..20].copy_from_slice(account.as_slice());
         data[20..].copy_from_slice(key_id.as_slice());
         keccak256(data)
+    }
+
+    /// (T3+) Cap a spending-limit input to TIP-20's `u128` supply range.
+    /// Mirrors writer `account_keychain/mod.rs:175-182`.
+    #[inline]
+    fn t3_spending_limit_cap(limit: U256) -> Result<u128> {
+        if limit > U256::from(u128::MAX) {
+            return Err(err_invalid_spending_limit());
+        }
+        Ok(limit.to::<u128>())
     }
 
     /// Ensures admin operations are authorized for this caller.
@@ -427,11 +655,26 @@ impl AccountKeychain {
 
         self.keys[msg_sender][call.keyId].write(new_key)?;
 
-        // Set initial spending limits (only if enforce_limits is true)
+        // Set initial spending limits (only if enforce_limits is true).
+        // T3+ also caps `max` to TIP-20's u128 supply range so the cap field
+        // populates the new layout's slot+1 packed `max` slot. Pre-T3 leaves
+        // max=0 (non-periodic legacy behaviour).
         if call.enforceLimits {
             let limit_key = Self::spending_limit_key(msg_sender, call.keyId);
+            let is_t3 = self.storage.spec().is_t3();
             for limit in call.limits {
-                self.spending_limits[limit_key][limit.token].write(limit.amount)?;
+                let max = if is_t3 {
+                    Self::t3_spending_limit_cap(limit.amount)?
+                } else {
+                    0
+                };
+                let state = SpendingLimitState {
+                    remaining: limit.amount,
+                    max,
+                    period: 0,
+                    period_end: 0,
+                };
+                self.spending_limits[limit_key][limit.token].write(state)?;
             }
         }
 
@@ -489,8 +732,22 @@ impl AccountKeychain {
             self.keys[msg_sender][call.keyId].write(key)?;
         }
 
+        // Update the spending limit. T3+ updates both remaining + max while
+        // preserving period + period_end (read-modify-write). Pre-T3 only
+        // touches the `.remaining` sub-slot to match writer's storage diff.
         let limit_key = Self::spending_limit_key(msg_sender, call.keyId);
-        self.spending_limits[limit_key][call.token].write(call.newLimit)?;
+        if self.storage.spec().is_t3() {
+            let max = Self::t3_spending_limit_cap(call.newLimit)?;
+            let handler = &mut self.spending_limits[limit_key][call.token];
+            let mut state = handler.read()?;
+            state.remaining = call.newLimit;
+            state.max = max;
+            handler.write(state)?;
+        } else {
+            self.spending_limits[limit_key][call.token]
+                .remaining
+                .write(call.newLimit)?;
+        }
 
         self.emit_event(IAccountKeychain::SpendingLimitUpdated {
             account: msg_sender,
@@ -546,7 +803,7 @@ impl AccountKeychain {
         }
 
         let limit_key = Self::spending_limit_key(call.account, call.keyId);
-        self.spending_limits[limit_key][call.token].read()
+        self.spending_limits[limit_key][call.token].remaining.read()
     }
 
     /// Returns the access key used to authorize the current transaction.
@@ -627,13 +884,15 @@ impl AccountKeychain {
         }
 
         let limit_key = Self::spending_limit_key(account, key_id);
-        let remaining = self.spending_limits[limit_key][token].read()?;
+        let remaining = self.spending_limits[limit_key][token].remaining.read()?;
 
         if amount > remaining {
             return Err(err_spending_limit_exceeded());
         }
 
-        self.spending_limits[limit_key][token].write(remaining - amount)
+        self.spending_limits[limit_key][token]
+            .remaining
+            .write(remaining - amount)
     }
 
     /// Refund spending limit after a fee refund.
@@ -664,9 +923,12 @@ impl AccountKeychain {
         }
 
         let limit_key = Self::spending_limit_key(account, transaction_key);
-        let remaining = self.spending_limits[limit_key][token].read()?;
+        let remaining = self.spending_limits[limit_key][token].remaining.read()?;
+        // FU-4 will clamp to `state.max` on T3+ here.
         let new_remaining = remaining.saturating_add(amount);
-        self.spending_limits[limit_key][token].write(new_remaining)
+        self.spending_limits[limit_key][token]
+            .remaining
+            .write(new_remaining)
     }
 
     /// Authorize a token transfer with access key spending limits.
@@ -1258,6 +1520,83 @@ mod tests {
             || kc.validate_selector_rules(tip20_addr(), &rules),
         );
         assert!(matches!(result, Err(TempoPrecompileError::Revert(_))));
+    }
+
+    // -- SpendingLimitState round-trip (FU-3) -----------------------------------
+
+    /// In-memory `StorageOps` for unit-testing the 2-slot pack layout.
+    struct MockStorage(std::collections::HashMap<U256, U256>);
+    impl MockStorage {
+        fn new() -> Self {
+            Self(std::collections::HashMap::new())
+        }
+    }
+    impl StorageOps for MockStorage {
+        fn load(&self, slot: U256) -> Result<U256> {
+            Ok(self.0.get(&slot).copied().unwrap_or(U256::ZERO))
+        }
+        fn store(&mut self, slot: U256, value: U256) -> Result<()> {
+            self.0.insert(slot, value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spending_limit_state_storable_round_trip() {
+        let state = SpendingLimitState {
+            remaining: U256::from(0x1234_5678_u32),
+            max: 0xABCD_EF01_2345_6789_u128,
+            period: 60 * 60 * 24,         // 86400 seconds
+            period_end: 1_777_298_400_u64, // T3 timestamp
+        };
+
+        let mut mock = MockStorage::new();
+        state.store(&mut mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
+        let loaded = SpendingLimitState::load(&mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn spending_limit_state_packed_byte_layout_matches_writer() {
+        // Verify slot+1 packed byte positions: max @ bytes 0..16,
+        // period @ bytes 16..24, period_end @ bytes 24..32.
+        let state = SpendingLimitState {
+            remaining: U256::from(42u8),
+            max: 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10_u128,
+            period: 0x1112_1314_1516_1718_u64,
+            period_end: 0x2122_2324_2526_2728_u64,
+        };
+
+        let mut mock = MockStorage::new();
+        state.store(&mut mock, U256::from(0u8), LayoutCtx::FULL).unwrap();
+
+        // Slot 0: remaining
+        assert_eq!(mock.load(U256::ZERO).unwrap(), U256::from(42u8));
+        // Slot 1: bytes encoded little-end-first per Solidity packing (offset 0 = LSB).
+        let packed = mock.load(U256::ONE).unwrap();
+        // max fills bytes [0..16] (LSB), period bytes [16..24], period_end [24..32].
+        let expected = (U256::from(state.max))
+            | (U256::from(state.period) << (8 * SPENDING_LIMIT_PERIOD_OFFSET))
+            | (U256::from(state.period_end) << (8 * SPENDING_LIMIT_PERIOD_END_OFFSET));
+        assert_eq!(packed, expected);
+    }
+
+    #[test]
+    fn spending_limit_state_pre_t3_data_decodes_as_non_periodic() {
+        // Pre-T3 entries wrote only slot+0 (remaining). Reading the new 2-slot
+        // layout against that legacy storage must produce
+        // {remaining, max=0, period=0, period_end=0} so the non-periodic
+        // semantic kicks in (matches writer).
+        let mut mock = MockStorage::new();
+        let legacy_remaining = U256::from(99u8);
+        mock.store(U256::from(5u8), legacy_remaining).unwrap();
+        // slot+1 left untouched (== 0)
+
+        let loaded = SpendingLimitState::load(&mock, U256::from(5u8), LayoutCtx::FULL).unwrap();
+        assert_eq!(loaded.remaining, legacy_remaining);
+        assert_eq!(loaded.max, 0);
+        assert_eq!(loaded.period, 0);
+        assert_eq!(loaded.period_end, 0);
     }
 
     #[test]
