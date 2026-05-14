@@ -923,9 +923,20 @@ impl AccountKeychain {
         }
 
         let limit_key = Self::spending_limit_key(account, transaction_key);
-        let remaining = self.spending_limits[limit_key][token].remaining.read()?;
-        // FU-4 will clamp to `state.max` on T3+ here.
-        let new_remaining = remaining.saturating_add(amount);
+        // T3+ clamps `remaining + amount` to the configured `max` so refunds
+        // can't overflow the spending budget. Pre-T3 keeps the saturating-add
+        // semantic. Mirrors writer L350-380.
+        let new_remaining = if self.storage.spec().is_t3() {
+            let handler = &self.spending_limits[limit_key][token];
+            let state = handler.read()?;
+            state
+                .remaining
+                .saturating_add(amount)
+                .min(U256::from(state.max))
+        } else {
+            let remaining = self.spending_limits[limit_key][token].remaining.read()?;
+            remaining.saturating_add(amount)
+        };
         self.spending_limits[limit_key][token]
             .remaining
             .write(new_remaining)
