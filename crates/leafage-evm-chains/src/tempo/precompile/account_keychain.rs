@@ -327,6 +327,22 @@ pub struct SpendingLimitState {
     pub period_end: u64,
 }
 
+impl SpendingLimitState {
+    /// Computes the next `period_end` after `current_timestamp` has crossed
+    /// the existing window. Mirrors writer
+    /// `account_keychain/mod.rs:151-160 compute_next_period_end`.
+    ///
+    /// **Caller MUST ensure** `self.period != 0` (non-periodic limits don't
+    /// rollover). Saturating arithmetic on extreme timestamps avoids overflow.
+    pub fn compute_next_period_end(&self, current_timestamp: u64) -> u64 {
+        debug_assert!(self.period != 0, "period rollover requires non-zero period");
+        let elapsed = current_timestamp.saturating_sub(self.period_end);
+        let periods_elapsed = (elapsed / self.period).saturating_add(1);
+        let advance = self.period.saturating_mul(periods_elapsed);
+        self.period_end.saturating_add(advance)
+    }
+}
+
 const SPENDING_LIMIT_MAX_OFFSET: usize = 0;
 const SPENDING_LIMIT_PERIOD_OFFSET: usize = 16;
 const SPENDING_LIMIT_PERIOD_END_OFFSET: usize = 24;
@@ -884,7 +900,28 @@ impl AccountKeychain {
         }
 
         let limit_key = Self::spending_limit_key(account, key_id);
-        let remaining = self.spending_limits[limit_key][token].remaining.read()?;
+
+        // T3+ periodic reset: if the active window has rolled over, refill
+        // `remaining` to `max` and advance `period_end` by full period(s)
+        // before applying the spend. Mirrors writer L1157-1162 +
+        // SpendingLimitState::compute_next_period_end L151-160.
+        let remaining = if self.storage.spec().is_t3() {
+            let handler = &self.spending_limits[limit_key][token];
+            let mut state = handler.read()?;
+            let now: u64 = self.storage.timestamp().to::<u64>();
+            if state.period > 0 && now >= state.period_end {
+                state.period_end = state.compute_next_period_end(now);
+                state.remaining = U256::from(state.max);
+                // Persist the rolled-over window before the spend so the
+                // updated `period_end` is observable to subsequent calls
+                // (matches writer write-back ordering).
+                let handler_mut = &mut self.spending_limits[limit_key][token];
+                handler_mut.write(state.clone())?;
+            }
+            state.remaining
+        } else {
+            self.spending_limits[limit_key][token].remaining.read()?
+        };
 
         if amount > remaining {
             return Err(err_spending_limit_exceeded());
@@ -1590,6 +1627,53 @@ mod tests {
             | (U256::from(state.period) << (8 * SPENDING_LIMIT_PERIOD_OFFSET))
             | (U256::from(state.period_end) << (8 * SPENDING_LIMIT_PERIOD_END_OFFSET));
         assert_eq!(packed, expected);
+    }
+
+    #[test]
+    fn compute_next_period_end_within_one_period_advances_once() {
+        let state = SpendingLimitState {
+            remaining: U256::ZERO,
+            max: 1_000,
+            period: 86_400,
+            period_end: 1_777_298_400,
+        };
+        // current = period_end exactly → advances exactly one period
+        assert_eq!(
+            state.compute_next_period_end(1_777_298_400),
+            1_777_298_400 + 86_400,
+        );
+        // current = period_end + 1s (just past) → also one period
+        assert_eq!(
+            state.compute_next_period_end(1_777_298_401),
+            1_777_298_400 + 86_400,
+        );
+    }
+
+    #[test]
+    fn compute_next_period_end_skips_multiple_periods() {
+        let state = SpendingLimitState {
+            remaining: U256::ZERO,
+            max: 1_000,
+            period: 100,
+            period_end: 1_000,
+        };
+        // 350 seconds past period_end → 3 full periods elapsed + 1 = 4 advances
+        let now = 1_000 + 350;
+        assert_eq!(state.compute_next_period_end(now), 1_000 + 100 * 4);
+    }
+
+    #[test]
+    fn compute_next_period_end_saturating_on_extreme_inputs() {
+        let state = SpendingLimitState {
+            remaining: U256::ZERO,
+            max: 0,
+            period: u64::MAX / 2,
+            period_end: u64::MAX - 10,
+        };
+        // current_timestamp > period_end + period_max → saturates to u64::MAX
+        let now = u64::MAX;
+        let next = state.compute_next_period_end(now);
+        assert_eq!(next, u64::MAX);
     }
 
     #[test]
