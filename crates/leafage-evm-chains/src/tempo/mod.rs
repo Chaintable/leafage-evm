@@ -7,6 +7,7 @@ pub const VIRTUAL_BALANCE: alloy::primitives::U256 = alloy::primitives::uint!(
 pub mod api;
 pub use api::TempoEvm;
 
+pub mod address;
 pub mod block;
 pub mod fee_payer;
 pub mod gas_params;
