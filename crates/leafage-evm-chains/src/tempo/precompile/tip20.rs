@@ -49,6 +49,7 @@ use super::{
     dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile,
     STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
 };
+use crate::tempo::address::TempoAddressExt;
 
 // ===========================================================================
 // Constants
@@ -1254,6 +1255,15 @@ impl TIP20Token {
 
     /// Core internal transfer. Adjusts balances and emits Transfer event.
     fn _transfer(&mut self, from: Address, to: Address, amount: U256) -> Result<()> {
+        // TIP-1022 (T3+): if `to` is a TIP-1022 virtual address, resolve to its
+        // registered master so the balance is credited to the master EOA.
+        // Reverts VirtualAddressUnregistered if the master isn't registered.
+        let to = if self.storage.spec().is_t3() && to.is_virtual() {
+            super::address_registry::AddressRegistry::new().resolve_recipient(to)?
+        } else {
+            to
+        };
+
         let from_balance = self.get_balance(from)?;
         if amount > from_balance {
             return Err(TempoPrecompileError::Revert(
@@ -1321,6 +1331,12 @@ impl TIP20Token {
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
         }
+        // TIP-1022 (T3+): credit the master EOA when `to` is a virtual address.
+        let to = if self.storage.spec().is_t3() && to.is_virtual() {
+            super::address_registry::AddressRegistry::new().resolve_recipient(to)?
+        } else {
+            to
+        };
         let total_supply = self.total_supply()?;
 
         // TIP403Registry mint recipient authorization check
