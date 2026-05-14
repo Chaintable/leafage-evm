@@ -476,6 +476,7 @@ mod tests {
             TempoHardfork::T1C,
             TempoHardfork::T2,
             TempoHardfork::T3,
+            TempoHardfork::T4,
         ] {
             assert_eq!(
                 SpecId::from(hf),
