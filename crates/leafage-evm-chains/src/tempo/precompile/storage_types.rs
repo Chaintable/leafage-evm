@@ -12,7 +12,7 @@
 //! - Packing helpers: [`FieldLocation`], [`PackedSlot`], extract/insert/delete operations
 //! - Primitive implementations for `bool`, `Address`, `u8`..`u128`, `U256`
 
-use alloy::primitives::{keccak256, Address, Bytes, U256};
+use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, U256};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -1003,6 +1003,55 @@ impl StorageKey for alloy::primitives::B256 {
     }
 }
 
+// -- alloy FixedBytes<4> --
+//
+// Mirrors writer `crates/precompiles-macros/src/storable_primitives.rs::FixedBytes`
+// pattern. Value lives in the LOWER N bytes of the U256 word (left-padded with
+// zeros in upper bytes), matching writer's uniform storage scheme rather than
+// Solidity ABI right-padded bytes4 semantics. The default `mapping_slot`
+// left-pads the key, which diverges from `abi.encode(bytes4)` but is what
+// writer's storage layer uses end-to-end (see writer
+// `storage/types/mod.rs:349-351` warning).
+//
+// Needed to instantiate `Set<FixedBytes<4>>` for account_keychain's
+// per-target selector set in CallScope.
+
+impl sealed::OnlyPrimitives for FixedBytes<4> {}
+impl Packable for FixedBytes<4> {}
+
+impl StorableType for FixedBytes<4> {
+    const LAYOUT: Layout = Layout::Bytes(4);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new_with_ctx(slot, ctx, address)
+    }
+}
+
+impl FromWord for FixedBytes<4> {
+    #[inline]
+    fn to_word(&self) -> U256 {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&self.0);
+        U256::from_be_bytes(bytes)
+    }
+
+    #[inline]
+    fn from_word(word: U256) -> Result<Self> {
+        let bytes = word.to_be_bytes::<32>();
+        let mut fixed = [0u8; 4];
+        fixed.copy_from_slice(&bytes[28..32]);
+        Ok(Self::from(fixed))
+    }
+}
+
+impl StorageKey for FixedBytes<4> {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.as_slice()
+    }
+}
+
 // -- Bytes (dynamic) --
 
 impl StorableType for Bytes {
@@ -1640,5 +1689,50 @@ where
         Err(TempoPrecompileError::Fatal(
             "Set does not support transient storage".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_bytes_4_word_roundtrip() {
+        let value = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+        let word = value.to_word();
+        assert_eq!(word, U256::from(0xdead_beefu32));
+        let recovered = FixedBytes::<4>::from_word(word).unwrap();
+        assert_eq!(recovered, value);
+    }
+
+    #[test]
+    fn fixed_bytes_4_packing_at_offset() {
+        let value = FixedBytes::<4>::from([0xab, 0xcd, 0xef, 0x01]);
+        let mut packed = packing::PackedSlot(U256::ZERO);
+
+        value
+            .store(&mut packed, U256::ZERO, LayoutCtx::packed(8))
+            .unwrap();
+        let expected = U256::from(0xabcd_ef01u32) << (8 * 8);
+        assert_eq!(packed.0, expected, "packed bytes at offset 8");
+
+        let recovered =
+            FixedBytes::<4>::load(&packed, U256::ZERO, LayoutCtx::packed(8)).unwrap();
+        assert_eq!(recovered, value, "round-trip from packed offset");
+    }
+
+    #[test]
+    fn fixed_bytes_4_mapping_slot_matches_left_padded_keccak() {
+        let key = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+        let slot = U256::from(7u8);
+
+        let computed = key.mapping_slot(slot);
+
+        let mut buf = [0u8; 64];
+        buf[28..32].copy_from_slice(&key.0);
+        buf[32..].copy_from_slice(&slot.to_be_bytes::<32>());
+        let expected = U256::from_be_bytes(keccak256(buf).0);
+
+        assert_eq!(computed, expected);
     }
 }
