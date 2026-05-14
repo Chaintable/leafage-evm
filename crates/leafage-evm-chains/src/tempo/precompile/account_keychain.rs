@@ -37,6 +37,7 @@ use super::storage_types::{
 };
 use super::tip20::ITIP20;
 use super::tip20_factory::TIP20Factory;
+use super::super::address::TempoAddressExt;
 use super::{
     dispatch_call, input_cost, mutate_void, view, Precompile,
     ACCOUNT_KEYCHAIN_ADDRESS,
@@ -1011,10 +1012,10 @@ impl AccountKeychain {
     /// rules on non-TIP-20 targets. Mirrors writer
     /// `account_keychain/mod.rs:902-947 validate_selector_rules`.
     ///
-    /// **NOTE**: This commit lands the T3 path that defers the TIP20 lookup to
-    /// the writer's stateful `TIP20Factory::is_tip20` (a storage probe).
-    /// FU-5 (next commit) flips to the T4 stateless `Address::is_tip20` format
-    /// check when running on T4+.
+    /// **Hardfork behaviour** (mirrors writer L913-919):
+    /// - Pre-T4: stateful `TIP20Factory::is_tip20(target)` — probes storage to
+    ///   confirm the target is a deployed TIP-20.
+    /// - T4+: stateless `target.is_tip20()` — only checks the address prefix.
     fn validate_selector_rules(
         &self,
         target: Address,
@@ -1025,7 +1026,11 @@ impl AccountKeychain {
             if let Some(v) = cached_is_tip20 {
                 return Ok(v);
             }
-            let v = TIP20Factory::new().is_tip20(target)?;
+            let v = if !self.storage.spec().is_t4() {
+                TIP20Factory::new().is_tip20(target)?
+            } else {
+                target.is_tip20()
+            };
             cached_is_tip20 = Some(v);
             Ok(v)
         };
@@ -1126,7 +1131,26 @@ impl Precompile for AccountKeychain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::with_read_only_storage_ctx;
     use alloy::primitives::address;
+    use revm::database::EmptyDB;
+
+    fn tip20_addr() -> Address {
+        // 12-byte TIP-20 prefix (0x20C00000_0000_0000_0000_0000) + 8 random tail bytes
+        address!("0x20C000000000000000000000DEADBEEFDEADBEEF")
+    }
+
+    fn non_tip20_addr() -> Address {
+        address!("0xDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF")
+    }
+
+    fn one_transfer_rule_with_recipient() -> Vec<IAccountKeychain::SelectorRule> {
+        vec![IAccountKeychain::SelectorRule {
+            selector: FixedBytes::from(TIP20_TRANSFER_SELECTOR),
+            recipients: vec![Address::repeat_byte(1)],
+        }]
+    }
 
     #[test]
     fn constrained_tip20_selectors_match_writer() {
@@ -1189,5 +1213,71 @@ mod tests {
         let expected = U256::from_be_bytes(keccak256(buf).0);
 
         assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn validate_selector_rules_t4_rejects_non_tip20_prefix_target() {
+        // T4 stateless path: target without the TIP-20 prefix is rejected even
+        // before any storage probe.
+        let kc = AccountKeychain::new();
+        let rules = one_transfer_rule_with_recipient();
+        let result = with_read_only_storage_ctx(
+            &EmptyDB::default(),
+            TempoHardfork::T4,
+            4217,
+            || kc.validate_selector_rules(non_tip20_addr(), &rules),
+        );
+        assert!(matches!(result, Err(TempoPrecompileError::Revert(_))));
+    }
+
+    #[test]
+    fn validate_selector_rules_t4_accepts_tip20_prefix_with_no_bytecode() {
+        // T4 stateless: prefix alone is sufficient — EmptyDB has no deployed
+        // TIP-20 token, but the format check still passes.
+        let kc = AccountKeychain::new();
+        let rules = one_transfer_rule_with_recipient();
+        let result = with_read_only_storage_ctx(
+            &EmptyDB::default(),
+            TempoHardfork::T4,
+            4217,
+            || kc.validate_selector_rules(tip20_addr(), &rules),
+        );
+        assert!(result.is_ok(), "T4 prefix-only validate should pass");
+    }
+
+    #[test]
+    fn validate_selector_rules_t3_rejects_tip20_prefix_without_bytecode() {
+        // T3 stateful: prefix passes the format check but the storage probe
+        // (`TIP20Factory::is_tip20`) sees no code at `tip20_addr` → rejected.
+        let kc = AccountKeychain::new();
+        let rules = one_transfer_rule_with_recipient();
+        let result = with_read_only_storage_ctx(
+            &EmptyDB::default(),
+            TempoHardfork::T3,
+            4217,
+            || kc.validate_selector_rules(tip20_addr(), &rules),
+        );
+        assert!(matches!(result, Err(TempoPrecompileError::Revert(_))));
+    }
+
+    #[test]
+    fn validate_selector_rules_skips_tip20_check_for_recipientless_rules() {
+        // Both T3 and T4: a rule with empty recipients doesn't trigger the
+        // TIP-20 probe (skipped before `is_tip20()`), so it passes regardless.
+        let kc = AccountKeychain::new();
+        let rules = vec![IAccountKeychain::SelectorRule {
+            selector: FixedBytes::from(TIP20_TRANSFER_SELECTOR),
+            recipients: Vec::new(),
+        }];
+
+        for hardfork in [TempoHardfork::T3, TempoHardfork::T4] {
+            let result = with_read_only_storage_ctx(
+                &EmptyDB::default(),
+                hardfork,
+                4217,
+                || kc.validate_selector_rules(non_tip20_addr(), &rules),
+            );
+            assert!(result.is_ok(), "{:?} recipientless rule should pass", hardfork);
+        }
     }
 }
