@@ -181,6 +181,10 @@ where
                     .map(TempoSigType::from_str_lossy)
                     .unwrap_or_default(),
                 num_limits: ka.num_limits,
+                // TODO (FU-2): populate from ka.allowed_calls once the RPC
+                // request type carries that field. See
+                // docs/tempo-t3-t4-followups.md (FU-2).
+                scope_counts: Default::default(),
             });
 
             // Tempo authorization list: gas info + optional delegation fields.
