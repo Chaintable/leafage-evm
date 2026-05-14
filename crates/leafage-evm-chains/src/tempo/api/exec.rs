@@ -1629,6 +1629,7 @@ mod tests {
         let fields_with = make_fields(Some(TempoKeyAuthGas {
             sig_type: TempoSigType::Secp256k1,
             num_limits: 0,
+            scope_counts: Default::default(),
         }));
 
         let mut evm = make_evm();
@@ -1680,6 +1681,7 @@ mod tests {
             key_auth: Some(TempoKeyAuthGas {
                 sig_type: TempoSigType::Secp256k1,
                 num_limits,
+                scope_counts: Default::default(),
             }),
             ..Default::default()
         };
