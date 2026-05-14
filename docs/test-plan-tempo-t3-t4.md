@@ -194,16 +194,17 @@ T4 mainnet 激活：2026-05-18 14:00 UTC，timestamp `1779112800`。
 | 5.1.5 | **T3 with WebAuthn** | T3-E (webAuthn AA tx) | leafage = writer (含 WebAuthn calldata cost) |
 | 5.1.6 | **T4** | T4-A post-5/18 AA tx no scopes | leafage = writer + BASE_SCOPE_GAS (5_000) |
 
-### 5.2 带 call scope 的 AA tx（partial — scope_counts 待 follow-up FU-2）
+### 5.2 带 call scope 的 AA tx
 
-> **当前 PR 限制**：tx envelope 解析未填 ScopeCounts，所以 leafage 估算这部分**偏低**。FU-2 上线后补完整测。
+> FU-2 完成（commit `1d56765`）后 ScopeCounts 已从 envelope 解析填充，本节
+> 期望 leafage = writer 字节相同。
 
-| # | 测试项 | 当前预期 | FU-2 完成后预期 |
-|---|---|---|---|
-| 5.2.1 | T4 AA tx with `allowedCalls=[]` | leafage = writer - 1 (writer 因 has_allowed_calls 多计 1 slot) | leafage = writer |
-| 5.2.2 | T4 AA tx with 1 scope/1 selector/1 recipient | leafage = writer - `(scope_slots + 1*TARGET + 1*SELECTOR + 1*RECIPIENT) * gas` ≈ writer - 19000+sstore_cost | leafage = writer |
-| 5.2.3 | T3 AA tx with allowedCalls | leafage - writer 差额 = call_scope_storage_slots(T3) × sstore_cost | leafage = writer |
-| 5.2.4 | T4 AA tx with 0 limits 0 scopes | leafage = writer (BASE_SCOPE_GAS only) | leafage = writer |
+| # | 测试项 | 期望 |
+|---|---|---|
+| 5.2.1 | T4 AA tx with `allowedCalls=[]` | leafage = writer (has_allowed_calls=true，BASE_SCOPE_GAS + scope_slots=1) |
+| 5.2.2 | T4 AA tx with 1 scope/1 selector/1 recipient | leafage = writer (含 TARGET+SELECTOR+RECIPIENT extra gas) |
+| 5.2.3 | T3 AA tx with allowedCalls | leafage = writer (T3 storage_slots 公式) |
+| 5.2.4 | T4 AA tx with 0 limits 0 scopes | leafage = writer (BASE_SCOPE_GAS only) |
 
 ### 5.3 单元测试（cargo test）
 
@@ -251,16 +252,21 @@ cargo test 覆盖：
 
 ---
 
-## 8. CallScope stub 行为（FU-1 完成前 stub 期望）
+## 8. CallScope 行为（FU-1 / FU-5 已 land）
 
-> Commit 10 (`1c59464`) 只立框架，`setCallScopes` revert / `getCallScope` 返回 empty。
+> FU-1 (commit `7706744`) wire 了三层 CallScope storage 读写 + ABI rename 到
+> writer 对齐的 `setAllowedCalls` / `getAllowedCalls` / `removeAllowedCalls`。
+> FU-5 (commit `8a93c60`) 加了 T3/T4 validate 分支。
 
-| # | 测试项 | 当前 PR 预期 | FU-1 完成后预期 |
-|---|---|---|---|
-| 8.1 | post-T3 `eth_call setCallScopes(...)` | revert (InvalidCallScope) | success（写 storage） |
-| 8.2 | post-T3 `eth_call getCallScope(account, keyId)` 对已配置 scope 的 account | 返回 `CallScope[]([])`（空数组） | 返回 writer state diff 中实际配的 scope 数组 |
-| 8.3 | pre-T3 `getCallScope` 调用 | revert (unknown_selector) | 同 |
-| 8.4 | account_keychain storage layout slot 4 (call_scope_base) 与 writer 一致 | 通过 `eth_getStorageAt` 对比 leafage = writer | 同（state diff 兼容） |
+| # | 测试项 | 期望 |
+|---|---|---|
+| 8.1 | post-T3 `eth_call setAllowedCalls(...)` 合法 scope | success；写 storage 字节与 writer 一致 |
+| 8.2 | post-T3 `eth_call getAllowedCalls(account, keyId)` 对已配置 scope 的 account | 返回 `(isScoped=true, scopes)` 与 writer state diff 字节一致 |
+| 8.3 | post-T3 `eth_call removeAllowedCalls(keyId, target)` | success；后续 getAllowedCalls 不再包含该 target |
+| 8.4 | pre-T3 `setAllowedCalls` 调用 | revert (InvalidCallScope)；同 writer |
+| 8.5 | T3 `setAllowedCalls` target = 未部署 TIP-20 prefix 地址 | revert (InvalidCallScope) (stateful TIP20Factory 拒绝) |
+| 8.6 | T4 `setAllowedCalls` target = 未部署 TIP-20 prefix 地址 | success (stateless 仅 prefix 检查) |
+| 8.7 | account_keychain storage layout slot 4 (`key_scopes`) 与 writer 字节一致 | 通过 `eth_getStorageAt` 对比 leafage = writer |
 
 ---
 
@@ -292,10 +298,10 @@ cargo test 覆盖：
 
 | # | 差异 | 原因 |
 |---|---|---|
-| 11.1 | AA tx with call scopes 的 `eth_estimateGas` 偏低 | scope_counts 待 FU-2 envelope 解析填充 |
-| 11.2 | `getCallScope` 返回 empty | CallScope 读路径待 FU-1 |
-| 11.3 | `setCallScopes` revert | CallScope 写路径待 FU-1 |
-| 11.4 | spending limit 周期性 reset 未实现 | 待 FU-3 / FU-6 |
+| 11.1 | ~~AA tx with call scopes 的 `eth_estimateGas` 偏低~~ | ✅ FU-2 完成 (commit `1d56765`)，scope_counts 从 envelope 解析填充 |
+| 11.2 | ~~`getCallScope` 返回 empty~~ | ✅ FU-1 完成 (commit `7706744`)，ABI 已 rename 为 `getAllowedCalls`，三层读路径已 wire |
+| 11.3 | ~~`setCallScopes` revert~~ | ✅ FU-1 完成；ABI 已 rename 为 `setAllowedCalls`，写路径已 wire |
+| 11.4 | ~~spending limit 周期性 reset 未实现~~ | ✅ FU-3 / FU-4 / FU-6 全部完成 (commits `59a2e44` / `0ac5f8e` / `b850804`) |
 | 11.5 | `consensus_context` header 字段缺失 | 设计 non-goal，待 FU-7 业务方需求 |
 | 11.6 | TIP-1016 state gas 未实现 | mainnet flag 未启用 (FU-11) |
 
@@ -343,10 +349,10 @@ ssh blockchain-misc-x1 'sudo docker compose -f /data/tempo-t4/docker-compose.yml
 | 2. signature_verifier | 12+ | TBD | TBD | - |
 | 3. address_registry | 13+ | TBD | TBD | - |
 | 4. TIP-20 T3 | 10+ | TBD | TBD | - |
-| 5. AA gas | 10+ | TBD | TBD | 5.2 partial / 待 FU-2 |
+| 5. AA gas | 10+ | TBD | TBD | 5.2 full (FU-2 ✅) |
 | 6. stablecoin_dex T4 | 5 | TBD | TBD | 5/18 后 |
 | 7. hardfork routing | 4 | TBD | TBD | - |
-| 8. CallScope stub | 4 | TBD | TBD | 8.1/8.2 expected stub behavior |
+| 8. CallScope | 7 | TBD | TBD | full byte-equivalence (FU-1 / FU-5 ✅) |
 | 9. consistency-checker | 4 | TBD | TBD | T4 项待 5/18 后 |
 | 10. 性能 / 长跑 | 4 | TBD | TBD | - |
 | **合计** | **75+** | **TBD** | **TBD** | **TBD** |
