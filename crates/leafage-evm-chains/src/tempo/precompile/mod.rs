@@ -10,6 +10,7 @@
 //! - [`storage_types`] -- `Slot`, `Mapping`, packing helpers, primitive type encoders
 
 pub mod account_keychain;
+pub mod address_registry;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
@@ -63,6 +64,9 @@ pub const VALIDATOR_CONFIG_V2_ADDRESS: Address =
 /// T3+ TIP-1020 signature verifier (secp256k1 / P256 / WebAuthn).
 pub const SIGNATURE_VERIFIER_ADDRESS: Address =
     address!("0x5165300000000000000000000000000000000000");
+/// T3+ TIP-1022 virtual address registry.
+pub const ADDRESS_REGISTRY_ADDRESS: Address =
+    address!("0xFDC0000000000000000000000000000000000000");
 
 // ===========================================================================
 // Gas constants
@@ -306,6 +310,8 @@ pub fn extend_tempo_precompiles(
             Some(create_validator_config_v2_precompile(chain_id))
         } else if *address == SIGNATURE_VERIFIER_ADDRESS && spec.is_t3() {
             Some(create_signature_verifier_precompile(chain_id))
+        } else if *address == ADDRESS_REGISTRY_ADDRESS && spec.is_t3() {
+            Some(create_address_registry_precompile(chain_id))
         } else {
             None
         }
@@ -369,6 +375,12 @@ fn create_validator_config_v2_precompile(chain_id: u64) -> DynPrecompile {
 fn create_signature_verifier_precompile(chain_id: u64) -> DynPrecompile {
     tempo_precompile!("SignatureVerifier", chain_id, |input| {
         signature_verifier::SignatureVerifier::new()
+    })
+}
+
+fn create_address_registry_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("AddressRegistry", chain_id, |input| {
+        address_registry::AddressRegistry::new()
     })
 }
 
