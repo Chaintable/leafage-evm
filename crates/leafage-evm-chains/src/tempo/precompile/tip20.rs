@@ -1316,6 +1316,11 @@ impl TIP20Token {
 
     fn _mint(&mut self, msg_sender: Address, to: Address, amount: U256) -> Result<()> {
         self.check_role(msg_sender, *ISSUER_ROLE)?;
+        // TIP-1038 #2 (T3+): mint must respect the paused flag. Pre-T3 callers
+        // could mint into a paused token; T3 closes that gap.
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
         let total_supply = self.total_supply()?;
 
         // TIP403Registry mint recipient authorization check
@@ -1392,6 +1397,10 @@ impl TIP20Token {
         call: ITIP20::burnBlockedCall,
     ) -> Result<()> {
         self.check_role(msg_sender, *BURN_BLOCKED_ROLE)?;
+        // TIP-1038 #2 (T3+): burn_blocked must respect the paused flag.
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
 
         if call.from == TIP_FEE_MANAGER_ADDRESS || call.from == STABLECOIN_DEX_ADDRESS {
             return Err(TempoPrecompileError::Revert(
@@ -1435,6 +1444,12 @@ impl TIP20Token {
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
         self.check_role(msg_sender, *ISSUER_ROLE)?;
+        // TIP-1038 #2 (T3+): burn must respect the paused flag. `_transfer`
+        // checks paused only on its public-entry callers, so _burn needs an
+        // explicit guard here on T3+.
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
 
         self._transfer(msg_sender, Address::ZERO, amount)?;
 
