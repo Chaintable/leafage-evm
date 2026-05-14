@@ -4684,6 +4684,7 @@ dependencies = [
  "alloy-hardforks",
  "alloy-rlp",
  "alloy-sol-types",
+ "base64 0.22.1",
  "bech32",
  "bls_on_arkworks",
  "bytes 1.10.1",
@@ -4703,6 +4704,7 @@ dependencies = [
  "scoped-tls",
  "secp256k1 0.30.0",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tendermint",
 ]
