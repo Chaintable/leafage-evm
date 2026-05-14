@@ -1,7 +1,41 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::rpc::types::TransactionRequest;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
+
+// ---------------------------------------------------------------------------
+// CallScope / SelectorRule (TIP-1011, T3+)
+// ---------------------------------------------------------------------------
+
+/// Per-target call scope. Used in [`TempoKeyAuthGasInfo::allowed_calls`] and
+/// (re-exported) in the chains-layer `KeyAuthorization` RLP encoding.
+///
+/// `selector_rules` semantics: `[]` allows any selector on this target.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+    alloy_rlp_derive::RlpEncodable,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct CallScope {
+    pub target: Address,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selector_rules: Vec<SelectorRule>,
+}
+
+/// Selector-level rule within a `CallScope`.
+///
+/// `recipients` semantics: `[]` imposes no recipient constraint; otherwise the
+/// first ABI address argument must be in the allowlist.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+    alloy_rlp_derive::RlpEncodable,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectorRule {
+    pub selector: FixedBytes<4>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipients: Vec<Address>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +99,12 @@ pub struct TempoKeyAuthGasInfo {
 
     #[serde(default)]
     pub num_limits: u32,
+
+    /// (T3+, TIP-1011) Per-target call scopes carried on the key authorization.
+    /// `None` = unrestricted; `Some([])` = scoped deny-all; `Some([...])` =
+    /// listed scopes. Used to derive `ScopeCounts` for `key_auth_gas`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_calls: Option<Vec<CallScope>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

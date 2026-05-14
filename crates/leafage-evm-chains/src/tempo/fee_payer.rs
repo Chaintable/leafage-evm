@@ -520,10 +520,17 @@ pub struct TokenLimit {
 // KeyAuthorization
 // ---------------------------------------------------------------------------
 
+// `CallScope` / `SelectorRule` live in `leafage-evm-types` (re-exported via
+// the `rpc::call` module) so the RPC layer can deserialize them directly
+// from JSON. We re-import them here for use inside `KeyAuthorization`.
+pub use leafage_evm_types::{CallScope, SelectorRule};
+
 /// Key authorization for provisioning access keys.
 ///
-/// RLP encoding: `[chain_id, key_type, key_id, expiry?, limits?]`
-/// Uses `#[rlp(trailing)]` semantics: optional trailing fields omitted when `None`.
+/// RLP encoding: `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?]`
+/// Uses `#[rlp(trailing(canonical))]` semantics: trailing optionals are omitted
+/// when `None` (canonical) and any `None` preceding a `Some` is encoded as the
+/// empty bytestring `0x80` for positional correctness.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyAuthorization {
@@ -535,10 +542,16 @@ pub struct KeyAuthorization {
     pub expiry: Option<u64>,
     #[serde(default)]
     pub limits: Option<Vec<TokenLimit>>,
+    /// TIP-1011 (T3+) per-target call scopes. `None` = unrestricted; `Some([])`
+    /// = scoped deny-all; `Some([scope, ...])` = the listed scopes.
+    #[serde(default)]
+    pub allowed_calls: Option<Vec<CallScope>>,
 }
 
-/// Manual RLP Encodable to match the writer's `#[rlp(trailing)]` behavior:
-/// optional trailing fields are only encoded when present.
+/// Manual RLP Encodable to match the writer's `#[rlp(trailing(canonical))]`
+/// behavior: trailing optionals are omitted when `None`, but a `None`
+/// preceding any later `Some` is encoded positionally as the empty bytestring
+/// `0x80`.
 impl Encodable for KeyAuthorization {
     fn encode(&self, out: &mut dyn BufMut) {
         let payload = self.fields_len();
@@ -546,20 +559,24 @@ impl Encodable for KeyAuthorization {
         self.chain_id.encode(out);
         self.key_type.encode(out);
         self.key_id.encode(out);
-        // Trailing optional fields: only encoded if present (or if a later field is present)
-        match (&self.expiry, &self.limits) {
-            (None, None) => { /* nothing */ }
-            (Some(expiry), None) => {
-                expiry.encode(out);
+
+        let last_present = self.last_trailing_present();
+        if last_present >= 1 {
+            match &self.expiry {
+                Some(expiry) => expiry.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
             }
-            (expiry, Some(limits)) => {
-                // If limits is present, expiry must be encoded (even if None -> empty string)
-                if let Some(expiry) = expiry {
-                    expiry.encode(out);
-                } else {
-                    out.put_u8(EMPTY_STRING_CODE);
-                }
-                limits.encode(out);
+        }
+        if last_present >= 2 {
+            match &self.limits {
+                Some(limits) => limits.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
+            }
+        }
+        if last_present >= 3 {
+            match &self.allowed_calls {
+                Some(scopes) => scopes.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
             }
         }
     }
@@ -571,19 +588,34 @@ impl Encodable for KeyAuthorization {
 }
 
 impl KeyAuthorization {
+    /// Returns the 1-indexed position of the latest `Some` trailing field
+    /// (1=expiry, 2=limits, 3=allowed_calls), or 0 if all are `None`. Used to
+    /// decide which preceding `None`s require positional 0x80 encoding.
+    fn last_trailing_present(&self) -> u8 {
+        if self.allowed_calls.is_some() {
+            3
+        } else if self.limits.is_some() {
+            2
+        } else if self.expiry.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
     fn fields_len(&self) -> usize {
         let mut len = self.chain_id.length()
             + self.key_type.length()
             + self.key_id.length();
-        match (&self.expiry, &self.limits) {
-            (None, None) => {}
-            (Some(expiry), None) => {
-                len += expiry.length();
-            }
-            (expiry, Some(limits)) => {
-                len += expiry.map_or(1, |e| e.length());
-                len += limits.length();
-            }
+        let last_present = self.last_trailing_present();
+        if last_present >= 1 {
+            len += self.expiry.map_or(1, |e| e.length());
+        }
+        if last_present >= 2 {
+            len += self.limits.as_ref().map_or(1, |l| l.length());
+        }
+        if last_present >= 3 {
+            len += self.allowed_calls.as_ref().map_or(1, |s| s.length());
         }
         len
     }
@@ -610,13 +642,12 @@ impl Encodable for SignedKeyAuthorization {
     fn encode(&self, out: &mut dyn BufMut) {
         let payload = self.fields_len();
         Header { list: true, payload_length: payload }.encode(out);
-        // Encode all KeyAuthorization fields inline (not as a nested list)
+        // Encode all KeyAuthorization fields inline (not as a nested list).
         self.authorization.chain_id.encode(out);
         self.authorization.key_type.encode(out);
         self.authorization.key_id.encode(out);
-        // Trailing: expiry, limits, signature
-        // Since signature is always present, we must encode expiry and limits too
-        // (even if None -> empty string) to maintain positional correctness.
+        // signature is always present at the trailing position, so every
+        // preceding optional must be encoded positionally (None -> 0x80).
         if let Some(expiry) = self.authorization.expiry {
             expiry.encode(out);
         } else {
@@ -624,6 +655,11 @@ impl Encodable for SignedKeyAuthorization {
         }
         if let Some(ref limits) = self.authorization.limits {
             limits.encode(out);
+        } else {
+            out.put_u8(EMPTY_STRING_CODE);
+        }
+        if let Some(ref scopes) = self.authorization.allowed_calls {
+            scopes.encode(out);
         } else {
             out.put_u8(EMPTY_STRING_CODE);
         }
@@ -643,6 +679,7 @@ impl SignedKeyAuthorization {
             + self.authorization.key_id.length()
             + self.authorization.expiry.map_or(1, |e| e.length())
             + self.authorization.limits.as_ref().map_or(1, |l| l.length())
+            + self.authorization.allowed_calls.as_ref().map_or(1, |s| s.length())
             + self.signature.length()
     }
 }
@@ -1108,6 +1145,7 @@ mod tests {
                 key_id: Address::ZERO,
                 expiry: Some(1000),
                 limits: None,
+                allowed_calls: None,
             },
             signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
         };
@@ -1125,6 +1163,7 @@ mod tests {
             key_id: Address::ZERO,
             expiry: None,
             limits: None,
+            allowed_calls: None,
         };
         let mut buf1 = Vec::new();
         auth1.encode(&mut buf1);
@@ -1136,6 +1175,7 @@ mod tests {
             key_id: Address::ZERO,
             expiry: Some(1000),
             limits: None,
+            allowed_calls: None,
         };
         let mut buf2 = Vec::new();
         auth2.encode(&mut buf2);
@@ -1150,6 +1190,7 @@ mod tests {
                 token: Address::ZERO,
                 limit: U256::from(100u64),
             }]),
+            allowed_calls: None,
         };
         let mut buf3 = Vec::new();
         auth3.encode(&mut buf3);
@@ -1162,6 +1203,88 @@ mod tests {
         // Trailing fields make it longer
         assert!(buf2.len() > buf1.len());
         assert!(buf3.len() > buf2.len());
+    }
+
+    #[test]
+    fn key_authorization_with_allowed_calls_grows_encoding() {
+        use alloy::primitives::address;
+
+        let scope = CallScope {
+            target: address!("0x20C0000000000000000000000000000000000042"),
+            selector_rules: vec![SelectorRule {
+                selector: alloy::primitives::FixedBytes::from([0xa9, 0x05, 0x9c, 0xbb]),
+                recipients: vec![address!("0x1111111111111111111111111111111111111111")],
+            }],
+        };
+
+        let base = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: Some(1000),
+            limits: None,
+            allowed_calls: None,
+        };
+        let mut base_buf = Vec::new();
+        base.encode(&mut base_buf);
+
+        let with_scopes = KeyAuthorization {
+            allowed_calls: Some(vec![scope.clone()]),
+            ..base.clone()
+        };
+        let mut scopes_buf = Vec::new();
+        with_scopes.encode(&mut scopes_buf);
+
+        assert_eq!(scopes_buf.len(), with_scopes.length());
+        // Adding allowed_calls forces both `limits` (None -> 0x80) and the new
+        // field to be encoded positionally, so the buffer must grow.
+        assert!(
+            scopes_buf.len() > base_buf.len(),
+            "with_scopes ({}) should be longer than base ({})",
+            scopes_buf.len(),
+            base_buf.len(),
+        );
+    }
+
+    #[test]
+    fn key_authorization_deny_all_allowed_calls_round_trips_in_length() {
+        // `Some(vec![])` encodes as the empty list `0xc0`, not as `None`.
+        let deny_all = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: Some(1000),
+            limits: None,
+            allowed_calls: Some(Vec::new()),
+        };
+        let mut buf = Vec::new();
+        deny_all.encode(&mut buf);
+        assert_eq!(buf.len(), deny_all.length());
+        // Sanity: contains an explicit empty-list byte after the limits 0x80.
+        assert!(
+            buf.contains(&0xc0),
+            "deny-all allowed_calls should be encoded as empty list 0xc0",
+        );
+    }
+
+    #[test]
+    fn signed_key_authorization_includes_allowed_calls_positionally() {
+        // signature is always trailing → both `limits` (None) and
+        // `allowed_calls` (Some(vec![])) must take slots before signature.
+        let signed = SignedKeyAuthorization {
+            authorization: KeyAuthorization {
+                chain_id: 1,
+                key_type: SignatureType::Secp256k1,
+                key_id: Address::ZERO,
+                expiry: Some(1000),
+                limits: None,
+                allowed_calls: Some(Vec::new()),
+            },
+            signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
+        };
+        let mut buf = Vec::new();
+        signed.encode(&mut buf);
+        assert_eq!(buf.len(), signed.length());
     }
 
     // ========================================================================

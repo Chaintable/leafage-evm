@@ -92,6 +92,45 @@ pub struct TempoEvmCustomConfig;
 
 type TempoApiImpl<DB> = ApiImpl<DB, TempoHardfork, TempoEvmCustomConfig>;
 
+/// Derive `ScopeCounts` from a TIP-1011 `allowedCalls` wire value.
+///
+/// `None` → all zero, `has_allowed_calls = false`, which selects the gas
+/// formula's pre-T3 branch.
+/// `Some(&[])` → `has_allowed_calls = true` with all counts zero (scoped
+/// deny-all; gas reflects the `BASE_SCOPE_GAS` + storage-slot reservation).
+/// `Some(scopes)` → counts of targets, selectors, recipient-bearing selectors,
+/// and total recipients. Matches writer's per-field accounting in
+/// `crates/revm/src/handler.rs:203-244`.
+fn derive_scope_counts(
+    allowed_calls: Option<&[leafage_evm_types::CallScope]>,
+) -> leafage_evm_chains::tempo::tx::ScopeCounts {
+    use leafage_evm_chains::tempo::tx::ScopeCounts;
+    match allowed_calls {
+        None => ScopeCounts::default(),
+        Some(scopes) => {
+            let selectors_total: usize =
+                scopes.iter().map(|s| s.selector_rules.len()).sum();
+            let constrained_selectors: usize = scopes
+                .iter()
+                .flat_map(|s| &s.selector_rules)
+                .filter(|r| !r.recipients.is_empty())
+                .count();
+            let recipients_total: usize = scopes
+                .iter()
+                .flat_map(|s| &s.selector_rules)
+                .map(|r| r.recipients.len())
+                .sum();
+            ScopeCounts {
+                has_allowed_calls: true,
+                scopes: scopes.len() as u32,
+                selectors: selectors_total as u32,
+                constrained_selectors: constrained_selectors as u32,
+                recipients: recipients_total as u32,
+            }
+        }
+    }
+}
+
 impl<DB> EvmExecutor for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
@@ -173,7 +212,10 @@ where
                 0
             };
 
-            // Key authorization gas info.
+            // Key authorization gas info. `scope_counts` is derived from the
+            // TIP-1011 `allowedCalls` list on the wire if present; otherwise
+            // ScopeCounts::default() (has_allowed_calls = false) and the gas
+            // formula's pre-T3 branch fires.
             let key_auth = key_authorization.map(|ka| TempoKeyAuthGas {
                 sig_type: ka
                     .sig_type
@@ -181,10 +223,7 @@ where
                     .map(TempoSigType::from_str_lossy)
                     .unwrap_or_default(),
                 num_limits: ka.num_limits,
-                // TODO (FU-2): populate from ka.allowed_calls once the RPC
-                // request type carries that field. See
-                // docs/tempo-t3-t4-followups.md (FU-2).
-                scope_counts: Default::default(),
+                scope_counts: derive_scope_counts(ka.allowed_calls.as_deref()),
             });
 
             // Tempo authorization list: gas info + optional delegation fields.
@@ -514,6 +553,84 @@ mod tests {
             Some(&[0xfe][..]),
             "existing code should NOT be overwritten"
         );
+    }
+
+    // -- derive_scope_counts (FU-2) -----------------------------------------
+
+    fn make_scope(
+        target: alloy::primitives::Address,
+        rules: Vec<(alloy::primitives::FixedBytes<4>, Vec<alloy::primitives::Address>)>,
+    ) -> leafage_evm_types::CallScope {
+        leafage_evm_types::CallScope {
+            target,
+            selector_rules: rules
+                .into_iter()
+                .map(|(selector, recipients)| leafage_evm_types::SelectorRule {
+                    selector,
+                    recipients,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn derive_scope_counts_none_returns_default() {
+        let counts = derive_scope_counts(None);
+        assert!(!counts.has_allowed_calls);
+        assert_eq!(counts.scopes, 0);
+        assert_eq!(counts.selectors, 0);
+        assert_eq!(counts.constrained_selectors, 0);
+        assert_eq!(counts.recipients, 0);
+    }
+
+    #[test]
+    fn derive_scope_counts_empty_marks_has_allowed_calls() {
+        let counts = derive_scope_counts(Some(&[]));
+        assert!(counts.has_allowed_calls);
+        assert_eq!(counts.scopes, 0);
+        assert_eq!(counts.selectors, 0);
+        assert_eq!(counts.constrained_selectors, 0);
+        assert_eq!(counts.recipients, 0);
+    }
+
+    #[test]
+    fn derive_scope_counts_aggregates_across_nested_rules() {
+        use alloy::primitives::{address, FixedBytes};
+
+        let scopes = vec![
+            make_scope(
+                address!("0x20C0000000000000000000000000000000000001"),
+                vec![
+                    // 1 selector with 2 recipients (constrained)
+                    (
+                        FixedBytes::from([0xa9, 0x05, 0x9c, 0xbb]),
+                        vec![
+                            address!("0x1111111111111111111111111111111111111111"),
+                            address!("0x2222222222222222222222222222222222222222"),
+                        ],
+                    ),
+                    // 1 selector with 0 recipients (unconstrained)
+                    (FixedBytes::from([0x09, 0x5e, 0xa7, 0xb3]), Vec::new()),
+                ],
+            ),
+            make_scope(
+                address!("0x20C0000000000000000000000000000000000002"),
+                vec![
+                    // 1 selector with 1 recipient (constrained)
+                    (
+                        FixedBytes::from([0xa9, 0x05, 0x9c, 0xbb]),
+                        vec![address!("0x3333333333333333333333333333333333333333")],
+                    ),
+                ],
+            ),
+        ];
+
+        let counts = derive_scope_counts(Some(&scopes));
+        assert!(counts.has_allowed_calls);
+        assert_eq!(counts.scopes, 2, "2 targets");
+        assert_eq!(counts.selectors, 3, "2 + 1 selectors");
+        assert_eq!(counts.constrained_selectors, 2, "1 + 1 with non-empty recipients");
+        assert_eq!(counts.recipients, 3, "2 + 1 recipients total");
     }
 
     #[test]
