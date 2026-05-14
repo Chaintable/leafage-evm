@@ -1592,6 +1592,15 @@ impl TIP20Token {
         call: ITIP20::setRewardRecipientCall,
     ) -> Result<()> {
         self.check_not_paused()?;
+        // TIP-1022 (T3+): reward recipients cannot be virtual addresses. They are
+        // accumulators that must be claimed; routing to a virtual recipient would
+        // mean the rewards land on a master EOA that may not be the original
+        // intent. Reject at recipient-set time. Pre-T3 behaviour is unchanged.
+        if self.storage.spec().is_t3() && call.recipient.is_virtual() {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidRecipient {}.abi_encode().into(),
+            ));
+        }
         if call.recipient != Address::ZERO {
             self.ensure_transfer_authorized(msg_sender, call.recipient)?;
         }
