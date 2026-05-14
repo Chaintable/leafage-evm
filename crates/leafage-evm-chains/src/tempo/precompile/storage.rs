@@ -173,6 +173,43 @@ pub trait StorageOps {
     fn load(&self, slot: U256) -> Result<U256>;
 }
 
+/// Read-only `StorageOps` adapter bound to a specific contract address.
+///
+/// Wraps the thread-local `StorageCtx` so that `Storable::load` /
+/// `Set::load` / `Vec::load` can be called with a manually-computed slot
+/// against a known contract address. The typed `Slot`/`Mapping` handlers
+/// already provide this via their own `StorageOps` impl, but those carry a
+/// fixed base slot — the reader is for traversal paths (e.g. CallScope
+/// nested `Set<Address>` reads in `account_keychain`) that compute slots
+/// outside the handler hierarchy.
+///
+/// Writes intentionally fail: write paths must go through typed handlers so
+/// that gas accounting and packed-slot semantics stay correct.
+pub struct ContractStorageReader {
+    address: Address,
+}
+
+impl ContractStorageReader {
+    /// Create a reader bound to `address`.
+    #[inline]
+    pub const fn new(address: Address) -> Self {
+        Self { address }
+    }
+}
+
+impl StorageOps for ContractStorageReader {
+    #[inline]
+    fn load(&self, slot: U256) -> Result<U256> {
+        StorageCtx.sload(self.address, slot)
+    }
+
+    fn store(&mut self, _slot: U256, _value: U256) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "ContractStorageReader is read-only; use Slot/Mapping handler for writes".into(),
+        ))
+    }
+}
+
 /// Trait providing access to a contract's address and storage context.
 ///
 /// Automatically implemented by individual precompile contract types.
@@ -822,4 +859,38 @@ where
 {
     let mut provider = ReadOnlyStorageProvider::new(db, spec, chain_id);
     StorageCtx::enter(&mut provider, f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+    use revm::database::EmptyDB;
+
+    #[test]
+    fn contract_storage_reader_load_returns_zero_from_empty_db() {
+        let addr = address!("0x1111111111111111111111111111111111111111");
+        let reader = ContractStorageReader::new(addr);
+        let value = with_read_only_storage_ctx(
+            &EmptyDB::default(),
+            TempoHardfork::T3,
+            4217,
+            || reader.load(U256::from(42u8)),
+        )
+        .unwrap();
+        assert_eq!(value, U256::ZERO);
+    }
+
+    #[test]
+    fn contract_storage_reader_store_is_unreachable() {
+        let mut reader = ContractStorageReader::new(Address::ZERO);
+        let err = reader.store(U256::ZERO, U256::ONE).unwrap_err();
+        match err {
+            TempoPrecompileError::Fatal(msg) => assert!(
+                msg.contains("read-only"),
+                "expected read-only error, got {msg}",
+            ),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
 }
