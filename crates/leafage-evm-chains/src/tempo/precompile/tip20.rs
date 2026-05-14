@@ -557,7 +557,7 @@ impl TIP20Token {
         self.total_supply.write(amount)
     }
 
-    fn check_not_paused(&self) -> Result<()> {
+    pub(crate) fn check_not_paused(&self) -> Result<()> {
         if self.paused()? {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::ContractPaused {}.abi_encode().into(),
