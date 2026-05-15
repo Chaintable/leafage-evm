@@ -21,8 +21,11 @@ impl Command {
         info!(target: "compact", "Starting database compaction");
         info!(target: "compact", "db_path: {:?}, cache_size: {}MB", self.db_path, self.cache_size);
 
-        // Open archive database
-        let db = ArchiveRocksDBStorage::open(&self.db_path, self.cache_size, false);
+        // Open archive database with auto-compactions disabled: this command
+        // drives its own range-segmented compact() (low memory by design), and
+        // letting RocksDB also fire uncontrolled background compaction on the
+        // bulk-load L0 backlog is what blows past the memory limit.
+        let db = ArchiveRocksDBStorage::open(&self.db_path, self.cache_size, true);
 
         info!(target: "compact", "Database opened, starting compaction...");
         db.compact()?;
