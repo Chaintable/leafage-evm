@@ -37,6 +37,16 @@ pub struct GatewayObjectConfig {
     pub chain_id: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub r2_endpoint: String,
+    #[serde(default)]
+    pub r2_inner_bucket: String,
+    #[serde(default = "default_prefetch_window")]
+    pub prefetch_window: usize,
+}
+
+fn default_prefetch_window() -> usize {
+    8
 }
 
 pub async fn s3_get_block_diff(
