@@ -237,6 +237,7 @@ where
                         match ack.next_action.as_str() {
                             "replay" => Ok(ControlAction::Continue),
                             "catchup" => Ok(ControlAction::Continue),
+                            "wait" => Ok(ControlAction::Continue),
                             "snapshot" => Ok(ControlAction::SnapshotRequired {
                                 manifest_url: String::new(),
                                 reason: "snapshot_required_from_hello_ack".to_string(),
