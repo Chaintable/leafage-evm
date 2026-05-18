@@ -120,6 +120,13 @@ pub struct Command {
     /// Checkpoint interval for committing blocks to database
     #[arg(long, default_value = "1024")]
     checkpoint_interval: u64,
+
+    /// Use ZSTD-with-dict compression at deep levels for the three large
+    /// archive CFs (RocksDB only). Default: false (uniform LZ4). See standalone
+    /// command `--archive-zstd-compression` for full trade-off notes. Applies
+    /// both during bulk-load ingest and the post-ingest compact() reopen.
+    #[arg(long, default_value = "false")]
+    archive_zstd_compression: bool,
 }
 
 /// Data fetched and pre-encoded for a single block, to be written by the
@@ -865,6 +872,7 @@ impl Command {
                 ArchiveStorage::RocksDB(Arc::new(ArchiveRocksDBStorage::open_for_bulk_load(
                     &self.db_path,
                     self.db_cache,
+                    self.archive_zstd_compression,
                 )))
             }
             StorageKind::MDBX => {
@@ -1076,7 +1084,12 @@ impl Command {
             sleep(ROCKSDB_SETTLE_DELAY).await;
 
             // Reopen database with auto compaction enabled for the compaction phase
-            let compact_db = ArchiveRocksDBStorage::open(&self.db_path, self.db_cache, false);
+            let compact_db = ArchiveRocksDBStorage::open(
+                &self.db_path,
+                self.db_cache,
+                false,
+                self.archive_zstd_compression,
+            );
             info!(target: "archive_init", "Starting database compaction...");
             compact_db.compact()?;
             info!(target: "archive_init", "Database compaction completed.");

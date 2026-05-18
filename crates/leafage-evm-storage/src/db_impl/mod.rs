@@ -61,6 +61,7 @@ impl MultiStorage {
         kind: StorageKind,
         is_archive: bool,
         disable_auto_compactions: bool,
+        archive_zstd_compression: bool,
     ) -> Result<Self, StorageError> {
         match (kind, is_archive) {
             (StorageKind::Rocksdb, false) => {
@@ -68,7 +69,12 @@ impl MultiStorage {
                 Ok(MultiStorage::RocksDBState(Arc::new(db)))
             }
             (StorageKind::Rocksdb, true) => {
-                let db = ArchiveRocksDBStorage::open(path, cache_size, disable_auto_compactions);
+                let db = ArchiveRocksDBStorage::open(
+                    path,
+                    cache_size,
+                    disable_auto_compactions,
+                    archive_zstd_compression,
+                );
                 Ok(MultiStorage::RocksDBArchive(Arc::new(db)))
             }
             (StorageKind::MDBX, false) => {

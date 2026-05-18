@@ -209,7 +209,9 @@ unsafe impl Sync for DataBaseInner {}
 enum CfCompression {
     /// No compression — only used for tiny CFs where the encode CPU isn't worth it.
     None,
-    /// LZ4 at shallow levels (cheap flush), ZSTD with dict at deep levels for ratio.
+    /// LZ4 across all levels. Default policy for medium-sized CFs.
+    Lz4,
+    /// LZ4 at shallow levels, ZSTD with dict at deep levels. Best ratio for code-like blobs.
     Zstd,
 }
 
@@ -220,6 +222,7 @@ fn rocksdb_column_options(
     disable_auto_compactions: bool,
     compression: CfCompression,
     bulk_load: bool,
+    archive_zstd_compression: bool,
 ) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
@@ -281,20 +284,29 @@ fn rocksdb_column_options(
         cf_opts.set_level_zero_file_num_compaction_trigger(50);
     }
 
-    // The compression policy is identical across normal and bulk-load opens.
-    // The previous policy made the shallow levels uncompressed in normal mode
-    // (for hot-read latency) but compressed in bulk-load mode. That asymmetry
-    // caused a pathological expansion when a bulk-loaded DB was reopened in
-    // normal mode for compaction: SSTs written as LZ4 at flush were rewritten
-    // as None one level down during cascade, inflating disk by ~1.7× until
-    // data reached the next compressed level. LZ4 decompresses at ~4 GB/s,
-    // comparable to or faster than NVMe sequential read, so compressing the
-    // shallow levels has negligible read-latency cost in practice.
+    // Compression policy.
+    //
+    // Two policies coexist, gated by `archive_zstd_compression`:
+    //
+    // * `archive_zstd_compression = false` (default — preserves pre-branch
+    //   behavior for existing deployments):
+    //   - Lz4: L0/L1 = None in normal mode, LZ4 in bulk-load; L2-L6 = LZ4.
+    //   - Zstd: L0 = None in normal mode, LZ4 in bulk-load; L1 = LZ4; L2-L6 = ZSTD-with-dict.
+    //
+    // * `archive_zstd_compression = true` (opt-in — newer policy from this branch):
+    //   - Lz4: LZ4 across all levels unconditionally.
+    //   - Zstd: L0-L1 = LZ4 unconditionally; L2-L6 = ZSTD-with-dict.
+    //   The unconditional shallow-level compression fixes a bug where a
+    //   bulk-loaded DB reopened in normal mode would have its L0 SSTs
+    //   (written as LZ4) rewritten as None on cascade, inflating disk by
+    //   ~1.7× until the data reached the next compressed level. LZ4
+    //   decompresses at ~4 GB/s — comparable to NVMe sequential read — so
+    //   shallow compression has negligible read-latency cost.
     //
     // NOTE on dynamic levels: this CF enables level_compaction_dynamic_level_bytes,
-    // so the physical level numbers below the flush level shift with DB size.
-    // What matters is that the flush output (compression_per_level[0]) and all
-    // deeper levels reachable via cascade are set consistently — they are.
+    // so physical level numbers below the flush level shift with DB size. What
+    // matters is that the flush output (compression_per_level[0]) and all deeper
+    // levels reachable via cascade are set consistently — they are.
     //
     // NOTE on overrides: optimize_level_style_compaction() populates compression_per_level
     // (L0-L1: None, L2+: LZ4), which takes precedence over set_compression_type().
@@ -311,12 +323,30 @@ fn rocksdb_column_options(
                 rocksdb::DBCompressionType::None,
             ]);
         }
-        CfCompression::Zstd => {
-            // Shallow levels (flush output and one cascade below) use LZ4 for
-            // cheap encode; deeper levels switch to ZSTD for better ratio on
-            // data that is rewritten less often.
+        CfCompression::Lz4 => {
+            let l0_l1 = if archive_zstd_compression || bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
+                l0_l1,
+                l0_l1,
                 rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+                rocksdb::DBCompressionType::Lz4,
+            ]);
+        }
+        CfCompression::Zstd => {
+            let l0 = if archive_zstd_compression || bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
+            cf_opts.set_compression_per_level(&[
+                l0,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
@@ -392,8 +422,15 @@ impl DataBaseRef {
         path: P,
         cache_size: usize,
         disable_auto_compactions: bool,
+        archive_zstd_compression: bool,
     ) -> Self {
-        Self::open_inner(path, cache_size, disable_auto_compactions, false)
+        Self::open_inner(
+            path,
+            cache_size,
+            disable_auto_compactions,
+            false,
+            archive_zstd_compression,
+        )
     }
 
     /// Open the archive RocksDB tuned for bulk ingest:
@@ -405,7 +442,11 @@ impl DataBaseRef {
     /// - WAL is on (same as `open()`); callers wanting durable resume
     ///   should mark each checkpoint batch as `set_sync(true)` so the WAL
     ///   is fsynced before the commit returns.
-    pub fn open_for_bulk_load<P: AsRef<Path>>(path: P, cache_size: usize) -> Self {
+    pub fn open_for_bulk_load<P: AsRef<Path>>(
+        path: P,
+        cache_size: usize,
+        archive_zstd_compression: bool,
+    ) -> Self {
         warn!(
             target = "rocksdb",
             "Opening RocksDB archive in BULK-LOAD mode: \
@@ -419,7 +460,7 @@ impl DataBaseRef {
         // compaction (work proportional to total written so far), so periodic
         // calls produced O(N²) total compaction work. Letting RocksDB do
         // incremental L0 → L1 in the background keeps each step bounded.
-        Self::open_inner(path, cache_size, false, true)
+        Self::open_inner(path, cache_size, false, true, archive_zstd_compression)
     }
 
     fn open_inner<P: AsRef<Path>>(
@@ -427,6 +468,7 @@ impl DataBaseRef {
         cache_size: usize,
         disable_auto_compactions: bool,
         bulk_load: bool,
+        archive_zstd_compression: bool,
     ) -> Self {
         let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
@@ -435,10 +477,23 @@ impl DataBaseRef {
         );
         info!(
             target = "rocksdb",
-            "Created shared Clock Cache with size: {}MB for archive (bulk_load={})",
+            "Created shared Clock Cache with size: {}MB for archive (bulk_load={}, archive_zstd_compression={})",
             total_cache_size,
             bulk_load,
+            archive_zstd_compression,
         );
+
+        // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
+        // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at
+        // deep levels via `archive_zstd_compression` for ~15-20% extra ratio
+        // at the cost of ~2× compaction CPU and ~3× cold-read decode latency.
+        // HashToCode is always Zstd: code blobs benefit from dict compression
+        // regardless of the flag.
+        let big_cf_compression = if archive_zstd_compression {
+            CfCompression::Zstd
+        } else {
+            CfCompression::Lz4
+        };
 
         // LatestBlockHash: single record, no compression needed
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
@@ -449,19 +504,18 @@ impl DataBaseRef {
                 disable_auto_compactions,
                 CfCompression::None,
                 bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // BlockHashToBlockInfo: ~500 bytes structured value (RLP block info).
-        // ZSTD with dict at deep levels for better ratio on repeated patterns;
-        // shallow levels stay LZ4 for cheap flush.
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 0,
                 disable_auto_compactions,
-                CfCompression::Zstd,
+                big_cf_compression,
                 bulk_load,
+                archive_zstd_compression,
             ),
         );
         // BlockNumToBlockHash: 32 bytes value, no compression needed
@@ -473,33 +527,29 @@ impl DataBaseRef {
                 disable_auto_compactions,
                 CfCompression::None,
                 bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // AddressToAccount: ~100 bytes RLP slim account. ZSTD with dict at
-        // deep levels captures repeating RLP framing and zero-padding; shallow
-        // levels stay LZ4 for cheap flush.
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 32,
                 disable_auto_compactions,
-                CfCompression::Zstd,
+                big_cf_compression,
                 bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // AddressToStorage: 32-byte values are high-entropy, but 96-byte keys
-        // have heavy address+slot prefix redundancy when sorted. ZSTD with
-        // dict at deep levels squeezes more out of that redundancy than LZ4;
-        // shallow levels stay LZ4 for cheap flush.
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 64,
                 disable_auto_compactions,
-                CfCompression::Zstd,
+                big_cf_compression,
                 bulk_load,
+                archive_zstd_compression,
             ),
         );
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
@@ -511,6 +561,7 @@ impl DataBaseRef {
                 disable_auto_compactions,
                 CfCompression::Zstd,
                 bulk_load,
+                archive_zstd_compression,
             ),
         );
         let cfs = vec![

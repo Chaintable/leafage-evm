@@ -254,6 +254,19 @@ pub struct Command {
     #[arg(long, default_value = "false")]
     disable_auto_compactions: bool,
 
+    /// Use ZSTD-with-dict compression at deep levels for the three large
+    /// archive CFs (BlockHashToBlockInfo, AddressToAccount, AddressToStorage).
+    /// Default: false (uniform LZ4 — same as the pre-refactor build).
+    ///
+    /// When enabled, archive disk usage shrinks by ~15-20% over time as
+    /// compaction rewrites deep levels, at the cost of ~2× compaction CPU and
+    /// ~3× cold-read decompression latency on deep-level reads. RocksDB
+    /// records compression type per SST, so existing data remains readable
+    /// regardless of this flag — toggling only affects newly written SSTs.
+    /// Archive-only (RocksDB archive mode).
+    #[arg(long, default_value = "false")]
+    archive_zstd_compression: bool,
+
     /// Iterator timeout in seconds for archive mode.
     /// Default: 0 (disabled)
     /// When > 0, StateDB iterators will be tracked and logged when they exceed this timeout.
@@ -526,6 +539,7 @@ impl Command {
             self.db_type,
             self.archive,
             self.disable_auto_compactions,
+            self.archive_zstd_compression,
         )?;
 
         // check if db shoud be initialized
