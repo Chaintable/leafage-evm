@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::SyncIoBridge;
 use tracing::{info, warn};
 
 const DEFAULT_CONCURRENCY: usize = 32;
@@ -15,6 +16,15 @@ const LATEST_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
 const LATEST_RETRY_MAX_DELAY_MS: u64 = 60_000;
 const LATEST_RETRY_MAX_ATTEMPTS: usize = 6;
 const PER_FILE_MAX_ATTEMPTS: usize = 3;
+
+// v3 archive 模式默认并发,可由配置覆盖。
+const DEFAULT_ARCHIVE_CONCURRENCY: usize = 4;
+
+// 单 archive 外层重试默认 3 次,指数退避 1s → 4s。
+// SDK 内层 retry 兜底瞬时网络抖动,外层兜底"SDK retry 用尽"的持续故障。
+const DEFAULT_OUTER_RETRY_ATTEMPTS: usize = 3;
+const OUTER_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
+const OUTER_RETRY_MAX_DELAY_MS: u64 = 16_000;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct SnapshotConfig {
@@ -30,12 +40,42 @@ pub(crate) struct SnapshotConfig {
     pub secret_access_key: String,
     #[serde(default)]
     pub concurrency: usize,
+
+    /// archive 级 worker pool 路数,默认 4。
+    #[serde(default)]
+    pub archive_concurrency: usize,
+
+    /// 单 archive 外层重试次数,默认 3(SDK 内层 retry 之外)。
+    #[serde(default)]
+    pub retry_outer_attempts: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ArchiveEntry {
+    name: String,
+    #[serde(default)]
+    size_bytes: i64,
+    #[serde(default)]
+    uncompressed_size_bytes: i64,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    file_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct R2Manifest {
     schema_version: u32,
     format: String,
+    #[serde(default)]
+    compression: String,
+    #[serde(default)]
+    archive_size_bytes: i64,
+    #[serde(default)]
+    archives_prefix: String,
+    #[serde(default)]
+    archives: Vec<ArchiveEntry>,
+    #[serde(default)]
     files_prefix: String,
     namespace: String,
     component: String,
@@ -53,6 +93,8 @@ struct Initializer {
     db_path: PathBuf,
     s3_client: Client,
     concurrency: usize,
+    archive_concurrency: usize,
+    outer_retry_attempts: usize,
 }
 
 impl Initializer {
@@ -106,12 +148,24 @@ impl Initializer {
         } else {
             cfg.concurrency
         };
+        let archive_concurrency = if cfg.archive_concurrency == 0 {
+            DEFAULT_ARCHIVE_CONCURRENCY
+        } else {
+            cfg.archive_concurrency
+        };
+        let outer_retry_attempts = if cfg.retry_outer_attempts == 0 {
+            DEFAULT_OUTER_RETRY_ATTEMPTS
+        } else {
+            cfg.retry_outer_attempts
+        };
 
         Ok(Self {
             cfg,
             db_path,
             s3_client,
             concurrency,
+            archive_concurrency,
+            outer_retry_attempts,
         })
     }
 
@@ -130,18 +184,27 @@ impl Initializer {
             .context("fetch latest.json")?;
         info!(
             target: "snapshot_init",
-            "manifest snap_id={} file_count={} total_size_bytes={} created_at={}",
-            manifest.snap_id, manifest.file_count, manifest.total_size_bytes, manifest.created_at,
+            "manifest schema_version={} format={} snap_id={} file_count={} total_size_bytes={} created_at={}",
+            manifest.schema_version,
+            manifest.format,
+            manifest.snap_id,
+            manifest.file_count,
+            manifest.total_size_bytes,
+            manifest.created_at,
         );
 
-        if manifest.schema_version != 2 {
-            anyhow::bail!(
-                "unsupported manifest.schema_version: {}",
-                manifest.schema_version
-            );
-        }
-        if manifest.format != "per-file" {
-            anyhow::bail!("unsupported manifest.format: {}", manifest.format);
+        // v2 schema 仅支持 per-file;v3 schema 同时支持 per-file 与 archive。
+        match manifest.schema_version {
+            2 => {
+                if manifest.format != "per-file" {
+                    anyhow::bail!(
+                        "schema_version=2 only supports format=per-file, got {}",
+                        manifest.format
+                    );
+                }
+            }
+            3 => {}
+            other => anyhow::bail!("unsupported manifest.schema_version: {}", other),
         }
         if manifest.namespace != self.cfg.namespace
             || manifest.component != self.cfg.component
@@ -154,6 +217,62 @@ impl Initializer {
                 self.cfg.component
             );
         }
+
+        fs::create_dir_all(&self.db_path)
+            .await
+            .with_context(|| format!("mkdir {:?}", self.db_path))?;
+
+        // 进 init 前清空 db_path 现有内容,避免上一次半套残留与本次 snapshot 混杂。
+        // 目录本身保留(容器场景常见挂载点),只删直接子项。
+        self.purge_db_path().await?;
+
+        match manifest.format.as_str() {
+            "per-file" => self.restore_per_file(&manifest, &chain_prefix).await,
+            "archive" => self.restore_archive(&manifest, &chain_prefix).await,
+            other => anyhow::bail!("unsupported manifest.format: {}", other),
+        }
+    }
+
+    /// 清空 db_path 下所有直接子项(目录本身保留,适配 bind-mount / 挂载点场景)。
+    async fn purge_db_path(&self) -> Result<()> {
+        let mut rd = fs::read_dir(&self.db_path)
+            .await
+            .with_context(|| format!("read_dir {:?}", self.db_path))?;
+        let mut removed: usize = 0;
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .with_context(|| format!("next_entry {:?}", self.db_path))?
+        {
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .await
+                .with_context(|| format!("file_type {:?}", path))?;
+            if ft.is_dir() {
+                fs::remove_dir_all(&path)
+                    .await
+                    .with_context(|| format!("rm -rf {:?}", path))?;
+            } else {
+                fs::remove_file(&path)
+                    .await
+                    .with_context(|| format!("rm {:?}", path))?;
+            }
+            removed += 1;
+        }
+        if removed > 0 {
+            info!(
+                target: "snapshot_init",
+                "purged {} entries from {:?} before restore",
+                removed, self.db_path,
+            );
+        }
+        Ok(())
+    }
+
+    // === per-file 路径(v1/v2 兼容,v3 schema 下 format=per-file 也走这里)===
+
+    async fn restore_per_file(&self, manifest: &R2Manifest, chain_prefix: &str) -> Result<()> {
         let expected_prefix_root = format!("{}/snapshots/", chain_prefix);
         if !manifest.files_prefix.starts_with(&expected_prefix_root) {
             anyhow::bail!(
@@ -180,10 +299,6 @@ impl Initializer {
             );
         }
 
-        fs::create_dir_all(&self.db_path)
-            .await
-            .with_context(|| format!("mkdir {:?}", self.db_path))?;
-
         info!(
             target: "snapshot_init",
             "downloading {} files into {:?} concurrency={}",
@@ -204,11 +319,136 @@ impl Initializer {
         }
         info!(
             target: "snapshot_init",
-            "snapshot restore complete: {} files written",
+            "snapshot restore complete (per-file): {} files written",
             downloaded,
         );
         Ok(())
     }
+
+    // === archive 路径(v3,format=archive)===
+    // 流式管道:S3 ByteStream → AsyncRead → SyncIoBridge → tar::Archive → 直接 unpack 到 db_path。
+    // 不落本地盘,不算 sha256,不做外层重试。任一 archive 失败 → 整任务退出。
+
+    async fn restore_archive(&self, manifest: &R2Manifest, chain_prefix: &str) -> Result<()> {
+        let expected_prefix_root = format!("{}/snapshots/", chain_prefix);
+        if !manifest.archives_prefix.starts_with(&expected_prefix_root) {
+            anyhow::bail!(
+                "manifest.archives_prefix does not start with {}: got {}",
+                expected_prefix_root,
+                manifest.archives_prefix
+            );
+        }
+        if manifest.archives.is_empty() {
+            anyhow::bail!("manifest.archives is empty");
+        }
+
+        info!(
+            target: "snapshot_init",
+            "archive restore start archives={} archive_concurrency={}",
+            manifest.archives.len(),
+            self.archive_concurrency,
+        );
+
+        let archives_prefix = manifest.archives_prefix.clone();
+
+        // 镜像 r2-pusher 的 worker pool:FuturesUnordered + 滑动窗口。
+        // 任一 worker 错 → result? 短路返回 → in_flight 集合 drop → 余下 future 自动取消。
+        let mut iter = manifest.archives.iter().cloned().enumerate();
+        let mut in_flight = FuturesUnordered::new();
+        for _ in 0..self.archive_concurrency {
+            if let Some((idx, entry)) = iter.next() {
+                in_flight.push(self.extract_one_archive(idx, entry, archives_prefix.clone()));
+            }
+        }
+        while let Some(result) = in_flight.next().await {
+            result?;
+            if let Some((idx, entry)) = iter.next() {
+                in_flight.push(self.extract_one_archive(idx, entry, archives_prefix.clone()));
+            }
+        }
+
+        info!(
+            target: "snapshot_init",
+            "snapshot restore complete (archive): {} archives, {} files",
+            manifest.archives.len(),
+            manifest.file_count,
+        );
+        Ok(())
+    }
+
+    /// 单 archive 流式解压:GET → AsyncRead → SyncIoBridge → tar → unpack 直接落 db_path。
+    /// 不下载到 scratch、不算 sha256;外层包 retry × N(指数退避 1s → 4s)。
+    /// 任一 attempt 失败 → warn + 退避后下一次;N 次都失败 → 返回 Err 由调用方短路整轮。
+    /// 失败时已落 db_path 的数据不主动清理(由调用方/运维决定)。
+    async fn extract_one_archive(
+        &self,
+        idx: usize,
+        entry: ArchiveEntry,
+        archives_prefix: String,
+    ) -> Result<()> {
+        let key = format!("{}{}", archives_prefix, entry.name);
+        info!(
+            target: "snapshot_init",
+            "archive start index={} name={} size_bytes={} files={}",
+            idx, entry.name, entry.size_bytes, entry.file_count,
+        );
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
+        for attempt in 1..=self.outer_retry_attempts {
+            match self.try_extract_one_archive(&key).await {
+                Ok(()) => {
+                    info!(
+                        target: "snapshot_init",
+                        "archive done index={} name={} attempt={}",
+                        idx, entry.name, attempt,
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        target: "snapshot_init",
+                        "archive {} attempt {}/{} failed: {:#}",
+                        entry.name, attempt, self.outer_retry_attempts, err,
+                    );
+                    last_err = Some(err);
+                    if attempt < self.outer_retry_attempts {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = delay_ms.saturating_mul(4).min(OUTER_RETRY_MAX_DELAY_MS);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("unknown error"))).with_context(|| {
+            format!(
+                "archive {} after {} attempts",
+                entry.name, self.outer_retry_attempts
+            )
+        })
+    }
+
+    /// 单次尝试:完整跑一遍流式管道(GET → SyncIoBridge → tar::Archive::unpack)。
+    /// 中途任何错(GET 失败 / tar 解析 / 写盘)直接抛出,由外层 wrapper 决定是否重试。
+    async fn try_extract_one_archive(&self, key: &str) -> Result<()> {
+        let resp = self
+            .s3_client
+            .get_object()
+            .bucket(&self.cfg.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("get_object {}/{}", self.cfg.bucket, key))?;
+
+        let async_read = resp.body.into_async_read();
+        let db_path = self.db_path.clone();
+        // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),再 move 进 spawn_blocking。
+        let sync_read = SyncIoBridge::new(async_read);
+        tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path))
+            .await
+            .context("extract task")?
+    }
+
+    // === per-file 模式下使用的旧实现(原样保留)===
 
     async fn fetch_latest_with_retry(&self, key: &str) -> Result<R2Manifest> {
         let mut delay_ms = LATEST_RETRY_INITIAL_DELAY_MS;
@@ -355,6 +595,55 @@ impl Initializer {
         file.flush().await?;
         Ok(())
     }
+}
+
+/// 同步流式解压:reader(假设未压缩 tar)→ tar entries → 直接落 db_path。
+/// 在 spawn_blocking 内执行。单 archive 解压过程内存占用 KB 级(逐 entry 流式)。
+fn extract_tar<R: std::io::Read>(reader: R, db_path: &Path) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    archive.set_overwrite(true);
+    archive.set_preserve_mtime(false);
+    archive.set_preserve_permissions(false);
+
+    for entry in archive.entries().context("tar entries")? {
+        let mut entry = entry.context("tar entry")?;
+        let entry_path = entry
+            .path()
+            .context("tar entry path")?
+            .into_owned();
+        // 拒绝绝对路径与 ".." 越界
+        for comp in entry_path.components() {
+            use std::path::Component;
+            match comp {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    anyhow::bail!("tar entry path escapes db_path: {:?}", entry_path);
+                }
+            }
+        }
+        let dst = db_path.join(&entry_path);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {:?}", parent))?;
+        }
+        // 只处理常规文件;目录由 mkdir 兜底,符号链接/特殊文件 skip。
+        match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Continuous => {}
+            tar::EntryType::Directory => continue,
+            other => {
+                warn!(
+                    target: "snapshot_init",
+                    "skip non-regular tar entry path={:?} type={:?}",
+                    entry_path, other,
+                );
+                continue;
+            }
+        }
+        entry
+            .unpack(&dst)
+            .with_context(|| format!("unpack {:?}", dst))?;
+    }
+    Ok(())
 }
 
 /// `leafage-evm snapshot-init` command
