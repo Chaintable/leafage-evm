@@ -222,11 +222,52 @@ impl Initializer {
             .await
             .with_context(|| format!("mkdir {:?}", self.db_path))?;
 
+        // 进 init 前清空 db_path 现有内容,避免上一次半套残留与本次 snapshot 混杂。
+        // 目录本身保留(容器场景常见挂载点),只删直接子项。
+        self.purge_db_path().await?;
+
         match manifest.format.as_str() {
             "per-file" => self.restore_per_file(&manifest, &chain_prefix).await,
             "archive" => self.restore_archive(&manifest, &chain_prefix).await,
             other => anyhow::bail!("unsupported manifest.format: {}", other),
         }
+    }
+
+    /// 清空 db_path 下所有直接子项(目录本身保留,适配 bind-mount / 挂载点场景)。
+    async fn purge_db_path(&self) -> Result<()> {
+        let mut rd = fs::read_dir(&self.db_path)
+            .await
+            .with_context(|| format!("read_dir {:?}", self.db_path))?;
+        let mut removed: usize = 0;
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .with_context(|| format!("next_entry {:?}", self.db_path))?
+        {
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .await
+                .with_context(|| format!("file_type {:?}", path))?;
+            if ft.is_dir() {
+                fs::remove_dir_all(&path)
+                    .await
+                    .with_context(|| format!("rm -rf {:?}", path))?;
+            } else {
+                fs::remove_file(&path)
+                    .await
+                    .with_context(|| format!("rm {:?}", path))?;
+            }
+            removed += 1;
+        }
+        if removed > 0 {
+            info!(
+                target: "snapshot_init",
+                "purged {} entries from {:?} before restore",
+                removed, self.db_path,
+            );
+        }
+        Ok(())
     }
 
     // === per-file 路径(v1/v2 兼容,v3 schema 下 format=per-file 也走这里)===
