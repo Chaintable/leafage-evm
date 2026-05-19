@@ -20,6 +20,12 @@ const PER_FILE_MAX_ATTEMPTS: usize = 3;
 // v3 archive 模式默认并发,可由配置覆盖。
 const DEFAULT_ARCHIVE_CONCURRENCY: usize = 4;
 
+// 单 archive 外层重试默认 3 次,指数退避 1s → 4s。
+// SDK 内层 retry 兜底瞬时网络抖动,外层兜底"SDK retry 用尽"的持续故障。
+const DEFAULT_OUTER_RETRY_ATTEMPTS: usize = 3;
+const OUTER_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
+const OUTER_RETRY_MAX_DELAY_MS: u64 = 16_000;
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct SnapshotConfig {
     pub endpoint: String,
@@ -38,6 +44,10 @@ pub(crate) struct SnapshotConfig {
     /// archive 级 worker pool 路数,默认 4。
     #[serde(default)]
     pub archive_concurrency: usize,
+
+    /// 单 archive 外层重试次数,默认 3(SDK 内层 retry 之外)。
+    #[serde(default)]
+    pub retry_outer_attempts: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -84,6 +94,7 @@ struct Initializer {
     s3_client: Client,
     concurrency: usize,
     archive_concurrency: usize,
+    outer_retry_attempts: usize,
 }
 
 impl Initializer {
@@ -142,6 +153,11 @@ impl Initializer {
         } else {
             cfg.archive_concurrency
         };
+        let outer_retry_attempts = if cfg.retry_outer_attempts == 0 {
+            DEFAULT_OUTER_RETRY_ATTEMPTS
+        } else {
+            cfg.retry_outer_attempts
+        };
 
         Ok(Self {
             cfg,
@@ -149,6 +165,7 @@ impl Initializer {
             s3_client,
             concurrency,
             archive_concurrency,
+            outer_retry_attempts,
         })
     }
 
@@ -319,7 +336,9 @@ impl Initializer {
     }
 
     /// 单 archive 流式解压:GET → AsyncRead → SyncIoBridge → tar → unpack 直接落 db_path。
-    /// 不下载到 scratch、不算 sha256、不重试。
+    /// 不下载到 scratch、不算 sha256;外层包 retry × N(指数退避 1s → 4s)。
+    /// 任一 attempt 失败 → warn + 退避后下一次;N 次都失败 → 返回 Err 由调用方短路整轮。
+    /// 失败时已落 db_path 的数据不主动清理(由调用方/运维决定)。
     async fn extract_one_archive(
         &self,
         idx: usize,
@@ -333,32 +352,59 @@ impl Initializer {
             idx, entry.name, entry.size_bytes, entry.file_count,
         );
 
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
+        for attempt in 1..=self.outer_retry_attempts {
+            match self.try_extract_one_archive(&key).await {
+                Ok(()) => {
+                    info!(
+                        target: "snapshot_init",
+                        "archive done index={} name={} attempt={}",
+                        idx, entry.name, attempt,
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        target: "snapshot_init",
+                        "archive {} attempt {}/{} failed: {:#}",
+                        entry.name, attempt, self.outer_retry_attempts, err,
+                    );
+                    last_err = Some(err);
+                    if attempt < self.outer_retry_attempts {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = delay_ms.saturating_mul(4).min(OUTER_RETRY_MAX_DELAY_MS);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("unknown error"))).with_context(|| {
+            format!(
+                "archive {} after {} attempts",
+                entry.name, self.outer_retry_attempts
+            )
+        })
+    }
+
+    /// 单次尝试:完整跑一遍流式管道(GET → SyncIoBridge → tar::Archive::unpack)。
+    /// 中途任何错(GET 失败 / tar 解析 / 写盘)直接抛出,由外层 wrapper 决定是否重试。
+    async fn try_extract_one_archive(&self, key: &str) -> Result<()> {
         let resp = self
             .s3_client
             .get_object()
             .bucket(&self.cfg.bucket)
-            .key(&key)
+            .key(key)
             .send()
             .await
             .with_context(|| format!("get_object {}/{}", self.cfg.bucket, key))?;
 
         let async_read = resp.body.into_async_read();
         let db_path = self.db_path.clone();
-        let entry_name = entry.name.clone();
-
-        // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),然后 move 进 spawn_blocking。
+        // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),再 move 进 spawn_blocking。
         let sync_read = SyncIoBridge::new(async_read);
         tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path))
             .await
             .context("extract task")?
-            .with_context(|| format!("extract archive {}", entry_name))?;
-
-        info!(
-            target: "snapshot_init",
-            "archive done index={} name={}",
-            idx, entry.name,
-        );
-        Ok(())
     }
 
     // === per-file 模式下使用的旧实现(原样保留)===
