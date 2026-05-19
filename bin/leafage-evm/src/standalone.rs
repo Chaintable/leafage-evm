@@ -574,6 +574,9 @@ impl Command {
         )
         .await?;
 
+        // MDBX has per-handle ro_txn snapshots; the shared CacheDiskLayer
+        // would blur those boundaries, so disable it for MDBX backends.
+        let enable_cache = matches!(self.db_type, StorageKind::Rocksdb);
         let tree = Arc::new(StateTree::new(
             db,
             StateTreeConfig::new(
@@ -581,6 +584,7 @@ impl Command {
                 self.account_cache_size,
                 self.storage_cache_size,
                 self.code_cache_size,
+                enable_cache,
             ),
         )?);
 
