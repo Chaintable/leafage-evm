@@ -14,15 +14,33 @@ pub struct Command {
     /// Database cache size in MB
     #[arg(long, default_value = "2048")]
     cache_size: usize,
+
+    /// Use ZSTD-with-dict compression at deep levels for the three large
+    /// archive CFs. Default: false (uniform LZ4). See standalone command
+    /// `--archive-zstd-compression` for full trade-off notes.
+    #[arg(long, default_value = "false")]
+    archive_zstd_compression: bool,
 }
 
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
         info!(target: "compact", "Starting database compaction");
-        info!(target: "compact", "db_path: {:?}, cache_size: {}MB", self.db_path, self.cache_size);
+        info!(
+            target: "compact",
+            "db_path: {:?}, cache_size: {}MB, archive_zstd_compression: {}",
+            self.db_path, self.cache_size, self.archive_zstd_compression,
+        );
 
-        // Open archive database
-        let db = ArchiveRocksDBStorage::open(&self.db_path, self.cache_size, false);
+        // Open archive database with auto-compactions disabled: this command
+        // drives its own range-segmented compact() (low memory by design), and
+        // letting RocksDB also fire uncontrolled background compaction on the
+        // bulk-load L0 backlog is what blows past the memory limit.
+        let db = ArchiveRocksDBStorage::open(
+            &self.db_path,
+            self.cache_size,
+            true,
+            self.archive_zstd_compression,
+        );
 
         info!(target: "compact", "Database opened, starting compaction...");
         db.compact()?;

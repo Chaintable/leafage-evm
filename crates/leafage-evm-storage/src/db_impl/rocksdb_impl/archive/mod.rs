@@ -22,6 +22,9 @@
 //! - `get_transaction_by_context`
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::archive_encoding::{
+    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+};
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy::primitives::B64;
@@ -31,15 +34,16 @@ use leafage_evm_types::{
     H256, KECCAK256_EMPTY, U256,
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
-    ReadOptions, SliceTransform, WriteBatch, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IngestExternalFileOptions,
+    IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter, WriteBatch, WriteOptions,
+    DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 mod iterator_tracker;
 use iterator_tracker::{
@@ -136,10 +140,62 @@ pub struct DataBaseRef {
     db: &'static DB,
 }
 
+pub struct ArchiveRocksDBWriteBatch {
+    inner: WriteBatch,
+    account_writes: Vec<([u8; 64], Vec<u8>)>,
+    storage_writes: Vec<([u8; 96], [u8; 32])>,
+    /// When true, the underlying `write_opt` is called with `sync=true`,
+    /// forcing fsync of the WAL segment for this batch before returning.
+    /// Used by archive ingest at checkpoint boundaries to make the resume
+    /// pointer durable without paying for fsync on every commit.
+    sync: bool,
+}
+
+impl ArchiveRocksDBWriteBatch {
+    fn new() -> Self {
+        Self {
+            inner: WriteBatch::default(),
+            account_writes: Vec::new(),
+            storage_writes: Vec::new(),
+            sync: false,
+        }
+    }
+
+    /// Mark this batch as a sync commit: fsync the WAL before `commit()`
+    /// returns. Without this, the WAL append is buffered and a power loss
+    /// could lose the most recent commits.
+    pub fn set_sync(&mut self, sync: bool) {
+        self.sync = sync;
+    }
+
+    /// Append pre-encoded account writes to the deferred cache. `None` is
+    /// treated as a deletion (stored as empty bytes), matching the encoding
+    /// used by [`StateDBWrite::write_account`].
+    #[inline]
+    pub fn extend_account_writes<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = ([u8; 64], Option<Vec<u8>>)>,
+    {
+        self.account_writes
+            .extend(items.into_iter().map(|(k, v)| (k, v.unwrap_or_default())));
+    }
+
+    /// Append pre-encoded storage writes to the deferred cache.
+    #[inline]
+    pub fn extend_storage_writes<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = ([u8; 96], [u8; 32])>,
+    {
+        self.storage_writes.extend(items);
+    }
+}
+
 impl Drop for DataBaseRef {
     fn drop(&mut self) {
+        // Flush every named CF. See `DataBaseRef::flush` for why `db.flush()`
+        // alone is insufficient.
+        self.flush().unwrap();
         unsafe {
-            DATA_BASE.as_mut().unwrap().db.flush().unwrap();
             DATA_BASE = None;
         }
     }
@@ -151,11 +207,11 @@ unsafe impl Sync for DataBaseInner {}
 /// Compression type for column families
 #[derive(Clone, Copy)]
 enum CfCompression {
-    /// No compression (small values, not worth compressing)
+    /// No compression — only used for tiny CFs where the encode CPU isn't worth it.
     None,
-    /// LZ4 compression (good balance of speed and compression)
+    /// LZ4 across all levels. Default policy for medium-sized CFs.
     Lz4,
-    /// ZSTD compression (high compression ratio for large values like code)
+    /// LZ4 at shallow levels, ZSTD with dict at deep levels. Best ratio for code-like blobs.
     Zstd,
 }
 
@@ -165,6 +221,8 @@ fn rocksdb_column_options(
     fixed_prefix_size: usize,
     disable_auto_compactions: bool,
     compression: CfCompression,
+    bulk_load: bool,
+    archive_zstd_compression: bool,
 ) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
@@ -188,6 +246,14 @@ fn rocksdb_column_options(
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
+    // Allow the writer to roll into a fresh memtable while older ones are
+    // still being flushed (default is 2). Helps under sustained write load
+    // such as archive bulk-load.
+    cf_opts.set_max_write_buffer_number(4);
+    // Larger SST files = fewer files at every level = less metadata,
+    // smaller index/bloom overhead, fewer files for compaction to track.
+    // Default is 64MB; bump to 128MB.
+    cf_opts.set_target_file_size_base(128 << 20);
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
     // Disable TTL-based compaction. Archive data is immutable — recompacting
     // old SST files just because they exceed 30 days (the default set by
@@ -195,8 +261,54 @@ fn rocksdb_column_options(
     // temporary disk usage spikes (e.g. ~30 GB for AddressToStorage L6 rewrites).
     cf_opts.set_ttl(0);
 
-    // Set compression based on data characteristics.
-    // NOTE: optimize_level_style_compaction() populates compression_per_level
+    if bulk_load {
+        // Disable every back-pressure mechanism on the writer thread. Auto
+        // compaction still runs in the background to drain L0 → L1
+        // incrementally, but if it can't keep up the writer must NOT be
+        // throttled — archive ingest treats the source as replayable and
+        // would rather pay the disk cost than slow down.
+        // (Defaults: slowdown 20 files, stop 24 files, soft 64GB, hard 256GB.)
+        cf_opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
+        cf_opts.set_level_zero_stop_writes_trigger(i32::MAX);
+        cf_opts.set_soft_pending_compaction_bytes_limit(0);
+        cf_opts.set_hard_pending_compaction_bytes_limit(0);
+        // Push the L0 → L1 compaction trigger from the default 4 files up to
+        // 50 so background compaction stops competing with the WAL writer
+        // for disk bandwidth on slower NVMes. Observed on a ~150 MB/s NVMe:
+        // ingest at 1024-block checkpoints had compaction reading ~40 MB/s
+        // and writing ~30 MB/s while the WAL writer needed ~250 MB/checkpoint
+        // → checkpoint stalls 14s. Letting L0 grow to 50 files frees disk
+        // bandwidth for the WAL/flush path; the deferred compaction work is
+        // picked up by the final manual compact() the caller runs at end of
+        // ingest.
+        cf_opts.set_level_zero_file_num_compaction_trigger(50);
+    }
+
+    // Compression policy.
+    //
+    // Two policies coexist, gated by `archive_zstd_compression`:
+    //
+    // * `archive_zstd_compression = false` (default — preserves pre-branch
+    //   behavior for existing deployments):
+    //   - Lz4: L0/L1 = None in normal mode, LZ4 in bulk-load; L2-L6 = LZ4.
+    //   - Zstd: L0 = None in normal mode, LZ4 in bulk-load; L1 = LZ4; L2-L6 = ZSTD-with-dict.
+    //
+    // * `archive_zstd_compression = true` (opt-in — newer policy from this branch):
+    //   - Lz4: LZ4 across all levels unconditionally.
+    //   - Zstd: L0-L1 = LZ4 unconditionally; L2-L6 = ZSTD-with-dict.
+    //   The unconditional shallow-level compression fixes a bug where a
+    //   bulk-loaded DB reopened in normal mode would have its L0 SSTs
+    //   (written as LZ4) rewritten as None on cascade, inflating disk by
+    //   ~1.7× until the data reached the next compressed level. LZ4
+    //   decompresses at ~4 GB/s — comparable to NVMe sequential read — so
+    //   shallow compression has negligible read-latency cost.
+    //
+    // NOTE on dynamic levels: this CF enables level_compaction_dynamic_level_bytes,
+    // so physical level numbers below the flush level shift with DB size. What
+    // matters is that the flush output (compression_per_level[0]) and all deeper
+    // levels reachable via cascade are set consistently — they are.
+    //
+    // NOTE on overrides: optimize_level_style_compaction() populates compression_per_level
     // (L0-L1: None, L2+: LZ4), which takes precedence over set_compression_type().
     // We must use set_compression_per_level() to override it reliably.
     match compression {
@@ -212,10 +324,14 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Lz4 => {
-            // L0-L1: no compression (frequently accessed), L2+: LZ4
+            let l0_l1 = if archive_zstd_compression || bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::None,
-                rocksdb::DBCompressionType::None,
+                l0_l1,
+                l0_l1,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
@@ -224,9 +340,13 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Zstd => {
-            // L0-L1: LZ4 (fast), L2+: ZSTD (high compression for large code blobs)
+            let l0 = if archive_zstd_compression || bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::None,
+                l0,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
@@ -234,12 +354,7 @@ fn rocksdb_column_options(
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
             ]);
-            // Enable ZSTD dictionary compression for better compression of similar data patterns
-            // - max_train_bytes: bytes to sample for dictionary training (1MB)
-            // - zstd_max_train_bytes: same as above for ZSTD specifically
-            cf_opts.set_zstd_max_train_bytes(1024 * 1024); // 1MB training data
-                                                           // compression_opts: (window_bits, level, strategy, max_dict_bytes)
-                                                           // max_dict_bytes: dictionary size (16KB is a good default)
+            cf_opts.set_zstd_max_train_bytes(1024 * 1024);
             cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
         }
     }
@@ -254,11 +369,20 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.create_if_missing(true);
     opts.set_use_fsync(false);
     opts.set_keep_log_file_num(1);
-    opts.set_bytes_per_sync(1 << 20); // e.g., 1MB
+    // Larger sync chunks: amortise the per-fsync cost during heavy writes
+    // (archive bulk-load and background compaction) at the small cost of a
+    // slightly larger window of dirty pages on crash.
+    opts.set_bytes_per_sync(4 << 20); // 4MB
     opts.set_write_buffer_size(1 << 28); // e.g., 256MB
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
-    opts.increase_parallelism(2);
+    // Background concurrency. The previous value (2) covered flush + a single
+    // compaction job, which serialised L0 → L1 across CFs and bottlenecked
+    // archive bulk-load; standalone reads/writes also benefit from faster
+    // background compaction. `max_subcompactions` lets a single big
+    // compaction (e.g. AddressToStorage) split into parallel ranges.
+    opts.increase_parallelism(8);
+    opts.set_max_subcompactions(4);
     opts.set_use_direct_io_for_flush_and_compaction(true);
     opts.set_disable_auto_compactions(disable_auto_compactions);
 
@@ -287,10 +411,64 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
 }
 
 impl DataBaseRef {
+    /// Open the archive RocksDB with default throttles. Set
+    /// `disable_auto_compactions=true` if a caller plans to run its own
+    /// manual `compact()` and doesn't want background work in between.
+    ///
+    /// For archive-init bulk ingest, prefer [`Self::open_for_bulk_load`]
+    /// which disables the L0 / pending-compaction throttles so the writer
+    /// is never back-pressured by lagging compaction.
     pub fn open<P: AsRef<Path>>(
         path: P,
         cache_size: usize,
         disable_auto_compactions: bool,
+        archive_zstd_compression: bool,
+    ) -> Self {
+        Self::open_inner(
+            path,
+            cache_size,
+            disable_auto_compactions,
+            false,
+            archive_zstd_compression,
+        )
+    }
+
+    /// Open the archive RocksDB tuned for bulk ingest:
+    /// - Auto-compactions ON: RocksDB drains L0 → L1 in the background as
+    ///   files accumulate, so disk doesn't grow unbounded during long
+    ///   ingests.
+    /// - L0 slowdown/stop triggers and pending-compaction byte limits
+    ///   disabled: background compaction never back-pressures the writer.
+    /// - WAL is on (same as `open()`); callers wanting durable resume
+    ///   should mark each checkpoint batch as `set_sync(true)` so the WAL
+    ///   is fsynced before the commit returns.
+    pub fn open_for_bulk_load<P: AsRef<Path>>(
+        path: P,
+        cache_size: usize,
+        archive_zstd_compression: bool,
+    ) -> Self {
+        warn!(
+            target = "rocksdb",
+            "Opening RocksDB archive in BULK-LOAD mode: \
+             L0/pending-compaction throttles disabled (auto compactions still on, \
+             WAL still on). Caller is expected to drive durability by calling \
+             commit() with sync=true on checkpoint batches."
+        );
+        // Note: disable_auto_compactions = false. Earlier revisions disabled
+        // auto compactions and tried to do periodic manual compactions, but
+        // every `compact_range_cf(.., None, None)` is a full-range manual
+        // compaction (work proportional to total written so far), so periodic
+        // calls produced O(N²) total compaction work. Letting RocksDB do
+        // incremental L0 → L1 in the background keeps each step bounded.
+        Self::open_inner(path, cache_size, false, true, archive_zstd_compression)
+    }
+
+    fn open_inner<P: AsRef<Path>>(
+        path: P,
+        cache_size: usize,
+        disable_auto_compactions: bool,
+        bulk_load: bool,
+        archive_zstd_compression: bool,
     ) -> Self {
         let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
@@ -299,8 +477,23 @@ impl DataBaseRef {
         );
         info!(
             target = "rocksdb",
-            "Created shared Clock Cache with size: {}MB for archive", total_cache_size
+            "Created shared Clock Cache with size: {}MB for archive (bulk_load={}, archive_zstd_compression={})",
+            total_cache_size,
+            bulk_load,
+            archive_zstd_compression,
         );
+
+        // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
+        // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at
+        // deep levels via `archive_zstd_compression` for ~15-20% extra ratio
+        // at the cost of ~2× compaction CPU and ~3× cold-read decode latency.
+        // HashToCode is always Zstd: code blobs benefit from dict compression
+        // regardless of the flag.
+        let big_cf_compression = if archive_zstd_compression {
+            CfCompression::Zstd
+        } else {
+            CfCompression::Lz4
+        };
 
         // LatestBlockHash: single record, no compression needed
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
@@ -310,16 +503,19 @@ impl DataBaseRef {
                 0,
                 disable_auto_compactions,
                 CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // BlockHashToBlockInfo: ~500 bytes value, LZ4 compression
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 0,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
         // BlockNumToBlockHash: 32 bytes value, no compression needed
@@ -330,28 +526,30 @@ impl DataBaseRef {
                 0,
                 disable_auto_compactions,
                 CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // AddressToAccount: ~100 bytes value, LZ4 compression
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 32,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // AddressToStorage: 32 bytes value, but 96-byte keys have high prefix
-        // redundancy. LZ4 at deeper levels reduces disk usage with negligible
-        // CPU overhead.
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 64,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
@@ -362,6 +560,8 @@ impl DataBaseRef {
                 0,
                 disable_auto_compactions,
                 CfCompression::Zstd,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
         let cfs = vec![
@@ -438,7 +638,7 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let block_num_bytes = encode_block_num(block_num);
         let block_hash_bytes = self.db.get_pinned_cf_opt(
             block_num_to_block_hash_cf,
             block_num_bytes,
@@ -529,11 +729,9 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        let block_hash_bytes = self.db.get_cf_opt(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            &rocksdb_read_options(),
-        )?;
+        let block_hash_bytes =
+            self.db
+                .get_cf_opt(latest_block_hash_cf, [1u8], &rocksdb_read_options())?;
         STORAGE_METRICS
             .read_latest_block_hash_latency
             .record(start.elapsed().as_secs_f64());
@@ -557,8 +755,120 @@ impl DataBaseRef {
         }
     }
 
+    /// SstFileWriter Options used for archive bulk-load. Compression matches the
+    /// L0/L1 setting of the large CFs (LZ4) so RocksDB does not transcode the
+    /// ingested file when cascading. The default BytewiseComparator matches the
+    /// CF comparator. Block-table layout is left default; bloom/index are
+    /// regenerated by the final manual `compact()` when files cascade out of L0.
+    fn sst_writer_options() -> Options {
+        let mut opts = Options::default();
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts
+    }
+
+    /// Default IngestExternalFileOptions for archive bulk-load. `move_files=true`
+    /// renames the file into RocksDB's data directory instead of copying — the
+    /// caller is responsible for ensuring the source path is on the same
+    /// filesystem as the database. Other options are left at RocksDB defaults
+    /// (`snapshot_consistency=true`, `allow_global_seqno=true`,
+    /// `allow_blocking_flush=true`, `ingest_behind=false`); these are correct
+    /// for the bulk-load workload, where we do not write to the target CFs'
+    /// memtables and depend on global seqno assignment for correct read-merge
+    /// of any duplicate keys produced by crash-resume re-ingest.
+    fn ingest_external_file_options() -> IngestExternalFileOptions {
+        let mut opts = IngestExternalFileOptions::default();
+        opts.set_move_files(true);
+        opts
+    }
+
+    /// Build an SST file at `path` containing the `AddressToAccount` writes.
+    ///
+    /// REQUIRES: `sorted_writes` is strictly increasing by key (per
+    /// BytewiseComparator). Caller must sort and (defensively) dedup-keep-last
+    /// before calling. Empty `sorted_writes` produces no file (the SST writer
+    /// rejects empty finishes); caller must guard.
+    pub fn write_account_sst<P: AsRef<Path>>(
+        &self,
+        path: P,
+        sorted_writes: &[([u8; 64], Vec<u8>)],
+    ) -> Result<(), Error> {
+        let opts = Self::sst_writer_options();
+        let mut writer = SstFileWriter::create(&opts);
+        writer.open(path.as_ref())?;
+        for (k, v) in sorted_writes {
+            writer.put(k, v)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Build an SST file at `path` containing the `AddressToStorage` writes.
+    /// Same preconditions as [`Self::write_account_sst`].
+    pub fn write_storage_sst<P: AsRef<Path>>(
+        &self,
+        path: P,
+        sorted_writes: &[([u8; 96], [u8; 32])],
+    ) -> Result<(), Error> {
+        let opts = Self::sst_writer_options();
+        let mut writer = SstFileWriter::create(&opts);
+        writer.open(path.as_ref())?;
+        for (k, v) in sorted_writes {
+            writer.put(k, v)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Ingest a list of pre-built SST files into the `AddressToAccount` CF.
+    /// Files in `paths` must have non-overlapping key ranges among themselves
+    /// (otherwise they all land in L0 anyway). Across calls the key ranges may
+    /// overlap (and will, because address space is sparse but block_num
+    /// progresses), so files cascade through L0.
+    pub fn ingest_account_ssts(&self, paths: Vec<std::path::PathBuf>) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+            .unwrap();
+        let opts = Self::ingest_external_file_options();
+        self.db.ingest_external_file_cf_opts(cf, &opts, paths)?;
+        Ok(())
+    }
+
+    /// Ingest a list of pre-built SST files into the `AddressToStorage` CF.
+    pub fn ingest_storage_ssts(&self, paths: Vec<std::path::PathBuf>) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let opts = Self::ingest_external_file_options();
+        self.db.ingest_external_file_cf_opts(cf, &opts, paths)?;
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), Error> {
-        self.db.flush()?;
+        // Flush every named column family. `DB::flush()` from rocksdb-rs only
+        // flushes the default CF (which we don't use), so it is unsafe to rely
+        // on for durability — especially under bulk-load (WAL disabled), where
+        // unflushed memtable contents are not recoverable on crash.
+        //
+        // Ordering matters: `LatestBlockHash` is a pointer into the content
+        // CFs and MUST flush last. If we crash mid-flush after content CFs
+        // are persisted but before the pointer is, resume reads the older
+        // pointer from SST and replays the lost block range (idempotent,
+        // since archive keys include block_num). The reverse order risks
+        // committing a pointer to a block whose content was lost with the
+        // memtable.
+        for cf_type in [
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::HashToCode,
+            StorageTypeColumn::LatestBlockHash,
+        ] {
+            let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+            self.db.flush_cf(cf)?;
+        }
         Ok(())
     }
 
@@ -1002,7 +1312,7 @@ impl StateDBRead for StateDB {
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
-        let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
+        let target_key = encode_account_key(address, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -1010,7 +1320,7 @@ impl StateDBRead for StateDB {
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        account_iter.seek_for_prev([address_bytes.as_ref(), &block_num_bytes].concat());
+        account_iter.seek_for_prev(target_key);
         STORAGE_METRICS
             .read_account_latency
             .record(start.elapsed().as_secs_f64());
@@ -1043,7 +1353,7 @@ impl StateDBRead for StateDB {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let key_bytes: [u8; 32] = key.into();
-        let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
+        let target_key = encode_storage_key(address, key, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -1051,8 +1361,7 @@ impl StateDBRead for StateDB {
         let storage_iter = storage_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        storage_iter
-            .seek_for_prev([address_bytes.as_ref(), key_bytes.as_ref(), &block_num_bytes].concat());
+        storage_iter.seek_for_prev(target_key);
         STORAGE_METRICS
             .read_storage_latency
             .record(start.elapsed().as_secs_f64());
@@ -1121,9 +1430,9 @@ impl StateDBRead for StateDB {
 }
 /// StateDB delegates all write operations to Arc<DataBaseRef>
 impl StateDBWrite for StateDB {
-    type DBWriteBatch = WriteBatch;
+    type DBWriteBatch = ArchiveRocksDBWriteBatch;
 
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Error> {
         self.db.prepare_write_batch()
     }
 
@@ -1191,10 +1500,10 @@ impl StateDBWrite for StateDB {
 /// Direct write implementation for `Arc<DataBaseRef>` without needing a StateDB instance.
 /// This is useful for bulk initialization where we don't need read capabilities.
 impl StateDBWrite for Arc<DataBaseRef> {
-    type DBWriteBatch = WriteBatch;
+    type DBWriteBatch = ArchiveRocksDBWriteBatch;
 
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
-        Ok(WriteBatch::default())
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Error> {
+        Ok(ArchiveRocksDBWriteBatch::new())
     }
 
     fn write_block_hash(
@@ -1208,8 +1517,8 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_hash.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-        batch.put_cf(
+        let block_num_bytes = encode_block_num(block_num);
+        batch.inner.put_cf(
             block_num_to_block_hash_cf,
             block_num_bytes,
             block_hash_bytes,
@@ -1236,7 +1545,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
             })?;
             block_info_bytes.extend_from_slice(&other_bytes);
         }
-        batch.put_cf(
+        batch.inner.put_cf(
             block_hash_to_block_info_cf,
             block_hash_bytes,
             block_info_bytes,
@@ -1251,29 +1560,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
-        let address_to_account_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-            .unwrap();
-        let address_bytes = address.as_slice();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-
-        if let Some(raw_account) = raw_account {
-            let raw_account: SlimAccount = raw_account.into();
-            let mut raw_account_bytes = Vec::new();
-            raw_account.encode(&mut raw_account_bytes);
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &block_num_bytes].concat(),
-                &raw_account_bytes,
-            );
-        } else {
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &block_num_bytes].concat(),
-                &[],
-            );
-        }
+        let account_key = encode_account_key(address, block_num);
+        let value = raw_account.map(encode_slim_account).unwrap_or_default();
+        batch.account_writes.push((account_key, value));
         Ok(())
     }
 
@@ -1285,20 +1574,10 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
-        let address_to_storage_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-        let address_bytes = address.as_slice();
-        let key_bytes: [u8; 32] = key.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let storage_key = encode_storage_key(address, key, block_num);
         let value_bytes: [u8; 32] = value.to_be_bytes();
 
-        batch.put_cf(
-            address_to_storage_cf,
-            [address_bytes, &key_bytes, &block_num_bytes].concat(),
-            value_bytes,
-        );
+        batch.storage_writes.push((storage_key, value_bytes));
         Ok(())
     }
 
@@ -1313,7 +1592,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
         let code_hash_bytes = code_hash.as_slice();
-        batch.put_cf(address_to_code_cf, code_hash_bytes, code);
+        batch
+            .inner
+            .put_cf(address_to_code_cf, code_hash_bytes, code);
         Ok(())
     }
 
@@ -1326,12 +1607,66 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_slice());
+        batch
+            .inner
+            .put_cf(latest_block_hash_cf, [1u8], block_hash.as_slice());
         Ok(())
     }
 
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
-        self.db.write(batch)?;
+    fn commit(&self, mut batch: Self::DBWriteBatch) -> Result<(), Error> {
+        if !batch.account_writes.is_empty() {
+            let address_to_account_cf = self
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            // Stable sort by key: equal keys keep insertion order, so the last
+            // write per key is naturally the last entry within its run.
+            batch.account_writes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut last_write: Option<([u8; 64], Vec<u8>)> = None;
+            for (key, value) in batch.account_writes {
+                if let Some((prev_key, prev_value)) = last_write.take() {
+                    if prev_key != key {
+                        batch
+                            .inner
+                            .put_cf(address_to_account_cf, prev_key, prev_value);
+                    }
+                }
+                last_write = Some((key, value));
+            }
+            if let Some((key, value)) = last_write {
+                batch.inner.put_cf(address_to_account_cf, key, value);
+            }
+        }
+
+        if !batch.storage_writes.is_empty() {
+            let address_to_storage_cf = self
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            // Stable sort by key: equal keys keep insertion order, so the last
+            // write per key is naturally the last entry within its run.
+            batch.storage_writes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut last_write: Option<([u8; 96], [u8; 32])> = None;
+            for (key, value) in batch.storage_writes {
+                if let Some((prev_key, prev_value)) = last_write.take() {
+                    if prev_key != key {
+                        batch
+                            .inner
+                            .put_cf(address_to_storage_cf, prev_key, prev_value);
+                    }
+                }
+                last_write = Some((key, value));
+            }
+            if let Some((key, value)) = last_write {
+                batch.inner.put_cf(address_to_storage_cf, key, value);
+            }
+        }
+
+        let mut wo = WriteOptions::default();
+        wo.set_sync(batch.sync);
+        self.db.write_opt(batch.inner, &wo)?;
         Ok(())
     }
 }
@@ -1557,7 +1892,13 @@ mod tests {
         let encoded = encode_block_info(&original);
         let decoded = decode_block_info_bytes(H256::ZERO, &encoded).expect("decode should succeed");
 
-        assert_eq!(decoded.other.get("l1FeeRate"), original.other.get("l1FeeRate"));
-        assert_eq!(decoded.other.get("customField"), original.other.get("customField"));
+        assert_eq!(
+            decoded.other.get("l1FeeRate"),
+            original.other.get("l1FeeRate")
+        );
+        assert_eq!(
+            decoded.other.get("customField"),
+            original.other.get("customField")
+        );
     }
 }
