@@ -1,15 +1,17 @@
 /// Tempo hardfork enum for leafage-evm with timestamp-based activation.
 ///
-/// Supports both "latest spec" mode (via `Default`, returns `T3`) and
-/// archive mode (via `from_timestamp`, returns the hardfork active at a
-/// given block timestamp).
+/// Supports both "latest spec" mode (via `Default`, returns the latest activated
+/// hardfork on mainnet) and archive mode (via `from_timestamp`, returns the
+/// hardfork active at a given block timestamp).
 ///
 /// Mainnet activation timestamps (from `presto.json` genesis):
 /// - Genesis/T0: 0
 /// - T1/T1A: 1770908400 (Feb 12, 2026 15:00 UTC)
 /// - T1B: 1771858800 (Feb 23, 2026 15:00 UTC)
 /// - T1C: 1773327600 (Mar 12, 2026 15:00 UTC)
-/// - T2: not yet scheduled
+/// - T2: 1774965600 (Mar 31, 2026 14:00 UTC)
+/// - T3: 1777298400 (Apr 27, 2026 14:00 UTC)
+/// - T4: 1779112800 (May 18, 2026 14:00 UTC)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TempoHardfork {
     Genesis,
@@ -17,9 +19,10 @@ pub enum TempoHardfork {
     T1A,
     T1B,
     T1C,
-    #[default]
     T2,
     T3,
+    #[default]
+    T4,
 }
 
 /// Tempo mainnet activation timestamps (from `presto.json` genesis config).
@@ -33,6 +36,10 @@ const MAINNET_T1B_TIME: u64 = 1_771_858_800;
 const MAINNET_T1C_TIME: u64 = 1_773_327_600;
 // T2 activated on mainnet: 2026-03-31 14:00 UTC (from presto.json genesis).
 const MAINNET_T2_TIME: u64 = 1_774_965_600;
+// T3 activated on mainnet: 2026-04-27 14:00 UTC (from presto.json genesis).
+const MAINNET_T3_TIME: u64 = 1_777_298_400;
+// T4 activates on mainnet: 2026-05-18 14:00 UTC (from presto.json genesis).
+const MAINNET_T4_TIME: u64 = 1_779_112_800;
 
 impl TempoHardfork {
     /// Determine the active hardfork for a given block timestamp.
@@ -41,7 +48,11 @@ impl TempoHardfork {
     /// timestamp 0 (same as Genesis), so the `Genesis` variant covers both
     /// the Genesis and T0 eras.
     pub fn from_timestamp(timestamp: u64) -> Self {
-        if timestamp >= MAINNET_T2_TIME {
+        if timestamp >= MAINNET_T4_TIME {
+            Self::T4
+        } else if timestamp >= MAINNET_T3_TIME {
+            Self::T3
+        } else if timestamp >= MAINNET_T2_TIME {
             Self::T2
         } else if timestamp >= MAINNET_T1C_TIME {
             Self::T1C
@@ -80,6 +91,9 @@ impl TempoHardfork {
     pub fn is_t3(&self) -> bool {
         *self >= Self::T3
     }
+    pub fn is_t4(&self) -> bool {
+        *self >= Self::T4
+    }
 
     /// Gas cost for using an existing 2D nonce key (cold SLOAD + warm SSTORE reset).
     /// Ported from Tempo writer: crates/chainspec/src/spec.rs
@@ -91,8 +105,8 @@ impl TempoHardfork {
                 // COLD_SLOAD_COST + WARM_SSTORE_RESET = 2100 + 2900
                 5_000
             }
-            Self::T2 | Self::T3 => {
-                // T2 adds 2 warm SLOADs for extended nonce key lookup
+            Self::T2 | Self::T3 | Self::T4 => {
+                // T2 adds 2 warm SLOADs for extended nonce key lookup; T3/T4 inherit.
                 5_200
             }
         }
@@ -108,8 +122,8 @@ impl TempoHardfork {
                 // COLD_SLOAD_COST + SSTORE_SET = 2100 + 20000
                 22_100
             }
-            Self::T2 | Self::T3 => {
-                // T2 adds 2 warm SLOADs for extended nonce key lookup
+            Self::T2 | Self::T3 | Self::T4 => {
+                // T2 adds 2 warm SLOADs for extended nonce key lookup; T3/T4 inherit.
                 22_300
             }
         }
@@ -189,6 +203,40 @@ mod tests {
     }
 
     #[test]
+    fn from_timestamp_t3_activated() {
+        // T3 activated at 1777298400 (2026-04-27 14:00 UTC)
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T3_TIME - 1),
+            TempoHardfork::T2
+        );
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T3_TIME),
+            TempoHardfork::T3
+        );
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T3_TIME + 1),
+            TempoHardfork::T3
+        );
+    }
+
+    #[test]
+    fn from_timestamp_t4_activated() {
+        // T4 activates at 1779112800 (2026-05-18 14:00 UTC)
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T4_TIME - 1),
+            TempoHardfork::T3
+        );
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T4_TIME),
+            TempoHardfork::T4
+        );
+        assert_eq!(
+            TempoHardfork::from_timestamp(MAINNET_T4_TIME + 1),
+            TempoHardfork::T4
+        );
+    }
+
+    #[test]
     fn is_methods_on_genesis() {
         let hf = TempoHardfork::Genesis;
         assert!(hf.is_t0());
@@ -198,6 +246,7 @@ mod tests {
         assert!(!hf.is_t1c());
         assert!(!hf.is_t2());
         assert!(!hf.is_t3());
+        assert!(!hf.is_t4());
     }
 
     #[test]
@@ -210,13 +259,60 @@ mod tests {
         assert!(hf.is_t1c());
         assert!(!hf.is_t2());
         assert!(!hf.is_t3());
+        assert!(!hf.is_t4());
+    }
+
+    #[test]
+    fn is_methods_on_t3() {
+        let hf = TempoHardfork::T3;
+        assert!(hf.is_t0());
+        assert!(hf.is_t1());
+        assert!(hf.is_t1a());
+        assert!(hf.is_t1b());
+        assert!(hf.is_t1c());
+        assert!(hf.is_t2());
+        assert!(hf.is_t3());
+        assert!(!hf.is_t4());
+    }
+
+    #[test]
+    fn is_methods_on_t4() {
+        let hf = TempoHardfork::T4;
+        assert!(hf.is_t0());
+        assert!(hf.is_t1());
+        assert!(hf.is_t1a());
+        assert!(hf.is_t1b());
+        assert!(hf.is_t1c());
+        assert!(hf.is_t2());
+        assert!(hf.is_t3());
+        assert!(hf.is_t4());
     }
 
     #[test]
     fn default_is_latest_activated() {
         let hf = TempoHardfork::default();
-        assert_eq!(hf, TempoHardfork::T2);
-        assert!(hf.is_t2());
-        assert!(!hf.is_t3());
+        assert_eq!(hf, TempoHardfork::T4);
+        assert!(hf.is_t4());
+    }
+
+    #[test]
+    fn t3_gas_matches_t2() {
+        // T3/T4 inherit T2 nonce gas (no schedule change).
+        assert_eq!(
+            TempoHardfork::T3.gas_existing_nonce_key(),
+            TempoHardfork::T2.gas_existing_nonce_key()
+        );
+        assert_eq!(
+            TempoHardfork::T4.gas_existing_nonce_key(),
+            TempoHardfork::T2.gas_existing_nonce_key()
+        );
+        assert_eq!(
+            TempoHardfork::T3.gas_new_nonce_key(),
+            TempoHardfork::T2.gas_new_nonce_key()
+        );
+        assert_eq!(
+            TempoHardfork::T4.gas_new_nonce_key(),
+            TempoHardfork::T2.gas_new_nonce_key()
+        );
     }
 }

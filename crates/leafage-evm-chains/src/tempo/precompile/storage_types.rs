@@ -12,7 +12,7 @@
 //! - Packing helpers: [`FieldLocation`], [`PackedSlot`], extract/insert/delete operations
 //! - Primitive implementations for `bool`, `Address`, `u8`..`u128`, `U256`
 
-use alloy::primitives::{keccak256, Address, Bytes, U256};
+use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, U256};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -1003,6 +1003,55 @@ impl StorageKey for alloy::primitives::B256 {
     }
 }
 
+// -- alloy FixedBytes<4> --
+//
+// Mirrors writer `crates/precompiles-macros/src/storable_primitives.rs::FixedBytes`
+// pattern. Value lives in the LOWER N bytes of the U256 word (left-padded with
+// zeros in upper bytes), matching writer's uniform storage scheme rather than
+// Solidity ABI right-padded bytes4 semantics. The default `mapping_slot`
+// left-pads the key, which diverges from `abi.encode(bytes4)` but is what
+// writer's storage layer uses end-to-end (see writer
+// `storage/types/mod.rs:349-351` warning).
+//
+// Needed to instantiate `Set<FixedBytes<4>>` for account_keychain's
+// per-target selector set in CallScope.
+
+impl sealed::OnlyPrimitives for FixedBytes<4> {}
+impl Packable for FixedBytes<4> {}
+
+impl StorableType for FixedBytes<4> {
+    const LAYOUT: Layout = Layout::Bytes(4);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new_with_ctx(slot, ctx, address)
+    }
+}
+
+impl FromWord for FixedBytes<4> {
+    #[inline]
+    fn to_word(&self) -> U256 {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&self.0);
+        U256::from_be_bytes(bytes)
+    }
+
+    #[inline]
+    fn from_word(word: U256) -> Result<Self> {
+        let bytes = word.to_be_bytes::<32>();
+        let mut fixed = [0u8; 4];
+        fixed.copy_from_slice(&bytes[28..32]);
+        Ok(Self::from(fixed))
+    }
+}
+
+impl StorageKey for FixedBytes<4> {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.as_slice()
+    }
+}
+
 // -- Bytes (dynamic) --
 
 impl StorableType for Bytes {
@@ -1401,5 +1450,333 @@ where
         self.cache.get_or_insert_mut(&index, || {
             Self::compute_handler(data_start, address, index)
         })
+    }
+}
+
+// ===========================================================================
+// Set<T> -- OpenZeppelin EnumerableSet for EVM storage
+// ===========================================================================
+//
+// Storage layout (mirrors writer crates/precompiles/src/storage/types/set.rs):
+//   base_slot: length (U256) + values array data at keccak256(base_slot)
+//   base_slot + 1: positions mapping (T -> u32, 1-indexed; 0 = not present)
+//
+// Read path is the leafage hot path (state diffs from writer populate storage,
+// eth_call reads). Write paths are simplified relative to writer:
+//   - `insert` and `remove` are implemented (used by setCallScopes full-replace)
+//   - swap-and-pop on remove follows OZ semantics
+
+/// Read-only in-memory snapshot of an [`SetHandler`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Set<T>(Vec<T>);
+
+impl<T> Set<T> {
+    #[inline]
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> From<Set<T>> for Vec<T> {
+    #[inline]
+    fn from(set: Set<T>) -> Self {
+        set.0
+    }
+}
+
+impl<T: Eq + Hash + Clone> From<Vec<T>> for Set<T> {
+    /// Creates a set from a vector, deduplicating while preserving first-occurrence order.
+    fn from(vec: Vec<T>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::with_capacity(vec.len());
+        for item in vec {
+            if seen.insert(item.clone()) {
+                deduped.push(item);
+            }
+        }
+        Self(deduped)
+    }
+}
+
+impl<T> IntoIterator for Set<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Handler for storage operations on a `Set<T>`.
+///
+/// Layout (`base_slot` is the U256 reserved for the set):
+/// - `base_slot`: vec length; values data at `keccak256(base_slot)` (via `VecHandler`)
+/// - `base_slot + 1`: `Mapping<T, u32>` for OZ EnumerableSet positions (1-indexed, 0 = absent)
+pub struct SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    values: VecHandler<T>,
+    positions: Mapping<T, u32>,
+    base_slot: U256,
+    address: Address,
+}
+
+/// Set occupies 2 reserved slots; values + positions are then placed at hashed
+/// derived slots. Layout-equivalent to writer `crates/precompiles/src/storage/types/set.rs`.
+impl<T> StorableType for Set<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    const LAYOUT: Layout = Layout::Slots(2);
+    const IS_DYNAMIC: bool = true;
+    type Handler = SetHandler<T>;
+
+    fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
+        SetHandler::new(slot, address)
+    }
+}
+
+impl<T> Storable for Set<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+    T::Handler: Handler<T>,
+{
+    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let values: Vec<T> = Vec::load(storage, slot, LayoutCtx::FULL)?;
+        Ok(Self(values))
+    }
+
+    /// Writes the set's values vector and length. The positions mapping at
+    /// `slot + 1` is NOT updated here — it is only used by single-element
+    /// `contains` / `insert` / `remove` paths. Full-replace writes via this
+    /// `store` (e.g. nested via parent struct `Storable::store`) skip them;
+    /// callers that need `contains` correctness afterwards must use
+    /// `SetHandler::write` which keeps positions in sync.
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        Vec::store(&self.0, storage, slot, LayoutCtx::FULL)
+    }
+}
+
+#[inline]
+fn checked_position(index: usize) -> Result<u32> {
+    u32::try_from(index)
+        .ok()
+        .and_then(|i| i.checked_add(1))
+        .ok_or_else(|| TempoPrecompileError::Fatal("Set position overflow".into()))
+}
+
+impl<T> SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    pub fn new(base_slot: U256, address: Address) -> Self {
+        Self {
+            values: VecHandler::new(base_slot, address),
+            positions: Mapping::new(base_slot + U256::ONE, address),
+            base_slot,
+            address,
+        }
+    }
+
+    /// Returns the base storage slot.
+    #[inline]
+    pub fn base_slot(&self) -> U256 {
+        self.base_slot
+    }
+
+    /// Returns the number of elements in the set.
+    pub fn len(&self) -> Result<usize> {
+        self.values.len()
+    }
+
+    /// Returns whether the set is empty.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Returns true if `value` is in the set.
+    pub fn contains(&self, value: &T) -> Result<bool> {
+        Ok(self.positions.at(value).read()? != 0)
+    }
+
+    /// Returns the value at the given index, or `None` if OOB.
+    pub fn at(&self, index: usize) -> Result<Option<T>>
+    where
+        T::Handler: Handler<T>,
+    {
+        if index >= self.len()? {
+            return Ok(None);
+        }
+        Ok(Some(self.values[index].read()?))
+    }
+
+    /// Inserts `value`. Returns `true` if newly added, `false` if already present.
+    /// Mirrors writer single-element `Set::insert` behaviour (OZ EnumerableSet).
+    pub fn insert(&mut self, value: T) -> Result<bool>
+    where
+        T::Handler: Handler<T>,
+    {
+        if self.contains(&value)? {
+            return Ok(false);
+        }
+        let len = self.len()?;
+        self.values.push(value.clone())?;
+        self.positions
+            .at_mut(&value)
+            .write(checked_position(len)?)?;
+        Ok(true)
+    }
+
+    /// Removes `value` via OZ EnumerableSet swap-and-pop. Returns `true` if it
+    /// was present, `false` otherwise. Mirrors writer `Set::remove`.
+    pub fn remove(&mut self, value: &T) -> Result<bool>
+    where
+        T::Handler: Handler<T>,
+    {
+        let pos = self.positions.at(value).read()?;
+        if pos == 0 {
+            return Ok(false);
+        }
+        let to_remove_idx = (pos - 1) as usize;
+        let last_idx = self.len()?.saturating_sub(1);
+
+        if to_remove_idx != last_idx {
+            let last_value = self.values[last_idx].read()?;
+            self.values[to_remove_idx].write(last_value.clone())?;
+            self.positions
+                .at_mut(&last_value)
+                .write(checked_position(to_remove_idx)?)?;
+        }
+
+        self.values[last_idx].delete()?;
+        self.values.pop()?;
+        self.positions.at_mut(value).delete()?;
+        Ok(true)
+    }
+}
+
+impl<T> Handler<Set<T>> for SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+    T::Handler: Handler<T>,
+{
+    fn read(&self) -> Result<Set<T>> {
+        let len = self.len()?;
+        let mut vec = Vec::with_capacity(len);
+        for i in 0..len {
+            vec.push(self.values[i].read()?);
+        }
+        Ok(Set(vec))
+    }
+
+    fn write(&mut self, value: Set<T>) -> Result<()> {
+        let old_len = self.values.len()?;
+        let new_vec: Vec<T> = value.into();
+        let new_len = new_vec.len();
+
+        // Clear old positions.
+        for i in 0..old_len {
+            let old_value = self.values[i].read()?;
+            self.positions.at_mut(&old_value).delete()?;
+        }
+
+        // Write new values + positions (1-indexed).
+        for (index, new_value) in new_vec.into_iter().enumerate() {
+            self.positions
+                .at_mut(&new_value)
+                .write(checked_position(index)?)?;
+            self.values[index].write(new_value)?;
+        }
+
+        // Update length.
+        Slot::<U256>::new(self.base_slot, self.address).write(U256::from(new_len))?;
+
+        // Clear leftover value slots if shrinking.
+        for i in new_len..old_len {
+            self.values[i].delete()?;
+        }
+
+        Ok(())
+    }
+
+    fn delete(&mut self) -> Result<()> {
+        let len = self.len()?;
+        for i in 0..len {
+            let value = self.values[i].read()?;
+            self.positions.at_mut(&value).delete()?;
+        }
+        self.values.delete()
+    }
+
+    fn t_read(&self) -> Result<Set<T>> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+    fn t_write(&mut self, _value: Set<T>) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+    fn t_delete(&mut self) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_bytes_4_word_roundtrip() {
+        let value = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+        let word = value.to_word();
+        assert_eq!(word, U256::from(0xdead_beefu32));
+        let recovered = FixedBytes::<4>::from_word(word).unwrap();
+        assert_eq!(recovered, value);
+    }
+
+    #[test]
+    fn fixed_bytes_4_packing_at_offset() {
+        let value = FixedBytes::<4>::from([0xab, 0xcd, 0xef, 0x01]);
+        let mut packed = packing::PackedSlot(U256::ZERO);
+
+        value
+            .store(&mut packed, U256::ZERO, LayoutCtx::packed(8))
+            .unwrap();
+        let expected = U256::from(0xabcd_ef01u32) << (8 * 8);
+        assert_eq!(packed.0, expected, "packed bytes at offset 8");
+
+        let recovered =
+            FixedBytes::<4>::load(&packed, U256::ZERO, LayoutCtx::packed(8)).unwrap();
+        assert_eq!(recovered, value, "round-trip from packed offset");
+    }
+
+    #[test]
+    fn fixed_bytes_4_mapping_slot_matches_left_padded_keccak() {
+        let key = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+        let slot = U256::from(7u8);
+
+        let computed = key.mapping_slot(slot);
+
+        let mut buf = [0u8; 64];
+        buf[28..32].copy_from_slice(&key.0);
+        buf[32..].copy_from_slice(&slot.to_be_bytes::<32>());
+        let expected = U256::from_be_bytes(keccak256(buf).0);
+
+        assert_eq!(computed, expected);
     }
 }

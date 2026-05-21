@@ -1165,8 +1165,14 @@ impl StablecoinDEX {
             (token, amount, quote_token)
         };
 
-        TIP20Token::from_address(non_escrow_token)?
-            .ensure_transfer_authorized(self.address, sender)?;
+        let non_escrow_tip20 = TIP20Token::from_address(non_escrow_token)?;
+        non_escrow_tip20.ensure_transfer_authorized(self.address, sender)?;
+        // TIP-1046 (T4+): when this order fills, the non-escrow token may be
+        // moved via internal-balance updates that bypass TIP-20 transfer's
+        // own paused gate. Enforce paused at order placement.
+        if self.storage.spec().is_t4() {
+            non_escrow_tip20.check_not_paused()?;
+        }
         self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
 
         let order_id = self.next_order_id_val()?;
@@ -1279,12 +1285,21 @@ impl StablecoinDEX {
             (token, amount, quote_token)
         };
 
-        TIP20Token::from_address(non_escrow_token)?
-            .ensure_transfer_authorized(self.address, sender)?;
+        let non_escrow_tip20 = TIP20Token::from_address(non_escrow_token)?;
+        non_escrow_tip20.ensure_transfer_authorized(self.address, sender)?;
+        // TIP-1046 (T4+): see place_order — paused check at placement time.
+        if self.storage.spec().is_t4() {
+            non_escrow_tip20.check_not_paused()?;
+        }
 
         if internal_balance_only {
-            TIP20Token::from_address(escrow_token)?
-                .ensure_transfer_authorized(sender, self.address)?;
+            let escrow_tip20 = TIP20Token::from_address(escrow_token)?;
+            escrow_tip20.ensure_transfer_authorized(sender, self.address)?;
+            // TIP-1046 (T4+): internal-balance-only path bypasses TIP-20
+            // transferFrom, so we must check the pause state ourselves.
+            if self.storage.spec().is_t4() {
+                escrow_tip20.check_not_paused()?;
+            }
             let user_balance = self.balance_of(sender, escrow_token)?;
             if user_balance < escrow_amount {
                 return Err(err_insufficient_balance());

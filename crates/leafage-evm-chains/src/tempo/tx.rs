@@ -33,6 +33,25 @@ impl TempoSigType {
     }
 }
 
+/// Call-scope cardinality summary used for AA gas estimation (TIP-1011, T3+).
+///
+/// `scopes`, `selectors`, `recipients` are the totals across the entire
+/// `allowedCalls` list of a `KeyAuthorization`. `constrained_selectors` counts
+/// just the selectors that carry a non-empty recipient list (those incur an
+/// extra length-slot write).
+///
+/// `has_allowed_calls = false` means the authorization carries no `allowedCalls`
+/// field at all (key is unrestricted). `has_allowed_calls = true && scopes == 0`
+/// means an explicit empty list (deny-all).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScopeCounts {
+    pub has_allowed_calls: bool,
+    pub scopes: u32,
+    pub selectors: u32,
+    pub constrained_selectors: u32,
+    pub recipients: u32,
+}
+
 /// Key authorization gas info (lightweight).
 #[derive(Clone, Debug, Default)]
 pub struct TempoKeyAuthGas {
@@ -40,6 +59,14 @@ pub struct TempoKeyAuthGas {
     pub sig_type: TempoSigType,
     /// Number of spending limits.
     pub num_limits: u32,
+    /// Call-scope cardinality (T3+). Zero on pre-T3 or for unrestricted keys.
+    /// Currently populated by tx-envelope parsing once `KeyAuthorization`
+    /// carries the `allowedCalls` field; parsers that don't yet supply it
+    /// default to `ScopeCounts::default()`, which gives byte-accurate gas
+    /// for AA tx that DON'T configure call scopes and under-estimates by
+    /// `call_scope_storage_slots(...) * sstore + call_scope_extra_gas(...)`
+    /// for AA tx that DO. See `key_auth_gas` in `api/exec.rs`.
+    pub scope_counts: ScopeCounts,
 }
 
 /// Per-authorization gas info with optional EIP-7702 delegation data.

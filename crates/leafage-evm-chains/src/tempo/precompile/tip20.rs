@@ -49,6 +49,7 @@ use super::{
     dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile,
     STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
 };
+use crate::tempo::address::TempoAddressExt;
 
 // ===========================================================================
 // Constants
@@ -556,7 +557,7 @@ impl TIP20Token {
         self.total_supply.write(amount)
     }
 
-    fn check_not_paused(&self) -> Result<()> {
+    pub(crate) fn check_not_paused(&self) -> Result<()> {
         if self.paused()? {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::ContractPaused {}.abi_encode().into(),
@@ -1254,6 +1255,15 @@ impl TIP20Token {
 
     /// Core internal transfer. Adjusts balances and emits Transfer event.
     fn _transfer(&mut self, from: Address, to: Address, amount: U256) -> Result<()> {
+        // TIP-1022 (T3+): if `to` is a TIP-1022 virtual address, resolve to its
+        // registered master so the balance is credited to the master EOA.
+        // Reverts VirtualAddressUnregistered if the master isn't registered.
+        let to = if self.storage.spec().is_t3() && to.is_virtual() {
+            super::address_registry::AddressRegistry::new().resolve_recipient(to)?
+        } else {
+            to
+        };
+
         let from_balance = self.get_balance(from)?;
         if amount > from_balance {
             return Err(TempoPrecompileError::Revert(
@@ -1316,6 +1326,17 @@ impl TIP20Token {
 
     fn _mint(&mut self, msg_sender: Address, to: Address, amount: U256) -> Result<()> {
         self.check_role(msg_sender, *ISSUER_ROLE)?;
+        // TIP-1038 #2 (T3+): mint must respect the paused flag. Pre-T3 callers
+        // could mint into a paused token; T3 closes that gap.
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
+        // TIP-1022 (T3+): credit the master EOA when `to` is a virtual address.
+        let to = if self.storage.spec().is_t3() && to.is_virtual() {
+            super::address_registry::AddressRegistry::new().resolve_recipient(to)?
+        } else {
+            to
+        };
         let total_supply = self.total_supply()?;
 
         // TIP403Registry mint recipient authorization check
@@ -1392,6 +1413,10 @@ impl TIP20Token {
         call: ITIP20::burnBlockedCall,
     ) -> Result<()> {
         self.check_role(msg_sender, *BURN_BLOCKED_ROLE)?;
+        // TIP-1038 #2 (T3+): burn_blocked must respect the paused flag.
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
 
         if call.from == TIP_FEE_MANAGER_ADDRESS || call.from == STABLECOIN_DEX_ADDRESS {
             return Err(TempoPrecompileError::Revert(
@@ -1435,6 +1460,12 @@ impl TIP20Token {
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
         self.check_role(msg_sender, *ISSUER_ROLE)?;
+        // TIP-1038 #2 (T3+): burn must respect the paused flag. `_transfer`
+        // checks paused only on its public-entry callers, so _burn needs an
+        // explicit guard here on T3+.
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+        }
 
         self._transfer(msg_sender, Address::ZERO, amount)?;
 
@@ -1561,6 +1592,15 @@ impl TIP20Token {
         call: ITIP20::setRewardRecipientCall,
     ) -> Result<()> {
         self.check_not_paused()?;
+        // TIP-1022 (T3+): reward recipients cannot be virtual addresses. They are
+        // accumulators that must be claimed; routing to a virtual recipient would
+        // mean the rewards land on a master EOA that may not be the original
+        // intent. Reject at recipient-set time. Pre-T3 behaviour is unchanged.
+        if self.storage.spec().is_t3() && call.recipient.is_virtual() {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidRecipient {}.abi_encode().into(),
+            ));
+        }
         if call.recipient != Address::ZERO {
             self.ensure_transfer_authorized(msg_sender, call.recipient)?;
         }

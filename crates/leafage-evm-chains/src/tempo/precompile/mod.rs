@@ -10,9 +10,11 @@
 //! - [`storage_types`] -- `Slot`, `Mapping`, packing helpers, primitive type encoders
 
 pub mod account_keychain;
+pub mod address_registry;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
+pub mod signature_verifier;
 pub mod stablecoin_dex;
 pub mod storage;
 pub mod storage_types;
@@ -59,6 +61,12 @@ pub const ACCOUNT_KEYCHAIN_ADDRESS: Address =
     address!("0xAAAAAAAA00000000000000000000000000000000");
 pub const VALIDATOR_CONFIG_V2_ADDRESS: Address =
     address!("0xCCCCCCCC00000000000000000000000000000001");
+/// T3+ TIP-1020 signature verifier (secp256k1 / P256 / WebAuthn).
+pub const SIGNATURE_VERIFIER_ADDRESS: Address =
+    address!("0x5165300000000000000000000000000000000000");
+/// T3+ TIP-1022 virtual address registry.
+pub const ADDRESS_REGISTRY_ADDRESS: Address =
+    address!("0xFDC0000000000000000000000000000000000000");
 
 // ===========================================================================
 // Gas constants
@@ -264,15 +272,23 @@ pub fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
 // Precompile registration
 // ===========================================================================
 
-/// Registers all 9 Tempo precompiles into the given [`PrecompilesMap`].
+/// Registers all Tempo precompiles into the given [`PrecompilesMap`].
 ///
 /// Uses [`set_precompile_lookup`] to install a closure that matches addresses to
 /// the appropriate Tempo precompile. TIP-20 tokens use prefix matching; all other
 /// precompiles use exact address matching.
 ///
+/// `spec` is the active hardfork — T3+ precompiles (signature_verifier,
+/// address_registry) are only registered when `spec >= T3`, matching the writer's
+/// behaviour where their addresses behave as plain EOAs prior to T3.
+///
 /// Each precompile is wrapped via the [`tempo_precompile!`] macro which handles
 /// DELEGATECALL rejection, `LeafageStorageProvider` setup, and gas accounting.
-pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, chain_id: u64) {
+pub fn extend_tempo_precompiles(
+    precompiles: &mut PrecompilesMap,
+    chain_id: u64,
+    spec: crate::tempo::hardfork::TempoHardfork,
+) {
     precompiles.set_precompile_lookup(move |address: &Address| {
         if tip20::is_tip20_prefix(*address) {
             Some(create_tip20_precompile(*address, chain_id))
@@ -292,6 +308,10 @@ pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, chain_id: u64)
             Some(create_account_keychain_precompile(chain_id))
         } else if *address == VALIDATOR_CONFIG_V2_ADDRESS {
             Some(create_validator_config_v2_precompile(chain_id))
+        } else if *address == SIGNATURE_VERIFIER_ADDRESS && spec.is_t3() {
+            Some(create_signature_verifier_precompile(chain_id))
+        } else if *address == ADDRESS_REGISTRY_ADDRESS && spec.is_t3() {
+            Some(create_address_registry_precompile(chain_id))
         } else {
             None
         }
@@ -349,6 +369,18 @@ fn create_account_keychain_precompile(chain_id: u64) -> DynPrecompile {
 fn create_validator_config_v2_precompile(chain_id: u64) -> DynPrecompile {
     tempo_precompile!("ValidatorConfigV2", chain_id, |input| {
         validator_config_v2::ValidatorConfigV2::new()
+    })
+}
+
+fn create_signature_verifier_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("SignatureVerifier", chain_id, |input| {
+        signature_verifier::SignatureVerifier::new()
+    })
+}
+
+fn create_address_registry_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("AddressRegistry", chain_id, |input| {
+        address_registry::AddressRegistry::new()
     })
 }
 

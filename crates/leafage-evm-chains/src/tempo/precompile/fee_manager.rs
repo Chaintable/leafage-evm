@@ -297,6 +297,17 @@ impl TipFeeManager {
 
         validate_usd_currency(call.token)?;
 
+        // T3+: skip the write + event if the token is already set to the
+        // requested value. Prevents permissionless callers from forcing
+        // redundant pool invalidation scans. Mirrors writer
+        // `tip_fee_manager/mod.rs:131-136`.
+        if self.storage.spec().is_t3() {
+            let current = self.user_tokens[sender].read()?;
+            if current == call.token {
+                return Ok(());
+            }
+        }
+
         self.user_tokens[sender].write(call.token)?;
 
         self.emit_event(IFeeManager::UserTokenSet {

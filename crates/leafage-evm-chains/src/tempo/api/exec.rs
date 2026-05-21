@@ -1,6 +1,6 @@
 use crate::tempo::api::{TempoContext, TempoEvm};
 use crate::tempo::hardfork::TempoHardfork;
-use crate::tempo::tx::{TempoCall, TempoSigType, TempoTxEnv, TempoTxFields};
+use crate::tempo::tx::{ScopeCounts, TempoCall, TempoSigType, TempoTxEnv, TempoTxFields};
 use alloy_evm::Database;
 use revm::{
     context::{BlockEnv, ContextSetters},
@@ -866,28 +866,126 @@ fn tempo_sig_gas(fields: &TempoTxFields) -> u64 {
     }
 }
 
-/// Key authorization gas calculation.
-/// Pre-T1B: heuristic constants. T1B+: accurate storage-based calculation.
-/// Ported from Tempo writer: `calculate_key_authorization_gas`.
+// Call-scope helper-gas constants (TIP-1046, T4+).
+const BASE_SCOPE_GAS: u64 = 5_000;
+const TARGET_SCOPE_GAS: u64 = 7_000;
+const SELECTOR_SCOPE_GAS: u64 = 7_000;
+const RECIPIENT_SCOPE_GAS: u64 = 5_000;
+
+/// Counts the `KeyAuthorization` SSTORE-set rows charged by the dynamic path,
+/// per `ScopeCounts` and active spec. Mirrors writer
+/// `call_scope_storage_slots(KeyAuthorization, TempoHardfork)`.
+///
+/// - `has_allowed_calls = false`: 0 (key is unrestricted, no scope tree).
+/// - empty `allowedCalls`: 1 (account mode write).
+/// - non-empty `allowedCalls` (`spec.is_t3()` only):
+///     - T3: `1 + scopes*3 + selectors*3 + constrained_selectors + recipients*2`
+///       (counts every persisted row).
+///     - T4: `1 + scopes*2 + 1 + selectors*2 + selector_sets + constrained_selectors + recipients*2`
+///       (only storage-creating rows; same-tx set-length rewrites are not
+///       re-counted).
+#[inline]
+fn call_scope_storage_slots(s: &ScopeCounts, spec: TempoHardfork) -> u64 {
+    if !s.has_allowed_calls {
+        return 0;
+    }
+    if s.scopes == 0 {
+        return 1;
+    }
+    let scopes = s.scopes as u64;
+    let selectors = s.selectors as u64;
+    let constrained = s.constrained_selectors as u64;
+    let recipients = s.recipients as u64;
+
+    if spec.is_t4() {
+        // selector_sets = number of scopes that have at least one selector_rule.
+        // Without per-scope detail we conservatively use the number of scopes
+        // that contain any selector (== scopes when selectors > 0).
+        let selector_sets = if selectors > 0 { scopes } else { 0 };
+        1 + scopes * 2 + 1 + selectors * 2 + selector_sets + constrained + recipients * 2
+    } else {
+        // T3
+        1 + scopes * 3 + selectors * 3 + constrained + recipients * 2
+    }
+}
+
+/// Unpriced bookkeeping gas around the scope tree (T4+). Mirrors writer
+/// `call_scope_extra_gas(KeyAuthorization)`:
+/// `BASE + TARGET*targets + SELECTOR*selectors + RECIPIENT*recipients`.
+/// `BASE_SCOPE_GAS` is always charged even when `allowed_calls` is `None`.
+#[inline]
+fn call_scope_extra_gas(s: &ScopeCounts) -> u64 {
+    if !s.has_allowed_calls {
+        return BASE_SCOPE_GAS;
+    }
+    BASE_SCOPE_GAS
+        + TARGET_SCOPE_GAS.saturating_mul(s.scopes as u64)
+        + SELECTOR_SCOPE_GAS.saturating_mul(s.selectors as u64)
+        + RECIPIENT_SCOPE_GAS.saturating_mul(s.recipients as u64)
+}
+
+/// Key authorization gas calculation. Four active branches matching writer
+/// `calculate_key_authorization_gas`:
+///
+/// - **Pre-T1B**: heuristic constants `KEY_AUTH_BASE_GAS + sig_gas + n × KEY_AUTH_PER_LIMIT_GAS`.
+/// - **T1B-T2**: precise storage cost: `sig_gas + sload + sstore × (1 + n) + BUFFER`.
+/// - **T3**: T1B-T2 with `limit_slots = n × 2` (T3 stores periodic-limit meta
+///   in a second slot) and `+ sstore × call_scope_storage_slots(T3)`.
+/// - **T4**: T3 with the T4 `call_scope_storage_slots` formula and
+///   `+ call_scope_extra_gas` (BASE/TARGET/SELECTOR/RECIPIENT surcharges).
+///
+/// TIP-1016 state gas is NOT implemented: writer gates it under
+/// `cfg_env.enable_amsterdam_eip8037` which is disabled on mainnet, so
+/// state_gas is 0 at T4 activation.
+///
+/// `scope_counts` is `ScopeCounts::default()` for keys without call scopes,
+/// which is byte-accurate vs writer for that case. Once tx-envelope parsing
+/// fills `scope_counts` from `KeyAuthorization.allowedCalls`, call-scope tx
+/// will also be byte-accurate.
 #[inline]
 fn key_auth_gas(
     sig_type: TempoSigType,
     num_limits: u32,
+    scope_counts: &ScopeCounts,
     gas_params: &GasParams,
     hardfork: TempoHardfork,
 ) -> u64 {
     let sig_gas = ECRECOVER_GAS + primitive_sig_gas(sig_type, 0);
     let num_limits = num_limits as u64;
 
-    if hardfork.is_t1b() {
-        const BUFFER: u64 = 2_000;
-        let sstore_cost = gas_params.get(GasId::sstore_set_without_load_cost());
-        let sload_cost =
-            gas_params.warm_storage_read_cost() + gas_params.cold_storage_additional_cost();
-        sig_gas + sload_cost + sstore_cost * (1 + num_limits) + BUFFER
-    } else {
-        KEY_AUTH_BASE_GAS + sig_gas + num_limits * KEY_AUTH_PER_LIMIT_GAS
+    if !hardfork.is_t1b() {
+        // Pre-T1B: heuristic constants.
+        return KEY_AUTH_BASE_GAS + sig_gas + num_limits * KEY_AUTH_PER_LIMIT_GAS;
     }
+
+    const BUFFER: u64 = 2_000;
+    let sstore_cost = gas_params.get(GasId::sstore_set_without_load_cost());
+    let sload_cost =
+        gas_params.warm_storage_read_cost() + gas_params.cold_storage_additional_cost();
+
+    // T3+ stores 2 slots per spending limit (remaining + packed period meta).
+    let limit_slots = if hardfork.is_t3() {
+        num_limits.saturating_mul(2)
+    } else {
+        num_limits
+    };
+
+    // T3+ adds call-scope storage rows.
+    let scope_slots = if hardfork.is_t3() {
+        call_scope_storage_slots(scope_counts, hardfork)
+    } else {
+        0
+    };
+
+    let mut total =
+        sig_gas + sload_cost + sstore_cost * (1 + limit_slots + scope_slots) + BUFFER;
+
+    // T4+: bookkeeping surcharge around the scope tree.
+    if hardfork.is_t4() {
+        total = total.saturating_add(call_scope_extra_gas(scope_counts));
+    }
+
+    total
 }
 
 /// Computes intrinsic gas for an AA batch transaction.
@@ -947,7 +1045,8 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
 
     // 5. Key authorization costs (if present).
     if let Some(ka) = &fields.key_auth {
-        gas.initial_gas += key_auth_gas(ka.sig_type, ka.num_limits, gas_params, hardfork);
+        gas.initial_gas +=
+            key_auth_gas(ka.sig_type, ka.num_limits, &ka.scope_counts, gas_params, hardfork);
     }
 
     // 6. Per-call costs (calldata + CREATE).
@@ -1592,6 +1691,7 @@ mod tests {
         let fields_with = make_fields(Some(TempoKeyAuthGas {
             sig_type: TempoSigType::Secp256k1,
             num_limits: 0,
+            scope_counts: Default::default(),
         }));
 
         let mut evm = make_evm();
@@ -1643,6 +1743,7 @@ mod tests {
             key_auth: Some(TempoKeyAuthGas {
                 sig_type: TempoSigType::Secp256k1,
                 num_limits,
+                scope_counts: Default::default(),
             }),
             ..Default::default()
         };
@@ -1754,5 +1855,252 @@ mod tests {
         // No tempo_fields at all (standard tx)
         increment_2d_nonce_if_needed(&mut evm);
         // Should not panic
+    }
+
+    // ========================================================================
+    // key_auth_gas hardfork branch tests (T1B / T2 / T3 / T4)
+    // ========================================================================
+
+    fn gas_params_for(hf: TempoHardfork) -> GasParams {
+        let mut gp = GasParams::new_spec(hf.into());
+        if hf.is_t1() {
+            gp.override_gas([
+                (GasId::sstore_set_without_load_cost(), 250_000),
+                (GasId::create(), 500_000),
+                (GasId::tx_create_cost(), 500_000),
+                (GasId::new_account_cost(), 250_000),
+                (GasId::new_account_cost_for_selfdestruct(), 250_000),
+                (GasId::code_deposit_cost(), 1_000),
+                (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                (GasId::new(255), 250_000),
+            ]);
+        }
+        gp
+    }
+
+    /// Builds the precise-SSTORE branch (T1B+) expected value for a given
+    /// `limit_slots` count and an optional T4 base-scope surcharge.
+    fn expected_t1b_plus(
+        hf: TempoHardfork,
+        sig_type: TempoSigType,
+        limit_slots: u64,
+        scope_extra: u64,
+    ) -> u64 {
+        const BUFFER: u64 = 2_000;
+        let gp = gas_params_for(hf);
+        let sig_gas = ECRECOVER_GAS + primitive_sig_gas(sig_type, 0);
+        let sstore_cost = gp.get(GasId::sstore_set_without_load_cost());
+        let sload_cost = gp.warm_storage_read_cost() + gp.cold_storage_additional_cost();
+        sig_gas + sload_cost + sstore_cost * (1 + limit_slots) + BUFFER + scope_extra
+    }
+
+    #[test]
+    fn key_auth_gas_pre_t1b_uses_heuristic() {
+        let gp = gas_params_for(TempoHardfork::T1A);
+        let g = key_auth_gas(
+            TempoSigType::Secp256k1,
+            2,
+            &ScopeCounts::default(),
+            &gp,
+            TempoHardfork::T1A,
+        );
+        // Pre-T1B: KEY_AUTH_BASE_GAS + sig_gas(ECRECOVER) + 2 * KEY_AUTH_PER_LIMIT_GAS
+        let expected = KEY_AUTH_BASE_GAS + ECRECOVER_GAS + 2 * KEY_AUTH_PER_LIMIT_GAS;
+        assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t1b_uses_precise_sstore() {
+        let g = key_auth_gas(
+            TempoSigType::Secp256k1,
+            2,
+            &ScopeCounts::default(),
+            &gas_params_for(TempoHardfork::T1B),
+            TempoHardfork::T1B,
+        );
+        let expected = expected_t1b_plus(TempoHardfork::T1B, TempoSigType::Secp256k1, 2, 0);
+        assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t2_matches_t1b_formula() {
+        let g = key_auth_gas(
+            TempoSigType::Secp256k1,
+            3,
+            &ScopeCounts::default(),
+            &gas_params_for(TempoHardfork::T2),
+            TempoHardfork::T2,
+        );
+        let expected = expected_t1b_plus(TempoHardfork::T2, TempoSigType::Secp256k1, 3, 0);
+        assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t3_doubles_limit_slots() {
+        // T3 stores 2 slots per spending limit; no scopes -> scope_slots = 0.
+        let g = key_auth_gas(
+            TempoSigType::Secp256k1,
+            2,
+            &ScopeCounts::default(),
+            &gas_params_for(TempoHardfork::T3),
+            TempoHardfork::T3,
+        );
+        let expected = expected_t1b_plus(TempoHardfork::T3, TempoSigType::Secp256k1, 2 * 2, 0);
+        assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t4_adds_base_scope_gas() {
+        // T4, no scope tree -> scope_slots = 0, extra_gas = BASE_SCOPE_GAS.
+        let g = key_auth_gas(
+            TempoSigType::Secp256k1,
+            2,
+            &ScopeCounts::default(),
+            &gas_params_for(TempoHardfork::T4),
+            TempoHardfork::T4,
+        );
+        let expected = expected_t1b_plus(
+            TempoHardfork::T4,
+            TempoSigType::Secp256k1,
+            2 * 2,
+            BASE_SCOPE_GAS,
+        );
+        assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_zero_limits_per_fork() {
+        // Sanity: num_limits = 0 still pays the key-write SSTORE + buffer.
+        for hf in [
+            TempoHardfork::T1B,
+            TempoHardfork::T2,
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+        ] {
+            let g = key_auth_gas(
+                TempoSigType::Secp256k1,
+                0,
+                &ScopeCounts::default(),
+                &gas_params_for(hf),
+                hf,
+            );
+            let scope_extra = if hf.is_t4() { BASE_SCOPE_GAS } else { 0 };
+            assert_eq!(
+                g,
+                expected_t1b_plus(hf, TempoSigType::Secp256k1, 0, scope_extra),
+                "zero-limit gas mismatch on {hf:?}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // call_scope_storage_slots / call_scope_extra_gas (Commit 12)
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn call_scope_storage_slots_none() {
+        // has_allowed_calls = false -> 0
+        let s = ScopeCounts::default();
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T3), 0);
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T4), 0);
+    }
+
+    #[test]
+    fn call_scope_storage_slots_empty_list() {
+        // has_allowed_calls = true, empty list -> 1
+        let s = ScopeCounts {
+            has_allowed_calls: true,
+            ..Default::default()
+        };
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T3), 1);
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T4), 1);
+    }
+
+    #[test]
+    fn call_scope_storage_slots_t3_formula() {
+        // 1 target, 1 selector, 1 recipient (constrained)
+        let s = ScopeCounts {
+            has_allowed_calls: true,
+            scopes: 1,
+            selectors: 1,
+            constrained_selectors: 1,
+            recipients: 1,
+        };
+        // T3 = 1 + 1*3 + 1*3 + 1 + 1*2 = 10
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T3), 10);
+    }
+
+    #[test]
+    fn call_scope_storage_slots_t4_formula() {
+        let s = ScopeCounts {
+            has_allowed_calls: true,
+            scopes: 1,
+            selectors: 1,
+            constrained_selectors: 1,
+            recipients: 1,
+        };
+        // T4 = 1 + 1*2 + 1 + 1*2 + 1 (selector_set since selectors > 0) + 1 + 1*2 = 10
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T4), 10);
+
+        // 2 targets, 3 selectors, 2 constrained, 5 recipients:
+        // T4 = 1 + 2*2 + 1 + 3*2 + 2 (selector_set per scope, 2 scopes have selectors) + 2 + 5*2
+        //    = 1 + 4 + 1 + 6 + 2 + 2 + 10 = 26
+        let s = ScopeCounts {
+            has_allowed_calls: true,
+            scopes: 2,
+            selectors: 3,
+            constrained_selectors: 2,
+            recipients: 5,
+        };
+        assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T4), 26);
+    }
+
+    #[test]
+    fn call_scope_extra_gas_no_scopes() {
+        let s = ScopeCounts::default();
+        // has_allowed_calls = false still pays BASE.
+        assert_eq!(call_scope_extra_gas(&s), BASE_SCOPE_GAS);
+    }
+
+    #[test]
+    fn call_scope_extra_gas_with_scopes() {
+        // 2 targets, 3 selectors, 5 recipients -> base + 2*TARGET + 3*SELECTOR + 5*RECIPIENT
+        let s = ScopeCounts {
+            has_allowed_calls: true,
+            scopes: 2,
+            selectors: 3,
+            constrained_selectors: 2,
+            recipients: 5,
+        };
+        let expected =
+            BASE_SCOPE_GAS + 2 * TARGET_SCOPE_GAS + 3 * SELECTOR_SCOPE_GAS + 5 * RECIPIENT_SCOPE_GAS;
+        assert_eq!(call_scope_extra_gas(&s), expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t4_with_scope_counts() {
+        let s = ScopeCounts {
+            has_allowed_calls: true,
+            scopes: 1,
+            selectors: 1,
+            constrained_selectors: 1,
+            recipients: 1,
+        };
+        let g = key_auth_gas(
+            TempoSigType::Secp256k1,
+            0,
+            &s,
+            &gas_params_for(TempoHardfork::T4),
+            TempoHardfork::T4,
+        );
+        // Expected = T4 baseline (limit_slots=0, scope_slots=10) + extra_gas.
+        // = sig + sload + sstore*(1 + 0 + 10) + BUFFER + extra_gas
+        let gp = gas_params_for(TempoHardfork::T4);
+        let sig_gas = ECRECOVER_GAS + primitive_sig_gas(TempoSigType::Secp256k1, 0);
+        let sstore = gp.get(GasId::sstore_set_without_load_cost());
+        let sload = gp.warm_storage_read_cost() + gp.cold_storage_additional_cost();
+        let extra = BASE_SCOPE_GAS + 1 * TARGET_SCOPE_GAS + 1 * SELECTOR_SCOPE_GAS + 1 * RECIPIENT_SCOPE_GAS;
+        let expected = sig_gas + sload + sstore * (1 + 0 + 10) + 2_000 + extra;
+        assert_eq!(g, expected);
     }
 }

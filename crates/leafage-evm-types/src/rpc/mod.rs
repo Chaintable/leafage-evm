@@ -1,5 +1,8 @@
 mod call;
-pub use call::{CallRequest, TempoAuthGasInfo, TempoCallExtension, TempoKeyAuthGasInfo};
+pub use call::{
+    CallRequest, CallScope, SelectorRule, TempoAuthGasInfo, TempoCallExtension,
+    TempoKeyAuthGasInfo,
+};
 
 mod key;
 pub use key::JsonStorageKey;

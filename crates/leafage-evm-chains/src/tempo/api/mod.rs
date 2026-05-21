@@ -106,14 +106,17 @@ impl<DB: Database, I> TempoEvm<DB, I> {
     /// 2. Extends them with all 9 Tempo precompiles via [`extend_tempo_precompiles`]
     /// 3. Builds the EVM context with the merged precompile set
     pub fn new(env: EvmEnv<TempoHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
+        // Derive the active hardfork from block timestamp first so precompile
+        // registration can hardfork-gate T3+ precompiles correctly.
+        let timestamp = env.block_env.timestamp.saturating_to::<u64>();
+        let hardfork = TempoHardfork::from_timestamp(timestamp);
+
         let mut precompiles = PrecompilesMap::from_static(Precompiles::new(
             PrecompileSpecId::from_spec_id(env.cfg_env.spec.into()),
         ));
-        extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
+        extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id, hardfork);
 
         let mut cfg_env = env.cfg_env;
-        let timestamp = env.block_env.timestamp.saturating_to::<u64>();
-        let hardfork = TempoHardfork::from_timestamp(timestamp);
         cfg_env.spec = hardfork;
         let mut gas_params = GasParams::new_spec(hardfork.into());
         if hardfork.is_t1() {
@@ -476,6 +479,7 @@ mod tests {
             TempoHardfork::T1C,
             TempoHardfork::T2,
             TempoHardfork::T3,
+            TempoHardfork::T4,
         ] {
             assert_eq!(
                 SpecId::from(hf),
