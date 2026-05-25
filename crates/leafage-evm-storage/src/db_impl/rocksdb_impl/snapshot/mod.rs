@@ -34,7 +34,7 @@ use std::fmt::Display;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,7 +142,21 @@ impl StateDBRead for DataBase {
         }
         let block_info_bytes = block_info_bytes.unwrap();
         let block_info_slice = block_info_bytes.as_ref();
-        let block_info = from_slice::<BlockInfo>(block_info_slice)?;
+        let block_info = match from_slice::<BlockInfo>(block_info_slice) {
+            Ok(block_info) => block_info,
+            Err(e) => {
+                let preview_len = block_info_slice.len().min(64);
+                error!(
+                    target: "storage",
+                    "failed to deserialize BlockInfo for block_hash {block_hash}: {e}; \
+                     value len = {}, first {preview_len} bytes (hex) = {}, lossy = {:?}",
+                    block_info_slice.len(),
+                    alloy::hex::encode(&block_info_slice[..preview_len]),
+                    String::from_utf8_lossy(&block_info_slice[..preview_len]),
+                );
+                return Err(e.into());
+            }
+        };
         Ok(Some(block_info))
     }
 
