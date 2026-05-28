@@ -17,6 +17,11 @@ pub struct StateTreeConfig {
     pub account_cache_size: usize,
     pub storage_cache_size: usize,
     pub code_cache_size: usize,
+    /// Whether the bottom CacheDiskLayer's moka caches are active. Set
+    /// false for backends with per-handle snapshot semantics (MDBX) so
+    /// each handle reads directly from its own ro_txn — the shared
+    /// cache would otherwise blur snapshot boundaries.
+    pub enable_cache: bool,
 }
 
 impl StateTreeConfig {
@@ -25,12 +30,14 @@ impl StateTreeConfig {
         account_cache_size: usize,
         storage_cache_size: usize,
         code_cache_size: usize,
+        enable_cache: bool,
     ) -> Self {
         Self {
             diff_tree_depth_limit,
             account_cache_size,
             storage_cache_size,
             code_cache_size,
+            enable_cache,
         }
     }
 }
@@ -42,6 +49,7 @@ impl Default for StateTreeConfig {
             account_cache_size: 1000000,
             storage_cache_size: 5000000,
             code_cache_size: 100000,
+            enable_cache: true,
         }
     }
 }
@@ -53,6 +61,9 @@ pub struct StateTree<DB> {
     /// 1. bottom disk db (when init).
     /// 2. top diff -> (top-1) diif -> ... -> bottom disk db.
     latest: RwLock<Arc<LinkedDiffLayer>>,
+    /// Bottom CacheDiskLayer held directly so state_at() can read
+    /// `committed_height` in O(1) instead of walking the diff chain.
+    cache_layer: Arc<LinkedDiffLayer>,
     /// blockhash -> node, hash_diff_map stores all the diff layer of the EVM.
     hash_diff_map: RwLock<HashMap<H256, Arc<LinkedDiffLayer>>>,
     /// blocknum-> node, num_diff_map stores all the diff layer of the EVM.
@@ -99,6 +110,8 @@ where
             config.account_cache_size,
             config.storage_cache_size,
             config.code_cache_size,
+            info.header.number,
+            config.enable_cache,
         )));
         let bottom_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
             info.clone(),
@@ -110,6 +123,7 @@ where
         num_diffs.insert(info.header.number, bottom_layer.clone());
         Ok(Self {
             latest: RwLock::new(cache_layer.clone()),
+            cache_layer,
             hash_diff_map: RwLock::new(hash_diffs),
             num_diff_map: RwLock::new(num_diffs),
             config,
@@ -166,11 +180,10 @@ where
                 .unwrap()
                 .insert(block_info.header.number, new_diff_layer.clone());
 
-            let latest_block_info = HybridStateDB {
-                memory_layer: self.latest.read().unwrap().clone(),
-                statedb: &latest_statedb,
-            }
-            .block_info()?;
+            // Metadata-only; None disables refill.
+            let latest_block_info =
+                HybridStateDB::new(self.latest.read().unwrap().clone(), &latest_statedb, None)
+                    .block_info()?;
             // import reorg block
             if block_info.header.number < latest_block_info.header.number {
                 info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.header.number, latest_block_info.header.number);
@@ -251,11 +264,8 @@ where
                 let statedb = self.db.state_at(block_id)?;
                 match statedb {
                     Some(statedb) => Ok(Some(
-                        HybridStateDB {
-                            memory_layer: Arc::new(LinkedDiffLayer::Empty),
-                            statedb,
-                        }
-                        .block_info_arc()?,
+                        HybridStateDB::new(Arc::new(LinkedDiffLayer::Empty), statedb, None)
+                            .block_info_arc()?,
                     )),
                     None => Ok(None),
                 }
@@ -272,11 +282,7 @@ where
                     .state_at(BlockId::Number(BlockNumberOrTag::Latest))?
                     .ok_or(Error::NoLatestBlockInDB)?;
                 Ok(Some(
-                    HybridStateDB {
-                        memory_layer,
-                        statedb,
-                    }
-                    .block_info_arc()?,
+                    HybridStateDB::new(memory_layer, statedb, None).block_info_arc()?,
                 ))
             }
             Err(e) => Err(e),
@@ -325,22 +331,28 @@ where
             Ok(None) => {
                 let statedb = self.db.state_at(block_arg)?;
                 match statedb {
-                    Some(statedb) => Ok(Some(HybridStateDB {
-                        memory_layer: Arc::new(LinkedDiffLayer::Empty),
+                    Some(statedb) => Ok(Some(HybridStateDB::new(
+                        Arc::new(LinkedDiffLayer::Empty),
                         statedb,
-                    })),
+                        None,
+                    ))),
                     None => Ok(None),
                 }
             }
             Ok(Some(memory_layer)) => {
+                // Snapshot committed_height for refill tagging; `None`
+                // when the cache is disabled so HybridStateDB skips
+                // refill entirely.
+                let cache_view_height = self.cache_layer.unwrap_cache_layer().cache_view_height();
                 let statedb = self
                     .db
                     .state_at(BlockId::Number(BlockNumberOrTag::Latest))?
                     .ok_or(Error::NoLatestBlockInDB)?;
-                Ok(Some(HybridStateDB {
+                Ok(Some(HybridStateDB::new(
                     memory_layer,
                     statedb,
-                }))
+                    cache_view_height,
+                )))
             }
             Err(e) => Err(e),
         }
