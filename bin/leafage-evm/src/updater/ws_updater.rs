@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::{sync::watch, task::JoinSet, time};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
+use metrics::{counter, gauge, histogram};
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,7 @@ struct LeafageHelloAck {
 struct LeafageManifestEntry {
     block_number: u64,
     block_hash: String,
+    state_root: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -105,6 +107,70 @@ struct LeafageCatchupComplete {
     chain_id: String,
     current_data_version: String,
     last_block_number: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct PassthroughFrameMeta {
+    r#type: String,
+    seq: u64,
+    chain_id: String,
+    data_version: String,
+    min_block: u64,
+    max_block: u64,
+    ts: i64,
+}
+
+fn decode_passthrough_notification(frame: &[u8]) -> Result<(PassthroughFrameMeta, KafkaBlockChangeNotification)> {
+    if frame.len() < 4 {
+        return Err(anyhow::anyhow!("passthrough frame too short"));
+    }
+    let meta_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+    if frame.len() < 4 + meta_len {
+        return Err(anyhow::anyhow!("passthrough frame truncated"));
+    }
+    let meta: PassthroughFrameMeta = serde_json::from_slice(&frame[4..4 + meta_len])?;
+    if meta.r#type != "kafka_passthrough" {
+        return Err(anyhow::anyhow!("unsupported passthrough frame type: {}", meta.r#type));
+    }
+    let raw_payload = &frame[4 + meta_len..];
+    let mut gz = flate2::read::GzDecoder::new(raw_payload);
+    let mut decoded = Vec::new();
+    use std::io::Read;
+    gz.read_to_end(&mut decoded)?;
+    let notif: KafkaBlockChangeNotification = serde_json::from_slice(&decoded)?;
+    Ok((meta, notif))
+}
+
+
+fn metric_reconnect_reason(err: &anyhow::Error) -> String {
+    let msg = err.to_string().to_lowercase();
+    if msg.contains("reset") {
+        "connection_reset".to_string()
+    } else if msg.contains("refused") {
+        "connection_refused".to_string()
+    } else if msg.contains("lookup") {
+        "dns".to_string()
+    } else if msg.contains("timeout") {
+        "timeout".to_string()
+    } else if msg.contains("snapshot restore not implemented") {
+        "snapshot_required".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn record_ws_frame(direction: &str, frame_type: &str, size: usize) {
+    counter!("pipeline_leafage_ws_frames_total", &[("direction", direction.to_string()), ("type", frame_type.to_string())]).increment(1);
+    counter!("pipeline_leafage_ws_frame_bytes_total", &[("direction", direction.to_string()), ("type", frame_type.to_string())]).increment(size as u64);
+}
+
+fn record_next_action(action: &str, source: &str) {
+    counter!("pipeline_leafage_next_action_total", &[("action", action.to_string()), ("source", source.to_string())]).increment(1);
+}
+
+fn set_progress(stage: &str) {
+    gauge!("pipeline_leafage_last_progress_timestamp_seconds", &[("stage", stage.to_string())]).set(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64());
 }
 
 /// [`Updater`] subscribes to an external WebSocket endpoint that pushes the
@@ -233,6 +299,8 @@ where
                 match msg_type {
                     "hello_ack" => {
                         let ack: LeafageHelloAck = serde_json::from_value(value)?;
+                        gauge!("pipeline_leafage_gateway_latest_height").set(ack.latest_height as f64);
+                        record_next_action(&ack.next_action, "hello_ack");
                         info!(target:"updater", "leafage ws hello_ack chain={} version={} latest_height={} next_action={}", ack.chain_id, ack.current_data_version, ack.latest_height, ack.next_action);
                         match ack.next_action.as_str() {
                             "replay" => Ok(ControlAction::Continue),
@@ -249,6 +317,8 @@ where
                     "catchup_required" => {
                         let control: LeafageCatchupRequired = serde_json::from_value(value)?;
                         info!(target:"updater", "leafage ws catchup_required chain={} version={} from_block={} to_block={} reason={}", control.chain_id, control.current_data_version, control.from_block, control.to_block, control.reason);
+                        record_next_action("catchup", "control");
+                        counter!("pipeline_leafage_catchup_blocks_total", &[("mode", if control.manifest.is_empty() { "s3".to_string() } else { "manifest".to_string() })]).increment((control.to_block.saturating_sub(control.from_block) + 1) as u64);
                         Ok(ControlAction::Catchup {
                             from_block: control.from_block,
                             to_block: control.to_block,
@@ -258,6 +328,7 @@ where
                     "snapshot_required" => {
                         let control: LeafageSnapshotRequired = serde_json::from_value(value)?;
                         info!(target:"updater", "leafage ws snapshot_required chain={} version={} reason={} manifest={} resume_from={}", control.chain_id, control.current_data_version, control.reason, control.snapshot.manifest_url, control.snapshot.resume_from);
+                        record_next_action("snapshot", "control");
                         Ok(ControlAction::SnapshotRequired {
                             manifest_url: control.snapshot.manifest_url,
                             reason: control.reason,
@@ -335,6 +406,7 @@ where
                 let cfg = cfg.clone();
                 join_set.spawn(async move {
                     let block_hash = H256::from_str(&entry.block_hash)?;
+                    let state_root = H256::from_str(&entry.state_root)?;
                     let block_info = s3_get_block_info(
                         &s3_client,
                         &cfg.r2_inner_bucket,
@@ -347,7 +419,7 @@ where
                         &cfg.r2_inner_bucket,
                         &cfg.chain_id,
                         &cfg.version,
-                        block_info.header.state_root,
+                        state_root,
                     ).await?;
                     Ok::<(usize, BlockInfo, BlockStorageDiff), anyhow::Error>((idx, block_info, block_diff))
                 });
@@ -605,6 +677,7 @@ where
             })
             .collect::<Vec<_>>();
         for block in update_path.drain(..) {
+            let apply_started = std::time::Instant::now();
             let block_storage_diff = block.block_diff;
             let block_info = block.block_info;
             let block_hash = block_info.header.hash;
@@ -613,6 +686,9 @@ where
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
             self.tree.update_block(block_info, block_storage_diff)?;
+            histogram!("pipeline_leafage_apply_block_duration_seconds").record(apply_started.elapsed().as_secs_f64());
+            gauge!("pipeline_leafage_applied_block").set(block_num as f64);
+            set_progress("applied_block");
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
@@ -645,6 +721,8 @@ where
         use futures::{SinkExt, StreamExt};
         info!(target:"updater", "connecting to ws endpoint {}", self.ws_url);
         let (ws_stream, _resp) = connect_async(&self.ws_url).await?;
+        gauge!("pipeline_leafage_ws_connection_up").set(1.0);
+        set_progress("ws_connected");
         let (mut sink, read) = ws_stream.split();
         let hello = self.build_hello_request()?;
         info!(target:"updater", "sending leafage hello chain={} last_block={} data_version={}", hello.chain_id, hello.resume_cursor.last_block_number, hello.resume_cursor.data_version);
@@ -693,12 +771,23 @@ where
                 }
                 match message {
                     Message::Text(text) => {
+                        record_ws_frame("inbound", "control_json", text.len());
                         let notif: KafkaBlockChangeNotification = serde_json::from_str(&text)?;
                         notifications.push(notif);
                     }
                     Message::Binary(bytes) => {
-                        let notif: KafkaBlockChangeNotification = bytes.as_ref().try_into()?;
-                        notifications.push(notif);
+                        record_ws_frame("inbound", "binary", bytes.len());
+                        match decode_passthrough_notification(bytes.as_ref()) {
+                            Ok((meta, notif)) => {
+                                histogram!("pipeline_leafage_gateway_frame_latency_seconds").record((std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() - meta.ts as f64).max(0.0));
+                                notifications.push(notif)
+                            },
+                            Err(_) => {
+                                counter!("pipeline_leafage_ws_decode_errors_total", &[("type", "passthrough_binary".to_string())]).increment(1);
+                                let notif: KafkaBlockChangeNotification = bytes.as_ref().try_into()?;
+                                notifications.push(notif);
+                            }
+                        }
                     }
                     Message::Close(frame) => {
                         info!(target:"updater", "ws closed by peer: {:?}", frame);
@@ -744,9 +833,13 @@ where
                         break;
                     }
                     res = self.serve() => {
+                        gauge!("pipeline_leafage_ws_connection_up").set(0.0);
                         match res {
                             Ok(()) => info!(target:"updater", "ws stream ended, reconnecting in 1s"),
-                            Err(e) => error!(target:"updater", "ws updater error: {:?}, reconnecting in 1s", e),
+                            Err(e) => {
+                                counter!("pipeline_leafage_ws_reconnect_total", &[("reason", metric_reconnect_reason(&e))]).increment(1);
+                                error!(target:"updater", "ws updater error: {:?}, reconnecting in 1s", e)
+                            },
                         }
                         time::sleep(Duration::from_secs(1)).await;
                     }

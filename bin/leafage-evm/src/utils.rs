@@ -45,8 +45,46 @@ pub struct GatewayObjectConfig {
     pub prefetch_window: usize,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CanonicalIndex {
+    pub chain_id: String,
+    pub version: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub parent_hash: String,
+    pub state_root: String,
+    pub updated_at: i64,
+}
+
 fn default_prefetch_window() -> usize {
     8
+}
+
+pub async fn s3_get_canonical_index_by_number(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    number: u64,
+) -> Result<CanonicalIndex> {
+    let s3_key = if version.is_empty() {
+        format!("{}/index/block/{}.json", s3_chain_id, number)
+    } else {
+        format!("{}/{}/index/block/{}.json", s3_chain_id, version, number)
+    };
+    let s3_obj = s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&s3_key)
+        .send()
+        .await
+        .context(format!("{bucket_name}: {s3_key}"))?;
+    let bytes = s3_obj.body.collect().await?.into_bytes();
+    let mut gz = read::GzDecoder::new(&bytes[..]);
+    let mut bytes = Vec::new();
+    gz.read_to_end(&mut bytes)?;
+    let index: CanonicalIndex = serde_json::from_slice(&bytes)?;
+    Ok(index)
 }
 
 pub async fn s3_get_block_diff(
@@ -168,14 +206,17 @@ pub async fn s3_get_block_transactions_by_number(
             .context(format!("s3 get transactions failed, {}", block.header.hash))?
         }
         None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
+            let block_hash = H256::from_str(
+                &s3_get_canonical_index_by_number(
+                    s3_client,
+                    outer_bucket_name,
+                    s3_chain_id,
+                    version,
+                    number,
+                )
+                .await?
+                .block_hash,
+            )?;
             s3_get_block_transactions(
                 s3_client,
                 outer_bucket_name,
@@ -188,72 +229,6 @@ pub async fn s3_get_block_transactions_by_number(
         }
     };
     Ok(transactions)
-}
-
-pub async fn s3_get_block_hash_by_number(
-    s3_client: &Client,
-    bucket_name: &str,
-    s3_chain_id: &str,
-    version: &str,
-    number: u64,
-) -> Result<H256> {
-    #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    struct BlockValidation {
-        pub validation_hash: i64,
-        pub is_fork: bool,
-    }
-    let prefix = if version.is_empty() {
-        format!("{}/{}/", s3_chain_id, number)
-    } else {
-        format!("{}/{}/{}/", s3_chain_id, version, number)
-    };
-    let list_output = s3_client
-        .list_objects_v2()
-        .bucket(bucket_name)
-        .prefix(&prefix)
-        .send()
-        .await
-        .context(format!(
-            "Failed to list objects in bucket {bucket_name} with prefix {prefix}"
-        ))?;
-    // 只有一个对象，肯定没有fork，直接返回
-    if list_output.contents().len() == 1 {
-        let hash_str = list_output.contents()[0]
-            .key()
-            .unwrap()
-            .strip_prefix(&prefix)
-            .ok_or_else(|| anyhow::anyhow!("Failed to strip prefix {prefix} from key"))?;
-        return H256::from_str(hash_str)
-            .context(format!("Failed to parse block hash from key {hash_str}"));
-    }
-    for object in list_output.contents() {
-        if let Some(key) = object.key() {
-            let s3_obj = s3_client
-                .get_object()
-                .bucket(bucket_name)
-                .key(key)
-                .send()
-                .await
-                .context(format!("{bucket_name}: {key}"))?;
-            let bytes = s3_obj.body.collect().await?.into_bytes();
-            let mut gz = read::GzDecoder::new(&bytes[..]);
-            let mut bytes = Vec::new();
-            gz.read_to_end(&mut bytes)?;
-            let block_validation: BlockValidation = serde_json::from_slice(&bytes)
-                .context(format!("Failed to parse block validation"))?;
-            if !block_validation.is_fork {
-                let hash_str = key.strip_prefix(&prefix).ok_or_else(|| {
-                    anyhow::anyhow!("Failed to strip prefix {prefix} from key {key}")
-                })?;
-                return H256::from_str(hash_str)
-                    .context(format!("Failed to parse block hash from key {hash_str}"));
-            }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "No valid block hash found for number {number} in chain {s3_chain_id}"
-    ))
 }
 
 pub async fn s3_get_block_info_and_diff_by_number(
@@ -281,14 +256,17 @@ pub async fn s3_get_block_info_and_diff_by_number(
             block
         }
         None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
+            let block_hash = H256::from_str(
+                &s3_get_canonical_index_by_number(
+                    s3_client,
+                    outer_bucket_name,
+                    s3_chain_id,
+                    version,
+                    number,
+                )
+                .await?
+                .block_hash,
+            )?;
             s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
                 .context(format!("s3 get block info failed, {block_hash}"))?
@@ -354,14 +332,17 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
             block
         }
         None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
+            let block_hash = H256::from_str(
+                &s3_get_canonical_index_by_number(
+                    s3_client,
+                    outer_bucket_name,
+                    s3_chain_id,
+                    version,
+                    number,
+                )
+                .await?
+                .block_hash,
+            )?;
             s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
                 .context(format!("s3 get block info failed, {block_hash}"))?
