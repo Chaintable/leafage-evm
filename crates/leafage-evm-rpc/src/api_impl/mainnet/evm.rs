@@ -1,6 +1,5 @@
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::invalid_params_rpc_err;
 use alloy::consensus::TxType;
-use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::Either;
 use jsonrpsee::core::RpcResult;
@@ -9,12 +8,9 @@ use revm::context::{Evm, TxEnv};
 use revm::context_interface::Block;
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::handler::{instructions::EthInstructions, EthPrecompiles};
-use revm::inspector::NoOpInspector;
 use revm::interpreter::interpreter::EthInterpreter;
-use revm::primitives::hardfork::SpecId;
 use revm::primitives::TxKind;
-use revm::{Context, DatabaseCommit, MainBuilder, MainContext, SystemCallEvm};
-use std::fmt::Debug;
+use revm::{Context, MainBuilder, MainContext};
 
 /// Helper type for representing the fees of a [CallRequest]
 pub(crate) struct CallFees {
@@ -217,40 +213,4 @@ where
         .with_ref_db(state)
         .build_mainnet_with_inspector(inspector)
         .with_precompiles(EthPrecompiles::new(spec))
-}
-
-/// Apply the EIP-2935 (Prague) blockhashes system-contract call as part of
-/// pre-execution state setup. Extracted as a free function so the mainnet and
-/// arbitrum executors share one implementation. No-op before Prague or at the
-/// genesis block.
-pub(crate) fn apply_blockhashes_contract_call<StateDB>(
-    cfg: &CfgEnv<MainnetSpecId>,
-    parent_block_hash: H256,
-    block_env: &BlockEnv,
-    state: &mut StateDB,
-) -> RpcResult<()>
-where
-    StateDB: DatabaseCommit + DatabaseRef + Debug,
-    StateDB::Error: Sync + Send + 'static,
-{
-    if !cfg.spec.is_enabled_in(SpecId::PRAGUE) {
-        return Ok(());
-    }
-
-    if block_env.number.is_zero() {
-        return Ok(());
-    }
-
-    let result = {
-        let mut evm =
-            create_main_evm_from_state(block_env.clone(), cfg.clone(), &*state, NoOpInspector {});
-
-        evm.system_call(HISTORY_STORAGE_ADDRESS, parent_block_hash.0.into())
-            .map_err(|e| {
-                internal_rpc_err(format!("EIP-2935 blockhashes contract call failed: {e}"))
-            })?
-    };
-
-    state.commit(result.state);
-    Ok(())
 }

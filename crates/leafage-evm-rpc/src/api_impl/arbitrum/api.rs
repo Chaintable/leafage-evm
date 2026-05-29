@@ -1,18 +1,16 @@
 //! Arbitrum Orbit (Nitro) RPC impl.
 //!
-//! EVM execution mirrors mainnet verbatim (Nitro's normal-tx L2 execution is a
-//! mainnet EVM), reusing the shared free functions in `mainnet::evm`. The only
-//! behavioural addition is overriding [`GasFeeHandler::estimate_l1_overhead`] to
-//! add Nitro's L1 data-posting cost (posterGas) to `eth_estimateGas`, gated by
-//! the per-chain `enable_l1_gas` switch. With the switch off, this type behaves
-//! exactly like mainnet.
+//! EVM execution reuses mainnet's `create_mainnet_txn_env` / `create_main_evm_from_state`
+//! free functions (Nitro's normal-tx L2 execution is a mainnet EVM). The pre-execution
+//! hook stays at its no-op default: the EIP-2935 blockhash call is Prague-gated and the
+//! arbitrum spec is pre-Prague (Nitro has no EIP-2935), so there is nothing to do — hence
+//! no change to mainnet is needed. The only behavioural addition is overriding
+//! [`GasFeeHandler::estimate_l1_overhead`] to add Nitro's L1 data-posting cost (posterGas)
+//! to gas estimation, gated by the per-chain `enable_l1_gas` switch (off by default).
 
 use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
-use crate::api_impl::mainnet::evm::{
-    apply_blockhashes_contract_call, create_main_evm_from_state, create_mainnet_txn_env,
-};
+use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
-use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::arbitrum::{arbos_state, poster_gas, ArbitrumEvmConfig};
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, MainnetSpecId};
@@ -25,8 +23,8 @@ use std::fmt::Debug;
 
 type ArbitrumApiImpl<DB> = ApiImpl<DB, MainnetSpecId, ArbitrumEvmConfig>;
 
-// EVM execution: identical to mainnet (mirrors `mainnet::api`), so eth_call /
-// trace / replay are byte-for-byte unchanged versus running as `mainnet`.
+// create_txn_env / transact / inspect_tx_commit reuse mainnet's free functions;
+// apply_pre_execution_changes keeps the trait default (no-op) — see module doc.
 impl<DB> EvmExecutor for ArbitrumApiImpl<DB>
 where
     DB: Sync + Send + 'static,
@@ -62,19 +60,6 @@ where
         );
 
         evm.transact(tx).map(|res| res.result.into())
-    }
-
-    fn apply_pre_execution_changes<StateDB>(
-        &self,
-        header: impl BlockHeader,
-        block_env: &BlockEnv,
-        state: &mut StateDB,
-    ) -> RpcResult<()>
-    where
-        StateDB: DatabaseCommit + DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        apply_blockhashes_contract_call(&self.evm_cfg.cfg, header.parent_hash(), block_env, state)
     }
 
     fn inspect_tx_commit<
