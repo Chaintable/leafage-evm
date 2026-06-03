@@ -15,9 +15,8 @@
 //! ```
 
 use super::arbos_state::ArbPricing;
-use alloy::consensus::{SignableTransaction, TxEip1559};
-use alloy::eips::eip2718::Encodable2718;
-use alloy::primitives::{keccak256, Signature, U256};
+use alloy::primitives::{keccak256, U256};
+use alloy_rlp::Encodable;
 use once_cell::sync::Lazy;
 use revm::context::TxEnv;
 
@@ -45,41 +44,69 @@ static RANDOM_GAS: Lazy<u64> =
     Lazy::new(|| u32::from_be_bytes(keccak256("Gas").0[..4].try_into().unwrap()) as u64);
 static RANDOM_R: Lazy<U256> = Lazy::new(|| U256::from_be_bytes::<32>(keccak256("R").0));
 static RANDOM_S: Lazy<U256> = Lazy::new(|| U256::from_be_bytes::<32>(keccak256("S").0));
+/// Nitro's fake-tx `V` (`l1pricing.go:564`): `randV = ArbitrumOne chainId (42161) * 3
+/// = 126483`, hardcoded to arb1 — NOT the current Orbit chain's id. It RLP-encodes to
+/// 4 bytes (`0x83 01EE13`), vs a normal EIP-1559 signature's 1-byte `y_parity`, so
+/// reproducing it keeps the fake tx the same size as Nitro's before brotli.
+const FAKE_SIG_V: u64 = 126_483;
 
 /// EIP-2718 bytes of Nitro's gas-estimation fake tx: the request's
-/// to/value/data/access_list, with Nitro's fixed random values for everything
-/// else (gas is always `RandomGas` during estimation).
+/// to/value/data/access_list, with Nitro's fixed random values for everything else
+/// (gas is always `RandomGas` during estimation). Hand-rolled RLP rather than alloy's
+/// signed encoding, because Nitro's `V` is a 4-byte integer ([`FAKE_SIG_V`]) that
+/// alloy's bool-parity `Signature` can't express — and the byte count feeds brotli, so
+/// it must match Nitro exactly.
 fn fake_tx_bytes(tx: &TxEnv) -> Vec<u8> {
-    let nonce = if tx.nonce == 0 {
-        *RANDOM_NONCE
-    } else {
-        tx.nonce
-    };
-    let tip = tx
+    let chain_id: u64 = 0; // Nitro leaves the fake tx's ChainID unset (encodes as 0)
+    let nonce: u64 = if tx.nonce == 0 { *RANDOM_NONCE } else { tx.nonce };
+    let tip: u128 = tx
         .gas_priority_fee
         .filter(|v| *v != 0)
         .unwrap_or(*RANDOM_GAS_TIP_CAP);
-    let fee = if tx.gas_price == 0 {
+    let fee: u128 = if tx.gas_price == 0 {
         *RANDOM_GAS_FEE_CAP
     } else {
         tx.gas_price
     };
+    let gas: u64 = *RANDOM_GAS;
+    let r: U256 = *RANDOM_R;
+    let s: U256 = *RANDOM_S;
 
-    let fake = TxEip1559 {
-        chain_id: 0,
-        nonce,
-        gas_limit: *RANDOM_GAS,
-        max_fee_per_gas: fee,
-        max_priority_fee_per_gas: tip,
-        to: tx.kind,
-        value: tx.value,
-        access_list: tx.access_list.clone(),
-        input: tx.data.clone(),
-    };
-    let sig = Signature::new(*RANDOM_R, *RANDOM_S, false);
-    let mut buf = Vec::new();
-    fake.into_signed(sig).encode_2718(&mut buf);
-    buf
+    // 0x02 || rlp([chainId, nonce, maxPrioFee, maxFee, gas, to, value, input,
+    //              accessList, v, r, s]) — geth DynamicFeeTx MarshalBinary layout.
+    let payload_len = chain_id.length()
+        + nonce.length()
+        + tip.length()
+        + fee.length()
+        + gas.length()
+        + tx.kind.length()
+        + tx.value.length()
+        + tx.data.length()
+        + tx.access_list.length()
+        + FAKE_SIG_V.length()
+        + r.length()
+        + s.length();
+
+    let mut out = Vec::with_capacity(payload_len + 8);
+    out.push(0x02); // EIP-2718 type byte (EIP-1559)
+    alloy_rlp::Header {
+        list: true,
+        payload_length: payload_len,
+    }
+    .encode(&mut out);
+    chain_id.encode(&mut out);
+    nonce.encode(&mut out);
+    tip.encode(&mut out);
+    fee.encode(&mut out);
+    gas.encode(&mut out);
+    tx.kind.encode(&mut out);
+    tx.value.encode(&mut out);
+    tx.data.encode(&mut out);
+    tx.access_list.encode(&mut out);
+    FAKE_SIG_V.encode(&mut out);
+    r.encode(&mut out);
+    s.encode(&mut out);
+    out
 }
 
 fn brotli_len(input: &[u8], level: u64) -> Option<usize> {
@@ -197,6 +224,13 @@ mod tests {
         assert_eq!(small[0], 0x02, "EIP-2718 type byte for EIP-1559");
         assert_eq!(large[0], 0x02);
         assert!(large.len() > small.len());
+        // V must carry Nitro's randV = 126483, RLP-encoded as the 4 bytes 0x83 01 EE 13
+        // (not a 1-byte y_parity) — this is what keeps the fake tx byte-identical to
+        // Nitro's before brotli. See FAKE_SIG_V.
+        assert!(
+            small.windows(4).any(|w| w == [0x83, 0x01, 0xEE, 0x13]),
+            "fake tx must encode V=126483 as 4 bytes (matches Nitro's randV)"
+        );
     }
 
     /// posterGas is non-zero end-to-end for a realistic call and scales up with
