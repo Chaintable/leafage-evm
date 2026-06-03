@@ -235,11 +235,26 @@ impl Initializer {
             anyhow::bail!("manifest.archives is empty");
         }
 
+        // 压缩由生产端 compression 配置决定,写在 manifest.compression(权威来源)。
+        // 早判早错:不支持的算法在开始下载前就退出。整份 snapshot 同一压缩,解析一次即可。
+        //   "zstd"        → 流式 zstd 解码后再 tar
+        //   "none" / ""   → 原始字节直喂 tar
+        //   其他          → 直接报错(目前只支持 zstd)
+        let compressed = match manifest.compression.as_str() {
+            "zstd" => true,
+            "none" | "" => false,
+            other => anyhow::bail!(
+                "unsupported compression algorithm: {} (only zstd / none supported)",
+                other
+            ),
+        };
+
         info!(
             target: "snapshot_init",
-            "archive restore start archives={} archive_concurrency={}",
+            "archive restore start archives={} archive_concurrency={} compression={}",
             manifest.archives.len(),
             self.archive_concurrency,
+            if compressed { "zstd" } else { "none" },
         );
 
         let archives_prefix = manifest.archives_prefix.clone();
@@ -250,13 +265,23 @@ impl Initializer {
         let mut in_flight = FuturesUnordered::new();
         for _ in 0..self.archive_concurrency {
             if let Some((idx, entry)) = iter.next() {
-                in_flight.push(self.extract_one_archive(idx, entry, archives_prefix.clone()));
+                in_flight.push(self.extract_one_archive(
+                    idx,
+                    entry,
+                    archives_prefix.clone(),
+                    compressed,
+                ));
             }
         }
         while let Some(result) = in_flight.next().await {
             result?;
             if let Some((idx, entry)) = iter.next() {
-                in_flight.push(self.extract_one_archive(idx, entry, archives_prefix.clone()));
+                in_flight.push(self.extract_one_archive(
+                    idx,
+                    entry,
+                    archives_prefix.clone(),
+                    compressed,
+                ));
             }
         }
 
@@ -278,6 +303,7 @@ impl Initializer {
         idx: usize,
         entry: ArchiveEntry,
         archives_prefix: String,
+        compressed: bool,
     ) -> Result<()> {
         let key = format!("{}{}", archives_prefix, entry.name);
         info!(
@@ -289,7 +315,7 @@ impl Initializer {
         let mut last_err: Option<anyhow::Error> = None;
         let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
         for attempt in 1..=self.outer_retry_attempts {
-            match self.try_extract_one_archive(&key).await {
+            match self.try_extract_one_archive(&key, compressed).await {
                 Ok(()) => {
                     info!(
                         target: "snapshot_init",
@@ -322,7 +348,7 @@ impl Initializer {
 
     /// 单次尝试:完整跑一遍流式管道(GET → StreamReader → SyncIoBridge → tar::Archive::unpack)。
     /// 中途任何错(GET 失败 / 非 2xx / tar 解析 / 写盘)直接抛出,由外层 wrapper 决定是否重试。
-    async fn try_extract_one_archive(&self, key: &str) -> Result<()> {
+    async fn try_extract_one_archive(&self, key: &str, compressed: bool) -> Result<()> {
         let url = self.object_url(key);
         let resp = self
             .http
@@ -343,7 +369,7 @@ impl Initializer {
         let db_path = self.db_path.clone();
         // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),再 move 进 spawn_blocking。
         let sync_read = SyncIoBridge::new(async_read);
-        tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path))
+        tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path, compressed))
             .await
             .context("extract task")?
     }
@@ -394,9 +420,21 @@ impl Initializer {
     }
 }
 
-/// 同步流式解压:reader(假设未压缩 tar)→ tar entries → 直接落 db_path。
-/// 在 spawn_blocking 内执行。单 archive 解压过程内存占用 KB 级(逐 entry 流式)。
-fn extract_tar<R: std::io::Read>(reader: R, db_path: &Path) -> Result<()> {
+/// 同步流式解包:reader → (可选 zstd 流式解码) → tar entries → 直接落 db_path。
+/// 在 spawn_blocking 内执行。compressed=true 时先套一层流式 zstd 解码器,
+/// 仍是边读边解边写、不缓存整片,内存占用 KB~MB 级。
+fn extract_tar<R: std::io::Read>(reader: R, db_path: &Path, compressed: bool) -> Result<()> {
+    if compressed {
+        let decoder =
+            zstd::stream::read::Decoder::new(reader).context("init zstd stream decoder")?;
+        unpack_tar(decoder, db_path)
+    } else {
+        unpack_tar(reader, db_path)
+    }
+}
+
+/// 逐 entry 流式解 tar 落盘(防越权:拒绝绝对路径 / ".." / 设备等特殊文件)。
+fn unpack_tar<R: std::io::Read>(reader: R, db_path: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.set_overwrite(true);
     archive.set_preserve_mtime(false);
