@@ -34,7 +34,7 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "iotex"], default_value = "mainnet")]
+    #[arg(long, value_parser = ["mainnet", "arbitrum", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "iotex"], default_value = "mainnet")]
     evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
@@ -389,6 +389,31 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "arbitrum" => {
+                // Arbitrum Orbit (Nitro) on ArbOS >= 40 is Prague-level. Its EIP-7623
+                // calldata floor is a runtime feature flag (default off, e.g. Robinhood),
+                // so default to PRAGUE: it matches the chain's Prague EVM and never
+                // *under*-estimates the floor — if a chain enables 7623 PRAGUE is exact,
+                // if it's off the floor only over-estimates rare calldata-heavy txs (the
+                // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
+                // chains. The L1 cost is added separately in estimate_l1_overhead.
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::PRAGUE, "arbitrum")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                let custom_evm_cfg = custom_evm_cfg
+                    .map(|str| {
+                        serde_json::from_str(&str).map_err(|err| {
+                            anyhow!("cannot parse arbitrum custom evm config: {}", err)
+                        })
+                    })
+                    .transpose()?;
+                Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);

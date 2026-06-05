@@ -1,3 +1,4 @@
+pub mod arbitrum;
 pub mod bsc;
 pub mod citrea;
 pub mod cosmos;

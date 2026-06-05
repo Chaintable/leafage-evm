@@ -2,6 +2,7 @@ use crate::api_impl::token_collector::TokenCollector;
 use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
+use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
@@ -189,6 +190,7 @@ impl<C> Clone for Api<C> {
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    Arbitrum((CfgEnv<MainnetSpecId>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
@@ -202,6 +204,7 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
