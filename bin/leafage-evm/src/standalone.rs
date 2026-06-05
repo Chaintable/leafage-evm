@@ -391,12 +391,14 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
             "arbitrum" => {
-                // Arbitrum Nitro (ArbOS) has no EIP-7623 calldata floor — it accounts
-                // for L1 data cost via posterGas instead. Default to CANCUN (highest
-                // pre-Prague spec) so the base gas matches Nitro; the L1 cost is added
-                // separately in estimate_l1_overhead. Override with --spec-id for a chain
-                // on a different ArbOS EVM level. Otherwise identical to the mainnet arm.
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::CANCUN, "arbitrum")?;
+                // Arbitrum Orbit (Nitro) on ArbOS >= 40 is Prague-level. Its EIP-7623
+                // calldata floor is a runtime feature flag (default off, e.g. Robinhood),
+                // so default to PRAGUE: it matches the chain's Prague EVM and never
+                // *under*-estimates the floor — if a chain enables 7623 PRAGUE is exact,
+                // if it's off the floor only over-estimates rare calldata-heavy txs (the
+                // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
+                // chains. The L1 cost is added separately in estimate_l1_overhead.
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::PRAGUE, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;

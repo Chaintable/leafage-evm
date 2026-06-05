@@ -2,8 +2,9 @@
 //!
 //! EVM execution reuses mainnet's `create_mainnet_txn_env` / `create_main_evm_from_state`
 //! free functions (Nitro's normal-tx L2 execution is a mainnet EVM). The pre-execution
-//! hook stays at its no-op default: the EIP-2935 blockhash call is Prague-gated and the
-//! arbitrum spec is pre-Prague (Nitro has no EIP-2935), so there is nothing to do — hence
+//! hook stays at its no-op default even on Prague: Arbitrum skips the EIP-2935
+//! parent-blockhash system call (go-ethereum-arb gates it on `!IsArbitrum`; block hashes
+//! come from the per-block internal tx instead), so there is nothing to populate — hence
 //! no change to mainnet is needed. The only behavioural addition is overriding
 //! [`GasFeeHandler::estimate_l1_overhead`] to add Nitro's L1 data-posting cost (posterGas)
 //! to gas estimation, gated by the per-chain `enable_l1_gas` switch (off by default).
