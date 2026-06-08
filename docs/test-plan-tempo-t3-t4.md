@@ -43,21 +43,53 @@ T4 mainnet 激活：2026-05-18 14:00 UTC，timestamp `1779112800`。
 | **T3-E** | 18,505,730 | 0x11a6002 | T3 | **address_registry + AA tx (webAuthn signature)** | task_tempo T3 报告 |
 | **T3-F** | 19,600,000 | 0x12b1280 | T3 | 高 tx count（5 Legacy） | task_tempo T3 报告 |
 | **T3-G** | ~19,940,000+ | live | T3 | 实时区块，验证 follow + Kafka 同步 | runtime |
-| **T4-A** | TBD post-5/18 | TBD | **T4** | T4 激活后首块 | 待 5/18 后选 |
-| **T4-B** | TBD | TBD | T4 | T4 stablecoin_dex paused 触发块（如果发生） | 待选 |
-| **T4-C** | TBD | TBD | T4 | T4 AA tx with call scopes（scope_counts 完整路径） | 待选 |
+| **C3** | 20,636,963 | 0x13ad5e3 | **T3 → T4 边界** | T4 激活前最后一块 (ts=1779112799) | binary search |
+| **T4-A** | 20,636,964 | 0x13ad5e4 | **T4** | T4 激活后首块 (ts=1779112800) | binary search |
+| **T4-B** | 20,670,000 | 0x13b56b0 | T4 | T4+33k 块，stablecoin_dex 行为采样 | mid-T4 |
+| **T4-C** | 20,700,000 | 0x13bcb40 | T4 | T4+63k 块，AA tx scope_counts 采样 | mid-T4 |
+| **T4-D** | 20,720,000 | 0x13c1990 | T4 | 临近 tip，validate_call_scopes T4 stateless 采样 | late-T4 |
+| **T4-live** | live tip | live | T4 | 实时块，hardfork 路由 + follow 验证 | runtime |
+
+### T4 区间 fixture tx（mainnet 真实 tx，2026-05-19 writer 扫描）
+
+下表 7 笔 fixture 来自 writer (port 8545) 在 T4 区间（20,636,964 ~ 20,772,759，135,795 blocks）的实际扫描结果，作为 §1/§5/§6/§8/§14 字节回归测试的具体输入。
+
+| Fixture | Block | Tx Hash | tx type | to | 特征 | 关联 FU / §  |
+|---|---|---|---|---|---|---|
+| T4-fx1 | 20,636,964 (T4-A) | `0x4ccd243c79dbd256353a7abd9b26ed28814c218b930bc6616a36b7dd5b815b6e` | EIP-1559 (0x2) | stablecoin_dex `0xdec0...` | T4 首块第 1 笔，selector `0xf8856c0f`，触发 `OrderFilled` | §1.1-1.3 / §6.s / §14.1 |
+| T4-fx2 | 20,637,200 | `0xe4f7cb50ee98c4ddf803ca42249d4a995fbaa07a3c8c5714ee32b53d6bd0f88e` | Tempo AA (0x76) | TIP-20 virtual `0x20c0...b950` | AccessKeySpend（legacy spend，`keyAuthorization=null`） | §5.1 / §14.3.1 |
+| T4-fx3 | 20,637,236 | `0x38da83059f970a09968d50579ff20aa73765c0a796b5cdc80418b42f0d0932fa` | Tempo AA (0x76) | TIP-20 virtual | KeyAuthorized：limits=1 (`period=0`，非周期), `allowedCalls=null`, sig=webAuthn | FU-3 (period=0 baseline) |
+| T4-fx4 | 20,641,039 | `0x3ac71a0cd5f9bd024106a4022ee69c9a6f12e7e8fd600c25c18b1ac87ce2bd94` | Legacy (0x0) | stablecoin_dex | placeOrder（selector `0x63813125`），触发 `OrderPlaced` | §6 |
+| T4-fx5 | 20,641,109 | `0xd8e594c07dbd7cf1cefbb940d5545064f3593076a8e4e579feef67c2fdde6386` | Legacy (0x0) | stablecoin_dex | `OrderCancelled` | §6 |
+| **T4-fx6 ★** | **20,675,920** | `0x06616b5ee5125ead4b653ecccd077429084b8c42783f1e6acc8378003f3cbca2` | Tempo AA (0x76) | TIP-20 virtual | **金 fixture** — keyAuthorization 同时含：① `limits=1` (token=`0x20c0...b950`, limit=10M, **period=86400** 周期 limit)；② `allowedCalls=1 scope` (target=TIP-20 prefix, **selectors=2** [`transfer 0xa9059cbb` + `0x95777d59`])；sig=webAuthn | **FU-2/3/5/6** |
+| T4-fx7 | 20,700,761 | `0xbcc1da0aeb40ff031e56d9aa0bc0470f9c9405184e868f3eb90a9e7ad734527f` | Tempo AA (0x76) | TIP-20 virtual | `KeyRevoked` | §5 / §8 |
+
+**T4 区间 event 统计**（writer eth_getLogs 双段扫描）：
+
+| precompile / event | count | 备注 |
+|---|---|---|
+| account_keychain `AccessKeySpend` | ~2,434 | AA tx 触发的 spend log |
+| account_keychain `KeyAuthorized` | ~129 | 其中 **10 笔 `allowedCalls` 非 null**（T4-fx6 是最早） |
+| account_keychain `KeyRevoked` | 2 | |
+| stablecoin_dex `OrderFilled` | ~1,049 | |
+| stablecoin_dex `OrderPlaced` | ~436 | |
+| stablecoin_dex `OrderCancelled` | ~428 | |
+| address_registry, signature_verifier | 0 log | 这两个 precompile 不 emit event；要靠 `to` 字段筛 tx，T3 历史块更多 fixture（见 T3-A/D/E） |
+
+> **§6.2 paused token gap**：writer 扫描中未发现 mainnet 已有 paused TIP-20 contract（OrderPlaced/OrderFilled 全部成功，无 paused 触发的 revert）。§6.2 路径需要 staging 构造或等 mainnet 实际触发；§6.s smoke 测试不受影响照常跑。
 
 ---
 
 ## 1. 顶层 RPC 一致性（leafage vs writer，byte-identical）
 
 每个测试块对每笔 tx 做以下对比，全部要求 leafage 返回 = writer 返回（同 JSON sha256）。
+T4 区间 fixture 见前文 "T4 区间 fixture tx" 节（7 笔 mainnet 真实 tx，pin 在 T4-fx1..T4-fx7）。
 
 | # | 测试项 | 验证方法 | 期望结果 |
 |---|---|---|---|
-| 1.1 | `eth_getBlockByNumber(b, false)` | leafage / writer 双侧调用，对比 `hash` / `stateRoot` / `transactionsRoot` / `receiptsRoot` 4 个 root byte-identical | 9 块 × 4 root = 36/36 |
-| 1.2 | `eth_getBlockByNumber(b, true)` | 对比 `transactions` 数组 sha256 | 9/9 byte-identical |
-| 1.3 | `eth_getTransactionReceipt(tx)` | 对每笔 tx 对比 `status` / `gasUsed` / `cumulativeGasUsed` / `contractAddress` / `logs` | 全 byte-identical |
+| 1.1 | `eth_getBlockByNumber(b, false)` | leafage / writer 双侧调用，对比 `hash` / `stateRoot` / `transactionsRoot` / `receiptsRoot` 4 个 root byte-identical | 15 块 × 4 root = 60/60（含 T4 sample + fixture blocks） |
+| 1.2 | `eth_getBlockByNumber(b, true)` | 对比 `transactions` 数组 sha256（含 T4-fx1..fx7 7 笔 fixture 所在块） | 15/15 byte-identical |
+| 1.3 | `eth_getTransactionReceipt(tx)` | 对每笔 tx 对比 `status` / `gasUsed` / `cumulativeGasUsed` / `contractAddress` / `logs`；T4-fx1..fx7 必须 byte-identical | 全 byte-identical |
 | 1.4 | `eth_call` 任意只读调用 | 见 §2/§3 各预编译详测 | byte-identical |
 | 1.5 | `eth_estimateGas` | AA tx 和 普通 tx | 见 §5 AA gas 详测 |
 | 1.6 | `eth_getCode(addr, b)` | 对所有 TIP-20 + 9 个已有预编译 + 2 个新预编译地址 | byte-identical |
@@ -223,15 +255,43 @@ T4 mainnet 激活：2026-05-18 14:00 UTC，timestamp `1779112800`。
 
 ## 6. Stablecoin DEX T4 paused (TIP-1046)
 
-需要 **T4 mainnet 激活后 (5/18)** 才能跑链上对照。
+T4 已于 **2026-05-18 14:00 UTC** 激活（block 20,636,964）。FU 之 stablecoin_dex
+T4 paused gate 在 internal balance 操作路径上调用
+`check_token_not_paused(token)`；该 token paused 状态来自 TIP-20 paused slot。
+
+**precompile 地址**：`STABLECOIN_DEX_ADDRESS = 0xdec0000000000000000000000000000000000000`
+
+### 6.1 调度层 smoke tests（不需要特定 paused token）
 
 | # | 测试项 | 测试块 | 期望 |
 |---|---|---|---|
-| 6.1 | post-T4 `placeOrder` non_escrow_token paused | T4-B | revert (ContractPaused)，leafage = writer |
-| 6.2 | post-T4 `placeFlipOrder` non_escrow paused | T4-B | revert，leafage = writer |
-| 6.3 | post-T4 `placeFlipOrder` internal_balance_only escrow paused | T4-B | revert，leafage = writer |
-| 6.4 | pre-T4 同样调用 paused token | C1/T3-A | 旧行为通过（不 revert），leafage = writer |
-| 6.5 | post-T4 non-paused token swap | T4-A | success，leafage = writer (state diff byte-identical) |
+| 6.s1 | `eth_getCode(0xdec0..., T4 block)` | T4-A | leafage = writer（precompile bytecode 0xef） |
+| 6.s2 | `eth_call(0xdec0..., data=0x00, T4 block)` | T4-A | leafage 与 writer 同样 revert (unknown_selector) |
+| 6.s3 | `eth_getStorageAt(0xdec0..., 0x0, T4 block)` | T4-A | 任意 slot，leafage = writer (storage layout consistency) |
+| 6.s4 | dispatch on **pre-T4** block 同 calldata | C3 (T3 last) | T3 行为：调用成功或同样 revert，leafage = writer（确认 T4 gate 触发点） |
+| 6.s5 | replay **T4-fx1** tx receipt + state diff | 20,636,964 | T4 首块 OrderFilled tx，leafage = writer (status / logs / gasUsed) |
+| 6.s6 | replay **T4-fx4** tx (`OrderPlaced`) | 20,641,039 | leafage = writer (selector `0x63813125`) |
+| 6.s7 | replay **T4-fx5** tx (`OrderCancelled`) | 20,641,109 | leafage = writer |
+
+### 6.2 paused token 触发路径（需要特定 paused token 地址）
+
+> **gap**: writer 在 T4 区间 (20,636,964..20,772,759, ~136k blocks) 的 stablecoin_dex
+> log 扫描中未发现任何 `<PAUSED_TOKEN>` 触发的 revert tx（1049 OrderFilled + 436
+> OrderPlaced + 428 OrderCancelled 全部成功）。说明 mainnet 上目前没有已 paused
+> 的 TIP-20 在 stablecoin_dex 内交易。本节路径需要 staging 构造或等 mainnet 实际触发。
+
+`<PAUSED_TOKEN>` 占位，业务侧提供或链上扫描（找一个 `tip20.paused() == true` 的 TIP-20）。
+各 placeOrder/placeFlipOrder 的 selector：
+- `placeOrder(...)`: `0x63813125`（已从 T4-fx4 反查 mainnet 验证）
+- `placeFlipOrder(...)`: TBD（需读 stablecoin_dex.rs 取最新 sol! 签名）
+
+| # | 测试项 | 测试块 | 期望 |
+|---|---|---|---|
+| 6.1 | post-T4 `placeOrder` `<PAUSED_TOKEN>` (non-escrow) | T4-B | revert (TokenPaused / ContractPaused)，leafage = writer |
+| 6.2 | post-T4 `placeFlipOrder` `<PAUSED_TOKEN>` (non-escrow) | T4-B | revert，leafage = writer |
+| 6.3 | post-T4 `placeFlipOrder` internal_balance_only escrow `<PAUSED_TOKEN>` | T4-B | revert，leafage = writer |
+| 6.4 | pre-T4 同样调用 `<PAUSED_TOKEN>` | C1/T3-A | 旧行为通过（不 revert），leafage = writer |
+| 6.5 | post-T4 non-paused `<PATH_USD>` (0x20C0...) swap | T4-A | success，leafage = writer (state diff byte-identical) |
 
 ---
 
@@ -304,6 +364,10 @@ cargo test 覆盖：
 | 11.4 | ~~spending limit 周期性 reset 未实现~~ | ✅ FU-3 / FU-4 / FU-6 全部完成 (commits `59a2e44` / `0ac5f8e` / `b850804`) |
 | 11.5 | `consensus_context` header 字段缺失 | 设计 non-goal，待 FU-7 业务方需求 |
 | 11.6 | TIP-1016 state gas 未实现 | mainnet flag 未启用 (FU-11) |
+| 11.7 | RPC error envelope 格式不同 | writer `{code:3, message:"execution reverted", data:"0x..."}` vs leafage `{code:-32603, message:"Reverted: \"…\""}` — 双侧 EVM 都 revert，仅 JSON-RPC 错误外壳差异。Diff 时需先 normalize (取 `.error.message ~ /reverted/i` 作 boolean) 再比对 |
+| 11.8 | `eth_getCode(signature_verifier/0x5165)` 返回不同 | writer `0xef`（pre-execution change 注入），leafage `0x`（未实现 T3 新 precompile bytecode 注入）。不影响 dispatch（走 chains 层，无需真 bytecode）。同样 gap：address_registry 在未被 __initialize 触发前也是 `0x`。需要单独 followup 扩展 `Vcv2CodeInjector` 到 T3+ precompile |
+| 11.9 | 不支持 `eth_getBlockReceipts` / `eth_getTransactionByHash` / `eth_getTransactionReceipt` / `eth_getLogs` | leafage 是 **state RPC node**，不是 archive。tx-history 类查询超出设计范围 |
+| 11.10 | `eth_getBlockByNumber` 缺少 writer 专有字段 | `mainBlockGeneralGasLimit` / `sharedGasLimit` / `size` / `timestampMillis` / `timestampMillisPart` / `withdrawals` — leafage block env 用 revm 标准结构未携带。byte-equivalence 比对只看 4 root + transactions 数组 |
 
 ---
 
@@ -345,14 +409,73 @@ ssh blockchain-misc-x1 'sudo docker compose -f /data/tempo-t4/docker-compose.yml
 
 | 大类 | 测试点 | 通过 | 失败 | 不适用 |
 |---|---|---|---|---|
-| 1. RPC 一致性 | TBD | TBD | TBD | - |
+| 1. RPC 一致性 | 4 roots × N blocks + getCode + getStorageAt | TBD | TBD | - |
 | 2. signature_verifier | 12+ | TBD | TBD | - |
 | 3. address_registry | 13+ | TBD | TBD | - |
 | 4. TIP-20 T3 | 10+ | TBD | TBD | - |
 | 5. AA gas | 10+ | TBD | TBD | 5.2 full (FU-2 ✅) |
-| 6. stablecoin_dex T4 | 5 | TBD | TBD | 5/18 后 |
-| 7. hardfork routing | 4 | TBD | TBD | - |
+| 6. stablecoin_dex T4 | 7 smoke + 5 paused | TBD | TBD | 6.s1-s7 fixture replay; 6.1-6.5 paused 路径需 staging 触发（mainnet 暂无 paused token） |
+| 7. hardfork routing | 4 + 边界(C3/T4-A) | TBD | TBD | - |
 | 8. CallScope | 7 | TBD | TBD | full byte-equivalence (FU-1 / FU-5 ✅) |
-| 9. consistency-checker | 4 | TBD | TBD | T4 项待 5/18 后 |
+| 9. consistency-checker | 4 | TBD | TBD | x1 上 checker 当前 stuck，需独立修复 |
 | 10. 性能 / 长跑 | 4 | TBD | TBD | - |
-| **合计** | **75+** | **TBD** | **TBD** | **TBD** |
+| 14. T4 专项 | 见 §14 (14.1×3 + 14.3×7 + 14.4×5 + 14.5×3) | TBD | TBD | T4 已激活 (2026-05-18 14:00 UTC)，含 T4-fx1..fx7 mainnet fixture replay |
+| **合计** | **95+** | **TBD** | **TBD** | **TBD** |
+
+---
+
+## 14. T4 专项测试（T4 激活后必跑）
+
+T4 mainnet 激活 **2026-05-18 14:00 UTC** (block **20,636,964**)。FU 之 T4 改动包括：
+- `stablecoin_dex` internal balance 路径 `check_token_not_paused` gate（已在 §6）
+- `key_auth_gas` T4 分支：`BASE_SCOPE_GAS` + scope-driven extra gas（已在 §5.1.6 / §5.2）
+- `validate_call_scopes` T4 stateless `target.is_tip20()` 分支（已在 §8.6）
+- `is_t4()` hardfork 路由（已在 §7.3）
+
+### 14.1 T4 hardfork 边界正确性
+
+| # | 测试项 | 验证 |
+|---|---|---|
+| 14.1.1 | block 20,636,963 (C3, last T3): leafage 用 T3 公式 | `eth_estimateGas` AA tx no scopes leafage = writer T3 行为 |
+| 14.1.2 | block 20,636,964 (T4-A, first T4): leafage 用 T4 公式，对照 **T4-fx1** | `eth_estimateGas` AA tx no scopes leafage = writer T4 行为（+BASE_SCOPE_GAS） |
+| 14.1.3 | 4 个 T4 sample blocks state root + replay **T4-fx1** (块 20636964) | hash / stateRoot / transactionsRoot / receiptsRoot 全 match |
+
+### 14.2 T4 stablecoin_dex 行为对照
+
+见 §6（已展开 7 smoke + 5 paused 详细项）。smoke tests 不需要 paused token 即可跑，
+对照 **T4-fx1 / T4-fx4 / T4-fx5** 三笔真实 mainnet tx 跑 receipt + state diff。
+
+### 14.3 T4 AA gas 公式（key_auth_gas + scope_counts）
+
+下表 14.3.1 / 14.3.5 / 14.3.6 用 **mainnet 真实 fixture** 跑（无需自构造 calldata）；
+14.3.2 / 14.3.3 / 14.3.4 仍需自构造（mainnet 暂无对应 pattern）。
+
+| # | 测试构造 | 测试 fixture | 期望 |
+|---|---|---|---|
+| 14.3.1 | AA tx with `keyAuthorization=null`（已 authorized key 复用） | **T4-fx2** (block 20,637,200) | leafage = writer; 走 stored key 路径，key_auth_gas=0 |
+| 14.3.2 | AA tx with `allowedCalls=[]` (Some(vec![]), deny-all) | 自构造 on T4-A | leafage = writer; has_allowed_calls=true, scope_slots=1, BASE_SCOPE_GAS=5000 |
+| 14.3.3 | AA tx with 1 scope + 1 selector + 1 recipient | 自构造 on T4-C | leafage = writer; 含 TARGET (7k) + SELECTOR (7k) + RECIPIENT (5k) extra |
+| 14.3.4 | AA tx with 3 scopes + multiple selectors/recipients | 自构造 on T4-D | leafage = writer; aggregate counts 正确派生 |
+| 14.3.5 | AA tx with `keyAuthorization` 含 limit (period=0, 非周期) | **T4-fx3** (block 20,637,236) | leafage = writer; FU-3 SpendingLimitState `period=0` 路径 |
+| 14.3.6 | AA tx with **periodic limit (period=86400) + 1 scope/2 selectors** | **T4-fx6** (block 20,675,920) | leafage = writer; **FU-2/3/6 全集**；key_auth_gas T4 含 BASE(5k) + TARGET(7k) + SELECTOR(7k×2) = 26k extra |
+| 14.3.7 | AA tx KeyRevoked | **T4-fx7** (block 20,700,761) | leafage = writer; revoke 后 key 不可复用 |
+
+实际跑法：通过 `debug_replayTransaction` / `eth_getTransactionReceipt` 同时向 writer / leafage 发送相同 hash，对比 result（fixture 路径）；或通过 `eth_estimateGas` 自构造 calldata（14.3.2-4 路径）。FU-2 完成后 `derive_scope_counts` 已 wire，所以 leafage 不再低估。
+
+### 14.4 T4 `validate_call_scopes` stateless（FU-5）
+
+| # | 测试构造 | 测试块 / fixture | 期望 |
+|---|---|---|---|
+| 14.4.1 | `setAllowedCalls` target = TIP-20 prefix 地址 (e.g. 0x20C0…0042) **未部署** | T3-A | revert (InvalidCallScope) on both — stateful TIP20Factory 拒绝 |
+| 14.4.2 | 同 14.4.1 但在 T4-A | T4-A | success on both — stateless 仅 prefix 检查 |
+| 14.4.3 | `setAllowedCalls` target = 非 TIP-20 prefix (e.g. EOA) | T4-A | revert (InvalidCallScope) on both — 即使 stateless 也拒绝错前缀 |
+| 14.4.4 | `setAllowedCalls` target = 已部署 TIP-20 (e.g. 0x20C0…0000 PATH USD) | T3-A 和 T4-A | success on both |
+| 14.4.5 | replay **T4-fx6** keyAuthorization 中的 `allowedCalls[0].target = 0x20c0...b950` | block 20,675,920 | leafage = writer; FU-5 stateless 路径在 mainnet tx 上字节正确 |
+
+### 14.5 T4 follow-up checklist（FU-11 等）
+
+| # | 检查项 | 触发条件 |
+|---|---|---|
+| 14.5.1 | TIP-1016 state gas | writer `enable_amsterdam_eip8037` flag flip → FU-11 立刻补 |
+| 14.5.2 | T4 storage_slots 公式 vs T3 | call_scope_storage_slots cargo test 已覆盖；live RPC 通过 14.3.x 验证 |
+| 14.5.3 | TIP20 paused 字段 read-equivalence at T4 | 对几个已知 TIP-20 跑 `eth_call paused()` writer vs leafage |

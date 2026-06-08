@@ -901,35 +901,44 @@ impl AccountKeychain {
 
         let limit_key = Self::spending_limit_key(account, key_id);
 
+        if !self.storage.spec().is_t3() {
+            let remaining = self.spending_limits[limit_key][token].remaining.read()?;
+            if amount > remaining {
+                return Err(err_spending_limit_exceeded());
+            }
+            return self.spending_limits[limit_key][token]
+                .remaining
+                .write(remaining - amount);
+        }
+
         // T3+ periodic reset: if the active window has rolled over, refill
         // `remaining` to `max` and advance `period_end` by full period(s)
-        // before applying the spend. Mirrors writer L1157-1162 +
-        // SpendingLimitState::compute_next_period_end L151-160.
-        let remaining = if self.storage.spec().is_t3() {
-            let handler = &self.spending_limits[limit_key][token];
-            let mut state = handler.read()?;
-            let now: u64 = self.storage.timestamp().to::<u64>();
-            if state.period > 0 && now >= state.period_end {
-                state.period_end = state.compute_next_period_end(now);
-                state.remaining = U256::from(state.max);
-                // Persist the rolled-over window before the spend so the
-                // updated `period_end` is observable to subsequent calls
-                // (matches writer write-back ordering).
-                let handler_mut = &mut self.spending_limits[limit_key][token];
-                handler_mut.write(state.clone())?;
-            }
-            state.remaining
-        } else {
-            self.spending_limits[limit_key][token].remaining.read()?
-        };
+        // before applying the spend. Mirrors writer L1117-1180 +
+        // SpendingLimitState::compute_next_period_end L151-160. Both the
+        // rolled-over window and the deducted `remaining` are committed in a
+        // single SSTORE per slot (matches writer L1171-1173).
+        let mut state = self.spending_limits[limit_key][token].read()?;
+        let now: u64 = self.storage.timestamp().to::<u64>();
+        let is_periodic = state.period != 0;
 
-        if amount > remaining {
+        if is_periodic && now >= state.period_end {
+            state.period_end = state.compute_next_period_end(now);
+            state.remaining = U256::from(state.max);
+        }
+
+        if amount > state.remaining {
             return Err(err_spending_limit_exceeded());
         }
 
-        self.spending_limits[limit_key][token]
-            .remaining
-            .write(remaining - amount)
+        let new_remaining = state.remaining - amount;
+        if is_periodic {
+            state.remaining = new_remaining;
+            self.spending_limits[limit_key][token].write(state)
+        } else {
+            self.spending_limits[limit_key][token]
+                .remaining
+                .write(new_remaining)
+        }
     }
 
     /// Refund spending limit after a fee refund.
@@ -962,14 +971,18 @@ impl AccountKeychain {
         let limit_key = Self::spending_limit_key(account, transaction_key);
         // T3+ clamps `remaining + amount` to the configured `max` so refunds
         // can't overflow the spending budget. Pre-T3 keeps the saturating-add
-        // semantic. Mirrors writer L350-380.
+        // semantic. Mirrors writer L1199-1250: legacy pre-T3 rows persisted only
+        // `remaining`, so they deserialize with `max == 0`; for those we must
+        // skip the clamp (otherwise `.min(0)` would zero out `remaining`).
         let new_remaining = if self.storage.spec().is_t3() {
             let handler = &self.spending_limits[limit_key][token];
             let state = handler.read()?;
-            state
-                .remaining
-                .saturating_add(amount)
-                .min(U256::from(state.max))
+            let refunded = state.remaining.saturating_add(amount);
+            if state.max == 0 {
+                refunded
+            } else {
+                refunded.min(U256::from(state.max))
+            }
         } else {
             let remaining = self.spending_limits[limit_key][token].remaining.read()?;
             remaining.saturating_add(amount)

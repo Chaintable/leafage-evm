@@ -1268,6 +1268,101 @@ mod tests {
     }
 
     #[test]
+    fn key_authorization_trailing_only_limits_byte_fixture() {
+        // (expiry=None, limits=Some([]), allowed_calls=None): limits is the
+        // last `Some`, so expiry positions as 0x80 and allowed_calls is
+        // truncated entirely.
+        let auth = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: Some(Vec::new()),
+            allowed_calls: None,
+        };
+        let mut buf = Vec::new();
+        auth.encode(&mut buf);
+
+        // body = 1 (chain_id) + 1 (key_type) + 21 (key_id) + 1 (expiry placeholder)
+        //      + 1 (limits empty list 0xc0)
+        //      = 25 bytes → list header = 0xc0 + 25 = 0xd9
+        let expected: Vec<u8> = vec![
+            0xd9, // list header
+            0x01, // chain_id
+            0x80, // key_type
+            0x94, // address header
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x80, // expiry = None positional placeholder
+            0xc0, // limits = Some([])
+                  // allowed_calls truncated (no bytes)
+        ];
+        assert_eq!(buf, expected, "(None, Some([]), None) trailing-canonical layout");
+    }
+
+    #[test]
+    fn key_authorization_trailing_only_allowed_calls_byte_fixture() {
+        // (expiry=None, limits=None, allowed_calls=Some([])): both expiry and
+        // limits become 0x80 positional placeholders before the deny-all 0xc0.
+        let auth = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: Some(Vec::new()),
+        };
+        let mut buf = Vec::new();
+        auth.encode(&mut buf);
+
+        // body = 1 + 1 + 21 + 1 (expiry) + 1 (limits) + 1 (0xc0) = 26 → header 0xda
+        let expected: Vec<u8> = vec![
+            0xda, // list header
+            0x01, 0x80, 0x94,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x80, // expiry None positional
+            0x80, // limits None positional
+            0xc0, // allowed_calls = Some([])
+        ];
+        assert_eq!(buf, expected, "(None, None, Some([])) trailing-canonical layout");
+    }
+
+    #[test]
+    fn key_authorization_deny_all_rlp_byte_fixture() {
+        // Pins the exact wire bytes for the deny-all envelope so the manual
+        // RLP impl can't drift away from writer's `#[derive(Encodable)]`
+        // output. Fields and trailing-canonical positioning must match
+        // writer `crates/primitives/src/transaction/key_authorization.rs`
+        // (`#[rlp(trailing(canonical))]`).
+        let deny_all = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1, // discriminant 0 → RLP 0x80
+            key_id: Address::ZERO,              // 0x94 + 20×0x00
+            expiry: Some(1000),                 // 0x82 0x03 0xe8
+            limits: None,                       // positional placeholder 0x80
+            allowed_calls: Some(Vec::new()),    // empty list 0xc0
+        };
+        let mut buf = Vec::new();
+        deny_all.encode(&mut buf);
+
+        // body = 1 (chain_id) + 1 (key_type) + 21 (key_id) + 3 (expiry) + 1 (limits 0x80) + 1 (0xc0)
+        //      = 28 bytes → list header = 0xc0 + 28 = 0xdc
+        let expected: Vec<u8> = vec![
+            0xdc, // list header (list, payload=28)
+            0x01, // chain_id = 1
+            0x80, // key_type = Secp256k1 (0u8 → empty string)
+            0x94, // address header (string, len 20)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x82, 0x03, 0xe8, // expiry = 1000
+            0x80,             // limits = None positional placeholder
+            0xc0,             // allowed_calls = empty list
+        ];
+        assert_eq!(buf, expected, "deny-all envelope RLP bytes must match the writer canonical form");
+    }
+
+    #[test]
     fn signed_key_authorization_includes_allowed_calls_positionally() {
         // signature is always trailing → both `limits` (None) and
         // `allowed_calls` (Some(vec![])) must take slots before signature.
