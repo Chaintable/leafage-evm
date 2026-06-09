@@ -30,6 +30,33 @@ pub struct KafkaS3Config {
     pub version: String,
 }
 
+/// Parse an `eth_getBlockBy*` JSON response into [`BlockInfo`].
+///
+/// alloy 的 `Block` 把 header 字段 `#[serde(flatten)]` 到顶层，而
+/// `alloy_consensus::Header::mix_hash`（即 `mixHash`）是必填字段（没有
+/// `#[serde(default)]`，也没有 `prevRandao` 别名）。部分链的 RPC 不返回
+/// `mixHash`，会导致 "missing field `mixHash`" 的反序列化错误。
+///
+/// 合并后 `mixHash` 实际承载的是 prevRandao：`block_env_from_block` 在
+/// difficulty 为 0 时会读取 `header.mix_hash` 作为 prevrandao。因此当
+/// `mixHash` 缺失时，优先复用 RPC 返回的 `prevRandao`（避免丢失真实随机值），
+/// 否则才退回零哈希（与 alloy `Header::default()` 一致，对 difficulty 非 0 的
+/// 链无影响）。
+fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
+    if let Some(obj) = block.as_object_mut() {
+        if !obj.contains_key("mixHash") {
+            let mix_hash = obj
+                .get("prevRandao")
+                .cloned()
+                .unwrap_or_else(|| {
+                    serde_json::to_value(H256::ZERO).expect("zero hash serializes")
+                });
+            obj.insert("mixHash".to_string(), mix_hash);
+        }
+    }
+    serde_json::from_value(block).context("rpc get block by hash parse failed")
+}
+
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,
@@ -136,8 +163,7 @@ pub async fn s3_get_block_transactions_by_number(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: BlockInfo = serde_json::from_value(block.unwrap())
-                .context("rpc get block by hash parse failed")?;
+            let block: BlockInfo = parse_block_info(block.unwrap())?;
             s3_get_block_transactions(
                 s3_client,
                 outer_bucket_name,
@@ -257,8 +283,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: BlockInfo = serde_json::from_value(block.unwrap())
-                .context("rpc get block by hash parse failed")?;
+            let block: BlockInfo = parse_block_info(block.unwrap())?;
             block
         }
         None => {
@@ -330,8 +355,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: BlockInfo = serde_json::from_value(block.unwrap())
-                .context("rpc get block by hash parse failed")?;
+            let block: BlockInfo = parse_block_info(block.unwrap())?;
             block
         }
         None => {
