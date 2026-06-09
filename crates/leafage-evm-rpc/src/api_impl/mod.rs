@@ -31,6 +31,7 @@ mod mantle;
 mod warmup;
 mod cosmos;
 mod iotex;
+mod moonbeam;
 mod tempo;
 
 pub(crate) mod token_collector;
