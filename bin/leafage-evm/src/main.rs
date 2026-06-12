@@ -4,6 +4,7 @@ mod compact;
 mod db_migrate;
 mod initializer;
 mod register;
+mod rewind;
 mod runner;
 mod standalone;
 mod updater;

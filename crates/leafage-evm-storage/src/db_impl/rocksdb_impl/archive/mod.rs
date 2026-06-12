@@ -1902,3 +1902,115 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+    use crate::db::StateDBWrapper;
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+
+    fn make_block_info_at(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
+        let mut raw = RawHeader::default();
+        raw.number = number;
+        raw.parent_hash = parent_hash;
+        BlockInfo::new(Block {
+            header: Header {
+                hash,
+                inner: raw,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStorageDiff {
+        BlockStorageDiff {
+            new_accounts: vec![NewAccount {
+                address: addr,
+                balance: U256::from(balance),
+                nonce,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            }],
+            storage_diffs: vec![AccountStorageDiff {
+                address: addr,
+                diffs: vec![IndexValuePair {
+                    index: slot,
+                    value: U256::from(value),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Archive-mode counterpart of the snapshot rewind invariant test: an
+    /// empty-diff `update_block` must move the committed-head pointer
+    /// without touching the height-versioned state, reads pinned at the
+    /// rewound head must see that height's values (not the newer ones),
+    /// and replaying the skipped diff must converge back to the old head.
+    #[test]
+    fn test_empty_diff_update_block_rewinds_head_pointer_archive() {
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-rewind-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let latest = |db: &Arc<DataBaseRef>| {
+                StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+
+            let addr = H256::repeat_byte(0xaa);
+            let slot = H256::repeat_byte(0x01);
+
+            let block1 = make_block_info_at(1, H256::repeat_byte(0x11), H256::ZERO);
+            latest(&db)
+                .update_block(block1.clone(), make_diff(addr, slot, 100, 1, 7))
+                .unwrap();
+            let block2 = make_block_info_at(2, H256::repeat_byte(0x22), block1.header.hash);
+            let diff2 = make_diff(addr, slot, 200, 2, 9);
+            latest(&db).update_block(block2.clone(), diff2.clone()).unwrap();
+
+            // Rewind the head pointer to block 1 with an empty diff.
+            latest(&db)
+                .update_block(block1.clone(), BlockStorageDiff::default())
+                .unwrap();
+            let state = latest(&db);
+            let head = state.last_committed_block().unwrap().unwrap();
+            assert_eq!(head.header.number, 1);
+            assert_eq!(head.header.hash, block1.header.hash);
+
+            // A handle pinned at the rewound head sees block-1 values...
+            let account = state.0.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(100));
+            assert_eq!(account.nonce, 1);
+            assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(7));
+
+            // ...while the block-2 versions remain queryable as history.
+            let state_at_2 = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(2)))
+                    .unwrap()
+                    .unwrap(),
+            );
+            let account = state_at_2.0.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(state_at_2.0.read_storage(addr, slot).unwrap(), U256::from(9));
+
+            // Replaying block 2's diff converges back to the old head.
+            latest(&db).update_block(block2.clone(), diff2).unwrap();
+            let state = latest(&db);
+            let head = state.last_committed_block().unwrap().unwrap();
+            assert_eq!(head.header.number, 2);
+            assert_eq!(head.header.hash, block2.header.hash);
+            let account = state.0.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

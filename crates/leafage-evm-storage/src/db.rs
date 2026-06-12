@@ -6,6 +6,7 @@ use leafage_evm_types::{
     AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
 use std::fmt::Debug;
+use tracing::{debug, trace};
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockIterator: Send + Sync + 'static {
@@ -184,20 +185,42 @@ where
         let start = std::time::Instant::now();
         let mut batch = self.0.prepare_write_batch()?;
         let block_number = block_info.header.number;
+        // Correlate with the fetch-side logs in s3_get_block_diff via the
+        // state root. Enable with RUST_LOG=state_diff=debug (or =trace for
+        // per-account / per-slot detail).
+        debug!(target: "state_diff",
+            "commit block {} ({}): root {}, new_accounts {}, deleted_accounts {}, storage_accounts {}, storage_slots {}, new_codes {}",
+            block_number,
+            block_info.header.hash,
+            block_info.header.state_root,
+            block_diff.new_accounts.len(),
+            block_diff.deleted_accounts.len(),
+            block_diff.storage_diffs.len(),
+            block_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum::<usize>(),
+            block_diff.new_codes.len(),
+        );
         self.0
             .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
         let hash = block_info.header.hash;
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
+            trace!(target: "state_diff",
+                "commit delete account: block {}, address {}", block_number, account);
             self.0
                 .write_account(&mut batch, account, block_number, None)?;
         }
         for account in block_diff.new_accounts {
+            trace!(target: "state_diff",
+                "commit account: block {}, address {}, balance {}, nonce {}, code_hash {}",
+                block_number, account.address, account.balance, account.nonce, account.code_hash);
             self.0
                 .write_account(&mut batch, account.address, block_number, Some(account))?;
         }
         for account_diff in block_diff.storage_diffs {
             for index_value_pair in account_diff.diffs {
+                trace!(target: "state_diff",
+                    "commit storage: block {}, address {}, index {}, value {}",
+                    block_number, account_diff.address, index_value_pair.index, index_value_pair.value);
                 self.0.write_storage(
                     &mut batch,
                     account_diff.address,
@@ -208,6 +231,9 @@ where
             }
         }
         for new_code in block_diff.new_codes {
+            trace!(target: "state_diff",
+                "commit code: block {}, code_hash {}, len {}",
+                block_number, new_code.code_hash, new_code.code.len());
             self.0
                 .write_code(&mut batch, new_code.code_hash, new_code.code)?;
         }

@@ -3,7 +3,7 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
+use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -319,17 +319,6 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     } else {
         bail!("invalid chain cfg: {}", arg);
     }
-}
-
-fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
-    let kafka_s3_config: KafkaS3Config;
-    if arg.starts_with("/") {
-        let file = std::fs::File::open(arg)?;
-        kafka_s3_config = serde_json::from_reader(file)?;
-    } else {
-        kafka_s3_config = serde_json::from_str(arg)?;
-    }
-    Ok(kafka_s3_config)
 }
 
 fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
