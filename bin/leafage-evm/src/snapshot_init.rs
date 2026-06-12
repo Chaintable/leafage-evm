@@ -28,7 +28,16 @@ const OUTER_RETRY_MAX_DELAY_MS: u64 = 16_000;
 pub(crate) struct SnapshotConfig {
     /// 公开桶域名(base URL),形如 https://snapshots.chaintable.<TLD>。
     /// 公网无鉴权 GET,不再需要 endpoint / bucket / region / ak / sk。
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
+    pub gateway_base_url: String,
+    #[serde(default)]
+    pub chain_id: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub is_archive: bool,
     pub namespace: String,
     pub component: String,
 
@@ -52,6 +61,8 @@ struct ArchiveEntry {
     sha256: String,
     #[serde(default)]
     file_count: i64,
+    #[serde(default)]
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,8 +99,16 @@ struct Initializer {
 
 impl Initializer {
     fn new(cfg: SnapshotConfig, db_path: PathBuf) -> Result<Self> {
-        if cfg.base_url.is_empty() {
-            anyhow::bail!("snapshot_config.base_url is required");
+        if cfg.base_url.is_empty() && cfg.gateway_base_url.is_empty() {
+            anyhow::bail!("snapshot_config.base_url or snapshot_config.gateway_base_url is required");
+        }
+        if !cfg.gateway_base_url.is_empty() {
+            if cfg.chain_id.is_empty() {
+                anyhow::bail!("snapshot_config.chain_id is required when gateway_base_url is set");
+            }
+            if cfg.version.is_empty() {
+                anyhow::bail!("snapshot_config.version is required when gateway_base_url is set");
+            }
         }
         if cfg.namespace.is_empty() {
             anyhow::bail!("snapshot_config.namespace is required");
@@ -133,15 +152,28 @@ impl Initializer {
         let chain_prefix = format!("{}/{}", self.cfg.namespace, self.cfg.component);
         let latest_key = format!("{}/latest.json", chain_prefix);
 
-        info!(
-            target: "snapshot_init",
-            "fetching latest manifest url={}",
-            self.object_url(&latest_key),
-        );
-        let manifest = self
-            .fetch_latest_with_retry(&latest_key)
-            .await
-            .context("fetch latest.json")?;
+        let manifest = if self.cfg.gateway_base_url.is_empty() {
+            info!(
+                target: "snapshot_init",
+                "fetching latest manifest url={}",
+                self.object_url(&latest_key),
+            );
+            self.fetch_latest_with_retry(&latest_key)
+                .await
+                .context("fetch latest.json")?
+        } else {
+            info!(
+                target: "snapshot_init",
+                "fetching latest manifest from gateway base={} chain_id={} version={} is_archive={}",
+                self.cfg.gateway_base_url,
+                self.cfg.chain_id,
+                self.cfg.version,
+                self.cfg.is_archive,
+            );
+            self.fetch_gateway_manifest_with_retry()
+                .await
+                .context("fetch gateway snapshot manifest")?
+        };
         info!(
             target: "snapshot_init",
             "manifest schema_version={} snap_id={} file_count={} total_size_bytes={} created_at={}",
@@ -306,16 +338,17 @@ impl Initializer {
         compressed: bool,
     ) -> Result<()> {
         let key = format!("{}{}", archives_prefix, entry.name);
+        let url = entry.url.clone();
         info!(
             target: "snapshot_init",
-            "archive start index={} name={} size_bytes={} files={}",
-            idx, entry.name, entry.size_bytes, entry.file_count,
+            "archive start index={} name={} size_bytes={} files={} url_present={}",
+            idx, entry.name, entry.size_bytes, entry.file_count, !url.is_empty(),
         );
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
         for attempt in 1..=self.outer_retry_attempts {
-            match self.try_extract_one_archive(&key, compressed).await {
+            match self.try_extract_one_archive(&key, if url.is_empty() { None } else { Some(url.as_str()) }, compressed).await {
                 Ok(()) => {
                     info!(
                         target: "snapshot_init",
@@ -348,8 +381,15 @@ impl Initializer {
 
     /// 单次尝试:完整跑一遍流式管道(GET → StreamReader → SyncIoBridge → tar::Archive::unpack)。
     /// 中途任何错(GET 失败 / 非 2xx / tar 解析 / 写盘)直接抛出,由外层 wrapper 决定是否重试。
-    async fn try_extract_one_archive(&self, key: &str, compressed: bool) -> Result<()> {
-        let url = self.object_url(key);
+    async fn try_extract_one_archive(
+        &self,
+        key: &str,
+        archive_url: Option<&str>,
+        compressed: bool,
+    ) -> Result<()> {
+        let url = archive_url
+            .map(str::to_string)
+            .unwrap_or_else(|| self.object_url(key));
         let resp = self
             .http
             .get(&url)
@@ -417,6 +457,51 @@ impl Initializer {
             .await
             .with_context(|| format!("read body {}", url))?;
         Ok(bytes.to_vec())
+    }
+
+    async fn fetch_gateway_manifest_with_retry(&self) -> Result<R2Manifest> {
+        let mut delay_ms = LATEST_RETRY_INITIAL_DELAY_MS;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=LATEST_RETRY_MAX_ATTEMPTS {
+            match self.fetch_gateway_manifest().await {
+                Ok(manifest) => return Ok(manifest),
+                Err(err) => {
+                    warn!(
+                        target: "snapshot_init",
+                        "gateway snapshot manifest attempt {}/{} failed: {:#}",
+                        attempt, LATEST_RETRY_MAX_ATTEMPTS, err,
+                    );
+                    last_err = Some(err);
+                    if attempt < LATEST_RETRY_MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = (delay_ms.saturating_mul(2)).min(LATEST_RETRY_MAX_DELAY_MS);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("unknown error")))
+            .context("gateway snapshot manifest not available after retries")
+    }
+
+    async fn fetch_gateway_manifest(&self) -> Result<R2Manifest> {
+        let base = self.cfg.gateway_base_url.trim_end_matches('/');
+        let url = format!(
+            "{}/v1/snapshot?chain_id={}&version={}&is_archive={}",
+            base, self.cfg.chain_id, self.cfg.version, self.cfg.is_archive
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("get {}", url))?
+            .error_for_status()
+            .with_context(|| format!("get {} returned error status", url))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("read body {}", url))?;
+        serde_json::from_slice(&bytes).context("parse gateway snapshot manifest")
     }
 }
 

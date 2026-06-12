@@ -42,6 +42,18 @@ struct LeafageHelloRequest {
     resume_cursor: LeafageResumeCursor,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct OfficialHelloRequest {
+    r#type: String,
+    protocol_version: String,
+    chain_id: String,
+    client_type: String,
+    gateway_id: String,
+    api_key: String,
+    resume_cursor: LeafageResumeCursor,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 struct LeafageResumeCursor {
@@ -55,10 +67,14 @@ struct LeafageResumeCursor {
 #[serde(rename_all = "snake_case")]
 struct LeafageHelloAck {
     r#type: String,
+    #[serde(default)]
     protocol_version: String,
+    #[serde(default)]
+    accepted_protocol_version: String,
     chain_id: String,
     current_data_version: String,
     latest_height: u64,
+    #[serde(default)]
     next_action: String,
 }
 
@@ -66,6 +82,13 @@ struct LeafageHelloAck {
 #[serde(rename_all = "snake_case")]
 struct LeafageManifestEntry {
     block_number: u64,
+    block_hash: String,
+    state_root: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CanonicalIndexEntry {
     block_hash: String,
     state_root: String,
 }
@@ -270,6 +293,126 @@ where
             .unwrap_or(8)
     }
 
+    fn ws_protocol(&self) -> &str {
+        self.gateway_object_cfg
+            .as_ref()
+            .map(|cfg| cfg.ws_protocol.as_str())
+            .filter(|protocol| *protocol == "official")
+            .unwrap_or("leafage")
+    }
+
+    fn is_official_ws(&self) -> bool {
+        self.ws_protocol() == "official"
+    }
+
+    fn gateway_object_fetch_mode(cfg: &GatewayObjectConfig) -> &str {
+        match cfg.object_fetch_mode.as_str() {
+            "url" | "s3" | "auto" => cfg.object_fetch_mode.as_str(),
+            _ => "auto",
+        }
+    }
+
+    fn gateway_snapshot_url(&self) -> Option<String> {
+        let cfg = self.gateway_object_cfg.as_ref()?;
+        let base = cfg.base_url.trim_end_matches('/');
+        Some(format!(
+            "{}/v1/snapshot?chain_id={}&version={}&is_archive={}",
+            base, cfg.chain_id, cfg.version, cfg.snapshot_is_archive
+        ))
+    }
+
+    fn r2_object_url(cfg: &GatewayObjectConfig, bucket: &str, key: &str) -> Result<String> {
+        let base = cfg.r2_public_base_url.trim_end_matches('/');
+        if base.is_empty() {
+            return Err(anyhow::anyhow!("r2_public_base_url is not configured"));
+        }
+        let escaped_key = key
+            .split('/')
+            .map(|part| part.replace('%', "%25").replace(' ', "%20").replace('#', "%23").replace('?', "%3F"))
+            .collect::<Vec<_>>()
+            .join("/");
+        Ok(format!("{}/{}/{}", base, bucket, escaped_key))
+    }
+
+    async fn r2_get_object_by_url(cfg: &GatewayObjectConfig, bucket: &str, key: &str) -> Result<Vec<u8>> {
+        let url = Self::r2_object_url(cfg, bucket, key)?;
+        let resp = reqwest::get(&url)
+            .await
+            .context(format!("r2 url fetch failed: {}", url))?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("r2 url fetch failed status {} for {}", resp.status(), url));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    async fn r2_get_object_by_s3(s3_client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
+        let s3_obj = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .context(format!("{bucket}: {key}"))?;
+        Ok(s3_obj.body.collect().await?.into_bytes().to_vec())
+    }
+
+    async fn r2_get_object(cfg: &GatewayObjectConfig, s3_client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
+        match Self::gateway_object_fetch_mode(cfg) {
+            "url" => Self::r2_get_object_by_url(cfg, bucket, key).await,
+            "s3" => Self::r2_get_object_by_s3(s3_client, bucket, key).await,
+            _ => {
+                if !cfg.r2_public_base_url.is_empty() {
+                    if let Ok(bytes) = Self::r2_get_object_by_url(cfg, bucket, key).await {
+                        return Ok(bytes);
+                    }
+                }
+                Self::r2_get_object_by_s3(s3_client, bucket, key).await
+            }
+        }
+    }
+
+    async fn r2_get_block_info_direct(cfg: &GatewayObjectConfig, s3_client: &Client, block_hash: H256) -> Result<BlockInfo> {
+        let key = if cfg.version.is_empty() {
+            format!("{}/{}/block", cfg.chain_id, block_hash)
+        } else {
+            format!("{}/{}/{}/block", cfg.chain_id, cfg.version, block_hash)
+        };
+        let bytes = Self::r2_get_object(cfg, s3_client, &cfg.r2_inner_bucket, &key).await?;
+        let mut gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut decoded = Vec::new();
+        use std::io::Read;
+        gz.read_to_end(&mut decoded)?;
+        Ok(serde_json::from_slice(&decoded)?)
+    }
+
+    async fn r2_get_block_diff_direct(cfg: &GatewayObjectConfig, s3_client: &Client, state_root: H256) -> Result<BlockStorageDiff> {
+        let key = if cfg.version.is_empty() {
+            format!("{}/{}/stateDiff", cfg.chain_id, state_root)
+        } else {
+            format!("{}/{}/{}/stateDiff", cfg.chain_id, cfg.version, state_root)
+        };
+        let bytes = Self::r2_get_object(cfg, s3_client, &cfg.r2_inner_bucket, &key).await?;
+        Ok(BlockStorageDiff::decode(&mut bytes.as_ref())?)
+    }
+
+    async fn r2_get_canonical_index_direct(
+        cfg: &GatewayObjectConfig,
+        s3_client: &Client,
+        block_number: u64,
+    ) -> Result<CanonicalIndexEntry> {
+        let key = if cfg.version.is_empty() {
+            format!("{}/index/block/{}.json", cfg.chain_id, block_number)
+        } else {
+            format!("{}/{}/index/block/{}.json", cfg.chain_id, cfg.version, block_number)
+        };
+        let bytes = Self::r2_get_object(cfg, s3_client, &cfg.r2_outer_bucket, &key).await?;
+        let mut gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut decoded = Vec::new();
+        use std::io::Read;
+        gz.read_to_end(&mut decoded)?;
+        Ok(serde_json::from_slice(&decoded)?)
+    }
+
     fn build_hello_request(&self) -> Result<LeafageHelloRequest> {
         let (last_seq, last_block_number, last_block_hash) = match self.tree.last_committed_block()? {
             Some(block) => (0, block.header.number, format!("{:?}", block.header.hash)),
@@ -289,6 +432,26 @@ where
         })
     }
 
+    fn build_official_hello_request(&self) -> Result<OfficialHelloRequest> {
+        let leafage_hello = self.build_hello_request()?;
+        let cfg = self
+            .gateway_object_cfg
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("official ws requires gateway object config"))?;
+        if cfg.api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!("official ws requires gateway object api_key"));
+        }
+        Ok(OfficialHelloRequest {
+            r#type: "hello".to_string(),
+            protocol_version: "v1".to_string(),
+            chain_id: leafage_hello.chain_id,
+            client_type: "leafage-evm".to_string(),
+            gateway_id: leafage_hello.node_id,
+            api_key: cfg.api_key.clone(),
+            resume_cursor: leafage_hello.resume_cursor,
+        })
+    }
+
     async fn handle_control_message(&self, msg: &Message) -> Result<ControlAction> {
         match msg {
             Message::Text(text) => {
@@ -302,12 +465,25 @@ where
                         gauge!("pipeline_leafage_gateway_latest_height").set(ack.latest_height as f64);
                         record_next_action(&ack.next_action, "hello_ack");
                         info!(target:"updater", "leafage ws hello_ack chain={} version={} latest_height={} next_action={}", ack.chain_id, ack.current_data_version, ack.latest_height, ack.next_action);
+                        if self.is_official_ws() {
+                            let last_block_number = self.tree.last_committed_block()?
+                                .map(|block| block.header.number)
+                                .unwrap_or(0);
+                            if ack.latest_height > last_block_number {
+                                return Ok(ControlAction::Catchup {
+                                    from_block: last_block_number.saturating_add(1),
+                                    to_block: ack.latest_height,
+                                    manifest: Vec::new(),
+                                });
+                            }
+                            return Ok(ControlAction::Continue);
+                        }
                         match ack.next_action.as_str() {
                             "replay" => Ok(ControlAction::Continue),
                             "catchup" => Ok(ControlAction::Continue),
                             "wait" => Ok(ControlAction::Continue),
                             "snapshot" => Ok(ControlAction::SnapshotRequired {
-                                manifest_url: String::new(),
+                                manifest_url: self.gateway_snapshot_url().unwrap_or_default(),
                                 reason: "snapshot_required_from_hello_ack".to_string(),
                                 resume_from: ack.latest_height,
                             }),
@@ -330,7 +506,11 @@ where
                         info!(target:"updater", "leafage ws snapshot_required chain={} version={} reason={} manifest={} resume_from={}", control.chain_id, control.current_data_version, control.reason, control.snapshot.manifest_url, control.snapshot.resume_from);
                         record_next_action("snapshot", "control");
                         Ok(ControlAction::SnapshotRequired {
-                            manifest_url: control.snapshot.manifest_url,
+                            manifest_url: if control.snapshot.manifest_url.is_empty() {
+                                self.gateway_snapshot_url().unwrap_or_default()
+                            } else {
+                                control.snapshot.manifest_url
+                            },
                             reason: control.reason,
                             resume_from: control.snapshot.resume_from,
                         })
@@ -383,6 +563,38 @@ where
         Ok(BlockStorageDiff::decode(&mut bytes.as_ref())?)
     }
 
+    async fn get_object_block_info_by_hash(&self, block_number: u64, block_hash: H256) -> Result<BlockInfo> {
+        if self.is_official_ws() {
+            let cfg = self
+                .gateway_object_cfg
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("gateway object mode disabled"))?;
+            Self::r2_get_block_info_direct(cfg, &self.s3_client, block_hash)
+                .await
+                .with_context(|| format!("r2 block info block {} hash {:?}", block_number, block_hash))
+        } else {
+            self.get_gateway_block_info_by_number(block_number, block_hash).await
+        }
+    }
+
+    async fn get_object_block_diff_by_state_root(
+        &self,
+        block_number: u64,
+        state_root: H256,
+    ) -> Result<BlockStorageDiff> {
+        if self.is_official_ws() {
+            let cfg = self
+                .gateway_object_cfg
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("gateway object mode disabled"))?;
+            Self::r2_get_block_diff_direct(cfg, &self.s3_client, state_root)
+                .await
+                .with_context(|| format!("r2 block diff block {} state_root {:?}", block_number, state_root))
+        } else {
+            self.get_gateway_block_diff_by_number(block_number, state_root).await
+        }
+    }
+
     async fn update_range_from_manifest(&mut self, manifest: &[LeafageManifestEntry]) -> Result<()> {
         let batch_size = self.manifest_prefetch_window();
         let total = manifest.len();
@@ -407,20 +619,8 @@ where
                 join_set.spawn(async move {
                     let block_hash = H256::from_str(&entry.block_hash)?;
                     let state_root = H256::from_str(&entry.state_root)?;
-                    let block_info = s3_get_block_info(
-                        &s3_client,
-                        &cfg.r2_inner_bucket,
-                        &cfg.chain_id,
-                        &cfg.version,
-                        block_hash,
-                    ).await?;
-                    let block_diff = s3_get_block_diff(
-                        &s3_client,
-                        &cfg.r2_inner_bucket,
-                        &cfg.chain_id,
-                        &cfg.version,
-                        state_root,
-                    ).await?;
+                    let block_info = Self::r2_get_block_info_direct(&cfg, &s3_client, block_hash).await?;
+                    let block_diff = Self::r2_get_block_diff_direct(&cfg, &s3_client, state_root).await?;
                     Ok::<(usize, BlockInfo, BlockStorageDiff), anyhow::Error>((idx, block_info, block_diff))
                 });
             }
@@ -481,8 +681,7 @@ where
         for notif in &notifications {
             for new_block in &notif.new_blocks {
                 let block_info = if self.gateway_object_cfg.is_some() {
-                    self.get_gateway_block_info_by_number(new_block.block_number, new_block.hash)
-                        .await?
+                    self.get_object_block_info_by_hash(new_block.block_number, new_block.hash).await?
                 } else {
                     let cfg = self
                         .kafka_s3_cfg
@@ -515,7 +714,7 @@ where
                         if new_block.block_number == 0 {
                             block_info.clone()
                         } else {
-                            self.get_gateway_block_info_by_number(new_block.block_number - 1, new_block.parent_hash).await?
+                            self.get_object_block_info_by_hash(new_block.block_number - 1, new_block.parent_hash).await?
                         }
                     } else {
                         self.get_block_info(new_block.parent_hash).await?
@@ -524,7 +723,7 @@ where
                     if new_block.block_number == 0 {
                         block_info.clone()
                     } else {
-                        self.get_gateway_block_info_by_number(new_block.block_number - 1, new_block.parent_hash).await?
+                        self.get_object_block_info_by_hash(new_block.block_number - 1, new_block.parent_hash).await?
                     }
                 } else {
                     self.get_block_info(new_block.parent_hash).await?
@@ -533,7 +732,7 @@ where
                 blockhash_to_block_info.entry(new_block.parent_hash).or_insert(parent_block_info.clone());
                 if parent_block_info.header.state_root != block_info.header.state_root {
                     let block_diff = if self.gateway_object_cfg.is_some() {
-                        self.get_gateway_block_diff_by_number(block_info.header.number, block_info.header.state_root).await?
+                        self.get_object_block_diff_by_state_root(block_info.header.number, block_info.header.state_root).await?
                     } else {
                         let cfg = self
                             .kafka_s3_cfg
@@ -581,18 +780,55 @@ where
         start_block_number: u64,
         end_block_number: u64,
     ) -> Result<()> {
-        if self.gateway_object_cfg.is_some() {
-            for block_number in start_block_number..=end_block_number {
-                let block_info = self
-                    .get_gateway_block_info_by_number(block_number, H256::ZERO)
-                    .await?;
-                let block_diff = self
-                    .get_gateway_block_diff_by_number(block_number, block_info.header.state_root)
-                    .await?;
-                info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
-                self.tree.update_block(block_info, block_diff)?;
+        if let Some(cfg) = &self.gateway_object_cfg {
+            let cfg = cfg.clone();
+            let batch_size = self.manifest_prefetch_window() as u64;
+            let mut batch_start = start_block_number;
+            while batch_start <= end_block_number {
+                let batch_end = std::cmp::min(
+                    batch_start.saturating_add(batch_size).saturating_sub(1),
+                    end_block_number,
+                );
+                let mut join_set = JoinSet::new();
+                for block_number in batch_start..=batch_end {
+                    let cfg = cfg.clone();
+                    let s3_client = self.s3_client.clone();
+                    join_set.spawn(async move {
+                        let index =
+                            Self::r2_get_canonical_index_direct(&cfg, &s3_client, block_number)
+                                .await
+                                .with_context(|| format!("r2 canonical index block {}", block_number))?;
+                        let block_hash = H256::from_str(&index.block_hash)
+                            .with_context(|| format!("parse block hash for block {}", block_number))?;
+                        let state_root = H256::from_str(&index.state_root)
+                            .with_context(|| format!("parse state root for block {}", block_number))?;
+                        let block_info = Self::r2_get_block_info_direct(&cfg, &s3_client, block_hash)
+                            .await
+                            .with_context(|| format!("r2 block info block {}", block_number))?;
+                        let block_diff = Self::r2_get_block_diff_direct(&cfg, &s3_client, state_root)
+                            .await
+                            .with_context(|| format!("r2 block diff block {}", block_number))?;
+                        Ok::<(u64, BlockInfo, BlockStorageDiff), anyhow::Error>((
+                            block_number,
+                            block_info,
+                            block_diff,
+                        ))
+                    });
+                }
+
+                let mut batch_results = join_set.join_all().await;
+                batch_results.sort_by_key(|res| match res {
+                    Ok((block_number, _, _)) => *block_number,
+                    Err(_) => u64::MAX,
+                });
+                for result in batch_results {
+                    let (_, block_info, block_diff) = result?;
+                    info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                    self.tree.update_block(block_info, block_diff)?;
+                }
+                batch_start = batch_end.saturating_add(1);
             }
-            info!(target:"updater", "update from gateway, start block number {}, end block number {}", start_block_number, end_block_number);
+            info!(target:"updater", "update from r2, start block number {}, end block number {}, prefetch window {}", start_block_number, end_block_number, batch_size);
             return Ok(());
         }
 
@@ -660,6 +896,29 @@ where
         Ok(())
     }
 
+    async fn catchup_gap_before_ws(&self, notifications: &[KafkaBlockChangeNotification]) -> Result<()> {
+        let target_block = notifications
+            .first()
+            .and_then(|n| n.new_blocks.first())
+            .ok_or_else(|| anyhow::anyhow!("No new blocks in the message"))?;
+        if self
+            .tree
+            .state_at(leafage_evm_types::BlockId::Hash(target_block.parent_hash.into()))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let last_committed = self.tree.last_committed_block()?.unwrap().header.number;
+        info!(
+            target:"updater",
+            "ws parent gap detected, catchup before apply, last_committed={}, incoming_block={}, parent_hash={}",
+            last_committed,
+            target_block.block_number,
+            target_block.parent_hash,
+        );
+        self.update_from_s3(notifications).await
+    }
+
     async fn update_from_ws(
         &self,
         notifications: Vec<KafkaBlockChangeNotification>,
@@ -703,20 +962,9 @@ where
         Ok(())
     }
 
-    /// Decide whether the first batch after a fresh connection is too far ahead
-    /// of the last committed block. If so, fall back to S3/RPC backfill first.
-    fn needs_s3_catchup(&self, notifications: &[KafkaBlockChangeNotification]) -> Result<bool> {
-        let Some(target_block) = notifications.first().and_then(|n| n.new_blocks.first()) else {
-            return Ok(false);
-        };
-        let last_committed = self.tree.last_committed_block()?.unwrap().header.number;
-        Ok(target_block.block_number > last_committed + 1)
-    }
-
     /// Run one connection lifecycle. Returns when the peer closes or the
-    /// stream errors. Each fresh call behaves as an initial connection:
-    /// `read_from_ws` is reset so the first batch triggers S3 catchup if the
-    /// tree is behind.
+    /// stream errors. Every inbound WS batch verifies its parent is reachable;
+    /// if not, the missing range is backfilled from R2 before applying live data.
     async fn serve(&mut self) -> Result<()> {
         use futures::{SinkExt, StreamExt};
         info!(target:"updater", "connecting to ws endpoint {}", self.ws_url);
@@ -724,9 +972,15 @@ where
         gauge!("pipeline_leafage_ws_connection_up").set(1.0);
         set_progress("ws_connected");
         let (mut sink, read) = ws_stream.split();
-        let hello = self.build_hello_request()?;
-        info!(target:"updater", "sending leafage hello chain={} last_block={} data_version={}", hello.chain_id, hello.resume_cursor.last_block_number, hello.resume_cursor.data_version);
-        sink.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
+        if self.is_official_ws() {
+            let hello = self.build_official_hello_request()?;
+            info!(target:"updater", "sending official hello chain={} last_block={} data_version={}", hello.chain_id, hello.resume_cursor.last_block_number, hello.resume_cursor.data_version);
+            sink.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
+        } else {
+            let hello = self.build_hello_request()?;
+            info!(target:"updater", "sending leafage hello chain={} last_block={} data_version={}", hello.chain_id, hello.resume_cursor.last_block_number, hello.resume_cursor.data_version);
+            sink.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
+        }
         let mut chunks = read.ready_chunks(std::cmp::max(1, self.max_diff_depth));
 
         self.read_from_ws = false;
@@ -746,16 +1000,18 @@ where
                                 self.update_range_from_s3(from_block, to_block).await?;
                             }
                             let _ = self.prune_cache();
-                            let last_block_number = self.tree.last_committed_block()?
-                                .map(|block| block.header.number)
-                                .unwrap_or(0);
-                            let complete = LeafageCatchupComplete {
-                                r#type: "catchup_complete".to_string(),
-                                chain_id: self.chain_id().to_string(),
-                                current_data_version: self.data_version().to_string(),
-                                last_block_number,
-                            };
-                            sink.send(Message::Text(serde_json::to_string(&complete)?.into())).await?;
+                            if !self.is_official_ws() {
+                                let last_block_number = self.tree.last_committed_block()?
+                                    .map(|block| block.header.number)
+                                    .unwrap_or(0);
+                                let complete = LeafageCatchupComplete {
+                                    r#type: "catchup_complete".to_string(),
+                                    chain_id: self.chain_id().to_string(),
+                                    current_data_version: self.data_version().to_string(),
+                                    last_block_number,
+                                };
+                                sink.send(Message::Text(serde_json::to_string(&complete)?.into())).await?;
+                            }
                             self.read_from_ws = true;
                         }
                         continue;
@@ -800,17 +1056,15 @@ where
                 continue;
             }
 
-            if !self.read_from_ws {
-                if self.needs_s3_catchup(&notifications)? {
-                    loop {
-                        if let Err(e) = self.update_from_s3(&notifications).await {
-                            error!(target:"updater", "Failed to update from S3: {:?}", e);
-                            time::sleep(Duration::from_secs(1)).await;
-                        } else {
-                            break;
-                        }
-                    }
+            loop {
+                if let Err(e) = self.catchup_gap_before_ws(&notifications).await {
+                    error!(target:"updater", "Failed to catch up before ws apply: {:?}", e);
+                    time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    break;
                 }
+            }
+            if !self.read_from_ws {
                 self.read_from_ws = true;
             }
 

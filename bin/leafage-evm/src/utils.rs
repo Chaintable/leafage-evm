@@ -28,6 +28,10 @@ pub struct KafkaS3Config {
     pub s3_chain_id: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub object_fetch_mode: String,
+    #[serde(default)]
+    pub r2_public_base_url: String,
 }
 
 
@@ -38,11 +42,23 @@ pub struct GatewayObjectConfig {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
+    pub ws_protocol: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub object_fetch_mode: String,
+    #[serde(default)]
+    pub r2_public_base_url: String,
+    #[serde(default)]
     pub r2_endpoint: String,
     #[serde(default)]
     pub r2_inner_bucket: String,
+    #[serde(default)]
+    pub r2_outer_bucket: String,
     #[serde(default = "default_prefetch_window")]
     pub prefetch_window: usize,
+    #[serde(default)]
+    pub snapshot_is_archive: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
