@@ -84,8 +84,17 @@ impl Command {
                 .ok_or_else(|| anyhow!("no latest state in database"))?,
         );
 
+        // Archive DBs share the snapshot CF names but store block info as
+        // RLP instead of JSON, so they open fine and only fail here.
         let current = state
-            .last_committed_block()?
+            .last_committed_block()
+            .map_err(|e| {
+                anyhow!(e).context(
+                    "failed to read the committed head; if this database was written in \
+                     archive mode (--archive / archive-init), rewind only supports \
+                     snapshot databases",
+                )
+            })?
             .ok_or_else(|| anyhow!("database is uninitialized, nothing to rewind"))?;
         info!(
             target: "rewind",
