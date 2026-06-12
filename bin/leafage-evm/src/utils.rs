@@ -30,6 +30,18 @@ pub struct KafkaS3Config {
     pub version: String,
 }
 
+/// Parse a [`KafkaS3Config`] CLI argument: an absolute file path or inline JSON.
+pub fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
+    let kafka_s3_config: KafkaS3Config;
+    if arg.starts_with("/") {
+        let file = std::fs::File::open(arg)?;
+        kafka_s3_config = serde_json::from_reader(file)?;
+    } else {
+        kafka_s3_config = serde_json::from_str(arg)?;
+    }
+    Ok(kafka_s3_config)
+}
+
 /// Parse an `eth_getBlockBy*` JSON response into [`BlockInfo`].
 ///
 /// alloy 的 `Block` 把 header 字段 `#[serde(flatten)]` 到顶层，而
@@ -263,7 +275,9 @@ pub async fn s3_get_block_hash_by_number(
     ))
 }
 
-pub async fn s3_get_block_info_and_diff_by_number(
+/// Resolve a block number to its [`BlockInfo`], preferring the RPC client
+/// when available and falling back to the S3 outer-bucket number index.
+pub async fn s3_get_block_info_by_number(
     rpc_client: &Option<HttpClient>,
     s3_client: &Client,
     bucket_name: &str,
@@ -271,8 +285,8 @@ pub async fn s3_get_block_info_and_diff_by_number(
     s3_chain_id: &str,
     version: &str,
     number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = match rpc_client {
+) -> Result<BlockInfo> {
+    match rpc_client {
         Some(rpc) => {
             let block = rpc
                 .get_block_by_number(number.into(), false)
@@ -283,8 +297,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: BlockInfo = parse_block_info(block.unwrap())?;
-            block
+            parse_block_info(block.unwrap())
         }
         None => {
             let block_hash = s3_get_block_hash_by_number(
@@ -297,9 +310,30 @@ pub async fn s3_get_block_info_and_diff_by_number(
             .await?;
             s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
-                .context(format!("s3 get block info failed, {block_hash}"))?
+                .context(format!("s3 get block info failed, {block_hash}"))
         }
-    };
+    }
+}
+
+pub async fn s3_get_block_info_and_diff_by_number(
+    rpc_client: &Option<HttpClient>,
+    s3_client: &Client,
+    bucket_name: &str,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    number: u64,
+) -> Result<(BlockInfo, BlockStorageDiff)> {
+    let block_info = s3_get_block_info_by_number(
+        rpc_client,
+        s3_client,
+        bucket_name,
+        outer_bucket_name,
+        s3_chain_id,
+        version,
+        number,
+    )
+    .await?;
 
     let parent_block_info = s3_get_block_info(
         s3_client,
@@ -344,34 +378,16 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     version: &str,
     number: u64,
 ) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = match rpc_client {
-        Some(rpc) => {
-            let block = rpc
-                .get_block_by_number(number.into(), false)
-                .await
-                .context(format!("rpc get block by hash failed, {number}"))?;
-            if block.is_none() {
-                return Err(anyhow::anyhow!(
-                    "rpc get block by hash returned none, {number}"
-                ));
-            }
-            let block: BlockInfo = parse_block_info(block.unwrap())?;
-            block
-        }
-        None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
-            s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
-                .await
-                .context(format!("s3 get block info failed, {block_hash}"))?
-        }
-    };
+    let block_info = s3_get_block_info_by_number(
+        rpc_client,
+        s3_client,
+        bucket_name,
+        outer_bucket_name,
+        s3_chain_id,
+        version,
+        number,
+    )
+    .await?;
     let block_diff = s3_get_block_diff(
         s3_client,
         bucket_name,
