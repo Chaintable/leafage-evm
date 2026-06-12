@@ -12,6 +12,7 @@ use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::{io::Read, str::FromStr};
+use tracing::{debug, trace};
 
 static S3_BLOCK_CACHE: LazyLock<RwLock<LruCache<H256, BlockInfo>>> =
     LazyLock::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(1024).unwrap())));
@@ -89,6 +90,35 @@ pub async fn s3_get_block_diff(
         .await?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
     let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
+    // Correlate with the commit-side logs in StateDBWrapper::update_block via
+    // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
+    // per-account / per-slot detail).
+    debug!(target: "state_diff",
+        "fetched stateDiff: root {}, parent_root {}, new_accounts {}, deleted_accounts {}, storage_accounts {}, storage_slots {}, new_codes {}",
+        block_storage_diff.hash,
+        block_storage_diff.parent_hash,
+        block_storage_diff.new_accounts.len(),
+        block_storage_diff.deleted_accounts.len(),
+        block_storage_diff.storage_diffs.len(),
+        block_storage_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum::<usize>(),
+        block_storage_diff.new_codes.len(),
+    );
+    for account in &block_storage_diff.new_accounts {
+        trace!(target: "state_diff",
+            "fetched account: root {}, address {}, balance {}, nonce {}, code_hash {}",
+            block_storage_diff.hash, account.address, account.balance, account.nonce, account.code_hash);
+    }
+    for address in &block_storage_diff.deleted_accounts {
+        trace!(target: "state_diff",
+            "fetched deleted account: root {}, address {}", block_storage_diff.hash, address);
+    }
+    for account_diff in &block_storage_diff.storage_diffs {
+        for pair in &account_diff.diffs {
+            trace!(target: "state_diff",
+                "fetched storage: root {}, address {}, index {}, value {}",
+                block_storage_diff.hash, account_diff.address, pair.index, pair.value);
+        }
+    }
     Ok(block_storage_diff)
 }
 
