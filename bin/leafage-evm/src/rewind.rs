@@ -3,24 +3,29 @@ use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
-    EvmStorageWrite, MultiStorage, StateDBProvider, StateDBWrapper, StorageKind,
+    EvmStorageWrite, MultiStorage, StateDBProvider, StateDBRead, StateDBWrapper, StorageKind,
 };
-use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff};
+use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::path::PathBuf;
 use tracing::info;
 
 /// `leafage-evm rewind` command
 ///
-/// Rewind the snapshot database's committed-head pointer to an earlier block
-/// so the next `standalone` start resyncs `to_block + 1 ..= head` from S3.
+/// Rewind the database's committed-head pointer to an earlier block so the
+/// next `standalone` start resyncs `to_block + 1 ..= head` from S3.
 ///
-/// The flat state itself is left untouched: `BlockStorageDiff` carries
-/// absolute post-state values, so replaying the range over the newer state
-/// converges to the exact head state. Until the replay catches up, the
+/// The state itself is left untouched: `BlockStorageDiff` carries absolute
+/// post-state values, so the forward replay converges to the exact head
+/// state.
+///
+/// Snapshot mode: the target block is resolved via --kafka-s3-config or
+/// --rpc-addr (one is required), and until the replay catches up the
 /// "latest" state is a mixture of old and replayed values — keep the node
 /// out of serving rotation until it has switched to the Kafka tail.
 ///
-/// Snapshot (non-archive) databases only.
+/// Archive mode (--archive): the target block is resolved from the local
+/// database, and the height-versioned keys keep reads consistent at every
+/// height (including "latest") throughout the replay.
 #[derive(Debug, Parser)]
 pub struct Command {
     /// The path to the database to rewind.
@@ -37,14 +42,24 @@ pub struct Command {
     #[arg(long, default_value = "2048")]
     db_cache: usize,
 
+    /// Whether the database was written in archive mode.
+    /// Default: false
+    ///
+    /// Must match how the database was written: snapshot and archive share
+    /// column family names but use different encodings.
+    #[arg(long, default_value_t = false)]
+    archive: bool,
+
     /// The block number to rewind the committed head to.
     #[arg(long)]
     to_block: u64,
 
     /// The kafka s3 config (absolute file path or inline JSON), used to
     /// resolve the target block info from S3 and locate the offset file.
+    /// Required in snapshot mode unless --rpc-addr is given; optional in
+    /// archive mode (only its offset_dir is used, if set).
     #[arg(long, value_parser = parse_kafka_s3_config, value_name = "KAFKA_S3_CONFIG_PATH")]
-    kafka_s3_config: KafkaS3Config,
+    kafka_s3_config: Option<KafkaS3Config>,
 
     /// Optional RPC endpoint for resolving the target block info instead of
     /// the S3 outer-bucket number index.
@@ -64,18 +79,11 @@ pub struct Command {
 
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
-        let mut rpc_client = None;
-        if let Some(rpc_url) = &self.rpc_addr {
-            rpc_client = Some(HttpClientBuilder::default().build(rpc_url)?);
-        }
-        let s3_config = aws_config::load_from_env().await;
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
-
         let db = MultiStorage::open(
             self.db_path.as_path(),
             self.db_cache,
             self.db_type,
-            false,
+            self.archive,
             false,
             false,
         )?;
@@ -84,15 +92,15 @@ impl Command {
                 .ok_or_else(|| anyhow!("no latest state in database"))?,
         );
 
-        // Archive DBs share the snapshot CF names but store block info as
-        // RLP instead of JSON, so they open fine and only fail here.
+        // Snapshot and archive DBs share CF names but encode block info
+        // differently (JSON vs RLP), so a mismatched --archive flag opens
+        // fine and only fails here.
         let current = state
             .last_committed_block()
             .map_err(|e| {
                 anyhow!(e).context(
-                    "failed to read the committed head; if this database was written in \
-                     archive mode (--archive / archive-init), rewind only supports \
-                     snapshot databases",
+                    "failed to read the committed head; check that --archive matches \
+                     how this database was written (snapshot and archive encodings differ)",
                 )
             })?
             .ok_or_else(|| anyhow!("database is uninitialized, nothing to rewind"))?;
@@ -109,16 +117,44 @@ impl Command {
             );
         }
 
-        let target = s3_get_block_info_by_number(
-            &rpc_client,
-            &s3_client,
-            &self.kafka_s3_config.bucket_name,
-            &self.kafka_s3_config.outer_bucket_name,
-            &self.kafka_s3_config.s3_chain_id,
-            &self.kafka_s3_config.version,
-            self.to_block,
-        )
-        .await?;
+        let target = if self.archive {
+            // Archive keeps every block info and the full number->hash
+            // index locally, so no S3/RPC lookup is needed.
+            let target_hash = state.0.read_block_hash(self.to_block)?;
+            if target_hash == H256::ZERO {
+                bail!(
+                    "block {} not found in the archive database",
+                    self.to_block
+                );
+            }
+            state.0.read_block_info(target_hash)?.ok_or_else(|| {
+                anyhow!("block info for {target_hash} not found in the archive database")
+            })?
+        } else {
+            if self.kafka_s3_config.is_none() && self.rpc_addr.is_none() {
+                bail!(
+                    "snapshot rewind needs --kafka-s3-config or --rpc-addr \
+                     to resolve the target block"
+                );
+            }
+            let mut rpc_client = None;
+            if let Some(rpc_url) = &self.rpc_addr {
+                rpc_client = Some(HttpClientBuilder::default().build(rpc_url)?);
+            }
+            let s3_config = aws_config::load_from_env().await;
+            let s3_client = aws_sdk_s3::Client::new(&s3_config);
+            let cfg = self.kafka_s3_config.clone().unwrap_or_default();
+            s3_get_block_info_by_number(
+                &rpc_client,
+                &s3_client,
+                &cfg.bucket_name,
+                &cfg.outer_bucket_name,
+                &cfg.s3_chain_id,
+                &cfg.version,
+                self.to_block,
+            )
+            .await?
+        };
         if target.header.number != self.to_block {
             bail!(
                 "resolved block info has number {}, expected {}",
@@ -139,10 +175,9 @@ impl Command {
         );
 
         if !self.keep_offset {
-            let offset_dir = if self.kafka_s3_config.offset_dir.is_empty() {
-                format!("{}/offset", self.db_path.to_str().unwrap_or_default())
-            } else {
-                self.kafka_s3_config.offset_dir.clone()
+            let offset_dir = match &self.kafka_s3_config {
+                Some(cfg) if !cfg.offset_dir.is_empty() => cfg.offset_dir.clone(),
+                _ => format!("{}/offset", self.db_path.to_str().unwrap_or_default()),
             };
             let offset_file = format!("{}/offset", offset_dir);
             match std::fs::remove_file(&offset_file) {
