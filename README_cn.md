@@ -35,7 +35,6 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 | Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
 | Tac                                           | [Chaintable/tacchain](https://github.com/Chaintable/tacchain)                                    |
 | Mitosis                                       | [Chaintable/reth-mitosis](https://github.com/Chaintable/reth-mitosis)                            |
-| Megaeth                                       | [Chaintable/mega-reth](https://github.com/Chaintable/mega-reth)                                  |
 | XDC                                           | [Chaintable/XDPoSChain](https://github.com/Chaintable/XDPoSChain)                                |
 | Citrea                                        | [Chaintable/citrea](https://github.com/Chaintable/citrea)                                        |
 | ZKsync: Lens, Era, Abstract, Sophon           | [Chaintable/zksync-era @ debank](https://github.com/Chaintable/zksync-era/tree/debank)           |
