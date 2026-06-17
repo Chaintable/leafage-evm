@@ -3,7 +3,7 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config};
+use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -288,6 +288,14 @@ pub struct Command {
     /// will be automatically saved to this file for future warmup use.
     #[arg(long, default_value = "")]
     token_collector_path: String,
+
+    /// The node type to register to etcd.
+    /// Default: auto (derive from --archive)
+    ///
+    /// `auto` registers archive nodes as archive and all others as state.
+    /// `state` / `archive` override that explicitly, regardless of --archive.
+    #[arg(long, value_enum, default_value_t = NodeTypeArg::Auto)]
+    node_type: NodeTypeArg,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -664,7 +672,7 @@ impl Command {
             chain_cfg.chain_id(),
             self.kafka_s3_config.clone().unwrap_or_default().version,
             etcd_config.clone(),
-            self.archive,
+            self.node_type.resolve(self.archive),
         )
         .await?;
 

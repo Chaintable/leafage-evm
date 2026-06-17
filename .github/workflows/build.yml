@@ -21,6 +21,9 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     runs-on: ${{ matrix.runner }}
 
     permissions:
@@ -108,4 +111,5 @@ jobs:
           docker buildx imagetools create \
             -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
             -t ${REGISTRY}/${IMAGE_NAME}:latest \
-            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64 \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64

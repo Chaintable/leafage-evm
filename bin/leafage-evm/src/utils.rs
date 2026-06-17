@@ -460,9 +460,37 @@ pub enum StateType {
     Offline = 3,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u64)]
 pub enum NodeType {
     State = 1,
     Archive = 2,
+}
+
+/// CLI selector for the node type registered to etcd. `Auto` (the default)
+/// preserves the historical behavior of deriving the type from `--archive`;
+/// `State`/`Archive` override it explicitly.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum NodeTypeArg {
+    /// Derive from `--archive`: archive nodes register as archive, all
+    /// others as state.
+    #[default]
+    Auto,
+    /// Register as a state node (node_type = 1) regardless of `--archive`.
+    State,
+    /// Register as an archive node (node_type = 2) regardless of `--archive`.
+    Archive,
+}
+
+impl NodeTypeArg {
+    /// Resolve to the concrete [`NodeType`] written to etcd, falling back to
+    /// `is_archive` when `Auto`.
+    pub fn resolve(self, is_archive: bool) -> NodeType {
+        match self {
+            NodeTypeArg::Auto if is_archive => NodeType::Archive,
+            NodeTypeArg::Auto => NodeType::State,
+            NodeTypeArg::State => NodeType::State,
+            NodeTypeArg::Archive => NodeType::Archive,
+        }
+    }
 }
