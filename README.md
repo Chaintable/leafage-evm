@@ -43,6 +43,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | Fraxtal                                         | [Chaintable/frax-op-reth](https://github.com/Chaintable/frax-op-reth)                    |
 | Ronin                                           | [Chaintable/conduit-op-reth](https://github.com/Chaintable/conduit-op-reth)              |
 | World Chain                                     | [Chaintable/world-chain](https://github.com/Chaintable/world-chain)                      |
+| Plasma                                          | [Chaintable/reth-x](https://github.com/Chaintable/reth-x)                                |
 | BSC                                             | [Chaintable/bsc-x](https://github.com/Chaintable/bsc-x)                                  |
 | Core                                            | [Chaintable/core](https://github.com/Chaintable/core)                                    |
 | Chiliz                                          | [Chaintable/chiliz-chain-v2](https://github.com/Chaintable/chiliz-chain-v2)              |
@@ -61,6 +62,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | Polygon PoS                                     | [Chaintable/bor](https://github.com/Chaintable/bor)                                      |
 | Sonic                                           | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                  |
 | Blast                                           | [Chaintable/blast](https://github.com/Chaintable/blast)                                  |
+| Botanix                                         | [botanix-labs/reth](https://github.com/botanix-labs/reth)                                |
 
 ## Supported JSON-RPC Methods
 
