@@ -34,7 +34,7 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "arbitrum", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "iotex"], default_value = "mainnet")]
+    #[arg(long, value_parser = ["mainnet", "arbitrum", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "iotex", "moonbeam", "moonriver"], default_value = "mainnet")]
     evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
@@ -459,6 +459,21 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Iotex(chain_cfg))
+            }
+            // Moonbeam and Moonriver share an identical EVM and precompile set;
+            // they differ only by chain id (passed via --chain-cfg) and native
+            // token metadata, which leafage does not need. Both map to the same
+            // MoonbeamHardfork executor.
+            "moonbeam" | "moonriver" => {
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, &evm_type)?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Moonbeam(chain_cfg))
             }
             "mantlev2" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
