@@ -3,6 +3,10 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::fs;
 use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -16,7 +20,7 @@ const LATEST_RETRY_MAX_ATTEMPTS: usize = 6;
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 // archive 模式默认并发,可由配置覆盖。
-const DEFAULT_ARCHIVE_CONCURRENCY: usize = 4;
+const DEFAULT_ARCHIVE_CONCURRENCY: usize = 10;
 
 // 单 archive 外层重试默认 3 次,指数退避 1s → 4s。
 // HTTP 客户端内层重试兜底瞬时网络抖动,外层兜底持续故障。
@@ -41,7 +45,7 @@ pub(crate) struct SnapshotConfig {
     pub namespace: String,
     pub component: String,
 
-    /// archive 级 worker pool 路数,默认 4。
+    /// archive 级 worker pool 路数,默认 10。
     #[serde(default)]
     pub archive_concurrency: usize,
 
@@ -95,6 +99,15 @@ struct Initializer {
     http: reqwest::Client,
     archive_concurrency: usize,
     outer_retry_attempts: usize,
+}
+
+#[derive(Debug)]
+struct GlobalProgress {
+    total_archives: usize,
+    completed_archives: AtomicU64,
+    total_bytes: u64,
+    downloaded_bytes: Arc<AtomicU64>,
+    finished: AtomicBool,
 }
 
 impl Initializer {
@@ -206,45 +219,26 @@ impl Initializer {
             .await
             .with_context(|| format!("mkdir {:?}", self.db_path))?;
 
-        // 进 init 前清空 db_path 现有内容,避免上一次半套残留与本次 snapshot 混杂。
-        // 目录本身保留(容器场景常见挂载点),只删直接子项。
-        self.purge_db_path().await?;
+        // snapshot-init 只允许在空目录执行,避免静默覆盖已有数据。
+        self.ensure_db_path_empty().await?;
 
         self.restore_archive(&manifest, &chain_prefix).await
     }
 
-    /// 清空 db_path 下所有直接子项(目录本身保留,适配 bind-mount / 挂载点场景)。
-    async fn purge_db_path(&self) -> Result<()> {
+    /// 确保 db_path 为空。目录本身允许存在,但只要有任何直接子项就报错。
+    async fn ensure_db_path_empty(&self) -> Result<()> {
         let mut rd = fs::read_dir(&self.db_path)
             .await
             .with_context(|| format!("read_dir {:?}", self.db_path))?;
-        let mut removed: usize = 0;
-        while let Some(entry) = rd
+        if let Some(entry) = rd
             .next_entry()
             .await
             .with_context(|| format!("next_entry {:?}", self.db_path))?
         {
-            let path = entry.path();
-            let ft = entry
-                .file_type()
-                .await
-                .with_context(|| format!("file_type {:?}", path))?;
-            if ft.is_dir() {
-                fs::remove_dir_all(&path)
-                    .await
-                    .with_context(|| format!("rm -rf {:?}", path))?;
-            } else {
-                fs::remove_file(&path)
-                    .await
-                    .with_context(|| format!("rm {:?}", path))?;
-            }
-            removed += 1;
-        }
-        if removed > 0 {
-            info!(
-                target: "snapshot_init",
-                "purged {} entries from {:?} before restore",
-                removed, self.db_path,
+            anyhow::bail!(
+                "db_path is not empty, refusing to overwrite existing data: {:?} (first entry: {:?})",
+                self.db_path,
+                entry.path()
             );
         }
         Ok(())
@@ -290,6 +284,19 @@ impl Initializer {
         );
 
         let archives_prefix = manifest.archives_prefix.clone();
+        let total_bytes = manifest
+            .archives
+            .iter()
+            .map(|entry| u64::try_from(entry.size_bytes).unwrap_or(0))
+            .sum();
+        let progress = Arc::new(GlobalProgress {
+            total_archives: manifest.archives.len(),
+            completed_archives: AtomicU64::new(0),
+            total_bytes,
+            downloaded_bytes: Arc::new(AtomicU64::new(0)),
+            finished: AtomicBool::new(false),
+        });
+        let progress_task = spawn_global_progress_logger(Arc::clone(&progress));
 
         // worker pool:FuturesUnordered + 滑动窗口。
         // 任一 worker 错 → result? 短路返回 → in_flight 集合 drop → 余下 future 自动取消。
@@ -302,6 +309,7 @@ impl Initializer {
                     entry,
                     archives_prefix.clone(),
                     compressed,
+                    Arc::clone(&progress),
                 ));
             }
         }
@@ -313,9 +321,12 @@ impl Initializer {
                     entry,
                     archives_prefix.clone(),
                     compressed,
+                    Arc::clone(&progress),
                 ));
             }
         }
+        progress.finished.store(true, Ordering::Relaxed);
+        let _ = progress_task.await;
 
         info!(
             target: "snapshot_init",
@@ -336,6 +347,7 @@ impl Initializer {
         entry: ArchiveEntry,
         archives_prefix: String,
         compressed: bool,
+        progress: Arc<GlobalProgress>,
     ) -> Result<()> {
         let key = format!("{}{}", archives_prefix, entry.name);
         let url = entry.url.clone();
@@ -348,13 +360,25 @@ impl Initializer {
         let mut last_err: Option<anyhow::Error> = None;
         let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
         for attempt in 1..=self.outer_retry_attempts {
-            match self.try_extract_one_archive(&key, if url.is_empty() { None } else { Some(url.as_str()) }, compressed).await {
+            match self
+                .try_extract_one_archive(
+                    &key,
+                    if url.is_empty() { None } else { Some(url.as_str()) },
+                    compressed,
+                    entry.size_bytes,
+                    Arc::clone(&progress),
+                )
+                .await
+            {
                 Ok(()) => {
                     info!(
                         target: "snapshot_init",
                         "archive done index={} name={} attempt={}",
                         idx, entry.name, attempt,
                     );
+                    progress
+                        .completed_archives
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(err) => {
@@ -386,6 +410,8 @@ impl Initializer {
         key: &str,
         archive_url: Option<&str>,
         compressed: bool,
+        archive_size_bytes: i64,
+        progress: Arc<GlobalProgress>,
     ) -> Result<()> {
         let url = archive_url
             .map(str::to_string)
@@ -399,6 +425,8 @@ impl Initializer {
             .error_for_status()
             .with_context(|| format!("get {} returned error status", url))?;
 
+        let total_bytes = u64::try_from(archive_size_bytes).unwrap_or(0);
+
         // bytes_stream → io::Error → StreamReader(AsyncRead)→ SyncIoBridge(sync Read)。
         // Box::pin 保证 StreamReader: Unpin(SyncIoBridge 的同步 Read impl 要求)。
         let stream = Box::pin(
@@ -408,7 +436,11 @@ impl Initializer {
         let async_read = StreamReader::new(stream);
         let db_path = self.db_path.clone();
         // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),再 move 进 spawn_blocking。
-        let sync_read = SyncIoBridge::new(async_read);
+        let sync_read = SyncIoBridge::new(CountedAsyncRead::new(
+            async_read,
+            Arc::clone(&progress.downloaded_bytes),
+            total_bytes,
+        ));
         tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path, compressed))
             .await
             .context("extract task")?
@@ -516,6 +548,113 @@ fn extract_tar<R: std::io::Read>(reader: R, db_path: &Path, compressed: bool) ->
     } else {
         unpack_tar(reader, db_path)
     }
+}
+
+struct CountedAsyncRead<R> {
+    inner: R,
+    global_count: Arc<AtomicU64>,
+    total_bytes: u64,
+    local_count: u64,
+}
+
+impl<R> CountedAsyncRead<R> {
+    fn new(inner: R, global_count: Arc<AtomicU64>, total_bytes: u64) -> Self {
+        Self {
+            inner,
+            global_count,
+            total_bytes,
+            local_count: 0,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedAsyncRead<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let filled_after = buf.filled().len();
+                if filled_after > filled_before {
+                    let delta = (filled_after - filled_before) as u64;
+                    let remaining = self.total_bytes.saturating_sub(self.local_count);
+                    let accounted = delta.min(remaining);
+                    self.local_count = self.local_count.saturating_add(accounted);
+                    if accounted > 0 {
+                        self.global_count.fetch_add(accounted, Ordering::Relaxed);
+                    }
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1}{}", UNITS[unit])
+}
+
+fn eta_secs(elapsed: Duration, done: u64, total: u64) -> Option<u64> {
+    if done == 0 || total == 0 || done >= total {
+        return None;
+    }
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+    let rate = done as f64 / elapsed_secs;
+    if rate <= 0.0 {
+        return None;
+    }
+    let remain = (total - done) as f64 / rate;
+    Some(remain.ceil().max(0.0) as u64)
+}
+
+fn spawn_global_progress_logger(progress: Arc<GlobalProgress>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started_at = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            if progress.finished.load(Ordering::Relaxed) {
+                break;
+            }
+            let done = progress.downloaded_bytes.load(Ordering::Relaxed);
+            let total_bytes = progress.total_bytes;
+            let completed = progress.completed_archives.load(Ordering::Relaxed);
+            let active = progress.total_archives.saturating_sub(completed as usize);
+            let percent = if total_bytes == 0 {
+                0.0
+            } else {
+                done as f64 * 100.0 / total_bytes as f64
+            };
+            let eta = eta_secs(started_at.elapsed(), done, total_bytes)
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "n/a".to_string());
+            info!(
+                target: "snapshot_init",
+                "snapshot progress {:.1}% ({}/{}) archives_completed={}/{} active={} eta={}",
+                percent,
+                format_bytes(done),
+                format_bytes(total_bytes),
+                completed,
+                progress.total_archives,
+                active,
+                eta,
+            );
+        }
+    })
 }
 
 /// 逐 entry 流式解 tar 落盘(防越权:拒绝绝对路径 / ".." / 设备等特殊文件)。

@@ -49,6 +49,12 @@ pub struct GatewayObjectConfig {
     pub object_fetch_mode: String,
     #[serde(default)]
     pub r2_public_base_url: String,
+    /// Public base URL for the inner bucket (block info + state diff). When set,
+    /// inner-bucket objects are fetched from here in url mode while outer-bucket
+    /// objects (canonical index) use `r2_public_base_url`. This lets url mode span
+    /// the two buckets the pipeline writes to, each behind its own public domain.
+    #[serde(default)]
+    pub r2_inner_public_base_url: String,
     #[serde(default)]
     pub r2_endpoint: String,
     #[serde(default)]

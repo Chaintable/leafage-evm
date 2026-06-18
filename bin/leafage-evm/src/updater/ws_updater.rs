@@ -322,16 +322,27 @@ where
     }
 
     fn r2_object_url(cfg: &GatewayObjectConfig, bucket: &str, key: &str) -> Result<String> {
-        let base = cfg.r2_public_base_url.trim_end_matches('/');
+        // Inner-bucket objects (block info / state diff) and outer-bucket objects
+        // (canonical index) may sit behind different public domains, so pick the
+        // base URL by bucket. Falls back to r2_public_base_url when no inner base
+        // is configured (single-bucket / single-domain deployments).
+        let base = if bucket == cfg.r2_inner_bucket && !cfg.r2_inner_public_base_url.is_empty() {
+            cfg.r2_inner_public_base_url.trim_end_matches('/')
+        } else {
+            cfg.r2_public_base_url.trim_end_matches('/')
+        };
         if base.is_empty() {
-            return Err(anyhow::anyhow!("r2_public_base_url is not configured"));
+            return Err(anyhow::anyhow!(
+                "r2 public base url is not configured for bucket {}",
+                bucket
+            ));
         }
         let escaped_key = key
             .split('/')
             .map(|part| part.replace('%', "%25").replace(' ', "%20").replace('#', "%23").replace('?', "%3F"))
             .collect::<Vec<_>>()
             .join("/");
-        Ok(format!("{}/{}/{}", base, bucket, escaped_key))
+        Ok(format!("{}/{}", base, escaped_key))
     }
 
     async fn r2_get_object_by_url(cfg: &GatewayObjectConfig, bucket: &str, key: &str) -> Result<Vec<u8>> {
@@ -372,6 +383,9 @@ where
     }
 
     async fn r2_get_block_info_direct(cfg: &GatewayObjectConfig, s3_client: &Client, block_hash: H256) -> Result<BlockInfo> {
+        // Block info lives in the inner bucket at <chain>/<version>/<hash>/block in
+        // both url and s3 modes. (The <hash> object in the outer bucket is a debank
+        // block that does not deserialize into BlockInfo.)
         let key = if cfg.version.is_empty() {
             format!("{}/{}/block", cfg.chain_id, block_hash)
         } else {
@@ -438,9 +452,8 @@ where
             .gateway_object_cfg
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("official ws requires gateway object config"))?;
-        if cfg.api_key.trim().is_empty() {
-            return Err(anyhow::anyhow!("official ws requires gateway object api_key"));
-        }
+        // api_key is optional: official-gateway accepts an empty key (and only
+        // enforces membership when a chain configures an allowed_users list).
         Ok(OfficialHelloRequest {
             r#type: "hello".to_string(),
             protocol_version: "v1".to_string(),
