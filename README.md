@@ -17,26 +17,50 @@ leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/
 
 Any EVM-compatible chain can potentially be supported. The following chains are currently supported:
 
-| Chain                     | Repository                                                                    |
-|---------------------------|-------------------------------------------------------------------------------|
-| ETH                       | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)           |
-| AVAX                      | [Chaintable/coreth](https://github.com/Chaintable/coreth)                     |
-| OP Stack (OP, Base, etc.) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                   |
-| Arb                       | [Chaintable/nitro](https://github.com/Chaintable/nitro)                       |
-| Gnosis                    | [Chaintable/erigon](https://github.com/Chaintable/erigon)                     |
-| Tempo                     | [Chaintable/tempo](https://github.com/Chaintable/tempo)                       |
-| Bitlayer                  | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)           |
-| Oasys                     | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)   |
-| Kava                      | [Chaintable/kava](https://github.com/Chaintable/kava)                         |
-| IoTeX                     | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)         |
-| Scrl                      | [Chaintable/go-ethereum-scrl](https://github.com/chaintable/go-ethereum-scrl) |
-| Bera                      | [Chaintable/bera-geth](https://github.com/chaintable/bera-geth)               |
-| Story                     | [Chaintable/story-geth](https://github.com/chaintable/story-geth)             |
-| Tac                       | [Chaintable/tacchain](https://github.com/chaintable/tacchain)                 |
-| Mitosis                   | [Chaintable/reth-mitosis](https://github.com/chaintable/reth-mitosis)         |
-| Megaeth                   | [Chaintable/mega-reth](https://github.com/chaintable/mega-reth)               |
-| XDC                       | [Chaintable/XDPoSChain](https://github.com/chaintable/XDPoSChain)             |
-| Citrea                    | [Chaintable/citrea](https://github.com/chaintable/citrea)                     |
+| Chain                                         | Repository                                                                                       |
+|-----------------------------------------------|--------------------------------------------------------------------------------------------------|
+| ETH, Linea                                    | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)                              |
+| AVAX                                          | [Chaintable/coreth](https://github.com/Chaintable/coreth)                                        |
+| OP Stack op-geth: OP, Base, opBNB, Celo, B2, BOB, DBK, Hemi, Katana, Manta, Mantle, Mode, Orderly, Soneium, Unichain, X Layer, Swell | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                                      |
+| OP Stack op-reth: HSK, Ink, Lisk, Zora, Cyber | [Chaintable/optimism](https://github.com/Chaintable/optimism)                                    |
+| Arb, Gravity, Plume, Hood                     | [Chaintable/nitro](https://github.com/Chaintable/nitro)                                          |
+| Gnosis                                        | [Chaintable/erigon](https://github.com/Chaintable/erigon)                                        |
+| Tempo                                         | [Chaintable/tempo](https://github.com/Chaintable/tempo)                                          |
+| Bitlayer                                      | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)                              |
+| Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
+| Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
+| IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
+| Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
+| Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
+| Tac                                           | [Chaintable/tacchain](https://github.com/Chaintable/tacchain)                                    |
+| Mitosis                                       | [Chaintable/reth-mitosis](https://github.com/Chaintable/reth-mitosis)                            |
+| XDC                                           | [Chaintable/XDPoSChain](https://github.com/Chaintable/XDPoSChain)                                |
+| Citrea                                        | [Chaintable/citrea](https://github.com/Chaintable/citrea)                                        |
+| ZKsync: Lens, Era, Abstract, Sophon           | [Chaintable/zksync-era @ debank](https://github.com/Chaintable/zksync-era/tree/debank)           |
+| Cronos zkEVM (Croze)                          | [Chaintable/zksync-era @ chain/croze](https://github.com/Chaintable/zksync-era/tree/chain/croze) |
+| Fraxtal                                       | [Chaintable/frax-op-reth](https://github.com/Chaintable/frax-op-reth)                            |
+| Ronin                                         | [Chaintable/conduit-op-reth](https://github.com/Chaintable/conduit-op-reth)                      |
+| World Chain                                   | [Chaintable/world-chain](https://github.com/Chaintable/world-chain)                              |
+| Plasma, Botanix                               | [Chaintable/reth-x](https://github.com/Chaintable/reth-x)                                        |
+| BSC                                           | [Chaintable/bsc-x](https://github.com/Chaintable/bsc-x)                                          |
+| Core                                          | [Chaintable/core](https://github.com/Chaintable/core)                                            |
+| Chiliz                                        | [Chaintable/chiliz-chain-v2](https://github.com/Chaintable/chiliz-chain-v2)                      |
+| Morph                                         | [Chaintable/go-ethereum-morph-x](https://github.com/Chaintable/go-ethereum-morph-x)              |
+| Taiko                                         | [Chaintable/taiko-geth](https://github.com/Chaintable/taiko-geth)                                |
+| Metis                                         | [Chaintable/mvm-x](https://github.com/Chaintable/mvm-x)                                          |
+| 0G                                            | [Chaintable/0g-geth](https://github.com/Chaintable/0g-geth)                                      |
+| Immutable zkEVM                               | [Chaintable/immutable-geth](https://github.com/Chaintable/immutable-geth)                        |
+| Kite                                          | [Chaintable/subnet-evm-kite](https://github.com/Chaintable/subnet-evm-kite)                      |
+| Merlin                                        | [Chaintable/cdk-erigon](https://github.com/Chaintable/cdk-erigon)                                |
+| Flare                                         | [Chaintable/go-flare-x](https://github.com/Chaintable/go-flare-x)                                |
+| Moonbeam / Moonriver                          | [Chaintable/moonbeam-x](https://github.com/Chaintable/moonbeam-x)                                |
+| Conflux                                       | [Chaintable/conflux-rust-x](https://github.com/Chaintable/conflux-rust-x)                        |
+| Kaia (Klaytn)                                 | [Chaintable/kaia](https://github.com/Chaintable/kaia)                                            |
+| WEMIX                                         | [Chaintable/go-wemix](https://github.com/Chaintable/go-wemix)                                    |
+| Polygon PoS                                   | [Chaintable/bor](https://github.com/Chaintable/bor)                                              |
+| Sonic                                         | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                          |
+| Blast                                         | [Chaintable/blast](https://github.com/Chaintable/blast)                                          |
 
 ## Supported JSON-RPC Methods
 
