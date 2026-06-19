@@ -9,6 +9,7 @@ use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
+use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
@@ -198,6 +199,7 @@ pub enum MultiChainCfgEnv {
     Iotex(CfgEnv<IotexHardfork>),
     Mantle(CfgEnv<MantleHardfork>),
     Moonbeam(CfgEnv<MoonbeamHardfork>),
+    Polygon(CfgEnv<PolygonHardfork>),
     Tempo(CfgEnv<TempoHardfork>),
     Citrea(CfgEnv<CitreaHardfork>),
 }
@@ -213,6 +215,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Iotex(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Moonbeam(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Polygon(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }

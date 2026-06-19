@@ -32,6 +32,7 @@ mod warmup;
 mod cosmos;
 mod iotex;
 mod moonbeam;
+mod polygon;
 mod tempo;
 
 pub(crate) mod token_collector;
