@@ -19,6 +19,12 @@ into a forward `Seek`. Forward `Seek` is RocksDB's optimized iterator operation
 effect is dramatically fewer SST reads per lookup, which matters enormously for
 `eth_call`, where a single call can read hundreds of storage slots.
 
+The encoding is selected at runtime by the **`--inverted-block-encoding`** flag
+(on both `standalone` and `archive-init`). It is **off by default** — existing
+deployments keep the legacy ascending layout and behaviour unchanged — and must
+be matched between the DB and the serving node (see
+[Enabling and migration](#enabling-and-migration)).
+
 ## Background: how the archive node stores state
 
 An archive node must serve state at **any** historical height, so it keeps every
@@ -168,36 +174,40 @@ lookup touches only the runs that actually hold the queried slot.
 
 All changes are in `crates/leafage-evm-storage/src/db_impl/` and affect **both**
 archive backends (RocksDB and MDBX), kept consistent because the key encoding is
-shared.
+shared. The mode is a process-global selected once at startup, so reads, writes,
+and iterators all agree for the lifetime of the (single-per-process) archive DB.
 
-### Encoding (`archive_encoding.rs`)
+### Mode selection (`archive_encoding.rs`)
 
-- `encode_block_num(bn)` — unchanged, raw **ascending** big-endian. Still used by
-  the `BlockNumToBlockHash` index, whose readers decode the raw block number.
-- `encode_block_num_desc(bn) = encode_block_num(u64::MAX - bn)` — new, descending.
-- `encode_account_key` / `encode_storage_key` — now use `encode_block_num_desc`
-  for the version tail.
+- `set_inverted_block_encoding(bool)` / `inverted_block_encoding() -> bool` — a
+  process-global `AtomicBool` (default `false`). The CLI sets it once at the top
+  of `run()` before any key is encoded or any DB opened.
+- `encode_block_num(bn)` — raw **ascending** big-endian. Still used unconditionally
+  by the `BlockNumToBlockHash` index, whose readers decode the raw block number.
+- `encode_block_num_desc(bn) = encode_block_num(u64::MAX - bn)` — descending.
+- `encode_account_key` / `encode_storage_key` — pick the tail per
+  `inverted_block_encoding()`: descending when set, ascending when not.
 
 The module doc carries the full rationale (this document is the expanded form).
 
 ### Reads
 
-- **RocksDB** (`rocksdb_impl/archive/mod.rs`): `read_account` / `read_storage`
-  switch `iter.seek_for_prev(target)` → `iter.seek(target)` (forward).
-- **MDBX** (`mdbx_impl/archive/mod.rs`): the bespoke `seek_for_prev` cursor
-  helper is replaced by `seek_ge` (a forward `set_range` = smallest key `>=`
-  target); `read_account` / `read_storage` use it.
+`read_account` / `read_storage` branch on `inverted_block_encoding()`:
+
+- **inverted** → forward seek (RocksDB `iter.seek`, MDBX `set_range` / `seek_ge`).
+- **legacy** → backward seek (RocksDB `iter.seek_for_prev`, MDBX `seek_le`).
 
 Both keep the existing post-seek prefix check, which handles the "no version
-`<= H`" case.
+`<= H`" case in either mode.
 
 ### Full-scan iterators
 
 The `LatestStateDBIterator` (`account_iter` / `storage_iter`) reconstructs the
-latest state by scanning. With ascending keys the newest version was the **last**
-record of each prefix; with descending keys it is the **first**. Both backends
-now emit the first record per prefix and skip the rest (skipping the whole prefix
-when the newest version is a deletion / zero).
+latest state by scanning. The newest version is the **last** record of each
+prefix under ascending keys and the **first** under descending keys, so both
+backends branch on the mode (peeking the next record for legacy last-per-prefix,
+tracking the consumed prefix for inverted first-per-prefix), skipping the whole
+prefix when the newest version is a deletion / zero.
 
 ### Unaffected
 
@@ -216,22 +226,29 @@ increasing under the new encoding, so the bulk-load path is unaffected.
 `archive-init` is therefore the tool used to (re)build archive DBs in the new
 format.
 
-## On-disk format change and migration
+## Enabling and migration
 
-This is a **breaking on-disk format change** for the archive `AddressToAccount`
-and `AddressToStorage` CFs:
+The encoding is opt-in via **`--inverted-block-encoding`**, off by default, so
+upgrading the binary alone changes nothing — existing archive DBs keep the
+ascending layout and are served with the legacy backward-seek readers.
 
-- Keys written by the old ascending layout are **not** correctly readable by the
-  new forward-seek readers, and vice versa.
-- There is **no in-DB format marker**, so a mismatch fails *silently* (wrong
-  values), not loudly.
+The two layouts are **mutually unreadable** for the `AddressToAccount` /
+`AddressToStorage` CFs: keys written ascending are not correctly read by the
+forward-seek readers and vice versa. There is **no in-DB format marker**, so the
+operator is responsible for keeping the flag consistent — a mismatch fails
+*silently* (wrong values), not loudly.
 
-**Migration:** rebuild the archive database with a matching-version
-`archive-init` (or re-sync). The `archive-init` binary and the serving
-`standalone --archive` binary must be built from the **same** version — never
-point a new-format node at an old-format DB or vice versa.
+To adopt the inverted layout:
 
-State Node databases require no migration.
+1. **Rebuild** the archive DB with `archive-init --inverted-block-encoding`
+   (or re-sync into a fresh DB with the flag).
+2. **Serve** it with `standalone --archive --inverted-block-encoding`.
+
+The flag on the builder and on the serving node must match the bytes on disk.
+The default (no flag, ascending) and a fully-rebuilt inverted DB are both
+self-consistent; the only failure mode is pointing a flag at a DB written with
+the other setting. State Node databases are unaffected by the flag and require
+no migration.
 
 ## Results
 

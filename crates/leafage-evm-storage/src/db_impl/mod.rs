@@ -9,7 +9,7 @@ mod error;
 
 pub use archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,
+    inverted_block_encoding, set_inverted_block_encoding, ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,
 };
 pub use error::Error as StorageError;
 pub use mdbx_impl::{

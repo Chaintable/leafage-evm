@@ -67,23 +67,64 @@
 //! iterators that reconstruct the latest state correspondingly take the
 //! **first** record of each prefix (the newest) rather than the last.
 //!
-//! ## On-disk compatibility
+//! ## Runtime toggle and on-disk compatibility
 //!
-//! This is a **breaking on-disk format change** for the account/storage CFs of
-//! archive databases: keys written by the old ascending layout are not
-//! readable by the descending readers and vice versa. There is no in-DB format
-//! marker, so an existing archive DB must be **rebuilt** (e.g. via
-//! `archive-init`, or re-synced) after adopting this encoding. The
-//! `BlockNumToBlockHash` index is unaffected — it keeps ascending
-//! [`encode_block_num`], as its readers decode the raw block number.
+//! The descending layout is **opt-in at runtime** via the process-global flag
+//! set by [`set_inverted_block_encoding`] (driven by the
+//! `--inverted-block-encoding` CLI option). When unset (the default), the
+//! account/storage key tails use the legacy **ascending** [`encode_block_num`]
+//! and the readers use `SeekForPrev` / last-record-per-prefix; when set, they
+//! use [`encode_block_num_desc`] and forward `Seek` / first-record-per-prefix.
+//!
+//! The two layouts are **mutually unreadable**: keys written ascending are not
+//! correctly read by the descending readers and vice versa, and there is no
+//! in-DB marker. The operator is responsible for matching the flag to the
+//! database — run with `--inverted-block-encoding` only against a DB built
+//! (via `archive-init` / re-sync) with the same flag. The archive backend
+//! opens a single DB per process, so the flag is a process-wide setting fixed
+//! at startup.
+//!
+//! The `BlockNumToBlockHash` index is unaffected either way — it keeps
+//! ascending [`encode_block_num`], as its readers decode the raw block number.
 
 use alloy_rlp::Encodable;
 use leafage_evm_types::{NewAccount, SlimAccount, H256};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Length of the encoded `(address, block_num)` account key.
 pub const ACCOUNT_KEY_LEN: usize = 64;
 /// Length of the encoded `(address, storage_key, block_num)` storage key.
 pub const STORAGE_KEY_LEN: usize = 96;
+
+/// Process-global selector for the versioned key encoding. `false` (default) =
+/// legacy ascending; `true` = descending/inverted. Set once at startup from the
+/// `--inverted-block-encoding` CLI flag, before any archive read/write.
+static INVERTED_BLOCK_ENCODING: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide versioned-key encoding. Call once at startup (before
+/// opening the archive DB or encoding any key); the archive backend operates a
+/// single DB per process in one mode for its lifetime.
+#[inline]
+pub fn set_inverted_block_encoding(inverted: bool) {
+    INVERTED_BLOCK_ENCODING.store(inverted, Ordering::Relaxed);
+}
+
+/// Whether versioned account/storage keys use the descending (inverted) height
+/// tail. Reads, writes, and full-scan iterators must all branch on this.
+#[inline]
+pub fn inverted_block_encoding() -> bool {
+    INVERTED_BLOCK_ENCODING.load(Ordering::Relaxed)
+}
+
+/// Encode the version tail per the current [`inverted_block_encoding`] mode.
+#[inline]
+fn encode_version_tail(block_num: u64) -> [u8; 32] {
+    if inverted_block_encoding() {
+        encode_block_num_desc(block_num)
+    } else {
+        encode_block_num(block_num)
+    }
+}
 
 /// Encode a raw, **ascending** big-endian block number into the trailing
 /// 32-byte slot. Used by the `BlockNumToBlockHash` index, whose readers decode
@@ -104,22 +145,20 @@ pub fn encode_block_num_desc(block_num: u64) -> [u8; 32] {
     encode_block_num(u64::MAX - block_num)
 }
 
-/// Encode account key: `address(32) || (MAX - block_num)(32 BE)`.
-///
-/// The inverted height makes a forward `Seek(address || (MAX - H))` land on the
-/// greatest version `≤ H`; see the module docs.
+/// Encode account key: `address(32) || version_tail(32 BE)`, where the tail is
+/// ascending or descending per [`inverted_block_encoding`]. In inverted mode a
+/// forward `Seek(address || (MAX - H))` lands on the greatest version `≤ H`; in
+/// legacy mode a `SeekForPrev(address || H)` does. See the module docs.
 #[inline]
 pub fn encode_account_key(address: H256, block_num: u64) -> [u8; ACCOUNT_KEY_LEN] {
     let mut key = [0u8; ACCOUNT_KEY_LEN];
     key[..32].copy_from_slice(address.as_slice());
-    key[32..64].copy_from_slice(&encode_block_num_desc(block_num));
+    key[32..64].copy_from_slice(&encode_version_tail(block_num));
     key
 }
 
-/// Encode storage key: `address(32) || storage_key(32) || (MAX - block_num)(32 BE)`.
-///
-/// The inverted height makes a forward `Seek(address || slot || (MAX - H))` land
-/// on the greatest version `≤ H`; see the module docs.
+/// Encode storage key: `address(32) || storage_key(32) || version_tail(32 BE)`,
+/// with the tail ascending or descending per [`inverted_block_encoding`].
 #[inline]
 pub fn encode_storage_key(
     address: H256,
@@ -129,7 +168,7 @@ pub fn encode_storage_key(
     let mut key = [0u8; STORAGE_KEY_LEN];
     key[..32].copy_from_slice(address.as_slice());
     key[32..64].copy_from_slice(storage_key.as_slice());
-    key[64..96].copy_from_slice(&encode_block_num_desc(block_num));
+    key[64..96].copy_from_slice(&encode_version_tail(block_num));
     key
 }
 

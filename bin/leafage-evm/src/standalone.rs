@@ -296,6 +296,18 @@ pub struct Command {
     /// `state` / `archive` override that explicitly, regardless of --archive.
     #[arg(long, value_enum, default_value_t = NodeTypeArg::Auto)]
     node_type: NodeTypeArg,
+
+    /// Use the inverted (descending) block-height key encoding for archive
+    /// account/storage reads and writes.
+    /// Default: false (legacy ascending encoding)
+    ///
+    /// The descending encoding turns historical reads into forward seeks that
+    /// use the prefix bloom (much faster `eth_call`). It is a different on-disk
+    /// key layout: only enable this against an archive DB built (via
+    /// `archive-init` / re-sync) with the same flag — mixing layouts silently
+    /// returns wrong values. Has no effect in state-node (non-archive) mode.
+    #[arg(long, default_value_t = false)]
+    inverted_block_encoding: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -698,6 +710,8 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Fix the versioned-key encoding mode before any archive DB access.
+        leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         let (updater_handle, rpc_handle, resgitry_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
