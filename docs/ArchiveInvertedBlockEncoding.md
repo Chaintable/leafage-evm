@@ -85,24 +85,77 @@ is inherently costlier.
 
 ### 2. The prefix bloom is effectively unusable on the backward path
 
-This is the decisive issue. The prefix bloom answers "does this run contain any
-key with prefix `P`?" Consider what each seek direction needs:
+This is the decisive issue, and it is worth stating carefully because the
+asymmetry is subtle: it is **not** that a backward seek is "more likely to be
+wrong" — it is about *which operation RocksDB exposes a prefix-scoped,
+bloom-optimized variant for*.
 
-- **Forward `Seek`** (smallest key `>= target`, within prefix `P`): if a run has
-  no key with prefix `P`, it holds nothing relevant → **safe to skip**. The
-  bloom's "no" maps directly onto a skip decision.
+#### The anchor: the only valid answer has prefix exactly `P`
 
-- **`SeekForPrev`** (largest key `<= target`): the answer can legitimately have a
-  *smaller, different* prefix. If the queried slot has no version `<= H`, its
-  predecessor is a key in a *neighbouring* prefix — living in a run whose
-  prefix bloom for `P` says "definitely not". So "no key with prefix `P`" does
-  **not** imply "nothing relevant here", and the bloom's negative answer cannot
-  justify a skip without risking a wrong result.
+The query is "newest version of *this* `(address, slot)`", so the prefix
+`P = address(‖slot)` is **fixed and exact**. After the seek, the reader
+prefix-checks the landed key and rejects anything whose prefix `≠ P`. A key with
+a *different* prefix — whether smaller or larger than `P` — is therefore **never**
+a valid answer. The prefix bloom answers exactly one question: "does this run
+contain any key with prefix `P`?" A skip based on it is sound only if it can
+never drop the run that holds our prefix-`P` answer.
 
-Because of this **directional asymmetry**, RocksDB cannot drive file-skipping off
-the prefix bloom on the `SeekForPrev` path (it falls back to total-order
-behaviour or restricts to same-prefix semantics). The prefix bloom is configured
-but half-bypassed.
+#### Why the forward `Seek` skip is sound
+
+Target `T = P‖(MAX − H)`; we want the smallest key `≥ T` **with prefix `P`**.
+Take any run whose prefix bloom says "no key with prefix `P`". Can our answer be
+in it? **No** — by definition it has zero prefix-`P` keys, and the answer must
+have prefix `P`. So the skip can never lose the answer.
+
+The natural objection: *"what if that skipped run holds a key with a prefix just
+`≥ P` (a different, larger prefix `P''`) that is the smallest key `≥ T`?"* It
+cannot matter, because of how sorting interacts with the prefix-check:
+
+- Keys sort by full bytes, so **every** prefix-`P` key precedes **every**
+  prefix-`P''` key (`P < P''`).
+- If the slot *has* a version `≤ H`, that version is a prefix-`P` key `≥ T` and is
+  **smaller** than any prefix-`P''` key, so it is the true answer — and it lives
+  in a run the bloom did *not* skip. The `P''` key never wins.
+- If the slot has *no* version `≤ H`, there is no prefix-`P` key `≥ T` at all and
+  the correct answer is "absent". Whether we land on a `P''` key and reject it in
+  the prefix-check, or skip its run and the iterator goes invalid, the result is
+  identical: **absent**.
+
+So a larger-prefix key `≥ T` is never something we want, and skipping its run
+costs nothing. The forward skip never turns a real answer into a miss.
+
+#### Why `SeekForPrev` cannot get the same skip
+
+Symmetrically, *for our prefix-scoped query*, the largest prefix-`P` key `≤ T`
+also cannot hide in a no-`P` run — so in principle a prefix-scoped *backward*
+seek would be just as safe to optimize. The problem is that **RocksDB does not
+offer a prefix-scoped backward seek.**
+
+- **Forward `Seek` (in prefix-seek mode) *is* the prefix-scoped operation.**
+  RocksDB knows the caller only wants keys sharing the target's prefix, so it is
+  entitled to apply the prefix-bloom skip — that is the prefix bloom's entire
+  purpose.
+- **`SeekForPrev` is the *general total-order predecessor*:** "the largest key
+  `≤ T` anywhere in the keyspace," whose answer **legitimately can be a smaller,
+  different prefix** (the key just below `T` in a neighbouring prefix). RocksDB
+  must honour that contract for every caller — including ones that do **not**
+  prefix-check — so it cannot assume the answer has prefix `P`, and therefore
+  cannot use "no key with prefix `P`" to skip a run: that run might hold the
+  legitimate cross-prefix predecessor.
+
+In short: the bloom skip is unsafe for the operation RocksDB actually exposes
+(general predecessor), even though it would be safe for the prefix-scoped
+predecessor we conceptually want. RocksDB only exposes a prefix-scoped, bloom-
+optimized **successor** (forward `Seek`) — there is no prefix-scoped predecessor.
+
+#### The consequence
+
+So on the ascending layout, `SeekForPrev` runs in total-order mode (or requires
+`total_order_seek`, which disables the prefix-bloom skip outright): the per-CF
+prefix bloom is configured but **half-bypassed**, and every backward lookup must
+position in and merge across every run that could hold a key near `T` — not just
+the runs that actually hold prefix `P`. Inverting the height converts our
+"newest `≤ H`" into a forward `Seek`, the one operation that gets the skip.
 
 ### Why this made `eth_call` slow
 
