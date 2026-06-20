@@ -1,16 +1,17 @@
 use crate::polygon::instructions::polygon_instructions;
+use crate::polygon::precompile::polygon_precompiles;
 use crate::polygon::PolygonHardfork;
+use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv};
 use revm::context::{Context, FrameStack};
 use revm::context::{Evm, JournalTr, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
-use revm::handler::{EthFrame, EthPrecompiles, EvmTr, FrameInitOrResult, FrameResult};
+use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult};
 use revm::inspector::InspectorEvmTr;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::primitives::hardfork::SpecId;
 use revm::{Inspector, Journal};
 use std::ops::{Deref, DerefMut};
 
@@ -23,7 +24,7 @@ pub struct PolygonEvm<DB: revm::database::Database, I> {
         PolygonContext<DB>,
         I,
         EthInstructions<EthInterpreter, PolygonContext<DB>>,
-        EthPrecompiles,
+        PrecompilesMap,
         EthFrame,
     >,
 }
@@ -31,7 +32,7 @@ pub struct PolygonEvm<DB: revm::database::Database, I> {
 impl<DB: Database, I> PolygonEvm<DB, I> {
     pub fn new(env: EvmEnv<PolygonHardfork>, db: DB, inspector: I) -> Self {
         let hardfork = env.cfg_env.spec;
-        let spec: SpecId = hardfork.into();
+        let precompiles = PrecompilesMap::from_static(polygon_precompiles(hardfork));
 
         Self {
             inner: Evm {
@@ -46,7 +47,7 @@ impl<DB: Database, I> PolygonEvm<DB, I> {
                 },
                 inspector,
                 instruction: polygon_instructions::<DB>(hardfork),
-                precompiles: EthPrecompiles::new(spec),
+                precompiles,
                 frame_stack: Default::default(),
             },
         }
@@ -83,7 +84,7 @@ where
 {
     type Context = PolygonContext<DB>;
     type Instructions = EthInstructions<EthInterpreter, PolygonContext<DB>>;
-    type Precompiles = EthPrecompiles;
+    type Precompiles = PrecompilesMap;
     type Frame = EthFrame;
 
     fn all(
