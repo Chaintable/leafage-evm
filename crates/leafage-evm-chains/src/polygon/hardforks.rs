@@ -1,6 +1,6 @@
 use crate::polygon::gas::apply_gas_rules;
 use alloy_hardforks::{hardfork, ForkCondition};
-use leafage_evm_types::{BlockEnv, CfgEnv};
+use leafage_evm_types::CfgEnv;
 use revm::primitives::hardfork::SpecId;
 
 const ISTANBUL_ACTIVATION_BLOCK: u64 = 3_395_000;
@@ -42,7 +42,7 @@ hardfork!(
 );
 
 impl PolygonHardfork {
-    pub fn from_block_number(block_number: u64) -> Self {
+    pub fn active_at_block(block_number: u64) -> Self {
         Self::VARIANTS
             .iter()
             .rev()
@@ -66,32 +66,13 @@ impl PolygonHardfork {
         }
     }
 
-    pub fn apply_to_cfg(self, base_cfg: &CfgEnv<PolygonHardfork>) -> CfgEnv<PolygonHardfork> {
-        let mut cfg = base_cfg.clone();
+    pub fn apply_cfg(self, cfg: &mut CfgEnv<PolygonHardfork>) {
         cfg.set_spec_and_mainnet_gas_params(self);
-        apply_gas_rules(self, &mut cfg);
-        cfg
+        apply_gas_rules(self, cfg);
     }
 
     pub fn is_pip88_enabled(self) -> bool {
         self >= Self::Chicago
-    }
-
-    pub(crate) fn is_madhugiri_enabled(self) -> bool {
-        self >= Self::Madhugiri
-    }
-}
-
-impl From<PolygonHardfork> for CfgEnv<PolygonHardfork> {
-    fn from(spec: PolygonHardfork) -> Self {
-        spec.apply_to_cfg(&CfgEnv::default())
-    }
-}
-
-impl From<&BlockEnv> for PolygonHardfork {
-    fn from(block_env: &BlockEnv) -> Self {
-        let block_number: u64 = block_env.number.saturating_to();
-        Self::from_block_number(block_number)
     }
 }
 
@@ -123,30 +104,6 @@ impl From<PolygonHardfork> for SpecId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::polygon::gas::{
-        COLD_SSTORE_ADDITIONAL_COST_PIP88, COLD_SSTORE_COST_PIP88,
-        SSTORE_CLEARS_SCHEDULE_REFUND_PIP88, SSTORE_RESET_WITHOUT_COLD_LOAD_COST_PIP88,
-        TX_GAS_LIMIT_CAP_POST_MADHUGIRI,
-    };
-    use revm::primitives::U256;
-
-    fn block_env(number: u64) -> BlockEnv {
-        let mut block_env = BlockEnv::default();
-        block_env.number = U256::from(number);
-        block_env
-    }
-
-    #[test]
-    fn resolves_chicago_at_pip88_block() {
-        assert_eq!(
-            PolygonHardfork::from_block_number(CHICAGO_ACTIVATION_BLOCK - 1),
-            PolygonHardfork::Lisovo
-        );
-        assert_eq!(
-            PolygonHardfork::from_block_number(CHICAGO_ACTIVATION_BLOCK),
-            PolygonHardfork::Chicago
-        );
-    }
 
     #[test]
     fn resolves_hardfork_from_activation_conditions() {
@@ -163,7 +120,7 @@ mod tests {
             (PolygonHardfork::Chicago, CHICAGO_ACTIVATION_BLOCK),
         ] {
             assert!(fork.fork_activation().active_at_block(block_number));
-            assert_eq!(PolygonHardfork::from_block_number(block_number), fork);
+            assert_eq!(PolygonHardfork::active_at_block(block_number), fork);
         }
     }
 
@@ -171,49 +128,5 @@ mod tests {
     fn resolves_cli_spec_id_from_variant_order() {
         assert_eq!(PolygonHardfork::try_from(9), Ok(PolygonHardfork::Chicago));
         assert_eq!(PolygonHardfork::try_from(10), Err(()));
-    }
-
-    #[test]
-    fn resolves_hardfork_from_block_env() {
-        assert_eq!(
-            PolygonHardfork::from(&block_env(CHICAGO_ACTIVATION_BLOCK)),
-            PolygonHardfork::Chicago
-        );
-    }
-
-    #[test]
-    fn applies_madhugiri_tx_gas_cap() {
-        let mut cfg = CfgEnv::new_with_spec(PolygonHardfork::Chicago);
-        cfg.tx_gas_limit_cap = Some(u64::MAX);
-        let block_env = block_env(MADHUGIRI_ACTIVATION_BLOCK);
-
-        let cfg = PolygonHardfork::from(&block_env).apply_to_cfg(&cfg);
-
-        assert_eq!(cfg.tx_gas_limit_cap, Some(TX_GAS_LIMIT_CAP_POST_MADHUGIRI));
-    }
-
-    #[test]
-    fn pip88_uses_sstore_cold_cost_in_cfg_table() {
-        let base_cfg = CfgEnv::default();
-        let block_env = block_env(CHICAGO_ACTIVATION_BLOCK);
-        let cfg = PolygonHardfork::from(&block_env).apply_to_cfg(&base_cfg);
-
-        assert_eq!(
-            cfg.gas_params.cold_storage_additional_cost(),
-            COLD_SSTORE_ADDITIONAL_COST_PIP88
-        );
-        assert_eq!(cfg.gas_params.cold_storage_cost(), COLD_SSTORE_COST_PIP88);
-        assert_eq!(
-            cfg.gas_params.sstore_clearing_slot_refund(),
-            SSTORE_CLEARS_SCHEDULE_REFUND_PIP88
-        );
-        assert_eq!(
-            cfg.gas_params.sstore_reset_without_cold_load_cost(),
-            SSTORE_RESET_WITHOUT_COLD_LOAD_COST_PIP88
-        );
-        assert_eq!(
-            cfg.gas_params.sstore_reset_refund(),
-            SSTORE_RESET_WITHOUT_COLD_LOAD_COST_PIP88
-        );
     }
 }

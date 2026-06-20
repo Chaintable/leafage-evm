@@ -1,6 +1,6 @@
 use crate::polygon::api::PolygonContext;
-use crate::polygon::gas::{
-    COLD_SLOAD_ADDITIONAL_COST_PIP88, COLD_SSTORE_ADDITIONAL_COST_PIP88, WARM_STORAGE_READ_COST,
+use crate::polygon::gas::pip88_costs::{
+    COLD_SLOAD_ADDITIONAL_COST, COLD_SSTORE_ADDITIONAL_COST, WARM_STORAGE_READ_COST,
 };
 use crate::polygon::PolygonHardfork;
 use revm::bytecode::opcode::{SLOAD, SSTORE};
@@ -48,13 +48,11 @@ fn sload_pip88<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
     };
     let target = context.interpreter.input.target_address();
 
-    let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_ADDITIONAL_COST_PIP88;
+    let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_ADDITIONAL_COST;
     let res = context.host.sload_skip_cold_load(target, index, skip_cold);
     match res {
         Ok(storage) => {
-            if storage.is_cold
-                && !record_cost(context.interpreter, COLD_SLOAD_ADDITIONAL_COST_PIP88)
-            {
+            if storage.is_cold && !record_cost(context.interpreter, COLD_SLOAD_ADDITIONAL_COST) {
                 return;
             }
 
@@ -97,7 +95,7 @@ fn sstore_pip88<WIRE: InterpreterTypes, H: Host + ?Sized>(
     }
 
     let target = context.interpreter.input.target_address();
-    let skip_cold = context.interpreter.gas.remaining() < COLD_SSTORE_ADDITIONAL_COST_PIP88;
+    let skip_cold = context.interpreter.gas.remaining() < COLD_SSTORE_ADDITIONAL_COST;
     let state_load = match context
         .host
         .sstore_skip_cold_load(target, index, value, skip_cold)
