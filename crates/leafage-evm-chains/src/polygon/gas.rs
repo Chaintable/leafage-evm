@@ -17,11 +17,6 @@ pub(crate) mod pip88_costs {
         SSTORE_RESET_GAS_EIP2200 - COLD_SSTORE_COST + TX_ACCESS_LIST_STORAGE_KEY_GAS;
 }
 
-use pip88_costs::{
-    COLD_SSTORE_ADDITIONAL_COST, COLD_SSTORE_COST, SSTORE_CLEARS_SCHEDULE_REFUND,
-    SSTORE_RESET_WITHOUT_COLD_LOAD_COST,
-};
-
 pub(crate) fn apply_gas_rules(hardfork: PolygonHardfork, cfg: &mut CfgEnv<PolygonHardfork>) {
     apply_storage_gas(hardfork, cfg);
 }
@@ -46,20 +41,20 @@ fn pip88_storage_overrides() -> impl Iterator<Item = (GasId, u64)> {
     [
         (
             GasId::cold_storage_additional_cost(),
-            COLD_SSTORE_ADDITIONAL_COST,
+            pip88_costs::COLD_SSTORE_ADDITIONAL_COST,
         ),
-        (GasId::cold_storage_cost(), COLD_SSTORE_COST),
+        (GasId::cold_storage_cost(), pip88_costs::COLD_SSTORE_COST),
         (
             GasId::sstore_reset_without_cold_load_cost(),
-            SSTORE_RESET_WITHOUT_COLD_LOAD_COST,
+            pip88_costs::SSTORE_RESET_WITHOUT_COLD_LOAD_COST,
         ),
         (
             GasId::sstore_clearing_slot_refund(),
-            SSTORE_CLEARS_SCHEDULE_REFUND,
+            pip88_costs::SSTORE_CLEARS_SCHEDULE_REFUND,
         ),
         (
             GasId::sstore_reset_refund(),
-            SSTORE_RESET_WITHOUT_COLD_LOAD_COST,
+            pip88_costs::SSTORE_RESET_WITHOUT_COLD_LOAD_COST,
         ),
     ]
     .into_iter()
@@ -68,10 +63,6 @@ fn pip88_storage_overrides() -> impl Iterator<Item = (GasId, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pip88_costs::{
-        COLD_SSTORE_COST, SSTORE_RESET_GAS_EIP2200, SSTORE_RESET_WITHOUT_COLD_LOAD_COST,
-        WARM_STORAGE_READ_COST,
-    };
     use revm::context_interface::context::SStoreResult;
     use revm::primitives::U256;
 
@@ -94,27 +85,33 @@ mod tests {
         };
 
         let cold_reset_existing = slot(val42, val42, val99);
-        assert_eq!(total(&cold_reset_existing, true), SSTORE_RESET_GAS_EIP2200);
+        assert_eq!(
+            total(&cold_reset_existing, true),
+            pip88_costs::SSTORE_RESET_GAS_EIP2200
+        );
 
         let warm_reset_existing = slot(val42, val42, val99);
         assert_eq!(
             total(&warm_reset_existing, false),
-            SSTORE_RESET_GAS_EIP2200 - COLD_SSTORE_COST
+            pip88_costs::SSTORE_RESET_GAS_EIP2200 - pip88_costs::COLD_SSTORE_COST
         );
 
         let cold_create = slot(U256::ZERO, U256::ZERO, val99);
-        assert_eq!(total(&cold_create, true), COLD_SSTORE_COST + 20_000);
+        assert_eq!(
+            total(&cold_create, true),
+            pip88_costs::COLD_SSTORE_COST + 20_000
+        );
 
         let cold_noop = slot(val42, val42, val42);
         assert_eq!(
             total(&cold_noop, true),
-            COLD_SSTORE_COST + WARM_STORAGE_READ_COST
+            pip88_costs::COLD_SSTORE_COST + pip88_costs::WARM_STORAGE_READ_COST
         );
 
         let reset_to_original_existing = slot(val42, val99, val42);
         assert_eq!(
             gas.sstore_refund(true, &reset_to_original_existing),
-            SSTORE_RESET_WITHOUT_COLD_LOAD_COST as i64
+            pip88_costs::SSTORE_RESET_WITHOUT_COLD_LOAD_COST as i64
         );
     }
 }
