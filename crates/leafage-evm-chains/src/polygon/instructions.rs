@@ -34,10 +34,7 @@ fn install_pip88_storage_instructions<DB: revm::database::Database>(
     );
     instructions.insert_instruction(
         SSTORE,
-        Instruction::new(
-            sstore_pip88::<EthInterpreter, PolygonContext<DB>>,
-            WARM_STORAGE_READ_COST,
-        ),
+        Instruction::new(sstore_pip88::<EthInterpreter, PolygonContext<DB>>, 0),
     );
 }
 
@@ -133,4 +130,24 @@ fn record_cost<WIRE: InterpreterTypes>(
 
     interpreter.halt_oog();
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::database_interface::EmptyDB;
+
+    #[test]
+    fn pip88_storage_instruction_static_gas_matches_revm_model() {
+        let instructions = polygon_instructions::<EmptyDB>(PolygonHardfork::Chicago);
+
+        assert_eq!(
+            instructions.instruction_table[SLOAD as usize].static_gas(),
+            WARM_STORAGE_READ_COST
+        );
+        assert_eq!(
+            instructions.instruction_table[SSTORE as usize].static_gas(),
+            0
+        );
+    }
 }
