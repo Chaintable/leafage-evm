@@ -100,6 +100,22 @@ fn rocksdb_read_options() -> ReadOptions {
     read_options
 }
 
+/// Read options for **full-range scans** (the `LatestStateDBIterator` /
+/// `BlockIterator` full-CF iterations).
+///
+/// The `AddressToAccount` / `AddressToStorage` CFs carry a `prefix_extractor`,
+/// so a default iterator runs in *prefix-seek mode*, where iterating across
+/// prefix boundaries is **not guaranteed to return all keys** — a full scan can
+/// silently skip data. `total_order_seek = true` forces a complete, prefix-
+/// agnostic traversal. (Point reads keep `rocksdb_read_options()` so their
+/// in-prefix `seek` still uses the prefix bloom.)
+fn rocksdb_scan_read_options() -> ReadOptions {
+    let mut read_options = ReadOptions::default();
+    read_options.set_verify_checksums(false);
+    read_options.set_total_order_seek(true);
+    read_options
+}
+
 impl StorageTypeColumn {
     fn to_str(&self) -> &'static str {
         match self {
@@ -939,7 +955,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                rocksdb_scan_read_options(),
                 IteratorMode::Start,
             )
             .peekable();
@@ -1003,7 +1019,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::HashToCode.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                rocksdb_scan_read_options(),
                 IteratorMode::Start,
             )
             .map(|item| {
@@ -1029,7 +1045,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                rocksdb_scan_read_options(),
                 IteratorMode::Start,
             )
             .peekable();
@@ -1082,7 +1098,7 @@ impl BlockIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                rocksdb_scan_read_options(),
                 IteratorMode::Start,
             )
             .map(|item| {
@@ -1121,7 +1137,7 @@ impl BlockIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                rocksdb_scan_read_options(),
                 IteratorMode::Start,
             )
             .map(|item| {
