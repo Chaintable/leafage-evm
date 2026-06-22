@@ -127,6 +127,15 @@ pub struct Command {
     /// both during bulk-load ingest and the post-ingest compact() reopen.
     #[arg(long, default_value = "false")]
     archive_zstd_compression: bool,
+
+    /// Write account/storage keys with the inverted (descending) block-height
+    /// encoding. Default: false (legacy ascending).
+    ///
+    /// Must match the `--inverted-block-encoding` flag the serving
+    /// `standalone --archive` node runs with — the two layouts are mutually
+    /// unreadable.
+    #[arg(long, default_value = "false")]
+    inverted_block_encoding: bool,
 }
 
 /// Data fetched and pre-encoded for a single block, to be written by the
@@ -839,8 +848,12 @@ fn spawn_rocksdb_watermark_advancer(
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
         info!(target: "archive_init", "Starting archive initialization");
-        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, db_type: {:?}",
-              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type);
+        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, db_type: {:?}, inverted_block_encoding: {}",
+              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type, self.inverted_block_encoding);
+
+        // Fix the versioned-key encoding before any key is encoded (fetchers
+        // call encode_account_key / encode_storage_key off the writer thread).
+        leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
 
         // Validate checkpoint_interval
         if self.checkpoint_interval == 0 {

@@ -23,6 +23,7 @@ use super::{default_page_size, DEFAULT_MAX_READERS, GIGABYTE, MEGABYTE, TERABYTE
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+    inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
@@ -408,43 +409,66 @@ impl DataBase {
 
 // ===== Helper Functions =====
 
-/// Simulate seek_for_prev for MDBX cursor.
+/// Forward seek: smallest key `>= target_key` (MDBX `set_range`).
 ///
-/// Returns the key-value pair where key <= target_key.
-/// If no such key exists, returns None.
+/// Returns `None` when no key `>= target_key` exists. With the descending
+/// height encoding (`MAX - block_num`), the greatest version `<= H` is the
+/// smallest key `>= address(‖slot)‖(MAX - H)`, so this lands on it directly.
 ///
 /// # Important
 ///
-/// When no key >= target_key exists, this function returns the **last entry**
-/// in the database, which may have a completely different key prefix.
-/// **Callers must verify the returned key matches the expected prefix** before
-/// using the value. This is by design for archive storage where we need to find
-/// the most recent state at or before a given block number.
-fn seek_for_prev<'a>(
+/// When the queried slot has no version `<= H`, the landed key belongs to a
+/// different (later) prefix. **Callers must verify the returned key matches the
+/// expected prefix** before using the value; a mismatch means the slot was
+/// first written after `H` (absent at that height). See the archive_encoding
+/// module docs.
+fn seek_ge<'a>(
     cursor: &'a mut Cursor<RO>,
     target_key: &[u8],
 ) -> Result<Option<(Cow<'a, [u8]>, Cow<'a, [u8]>)>, Error> {
-    // Try to set_range to find key >= target_key
+    cursor
+        .set_range::<Cow<'a, [u8]>, Cow<'a, [u8]>>(target_key)
+        .map_err(|e| Error::UnSupported(format!("Set range failed: {}", e)))
+}
+
+/// Backward seek: largest key `<= target_key` (legacy ascending encoding).
+///
+/// With ascending height keys, the greatest version `<= H` is the largest key
+/// `<= address(‖slot)‖H`. When no key `>= target` exists this returns the last
+/// entry (a different prefix), so **callers must prefix-check** the result.
+fn seek_le<'a>(
+    cursor: &'a mut Cursor<RO>,
+    target_key: &[u8],
+) -> Result<Option<(Cow<'a, [u8]>, Cow<'a, [u8]>)>, Error> {
     match cursor.set_range::<Cow<'a, [u8]>, Cow<'a, [u8]>>(target_key) {
         Ok(Some((key, value))) => {
             if key.as_ref() == target_key {
-                // Exact match
                 Ok(Some((key, value)))
             } else {
-                // key > target_key, need to go back one step
+                // key > target_key, step back one.
                 cursor
                     .prev::<Cow<'a, [u8]>, Cow<'a, [u8]>>()
                     .map_err(|e| Error::UnSupported(format!("Cursor prev failed: {}", e)))
             }
         }
-        Ok(None) => {
-            // No key >= target_key found, all keys are < target_key
-            // Go to the last entry (caller must verify prefix!)
-            cursor
-                .last::<Cow<'a, [u8]>, Cow<'a, [u8]>>()
-                .map_err(|e| Error::UnSupported(format!("Cursor last failed: {}", e)))
-        }
+        // All keys < target_key: the last entry is the largest <= target.
+        Ok(None) => cursor
+            .last::<Cow<'a, [u8]>, Cow<'a, [u8]>>()
+            .map_err(|e| Error::UnSupported(format!("Cursor last failed: {}", e))),
         Err(e) => Err(Error::UnSupported(format!("Set range failed: {}", e))),
+    }
+}
+
+/// Greatest version `<= block_num`, dispatching on the current encoding mode:
+/// inverted -> forward [`seek_ge`]; legacy ascending -> backward [`seek_le`].
+fn seek_version<'a>(
+    cursor: &'a mut Cursor<RO>,
+    target_key: &[u8],
+) -> Result<Option<(Cow<'a, [u8]>, Cow<'a, [u8]>)>, Error> {
+    if inverted_block_encoding() {
+        seek_ge(cursor, target_key)
+    } else {
+        seek_le(cursor, target_key)
     }
 }
 
@@ -494,8 +518,11 @@ impl LatestStateDBIterator for DataBase {
     fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
         match create_cursor(&self.env, StorageTable::AddressToAccount) {
             Ok(cursor) => {
-                let iter = cursor.iter_slices();
-                let mut iter = iter.peekable();
+                // Newest = FIRST record of each address prefix under inverted
+                // encoding, LAST under legacy ascending encoding.
+                let inverted = inverted_block_encoding();
+                let mut iter = cursor.iter_slices().peekable();
+                let mut consumed_prefix: Option<[u8; 32]> = None;
 
                 Box::new(std::iter::from_fn(move || {
                     loop {
@@ -512,26 +539,29 @@ impl LatestStateDBIterator for DataBase {
                         }
                         let address_bytes: [u8; 32] = key[..32].try_into().unwrap();
 
-                        // Check if next record has the same address
-                        let is_last_for_address = match iter.peek() {
-                            Some(Ok((next_key, _))) => {
-                                next_key.len() < 32 || next_key[..32] != address_bytes
+                        let is_newest = if inverted {
+                            let newest = consumed_prefix != Some(address_bytes);
+                            consumed_prefix = Some(address_bytes);
+                            newest
+                        } else {
+                            match iter.peek() {
+                                Some(Ok((next_key, _))) => {
+                                    next_key.len() < 32 || next_key[..32] != address_bytes
+                                }
+                                Some(Err(_)) => true,
+                                None => true,
                             }
-                            Some(Err(_)) => true,
-                            None => true,
                         };
-
-                        if !is_last_for_address {
+                        if !is_newest {
                             continue;
                         }
 
-                        let address = H256::from_slice(&address_bytes);
-
-                        // Skip empty values (deleted accounts)
+                        // Newest version is a deletion -> account absent at tip.
                         if value.is_empty() {
                             continue;
                         }
 
+                        let address = H256::from_slice(&address_bytes);
                         let mut raw_account_slice: &[u8] = &value;
                         match SlimAccount::decode(&mut raw_account_slice) {
                             Ok(account) => {
@@ -578,8 +608,11 @@ impl LatestStateDBIterator for DataBase {
     fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
         match create_cursor(&self.env, StorageTable::AddressToStorage) {
             Ok(cursor) => {
-                let iter = cursor.iter_slices();
-                let mut iter = iter.peekable();
+                // Newest = FIRST record of each (address||index) prefix under
+                // inverted encoding, LAST under legacy ascending encoding.
+                let inverted = inverted_block_encoding();
+                let mut iter = cursor.iter_slices().peekable();
+                let mut consumed_prefix: Option<[u8; 64]> = None;
 
                 Box::new(std::iter::from_fn(move || {
                     loop {
@@ -596,28 +629,31 @@ impl LatestStateDBIterator for DataBase {
                         }
                         let prefix: [u8; 64] = key[..64].try_into().unwrap();
 
-                        // Check if next record has the same (address, storage_key)
-                        let is_last_for_prefix = match iter.peek() {
-                            Some(Ok((next_key, _))) => {
-                                next_key.len() < 64 || next_key[..64] != prefix
+                        let is_newest = if inverted {
+                            let newest = consumed_prefix != Some(prefix);
+                            consumed_prefix = Some(prefix);
+                            newest
+                        } else {
+                            match iter.peek() {
+                                Some(Ok((next_key, _))) => {
+                                    next_key.len() < 64 || next_key[..64] != prefix
+                                }
+                                Some(Err(_)) => true,
+                                None => true,
                             }
-                            Some(Err(_)) => true,
-                            None => true,
                         };
+                        if !is_newest {
+                            continue;
+                        }
 
-                        if !is_last_for_prefix {
+                        let storage_value = U256::from_be_slice(&value);
+                        // Newest version is zero -> slot empty at tip.
+                        if storage_value == U256::ZERO {
                             continue;
                         }
 
                         let address = H256::from_slice(&prefix[..32]);
                         let storage_key = H256::from_slice(&prefix[32..64]);
-                        let storage_value = U256::from_be_slice(&value);
-
-                        // Skip zero values (deleted storage slots)
-                        if storage_value == U256::ZERO {
-                            continue;
-                        }
-
                         return Some(Ok((address, storage_key, storage_value)));
                     }
                 })) as Box<dyn Iterator<Item = _>>
@@ -761,8 +797,8 @@ impl StateDBRead for StateDB {
         // Key format: address(32) || block_num(32)
         let target_key = encode_account_key(address, self.block_num);
 
-        // Use seek_for_prev to find the latest account state <= block_num
-        let result = match seek_for_prev(&mut cursor, &target_key)? {
+        // Greatest version <= block_num (inverted -> forward, legacy -> backward).
+        let result = match seek_version(&mut cursor, &target_key)? {
             Some((key, value)) => {
                 // Verify the address prefix matches
                 if key.len() < 32 || &key[..32] != address.as_slice() {
@@ -817,8 +853,8 @@ impl StateDBRead for StateDB {
         // Key format: address(32) || storage_key(32) || block_num(32)
         let target_key = encode_storage_key(address, key, self.block_num);
 
-        // Use seek_for_prev to find the latest storage value <= block_num
-        let result = match seek_for_prev(&mut cursor, &target_key)? {
+        // Greatest version <= block_num (inverted -> forward, legacy -> backward).
+        let result = match seek_version(&mut cursor, &target_key)? {
             Some((found_key, value)) => {
                 // Verify the address and storage key prefix match
                 if found_key.len() < 64

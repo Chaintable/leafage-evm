@@ -24,6 +24,7 @@
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+    inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
@@ -928,8 +929,10 @@ impl LatestStateDBIterator for DataBaseRef {
     /// account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
     fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
-        // Data is sorted by address || block_num, so records for the same address are consecutive
-        // and ordered by block_num ascending. We need the last record for each address.
+        // Records for the same address are consecutive. The newest version is
+        // the FIRST record of the prefix under inverted (newest-first) encoding,
+        // and the LAST record under legacy ascending encoding.
+        let inverted = inverted_block_encoding();
         let mut iter = self
             .db
             .iterator_cf_opt(
@@ -941,6 +944,9 @@ impl LatestStateDBIterator for DataBaseRef {
             )
             .peekable();
 
+        // Address prefix whose newest version has already been handled (inverted).
+        let mut consumed_prefix: Option<[u8; 32]> = None;
+
         std::iter::from_fn(move || {
             loop {
                 let item = iter.next()?;
@@ -950,27 +956,30 @@ impl LatestStateDBIterator for DataBaseRef {
                 let (key, value) = item.unwrap();
                 let address_bytes: [u8; 32] = key[..32].try_into().unwrap();
 
-                // Check if next record has the same address
-                let is_last_for_address = match iter.peek() {
-                    Some(Ok((next_key, _))) => next_key[..32] != address_bytes,
-                    Some(Err(_)) => true, // Will handle error on next iteration
-                    None => true,         // No more records
+                let is_newest = if inverted {
+                    // First record of the prefix is newest.
+                    let newest = consumed_prefix != Some(address_bytes);
+                    consumed_prefix = Some(address_bytes);
+                    newest
+                } else {
+                    // Last record of the prefix is newest.
+                    match iter.peek() {
+                        Some(Ok((next_key, _))) => next_key[..32] != address_bytes,
+                        Some(Err(_)) => true,
+                        None => true,
+                    }
                 };
-
-                if !is_last_for_address {
-                    // Skip this record, there's a newer one for this address
+                if !is_newest {
                     continue;
                 }
 
-                // This is the last (newest) record for this address
-                let address = H256::from_slice(&address_bytes);
                 let mut raw_account_slice = value.as_ref();
-
-                // Skip empty values (deleted accounts)
+                // Newest version is a deletion -> account absent at tip.
                 if raw_account_slice.is_empty() {
                     continue;
                 }
 
+                let address = H256::from_slice(&address_bytes);
                 let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
                 let account = NewAccount {
                     address,
@@ -1010,8 +1019,10 @@ impl LatestStateDBIterator for DataBaseRef {
     /// account address | storage index -> storage value
     /// Returns the latest state for each (address, index) pair (the record with highest block_num)
     fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
-        // Data is sorted by address || index || block_num, so records for the same (address, index)
-        // are consecutive and ordered by block_num ascending. We need the last record for each pair.
+        // Records for the same (address, index) are consecutive. The newest is
+        // the FIRST record of the prefix under inverted encoding, the LAST under
+        // legacy ascending encoding.
+        let inverted = inverted_block_encoding();
         let mut iter = self
             .db
             .iterator_cf_opt(
@@ -1023,6 +1034,9 @@ impl LatestStateDBIterator for DataBaseRef {
             )
             .peekable();
 
+        // (address || index) prefix whose newest has been handled (inverted).
+        let mut consumed_prefix: Option<[u8; 64]> = None;
+
         std::iter::from_fn(move || {
             loop {
                 let item = iter.next()?;
@@ -1032,28 +1046,29 @@ impl LatestStateDBIterator for DataBaseRef {
                 let (key, value) = item.unwrap();
                 let prefix: [u8; 64] = key[..64].try_into().unwrap(); // address || index
 
-                // Check if next record has the same (address, index)
-                let is_last_for_prefix = match iter.peek() {
-                    Some(Ok((next_key, _))) => next_key[..64] != prefix,
-                    Some(Err(_)) => true, // Will handle error on next iteration
-                    None => true,         // No more records
+                let is_newest = if inverted {
+                    let newest = consumed_prefix != Some(prefix);
+                    consumed_prefix = Some(prefix);
+                    newest
+                } else {
+                    match iter.peek() {
+                        Some(Ok((next_key, _))) => next_key[..64] != prefix,
+                        Some(Err(_)) => true,
+                        None => true,
+                    }
                 };
-
-                if !is_last_for_prefix {
-                    // Skip this record, there's a newer one for this (address, index)
+                if !is_newest {
                     continue;
                 }
 
-                // This is the last (newest) record for this (address, index)
-                let address = H256::from_slice(&prefix[..32]);
-                let storage_key = H256::from_slice(&prefix[32..64]);
                 let storage_value = U256::from_be_slice(value.as_ref());
-
-                // Skip zero values (deleted storage slots)
+                // Newest version is zero -> slot empty at tip.
                 if storage_value == U256::ZERO {
                     continue;
                 }
 
+                let address = H256::from_slice(&prefix[..32]);
+                let storage_key = H256::from_slice(&prefix[32..64]);
                 return Some(Ok((address, storage_key, storage_value)));
             }
         })
@@ -1320,7 +1335,14 @@ impl StateDBRead for StateDB {
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        account_iter.seek_for_prev(target_key);
+        // Greatest version <= block_num: inverted encoding -> smallest key >=
+        // target (forward seek); legacy ascending -> largest key <= target
+        // (seek_for_prev). See archive_encoding module docs.
+        if inverted_block_encoding() {
+            account_iter.seek(target_key);
+        } else {
+            account_iter.seek_for_prev(target_key);
+        }
         STORAGE_METRICS
             .read_account_latency
             .record(start.elapsed().as_secs_f64());
@@ -1361,7 +1383,12 @@ impl StateDBRead for StateDB {
         let storage_iter = storage_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        storage_iter.seek_for_prev(target_key);
+        // Inverted -> forward seek; legacy ascending -> seek_for_prev. See read_account.
+        if inverted_block_encoding() {
+            storage_iter.seek(target_key);
+        } else {
+            storage_iter.seek_for_prev(target_key);
+        }
         STORAGE_METRICS
             .read_storage_latency
             .record(start.elapsed().as_secs_f64());
@@ -1671,6 +1698,13 @@ impl StateDBWrite for Arc<DataBaseRef> {
     }
 }
 
+/// Serializes tests that call [`DataBaseRef::open`]. The archive backend keeps
+/// the open DB in a process-global `static mut DATA_BASE` and hands out a
+/// pointer into it, so two concurrent opens invalidate each other's reference.
+/// Every test that opens an archive DB must hold this lock for its duration.
+#[cfg(test)]
+pub(crate) static ARCHIVE_DB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1950,6 +1984,9 @@ mod rewind_tests {
     /// and replaying the skipped diff must converge back to the old head.
     #[test]
     fn test_empty_diff_update_block_rewinds_head_pointer_archive() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "leafage-archive-rewind-test-{}",
             std::process::id()
@@ -2012,5 +2049,137 @@ mod rewind_tests {
             assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(9));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod inverted_encoding_tests {
+    use super::*;
+    use crate::db::{LatestStateDBIterator, StateDBRead, StateDBWrapper};
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+
+    fn block_info(number: u64) -> BlockInfo {
+        let mut raw = RawHeader::default();
+        raw.number = number;
+        BlockInfo::new(Block {
+            header: Header {
+                hash: H256::with_last_byte(number as u8),
+                inner: raw,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn slot_diff(addr: H256, slot: H256, balance: u64, value: u64) -> BlockStorageDiff {
+        BlockStorageDiff {
+            new_accounts: vec![NewAccount {
+                address: addr,
+                balance: U256::from(balance),
+                nonce: 1,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            }],
+            storage_diffs: vec![AccountStorageDiff {
+                address: addr,
+                diffs: vec![IndexValuePair {
+                    index: slot,
+                    value: U256::from(value),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// End-to-end versioned read/write round-trip, parameterized by encoding
+    /// mode. Writing a slot at blocks 5/10/20 and reading at arbitrary heights
+    /// must return the greatest version <= H, absence below the first write,
+    /// and the latest-state iterators must surface the newest version — under
+    /// BOTH the legacy ascending and the inverted descending encodings.
+    fn run_versioned_roundtrip(inverted: bool) {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(inverted);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-enc-{}-{}",
+            inverted,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let addr = H256::repeat_byte(0xab);
+            let slot = H256::repeat_byte(0x01);
+
+            // Contiguous blocks 1..=20; the slot/account change only at 5/10/20.
+            for n in 1..=20u64 {
+                let diff = match n {
+                    5 => slot_diff(addr, slot, 100, 7),
+                    10 => slot_diff(addr, slot, 200, 9),
+                    20 => slot_diff(addr, slot, 300, 11),
+                    _ => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+
+            // Below the first write: slot empty, account absent.
+            assert_eq!(at(4).read_storage(addr, slot).unwrap(), U256::ZERO);
+            assert!(at(4).read_account(addr).unwrap().is_none());
+
+            // greatest version <= H at and between change points.
+            for (h, val, bal) in [
+                (5u64, 7u64, 100u64),
+                (7, 7, 100),
+                (9, 7, 100),
+                (10, 9, 200),
+                (15, 9, 200),
+                (19, 9, 200),
+                (20, 11, 300),
+            ] {
+                assert_eq!(
+                    at(h).read_storage(addr, slot).unwrap(),
+                    U256::from(val),
+                    "storage at height {h} (inverted={inverted})"
+                );
+                assert_eq!(
+                    at(h).read_account(addr).unwrap().unwrap().balance,
+                    U256::from(bal),
+                    "balance at height {h} (inverted={inverted})"
+                );
+            }
+
+            // Latest-state iterators surface the newest version.
+            let storages: Vec<_> = db.storage_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(storages, vec![(addr, slot, U256::from(11))]);
+            let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].0, addr);
+            assert_eq!(accounts[0].1.balance, U256::from(300));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Restore the default so other tests aren't affected.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    #[test]
+    fn test_versioned_read_greatest_leq_height_inverted() {
+        run_versioned_roundtrip(true);
+    }
+
+    #[test]
+    fn test_versioned_read_greatest_leq_height_legacy() {
+        run_versioned_roundtrip(false);
     }
 }
