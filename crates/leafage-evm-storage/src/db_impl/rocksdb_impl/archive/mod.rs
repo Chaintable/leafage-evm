@@ -50,6 +50,7 @@ mod iterator_tracker;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 
@@ -114,6 +115,41 @@ fn rocksdb_scan_read_options() -> ReadOptions {
     read_options.set_verify_checksums(false);
     read_options.set_total_order_seek(true);
     read_options
+}
+
+/// Debug aid for migration: when `MIGRATE_DEBUG_ADDR_HASH` is set to the
+/// 32-byte keccak hash of an address (hex), the full-scan iterators log every
+/// on-disk account/storage record whose key prefix matches — including the
+/// versions they skip — so a wrong/missing slot after `db-migrate` can be
+/// traced to what's actually on disk. Unset (the default) = no overhead.
+///
+/// e.g. for address 0x7C5f5A4bBd8fD63184577525326123B519429bDc:
+///   MIGRATE_DEBUG_ADDR_HASH=0x21c8fc7a32bb7d551eeafa76d8b8cc19a740bc3854752dfd913af30e75e29d98
+static MIGRATE_DEBUG_ADDR_HASH: LazyLock<Option<[u8; 32]>> = LazyLock::new(|| {
+    let s = std::env::var("MIGRATE_DEBUG_ADDR_HASH").ok()?;
+    match H256::from_str(s.trim()) {
+        Ok(h) => {
+            info!(target: "migrate_debug", "storage/account record logging enabled for addr_hash {}", h);
+            Some(h.0)
+        }
+        Err(e) => {
+            warn!(target: "migrate_debug", "invalid MIGRATE_DEBUG_ADDR_HASH {:?}: {}", s, e);
+            None
+        }
+    }
+});
+
+/// Decode the block height from a versioned key's trailing 32-byte tail,
+/// honoring the current (ascending/descending) encoding. For logging only.
+#[inline]
+fn debug_decode_block_num(key_tail: &[u8]) -> u64 {
+    // tail is 32 bytes; the u64 lives in its last 8 bytes (big-endian).
+    let raw = u64::from_be_bytes(key_tail[24..32].try_into().unwrap());
+    if inverted_block_encoding() {
+        u64::MAX - raw
+    } else {
+        raw
+    }
 }
 
 impl StorageTypeColumn {
@@ -985,6 +1021,25 @@ impl LatestStateDBIterator for DataBaseRef {
                         None => true,
                     }
                 };
+                // Migration debug: log every on-disk version of the target
+                // account (including skipped ones).
+                if let Some(target) = MIGRATE_DEBUG_ADDR_HASH.as_ref() {
+                    if &key[..32] == target {
+                        let empty = value.as_ref().is_empty();
+                        let action = if !is_newest {
+                            "skip(older version)".to_string()
+                        } else if empty {
+                            "skip(deleted = absent at head)".to_string()
+                        } else {
+                            let acc = SlimAccount::decode(&mut value.as_ref()).unwrap();
+                            format!("EMIT -> snapshot (nonce={}, balance={})", acc.nonce, acc.balance)
+                        };
+                        info!(target: "migrate_debug",
+                            "account block={} newest={} -> {}",
+                            debug_decode_block_num(&key[32..64]), is_newest, action);
+                    }
+                }
+
                 if !is_newest {
                     continue;
                 }
@@ -1073,6 +1128,27 @@ impl LatestStateDBIterator for DataBaseRef {
                         None => true,
                     }
                 };
+                // Migration debug: log every on-disk version of the target
+                // address's slots (including ones we skip), so a wrong/missing
+                // slot can be traced to what's actually on disk.
+                if let Some(target) = MIGRATE_DEBUG_ADDR_HASH.as_ref() {
+                    if &key[..32] == target {
+                        let val = U256::from_be_slice(value.as_ref());
+                        let action = if !is_newest {
+                            "skip(older version)"
+                        } else if val == U256::ZERO {
+                            "skip(zero = empty at head, dropped from snapshot)"
+                        } else {
+                            "EMIT -> snapshot"
+                        };
+                        info!(target: "migrate_debug",
+                            "storage slot={} block={} value={} newest={} -> {}",
+                            H256::from_slice(&key[32..64]),
+                            debug_decode_block_num(&key[64..96]),
+                            val, is_newest, action);
+                    }
+                }
+
                 if !is_newest {
                     continue;
                 }
@@ -2197,5 +2273,93 @@ mod inverted_encoding_tests {
     #[test]
     fn test_versioned_read_greatest_leq_height_legacy() {
         run_versioned_roundtrip(false);
+    }
+}
+
+#[cfg(test)]
+mod scan_completeness_tests {
+    use super::*;
+    use crate::db::StateDBWrite;
+
+    fn addr(i: u64) -> H256 {
+        // Spread addresses across the keyspace by varying the high bytes, so
+        // distinct prefixes land in different SST key ranges / files.
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&i.to_be_bytes());
+        H256::from(b)
+    }
+
+    /// Settles empirically whether a full-CF scan over the prefix-extractor
+    /// `AddressToStorage` CF (binary-search index, skiplist memtable) drops
+    /// keys WITHOUT `total_order_seek`, vs WITH it. Writes N distinct
+    /// `address||slot` prefixes across many flushed L0 SSTs (and again after a
+    /// compaction), then counts both ways and prints the result.
+    #[test]
+    fn test_full_scan_completeness_prefix_vs_total_order() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-scan-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let slot = H256::repeat_byte(0x01);
+            let n: u64 = 20_000;
+            let per_batch: u64 = 1_000;
+
+            // Interleave so each flushed L0 SST spans the whole keyspace ->
+            // all L0 files OVERLAP, forcing the merging iterator to combine
+            // every SST during a full scan (the layout most likely to expose
+            // a prefix-mode skip).
+            let batches = n / per_batch;
+            for b in 0..batches {
+                let mut batch = db.prepare_write_batch().unwrap();
+                let mut j = b;
+                while j < n {
+                    db.write_storage(&mut batch, addr(j), slot, 1, U256::from(j + 1))
+                        .unwrap();
+                    j += batches;
+                }
+                db.commit(batch).unwrap();
+                db.flush().unwrap();
+            }
+
+            let cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            let count = |opts: ReadOptions| {
+                db.db
+                    .iterator_cf_opt(cf, opts, IteratorMode::Start)
+                    .count()
+            };
+
+            let total_l0 = count(rocksdb_scan_read_options());
+            let prefix_l0 = count(rocksdb_read_options());
+            eprintln!(
+                "[scan-test] L0 (multi-SST): expected={n} total_order_seek={total_l0} prefix_mode={prefix_l0}"
+            );
+
+            // Compact to push into deeper levels, then re-count.
+            db.compact().unwrap();
+            let total_compacted = count(rocksdb_scan_read_options());
+            let prefix_compacted = count(rocksdb_read_options());
+            eprintln!(
+                "[scan-test] compacted: expected={n} total_order_seek={total_compacted} prefix_mode={prefix_compacted}"
+            );
+
+            // The fix (total_order_seek=true) must be complete in both layouts.
+            assert_eq!(total_l0 as u64, n, "total_order_seek scan missed keys in L0");
+            assert_eq!(
+                total_compacted as u64, n,
+                "total_order_seek scan missed keys after compaction"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 }
