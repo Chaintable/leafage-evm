@@ -114,6 +114,19 @@ pub struct Command {
     #[arg(long, default_value = "64")]
     diff_depth_limit: usize,
 
+    /// The reorg buffer depth for S3 catch-up.
+    ///
+    /// During S3 catch-up the by-number index can resolve a wrong branch
+    /// around the chain tip while a reorg is in flight, leaving the hand-off
+    /// block disconnected from the Kafka stream. With a non-zero value, the
+    /// last `catchup_safe_depth` blocks below the Kafka head are backfilled by
+    /// following the exact parent-hash chain instead of the by-number index.
+    /// Set it above the chain's maximum reorg depth (e.g. 64 for Moonriver).
+    ///
+    /// Default: 0 (disabled; identical to the legacy by-number-only behavior).
+    #[arg(long, default_value = "0")]
+    catchup_safe_depth: usize,
+
     /// The size of the account cache.
     /// Default: 200000
     ///
@@ -724,6 +737,7 @@ impl Command {
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,
+            self.catchup_safe_depth,
         )
         .await?;
 

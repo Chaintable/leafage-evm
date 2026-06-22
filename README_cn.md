@@ -145,6 +145,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-type` | rocksdb | 数据库类型：rocksdb/mdbx |
 | `--db-cache` | 2048 | 数据库缓存大小（MB） |
 | `--diff-depth-limit` | 64 | 内存中保留的区块差异深度 |
+| `--catchup-safe-depth` | 0 | S3 catch-up 的 reorg 缓冲深度：靠近 Kafka 链头的这些区块改为沿精确的 parent-hash 链回补，而非按块号索引，避免 reorg 时选错分叉支。0 表示禁用（与旧逻辑完全一致）；应设为大于该链的最大 reorg 深度（如 Moonriver 设 64） |
 | `--archive` | false | 启用归档模式 |
 | `--prometheus-addr` | - | Prometheus 监控地址 |
 | `--kafka-s3-config` | - | Kafka + S3 配置文件路径 |
