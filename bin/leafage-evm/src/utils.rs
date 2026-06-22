@@ -345,6 +345,49 @@ pub async fn s3_get_block_info_by_number(
     }
 }
 
+/// Compute the [`BlockStorageDiff`] for an already-resolved [`BlockInfo`] by
+/// fetching its parent (by hash) and comparing state roots: an unchanged root
+/// yields an empty diff, otherwise the diff is read from S3.
+async fn s3_resolve_block_diff(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    block_info: &BlockInfo,
+) -> Result<BlockStorageDiff> {
+    let parent_block_info = s3_get_block_info(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        block_info.header.parent_hash,
+    )
+    .await
+    .context(format!(
+        "s3 get parent block info failed, {}",
+        block_info.header.parent_hash
+    ))?;
+    if parent_block_info.header.state_root != block_info.header.state_root {
+        s3_get_block_diff(
+            s3_client,
+            bucket_name,
+            s3_chain_id,
+            version,
+            block_info.header.state_root,
+        )
+        .await
+        .context(format!(
+            "s3 get block diff failed, root: {}, number: {}",
+            block_info.header.state_root, block_info.header.number
+        ))
+    } else {
+        let mut diff = BlockStorageDiff::default();
+        diff.hash = block_info.header.state_root;
+        diff.parent_hash = parent_block_info.header.state_root;
+        Ok(diff)
+    }
+}
+
 pub async fn s3_get_block_info_and_diff_by_number(
     rpc_client: &Option<HttpClient>,
     s3_client: &Client,
@@ -365,37 +408,26 @@ pub async fn s3_get_block_info_and_diff_by_number(
     )
     .await?;
 
-    let parent_block_info = s3_get_block_info(
-        s3_client,
-        bucket_name,
-        s3_chain_id,
-        version,
-        block_info.header.parent_hash,
-    )
-    .await
-    .context(format!(
-        "s3 get parent block info failed, {}",
-        block_info.header.parent_hash
-    ))?;
-    let block_diff = if parent_block_info.header.state_root != block_info.header.state_root {
-        s3_get_block_diff(
-            s3_client,
-            bucket_name,
-            s3_chain_id,
-            version,
-            block_info.header.state_root,
-        )
-        .await
-        .context(format!(
-            "s3 get block diff failed, root: {}, number: {}",
-            block_info.header.state_root, number
-        ))?
-    } else {
-        let mut diff = BlockStorageDiff::default();
-        diff.hash = block_info.header.state_root;
-        diff.parent_hash = parent_block_info.header.state_root;
-        diff
-    };
+    let block_diff =
+        s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
+    Ok((block_info, block_diff))
+}
+
+/// Resolve a block to its [`BlockInfo`] and [`BlockStorageDiff`] strictly by
+/// hash, following the by-hash S3 layout instead of the by-number index. Used
+/// to backfill the chain tip along the exact parent-hash links carried by
+/// Kafka, so a reorg near the tip cannot make the by-number index resolve a
+/// sibling on the wrong branch.
+pub async fn s3_get_block_info_and_diff_by_hash(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    hash: H256,
+) -> Result<(BlockInfo, BlockStorageDiff)> {
+    let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, hash).await?;
+    let block_diff =
+        s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
     Ok((block_info, block_diff))
 }
 

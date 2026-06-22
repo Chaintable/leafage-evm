@@ -145,6 +145,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-type` | rocksdb | Database type: rocksdb/mdbx |
 | `--db-cache` | 2048 | Database cache size (MB) |
 | `--diff-depth-limit` | 64 | Block diff depth retained in memory |
+| `--catchup-safe-depth` | 0 | S3 catch-up reorg buffer: blocks below the Kafka head backfilled via the exact parent-hash chain instead of the by-number index. 0 disables it (legacy behavior); set above the chain's max reorg depth (e.g. 64 for Moonriver) |
 | `--archive` | false | Enable archive mode |
 | `--prometheus-addr` | - | Prometheus metrics address |
 | `--kafka-s3-config` | - | Path to Kafka + S3 config JSON file |
