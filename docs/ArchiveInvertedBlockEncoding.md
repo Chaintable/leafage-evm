@@ -20,9 +20,9 @@ effect is dramatically fewer SST reads per lookup, which matters enormously for
 `eth_call`, where a single call can read hundreds of storage slots.
 
 The encoding is selected at runtime by the **`--inverted-block-encoding`** flag
-(on both `standalone` and `archive-init`). It is **off by default** — existing
-deployments keep the legacy ascending layout and behaviour unchanged — and must
-be matched between the DB and the serving node (see
+(on `standalone`, `archive-init`, and `db-migrate`). It is **off by default** —
+existing deployments keep the legacy ascending layout and behaviour unchanged —
+and must be matched between the DB and the command reading/writing it (see
 [Enabling and migration](#enabling-and-migration)).
 
 ## Background: how the archive node stores state
@@ -302,6 +302,12 @@ The default (no flag, ascending) and a fully-rebuilt inverted DB are both
 self-consistent; the only failure mode is pointing a flag at a DB written with
 the other setting. State Node databases are unaffected by the flag and require
 no migration.
+
+`db-migrate` reads an archive source through the same latest-state iterators, so
+it carries the flag too: migrating an **inverted** archive into a snapshot needs
+`--src-is-archive --inverted-block-encoding`. Omitting it reads the archive as
+ascending — the iterators pick the *wrong* version per key and silently produce a
+corrupt snapshot.
 
 ## Results
 
