@@ -1,6 +1,7 @@
 use crate::initializer::initialize_check;
 use crate::pprof::PProf;
 use crate::register::register_build;
+use crate::rpc_proxy_register::rpc_proxy_register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
 use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config};
@@ -288,6 +289,17 @@ pub struct Command {
     /// will be automatically saved to this file for future warmup use.
     #[arg(long, default_value = "")]
     token_collector_path: String,
+
+    /// Admin URL of rpc-proxy for self-registration.
+    /// Default: "" (disabled)
+    ///
+    /// When set, after the node is ready, it will register itself to rpc-proxy via
+    /// POST {rpc_proxy_admin_url}/chains/{chain_id}/upstreams with retries every 60s.
+    /// On shutdown, it sends DELETE to deregister.
+    ///
+    /// Example: --rpc-proxy-admin-url=http://localhost:9104
+    #[arg(long, default_value = "")]
+    rpc_proxy_admin_url: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -469,6 +481,7 @@ impl Command {
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
+        Option<tokio::sync::watch::Sender<()>>,
     )> {
         info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
@@ -646,16 +659,26 @@ impl Command {
         ready.store(true, std::sync::atomic::Ordering::SeqCst);
         info!(target:"updater", "leafage server started");
 
-        Ok((updater_handle, rpc_handle, registry_handle))
+        let rpc_proxy_handle = rpc_proxy_register_build(
+            self.rpc_proxy_admin_url.clone(),
+            format!("{}", chain_cfg.chain_id()),
+            self.meta.clone(),
+        )
+        .await;
+
+        Ok((updater_handle, rpc_handle, registry_handle, rpc_proxy_handle))
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, resgitry_handle) =
+        let (updater_handle, rpc_handle, resgitry_handle, rpc_proxy_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
+            if let Some(h) = rpc_proxy_handle {
+                let _ = h.send(());
+            }
             // wait for lease to unregist
             info!(
                 "waiting for etcd lease to expire in {} seconds...",

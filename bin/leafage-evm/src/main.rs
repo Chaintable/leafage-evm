@@ -10,6 +10,7 @@ mod updater;
 mod utils;
 mod pprof;
 mod warm;
+mod rpc_proxy_register;
 
 use clap::Parser;
 use runner::Cli;
