@@ -360,13 +360,16 @@ impl Initializer {
         let mut last_err: Option<anyhow::Error> = None;
         let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
         for attempt in 1..=self.outer_retry_attempts {
+            // Per-attempt counter: only merged into global on success, so retries
+            // never inflate the progress percentage above 100%.
+            let attempt_bytes = Arc::new(AtomicU64::new(0));
             match self
                 .try_extract_one_archive(
                     &key,
                     if url.is_empty() { None } else { Some(url.as_str()) },
                     compressed,
                     entry.size_bytes,
-                    Arc::clone(&progress),
+                    Arc::clone(&attempt_bytes),
                 )
                 .await
             {
@@ -375,6 +378,10 @@ impl Initializer {
                         target: "snapshot_init",
                         "archive done index={} name={} attempt={}",
                         idx, entry.name, attempt,
+                    );
+                    progress.downloaded_bytes.fetch_add(
+                        attempt_bytes.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
                     );
                     progress
                         .completed_archives
@@ -405,13 +412,14 @@ impl Initializer {
 
     /// 单次尝试:完整跑一遍流式管道(GET → StreamReader → SyncIoBridge → tar::Archive::unpack)。
     /// 中途任何错(GET 失败 / 非 2xx / tar 解析 / 写盘)直接抛出,由外层 wrapper 决定是否重试。
+    /// bytes_counter 是本次 attempt 的独立计数器,由调用方决定是否合并进全局进度。
     async fn try_extract_one_archive(
         &self,
         key: &str,
         archive_url: Option<&str>,
         compressed: bool,
         archive_size_bytes: i64,
-        progress: Arc<GlobalProgress>,
+        bytes_counter: Arc<AtomicU64>,
     ) -> Result<()> {
         let url = archive_url
             .map(str::to_string)
@@ -438,7 +446,7 @@ impl Initializer {
         // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),再 move 进 spawn_blocking。
         let sync_read = SyncIoBridge::new(CountedAsyncRead::new(
             async_read,
-            Arc::clone(&progress.downloaded_bytes),
+            bytes_counter,
             total_bytes,
         ));
         tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path, compressed))
