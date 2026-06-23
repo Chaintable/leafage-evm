@@ -25,7 +25,6 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 | OP Stack op-reth: HSK, Ink, Lisk, Zora, Cyber | [Chaintable/optimism](https://github.com/Chaintable/optimism)                                    |
 | Arb, Gravity, Plume, Hood                     | [Chaintable/nitro](https://github.com/Chaintable/nitro)                                          |
 | Gnosis                                        | [Chaintable/erigon](https://github.com/Chaintable/erigon)                                        |
-| Tempo                                         | [Chaintable/tempo](https://github.com/Chaintable/tempo)                                          |
 | Bitlayer                                      | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)                              |
 | Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
 | Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
@@ -60,7 +59,6 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 | WEMIX                                         | [Chaintable/go-wemix](https://github.com/Chaintable/go-wemix)                                    |
 | Polygon PoS                                   | [Chaintable/bor](https://github.com/Chaintable/bor)                                              |
 | Sonic                                         | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                          |
-| Blast                                         | [Chaintable/blast](https://github.com/Chaintable/blast)                                          |
 
 ## 支持的 JSON-RPC 方法
 
