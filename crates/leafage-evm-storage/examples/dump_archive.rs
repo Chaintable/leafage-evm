@@ -39,7 +39,16 @@ fn main() {
 
     // Read-only open. RocksDB requires every existing CF to be listed; the
     // archive backend uses the numeric names below.
-    let opts = Options::default();
+    let mut opts = Options::default();
+    // Archive DBs have a very large number of SST files; the default
+    // (max_open_files = -1) tries to keep them all open and hits the OS
+    // file-descriptor limit ("Too many open files"). Bound it so RocksDB uses
+    // a table cache instead. Override with ROCKSDB_MAX_OPEN_FILE if needed.
+    let max_open = std::env::var("ROCKSDB_MAX_OPEN_FILE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(256);
+    opts.set_max_open_files(max_open);
     let cfs = ["1", "2", "3", "4", "5", "6"];
     let db = DB::open_cf_for_read_only(&opts, db_path, cfs, false)
         .expect("open_cf_for_read_only failed (is the node stopped / DB not locked?)");
