@@ -6,7 +6,11 @@
 //! addresses are served by `leafage_evm_chains::base` reading storage through
 //! the journal, everything else delegates to `OpPrecompiles`.
 
-use leafage_evm_chains::base::{b20_dispatch, is_asset_variant, precompile::has_b20_prefix, B20Outcome};
+use leafage_evm_chains::base::{
+    b20_dispatch, is_asset_variant,
+    precompile::{has_b20_prefix, is_forwarded_registry},
+    B20Outcome,
+};
 use leafage_evm_types::{Address, Bytes, CfgEnv, OpSpecId, U256};
 use op_revm::{precompiles::OpPrecompiles, L1BlockInfo, OpTransaction};
 use revm::context::{BlockEnv, ContextTr, JournalTr, LocalContextTr};
@@ -47,6 +51,15 @@ impl<DB: Database> PrecompileProvider<BaseCtx<DB>> for BasePrecompiles {
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
         let addr = inputs.bytecode_address;
+
+        // Stateful registries leafage can't reproduce locally: signal
+        // UnsupportedPrecompile (-39008) so the proxy forwards to a real Base
+        // node. The "unsupported precompile address: " prefix is recognized by
+        // the EVMError::Custom -> -39008 mapping in api_impl.
+        if is_forwarded_registry(&addr) {
+            return Err(format!("unsupported precompile address: {addr}"));
+        }
+
         if !has_b20_prefix(&addr) {
             return PrecompileProvider::<BaseCtx<DB>>::run(&mut self.inner, context, inputs);
         }
@@ -96,6 +109,7 @@ impl<DB: Database> PrecompileProvider<BaseCtx<DB>> for BasePrecompiles {
 
     fn contains(&self, address: &Address) -> bool {
         has_b20_prefix(address)
+            || is_forwarded_registry(address)
             || PrecompileProvider::<BaseCtx<DB>>::contains(&self.inner, address)
     }
 }
