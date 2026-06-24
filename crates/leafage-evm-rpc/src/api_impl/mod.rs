@@ -24,6 +24,7 @@ pub(crate) use core::{ApiCore, EvmExecutor, GasFeeHandler};
 mod mainnet;
 
 mod arbitrum;
+mod base;
 mod bsc;
 mod citrea;
 mod op;
