@@ -56,9 +56,12 @@ pub(crate) fn create_base_evm_from_state<StateDB, INSP>(
 where
     StateDB: DatabaseRef,
 {
-    // Base execution is OP-equivalent. The Beryl precompiles are added on top of
-    // the op precompile set in a later stage; Stage 1 uses the op set as-is
-    // (base ≡ op for execution), establishing the wiring.
+    // NOTE (Stage 2 WIP): the B20 read precompiles + `extend_base_precompiles`
+    // are implemented and unit-tested in `leafage_evm_chains::base::b20`, but
+    // wiring an alloy-evm `PrecompilesMap` into op-revm's `OpEvm` hit an
+    // unresolved `PrecompileProvider`/`ExecuteEvm` trait-bound mismatch (revm is
+    // unified at 36, so it is not a version skew). Until that is resolved, base
+    // uses the op precompile set (base ≡ op for execution).
     Context::op()
         .with_block(block_env)
         .with_cfg(BaseHardfork::convert_cfg_env(cfg))
