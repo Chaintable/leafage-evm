@@ -1035,7 +1035,9 @@ impl LatestStateDBIterator for DataBaseRef {
                             format!("EMIT -> snapshot (nonce={}, balance={})", acc.nonce, acc.balance)
                         };
                         info!(target: "migrate_debug",
-                            "account block={} newest={} -> {}",
+                            "account key=0x{} tail=0x{} block={} newest={} -> {}",
+                            alloy::hex::encode(&key[..]),
+                            alloy::hex::encode(&key[32..64]),
                             debug_decode_block_num(&key[32..64]), is_newest, action);
                     }
                 }
@@ -1142,7 +1144,9 @@ impl LatestStateDBIterator for DataBaseRef {
                             "EMIT -> snapshot"
                         };
                         info!(target: "migrate_debug",
-                            "storage slot={} block={} value={} newest={} -> {}",
+                            "storage key=0x{} tail=0x{} slot={} block={} value={} newest={} -> {}",
+                            alloy::hex::encode(&key[..]),
+                            alloy::hex::encode(&key[64..96]),
                             H256::from_slice(&key[32..64]),
                             debug_decode_block_num(&key[64..96]),
                             val, is_newest, action);
