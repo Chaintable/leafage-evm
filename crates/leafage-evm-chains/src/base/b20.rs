@@ -2,21 +2,18 @@
 //!
 //! B20 tokens are precompiles (no deployed bytecode); their state lives in the
 //! EVM trie at the token address in an ERC-7201 namespaced layout. This module
-//! serves the read surface locally by reading those slots via the EVM journal
-//! (`EvmInternals::sload`), mirroring Base reth's `b20_asset`/`b20_stablecoin`
-//! semantics. See `docs/BaseBerylPrecompiles.md` for the extracted layout.
+//! serves the read surface locally by reading those slots, mirroring Base reth's
+//! `b20_asset`/`b20_stablecoin` semantics. See `docs/BaseBerylPrecompiles.md`.
 //!
-//! Scope: view methods only (leafage is read-only). Write methods are not
-//! reachable through eth_call serving. The registries/factory are forwarded
-//! (`-39008`) elsewhere.
+//! The dispatch here is journal-agnostic: it takes an `sload(address, key)`
+//! closure so the caller (the `PrecompileProvider` wrapper in the rpc crate)
+//! can back it with revm's journal for the op context. Returns the ABI-encoded
+//! output (or a revert), or `Err(())` on a storage-read failure.
+//!
+//! Scope: view methods only (leafage is read-only).
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolCall, SolInterface};
-use alloy_evm::precompiles::{DynPrecompile, PrecompileLookup, PrecompilesMap};
-use alloy_evm::EvmInternals;
-use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
-
-use crate::base::precompile::has_b20_prefix;
 
 // ERC-7201 namespace roots (extracted/verified from Base reth).
 // base.b20 core storage root.
@@ -42,7 +39,7 @@ const OFF_BALANCES: u64 = 4;
 const OFF_ALLOWANCES: u64 = 5;
 const OFF_SUPPLY_CAP: u64 = 12;
 // base.b20.asset field slot offsets.
-const OFF_ASSET_DECIMALS: u64 = 0; // u8 in slot 0, byte 0
+const OFF_ASSET_DECIMALS: u64 = 0; // u8 in slot 0, low byte
 const OFF_ASSET_MULTIPLIER: u64 = 1;
 
 /// WAD fixed-point precision (1e18) for the asset multiplier.
@@ -51,10 +48,6 @@ const WAD: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 const ASSET_DEFAULT_DECIMALS: u8 = 6;
 /// Fixed decimals for a stablecoin token.
 const STABLECOIN_DECIMALS: u8 = 6;
-
-/// Nominal gas charged per B20 view call (leafage disables gas accounting for
-/// reads; this only needs to fit within the call's gas limit).
-const B20_VIEW_GAS: u64 = 5_000;
 
 alloy::sol! {
     interface IB20 {
@@ -74,6 +67,15 @@ alloy::sol! {
     }
 }
 
+/// Outcome of a B20 view dispatch. `Err(())` (separate) signals a storage-read
+/// failure, which the caller maps to a precompile error.
+pub enum B20Outcome {
+    /// Successful return with ABI-encoded output.
+    Return(Bytes),
+    /// Revert with ABI-encoded output (e.g. unknown/unsupported selector).
+    Revert(Bytes),
+}
+
 #[inline]
 fn field_slot(root: U256, offset: u64) -> U256 {
     root.wrapping_add(U256::from(offset))
@@ -88,26 +90,12 @@ fn mapping_slot(slot: U256, key_word: B256) -> U256 {
     U256::from_be_bytes(keccak256(buf).0)
 }
 
-#[inline]
-fn db_err() -> PrecompileError {
-    PrecompileError::Other("b20 storage read failed".into())
-}
-
-#[inline]
-fn sload(internals: &mut EvmInternals, token: Address, slot: U256) -> Result<U256, PrecompileError> {
-    internals
-        .sload(token, slot)
-        .map(|loaded| loaded.data)
-        .map_err(|_| db_err())
-}
-
-/// Reads a Solidity `string`/`bytes` storage value at `slot`.
-fn read_string(
-    internals: &mut EvmInternals,
-    token: Address,
-    slot: U256,
-) -> Result<String, PrecompileError> {
-    let word = sload(internals, token, slot)?;
+/// Reads a Solidity `string` storage value at `slot`.
+fn read_string<F>(sload: &mut F, slot: U256) -> Result<String, ()>
+where
+    F: FnMut(U256) -> Result<U256, ()>,
+{
+    let word = sload(slot)?;
     let bytes = word.to_be_bytes::<32>();
     let last = bytes[31];
     if last & 1 == 0 {
@@ -121,8 +109,7 @@ fn read_string(
         let mut out = Vec::with_capacity(len);
         let mut i = 0u64;
         while out.len() < len {
-            let chunk = sload(internals, token, base.wrapping_add(U256::from(i)))?
-                .to_be_bytes::<32>();
+            let chunk = sload(base.wrapping_add(U256::from(i)))?.to_be_bytes::<32>();
             let take = (len - out.len()).min(32);
             out.extend_from_slice(&chunk[..take]);
             i += 1;
@@ -132,55 +119,56 @@ fn read_string(
 }
 
 #[inline]
-fn balance_of(internals: &mut EvmInternals, token: Address, account: Address) -> Result<U256, PrecompileError> {
-    let slot = mapping_slot(field_slot(ROOT_B20, OFF_BALANCES), account.into_word());
-    sload(internals, token, slot)
+fn read_balance<F>(sload: &mut F, account: Address) -> Result<U256, ()>
+where
+    F: FnMut(U256) -> Result<U256, ()>,
+{
+    sload(mapping_slot(field_slot(ROOT_B20, OFF_BALANCES), account.into_word()))
 }
 
 #[inline]
-fn multiplier(internals: &mut EvmInternals, token: Address) -> Result<U256, PrecompileError> {
-    sload(internals, token, field_slot(ROOT_ASSET, OFF_ASSET_MULTIPLIER))
-}
-
-fn ok(bytes: Bytes) -> PrecompileResult {
-    Ok(PrecompileOutput::new(B20_VIEW_GAS, bytes))
+fn read_multiplier<F>(sload: &mut F) -> Result<U256, ()>
+where
+    F: FnMut(U256) -> Result<U256, ()>,
+{
+    sload(field_slot(ROOT_ASSET, OFF_ASSET_MULTIPLIER))
 }
 
 /// Dispatches a single B20 view call against the token's storage.
-fn dispatch(
-    internals: &mut EvmInternals,
-    token: Address,
-    is_asset: bool,
-    data: &[u8],
-) -> PrecompileResult {
+///
+/// `sload(key)` reads storage at the token's address. Returns the ABI-encoded
+/// result, or `Err(())` if a storage read fails.
+pub fn dispatch<F>(is_asset: bool, data: &[u8], mut sload: F) -> Result<B20Outcome, ()>
+where
+    F: FnMut(U256) -> Result<U256, ()>,
+{
+    let revert = Ok(B20Outcome::Revert(Bytes::new()));
     let call = match IB20::IB20Calls::abi_decode(data) {
         Ok(c) => c,
-        // Unknown selector -> empty revert (matches a token without that method).
-        Err(_) => return Ok(PrecompileOutput::new_reverted(0, Bytes::new())),
+        // Unknown selector -> revert (a token without that method).
+        Err(_) => return revert,
     };
 
-    match call {
+    let out: Bytes = match call {
         IB20::IB20Calls::balanceOf(c) => {
-            let v = balance_of(internals, token, c.account)?;
-            ok(IB20::balanceOfCall::abi_encode_returns(&v).into())
+            IB20::balanceOfCall::abi_encode_returns(&read_balance(&mut sload, c.account)?).into()
         }
         IB20::IB20Calls::totalSupply(_) => {
-            let v = sload(internals, token, field_slot(ROOT_B20, OFF_TOTAL_SUPPLY))?;
-            ok(IB20::totalSupplyCall::abi_encode_returns(&v).into())
+            let v = sload(field_slot(ROOT_B20, OFF_TOTAL_SUPPLY))?;
+            IB20::totalSupplyCall::abi_encode_returns(&v).into()
         }
         IB20::IB20Calls::supplyCap(_) => {
-            let v = sload(internals, token, field_slot(ROOT_B20, OFF_SUPPLY_CAP))?;
-            ok(IB20::supplyCapCall::abi_encode_returns(&v).into())
+            let v = sload(field_slot(ROOT_B20, OFF_SUPPLY_CAP))?;
+            IB20::supplyCapCall::abi_encode_returns(&v).into()
         }
         IB20::IB20Calls::allowance(c) => {
             let inner = mapping_slot(field_slot(ROOT_B20, OFF_ALLOWANCES), c.owner.into_word());
-            let slot = mapping_slot(inner, c.spender.into_word());
-            let v = sload(internals, token, slot)?;
-            ok(IB20::allowanceCall::abi_encode_returns(&v).into())
+            let v = sload(mapping_slot(inner, c.spender.into_word()))?;
+            IB20::allowanceCall::abi_encode_returns(&v).into()
         }
         IB20::IB20Calls::decimals(_) => {
             let d = if is_asset {
-                let word = sload(internals, token, field_slot(ROOT_ASSET, OFF_ASSET_DECIMALS))?;
+                let word = sload(field_slot(ROOT_ASSET, OFF_ASSET_DECIMALS))?;
                 let b = word.to_be_bytes::<32>()[31];
                 if b == 0 {
                     ASSET_DEFAULT_DECIMALS
@@ -190,83 +178,56 @@ fn dispatch(
             } else {
                 STABLECOIN_DECIMALS
             };
-            ok(IB20::decimalsCall::abi_encode_returns(&d).into())
+            IB20::decimalsCall::abi_encode_returns(&d).into()
         }
         IB20::IB20Calls::name(_) => {
-            let s = read_string(internals, token, field_slot(ROOT_B20, OFF_NAME))?;
-            ok(IB20::nameCall::abi_encode_returns(&s).into())
+            let s = read_string(&mut sload, field_slot(ROOT_B20, OFF_NAME))?;
+            IB20::nameCall::abi_encode_returns(&s).into()
         }
         IB20::IB20Calls::symbol(_) => {
-            let s = read_string(internals, token, field_slot(ROOT_B20, OFF_SYMBOL))?;
-            ok(IB20::symbolCall::abi_encode_returns(&s).into())
+            let s = read_string(&mut sload, field_slot(ROOT_B20, OFF_SYMBOL))?;
+            IB20::symbolCall::abi_encode_returns(&s).into()
         }
-        IB20::IB20Calls::WAD_PRECISION(_) => {
-            ok(IB20::WAD_PRECISIONCall::abi_encode_returns(&WAD).into())
-        }
-        // Asset-only scaled methods (raw * multiplier / WAD). On a stablecoin
-        // these don't exist; revert.
+        IB20::IB20Calls::WAD_PRECISION(_) => IB20::WAD_PRECISIONCall::abi_encode_returns(&WAD).into(),
+        // Asset-only scaled methods (raw * multiplier / WAD).
         IB20::IB20Calls::multiplier(_) if is_asset => {
-            let v = multiplier(internals, token)?;
-            ok(IB20::multiplierCall::abi_encode_returns(&v).into())
+            IB20::multiplierCall::abi_encode_returns(&read_multiplier(&mut sload)?).into()
         }
         IB20::IB20Calls::scaledBalanceOf(c) if is_asset => {
-            let raw = balance_of(internals, token, c.account)?;
-            let m = multiplier(internals, token)?;
-            let v = raw.checked_mul(m).ok_or_else(db_err)? / WAD;
-            ok(IB20::scaledBalanceOfCall::abi_encode_returns(&v).into())
+            let raw = read_balance(&mut sload, c.account)?;
+            let m = read_multiplier(&mut sload)?;
+            let v = raw.checked_mul(m).ok_or(())? / WAD;
+            IB20::scaledBalanceOfCall::abi_encode_returns(&v).into()
         }
         IB20::IB20Calls::toScaledBalance(c) if is_asset => {
-            let m = multiplier(internals, token)?;
-            let v = c.rawBalance.checked_mul(m).ok_or_else(db_err)? / WAD;
-            ok(IB20::toScaledBalanceCall::abi_encode_returns(&v).into())
+            let m = read_multiplier(&mut sload)?;
+            let v = c.rawBalance.checked_mul(m).ok_or(())? / WAD;
+            IB20::toScaledBalanceCall::abi_encode_returns(&v).into()
         }
         IB20::IB20Calls::toRawBalance(c) if is_asset => {
-            let m = multiplier(internals, token)?;
-            let v = c.scaledBalance.checked_mul(WAD).ok_or_else(db_err)? / m;
-            ok(IB20::toRawBalanceCall::abi_encode_returns(&v).into())
+            let m = read_multiplier(&mut sload)?;
+            let v = c.scaledBalance.checked_mul(WAD).ok_or(())? / m;
+            IB20::toRawBalanceCall::abi_encode_returns(&v).into()
         }
-        // scaled methods on a non-asset token, or anything else -> revert.
-        _ => Ok(PrecompileOutput::new_reverted(0, Bytes::new())),
-    }
+        // Scaled methods on a non-asset token, or anything else -> revert.
+        _ => return revert,
+    };
+    Ok(B20Outcome::Return(out))
 }
 
-/// Builds the `DynPrecompile` for a B20 token at `token` (asset or stablecoin).
-fn create_b20_precompile(token: Address, is_asset: bool) -> DynPrecompile {
-    DynPrecompile::new_stateful(
-        PrecompileId::Custom("base-b20".into()),
-        move |input| {
-            let data = input.data;
-            let mut internals = input.internals;
-            dispatch(&mut internals, token, is_asset, data)
-        },
-    )
-}
-
-/// The B20 variant discriminant lives in byte 10 of the token address.
+/// The B20 variant discriminant lives in byte 10 of the token address:
 /// 0 = asset, 1 = stablecoin (mirrors Base `B20Variant`).
-fn is_asset_variant(address: &Address) -> bool {
+pub fn is_asset_variant(address: &Address) -> bool {
     address.as_slice()[10] == 0
-}
-
-/// Installs the Beryl B20-token dynamic prefix lookup into `precompiles`:
-/// any `0xb2_00…00_<variant>` address is dispatched to the B20 read precompile.
-pub fn extend_base_precompiles(precompiles: &mut PrecompilesMap) {
-    precompiles.set_precompile_lookup(move |address: &Address| {
-        if has_b20_prefix(address) {
-            Some(create_b20_precompile(*address, is_asset_variant(address)))
-        } else {
-            None
-        }
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn erc7201_roots_match_base() {
-        // Roots verified against Base reth core_storage.rs / b20_asset/storage.rs.
         assert_eq!(
             format!("{ROOT_B20:#x}"),
             "0xc78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434000"
@@ -284,33 +245,70 @@ mod tests {
 
     #[test]
     fn mapping_slot_matches_solidity() {
-        // balances[addr] at base slot S: keccak256(pad32(addr) ++ pad32(S)).
         let addr = Address::repeat_byte(0x11);
         let base_slot = field_slot(ROOT_B20, OFF_BALANCES);
         let got = mapping_slot(base_slot, addr.into_word());
         let mut buf = [0u8; 64];
         buf[12..32].copy_from_slice(addr.as_slice());
         buf[32..].copy_from_slice(&base_slot.to_be_bytes::<32>());
-        let want = U256::from_be_bytes(keccak256(buf).0);
-        assert_eq!(got, want);
+        assert_eq!(got, U256::from_be_bytes(keccak256(buf).0));
     }
 
     #[test]
     fn variant_discriminant() {
-        // B20 address = 0xb2 ++ [0;9] ++ variant(1) ++ tail(9). byte 10 is the
-        // variant discriminant: 0 = asset, 1 = stablecoin.
-        let mut asset_bytes = [0u8; 20];
-        asset_bytes[0] = 0xb2;
-        asset_bytes[10] = 0;
-        let asset = Address::from(asset_bytes);
+        let mut a = [0u8; 20];
+        a[0] = 0xb2;
+        a[10] = 0;
+        assert!(is_asset_variant(&Address::from(a)));
+        a[10] = 1;
+        assert!(!is_asset_variant(&Address::from(a)));
+    }
 
-        let mut stable_bytes = [0u8; 20];
-        stable_bytes[0] = 0xb2;
-        stable_bytes[10] = 1;
-        let stable = Address::from(stable_bytes);
+    /// End-to-end dispatch over a mock storage map: balanceOf returns the raw
+    /// balance, decimals reads the asset slot, scaledBalanceOf applies the
+    /// multiplier.
+    #[test]
+    fn dispatch_reads_balance_decimals_scaled() {
+        let account = Address::repeat_byte(0xAB);
+        let mut store: HashMap<U256, U256> = HashMap::new();
+        // raw balance = 100
+        store.insert(
+            mapping_slot(field_slot(ROOT_B20, OFF_BALANCES), account.into_word()),
+            U256::from(100u64),
+        );
+        // decimals = 8
+        store.insert(field_slot(ROOT_ASSET, OFF_ASSET_DECIMALS), U256::from(8u64));
+        // multiplier = 2 WAD (2x)
+        store.insert(field_slot(ROOT_ASSET, OFF_ASSET_MULTIPLIER), WAD * U256::from(2u64));
 
-        assert!(has_b20_prefix(&asset) && has_b20_prefix(&stable));
-        assert!(is_asset_variant(&asset));
-        assert!(!is_asset_variant(&stable));
+        let sload = |k: U256| -> Result<U256, ()> { Ok(store.get(&k).copied().unwrap_or_default()) };
+
+        // balanceOf(account) -> raw 100
+        let data = IB20::balanceOfCall { account }.abi_encode();
+        let out = match dispatch(true, &data, sload).unwrap() {
+            B20Outcome::Return(b) => b,
+            B20Outcome::Revert(_) => panic!("reverted"),
+        };
+        let got = IB20::balanceOfCall::abi_decode_returns(&out).unwrap();
+        assert_eq!(got, U256::from(100u64));
+
+        // decimals() -> 8
+        let data = IB20::decimalsCall {}.abi_encode();
+        let out = match dispatch(true, &data, sload).unwrap() {
+            B20Outcome::Return(b) => b,
+            B20Outcome::Revert(_) => panic!("reverted"),
+        };
+        assert_eq!(IB20::decimalsCall::abi_decode_returns(&out).unwrap(), 8u8);
+
+        // scaledBalanceOf(account) -> 100 * 2 = 200
+        let data = IB20::scaledBalanceOfCall { account }.abi_encode();
+        let out = match dispatch(true, &data, sload).unwrap() {
+            B20Outcome::Return(b) => b,
+            B20Outcome::Revert(_) => panic!("reverted"),
+        };
+        assert_eq!(
+            IB20::scaledBalanceOfCall::abi_decode_returns(&out).unwrap(),
+            U256::from(200u64)
+        );
     }
 }

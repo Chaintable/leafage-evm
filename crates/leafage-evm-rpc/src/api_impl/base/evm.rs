@@ -1,3 +1,4 @@
+use crate::api_impl::base::precompiles::BasePrecompiles;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::base::BaseHardfork;
@@ -52,20 +53,20 @@ pub(crate) fn create_base_evm_from_state<StateDB, INSP>(
             L1BlockInfo,
         >,
     >,
+    BasePrecompiles,
 >
 where
     StateDB: DatabaseRef,
 {
-    // NOTE (Stage 2 WIP): the B20 read precompiles + `extend_base_precompiles`
-    // are implemented and unit-tested in `leafage_evm_chains::base::b20`, but
-    // wiring an alloy-evm `PrecompilesMap` into op-revm's `OpEvm` hit an
-    // unresolved `PrecompileProvider`/`ExecuteEvm` trait-bound mismatch (revm is
-    // unified at 36, so it is not a version skew). Until that is resolved, base
-    // uses the op precompile set (base ≡ op for execution).
+    // Base execution is OP-equivalent; start from the op precompile set for the
+    // spec, wrapped so the Beryl B20-token reads are served from local state.
+    let op_cfg = BaseHardfork::convert_cfg_env(cfg);
+    let op_precompiles = OpPrecompiles::new_with_spec(op_cfg.spec);
+
     Context::op()
         .with_block(block_env)
-        .with_cfg(BaseHardfork::convert_cfg_env(cfg))
+        .with_cfg(op_cfg)
         .with_ref_db(state)
         .build_op_with_inspector(inspector)
-        .with_precompiles(OpPrecompiles::default())
+        .with_precompiles(BasePrecompiles::new(op_precompiles))
 }
