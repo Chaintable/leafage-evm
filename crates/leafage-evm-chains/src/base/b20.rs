@@ -30,6 +30,13 @@ const ROOT_ASSET: U256 = U256::from_limbs([
     0xe4d9facdbf0fb50d,
     0xfdc6d4552d1286ad,
 ]);
+// base.b20.stablecoin extension storage root.
+const ROOT_STABLECOIN: U256 = U256::from_limbs([
+    0xf09e73d0943d6200,
+    0x45d0ca58e30b7693,
+    0x367ea3129b19441d,
+    0x35827975a06ca0e9,
+]);
 
 // base.b20 core field slot offsets.
 const OFF_NAME: u64 = 0;
@@ -41,6 +48,8 @@ const OFF_SUPPLY_CAP: u64 = 12;
 // base.b20.asset field slot offsets.
 const OFF_ASSET_DECIMALS: u64 = 0; // u8 in slot 0, low byte
 const OFF_ASSET_MULTIPLIER: u64 = 1;
+// base.b20.stablecoin field slot offsets.
+const OFF_STABLECOIN_CURRENCY: u64 = 0; // string
 
 /// WAD fixed-point precision (1e18) for the asset multiplier.
 const WAD: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -58,12 +67,14 @@ alloy::sol! {
         function symbol() external view returns (string);
         function allowance(address owner, address spender) external view returns (uint256);
         function supplyCap() external view returns (uint256);
-        // Base asset-specific:
+        // Asset-only (b20_asset IB20Asset interface) — must revert on stablecoin:
         function multiplier() external view returns (uint256);
         function scaledBalanceOf(address account) external view returns (uint256);
         function toScaledBalance(uint256 rawBalance) external view returns (uint256);
         function toRawBalance(uint256 scaledBalance) external view returns (uint256);
         function WAD_PRECISION() external view returns (uint256);
+        // Stablecoin-only (b20_stablecoin IB20Stablecoin interface) — reverts on asset:
+        function currency() external view returns (string);
     }
 }
 
@@ -188,8 +199,15 @@ where
             let s = read_string(&mut sload, field_slot(ROOT_B20, OFF_SYMBOL))?;
             IB20::symbolCall::abi_encode_returns(&s).into()
         }
-        IB20::IB20Calls::WAD_PRECISION(_) => IB20::WAD_PRECISIONCall::abi_encode_returns(&WAD).into(),
-        // Asset-only scaled methods (raw * multiplier / WAD).
+        // Stablecoin-only: currency (ISO 4217 code) from the stablecoin extension.
+        IB20::IB20Calls::currency(_) if !is_asset => {
+            let s = read_string(&mut sload, field_slot(ROOT_STABLECOIN, OFF_STABLECOIN_CURRENCY))?;
+            IB20::currencyCall::abi_encode_returns(&s).into()
+        }
+        // Asset-only methods (WAD_PRECISION + scaled), revert on stablecoin.
+        IB20::IB20Calls::WAD_PRECISION(_) if is_asset => {
+            IB20::WAD_PRECISIONCall::abi_encode_returns(&WAD).into()
+        }
         IB20::IB20Calls::multiplier(_) if is_asset => {
             IB20::multiplierCall::abi_encode_returns(&read_multiplier(&mut sload)?).into()
         }
@@ -209,7 +227,8 @@ where
             let v = c.scaledBalance.checked_mul(WAD).ok_or(())? / m;
             IB20::toRawBalanceCall::abi_encode_returns(&v).into()
         }
-        // Scaled methods on a non-asset token, or anything else -> revert.
+        // Asset-only methods on a stablecoin, currency() on an asset, or any
+        // unknown selector -> revert (matches Base's per-variant interfaces).
         _ => return revert,
     };
     Ok(B20Outcome::Return(out))
@@ -235,6 +254,10 @@ mod tests {
         assert_eq!(
             format!("{ROOT_ASSET:#x}"),
             "0xfdc6d4552d1286ade4d9facdbf0fb50d2ec9b89a90e104f26fd277585e374b00"
+        );
+        assert_eq!(
+            format!("{ROOT_STABLECOIN:#x}"),
+            "0x35827975a06ca0e9367ea3129b19441d45d0ca58e30b7693f09e73d0943d6200"
         );
     }
 
@@ -310,5 +333,53 @@ mod tests {
             IB20::scaledBalanceOfCall::abi_decode_returns(&out).unwrap(),
             U256::from(200u64)
         );
+    }
+
+    /// Per-variant interface boundaries: a stablecoin serves the shared reads +
+    /// `currency()` but reverts the asset-only `WAD_PRECISION`; an asset serves
+    /// `WAD_PRECISION` but reverts the stablecoin-only `currency()`.
+    #[test]
+    fn variant_specific_methods_revert_across_variants() {
+        let mut store: HashMap<U256, U256> = HashMap::new();
+        // Short Solidity string "USD" at the stablecoin currency slot:
+        // bytes[..len]=ascii, last byte = len*2.
+        let mut word = [0u8; 32];
+        word[..3].copy_from_slice(b"USD");
+        word[31] = (3 * 2) as u8;
+        store.insert(
+            field_slot(ROOT_STABLECOIN, OFF_STABLECOIN_CURRENCY),
+            U256::from_be_bytes(word),
+        );
+        let sload = |k: U256| -> Result<U256, ()> { Ok(store.get(&k).copied().unwrap_or_default()) };
+
+        // Stablecoin (is_asset=false): currency() returns "USD".
+        let data = IB20::currencyCall {}.abi_encode();
+        let out = match dispatch(false, &data, sload).unwrap() {
+            B20Outcome::Return(b) => b,
+            B20Outcome::Revert(_) => panic!("stablecoin currency() reverted"),
+        };
+        assert_eq!(IB20::currencyCall::abi_decode_returns(&out).unwrap(), "USD");
+
+        // Stablecoin: WAD_PRECISION() is asset-only -> revert.
+        let data = IB20::WAD_PRECISIONCall {}.abi_encode();
+        assert!(matches!(
+            dispatch(false, &data, sload).unwrap(),
+            B20Outcome::Revert(_)
+        ));
+
+        // Asset (is_asset=true): WAD_PRECISION() returns WAD.
+        let data = IB20::WAD_PRECISIONCall {}.abi_encode();
+        let out = match dispatch(true, &data, sload).unwrap() {
+            B20Outcome::Return(b) => b,
+            B20Outcome::Revert(_) => panic!("asset WAD_PRECISION() reverted"),
+        };
+        assert_eq!(IB20::WAD_PRECISIONCall::abi_decode_returns(&out).unwrap(), WAD);
+
+        // Asset: currency() is stablecoin-only -> revert.
+        let data = IB20::currencyCall {}.abi_encode();
+        assert!(matches!(
+            dispatch(true, &data, sload).unwrap(),
+            B20Outcome::Revert(_)
+        ));
     }
 }
