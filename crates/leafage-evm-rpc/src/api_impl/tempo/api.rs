@@ -7,7 +7,7 @@ use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::tempo::tx::TempoTxEnv;
 use leafage_evm_chains::tempo::TempoEvm;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{BlockEnv, CallRequest};
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
@@ -102,6 +102,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         mut request: CallRequest,
         db: StateDB,

@@ -1,7 +1,5 @@
 use crate::api::EthApiServer;
-use crate::api_impl::core::{
-    Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError,
-};
+use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError};
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
@@ -28,6 +26,7 @@ where
     C::DB: EvmStorageRead + BlockIndex,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<C::EvmHaltReason>,
 {
     async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
@@ -114,7 +113,26 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
+        let cancel_token = CancellationToken::new();
+        if let Some(result) = self.inner.handle_virtual_call(
+            &request,
+            &block,
+            &block_env,
+            &db,
+            |estimate_request| {
+                self.estimate_gas_components_with_state(
+                    &block,
+                    &block_env,
+                    &db,
+                    estimate_request,
+                    &cancel_token,
+                )
+            },
+        )? {
+            return Ok(result);
+        }
         let tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request,
             &db,
@@ -346,6 +364,7 @@ where
                 }
             }
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 request,
                 state.clone(),
@@ -571,6 +590,7 @@ where
     C::DB: EvmStorageRead + BlockIndex,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<C::EvmHaltReason>,
 {
     async fn call(
         &self,

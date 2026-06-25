@@ -3,10 +3,12 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
+use crate::utils::{EtcdRegisterConfig, KafkaS3Config, NodeTypeArg, parse_kafka_s3_config};
 use crate::warm::Warmup;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::citrea::CitreaHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv, TokenCollector};
@@ -14,12 +16,11 @@ use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
-use leafage_evm_chains::citrea::CitreaHardfork;
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::time;
 use tracing::info;
 
@@ -437,7 +438,7 @@ impl Command {
                 // if it's off the floor only over-estimates rare calldata-heavy txs (the
                 // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
                 // chains. The L1 cost is added separately in estimate_l1_overhead.
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::PRAGUE, "arbitrum")?;
+                let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -543,7 +544,9 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mantle(chain_cfg))
             }
             "tempo" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(leafage_evm_chains::tempo::hardfork::TempoHardfork::default());
+                let mut chain_cfg = CfgEnv::new_with_spec(
+                    leafage_evm_chains::tempo::hardfork::TempoHardfork::default(),
+                );
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -553,7 +556,8 @@ impl Command {
                 Ok(MultiChainCfgEnv::Tempo(chain_cfg))
             }
             "citrea" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
+                let mut chain_cfg =
+                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -692,13 +696,13 @@ impl Command {
         }
         if !self.readiness_addr.is_empty() {
             // Initialize token collector if path is configured (before warmup so it can be used)
-            let token_collector_path =   if !self.token_collector_path.is_empty(){
+            let token_collector_path = if !self.token_collector_path.is_empty() {
                 let collector_path = PathBuf::from(&self.token_collector_path);
                 if let Some(parent) = collector_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 collector_path
-            }else{
+            } else {
                 self.db_path.join("tokens.json")
             };
             info!(target: "updater", "token collector enabled, saving to {:?}", token_collector_path);
@@ -716,7 +720,6 @@ impl Command {
             rpc_builder = warmup.with_warmup_data(rpc_builder).await;
             rpc_builder = rpc_builder.with_token_collector(token_collector);
         }
-
 
         let rpc_handle = rpc_builder
             .build_and_run(

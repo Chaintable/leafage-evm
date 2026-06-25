@@ -16,6 +16,7 @@ alloy-evm.workspace = true
 alloy-sol-types.workspace = true
 alloy-contract.workspace = true  # sol! 宏展开需要
 serde.workspace = true
+serde_json.workspace = true
 revm.workspace = true
 leafage-evm-types.workspace = true
 once_cell.workspace = true
@@ -31,6 +32,7 @@ p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
 bech32.workspace = true
 k256.workspace = true
 brotli.workspace = true
+libloading.workspace = true
 
 #only use in bsc precompile
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
