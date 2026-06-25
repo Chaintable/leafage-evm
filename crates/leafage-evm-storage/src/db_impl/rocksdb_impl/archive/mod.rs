@@ -152,6 +152,28 @@ fn debug_decode_block_num(key_tail: &[u8]) -> u64 {
     }
 }
 
+/// Whether a versioned key's trailing height is the legacy `u64::MAX`
+/// dual-write "latest" sentinel.
+///
+/// The original archive backend ("add archive support", #1) wrote each account/
+/// slot twice: a historical record at `address(‖slot) ‖ block_num` and a
+/// latest-pointer at `address(‖slot) ‖ u64::MAX`. #104 removed the dual write
+/// (latest reads use the real head + `seek_for_prev`) but never deleted the
+/// sentinels already on disk. In a full scan those `u64::MAX` rows sort *after*
+/// every real version and would otherwise be mistaken for the newest record —
+/// and they are stale for anything modified after the #104 upgrade. The
+/// latest-state iterators must therefore ignore them.
+///
+/// `key_tail` is the full 32-byte version tail; the height is its last 8 bytes
+/// (big-endian). Only meaningful under legacy ascending encoding: in inverted
+/// mode a raw-`MAX` tail is the legitimate encoding of block 0 (genesis), and
+/// inverted DBs (post-#162) never carried dual-write sentinels anyway — callers
+/// gate on `!inverted_block_encoding()`.
+#[inline]
+fn is_dual_write_sentinel_tail(key_tail: &[u8]) -> bool {
+    u64::from_be_bytes(key_tail[24..32].try_into().unwrap()) == u64::MAX
+}
+
 impl StorageTypeColumn {
     fn to_str(&self) -> &'static str {
         match self {
@@ -1008,15 +1030,24 @@ impl LatestStateDBIterator for DataBaseRef {
                 let (key, value) = item.unwrap();
                 let address_bytes: [u8; 32] = key[..32].try_into().unwrap();
 
+                // Orphaned pre-#104 dual-write latest pointer (address ‖ u64::MAX);
+                // not a real version. Legacy mode only (see helper docs).
+                let is_sentinel = !inverted && is_dual_write_sentinel_tail(&key[32..64]);
+
                 let is_newest = if inverted {
                     // First record of the prefix is newest.
                     let newest = consumed_prefix != Some(address_bytes);
                     consumed_prefix = Some(address_bytes);
                     newest
                 } else {
-                    // Last record of the prefix is newest.
+                    // Last *real* record of the prefix is newest. A trailing
+                    // dual-write sentinel is skipped below, so a record whose
+                    // only successor is that sentinel is still the newest.
                     match iter.peek() {
-                        Some(Ok((next_key, _))) => next_key[..32] != address_bytes,
+                        Some(Ok((next_key, _))) => {
+                            next_key[..32] != address_bytes
+                                || is_dual_write_sentinel_tail(&next_key[32..64])
+                        }
                         Some(Err(_)) => true,
                         None => true,
                     }
@@ -1026,7 +1057,9 @@ impl LatestStateDBIterator for DataBaseRef {
                 if let Some(target) = MIGRATE_DEBUG_ADDR_HASH.as_ref() {
                     if &key[..32] == target {
                         let empty = value.as_ref().is_empty();
-                        let action = if !is_newest {
+                        let action = if is_sentinel {
+                            "skip(u64::MAX dual-write sentinel)".to_string()
+                        } else if !is_newest {
                             "skip(older version)".to_string()
                         } else if empty {
                             "skip(deleted = absent at head)".to_string()
@@ -1042,6 +1075,11 @@ impl LatestStateDBIterator for DataBaseRef {
                     }
                 }
 
+                // Never emit the orphaned dual-write sentinel; the real newest
+                // record (greatest real height) is selected instead.
+                if is_sentinel {
+                    continue;
+                }
                 if !is_newest {
                     continue;
                 }
@@ -1119,13 +1157,22 @@ impl LatestStateDBIterator for DataBaseRef {
                 let (key, value) = item.unwrap();
                 let prefix: [u8; 64] = key[..64].try_into().unwrap(); // address || index
 
+                // Orphaned pre-#104 dual-write latest pointer
+                // (address ‖ slot ‖ u64::MAX); not a real version.
+                let is_sentinel = !inverted && is_dual_write_sentinel_tail(&key[64..96]);
+
                 let is_newest = if inverted {
                     let newest = consumed_prefix != Some(prefix);
                     consumed_prefix = Some(prefix);
                     newest
                 } else {
+                    // Last *real* record of the prefix is newest; a trailing
+                    // dual-write sentinel (skipped below) doesn't count.
                     match iter.peek() {
-                        Some(Ok((next_key, _))) => next_key[..64] != prefix,
+                        Some(Ok((next_key, _))) => {
+                            next_key[..64] != prefix
+                                || is_dual_write_sentinel_tail(&next_key[64..96])
+                        }
                         Some(Err(_)) => true,
                         None => true,
                     }
@@ -1136,7 +1183,9 @@ impl LatestStateDBIterator for DataBaseRef {
                 if let Some(target) = MIGRATE_DEBUG_ADDR_HASH.as_ref() {
                     if &key[..32] == target {
                         let val = U256::from_be_slice(value.as_ref());
-                        let action = if !is_newest {
+                        let action = if is_sentinel {
+                            "skip(u64::MAX dual-write sentinel)"
+                        } else if !is_newest {
                             "skip(older version)"
                         } else if val == U256::ZERO {
                             "skip(zero = empty at head, dropped from snapshot)"
@@ -1153,6 +1202,10 @@ impl LatestStateDBIterator for DataBaseRef {
                     }
                 }
 
+                // Never emit the orphaned dual-write sentinel.
+                if is_sentinel {
+                    continue;
+                }
                 if !is_newest {
                     continue;
                 }
@@ -2277,6 +2330,101 @@ mod inverted_encoding_tests {
     #[test]
     fn test_versioned_read_greatest_leq_height_legacy() {
         run_versioned_roundtrip(false);
+    }
+
+    /// Legacy DBs built before #104 carry orphaned dual-write "latest" pointers
+    /// at `address(‖slot) ‖ u64::MAX`. When such a pointer is *stale* (the
+    /// account/slot was modified after the node upgraded past #104, so only the
+    /// historical record was rewritten), the latest-state iterators must still
+    /// surface the real newest version — not the frozen sentinel. This is the
+    /// db-migrate lost/wrong-slot bug; the iterators must skip the sentinel.
+    #[test]
+    fn test_iterators_skip_stale_dual_write_sentinel_legacy() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-sentinel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let addr = H256::repeat_byte(0xcd);
+            let slot = H256::repeat_byte(0x02);
+
+            // Real history: account/slot change at blocks 5/10/20; the true
+            // newest state is balance 300 / slot value 11.
+            for n in 1..=20u64 {
+                let diff = match n {
+                    5 => slot_diff(addr, slot, 100, 7),
+                    10 => slot_diff(addr, slot, 200, 9),
+                    20 => slot_diff(addr, slot, 300, 11),
+                    _ => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+
+            // Inject STALE orphaned dual-write sentinels (address(‖slot) ‖
+            // u64::MAX) holding an early state (balance 100 / slot value 7), as
+            // a pre-#104 DB would carry after later single-write updates.
+            let acct_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            let stale_acct =
+                crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                    address: addr,
+                    balance: U256::from(100u64),
+                    nonce: 1,
+                    code_hash: KECCAK256_EMPTY.0.into(),
+                });
+            db.db
+                .put_cf(
+                    acct_cf,
+                    crate::db_impl::archive_encoding::encode_account_key(addr, u64::MAX),
+                    &stale_acct,
+                )
+                .unwrap();
+
+            let stor_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            let stale_val: [u8; 32] = U256::from(7u64).to_be_bytes();
+            db.db
+                .put_cf(
+                    stor_cf,
+                    crate::db_impl::archive_encoding::encode_storage_key(addr, slot, u64::MAX),
+                    stale_val,
+                )
+                .unwrap();
+
+            // Latest-state iterators must surface the REAL newest, not the
+            // stale sentinel (which without the fix sorts last and wins).
+            let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(
+                accounts[0].1.balance,
+                U256::from(300u64),
+                "account_iter must pick real newest balance, not stale u64::MAX sentinel"
+            );
+
+            let storages: Vec<_> = db.storage_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(
+                storages,
+                vec![(addr, slot, U256::from(11u64))],
+                "storage_iter must pick real newest slot, not stale u64::MAX sentinel"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 }
 
