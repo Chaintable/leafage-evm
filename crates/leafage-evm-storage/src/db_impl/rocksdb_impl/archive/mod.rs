@@ -44,7 +44,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod iterator_tracker;
 use iterator_tracker::{
@@ -101,22 +101,6 @@ fn rocksdb_read_options() -> ReadOptions {
     read_options
 }
 
-/// Read options for **full-range scans** (the `LatestStateDBIterator` /
-/// `BlockIterator` full-CF iterations).
-///
-/// The `AddressToAccount` / `AddressToStorage` CFs carry a `prefix_extractor`,
-/// so a default iterator runs in *prefix-seek mode*, where iterating across
-/// prefix boundaries is **not guaranteed to return all keys** — a full scan can
-/// silently skip data. `total_order_seek = true` forces a complete, prefix-
-/// agnostic traversal. (Point reads keep `rocksdb_read_options()` so their
-/// in-prefix `seek` still uses the prefix bloom.)
-fn rocksdb_scan_read_options() -> ReadOptions {
-    let mut read_options = ReadOptions::default();
-    read_options.set_verify_checksums(false);
-    read_options.set_total_order_seek(true);
-    read_options
-}
-
 /// Debug aid for migration: when `MIGRATE_DEBUG_ADDR_HASH` is set to the
 /// 32-byte keccak hash of an address (hex), the full-scan iterators log every
 /// on-disk account/storage record whose key prefix matches — including the
@@ -129,7 +113,7 @@ static MIGRATE_DEBUG_ADDR_HASH: LazyLock<Option<[u8; 32]>> = LazyLock::new(|| {
     let s = std::env::var("MIGRATE_DEBUG_ADDR_HASH").ok()?;
     match H256::from_str(s.trim()) {
         Ok(h) => {
-            info!(target: "migrate_debug", "storage/account record logging enabled for addr_hash {}", h);
+            debug!(target: "migrate_debug", "storage/account record logging enabled for addr_hash {}", h);
             Some(h.0)
         }
         Err(e) => {
@@ -1013,7 +997,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                     .unwrap(),
-                rocksdb_scan_read_options(),
+                rocksdb_read_options(),
                 IteratorMode::Start,
             )
             .peekable();
@@ -1067,7 +1051,7 @@ impl LatestStateDBIterator for DataBaseRef {
                             let acc = SlimAccount::decode(&mut value.as_ref()).unwrap();
                             format!("EMIT -> snapshot (nonce={}, balance={})", acc.nonce, acc.balance)
                         };
-                        info!(target: "migrate_debug",
+                        debug!(target: "migrate_debug",
                             "account key=0x{} tail=0x{} block={} newest={} -> {}",
                             alloy::hex::encode(&key[..]),
                             alloy::hex::encode(&key[32..64]),
@@ -1114,7 +1098,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::HashToCode.to_str())
                     .unwrap(),
-                rocksdb_scan_read_options(),
+                rocksdb_read_options(),
                 IteratorMode::Start,
             )
             .map(|item| {
@@ -1140,7 +1124,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
                     .unwrap(),
-                rocksdb_scan_read_options(),
+                rocksdb_read_options(),
                 IteratorMode::Start,
             )
             .peekable();
@@ -1192,7 +1176,7 @@ impl LatestStateDBIterator for DataBaseRef {
                         } else {
                             "EMIT -> snapshot"
                         };
-                        info!(target: "migrate_debug",
+                        debug!(target: "migrate_debug",
                             "storage key=0x{} tail=0x{} slot={} block={} value={} newest={} -> {}",
                             alloy::hex::encode(&key[..]),
                             alloy::hex::encode(&key[64..96]),
@@ -1231,7 +1215,7 @@ impl BlockIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
                     .unwrap(),
-                rocksdb_scan_read_options(),
+                rocksdb_read_options(),
                 IteratorMode::Start,
             )
             .map(|item| {
@@ -1270,7 +1254,7 @@ impl BlockIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
                     .unwrap(),
-                rocksdb_scan_read_options(),
+                rocksdb_read_options(),
                 IteratorMode::Start,
             )
             .map(|item| {
@@ -2441,13 +2425,15 @@ mod scan_completeness_tests {
         H256::from(b)
     }
 
-    /// Settles empirically whether a full-CF scan over the prefix-extractor
-    /// `AddressToStorage` CF (binary-search index, skiplist memtable) drops
-    /// keys WITHOUT `total_order_seek`, vs WITH it. Writes N distinct
-    /// `address||slot` prefixes across many flushed L0 SSTs (and again after a
-    /// compaction), then counts both ways and prints the result.
+    /// Settles empirically that a full-CF scan over the prefix-extractor
+    /// `AddressToStorage` CF (binary-search index, skiplist memtable) returns
+    /// every key in the shipped read mode (`rocksdb_read_options`, i.e. prefix
+    /// seek) — no `total_order_seek` required. Writes N distinct `address||slot`
+    /// prefixes across many overlapping flushed L0 SSTs (and again after a
+    /// compaction), then asserts the full scan is complete in both layouts.
+    /// This is the regression guard for reverting the `total_order_seek` change.
     #[test]
-    fn test_full_scan_completeness_prefix_vs_total_order() {
+    fn test_full_scan_completeness_prefix_mode() {
         let _g = super::ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2490,25 +2476,20 @@ mod scan_completeness_tests {
                     .count()
             };
 
-            let total_l0 = count(rocksdb_scan_read_options());
             let prefix_l0 = count(rocksdb_read_options());
-            eprintln!(
-                "[scan-test] L0 (multi-SST): expected={n} total_order_seek={total_l0} prefix_mode={prefix_l0}"
-            );
+            eprintln!("[scan-test] L0 (multi-SST): expected={n} prefix_mode={prefix_l0}");
 
             // Compact to push into deeper levels, then re-count.
             db.compact().unwrap();
-            let total_compacted = count(rocksdb_scan_read_options());
             let prefix_compacted = count(rocksdb_read_options());
-            eprintln!(
-                "[scan-test] compacted: expected={n} total_order_seek={total_compacted} prefix_mode={prefix_compacted}"
-            );
+            eprintln!("[scan-test] compacted: expected={n} prefix_mode={prefix_compacted}");
 
-            // The fix (total_order_seek=true) must be complete in both layouts.
-            assert_eq!(total_l0 as u64, n, "total_order_seek scan missed keys in L0");
+            // The shipped prefix-mode full scan must be complete in both layouts;
+            // this is why total_order_seek is unnecessary.
+            assert_eq!(prefix_l0 as u64, n, "prefix-mode scan missed keys in L0");
             assert_eq!(
-                total_compacted as u64, n,
-                "total_order_seek scan missed keys after compaction"
+                prefix_compacted as u64, n,
+                "prefix-mode scan missed keys after compaction"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
