@@ -27,6 +27,8 @@ tikv-jemallocator = { workspace = true, features = ["profiling"] }
 tikv-jemalloc-sys.workspace = true
 jemalloc_pprof = { workspace = true, features = ["symbolize"] }
 alloy-rlp.workspace = true
+alloy.workspace = true
+rocksdb = { workspace = true, features = ["jemalloc"] }
 rdkafka.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true

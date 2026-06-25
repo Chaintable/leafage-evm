@@ -3,11 +3,12 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, KafkaS3Config, NodeTypeArg, parse_kafka_s3_config};
+use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
 use crate::warm::Warmup;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
@@ -19,8 +20,8 @@ use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecI
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::time;
 use tracing::info;
 
@@ -41,6 +42,7 @@ pub struct Command {
             "mainnet",
             "arbitrum",
             "op",
+            "base",
             "bsc",
             "cosmos",
             "mantlev2",
@@ -464,6 +466,18 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
+            }
+            "base" => {
+                // Base forked from the OP stack; execution is OP-equivalent
+                // (Beryl precompiles are layered on separately).
+                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Base(chain_cfg))
             }
             "bsc" => {
                 let mut chain_cfg = CfgEnv::default();
