@@ -5,6 +5,7 @@ use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
+use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
@@ -194,6 +195,7 @@ pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
     Arbitrum((CfgEnv<MainnetSpecId>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
+    Base(CfgEnv<BaseHardfork>),
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Iotex(CfgEnv<IotexHardfork>),
@@ -210,6 +212,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Base(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Iotex(cfg) => cfg.chain_id,
