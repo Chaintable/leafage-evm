@@ -4680,6 +4680,7 @@ dependencies = [
 name = "leafage-evm"
 version = "0.2.0"
 dependencies = [
+ "alloy",
  "alloy-rlp",
  "anyhow",
  "aws-config",
@@ -4700,6 +4701,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "pprof",
  "rdkafka",
+ "rocksdb",
  "serde",
  "serde_json",
  "tikv-jemalloc-sys",
