@@ -575,6 +575,71 @@ fn archive_cf_descriptors(
     ]
 }
 
+/// Streams **strictly-ascending** `(key, value)` pairs into a series of rolled
+/// SST files for later `ingest_external_file`. Keys must be globally ascending
+/// across all `put` calls; the file is rolled whenever it exceeds `roll_bytes`
+/// (any split of an ascending stream yields non-overlapping files, which ingest
+/// can place across levels instead of piling into L0).
+struct SstSink<'a> {
+    opts: &'a Options,
+    tmp_dir: std::path::PathBuf,
+    name: String,
+    roll_bytes: u64,
+    seq: u64,
+    writer: Option<SstFileWriter<'a>>,
+    cur_path: std::path::PathBuf,
+    has_rows: bool,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl<'a> SstSink<'a> {
+    fn new(opts: &'a Options, tmp_dir: std::path::PathBuf, name: String, roll_bytes: u64) -> Self {
+        Self {
+            opts,
+            tmp_dir,
+            name,
+            roll_bytes,
+            seq: 0,
+            writer: None,
+            cur_path: std::path::PathBuf::new(),
+            has_rows: false,
+            paths: Vec::new(),
+        }
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        if self.writer.is_none() {
+            let p = self
+                .tmp_dir
+                .join(format!("{}_{:06}.sst", self.name, self.seq));
+            self.seq += 1;
+            let w = SstFileWriter::create(self.opts);
+            w.open(&p)?;
+            self.writer = Some(w);
+            self.cur_path = p;
+            self.has_rows = false;
+        }
+        let w = self.writer.as_mut().unwrap();
+        w.put(key, value)?;
+        self.has_rows = true;
+        if w.file_size() >= self.roll_bytes {
+            self.writer.take().unwrap().finish()?;
+            self.paths.push(std::mem::take(&mut self.cur_path));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<std::path::PathBuf>, Error> {
+        if let Some(mut w) = self.writer.take() {
+            if self.has_rows {
+                w.finish()?;
+                self.paths.push(self.cur_path);
+            }
+        }
+        Ok(self.paths)
+    }
+}
+
 impl DataBaseRef {
     /// Open the archive RocksDB with default throttles. Set
     /// `disable_auto_compactions=true` if a caller plans to run its own
@@ -788,8 +853,6 @@ impl DataBaseRef {
         dst_path: P,
         cache_size: usize,
     ) -> Result<(), Error> {
-        const COMMIT_CHUNK: usize = 200_000;
-
         // Source: read-only, bounded fds (archive DBs have very many SSTs, so
         // the default unlimited max_open_files trips the OS fd limit).
         let mut src_opts = Options::default();
@@ -835,11 +898,13 @@ impl DataBaseRef {
             .map_err(Error::RocksDB)?;
 
         // Full-scan read options: total_order_seek so the prefix-extractor CFs
-        // are traversed completely (a migration must not drop any key).
+        // are traversed completely (a migration must not drop any key), plus a
+        // large readahead so the sequential scan stays disk-sequential.
         let scan_ro = || {
             let mut r = ReadOptions::default();
             r.set_verify_checksums(false);
             r.set_total_order_seek(true);
+            r.set_readahead_size(16 * 1024 * 1024);
             r
         };
 
@@ -878,7 +943,16 @@ impl DataBaseRef {
                 processed, total_est, pct, fmt_hms(elapsed), fmt_hms(eta));
         };
 
-        // 1) Non-versioned CFs: copy verbatim.
+        // SST staging dir on the SAME filesystem as the destination, so ingest
+        // with move_files=true renames files in instead of copying them.
+        let tmp_dir = dst_path.as_ref().join(".reencode_tmp");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| Error::UnSupported(format!("create SST staging dir: {e}")))?;
+        let sst_opts = Self::sst_writer_options();
+        const ROLL_BYTES: u64 = 512 * 1024 * 1024;
+
+        // 1) Non-versioned CFs: copy verbatim (src is already key-ascending).
         for col in [
             StorageTypeColumn::LatestBlockHash,
             StorageTypeColumn::BlockHashToBlockInfo,
@@ -886,34 +960,64 @@ impl DataBaseRef {
             StorageTypeColumn::HashToCode,
         ] {
             let src_cf = src.cf_handle(col.to_str()).unwrap();
-            let dst_cf = dst.cf_handle(col.to_str()).unwrap();
-            let mut batch = WriteBatch::default();
+            let mut sink =
+                SstSink::new(&sst_opts, tmp_dir.clone(), col.to_str().to_string(), ROLL_BYTES);
             let mut n = 0usize;
             for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
                 let (key, value) = item.map_err(Error::RocksDB)?;
-                batch.put_cf(dst_cf, key, value);
+                sink.put(&key, &value)?;
                 n += 1;
                 processed += 1;
-                if n % COMMIT_CHUNK == 0 {
-                    dst.write(std::mem::take(&mut batch)).map_err(Error::RocksDB)?;
+                if processed % 200_000 == 0 {
                     log_progress(processed, false);
                 }
             }
-            dst.write(batch).map_err(Error::RocksDB)?;
+            let paths = sink.finish()?;
+            if !paths.is_empty() {
+                let cf = dst.cf_handle(col.to_str()).unwrap();
+                dst.ingest_external_file_cf_opts(cf, &Self::ingest_external_file_options(), paths)
+                    .map_err(Error::RocksDB)?;
+            }
             info!(target: "migrate", "reencode: copied {} {} records", n, col);
         }
 
-        // 2) Versioned CFs: rewrite the trailing 8-byte height (block_num ->
-        //    u64::MAX - block_num), dropping orphaned u64::MAX sentinels.
+        // 2) Versioned CFs: rewrite the trailing 8-byte height
+        //    (block_num -> u64::MAX - block_num), dropping orphaned u64::MAX
+        //    sentinels. The transform reverses order WITHIN each address(/slot)
+        //    prefix, so buffer one prefix at a time and emit it sorted; the
+        //    prefixes stay ascending, keeping the global key stream (and thus
+        //    every SST file) strictly increasing for ingest.
         for col in [
             StorageTypeColumn::AddressToAccount,
             StorageTypeColumn::AddressToStorage,
         ] {
+            let prefix_len = if matches!(col, StorageTypeColumn::AddressToAccount) {
+                32
+            } else {
+                64
+            };
             let src_cf = src.cf_handle(col.to_str()).unwrap();
-            let dst_cf = dst.cf_handle(col.to_str()).unwrap();
-            let mut batch = WriteBatch::default();
+            let mut sink =
+                SstSink::new(&sst_opts, tmp_dir.clone(), col.to_str().to_string(), ROLL_BYTES);
+            let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut cur_prefix: Option<Vec<u8>> = None;
             let mut kept = 0usize;
             let mut dropped = 0usize;
+
+            // Emit one prefix's buffered rows in ascending new-key order.
+            fn flush_prefix(
+                buf: &mut Vec<(Vec<u8>, Vec<u8>)>,
+                sink: &mut SstSink,
+            ) -> Result<usize, Error> {
+                buf.sort_by(|a, b| a.0.cmp(&b.0));
+                for (k, v) in buf.iter() {
+                    sink.put(k, v)?;
+                }
+                let n = buf.len();
+                buf.clear();
+                Ok(n)
+            }
+
             for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
                 let (key, value) = item.map_err(Error::RocksDB)?;
                 let len = key.len();
@@ -925,20 +1029,34 @@ impl DataBaseRef {
                     dropped += 1; // orphaned pre-#104 dual-write sentinel
                     continue;
                 }
+                if cur_prefix.as_deref() != Some(&key[..prefix_len]) {
+                    if !buf.is_empty() {
+                        kept += flush_prefix(&mut buf, &mut sink)?;
+                    }
+                    cur_prefix = Some(key[..prefix_len].to_vec());
+                }
                 let mut new_key = key.to_vec();
                 new_key[len - 8..].copy_from_slice(&(u64::MAX - block_num).to_be_bytes());
-                batch.put_cf(dst_cf, &new_key, value);
-                kept += 1;
-                if kept % COMMIT_CHUNK == 0 {
-                    dst.write(std::mem::take(&mut batch)).map_err(Error::RocksDB)?;
+                buf.push((new_key, value.to_vec()));
+                if processed % 200_000 == 0 {
                     log_progress(processed, false);
                 }
             }
-            dst.write(batch).map_err(Error::RocksDB)?;
+            if !buf.is_empty() {
+                kept += flush_prefix(&mut buf, &mut sink)?;
+            }
+            let paths = sink.finish()?;
+            if !paths.is_empty() {
+                let cf = dst.cf_handle(col.to_str()).unwrap();
+                dst.ingest_external_file_cf_opts(cf, &Self::ingest_external_file_options(), paths)
+                    .map_err(Error::RocksDB)?;
+            }
             info!(target: "migrate",
                 "reencode: rewrote {} {} records ({} u64::MAX sentinels dropped)",
                 kept, col, dropped);
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // Mark the destination as inverted so the node auto-detects it at open.
         {
