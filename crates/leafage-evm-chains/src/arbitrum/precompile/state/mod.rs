@@ -148,6 +148,14 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         self.gas_limit.saturating_sub(self.gas_used)
     }
 
+    fn load_account(&mut self, account: Address) -> Result<(), PrecompileError> {
+        self.context
+            .journal_mut()
+            .load_account(account)
+            .map(|_| ())
+            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+    }
+
     pub(super) fn read_key(
         &mut self,
         storage_key: &[u8],
@@ -163,6 +171,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         key: [u8; 32],
     ) -> Result<U256, PrecompileError> {
         self.burn(STORAGE_READ_GAS)?;
+        self.load_account(account)?;
         self.context
             .journal_mut()
             .sload(account, arbos_state::slot_for_key(storage_key, key))
@@ -176,6 +185,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         storage_key: &[u8],
         key: [u8; 32],
     ) -> Result<U256, PrecompileError> {
+        self.load_account(account)?;
         self.context
             .journal_mut()
             .sload(account, arbos_state::slot_for_key(storage_key, key))
@@ -212,6 +222,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         } else {
             STORAGE_WRITE_COST
         })?;
+        self.load_account(account)?;
         self.context
             .journal_mut()
             .sstore(account, arbos_state::slot_for_key(storage_key, key), value)
@@ -226,6 +237,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         key: [u8; 32],
         value: U256,
     ) -> Result<(), PrecompileError> {
+        self.load_account(account)?;
         self.context
             .journal_mut()
             .sstore(account, arbos_state::slot_for_key(storage_key, key), value)
@@ -327,6 +339,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             &[],
             U256::from(arbos_state::ARBOS_VERSION_OFFSET).to_be_bytes(),
         );
+        self.load_account(arbos_state::ARBOS_STATE_ADDRESS)?;
         self.context
             .journal_mut()
             .sload(arbos_state::ARBOS_STATE_ADDRESS, slot)
@@ -490,8 +503,8 @@ mod tests {
     use revm::database::EmptyDB;
     use revm::{Context, MainContext};
 
-    fn context(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
-        let mut context = Context::mainnet()
+    fn context_without_loaded_account(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
+        Context::mainnet()
             .with_tx(ArbitrumTxEnv::default())
             .with_block(BlockEnv {
                 basefee,
@@ -499,7 +512,11 @@ mod tests {
             })
             .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
             .with_db(CacheDB::new(EmptyDB::default()))
-            .with_chain(ArbitrumExecutionContext::default());
+            .with_chain(ArbitrumExecutionContext::default())
+    }
+
+    fn context(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
+        let mut context = context_without_loaded_account(basefee);
         context
             .journal_mut()
             .load_account(arbos_state::ARBOS_STATE_ADDRESS)
@@ -521,6 +538,41 @@ mod tests {
 
         assert_eq!(storage.arbos_version().expect("read ArbOS version"), 60);
         assert_eq!(storage.gas_used, 123);
+    }
+
+    #[test]
+    fn arbos_version_read_loads_account_before_sload() {
+        let mut context = context_without_loaded_account(0);
+        let slot = arbos_state::slot_for_key(
+            &[],
+            U256::from(arbos_state::ARBOS_VERSION_OFFSET).to_be_bytes(),
+        );
+        context
+            .db_mut()
+            .insert_account_storage(arbos_state::ARBOS_STATE_ADDRESS, slot, U256::from(60))
+            .expect("seed ArbOS version");
+
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 123);
+
+        assert_eq!(storage.arbos_version().expect("read ArbOS version"), 60);
+        assert_eq!(storage.gas_used, 123);
+    }
+
+    #[test]
+    fn storage_access_loads_account_and_preserves_journal_writes() {
+        let mut context = context_without_loaded_account(0);
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+
+        storage
+            .write(&[], arbos_state::ARBOS_VERSION_OFFSET, U256::from(60))
+            .expect("write ArbOS version");
+
+        assert_eq!(
+            storage
+                .read(&[], arbos_state::ARBOS_VERSION_OFFSET)
+                .expect("read ArbOS version"),
+            U256::from(60)
+        );
     }
 
     #[test]

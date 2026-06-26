@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use crate::api_impl::arbitrum::api::ArbitrumApiImpl;
 
-const ARBITRUM_ONE_NITRO_GENESIS_BLOCK: u64 = 22_207_818;
+const ARBITRUM_ONE_NITRO_GENESIS_BLOCK: u64 = 22_207_817;
 const ARBOS_VERSION_40: u64 = 40;
 const MIN_TRANSACTION_GAS: u64 = 21_000;
 const CALL_STIPEND_GAS: u64 = 2_300;
@@ -935,6 +935,11 @@ mod tests {
             ArbitrumApiImpl::<()>::retryable_redeem_gas_price(7, &block_env),
             42
         );
+    }
+
+    #[test]
+    fn arbitrum_one_nitro_genesis_block_matches_node_interface() {
+        assert_eq!(configured_nitro_genesis_block_num(42161, None), 22_207_817);
     }
 
     #[test]
