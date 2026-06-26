@@ -51,7 +51,7 @@ use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 /// Global iterator tracker for StateDB instances
@@ -319,9 +319,9 @@ fn rocksdb_column_options(
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
-    // Allow the writer to roll into a fresh memtable while older ones are
-    // still being flushed (default is 2). Helps under sustained write load
-    // such as archive bulk-load.
+                                                              // Allow the writer to roll into a fresh memtable while older ones are
+                                                              // still being flushed (default is 2). Helps under sustained write load
+                                                              // such as archive bulk-load.
     cf_opts.set_max_write_buffer_number(4);
     // Larger SST files = fewer files at every level = less metadata,
     // smaller index/bloom overhead, fewer files for compaction to track.
@@ -449,11 +449,11 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.set_write_buffer_size(1 << 28); // e.g., 256MB
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
-    // Background concurrency. The previous value (2) covered flush + a single
-    // compaction job, which serialised L0 → L1 across CFs and bottlenecked
-    // archive bulk-load; standalone reads/writes also benefit from faster
-    // background compaction. `max_subcompactions` lets a single big
-    // compaction (e.g. AddressToStorage) split into parallel ranges.
+                                          // Background concurrency. The previous value (2) covered flush + a single
+                                          // compaction job, which serialised L0 → L1 across CFs and bottlenecked
+                                          // archive bulk-load; standalone reads/writes also benefit from faster
+                                          // background compaction. `max_subcompactions` lets a single big
+                                          // compaction (e.g. AddressToStorage) split into parallel ranges.
     opts.increase_parallelism(8);
     opts.set_max_subcompactions(4);
     opts.set_use_direct_io_for_flush_and_compaction(true);
@@ -638,6 +638,198 @@ impl<'a> SstSink<'a> {
         }
         Ok(self.paths)
     }
+}
+
+/// Split the leading-byte keyspace `0..=255` into `jobs` contiguous shards,
+/// each `(lo, hi)` covering first-byte `[lo, hi)` (`hi = None` = to the end).
+/// Account/storage keys begin with a uniformly-distributed 32-byte hash, so
+/// equal byte ranges give roughly balanced shards.
+fn shard_bounds(jobs: usize) -> Vec<(u8, Option<u8>)> {
+    let jobs = jobs.clamp(1, 256);
+    (0..jobs)
+        .map(|i| {
+            let lo = (i * 256 / jobs) as u8;
+            let hi_idx = (i + 1) * 256 / jobs;
+            let hi = if hi_idx >= 256 {
+                None
+            } else {
+                Some(hi_idx as u8)
+            };
+            (lo, hi)
+        })
+        .collect()
+}
+
+/// Re-encode one versioned CF (`AddressToAccount`/`AddressToStorage`) from
+/// legacy into inverted SST files using `jobs` parallel workers sharded by the
+/// leading key byte, then ingest them. Each worker scans its disjoint key
+/// range, buffers one prefix at a time and emits it sorted (the tail rewrite
+/// reverses order within a prefix), and drops orphaned `u64::MAX` sentinels.
+/// Returns `(kept, dropped)`.
+#[allow(clippy::too_many_arguments)]
+fn reencode_versioned_cf(
+    src: &DB,
+    dst: &DB,
+    col: StorageTypeColumn,
+    prefix_len: usize,
+    jobs: usize,
+    sst_opts: &Options,
+    tmp_dir: &Path,
+    roll_bytes: u64,
+) -> Result<(u64, u64), Error> {
+    let bounds = shard_bounds(jobs);
+    let n = bounds.len();
+    let processed = AtomicU64::new(0);
+    let kept = AtomicU64::new(0);
+    let dropped = AtomicU64::new(0);
+    let progress_bps: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let stop = AtomicBool::new(false);
+    let start = std::time::Instant::now();
+    let name = col.to_str();
+
+    let paths = std::thread::scope(|scope| -> Result<Vec<std::path::PathBuf>, Error> {
+        // Progress monitor: keyspace position (leading byte), robust to the
+        // obsolete-entry inflation that makes key counts useless here.
+        scope.spawn(|| {
+            let mut ticks = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticks += 1;
+                if ticks % 5 != 0 {
+                    continue; // log every ~5s, but check `stop` every 1s
+                }
+                let covered: f64 = bounds
+                    .iter()
+                    .zip(&progress_bps)
+                    .map(|((lo, hi), bps)| {
+                        let width = (hi.map(u32::from).unwrap_or(256) - *lo as u32) as f64;
+                        width * (bps.load(Ordering::Relaxed) as f64 / 10_000.0)
+                    })
+                    .sum();
+                let frac = (covered / 256.0).clamp(0.0, 1.0);
+                let elapsed = start.elapsed().as_secs_f64();
+                let eta = if frac > 0.0001 {
+                    elapsed * (1.0 - frac) / frac
+                } else {
+                    0.0
+                };
+                info!(target: "migrate",
+                    "reencode {} progress: {:.1}% of keyspace, {} records, elapsed={} eta~{}",
+                    name, frac * 100.0, processed.load(Ordering::Relaxed),
+                    fmt_hms(elapsed), fmt_hms(eta));
+            }
+        });
+
+        let mut handles = Vec::with_capacity(n);
+        for (i, (lo, hi)) in bounds.iter().copied().enumerate() {
+            let processed = &processed;
+            let kept = &kept;
+            let dropped = &dropped;
+            let progress_bps = &progress_bps;
+            handles.push(
+                scope.spawn(move || -> Result<Vec<std::path::PathBuf>, Error> {
+                    let cf = src.cf_handle(name).unwrap();
+                    let mut ro = ReadOptions::default();
+                    ro.set_verify_checksums(false);
+                    ro.set_total_order_seek(true);
+                    ro.set_readahead_size(16 * 1024 * 1024);
+                    ro.set_iterate_lower_bound(vec![lo]);
+                    if let Some(h) = hi {
+                        ro.set_iterate_upper_bound(vec![h]);
+                    }
+                    let width = (hi.map(u32::from).unwrap_or(256) - lo as u32).max(1);
+                    let mut sink = SstSink::new(
+                        sst_opts,
+                        tmp_dir.to_path_buf(),
+                        format!("{name}_{i}"),
+                        roll_bytes,
+                    );
+                    let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let mut cur_prefix: Option<Vec<u8>> = None;
+                    let mut local_kept = 0u64;
+                    let mut local_dropped = 0u64;
+                    let mut since_report = 0u64;
+
+                    fn flush_prefix(
+                        buf: &mut Vec<(Vec<u8>, Vec<u8>)>,
+                        sink: &mut SstSink,
+                    ) -> Result<u64, Error> {
+                        buf.sort_by(|a, b| a.0.cmp(&b.0));
+                        for (k, v) in buf.iter() {
+                            sink.put(k, v)?;
+                        }
+                        let c = buf.len() as u64;
+                        buf.clear();
+                        Ok(c)
+                    }
+
+                    for item in src.iterator_cf_opt(cf, ro, IteratorMode::Start) {
+                        let (key, value) = item.map_err(Error::RocksDB)?;
+                        let klen = key.len();
+                        let block = u64::from_be_bytes(key[klen - 8..].try_into().unwrap());
+                        since_report += 1;
+                        if since_report >= 50_000 {
+                            processed.fetch_add(since_report, Ordering::Relaxed);
+                            since_report = 0;
+                            let pos =
+                                (key[0] as u32).saturating_sub(lo as u32) as f64 / width as f64;
+                            progress_bps[i]
+                                .store((pos.clamp(0.0, 1.0) * 10_000.0) as u32, Ordering::Relaxed);
+                        }
+                        if block == u64::MAX {
+                            local_dropped += 1; // orphaned pre-#104 dual-write sentinel
+                            continue;
+                        }
+                        if cur_prefix.as_deref() != Some(&key[..prefix_len]) {
+                            if !buf.is_empty() {
+                                local_kept += flush_prefix(&mut buf, &mut sink)?;
+                            }
+                            cur_prefix = Some(key[..prefix_len].to_vec());
+                        }
+                        let mut new_key = key.to_vec();
+                        new_key[klen - 8..].copy_from_slice(&(u64::MAX - block).to_be_bytes());
+                        buf.push((new_key, value.to_vec()));
+                    }
+                    if !buf.is_empty() {
+                        local_kept += flush_prefix(&mut buf, &mut sink)?;
+                    }
+                    processed.fetch_add(since_report, Ordering::Relaxed);
+                    kept.fetch_add(local_kept, Ordering::Relaxed);
+                    dropped.fetch_add(local_dropped, Ordering::Relaxed);
+                    progress_bps[i].store(10_000, Ordering::Relaxed);
+                    sink.finish()
+                }),
+            );
+        }
+
+        let mut paths = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(r) => paths.extend(r?),
+                Err(_) => {
+                    stop.store(true, Ordering::Relaxed);
+                    return Err(Error::UnSupported(format!(
+                        "reencode worker for {name} panicked"
+                    )));
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        Ok(paths)
+    })?;
+
+    if !paths.is_empty() {
+        let cf = dst.cf_handle(name).unwrap();
+        dst.ingest_external_file_cf_opts(cf, &DataBaseRef::ingest_external_file_options(), paths)
+            .map_err(Error::RocksDB)?;
+    }
+    Ok((
+        kept.load(Ordering::Relaxed),
+        dropped.load(Ordering::Relaxed),
+    ))
 }
 
 impl DataBaseRef {
@@ -852,7 +1044,20 @@ impl DataBaseRef {
         src_path: P,
         dst_path: P,
         cache_size: usize,
+        jobs: usize,
     ) -> Result<(), Error> {
+        // 0 = auto: one worker per core, capped (more than ~16 rarely helps and
+        // just multiplies the per-shard read/SST overhead).
+        let jobs = if jobs == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 16)
+        } else {
+            jobs.clamp(1, 16)
+        };
+        info!(target: "migrate", "reencode: legacy -> inverted with {jobs} worker(s)");
+
         // Source: read-only, bounded fds (archive DBs have very many SSTs, so
         // the default unlimited max_open_files trips the OS fd limit).
         let mut src_opts = Options::default();
@@ -908,40 +1113,7 @@ impl DataBaseRef {
             r
         };
 
-        // Estimated total record count (RocksDB key-count estimate) for the
-        // progress/ETA readout.
-        let total_est: u64 = cf_names
-            .iter()
-            .filter_map(|&n| src.cf_handle(n))
-            .filter_map(|cf| {
-                src.property_int_value_cf(cf, "rocksdb.estimate-num-keys")
-                    .ok()
-                    .flatten()
-            })
-            .sum();
         let start = std::time::Instant::now();
-        let mut last_log = start;
-        let mut processed: u64 = 0;
-        let mut log_progress = |processed: u64, force: bool| {
-            if !force && last_log.elapsed().as_secs() < 5 {
-                return; // throttle to ~every 5s
-            }
-            last_log = std::time::Instant::now();
-            let elapsed = start.elapsed().as_secs_f64();
-            let pct = if total_est > 0 {
-                (processed as f64 / total_est as f64 * 100.0).min(100.0)
-            } else {
-                0.0
-            };
-            let eta = if processed > 0 && total_est > processed {
-                elapsed * (total_est - processed) as f64 / processed as f64
-            } else {
-                0.0
-            };
-            info!(target: "migrate",
-                "reencode progress: {}/~{} ({:.1}%) elapsed={} eta~{}",
-                processed, total_est, pct, fmt_hms(elapsed), fmt_hms(eta));
-        };
 
         // SST staging dir on the SAME filesystem as the destination, so ingest
         // with move_files=true renames files in instead of copying them.
@@ -960,17 +1132,17 @@ impl DataBaseRef {
             StorageTypeColumn::HashToCode,
         ] {
             let src_cf = src.cf_handle(col.to_str()).unwrap();
-            let mut sink =
-                SstSink::new(&sst_opts, tmp_dir.clone(), col.to_str().to_string(), ROLL_BYTES);
+            let mut sink = SstSink::new(
+                &sst_opts,
+                tmp_dir.clone(),
+                col.to_str().to_string(),
+                ROLL_BYTES,
+            );
             let mut n = 0usize;
             for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
                 let (key, value) = item.map_err(Error::RocksDB)?;
                 sink.put(&key, &value)?;
                 n += 1;
-                processed += 1;
-                if processed % 200_000 == 0 {
-                    log_progress(processed, false);
-                }
             }
             let paths = sink.finish()?;
             if !paths.is_empty() {
@@ -981,80 +1153,34 @@ impl DataBaseRef {
             info!(target: "migrate", "reencode: copied {} {} records", n, col);
         }
 
-        // 2) Versioned CFs: rewrite the trailing 8-byte height
-        //    (block_num -> u64::MAX - block_num), dropping orphaned u64::MAX
-        //    sentinels. The transform reverses order WITHIN each address(/slot)
-        //    prefix, so buffer one prefix at a time and emit it sorted; the
-        //    prefixes stay ascending, keeping the global key stream (and thus
-        //    every SST file) strictly increasing for ingest.
-        for col in [
+        // 2) Versioned CFs: parallel sharded re-encode (tail rewrite + sentinel
+        //    drop) into SSTs, then ingest. See `reencode_versioned_cf`.
+        let (acc_kept, acc_dropped) = reencode_versioned_cf(
+            &src,
+            &dst,
             StorageTypeColumn::AddressToAccount,
+            32,
+            jobs,
+            &sst_opts,
+            &tmp_dir,
+            ROLL_BYTES,
+        )?;
+        info!(target: "migrate",
+            "reencode: rewrote {} AddressToAccount records ({} u64::MAX sentinels dropped)",
+            acc_kept, acc_dropped);
+        let (sto_kept, sto_dropped) = reencode_versioned_cf(
+            &src,
+            &dst,
             StorageTypeColumn::AddressToStorage,
-        ] {
-            let prefix_len = if matches!(col, StorageTypeColumn::AddressToAccount) {
-                32
-            } else {
-                64
-            };
-            let src_cf = src.cf_handle(col.to_str()).unwrap();
-            let mut sink =
-                SstSink::new(&sst_opts, tmp_dir.clone(), col.to_str().to_string(), ROLL_BYTES);
-            let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let mut cur_prefix: Option<Vec<u8>> = None;
-            let mut kept = 0usize;
-            let mut dropped = 0usize;
-
-            // Emit one prefix's buffered rows in ascending new-key order.
-            fn flush_prefix(
-                buf: &mut Vec<(Vec<u8>, Vec<u8>)>,
-                sink: &mut SstSink,
-            ) -> Result<usize, Error> {
-                buf.sort_by(|a, b| a.0.cmp(&b.0));
-                for (k, v) in buf.iter() {
-                    sink.put(k, v)?;
-                }
-                let n = buf.len();
-                buf.clear();
-                Ok(n)
-            }
-
-            for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
-                let (key, value) = item.map_err(Error::RocksDB)?;
-                let len = key.len();
-                // Legacy tail: block_num is the trailing 8 bytes (big-endian);
-                // the 24 bytes before it are zero in both encodings.
-                let block_num = u64::from_be_bytes(key[len - 8..].try_into().unwrap());
-                processed += 1;
-                if block_num == u64::MAX {
-                    dropped += 1; // orphaned pre-#104 dual-write sentinel
-                    continue;
-                }
-                if cur_prefix.as_deref() != Some(&key[..prefix_len]) {
-                    if !buf.is_empty() {
-                        kept += flush_prefix(&mut buf, &mut sink)?;
-                    }
-                    cur_prefix = Some(key[..prefix_len].to_vec());
-                }
-                let mut new_key = key.to_vec();
-                new_key[len - 8..].copy_from_slice(&(u64::MAX - block_num).to_be_bytes());
-                buf.push((new_key, value.to_vec()));
-                if processed % 200_000 == 0 {
-                    log_progress(processed, false);
-                }
-            }
-            if !buf.is_empty() {
-                kept += flush_prefix(&mut buf, &mut sink)?;
-            }
-            let paths = sink.finish()?;
-            if !paths.is_empty() {
-                let cf = dst.cf_handle(col.to_str()).unwrap();
-                dst.ingest_external_file_cf_opts(cf, &Self::ingest_external_file_options(), paths)
-                    .map_err(Error::RocksDB)?;
-            }
-            info!(target: "migrate",
-                "reencode: rewrote {} {} records ({} u64::MAX sentinels dropped)",
-                kept, col, dropped);
-        }
+            64,
+            jobs,
+            &sst_opts,
+            &tmp_dir,
+            ROLL_BYTES,
+        )?;
+        info!(target: "migrate",
+            "reencode: rewrote {} AddressToStorage records ({} u64::MAX sentinels dropped)",
+            sto_kept, sto_dropped);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -1068,7 +1194,6 @@ impl DataBaseRef {
         }
 
         dst.flush().map_err(Error::RocksDB)?;
-        log_progress(processed, true);
         info!(target: "migrate",
             "reencode: done in {}, destination flushed and marked inverted",
             fmt_hms(start.elapsed().as_secs_f64()));
@@ -1433,7 +1558,10 @@ impl LatestStateDBIterator for DataBaseRef {
                             "skip(deleted = absent at head)".to_string()
                         } else {
                             let acc = SlimAccount::decode(&mut value.as_ref()).unwrap();
-                            format!("EMIT -> snapshot (nonce={}, balance={})", acc.nonce, acc.balance)
+                            format!(
+                                "EMIT -> snapshot (nonce={}, balance={})",
+                                acc.nonce, acc.balance
+                            )
                         };
                         debug!(target: "migrate_debug",
                             "account key=0x{} tail=0x{} block={} newest={} -> {}",
@@ -2528,7 +2656,9 @@ mod rewind_tests {
                 .unwrap();
             let block2 = make_block_info_at(2, H256::repeat_byte(0x22), block1.header.hash);
             let diff2 = make_diff(addr, slot, 200, 2, 9);
-            latest(&db).update_block(block2.clone(), diff2.clone()).unwrap();
+            latest(&db)
+                .update_block(block2.clone(), diff2.clone())
+                .unwrap();
 
             // Rewind the head pointer to block 1 with an empty diff.
             latest(&db)
@@ -2553,7 +2683,10 @@ mod rewind_tests {
             );
             let account = state_at_2.0.read_account(addr).unwrap().unwrap();
             assert_eq!(account.balance, U256::from(200));
-            assert_eq!(state_at_2.0.read_storage(addr, slot).unwrap(), U256::from(9));
+            assert_eq!(
+                state_at_2.0.read_storage(addr, slot).unwrap(),
+                U256::from(9)
+            );
 
             // Replaying block 2's diff converges back to the old head.
             latest(&db).update_block(block2.clone(), diff2).unwrap();
@@ -2712,10 +2845,8 @@ mod inverted_encoding_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
-        let dir = std::env::temp_dir().join(format!(
-            "leafage-archive-sentinel-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leafage-archive-sentinel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
             let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
@@ -2746,13 +2877,12 @@ mod inverted_encoding_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                 .unwrap();
-            let stale_acct =
-                crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
-                    address: addr,
-                    balance: U256::from(100u64),
-                    nonce: 1,
-                    code_hash: KECCAK256_EMPTY.0.into(),
-                });
+            let stale_acct = crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                address: addr,
+                balance: U256::from(100u64),
+                nonce: 1,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            });
             db.db
                 .put_cf(
                     acct_cf,
@@ -2836,13 +2966,12 @@ mod inverted_encoding_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                 .unwrap();
-            let stale_acct =
-                crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
-                    address: addr,
-                    balance: U256::from(999u64),
-                    nonce: 1,
-                    code_hash: KECCAK256_EMPTY.0.into(),
-                });
+            let stale_acct = crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                address: addr,
+                balance: U256::from(999u64),
+                nonce: 1,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            });
             db.db
                 .put_cf(
                     acct_cf,
@@ -2864,8 +2993,9 @@ mod inverted_encoding_tests {
                 .unwrap();
         } // src DataBaseRef dropped here -> flushed, singleton released
 
-        // 2) Re-encode legacy -> inverted (raw handles; src untouched).
-        DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64).unwrap();
+        // 2) Re-encode legacy -> inverted (raw handles; src untouched). Use
+        //    jobs=4 to exercise the parallel sharded path.
+        DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64, 4).unwrap();
 
         // 3) Open the result WITHOUT setting the inverted flag — the DB's
         //    encoding marker must auto-align it (self-describing), proving the
@@ -2943,10 +3073,8 @@ mod scan_completeness_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
-        let dir = std::env::temp_dir().join(format!(
-            "leafage-archive-scan-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leafage-archive-scan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
             let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
@@ -2975,11 +3103,8 @@ mod scan_completeness_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
                 .unwrap();
-            let count = |opts: ReadOptions| {
-                db.db
-                    .iterator_cf_opt(cf, opts, IteratorMode::Start)
-                    .count()
-            };
+            let count =
+                |opts: ReadOptions| db.db.iterator_cf_opt(cf, opts, IteratorMode::Start).count();
 
             let prefix_l0 = count(rocksdb_read_options());
             eprintln!("[scan-test] L0 (multi-SST): expected={n} prefix_mode={prefix_l0}");

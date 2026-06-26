@@ -62,6 +62,13 @@ pub struct Command {
     /// with `--inverted-block-encoding` expects, with no S3 re-sync.
     #[arg(long, default_value = "false")]
     reencode_inverted: bool,
+
+    /// Parallel worker threads for `--reencode-inverted` (sharded by leading
+    /// key byte). 0 = auto (one per core, capped at 16). Higher values speed up
+    /// the CPU/merge-bound scan on multi-core hosts; lower values reduce disk
+    /// contention on slow storage.
+    #[arg(long, default_value = "0")]
+    reencode_jobs: usize,
 }
 
 impl Command {
@@ -85,6 +92,7 @@ impl Command {
                 &self.src,
                 &self.dst,
                 self.cache_size,
+                self.reencode_jobs,
             )?;
             // Carry the resync offset over, same as the normal migration.
             let offset =
