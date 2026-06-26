@@ -3,7 +3,10 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
+use crate::utils::{
+    parse_kafka_s3_config, EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config, NodeTypeArg,
+    SyncMode,
+};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -96,11 +99,19 @@ pub struct Command {
     rpc_addr: Option<String>,
 
     /// addr to listen on
-    /// Default: 8545  
+    /// Default: 8545
     ///
     /// This addr is used for the HTTP-RPC server
     #[arg(long, default_value = "0.0.0.0:8545")]
     listen_addr: String,
+
+    /// External WebSocket endpoint for subscribing to block notifications.
+    /// Default: ""
+    ///
+    /// When set, the node subscribes to new block notifications via this WS
+    /// endpoint as a replacement for kafka-based block delivery. Empty means disabled.
+    #[arg(long, default_value = "")]
+    ws_addr: String,
 
     /// The maximum number of concurrent connections.
     /// Default: 5000
@@ -184,6 +195,21 @@ pub struct Command {
     /// This config is used to set the kafka s3 config.
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
+
+    /// The gateway object config path
+    /// Default: None
+    #[arg(long, value_parser = parse_gateway_object_config, value_name = "GATEWAY_OBJECT_CONFIG_PATH")]
+    gateway_object_config: Option<GatewayObjectConfig>,
+
+    /// Node sync / startup mode.
+    /// Default: internal
+    ///
+    /// - internal:   kafka + s3 (requires --kafka-s3-config)
+    /// - standalone: single node, statediff direct from R2 (requires --gateway-object-config)
+    /// - cluster:    catchup from R2, live statediff via user-gateway
+    ///               (requires --gateway-object-config with user_gateway_url)
+    #[arg(long, value_enum, default_value_t = SyncMode::Internal)]
+    sync_mode: SyncMode,
 
     /// The etcd register config path
     /// Default: None
@@ -371,6 +397,17 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     } else {
         bail!("invalid chain cfg: {}", arg);
     }
+}
+
+fn parse_gateway_object_config(arg: &str) -> Result<GatewayObjectConfig> {
+    let cfg: GatewayObjectConfig;
+    if std::path::Path::new(arg).exists() {
+        let file = std::fs::File::open(arg)?;
+        cfg = serde_json::from_reader(file)?;
+    } else {
+        cfg = serde_json::from_str(arg)?;
+    }
+    Ok(cfg)
 }
 
 fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
@@ -745,13 +782,17 @@ impl Command {
             )
             .await?;
 
+        let ws_url = Some(self.ws_addr.clone()).filter(|s| !s.is_empty());
         let updater_handle = updater_build(
             tree.clone(),
             self.rpc_addr.clone(),
+            ws_url,
             self.kafka_s3_config.clone(),
+            self.gateway_object_config.clone(),
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,
+            self.sync_mode,
             self.catchup_safe_depth,
         )
         .await?;
@@ -779,9 +820,9 @@ impl Command {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
-            // wait for lease to unregist
+            // give the etcd unregister (key delete) time to complete before exit
             info!(
-                "waiting for etcd lease to expire in {} seconds...",
+                "waiting for etcd unregister in {} seconds...",
                 self.stop_wait_timeout
             );
             time::sleep(std::time::Duration::from_secs(

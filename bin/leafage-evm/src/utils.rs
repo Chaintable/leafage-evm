@@ -29,6 +29,103 @@ pub struct KafkaS3Config {
     pub s3_chain_id: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub object_fetch_mode: String,
+    #[serde(default)]
+    pub r2_public_base_url: String,
+}
+
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GatewayObjectConfig {
+    pub base_url: String,
+    pub chain_id: String,
+    #[serde(default)]
+    pub version: String,
+    /// Base URL of the user-gateway used for real-time (live) statediff in
+    /// `cluster` sync mode: live block info + state diff are fetched from
+    /// `{user_gateway_url}/v1/object`. Empty falls back to `base_url`.
+    /// Catchup always reads directly from R2 regardless of this field.
+    #[serde(default)]
+    pub user_gateway_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub object_fetch_mode: String,
+    #[serde(default)]
+    pub r2_public_base_url: String,
+    /// Public base URL for the inner bucket (block info + state diff). When set,
+    /// inner-bucket objects are fetched from here in url mode while outer-bucket
+    /// objects (canonical index) use `r2_public_base_url`. This lets url mode span
+    /// the two buckets the pipeline writes to, each behind its own public domain.
+    #[serde(default)]
+    pub r2_inner_public_base_url: String,
+    #[serde(default)]
+    pub r2_endpoint: String,
+    #[serde(default)]
+    pub r2_inner_bucket: String,
+    #[serde(default)]
+    pub r2_outer_bucket: String,
+    #[serde(default = "default_prefetch_window")]
+    pub prefetch_window: usize,
+    #[serde(default)]
+    pub snapshot_is_archive: bool,
+}
+
+/// Node sync / startup mode. Selected with `--sync-mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SyncMode {
+    /// kafka + s3 internal mode (requires `--kafka-s3-config`).
+    #[default]
+    Internal,
+    /// Single node: pull statediff directly from R2 for both catchup and live
+    /// (requires `--gateway-object-config`).
+    Standalone,
+    /// Cluster: catchup from R2, real-time sync via the user-gateway
+    /// (requires `--gateway-object-config` with `user_gateway_url`).
+    Cluster,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CanonicalIndex {
+    pub chain_id: String,
+    pub version: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub parent_hash: String,
+    pub state_root: String,
+    pub updated_at: i64,
+}
+
+fn default_prefetch_window() -> usize {
+    256
+}
+
+pub async fn s3_get_canonical_index_by_number(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    number: u64,
+) -> Result<CanonicalIndex> {
+    let s3_key = if version.is_empty() {
+        format!("{}/index/block/{}.json", s3_chain_id, number)
+    } else {
+        format!("{}/{}/index/block/{}.json", s3_chain_id, version, number)
+    };
+    let s3_obj = s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&s3_key)
+        .send()
+        .await
+        .context(format!("{bucket_name}: {s3_key}"))?;
+    let bytes = s3_obj.body.collect().await?.into_bytes();
+    let mut gz = read::GzDecoder::new(&bytes[..]);
+    let mut bytes = Vec::new();
+    gz.read_to_end(&mut bytes)?;
+    let index: CanonicalIndex = serde_json::from_slice(&bytes)?;
+    Ok(index)
 }
 
 /// Parse a [`KafkaS3Config`] CLI argument: an absolute file path or inline JSON.
@@ -217,14 +314,17 @@ pub async fn s3_get_block_transactions_by_number(
             .context(format!("s3 get transactions failed, {}", block.header.hash))?
         }
         None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
+            let block_hash = H256::from_str(
+                &s3_get_canonical_index_by_number(
+                    s3_client,
+                    outer_bucket_name,
+                    s3_chain_id,
+                    version,
+                    number,
+                )
+                .await?
+                .block_hash,
+            )?;
             s3_get_block_transactions(
                 s3_client,
                 outer_bucket_name,
@@ -330,14 +430,17 @@ pub async fn s3_get_block_info_by_number(
             parse_block_info(block.unwrap())
         }
         None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
+            let block_hash = H256::from_str(
+                &s3_get_canonical_index_by_number(
+                    s3_client,
+                    outer_bucket_name,
+                    s3_chain_id,
+                    version,
+                    number,
+                )
+                .await?
+                .block_hash,
+            )?;
             s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
                 .context(format!("s3 get block info failed, {block_hash}"))

@@ -61,5 +61,5 @@ Typical security-relevant areas include:
 ---
 
 ## Notes
-This project is a EVM executor built with alloy and revm. It focuses on **state queries**. 
+This project is a EVM executor built with alloy and revm. It focuses on **state queries**.
 Security issues may propagate to downstream systems — please report anything suspicious.

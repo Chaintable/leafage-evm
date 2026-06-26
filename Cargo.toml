@@ -28,7 +28,7 @@ thiserror = "1.0"
 async-trait = "0.1"
 anyhow = "1.0"
 tokio = { version = "1.44", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 clap = { version = "4.3", features = ["derive", "env"] }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
@@ -44,6 +44,7 @@ once_cell = "1.19.0"
 futures = "0.3.30"
 hyper = "1.6"
 rdkafka = "0.36.2"
+tokio-tungstenite = "0.28"
 aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
 flate2 = "1.0.34"
@@ -54,6 +55,7 @@ http = "1.3"
 http-body = "1"
 procfs = "0.17"
 lru = "0.16.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
 # revm
 revm = { version = "36.0.0", features = [

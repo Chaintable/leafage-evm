@@ -107,7 +107,7 @@ where
                 other,
             };
             self.tree.update_block(block_info, block_storage_diff)?;
-            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
+            info!(target:"updater", "[live][http] update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                             block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
 

@@ -280,7 +280,7 @@ where
         for (_, res) in all_results {
             match res {
                 Ok((block_info, block_diff)) => {
-                    info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                    info!(target:"updater", "[catchup][s3] update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
                     self.tree.update_block(block_info.clone(), block_diff)?;
                 }
                 Err(e) => {
@@ -289,7 +289,7 @@ where
                 }
             }
         }
-        info!(target:"updater", "update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
+        info!(target:"updater", "[catchup][s3] update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
         Ok(())
     }
 
@@ -328,7 +328,7 @@ where
         // Phase 1: by-number catch-up over the stable segment.
         let batch_size = self.init_task_queue_size as u64;
         let mut start_block_number = last_committed_number + 1;
-        info!(target:"updater", "update from s3 by number, start block number {}, target block number {}", start_block_number, by_number_target);
+        info!(target:"updater", "[catchup][s3] update from s3 by number, start block number {}, target block number {}", start_block_number, by_number_target);
         while start_block_number <= by_number_target {
             let end_block_number =
                 std::cmp::min(start_block_number + batch_size - 1, by_number_target);
@@ -420,7 +420,7 @@ where
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
             self.tree.update_block(block_info, block_storage_diff)?;
-            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
+            info!(target:"updater", "[live][kafka] update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
         self.commit_offset()

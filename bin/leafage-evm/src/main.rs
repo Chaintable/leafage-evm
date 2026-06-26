@@ -7,6 +7,7 @@ mod initializer;
 mod register;
 mod rewind;
 mod runner;
+mod snapshot_init;
 mod standalone;
 mod updater;
 mod utils;
