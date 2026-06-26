@@ -1,3 +1,4 @@
+use crate::api_impl::arbitrum::api::ArbitrumApiImpl;
 use crate::error::internal_rpc_err;
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{decode_revert_reason, SolInterface, SolValue};
@@ -6,7 +7,9 @@ use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
 use leafage_evm_chains::arbitrum::precompile::{
     NODE_INTERFACE_ADDRESS, NODE_INTERFACE_DEBUG_ADDRESS,
 };
-use leafage_evm_chains::arbitrum::tx::{ArbitrumSubmitRetryableTx, ArbitrumTxEnv};
+use leafage_evm_chains::arbitrum::tx::{
+    ArbitrumSubmitRetryableTx, ArbitrumTxContext, ArbitrumTxEnv,
+};
 use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockId, BlockInfo, BlockNumberOrTag};
@@ -19,7 +22,6 @@ use revm::state::{AccountInfo, Bytecode};
 use revm::DatabaseRef;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use crate::api_impl::arbitrum::api::ArbitrumApiImpl;
 
 const ARBITRUM_ONE_NITRO_GENESIS_BLOCK: u64 = 22_207_817;
 const ARBOS_VERSION_40: u64 = 40;
@@ -162,7 +164,10 @@ impl From<INodeInterfaceVirtual::estimateRetryableTicketCall> for RetryableRedee
     }
 }
 
-pub(in crate::api_impl::arbitrum) fn header_l1_block_num(block: &BlockInfo, legacy_zero_base_fee_until: u64) -> u64 {
+pub(in crate::api_impl::arbitrum) fn header_l1_block_num(
+    block: &BlockInfo,
+    legacy_zero_base_fee_until: u64,
+) -> u64 {
     if block.header.base_fee_per_gas.is_none()
         || block.header.extra_data.len() != 32
         || block.header.difficulty != U256::from(1)
@@ -171,11 +176,14 @@ pub(in crate::api_impl::arbitrum) fn header_l1_block_num(block: &BlockInfo, lega
     }
 
     let mix = block.header.mix_hash.as_slice();
-    let arbos_format_version = u64::from_be_bytes(
-        mix[16..24]
-            .try_into()
-            .expect("fixed-size header mix digest slice"),
-    );
+    let read_u64 = |range: std::ops::Range<usize>| {
+        mix.get(range)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_be_bytes)
+    };
+    let Some(arbos_format_version) = read_u64(16..24) else {
+        return 0;
+    };
     if arbos_format_version <= ARBOS_VERSION_40
         && block.header.base_fee_per_gas == Some(0)
         && block.header.timestamp < legacy_zero_base_fee_until
@@ -183,11 +191,7 @@ pub(in crate::api_impl::arbitrum) fn header_l1_block_num(block: &BlockInfo, lega
         return 0;
     }
 
-    u64::from_be_bytes(
-        mix[8..16]
-            .try_into()
-            .expect("fixed-size header mix digest slice"),
-    )
+    read_u64(8..16).unwrap_or_default()
 }
 
 fn block_by_l2_num<DB>(db: &DB, l2_block_num: u64) -> RpcResult<BlockInfo>
@@ -234,7 +238,9 @@ fn configured_nitro_genesis_block_num(chain_id: u64, config: Option<&ArbitrumEvm
         })
 }
 
-pub(in crate::api_impl::arbitrum) fn configured_legacy_zero_base_fee_until(config: Option<&ArbitrumEvmConfig>) -> u64 {
+pub(in crate::api_impl::arbitrum) fn configured_legacy_zero_base_fee_until(
+    config: Option<&ArbitrumEvmConfig>,
+) -> u64 {
     config
         .map(|config| config.legacy_zero_base_fee_until)
         .unwrap_or_default()
@@ -430,8 +436,8 @@ impl<DB> ArbitrumApiImpl<DB> {
             base,
             Some(submit_tx.ticket_id()),
             call.excess_fee_refund_address,
+            source_tx.context.clone(),
         )
-        .with_context(source_tx.context.clone())
     }
 
     fn gas_estimate_target_tx(
@@ -725,7 +731,12 @@ where
         highest_gas_limit = tx.gas_limit();
         let mut gas_used = res.gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
-        let optimistic_gas_limit = (gas_used + gas_refund + CALL_STIPEND_GAS) * 64 / 63;
+        let optimistic_gas_limit = ((gas_used as u128)
+            .saturating_add(gas_refund as u128)
+            .saturating_add(CALL_STIPEND_GAS as u128)
+            .saturating_mul(64)
+            / 63)
+            .min(u64::MAX as u128) as u64;
 
         if optimistic_gas_limit < highest_gas_limit {
             tx.base.gas_limit = optimistic_gas_limit;
@@ -740,14 +751,16 @@ where
         }
 
         let mut mid_gas_limit = std::cmp::min(
-            gas_used * 3,
+            (gas_used as u128).saturating_mul(3).min(u64::MAX as u128) as u64,
             ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
         );
 
-        while (highest_gas_limit - lowest_gas_limit) > 1 {
-            if (highest_gas_limit - lowest_gas_limit) as f64 / (highest_gas_limit as f64)
-                < ESTIMATE_GAS_ERROR_RATIO
-            {
+        loop {
+            let gas_limit_range = highest_gas_limit.saturating_sub(lowest_gas_limit);
+            if gas_limit_range <= 1 {
+                break;
+            }
+            if gas_limit_range as f64 / (highest_gas_limit as f64) < ESTIMATE_GAS_ERROR_RATIO {
                 break;
             }
 
@@ -859,12 +872,15 @@ mod tests {
 
         let mut block_env = BlockEnv::default();
         block_env.basefee = 42;
-        let source_tx = ArbitrumTxEnv::new(TxEnv {
-            kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
-            gas_limit: 777_000,
-            gas_price: 999,
-            ..Default::default()
-        });
+        let source_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 777_000,
+                gas_price: 999,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
         let target_tx = ArbitrumApiImpl::<()>::retryable_redeem_tx(
             &source_tx,
             &block_env,
@@ -955,7 +971,7 @@ mod tests {
         };
 
         let target_tx = ArbitrumApiImpl::<()>::retryable_redeem_tx(
-            &ArbitrumTxEnv::new(TxEnv::default()),
+            &ArbitrumTxEnv::new(TxEnv::default(), ArbitrumTxContext::default()),
             &BlockEnv::default(),
             &EmptyDB::default(),
             call,

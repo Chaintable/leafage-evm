@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, B256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,12 +19,27 @@ impl Default for ArbitrumCallContext {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArbitrumExecutionContext {
     current_call: ArbitrumCallContext,
+    current_l2_block_number: Option<U256>,
+    current_l2_basefee: Option<u64>,
     activated_wasm_modules: HashMap<B256, Bytes>,
     stylus_pages_open: u16,
     stylus_pages_ever: u16,
 }
 
 impl ArbitrumExecutionContext {
+    pub fn set_current_l2_context(&mut self, block_number: U256, basefee: u64) {
+        self.current_l2_block_number = Some(block_number);
+        self.current_l2_basefee = Some(basefee);
+    }
+
+    pub fn current_l2_block_number(&self) -> Option<U256> {
+        self.current_l2_block_number
+    }
+
+    pub fn current_l2_basefee(&self) -> Option<u64> {
+        self.current_l2_basefee
+    }
+
     pub fn set_current_call(&mut self, depth: usize, callers_caller: Address) {
         self.current_call = ArbitrumCallContext {
             depth,
@@ -70,8 +85,11 @@ mod tests {
 
         context.insert_activated_wasm_module(module_hash, module.clone());
         context.set_stylus_pages_open(5);
+        context.set_current_l2_context(U256::from(123), 456);
 
         assert_eq!(context.activated_wasm_module(module_hash), Some(&module));
+        assert_eq!(context.current_l2_block_number(), Some(U256::from(123)));
+        assert_eq!(context.current_l2_basefee(), Some(456));
         assert_eq!(context.stylus_pages_open(), 5);
         assert_eq!(context.remaining_stylus_page_limit(8), 3);
         assert_eq!(context.remaining_stylus_page_limit(4), 0);

@@ -3,8 +3,6 @@ use super::state::ArbStorage;
 use super::util::{dispatch, finish_call};
 use super::{ArbPrecompileInput, ArbitrumContext};
 use alloy::primitives::U256;
-use revm::context::ContextTr;
-use revm::context_interface::Block;
 use revm::precompile::PrecompileResult;
 use revm::Database;
 
@@ -25,7 +23,7 @@ impl ArbStatistics {
                         gas_limit,
                         storage.gas_used,
                         (
-                            storage.context.block().number(),
+                            storage.current_l2_block_number(),
                             U256::ZERO,
                             U256::ZERO,
                             U256::ZERO,

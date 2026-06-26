@@ -105,15 +105,20 @@ impl ArbitrumSubmitRetryableTx {
 }
 
 impl ArbitrumTxEnv {
-    pub fn new(base: TxEnv) -> Self {
+    pub fn new(base: TxEnv, context: ArbitrumTxContext) -> Self {
         Self {
             base,
             retryable: None,
-            context: ArbitrumTxContext::default(),
+            context,
         }
     }
 
-    pub fn retryable_redeem(mut base: TxEnv, ticket_id: Option<B256>, refund_to: Address) -> Self {
+    pub fn retryable_redeem(
+        mut base: TxEnv,
+        ticket_id: Option<B256>,
+        refund_to: Address,
+        context: ArbitrumTxContext,
+    ) -> Self {
         let zero_gas_price = base.gas_price == 0;
         base.tx_type = ARBITRUM_RETRY_TX_TYPE;
         Self {
@@ -123,13 +128,8 @@ impl ArbitrumTxEnv {
                 refund_to,
                 zero_gas_price,
             }),
-            context: ArbitrumTxContext::default(),
+            context,
         }
-    }
-
-    pub fn with_context(mut self, context: ArbitrumTxContext) -> Self {
-        self.context = context;
-        self
     }
 
     pub fn is_retryable_redeem(&self) -> bool {
@@ -236,6 +236,7 @@ mod tests {
             },
             Some(B256::with_last_byte(1)),
             Address::with_last_byte(2),
+            ArbitrumTxContext::default(),
         );
 
         assert_eq!(tx.tx_type(), ARBITRUM_RETRY_TX_TYPE);
@@ -253,6 +254,7 @@ mod tests {
             },
             None,
             Address::ZERO,
+            ArbitrumTxContext::default(),
         );
 
         assert!(!tx.is_zero_gas_price_retryable());
@@ -265,18 +267,24 @@ mod tests {
             ARBITRUM_CONTRACT_TX_TYPE,
             ARBITRUM_RETRY_TX_TYPE,
         ] {
-            let tx = ArbitrumTxEnv::new(TxEnv {
-                tx_type,
-                ..Default::default()
-            });
+            let tx = ArbitrumTxEnv::new(
+                TxEnv {
+                    tx_type,
+                    ..Default::default()
+                },
+                ArbitrumTxContext::default(),
+            );
             assert!(tx.aliases_caller(), "tx type {tx_type:#x} should alias");
         }
 
         for tx_type in [0, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE] {
-            let tx = ArbitrumTxEnv::new(TxEnv {
-                tx_type,
-                ..Default::default()
-            });
+            let tx = ArbitrumTxEnv::new(
+                TxEnv {
+                    tx_type,
+                    ..Default::default()
+                },
+                ArbitrumTxContext::default(),
+            );
             assert!(
                 !tx.aliases_caller(),
                 "tx type {tx_type:#x} should not alias"

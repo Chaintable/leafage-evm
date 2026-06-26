@@ -1038,7 +1038,7 @@ impl ArbOwner {
             let old_config = NitroChainConfig::parse(old_serialized_config.as_ref())?;
             old_config.check_compatible(
                 &new_config,
-                storage.context.block().number().to::<u64>(),
+                storage.current_l2_block_number_u64(),
                 storage.context.block().timestamp().to::<u64>(),
             )?;
         }
@@ -1047,7 +1047,7 @@ impl ArbOwner {
         let current_config = NitroChainConfig::parse(current_chain_config)?;
         current_config.check_compatible(
             &new_config,
-            storage.context.block().number().to::<u64>(),
+            storage.current_l2_block_number_u64(),
             storage.context.block().timestamp().to::<u64>(),
         )?;
 

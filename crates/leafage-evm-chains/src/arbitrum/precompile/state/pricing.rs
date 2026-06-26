@@ -8,7 +8,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         let l1_key = self.l1_key();
         let l2_key = self.l2_key();
         let l1_price = self.read(&l1_key, arbos_state::L1_PRICE_PER_UNIT_OFFSET)?;
-        let l2_price = U256::from(self.context.block().basefee());
+        let l2_price = U256::from(self.current_l2_basefee());
         let wei_for_l1_calldata = l1_price.saturating_mul(U256::from(TX_DATA_NON_ZERO_GAS));
         let per_l2_tx = wei_for_l1_calldata.saturating_mul(U256::from(ASSUMED_SIMPLE_TX_SIZE));
         let per_arb_gas_base = if arbos_version < ARBOS_VERSION_4 {
@@ -43,7 +43,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     ) -> Result<(U256, U256, U256), PrecompileError> {
         let l1_key = self.l1_key();
         let l1_price = self.read(&l1_key, arbos_state::L1_PRICE_PER_UNIT_OFFSET)?;
-        let l2_price = U256::from(self.context.block().basefee());
+        let l2_price = U256::from(self.current_l2_basefee());
         let wei_for_l1_calldata = l1_price.saturating_mul(U256::from(TX_DATA_NON_ZERO_GAS));
         let wei_per_l2_tx = wei_for_l1_calldata.saturating_mul(U256::from(ASSUMED_SIMPLE_TX_SIZE));
         let gas_per_l2_tx = if arbos_version < ARBOS_VERSION_4 {

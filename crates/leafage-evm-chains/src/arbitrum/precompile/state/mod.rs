@@ -148,6 +148,26 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         self.gas_limit.saturating_sub(self.gas_used)
     }
 
+    pub(in crate::arbitrum::precompile) fn current_l2_block_number(&self) -> U256 {
+        self.context
+            .chain()
+            .current_l2_block_number()
+            .unwrap_or_else(|| self.context.block().number())
+    }
+
+    pub(in crate::arbitrum::precompile) fn current_l2_block_number_u64(&self) -> u64 {
+        self.current_l2_block_number()
+            .try_into()
+            .unwrap_or_default()
+    }
+
+    pub(in crate::arbitrum::precompile) fn current_l2_basefee(&self) -> u64 {
+        self.context
+            .chain()
+            .current_l2_basefee()
+            .unwrap_or_else(|| self.context.block().basefee())
+    }
+
     fn load_account(&mut self, account: Address) -> Result<(), PrecompileError> {
         self.context
             .journal_mut()

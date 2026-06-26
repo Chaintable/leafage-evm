@@ -21,8 +21,10 @@ pub(super) fn to_interpreter_result(
 
     match result {
         Ok(output) => {
-            let underflow = interpreter_result.gas.record_cost(output.gas_used);
-            assert!(underflow, "Gas underflow is not possible");
+            if !interpreter_result.gas.record_cost(output.gas_used) {
+                interpreter_result.result = InstructionResult::PrecompileOOG;
+                return Ok(interpreter_result);
+            }
             interpreter_result.result = if output.reverted {
                 InstructionResult::Revert
             } else {
@@ -231,5 +233,14 @@ mod tests {
         assert!(output.reverted);
         assert_eq!(output.gas_used, gas_limit);
         assert!(output.bytes.is_empty());
+    }
+
+    #[test]
+    fn interpreter_result_over_gas_output_becomes_oog() {
+        let result = to_interpreter_result(10, Ok(PrecompileOutput::new(11, Bytes::new())))
+            .expect("convert precompile result");
+
+        assert_eq!(result.result, InstructionResult::PrecompileOOG);
+        assert!(result.output.is_empty());
     }
 }

@@ -41,6 +41,7 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
         db: DB,
         inspector: I,
         precompile_env: ArbitrumPrecompileEnv,
+        execution_context: ArbitrumExecutionContext,
     ) -> Self {
         let hardfork = cfg.spec;
         let spec = hardfork.into();
@@ -51,7 +52,7 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
                     tx: ArbitrumTxEnv::default(),
                     cfg,
                     journaled_state: Journal::new(db),
-                    chain: ArbitrumExecutionContext::default(),
+                    chain: execution_context,
                     local: Default::default(),
                     error: Ok(()),
                 },

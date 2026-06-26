@@ -34,12 +34,12 @@ impl ArbSys {
             let mut storage = ArbStorage::new_with_initial_gas(context, gas_limit, initial_gas);
             match call {
                 IArbSys::IArbSysCalls::arbBlockNumber(_) => {
-                    let ret = storage.context.block().number();
+                    let ret = storage.current_l2_block_number();
                     finish_call::<IArbSys::arbBlockNumberCall>(gas_limit, storage.gas_used, ret)
                 }
                 IArbSys::IArbSysCalls::arbBlockHash(call) => {
                     let requested = call.arbBlockNum;
-                    let current = storage.context.block().number();
+                    let current = storage.current_l2_block_number();
                     let u64_max = U256::from(u64::MAX);
                     let is_not_u64 = requested > u64_max;
                     let current_is_not_u64 = current > u64_max;
@@ -289,7 +289,7 @@ impl ArbSys {
             }
         }
 
-        let arb_block_num = storage.context.block().number();
+        let arb_block_num = storage.current_l2_block_number();
         let eth_block_num = U256::from(current_l1_block_number);
         let timestamp = storage.context.block().timestamp();
         let send_hash = Self::l2_to_l1_hash(
@@ -670,6 +670,31 @@ mod tests {
     }
 
     #[test]
+    fn arb_block_number_uses_l2_execution_context_when_evm_block_is_l1() {
+        let l1_block = U256::from(99_999u64);
+        let l2_block = U256::from(123_456u64);
+        let mut chain_context = ArbitrumExecutionContext::default();
+        chain_context.set_current_l2_context(l2_block, 10_000_000);
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv {
+                number: l1_block,
+                basefee: 0,
+                ..Default::default()
+            })
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .with_chain(chain_context);
+
+        let input = IArbSys::arbBlockNumberCall {}.abi_encode();
+        let output = run_arb_sys_view(&input, &mut context, 60);
+        let ret = IArbSys::arbBlockNumberCall::abi_decode_returns(output.bytes.as_ref())
+            .expect("decode arbBlockNumber return");
+
+        assert_eq!(ret, l2_block);
+    }
+
+    #[test]
     fn top_level_retryable_call_reports_unaliased_parent_caller() {
         let l1_origin = Address::from([0x22; 20]);
         let aliased_origin = alias_l1_address(l1_origin);
@@ -680,6 +705,7 @@ mod tests {
             },
             None,
             Address::ZERO,
+            Default::default(),
         );
         let mut context = context_with_tx(tx);
         context.chain.set_current_call(2, aliased_origin);
@@ -710,6 +736,7 @@ mod tests {
             },
             None,
             Address::ZERO,
+            Default::default(),
         );
         let mut context = context_with_tx(tx);
         context.chain.set_current_call(3, parent_contract);

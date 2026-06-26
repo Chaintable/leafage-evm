@@ -8,7 +8,6 @@ use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolCall, SolInterface, SolValue};
 use alloy_rlp::{BufMut, Encodable, Header, EMPTY_STRING_CODE};
 use revm::context::{Cfg, ContextTr, JournalTr};
-use revm::context_interface::Block;
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use revm::Database;
 
@@ -404,7 +403,7 @@ impl ArbRetryableTx {
         gas: u64,
     ) -> B256 {
         let chain_id = storage.context.cfg().chain_id();
-        let gas_fee_cap = U256::from(storage.context.block().basefee());
+        let gas_fee_cap = U256::from(storage.current_l2_basefee());
         let max_refund = U256::MAX;
         let submission_fee_refund = U256::ZERO;
         let payload_len = chain_id.length()
