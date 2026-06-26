@@ -469,6 +469,98 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts
 }
 
+/// Build the six archive column-family descriptors with the standard archive
+/// options. Shared by [`DataBaseRef::open_inner`] and the offline re-encode
+/// path so a re-encoded DB is option-compatible with a normally-opened one.
+fn archive_cf_descriptors(
+    shared_cache: &Cache,
+    disable_auto_compactions: bool,
+    bulk_load: bool,
+    archive_zstd_compression: bool,
+) -> Vec<ColumnFamilyDescriptor> {
+    // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
+    // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at deep
+    // levels via `archive_zstd_compression` for ~15-20% extra ratio at the cost
+    // of ~2× compaction CPU and ~3× cold-read decode latency. HashToCode is
+    // always Zstd: code blobs benefit from dict compression regardless.
+    let big_cf_compression = if archive_zstd_compression {
+        CfCompression::Zstd
+    } else {
+        CfCompression::Lz4
+    };
+    vec![
+        // LatestBlockHash: single record, no compression needed
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::LatestBlockHash.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        // BlockNumToBlockHash: 32 bytes value, no compression needed
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::BlockNumToBlockHash.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::AddressToAccount.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                32,
+                disable_auto_compactions,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::AddressToStorage.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                64,
+                disable_auto_compactions,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::HashToCode.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::Zstd,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+    ]
+}
+
 impl DataBaseRef {
     /// Open the archive RocksDB with default throttles. Set
     /// `disable_auto_compactions=true` if a caller plans to run its own
@@ -542,95 +634,12 @@ impl DataBaseRef {
             archive_zstd_compression,
         );
 
-        // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
-        // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at
-        // deep levels via `archive_zstd_compression` for ~15-20% extra ratio
-        // at the cost of ~2× compaction CPU and ~3× cold-read decode latency.
-        // HashToCode is always Zstd: code blobs benefit from dict compression
-        // regardless of the flag.
-        let big_cf_compression = if archive_zstd_compression {
-            CfCompression::Zstd
-        } else {
-            CfCompression::Lz4
-        };
-
-        // LatestBlockHash: single record, no compression needed
-        let latest_block_hash_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
+        let cfs = archive_cf_descriptors(
+            &shared_cache,
+            disable_auto_compactions,
+            bulk_load,
+            archive_zstd_compression,
         );
-        let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        // BlockNumToBlockHash: 32 bytes value, no compression needed
-        let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        let address_to_account_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                32,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        let address_to_storage_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                64,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
-        let hash_to_code_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::Zstd,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        let cfs = vec![
-            latest_block_hash_cf,
-            block_hash_to_block_info_cf,
-            block_num_to_block_hash_cf,
-            address_to_account_cf,
-            address_to_storage_cf,
-            hash_to_code_cf,
-        ];
         let db_opt = rocksdb_options(disable_auto_compactions);
         let db = DB::open_cf_descriptors(&db_opt, path, cfs).unwrap();
         let cols = vec![
@@ -691,6 +700,128 @@ impl DataBaseRef {
 }
 
 impl DataBaseRef {
+    /// Offline rebuild of a **legacy (ascending)** archive RocksDB into the
+    /// **inverted (descending)** block-height key encoding, without re-syncing
+    /// from S3.
+    ///
+    /// Pure byte-level transform: only the `AddressToAccount` /
+    /// `AddressToStorage` version tails are rewritten (`block_num` ->
+    /// `u64::MAX - block_num`); every other CF is copied verbatim. Orphaned
+    /// pre-#104 dual-write `u64::MAX` latest-pointer rows are dropped — the
+    /// inverted reader (forward `seek` to the real head) never uses them, and
+    /// keeping them would shadow the real newest version.
+    ///
+    /// Uses raw `rocksdb::DB` handles rather than the `DATA_BASE` singleton, so
+    /// source and destination can be open at once; the source is opened
+    /// read-only and is never modified. The destination is created fresh with
+    /// the standard archive CF options, so it is option-compatible with a
+    /// normally-opened archive DB. The destination must not already exist /
+    /// contain these CFs.
+    pub fn reencode_legacy_to_inverted<P: AsRef<Path>>(
+        src_path: P,
+        dst_path: P,
+        cache_size: usize,
+    ) -> Result<(), Error> {
+        const COMMIT_CHUNK: usize = 200_000;
+
+        // Source: read-only, bounded fds (archive DBs have very many SSTs, so
+        // the default unlimited max_open_files trips the OS fd limit).
+        let mut src_opts = Options::default();
+        src_opts.set_max_open_files(
+            env::var("ROCKSDB_MAX_OPEN_FILE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(512),
+        );
+        let cf_names = [
+            StorageTypeColumn::LatestBlockHash.to_str(),
+            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
+            StorageTypeColumn::BlockNumToBlockHash.to_str(),
+            StorageTypeColumn::AddressToAccount.to_str(),
+            StorageTypeColumn::AddressToStorage.to_str(),
+            StorageTypeColumn::HashToCode.to_str(),
+        ];
+        let src = DB::open_cf_for_read_only(&src_opts, &src_path, cf_names, false)
+            .map_err(Error::RocksDB)?;
+
+        // Destination: fresh DB with the standard archive CF options.
+        let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * cache_size, 8192);
+        let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false);
+        let dst = DB::open_cf_descriptors(&rocksdb_options(false), &dst_path, dst_cfs)
+            .map_err(Error::RocksDB)?;
+
+        // Full-scan read options: total_order_seek so the prefix-extractor CFs
+        // are traversed completely (a migration must not drop any key).
+        let scan_ro = || {
+            let mut r = ReadOptions::default();
+            r.set_verify_checksums(false);
+            r.set_total_order_seek(true);
+            r
+        };
+
+        // 1) Non-versioned CFs: copy verbatim.
+        for col in [
+            StorageTypeColumn::LatestBlockHash,
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::HashToCode,
+        ] {
+            let src_cf = src.cf_handle(col.to_str()).unwrap();
+            let dst_cf = dst.cf_handle(col.to_str()).unwrap();
+            let mut batch = WriteBatch::default();
+            let mut n = 0usize;
+            for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
+                let (key, value) = item.map_err(Error::RocksDB)?;
+                batch.put_cf(dst_cf, key, value);
+                n += 1;
+                if n % COMMIT_CHUNK == 0 {
+                    dst.write(std::mem::take(&mut batch)).map_err(Error::RocksDB)?;
+                }
+            }
+            dst.write(batch).map_err(Error::RocksDB)?;
+            info!(target: "migrate", "reencode: copied {} {} records", n, col);
+        }
+
+        // 2) Versioned CFs: rewrite the trailing 8-byte height (block_num ->
+        //    u64::MAX - block_num), dropping orphaned u64::MAX sentinels.
+        for col in [
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+        ] {
+            let src_cf = src.cf_handle(col.to_str()).unwrap();
+            let dst_cf = dst.cf_handle(col.to_str()).unwrap();
+            let mut batch = WriteBatch::default();
+            let mut kept = 0usize;
+            let mut dropped = 0usize;
+            for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
+                let (key, value) = item.map_err(Error::RocksDB)?;
+                let len = key.len();
+                // Legacy tail: block_num is the trailing 8 bytes (big-endian);
+                // the 24 bytes before it are zero in both encodings.
+                let block_num = u64::from_be_bytes(key[len - 8..].try_into().unwrap());
+                if block_num == u64::MAX {
+                    dropped += 1; // orphaned pre-#104 dual-write sentinel
+                    continue;
+                }
+                let mut new_key = key.to_vec();
+                new_key[len - 8..].copy_from_slice(&(u64::MAX - block_num).to_be_bytes());
+                batch.put_cf(dst_cf, &new_key, value);
+                kept += 1;
+                if kept % COMMIT_CHUNK == 0 {
+                    dst.write(std::mem::take(&mut batch)).map_err(Error::RocksDB)?;
+                }
+            }
+            dst.write(batch).map_err(Error::RocksDB)?;
+            info!(target: "migrate",
+                "reencode: rewrote {} {} records ({} u64::MAX sentinels dropped)",
+                kept, col, dropped);
+        }
+
+        dst.flush().map_err(Error::RocksDB)?;
+        info!(target: "migrate", "reencode: done, destination flushed");
+        Ok(())
+    }
+
     pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
@@ -2408,6 +2539,121 @@ mod inverted_encoding_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    /// End-to-end offline re-encode: build a LEGACY archive (with a stale
+    /// dual-write sentinel), run `reencode_legacy_to_inverted`, then open the
+    /// result as INVERTED and confirm every historical read matches and the
+    /// sentinel was dropped (so the real newest version wins).
+    #[test]
+    fn test_reencode_legacy_to_inverted_roundtrip() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("leafage-reencode-{}", std::process::id()));
+        let src_dir = base.join("legacy");
+        let dst_dir = base.join("inverted");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let addr = H256::repeat_byte(0xab);
+        let slot = H256::repeat_byte(0x01);
+
+        // 1) Build the LEGACY source.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        {
+            let db = Arc::new(DataBaseRef::open(&src_dir, 64, false, false));
+            for n in 1..=20u64 {
+                let diff = match n {
+                    5 => slot_diff(addr, slot, 100, 7),
+                    10 => slot_diff(addr, slot, 200, 9),
+                    20 => slot_diff(addr, slot, 300, 11),
+                    _ => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+            // Inject STALE orphaned dual-write sentinels (legacy tail u64::MAX)
+            // with values that must NOT survive the re-encode.
+            let acct_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            let stale_acct =
+                crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                    address: addr,
+                    balance: U256::from(999u64),
+                    nonce: 1,
+                    code_hash: KECCAK256_EMPTY.0.into(),
+                });
+            db.db
+                .put_cf(
+                    acct_cf,
+                    crate::db_impl::archive_encoding::encode_account_key(addr, u64::MAX),
+                    &stale_acct,
+                )
+                .unwrap();
+            let stor_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            let stale_val: [u8; 32] = U256::from(77u64).to_be_bytes();
+            db.db
+                .put_cf(
+                    stor_cf,
+                    crate::db_impl::archive_encoding::encode_storage_key(addr, slot, u64::MAX),
+                    stale_val,
+                )
+                .unwrap();
+        } // src DataBaseRef dropped here -> flushed, singleton released
+
+        // 2) Re-encode legacy -> inverted (raw handles; src untouched).
+        DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64).unwrap();
+
+        // 3) Open the result as INVERTED and verify.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
+        {
+            let db = Arc::new(DataBaseRef::open(&dst_dir, 64, false, false));
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+            // Below first write: absent/zero.
+            assert_eq!(at(4).read_storage(addr, slot).unwrap(), U256::ZERO);
+            assert!(at(4).read_account(addr).unwrap().is_none());
+            // greatest version <= H across change points.
+            for (h, val, bal) in [
+                (5u64, 7u64, 100u64),
+                (9, 7, 100),
+                (10, 9, 200),
+                (19, 9, 200),
+                (20, 11, 300),
+            ] {
+                assert_eq!(
+                    at(h).read_storage(addr, slot).unwrap(),
+                    U256::from(val),
+                    "storage at height {h} after re-encode"
+                );
+                assert_eq!(
+                    at(h).read_account(addr).unwrap().unwrap().balance,
+                    U256::from(bal),
+                    "balance at height {h} after re-encode"
+                );
+            }
+            // Latest-state iterators surface the REAL newest, not the dropped
+            // sentinel (999 / 77).
+            let storages: Vec<_> = db.storage_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(storages, vec![(addr, slot, U256::from(11u64))]);
+            let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].1.balance, U256::from(300u64));
+        }
+        let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 }
