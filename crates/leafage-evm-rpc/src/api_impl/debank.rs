@@ -11,11 +11,11 @@ use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, Address, BlockEnv, BlockId, BlockInfo, BlockNumberOrTag, BlockOverrides,
-    BlockType, Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankErrorCode,
-    DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
-    DebankSingleCallResult, DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo,
-    H256, KECCAK256_EMPTY, U256,
+    block_env_from_block, Address, BlockId, BlockNumberOrTag, BlockOverrides, BlockType, Bytes,
+    CallRequest, DebankBlock, DebankBlockContext, DebankErrorCode, DebankMultiCallResp,
+    DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult,
+    DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo, H256, KECCAK256_EMPTY,
+    U256,
 };
 use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
@@ -470,31 +470,6 @@ where
         if let Some(state_override) = state_override.clone() {
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
-        let cancel_token = CancellationToken::new();
-        if let Some(result) = self.inner.handle_virtual_call(
-            &request,
-            &block,
-            &block_env,
-            &db,
-            |estimate_request| {
-                self.estimate_gas_components_with_state(
-                    &block,
-                    &block_env,
-                    &db,
-                    estimate_request,
-                    &cancel_token,
-                )
-            },
-        )? {
-            return Ok(DebankSingleCallResult {
-                code: 0,
-                err: String::new(),
-                from_cache: false,
-                result,
-                gas_used: 0,
-                time_cost: start.elapsed().as_secs_f64(),
-            });
-        }
         let tx = self.inner.create_txn_env(
             &block,
             &block_env,
@@ -661,22 +636,6 @@ where
                     continue;
                 }
             }
-            if self
-                .inner
-                .handle_virtual_call(&tx, &block, &block_env, &memory_db, |estimate_request| {
-                    self.estimate_gas_components_with_state(
-                        &block,
-                        &block_env,
-                        &memory_db,
-                        estimate_request,
-                        &cancel_token,
-                    )
-                })?
-                .is_some()
-            {
-                results.push(DebankSingleSimulateResult::default());
-                continue;
-            }
             let mut trace_cfg = TracingInspectorConfig::default_parity()
                 .set_record_logs(true)
                 .set_steps(true);
@@ -736,28 +695,6 @@ where
                 block.header.clone(),
             );
         }
-        let (execution_gas, l1_overhead) = self.estimate_gas_components_with_state(
-            &block,
-            &block_env,
-            &memory_db,
-            request,
-            &cancel_token,
-        )?;
-        Ok(U256::from(execution_gas.saturating_add(l1_overhead)))
-    }
-
-    pub(crate) fn estimate_gas_components_with_state<StateDB>(
-        &self,
-        block: &BlockInfo,
-        block_env: &BlockEnv,
-        state: &StateDB,
-        request: CallRequest,
-        cancel_token: &CancellationToken,
-    ) -> RpcResult<(u64, u64)>
-    where
-        StateDB: DatabaseRef + std::fmt::Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
@@ -778,10 +715,10 @@ where
             })
             .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
-            block,
-            block_env,
+            &block,
+            &block_env,
             request.clone(),
-            state,
+            &memory_db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
@@ -790,7 +727,7 @@ where
         // required gas is 271000+.
         if self.inner.virtual_balance().is_none() && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
-                if let Ok(account) = state.basic_ref(to) {
+                if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
                         .map(|account| {
                             account.is_empty_code_hash() || account.code_hash().is_zero()
@@ -799,11 +736,9 @@ where
                     if no_code_callee {
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
-                        if let Ok(exec_res) = self.inner.transact(block_env, state, tx.clone()) {
+                        if let Ok(exec_res) = self.inner.transact(&block_env, &memory_db, tx) {
                             if exec_res.is_success() {
-                                let l1_overhead =
-                                    self.inner.estimate_l1_overhead(block, block_env, tx, state);
-                                return Ok((MIN_TRANSACTION_GAS, l1_overhead));
+                                return Ok(U256::from(MIN_TRANSACTION_GAS));
                             }
                         }
                     }
@@ -811,14 +746,16 @@ where
             }
         }
         if tx.gas_price() > 0 {
-            let gas_limit = self.inner.gas_allowance(&request, &tx, state, block_env)?;
+            let gas_limit = self
+                .inner
+                .gas_allowance(&request, &tx, &memory_db, &block_env)?;
             highest_gas_limit = highest_gas_limit.min(gas_limit);
         }
         tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));
 
         let res = self
             .inner
-            .transact(block_env, state, tx.clone())
+            .transact(&block_env, &memory_db, tx.clone())
             .map_err(|e| e.to_rpc_error())?;
 
         let gas_refund = match res {
@@ -850,7 +787,7 @@ where
             tx.set_gas_limit(optimistic_gas_limit);
             let res = self
                 .inner
-                .transact(block_env, state, tx.clone())
+                .transact(&block_env, &memory_db, tx.clone())
                 .map_err(|e| e.to_rpc_error())?;
             gas_used = res.gas_used();
             update_estimated_gas_range(
@@ -881,7 +818,7 @@ where
 
             tx.set_gas_limit(mid_gas_limit);
 
-            let res = self.inner.transact(block_env, state, tx.clone());
+            let res = self.inner.transact(&block_env, &memory_db, tx.clone());
 
             match res {
                 Err(e) => {
@@ -928,11 +865,11 @@ where
         };
 
         tx.set_gas_limit(final_gas);
-        let l1_overhead = self
-            .inner
-            .estimate_l1_overhead(block, block_env, tx.clone(), state);
+        let l1_overhead =
+            self.inner
+                .estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
 
-        Ok((final_gas, l1_overhead))
+        Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }
 
     async fn debank_estimate_gas_impl(

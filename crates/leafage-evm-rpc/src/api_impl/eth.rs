@@ -113,24 +113,6 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
-        let cancel_token = CancellationToken::new();
-        if let Some(result) = self.inner.handle_virtual_call(
-            &request,
-            &block,
-            &block_env,
-            &db,
-            |estimate_request| {
-                self.estimate_gas_components_with_state(
-                    &block,
-                    &block_env,
-                    &db,
-                    estimate_request,
-                    &cancel_token,
-                )
-            },
-        )? {
-            return Ok(result);
-        }
         let tx = self.inner.create_txn_env(
             &block,
             &block_env,

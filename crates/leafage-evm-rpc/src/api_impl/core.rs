@@ -1,20 +1,17 @@
 use crate::api_impl::token_collector::TokenCollector;
 use alloy::consensus::BlockHeader;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::http_client::HttpClient;
+use jsonrpsee::{core::RpcResult, http_client::HttpClient};
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
+use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
-use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{
-    BlockEnv, BlockInfo, Bytes, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
-};
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
@@ -37,21 +34,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
 pub(crate) trait ApiCore:
     ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
 {
-    fn handle_virtual_call<StateDB, EstimateGas>(
-        &self,
-        _request: &CallRequest,
-        _block: &BlockInfo,
-        _block_env: &BlockEnv,
-        _state: &StateDB,
-        _estimate_gas: EstimateGas,
-    ) -> RpcResult<Option<Bytes>>
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-        EstimateGas: FnMut(CallRequest) -> RpcResult<(u64, u64)>,
-    {
-        Ok(None)
-    }
 }
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
