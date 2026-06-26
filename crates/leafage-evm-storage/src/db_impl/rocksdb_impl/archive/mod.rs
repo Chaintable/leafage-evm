@@ -24,7 +24,7 @@
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding,
+    inverted_block_encoding, set_inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
@@ -99,6 +99,20 @@ fn rocksdb_read_options() -> ReadOptions {
     let mut read_options = ReadOptions::default();
     read_options.set_verify_checksums(false);
     read_options
+}
+
+/// Reserved key (stored in the `LatestBlockHash` CF) recording whether this
+/// archive DB uses the inverted (descending) block-height key encoding. Lets
+/// the node auto-detect the encoding at open time instead of relying solely on
+/// the `--inverted-block-encoding` flag (which, if wrong, silently corrupts
+/// reads). Value: a single byte, `1` = inverted, `0` = legacy. Absent = a
+/// legacy DB, or one written before the marker existed.
+const ENCODING_MARKER_KEY: &[u8] = b"leafage:block_encoding_inverted";
+
+/// Format a duration (seconds) as `HhMMmSSs` for progress/ETA logs.
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}h{:02}m{:02}s", s / 3600, (s % 3600) / 60, s % 60)
 }
 
 /// Debug aid for migration: when `MIGRATE_DEBUG_ADDR_HASH` is set to the
@@ -693,13 +707,65 @@ impl DataBaseRef {
             ),
         ];
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
-        Self {
+        let db_ref = Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
-        }
+        };
+        // Self-describing encoding: if the DB records its block-height key
+        // encoding, honor it (a legacy DB has no marker and is left untouched),
+        // so the node can't mistake an inverted DB for a legacy one.
+        db_ref.align_encoding_from_marker();
+        db_ref
     }
 }
 
 impl DataBaseRef {
+    /// Read the stored block-height encoding marker: `Some(true)` = inverted,
+    /// `Some(false)` = legacy, `None` = unmarked (legacy / pre-marker).
+    pub fn read_encoding_marker(&self) -> Result<Option<bool>, Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        Ok(self
+            .db
+            .get_cf_opt(cf, ENCODING_MARKER_KEY, &rocksdb_read_options())?
+            .and_then(|v| v.first().copied())
+            .map(|b| b == 1))
+    }
+
+    /// Record this DB's block-height encoding so future opens are self-describing.
+    pub fn write_encoding_marker(&self, inverted: bool) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        self.db.put_cf(cf, ENCODING_MARKER_KEY, [inverted as u8])?;
+        Ok(())
+    }
+
+    /// If the DB carries an encoding marker, align the process-wide
+    /// `inverted_block_encoding` flag to it (warning if the configured flag
+    /// disagreed). The DB is the source of truth; the CLI flag is only a
+    /// fallback for unmarked legacy DBs.
+    fn align_encoding_from_marker(&self) {
+        match self.read_encoding_marker() {
+            Ok(Some(inv)) => {
+                if inv != inverted_block_encoding() {
+                    warn!(
+                        target: "rocksdb",
+                        "archive DB encoding marker = inverted:{}, but configured \
+                         --inverted-block-encoding = {}; trusting the DB marker",
+                        inv,
+                        inverted_block_encoding()
+                    );
+                }
+                set_inverted_block_encoding(inv);
+            }
+            Ok(None) => {} // unmarked legacy DB: keep the configured flag
+            Err(e) => warn!(target: "rocksdb", "failed to read encoding marker: {e}"),
+        }
+    }
+
     /// Offline rebuild of a **legacy (ascending)** archive RocksDB into the
     /// **inverted (descending)** block-height key encoding, without re-syncing
     /// from S3.
@@ -744,6 +810,24 @@ impl DataBaseRef {
         let src = DB::open_cf_for_read_only(&src_opts, &src_path, cf_names, false)
             .map_err(Error::RocksDB)?;
 
+        // Guard: refuse to re-encode a source that is already inverted.
+        {
+            let src_cf1 = src
+                .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+                .unwrap();
+            let marker = src
+                .get_cf(src_cf1, ENCODING_MARKER_KEY)
+                .map_err(Error::RocksDB)?
+                .and_then(|v| v.first().copied());
+            if marker == Some(1) {
+                return Err(Error::UnSupported(
+                    "source archive is already inverted (encoding marker = inverted); \
+                     nothing to re-encode"
+                        .to_string(),
+                ));
+            }
+        }
+
         // Destination: fresh DB with the standard archive CF options.
         let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * cache_size, 8192);
         let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false);
@@ -757,6 +841,41 @@ impl DataBaseRef {
             r.set_verify_checksums(false);
             r.set_total_order_seek(true);
             r
+        };
+
+        // Estimated total record count (RocksDB key-count estimate) for the
+        // progress/ETA readout.
+        let total_est: u64 = cf_names
+            .iter()
+            .filter_map(|&n| src.cf_handle(n))
+            .filter_map(|cf| {
+                src.property_int_value_cf(cf, "rocksdb.estimate-num-keys")
+                    .ok()
+                    .flatten()
+            })
+            .sum();
+        let start = std::time::Instant::now();
+        let mut last_log = start;
+        let mut processed: u64 = 0;
+        let mut log_progress = |processed: u64, force: bool| {
+            if !force && last_log.elapsed().as_secs() < 5 {
+                return; // throttle to ~every 5s
+            }
+            last_log = std::time::Instant::now();
+            let elapsed = start.elapsed().as_secs_f64();
+            let pct = if total_est > 0 {
+                (processed as f64 / total_est as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            let eta = if processed > 0 && total_est > processed {
+                elapsed * (total_est - processed) as f64 / processed as f64
+            } else {
+                0.0
+            };
+            info!(target: "migrate",
+                "reencode progress: {}/~{} ({:.1}%) elapsed={} eta~{}",
+                processed, total_est, pct, fmt_hms(elapsed), fmt_hms(eta));
         };
 
         // 1) Non-versioned CFs: copy verbatim.
@@ -774,8 +893,10 @@ impl DataBaseRef {
                 let (key, value) = item.map_err(Error::RocksDB)?;
                 batch.put_cf(dst_cf, key, value);
                 n += 1;
+                processed += 1;
                 if n % COMMIT_CHUNK == 0 {
                     dst.write(std::mem::take(&mut batch)).map_err(Error::RocksDB)?;
+                    log_progress(processed, false);
                 }
             }
             dst.write(batch).map_err(Error::RocksDB)?;
@@ -799,6 +920,7 @@ impl DataBaseRef {
                 // Legacy tail: block_num is the trailing 8 bytes (big-endian);
                 // the 24 bytes before it are zero in both encodings.
                 let block_num = u64::from_be_bytes(key[len - 8..].try_into().unwrap());
+                processed += 1;
                 if block_num == u64::MAX {
                     dropped += 1; // orphaned pre-#104 dual-write sentinel
                     continue;
@@ -809,6 +931,7 @@ impl DataBaseRef {
                 kept += 1;
                 if kept % COMMIT_CHUNK == 0 {
                     dst.write(std::mem::take(&mut batch)).map_err(Error::RocksDB)?;
+                    log_progress(processed, false);
                 }
             }
             dst.write(batch).map_err(Error::RocksDB)?;
@@ -817,8 +940,20 @@ impl DataBaseRef {
                 kept, col, dropped);
         }
 
+        // Mark the destination as inverted so the node auto-detects it at open.
+        {
+            let dst_cf1 = dst
+                .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+                .unwrap();
+            dst.put_cf(dst_cf1, ENCODING_MARKER_KEY, [1u8])
+                .map_err(Error::RocksDB)?;
+        }
+
         dst.flush().map_err(Error::RocksDB)?;
-        info!(target: "migrate", "reencode: done, destination flushed");
+        log_progress(processed, true);
+        info!(target: "migrate",
+            "reencode: done in {}, destination flushed and marked inverted",
+            fmt_hms(start.elapsed().as_secs_f64()));
         Ok(())
     }
 
@@ -2614,10 +2749,16 @@ mod inverted_encoding_tests {
         // 2) Re-encode legacy -> inverted (raw handles; src untouched).
         DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64).unwrap();
 
-        // 3) Open the result as INVERTED and verify.
-        crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
+        // 3) Open the result WITHOUT setting the inverted flag — the DB's
+        //    encoding marker must auto-align it (self-describing), proving the
+        //    node can't mistake an inverted DB for a legacy one.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
         {
             let db = Arc::new(DataBaseRef::open(&dst_dir, 64, false, false));
+            assert!(
+                crate::db_impl::archive_encoding::inverted_block_encoding(),
+                "open() must auto-align the encoding flag from the DB marker"
+            );
             let at = |n: u64| {
                 db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
                     .unwrap()
