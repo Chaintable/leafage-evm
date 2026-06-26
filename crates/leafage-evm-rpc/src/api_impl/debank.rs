@@ -57,7 +57,6 @@ impl<C> Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead + BlockIndex,
-    C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
@@ -862,7 +861,8 @@ where
             highest_gas_limit
         };
 
-        let l1_overhead = self.inner.estimate_l1_overhead(&block, &block_env, &memory_db, tx.clone());
+        tx.set_gas_limit(final_gas);
+        let l1_overhead = self.inner.estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
 
         Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }
@@ -979,7 +979,6 @@ impl<C> DebankApiServer for Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead + BlockIndex,
-    C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,

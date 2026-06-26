@@ -1,12 +1,12 @@
+use crate::citrea::CitreaContext;
+use alloy_evm::Database;
+use leafage_evm_types::Bytecode;
+use revm::context::transaction::AuthorizationTr;
+use revm::context::{ContextTr, Transaction};
 use revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
-use revm::primitives::{Address, KECCAK_EMPTY, U256};
+use revm::primitives::{address, Address, KECCAK_EMPTY, U256};
 use revm::JournalEntry;
 use std::collections::{BTreeMap, BTreeSet};
-use alloy_evm::Database;
-use revm::context::{ContextTr, Transaction};
-use revm::context::transaction::AuthorizationTr;
-use leafage_evm_types::Bytecode;
-use crate::citrea::CitreaContext;
 
 const ACCOUNT_IDX_KEY_SIZE: usize = 24;
 const ACCOUNT_IDX_SIZE: usize = 8;
@@ -18,6 +18,7 @@ const STORAGE_VALUE_SIZE: usize = 32;
 
 pub const L1_FEE_OVERHEAD: usize = 2;
 pub const BROTLI_COMPRESSION_PERCENTAGE: usize = 48;
+pub const SYSTEM_SIGNER: Address = address!("deaddeaddeaddeaddeaddeaddeaddeaddeaddead");
 const STORAGE_DISCOUNTED_PERCENTAGE: usize = 66;
 const ACCOUNT_DISCOUNTED_PERCENTAGE: usize = 32;
 
@@ -73,10 +74,10 @@ where
             // we know the authorization went through
             if (delegated_to == &Address::ZERO && authority_in_state.info.code_hash == KECCAK_EMPTY)
                 || authority_in_state
-                .info
-                .code
-                .as_ref()
-                .is_some_and(|code| *code == Bytecode::new_eip7702(*delegated_to))
+                    .info
+                    .code
+                    .as_ref()
+                    .is_some_and(|code| *code == Bytecode::new_eip7702(*delegated_to))
             {
                 // we set account changed for the authority
                 let account = account_changes.entry(authority).or_default();
@@ -123,7 +124,10 @@ where
                 // * Selfdestruct account that is created in the same transaction and
                 // * Specify the target is same as selfdestructed account. The balance stays unchanged.
 
-                if matches!(destroyed_status, SelfdestructionRevertStatus::RepeatedSelfdestruction){
+                if matches!(
+                    destroyed_status,
+                    SelfdestructionRevertStatus::RepeatedSelfdestruction
+                ) {
                     // It was already destroyed before in the log, no need to do anything.
                     continue;
                 }
@@ -173,7 +177,7 @@ where
     }
     let mut new_account_based_diff = 0usize;
     for addr in addresses_to_check {
-        if context.db_mut().basic(addr).ok().flatten().is_none(){
+        if context.db_mut().basic(addr).ok().flatten().is_none() {
             new_account_based_diff += ACCOUNT_IDX_KEY_SIZE + ACCOUNT_IDX_SIZE;
         }
     }
@@ -183,4 +187,3 @@ where
         + (storage_based_diff * STORAGE_DISCOUNTED_PERCENTAGE / 100)
         + new_account_based_diff
 }
-

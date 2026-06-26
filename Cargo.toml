@@ -39,7 +39,7 @@ tikv-jemalloc-sys = { version = "0.6", features = [
 ] }
 jemalloc_pprof = "0.8"
 tower = { version = "0.4.13", features = ["full"] }
-quick_cache = "0.4.0"
+moka = { version = "0.12", features = ["sync"] }
 once_cell = "1.19.0"
 futures = "0.3.30"
 hyper = "1.6"
@@ -48,9 +48,9 @@ tokio-tungstenite = "0.28"
 aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
 flate2 = "1.0.34"
+brotli = "7"
 etcd-client = "0.14"
 md-5 = "0.10.6"
-http-body-util = "0.1"
 http = "1.3"
 http-body = "1"
 procfs = "0.17"
@@ -89,11 +89,10 @@ alloy-rlp-derive = "0.3"
 alloy-hardforks = "0.4"
 alloy-evm = "0.29.2"
 alloy-sol-types = "1.3"
+# alloy-contract 的 Rust 代码没直接 use，但 `sol!` 宏展开会生成 alloy_contract::* 的引用。
 alloy-contract = "1.1.3"
 
 # op
-op-alloy-rpc-types = "0.23.1"
-op-alloy-consensus = "0.23.1"
 
 # metrics
 metrics = "0.24.0"
@@ -107,7 +106,6 @@ prost = "0.12.6"
 parity-bytes = "0.1.2"
 secp256k1 = "0.30"
 p256 = "0.13"
-num-bigint = "0.4"
 elliptic-curve = "0.13"
 sha2 = "0.10"
 bech32 = "0.11"

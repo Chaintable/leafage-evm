@@ -7,7 +7,7 @@ use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
-    ToJsonRpcError, TxSetter,
+    ToJsonRpcError,
 };
 use crate::metrics::RpcMetric;
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
@@ -156,12 +156,25 @@ where
             MultiChainCfgEnv::Mainnet(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
+            MultiChainCfgEnv::Arbitrum((env, custom_evm_cfg)) => {
+                run_chain_setup!(env, custom_evm_cfg)
+            }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Base(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Bsc(env) => run_chain_setup!(env, None),
             MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
+            MultiChainCfgEnv::Iotex(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Moonbeam(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
+            MultiChainCfgEnv::Polygon(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Tempo(env) => {
                 // Tempo: set virtual balance placeholder (no native token).
                 // Writer returns this for all eth_getBalance calls.
@@ -204,7 +217,6 @@ async fn warmup_api<A>(
 ) where
     A: ApiCore,
     A::DB: EvmStorageRead + BlockIndex,
-    A::Tx: TxSetter + Clone,
     A::TransactionError: ToJsonRpcError + GetTransactionError,
     A::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,

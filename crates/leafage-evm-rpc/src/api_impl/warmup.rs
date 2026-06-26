@@ -37,7 +37,7 @@ impl<C> Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead + BlockIndex,
-    C::Tx: TxSetter + Clone,
+    <C as EvmExecutor>::Tx: TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,

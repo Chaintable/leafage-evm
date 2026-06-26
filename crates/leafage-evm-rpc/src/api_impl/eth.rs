@@ -1,6 +1,6 @@
 use crate::api::EthApiServer;
 use crate::api_impl::core::{
-    Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError,
 };
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
@@ -15,7 +15,6 @@ use leafage_evm_types::{
     U256,
 };
 use revm::context::result::ExecutionResult;
-use revm::context::Transaction as TransactionTrait;
 use revm::database::{CacheDB, DatabaseRef};
 use serde_json::Value;
 use std::error::Error;
@@ -27,7 +26,6 @@ impl<C> Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead + BlockIndex,
-    C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
 {
@@ -571,7 +569,6 @@ impl<C> EthApiServer for Api<C>
 where
     C: ApiCore,
     C::DB: EvmStorageRead + BlockIndex,
-    C::Tx: TransactionTrait + TxSetter + Clone,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
 {

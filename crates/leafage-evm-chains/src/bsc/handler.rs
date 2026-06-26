@@ -13,7 +13,7 @@ use revm::{
         transaction::TransactionType,
         Cfg, ContextError, ContextTr, LocalContextTr, Transaction,
     },
-    context_interface::{journaled_state::account::JournaledAccountTr, transaction::eip7702::AuthorizationTr, JournalTr},
+    context_interface::{journaled_state::account::JournaledAccountTr, result::InvalidHeader, transaction::eip7702::AuthorizationTr, Block, JournalTr},
     handler::{EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
@@ -44,6 +44,28 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     type Evm = BscEvm<DB, INSP>;
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
+
+    /// System transactions in BSC use `i64::MAX` as gas limit, which would fail the
+    /// EIP-7825 gas limit cap check enabled on Osaka. This mirrors go-bsc setting
+    /// `SkipTransactionChecks=true` for system transactions.
+    fn validate_env(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
+        if evm.ctx_ref().tx().is_system_transaction {
+            let ctx = evm.ctx_ref();
+            let spec: SpecId = (*ctx.cfg().spec()).into();
+
+            if spec.is_enabled_in(SpecId::MERGE) && ctx.block().prevrandao().is_none() {
+                return Err(InvalidHeader::PrevrandaoNotSet.into());
+            }
+            if spec.is_enabled_in(SpecId::CANCUN)
+                && ctx.block().blob_excess_gas_and_price().is_none()
+            {
+                return Err(InvalidHeader::ExcessBlobGasNotSet.into());
+            }
+            Ok(())
+        } else {
+            self.mainnet.validate_env(evm)
+        }
+    }
 
     // This function is based on the implementation of the EIP-7702.
     // https://github.com/bluealloy/revm/blob/df467931c4b1b8b620ff2cb9f62501c7abc3ea03/crates/handler/src/pre_execution.rs#L186

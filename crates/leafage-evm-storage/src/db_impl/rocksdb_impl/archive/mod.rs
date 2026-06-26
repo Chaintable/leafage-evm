@@ -22,6 +22,10 @@
 //! - `get_transaction_by_context`
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::archive_encoding::{
+    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+    inverted_block_encoding,
+};
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
 use alloy::primitives::B64;
@@ -31,20 +35,22 @@ use leafage_evm_types::{
     H256, KECCAK256_EMPTY, U256,
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options,
-    ReadOptions, SliceTransform, WriteBatch, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IngestExternalFileOptions,
+    IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter, WriteBatch, WriteOptions,
+    DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 mod iterator_tracker;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 
@@ -95,6 +101,63 @@ fn rocksdb_read_options() -> ReadOptions {
     read_options
 }
 
+/// Debug aid for migration: when `MIGRATE_DEBUG_ADDR_HASH` is set to the
+/// 32-byte keccak hash of an address (hex), the full-scan iterators log every
+/// on-disk account/storage record whose key prefix matches — including the
+/// versions they skip — so a wrong/missing slot after `db-migrate` can be
+/// traced to what's actually on disk. Unset (the default) = no overhead.
+///
+/// e.g. for address 0x7C5f5A4bBd8fD63184577525326123B519429bDc:
+///   MIGRATE_DEBUG_ADDR_HASH=0x21c8fc7a32bb7d551eeafa76d8b8cc19a740bc3854752dfd913af30e75e29d98
+static MIGRATE_DEBUG_ADDR_HASH: LazyLock<Option<[u8; 32]>> = LazyLock::new(|| {
+    let s = std::env::var("MIGRATE_DEBUG_ADDR_HASH").ok()?;
+    match H256::from_str(s.trim()) {
+        Ok(h) => {
+            debug!(target: "migrate_debug", "storage/account record logging enabled for addr_hash {}", h);
+            Some(h.0)
+        }
+        Err(e) => {
+            warn!(target: "migrate_debug", "invalid MIGRATE_DEBUG_ADDR_HASH {:?}: {}", s, e);
+            None
+        }
+    }
+});
+
+/// Decode the block height from a versioned key's trailing 32-byte tail,
+/// honoring the current (ascending/descending) encoding. For logging only.
+#[inline]
+fn debug_decode_block_num(key_tail: &[u8]) -> u64 {
+    // tail is 32 bytes; the u64 lives in its last 8 bytes (big-endian).
+    let raw = u64::from_be_bytes(key_tail[24..32].try_into().unwrap());
+    if inverted_block_encoding() {
+        u64::MAX - raw
+    } else {
+        raw
+    }
+}
+
+/// Whether a versioned key's trailing height is the legacy `u64::MAX`
+/// dual-write "latest" sentinel.
+///
+/// The original archive backend ("add archive support", #1) wrote each account/
+/// slot twice: a historical record at `address(‖slot) ‖ block_num` and a
+/// latest-pointer at `address(‖slot) ‖ u64::MAX`. #104 removed the dual write
+/// (latest reads use the real head + `seek_for_prev`) but never deleted the
+/// sentinels already on disk. In a full scan those `u64::MAX` rows sort *after*
+/// every real version and would otherwise be mistaken for the newest record —
+/// and they are stale for anything modified after the #104 upgrade. The
+/// latest-state iterators must therefore ignore them.
+///
+/// `key_tail` is the full 32-byte version tail; the height is its last 8 bytes
+/// (big-endian). Only meaningful under legacy ascending encoding: in inverted
+/// mode a raw-`MAX` tail is the legitimate encoding of block 0 (genesis), and
+/// inverted DBs (post-#162) never carried dual-write sentinels anyway — callers
+/// gate on `!inverted_block_encoding()`.
+#[inline]
+fn is_dual_write_sentinel_tail(key_tail: &[u8]) -> bool {
+    u64::from_be_bytes(key_tail[24..32].try_into().unwrap()) == u64::MAX
+}
+
 impl StorageTypeColumn {
     fn to_str(&self) -> &'static str {
         match self {
@@ -136,10 +199,62 @@ pub struct DataBaseRef {
     db: &'static DB,
 }
 
+pub struct ArchiveRocksDBWriteBatch {
+    inner: WriteBatch,
+    account_writes: Vec<([u8; 64], Vec<u8>)>,
+    storage_writes: Vec<([u8; 96], [u8; 32])>,
+    /// When true, the underlying `write_opt` is called with `sync=true`,
+    /// forcing fsync of the WAL segment for this batch before returning.
+    /// Used by archive ingest at checkpoint boundaries to make the resume
+    /// pointer durable without paying for fsync on every commit.
+    sync: bool,
+}
+
+impl ArchiveRocksDBWriteBatch {
+    fn new() -> Self {
+        Self {
+            inner: WriteBatch::default(),
+            account_writes: Vec::new(),
+            storage_writes: Vec::new(),
+            sync: false,
+        }
+    }
+
+    /// Mark this batch as a sync commit: fsync the WAL before `commit()`
+    /// returns. Without this, the WAL append is buffered and a power loss
+    /// could lose the most recent commits.
+    pub fn set_sync(&mut self, sync: bool) {
+        self.sync = sync;
+    }
+
+    /// Append pre-encoded account writes to the deferred cache. `None` is
+    /// treated as a deletion (stored as empty bytes), matching the encoding
+    /// used by [`StateDBWrite::write_account`].
+    #[inline]
+    pub fn extend_account_writes<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = ([u8; 64], Option<Vec<u8>>)>,
+    {
+        self.account_writes
+            .extend(items.into_iter().map(|(k, v)| (k, v.unwrap_or_default())));
+    }
+
+    /// Append pre-encoded storage writes to the deferred cache.
+    #[inline]
+    pub fn extend_storage_writes<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = ([u8; 96], [u8; 32])>,
+    {
+        self.storage_writes.extend(items);
+    }
+}
+
 impl Drop for DataBaseRef {
     fn drop(&mut self) {
+        // Flush every named CF. See `DataBaseRef::flush` for why `db.flush()`
+        // alone is insufficient.
+        self.flush().unwrap();
         unsafe {
-            DATA_BASE.as_mut().unwrap().db.flush().unwrap();
             DATA_BASE = None;
         }
     }
@@ -151,11 +266,11 @@ unsafe impl Sync for DataBaseInner {}
 /// Compression type for column families
 #[derive(Clone, Copy)]
 enum CfCompression {
-    /// No compression (small values, not worth compressing)
+    /// No compression — only used for tiny CFs where the encode CPU isn't worth it.
     None,
-    /// LZ4 compression (good balance of speed and compression)
+    /// LZ4 across all levels. Default policy for medium-sized CFs.
     Lz4,
-    /// ZSTD compression (high compression ratio for large values like code)
+    /// LZ4 at shallow levels, ZSTD with dict at deep levels. Best ratio for code-like blobs.
     Zstd,
 }
 
@@ -165,6 +280,8 @@ fn rocksdb_column_options(
     fixed_prefix_size: usize,
     disable_auto_compactions: bool,
     compression: CfCompression,
+    bulk_load: bool,
+    archive_zstd_compression: bool,
 ) -> Options {
     let mut cf_opts = Options::default();
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
@@ -188,6 +305,14 @@ fn rocksdb_column_options(
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
+    // Allow the writer to roll into a fresh memtable while older ones are
+    // still being flushed (default is 2). Helps under sustained write load
+    // such as archive bulk-load.
+    cf_opts.set_max_write_buffer_number(4);
+    // Larger SST files = fewer files at every level = less metadata,
+    // smaller index/bloom overhead, fewer files for compaction to track.
+    // Default is 64MB; bump to 128MB.
+    cf_opts.set_target_file_size_base(128 << 20);
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
     // Disable TTL-based compaction. Archive data is immutable — recompacting
     // old SST files just because they exceed 30 days (the default set by
@@ -195,8 +320,54 @@ fn rocksdb_column_options(
     // temporary disk usage spikes (e.g. ~30 GB for AddressToStorage L6 rewrites).
     cf_opts.set_ttl(0);
 
-    // Set compression based on data characteristics.
-    // NOTE: optimize_level_style_compaction() populates compression_per_level
+    if bulk_load {
+        // Disable every back-pressure mechanism on the writer thread. Auto
+        // compaction still runs in the background to drain L0 → L1
+        // incrementally, but if it can't keep up the writer must NOT be
+        // throttled — archive ingest treats the source as replayable and
+        // would rather pay the disk cost than slow down.
+        // (Defaults: slowdown 20 files, stop 24 files, soft 64GB, hard 256GB.)
+        cf_opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
+        cf_opts.set_level_zero_stop_writes_trigger(i32::MAX);
+        cf_opts.set_soft_pending_compaction_bytes_limit(0);
+        cf_opts.set_hard_pending_compaction_bytes_limit(0);
+        // Push the L0 → L1 compaction trigger from the default 4 files up to
+        // 50 so background compaction stops competing with the WAL writer
+        // for disk bandwidth on slower NVMes. Observed on a ~150 MB/s NVMe:
+        // ingest at 1024-block checkpoints had compaction reading ~40 MB/s
+        // and writing ~30 MB/s while the WAL writer needed ~250 MB/checkpoint
+        // → checkpoint stalls 14s. Letting L0 grow to 50 files frees disk
+        // bandwidth for the WAL/flush path; the deferred compaction work is
+        // picked up by the final manual compact() the caller runs at end of
+        // ingest.
+        cf_opts.set_level_zero_file_num_compaction_trigger(50);
+    }
+
+    // Compression policy.
+    //
+    // Two policies coexist, gated by `archive_zstd_compression`:
+    //
+    // * `archive_zstd_compression = false` (default — preserves pre-branch
+    //   behavior for existing deployments):
+    //   - Lz4: L0/L1 = None in normal mode, LZ4 in bulk-load; L2-L6 = LZ4.
+    //   - Zstd: L0 = None in normal mode, LZ4 in bulk-load; L1 = LZ4; L2-L6 = ZSTD-with-dict.
+    //
+    // * `archive_zstd_compression = true` (opt-in — newer policy from this branch):
+    //   - Lz4: LZ4 across all levels unconditionally.
+    //   - Zstd: L0-L1 = LZ4 unconditionally; L2-L6 = ZSTD-with-dict.
+    //   The unconditional shallow-level compression fixes a bug where a
+    //   bulk-loaded DB reopened in normal mode would have its L0 SSTs
+    //   (written as LZ4) rewritten as None on cascade, inflating disk by
+    //   ~1.7× until the data reached the next compressed level. LZ4
+    //   decompresses at ~4 GB/s — comparable to NVMe sequential read — so
+    //   shallow compression has negligible read-latency cost.
+    //
+    // NOTE on dynamic levels: this CF enables level_compaction_dynamic_level_bytes,
+    // so physical level numbers below the flush level shift with DB size. What
+    // matters is that the flush output (compression_per_level[0]) and all deeper
+    // levels reachable via cascade are set consistently — they are.
+    //
+    // NOTE on overrides: optimize_level_style_compaction() populates compression_per_level
     // (L0-L1: None, L2+: LZ4), which takes precedence over set_compression_type().
     // We must use set_compression_per_level() to override it reliably.
     match compression {
@@ -212,10 +383,14 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Lz4 => {
-            // L0-L1: no compression (frequently accessed), L2+: LZ4
+            let l0_l1 = if archive_zstd_compression || bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::None,
-                rocksdb::DBCompressionType::None,
+                l0_l1,
+                l0_l1,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Lz4,
@@ -224,9 +399,13 @@ fn rocksdb_column_options(
             ]);
         }
         CfCompression::Zstd => {
-            // L0-L1: LZ4 (fast), L2+: ZSTD (high compression for large code blobs)
+            let l0 = if archive_zstd_compression || bulk_load {
+                rocksdb::DBCompressionType::Lz4
+            } else {
+                rocksdb::DBCompressionType::None
+            };
             cf_opts.set_compression_per_level(&[
-                rocksdb::DBCompressionType::None,
+                l0,
                 rocksdb::DBCompressionType::Lz4,
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
@@ -234,12 +413,7 @@ fn rocksdb_column_options(
                 rocksdb::DBCompressionType::Zstd,
                 rocksdb::DBCompressionType::Zstd,
             ]);
-            // Enable ZSTD dictionary compression for better compression of similar data patterns
-            // - max_train_bytes: bytes to sample for dictionary training (1MB)
-            // - zstd_max_train_bytes: same as above for ZSTD specifically
-            cf_opts.set_zstd_max_train_bytes(1024 * 1024); // 1MB training data
-                                                           // compression_opts: (window_bits, level, strategy, max_dict_bytes)
-                                                           // max_dict_bytes: dictionary size (16KB is a good default)
+            cf_opts.set_zstd_max_train_bytes(1024 * 1024);
             cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
         }
     }
@@ -254,11 +428,20 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.create_if_missing(true);
     opts.set_use_fsync(false);
     opts.set_keep_log_file_num(1);
-    opts.set_bytes_per_sync(1 << 20); // e.g., 1MB
+    // Larger sync chunks: amortise the per-fsync cost during heavy writes
+    // (archive bulk-load and background compaction) at the small cost of a
+    // slightly larger window of dirty pages on crash.
+    opts.set_bytes_per_sync(4 << 20); // 4MB
     opts.set_write_buffer_size(1 << 28); // e.g., 256MB
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
-    opts.increase_parallelism(2);
+    // Background concurrency. The previous value (2) covered flush + a single
+    // compaction job, which serialised L0 → L1 across CFs and bottlenecked
+    // archive bulk-load; standalone reads/writes also benefit from faster
+    // background compaction. `max_subcompactions` lets a single big
+    // compaction (e.g. AddressToStorage) split into parallel ranges.
+    opts.increase_parallelism(8);
+    opts.set_max_subcompactions(4);
     opts.set_use_direct_io_for_flush_and_compaction(true);
     opts.set_disable_auto_compactions(disable_auto_compactions);
 
@@ -287,10 +470,64 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
 }
 
 impl DataBaseRef {
+    /// Open the archive RocksDB with default throttles. Set
+    /// `disable_auto_compactions=true` if a caller plans to run its own
+    /// manual `compact()` and doesn't want background work in between.
+    ///
+    /// For archive-init bulk ingest, prefer [`Self::open_for_bulk_load`]
+    /// which disables the L0 / pending-compaction throttles so the writer
+    /// is never back-pressured by lagging compaction.
     pub fn open<P: AsRef<Path>>(
         path: P,
         cache_size: usize,
         disable_auto_compactions: bool,
+        archive_zstd_compression: bool,
+    ) -> Self {
+        Self::open_inner(
+            path,
+            cache_size,
+            disable_auto_compactions,
+            false,
+            archive_zstd_compression,
+        )
+    }
+
+    /// Open the archive RocksDB tuned for bulk ingest:
+    /// - Auto-compactions ON: RocksDB drains L0 → L1 in the background as
+    ///   files accumulate, so disk doesn't grow unbounded during long
+    ///   ingests.
+    /// - L0 slowdown/stop triggers and pending-compaction byte limits
+    ///   disabled: background compaction never back-pressures the writer.
+    /// - WAL is on (same as `open()`); callers wanting durable resume
+    ///   should mark each checkpoint batch as `set_sync(true)` so the WAL
+    ///   is fsynced before the commit returns.
+    pub fn open_for_bulk_load<P: AsRef<Path>>(
+        path: P,
+        cache_size: usize,
+        archive_zstd_compression: bool,
+    ) -> Self {
+        warn!(
+            target = "rocksdb",
+            "Opening RocksDB archive in BULK-LOAD mode: \
+             L0/pending-compaction throttles disabled (auto compactions still on, \
+             WAL still on). Caller is expected to drive durability by calling \
+             commit() with sync=true on checkpoint batches."
+        );
+        // Note: disable_auto_compactions = false. Earlier revisions disabled
+        // auto compactions and tried to do periodic manual compactions, but
+        // every `compact_range_cf(.., None, None)` is a full-range manual
+        // compaction (work proportional to total written so far), so periodic
+        // calls produced O(N²) total compaction work. Letting RocksDB do
+        // incremental L0 → L1 in the background keeps each step bounded.
+        Self::open_inner(path, cache_size, false, true, archive_zstd_compression)
+    }
+
+    fn open_inner<P: AsRef<Path>>(
+        path: P,
+        cache_size: usize,
+        disable_auto_compactions: bool,
+        bulk_load: bool,
+        archive_zstd_compression: bool,
     ) -> Self {
         let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
@@ -299,8 +536,23 @@ impl DataBaseRef {
         );
         info!(
             target = "rocksdb",
-            "Created shared Clock Cache with size: {}MB for archive", total_cache_size
+            "Created shared Clock Cache with size: {}MB for archive (bulk_load={}, archive_zstd_compression={})",
+            total_cache_size,
+            bulk_load,
+            archive_zstd_compression,
         );
+
+        // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
+        // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at
+        // deep levels via `archive_zstd_compression` for ~15-20% extra ratio
+        // at the cost of ~2× compaction CPU and ~3× cold-read decode latency.
+        // HashToCode is always Zstd: code blobs benefit from dict compression
+        // regardless of the flag.
+        let big_cf_compression = if archive_zstd_compression {
+            CfCompression::Zstd
+        } else {
+            CfCompression::Lz4
+        };
 
         // LatestBlockHash: single record, no compression needed
         let latest_block_hash_cf = ColumnFamilyDescriptor::new(
@@ -310,16 +562,19 @@ impl DataBaseRef {
                 0,
                 disable_auto_compactions,
                 CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // BlockHashToBlockInfo: ~500 bytes value, LZ4 compression
         let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 0,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
         // BlockNumToBlockHash: 32 bytes value, no compression needed
@@ -330,28 +585,30 @@ impl DataBaseRef {
                 0,
                 disable_auto_compactions,
                 CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // AddressToAccount: ~100 bytes value, LZ4 compression
         let address_to_account_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToAccount.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 32,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
-        // AddressToStorage: 32 bytes value, but 96-byte keys have high prefix
-        // redundancy. LZ4 at deeper levels reduces disk usage with negligible
-        // CPU overhead.
         let address_to_storage_cf = ColumnFamilyDescriptor::new(
             StorageTypeColumn::AddressToStorage.to_str(),
             rocksdb_column_options(
                 &shared_cache,
                 64,
                 disable_auto_compactions,
-                CfCompression::Lz4,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
@@ -362,6 +619,8 @@ impl DataBaseRef {
                 0,
                 disable_auto_compactions,
                 CfCompression::Zstd,
+                bulk_load,
+                archive_zstd_compression,
             ),
         );
         let cfs = vec![
@@ -438,7 +697,7 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let block_num_bytes = encode_block_num(block_num);
         let block_hash_bytes = self.db.get_pinned_cf_opt(
             block_num_to_block_hash_cf,
             block_num_bytes,
@@ -529,11 +788,9 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        let block_hash_bytes = self.db.get_cf_opt(
-            latest_block_hash_cf,
-            [1u8].to_vec(),
-            &rocksdb_read_options(),
-        )?;
+        let block_hash_bytes =
+            self.db
+                .get_cf_opt(latest_block_hash_cf, [1u8], &rocksdb_read_options())?;
         STORAGE_METRICS
             .read_latest_block_hash_latency
             .record(start.elapsed().as_secs_f64());
@@ -557,8 +814,120 @@ impl DataBaseRef {
         }
     }
 
+    /// SstFileWriter Options used for archive bulk-load. Compression matches the
+    /// L0/L1 setting of the large CFs (LZ4) so RocksDB does not transcode the
+    /// ingested file when cascading. The default BytewiseComparator matches the
+    /// CF comparator. Block-table layout is left default; bloom/index are
+    /// regenerated by the final manual `compact()` when files cascade out of L0.
+    fn sst_writer_options() -> Options {
+        let mut opts = Options::default();
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts
+    }
+
+    /// Default IngestExternalFileOptions for archive bulk-load. `move_files=true`
+    /// renames the file into RocksDB's data directory instead of copying — the
+    /// caller is responsible for ensuring the source path is on the same
+    /// filesystem as the database. Other options are left at RocksDB defaults
+    /// (`snapshot_consistency=true`, `allow_global_seqno=true`,
+    /// `allow_blocking_flush=true`, `ingest_behind=false`); these are correct
+    /// for the bulk-load workload, where we do not write to the target CFs'
+    /// memtables and depend on global seqno assignment for correct read-merge
+    /// of any duplicate keys produced by crash-resume re-ingest.
+    fn ingest_external_file_options() -> IngestExternalFileOptions {
+        let mut opts = IngestExternalFileOptions::default();
+        opts.set_move_files(true);
+        opts
+    }
+
+    /// Build an SST file at `path` containing the `AddressToAccount` writes.
+    ///
+    /// REQUIRES: `sorted_writes` is strictly increasing by key (per
+    /// BytewiseComparator). Caller must sort and (defensively) dedup-keep-last
+    /// before calling. Empty `sorted_writes` produces no file (the SST writer
+    /// rejects empty finishes); caller must guard.
+    pub fn write_account_sst<P: AsRef<Path>>(
+        &self,
+        path: P,
+        sorted_writes: &[([u8; 64], Vec<u8>)],
+    ) -> Result<(), Error> {
+        let opts = Self::sst_writer_options();
+        let mut writer = SstFileWriter::create(&opts);
+        writer.open(path.as_ref())?;
+        for (k, v) in sorted_writes {
+            writer.put(k, v)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Build an SST file at `path` containing the `AddressToStorage` writes.
+    /// Same preconditions as [`Self::write_account_sst`].
+    pub fn write_storage_sst<P: AsRef<Path>>(
+        &self,
+        path: P,
+        sorted_writes: &[([u8; 96], [u8; 32])],
+    ) -> Result<(), Error> {
+        let opts = Self::sst_writer_options();
+        let mut writer = SstFileWriter::create(&opts);
+        writer.open(path.as_ref())?;
+        for (k, v) in sorted_writes {
+            writer.put(k, v)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Ingest a list of pre-built SST files into the `AddressToAccount` CF.
+    /// Files in `paths` must have non-overlapping key ranges among themselves
+    /// (otherwise they all land in L0 anyway). Across calls the key ranges may
+    /// overlap (and will, because address space is sparse but block_num
+    /// progresses), so files cascade through L0.
+    pub fn ingest_account_ssts(&self, paths: Vec<std::path::PathBuf>) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+            .unwrap();
+        let opts = Self::ingest_external_file_options();
+        self.db.ingest_external_file_cf_opts(cf, &opts, paths)?;
+        Ok(())
+    }
+
+    /// Ingest a list of pre-built SST files into the `AddressToStorage` CF.
+    pub fn ingest_storage_ssts(&self, paths: Vec<std::path::PathBuf>) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let opts = Self::ingest_external_file_options();
+        self.db.ingest_external_file_cf_opts(cf, &opts, paths)?;
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), Error> {
-        self.db.flush()?;
+        // Flush every named column family. `DB::flush()` from rocksdb-rs only
+        // flushes the default CF (which we don't use), so it is unsafe to rely
+        // on for durability — especially under bulk-load (WAL disabled), where
+        // unflushed memtable contents are not recoverable on crash.
+        //
+        // Ordering matters: `LatestBlockHash` is a pointer into the content
+        // CFs and MUST flush last. If we crash mid-flush after content CFs
+        // are persisted but before the pointer is, resume reads the older
+        // pointer from SST and replays the lost block range (idempotent,
+        // since archive keys include block_num). The reverse order risks
+        // committing a pointer to a block whose content was lost with the
+        // memtable.
+        for cf_type in [
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::HashToCode,
+            StorageTypeColumn::LatestBlockHash,
+        ] {
+            let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+            self.db.flush_cf(cf)?;
+        }
         Ok(())
     }
 
@@ -618,8 +987,10 @@ impl LatestStateDBIterator for DataBaseRef {
     /// account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
     fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
-        // Data is sorted by address || block_num, so records for the same address are consecutive
-        // and ordered by block_num ascending. We need the last record for each address.
+        // Records for the same address are consecutive. The newest version is
+        // the FIRST record of the prefix under inverted (newest-first) encoding,
+        // and the LAST record under legacy ascending encoding.
+        let inverted = inverted_block_encoding();
         let mut iter = self
             .db
             .iterator_cf_opt(
@@ -631,6 +1002,9 @@ impl LatestStateDBIterator for DataBaseRef {
             )
             .peekable();
 
+        // Address prefix whose newest version has already been handled (inverted).
+        let mut consumed_prefix: Option<[u8; 32]> = None;
+
         std::iter::from_fn(move || {
             loop {
                 let item = iter.next()?;
@@ -640,27 +1014,67 @@ impl LatestStateDBIterator for DataBaseRef {
                 let (key, value) = item.unwrap();
                 let address_bytes: [u8; 32] = key[..32].try_into().unwrap();
 
-                // Check if next record has the same address
-                let is_last_for_address = match iter.peek() {
-                    Some(Ok((next_key, _))) => next_key[..32] != address_bytes,
-                    Some(Err(_)) => true, // Will handle error on next iteration
-                    None => true,         // No more records
-                };
+                // Orphaned pre-#104 dual-write latest pointer (address ‖ u64::MAX);
+                // not a real version. Legacy mode only (see helper docs).
+                let is_sentinel = !inverted && is_dual_write_sentinel_tail(&key[32..64]);
 
-                if !is_last_for_address {
-                    // Skip this record, there's a newer one for this address
+                let is_newest = if inverted {
+                    // First record of the prefix is newest.
+                    let newest = consumed_prefix != Some(address_bytes);
+                    consumed_prefix = Some(address_bytes);
+                    newest
+                } else {
+                    // Last *real* record of the prefix is newest. A trailing
+                    // dual-write sentinel is skipped below, so a record whose
+                    // only successor is that sentinel is still the newest.
+                    match iter.peek() {
+                        Some(Ok((next_key, _))) => {
+                            next_key[..32] != address_bytes
+                                || is_dual_write_sentinel_tail(&next_key[32..64])
+                        }
+                        Some(Err(_)) => true,
+                        None => true,
+                    }
+                };
+                // Migration debug: log every on-disk version of the target
+                // account (including skipped ones).
+                if let Some(target) = MIGRATE_DEBUG_ADDR_HASH.as_ref() {
+                    if &key[..32] == target {
+                        let empty = value.as_ref().is_empty();
+                        let action = if is_sentinel {
+                            "skip(u64::MAX dual-write sentinel)".to_string()
+                        } else if !is_newest {
+                            "skip(older version)".to_string()
+                        } else if empty {
+                            "skip(deleted = absent at head)".to_string()
+                        } else {
+                            let acc = SlimAccount::decode(&mut value.as_ref()).unwrap();
+                            format!("EMIT -> snapshot (nonce={}, balance={})", acc.nonce, acc.balance)
+                        };
+                        debug!(target: "migrate_debug",
+                            "account key=0x{} tail=0x{} block={} newest={} -> {}",
+                            alloy::hex::encode(&key[..]),
+                            alloy::hex::encode(&key[32..64]),
+                            debug_decode_block_num(&key[32..64]), is_newest, action);
+                    }
+                }
+
+                // Never emit the orphaned dual-write sentinel; the real newest
+                // record (greatest real height) is selected instead.
+                if is_sentinel {
+                    continue;
+                }
+                if !is_newest {
                     continue;
                 }
 
-                // This is the last (newest) record for this address
-                let address = H256::from_slice(&address_bytes);
                 let mut raw_account_slice = value.as_ref();
-
-                // Skip empty values (deleted accounts)
+                // Newest version is a deletion -> account absent at tip.
                 if raw_account_slice.is_empty() {
                     continue;
                 }
 
+                let address = H256::from_slice(&address_bytes);
                 let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
                 let account = NewAccount {
                     address,
@@ -700,8 +1114,10 @@ impl LatestStateDBIterator for DataBaseRef {
     /// account address | storage index -> storage value
     /// Returns the latest state for each (address, index) pair (the record with highest block_num)
     fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
-        // Data is sorted by address || index || block_num, so records for the same (address, index)
-        // are consecutive and ordered by block_num ascending. We need the last record for each pair.
+        // Records for the same (address, index) are consecutive. The newest is
+        // the FIRST record of the prefix under inverted encoding, the LAST under
+        // legacy ascending encoding.
+        let inverted = inverted_block_encoding();
         let mut iter = self
             .db
             .iterator_cf_opt(
@@ -713,6 +1129,9 @@ impl LatestStateDBIterator for DataBaseRef {
             )
             .peekable();
 
+        // (address || index) prefix whose newest has been handled (inverted).
+        let mut consumed_prefix: Option<[u8; 64]> = None;
+
         std::iter::from_fn(move || {
             loop {
                 let item = iter.next()?;
@@ -722,28 +1141,67 @@ impl LatestStateDBIterator for DataBaseRef {
                 let (key, value) = item.unwrap();
                 let prefix: [u8; 64] = key[..64].try_into().unwrap(); // address || index
 
-                // Check if next record has the same (address, index)
-                let is_last_for_prefix = match iter.peek() {
-                    Some(Ok((next_key, _))) => next_key[..64] != prefix,
-                    Some(Err(_)) => true, // Will handle error on next iteration
-                    None => true,         // No more records
-                };
+                // Orphaned pre-#104 dual-write latest pointer
+                // (address ‖ slot ‖ u64::MAX); not a real version.
+                let is_sentinel = !inverted && is_dual_write_sentinel_tail(&key[64..96]);
 
-                if !is_last_for_prefix {
-                    // Skip this record, there's a newer one for this (address, index)
+                let is_newest = if inverted {
+                    let newest = consumed_prefix != Some(prefix);
+                    consumed_prefix = Some(prefix);
+                    newest
+                } else {
+                    // Last *real* record of the prefix is newest; a trailing
+                    // dual-write sentinel (skipped below) doesn't count.
+                    match iter.peek() {
+                        Some(Ok((next_key, _))) => {
+                            next_key[..64] != prefix
+                                || is_dual_write_sentinel_tail(&next_key[64..96])
+                        }
+                        Some(Err(_)) => true,
+                        None => true,
+                    }
+                };
+                // Migration debug: log every on-disk version of the target
+                // address's slots (including ones we skip), so a wrong/missing
+                // slot can be traced to what's actually on disk.
+                if let Some(target) = MIGRATE_DEBUG_ADDR_HASH.as_ref() {
+                    if &key[..32] == target {
+                        let val = U256::from_be_slice(value.as_ref());
+                        let action = if is_sentinel {
+                            "skip(u64::MAX dual-write sentinel)"
+                        } else if !is_newest {
+                            "skip(older version)"
+                        } else if val == U256::ZERO {
+                            "skip(zero = empty at head, dropped from snapshot)"
+                        } else {
+                            "EMIT -> snapshot"
+                        };
+                        debug!(target: "migrate_debug",
+                            "storage key=0x{} tail=0x{} slot={} block={} value={} newest={} -> {}",
+                            alloy::hex::encode(&key[..]),
+                            alloy::hex::encode(&key[64..96]),
+                            H256::from_slice(&key[32..64]),
+                            debug_decode_block_num(&key[64..96]),
+                            val, is_newest, action);
+                    }
+                }
+
+                // Never emit the orphaned dual-write sentinel.
+                if is_sentinel {
+                    continue;
+                }
+                if !is_newest {
                     continue;
                 }
 
-                // This is the last (newest) record for this (address, index)
-                let address = H256::from_slice(&prefix[..32]);
-                let storage_key = H256::from_slice(&prefix[32..64]);
                 let storage_value = U256::from_be_slice(value.as_ref());
-
-                // Skip zero values (deleted storage slots)
+                // Newest version is zero -> slot empty at tip.
                 if storage_value == U256::ZERO {
                     continue;
                 }
 
+                let address = H256::from_slice(&prefix[..32]);
+                let storage_key = H256::from_slice(&prefix[32..64]);
                 return Some(Ok((address, storage_key, storage_value)));
             }
         })
@@ -1002,7 +1460,7 @@ impl StateDBRead for StateDB {
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
-        let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
+        let target_key = encode_account_key(address, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -1010,7 +1468,14 @@ impl StateDBRead for StateDB {
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        account_iter.seek_for_prev([address_bytes.as_ref(), &block_num_bytes].concat());
+        // Greatest version <= block_num: inverted encoding -> smallest key >=
+        // target (forward seek); legacy ascending -> largest key <= target
+        // (seek_for_prev). See archive_encoding module docs.
+        if inverted_block_encoding() {
+            account_iter.seek(target_key);
+        } else {
+            account_iter.seek_for_prev(target_key);
+        }
         STORAGE_METRICS
             .read_account_latency
             .record(start.elapsed().as_secs_f64());
@@ -1043,7 +1508,7 @@ impl StateDBRead for StateDB {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let key_bytes: [u8; 32] = key.into();
-        let block_num_bytes: [u8; 32] = U256::from(self.block_num).to_be_bytes();
+        let target_key = encode_storage_key(address, key, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -1051,8 +1516,12 @@ impl StateDBRead for StateDB {
         let storage_iter = storage_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        storage_iter
-            .seek_for_prev([address_bytes.as_ref(), key_bytes.as_ref(), &block_num_bytes].concat());
+        // Inverted -> forward seek; legacy ascending -> seek_for_prev. See read_account.
+        if inverted_block_encoding() {
+            storage_iter.seek(target_key);
+        } else {
+            storage_iter.seek_for_prev(target_key);
+        }
         STORAGE_METRICS
             .read_storage_latency
             .record(start.elapsed().as_secs_f64());
@@ -1121,9 +1590,9 @@ impl StateDBRead for StateDB {
 }
 /// StateDB delegates all write operations to Arc<DataBaseRef>
 impl StateDBWrite for StateDB {
-    type DBWriteBatch = WriteBatch;
+    type DBWriteBatch = ArchiveRocksDBWriteBatch;
 
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Error> {
         self.db.prepare_write_batch()
     }
 
@@ -1191,10 +1660,10 @@ impl StateDBWrite for StateDB {
 /// Direct write implementation for `Arc<DataBaseRef>` without needing a StateDB instance.
 /// This is useful for bulk initialization where we don't need read capabilities.
 impl StateDBWrite for Arc<DataBaseRef> {
-    type DBWriteBatch = WriteBatch;
+    type DBWriteBatch = ArchiveRocksDBWriteBatch;
 
-    fn prepare_write_batch(&self) -> Result<WriteBatch, Error> {
-        Ok(WriteBatch::default())
+    fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, Error> {
+        Ok(ArchiveRocksDBWriteBatch::new())
     }
 
     fn write_block_hash(
@@ -1208,8 +1677,8 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_hash.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-        batch.put_cf(
+        let block_num_bytes = encode_block_num(block_num);
+        batch.inner.put_cf(
             block_num_to_block_hash_cf,
             block_num_bytes,
             block_hash_bytes,
@@ -1236,7 +1705,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
             })?;
             block_info_bytes.extend_from_slice(&other_bytes);
         }
-        batch.put_cf(
+        batch.inner.put_cf(
             block_hash_to_block_info_cf,
             block_hash_bytes,
             block_info_bytes,
@@ -1251,29 +1720,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         raw_account: Option<NewAccount>,
     ) -> Result<(), Error> {
-        let address_to_account_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-            .unwrap();
-        let address_bytes = address.as_slice();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
-
-        if let Some(raw_account) = raw_account {
-            let raw_account: SlimAccount = raw_account.into();
-            let mut raw_account_bytes = Vec::new();
-            raw_account.encode(&mut raw_account_bytes);
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &block_num_bytes].concat(),
-                &raw_account_bytes,
-            );
-        } else {
-            batch.put_cf(
-                address_to_account_cf,
-                [address_bytes, &block_num_bytes].concat(),
-                &[],
-            );
-        }
+        let account_key = encode_account_key(address, block_num);
+        let value = raw_account.map(encode_slim_account).unwrap_or_default();
+        batch.account_writes.push((account_key, value));
         Ok(())
     }
 
@@ -1285,20 +1734,10 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         value: U256,
     ) -> Result<(), Error> {
-        let address_to_storage_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-        let address_bytes = address.as_slice();
-        let key_bytes: [u8; 32] = key.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
+        let storage_key = encode_storage_key(address, key, block_num);
         let value_bytes: [u8; 32] = value.to_be_bytes();
 
-        batch.put_cf(
-            address_to_storage_cf,
-            [address_bytes, &key_bytes, &block_num_bytes].concat(),
-            value_bytes,
-        );
+        batch.storage_writes.push((storage_key, value_bytes));
         Ok(())
     }
 
@@ -1313,7 +1752,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
             .unwrap();
         let code_hash_bytes = code_hash.as_slice();
-        batch.put_cf(address_to_code_cf, code_hash_bytes, code);
+        batch
+            .inner
+            .put_cf(address_to_code_cf, code_hash_bytes, code);
         Ok(())
     }
 
@@ -1326,15 +1767,76 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
             .unwrap();
-        batch.put_cf(latest_block_hash_cf, [1u8].to_vec(), block_hash.as_slice());
+        batch
+            .inner
+            .put_cf(latest_block_hash_cf, [1u8], block_hash.as_slice());
         Ok(())
     }
 
-    fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
-        self.db.write(batch)?;
+    fn commit(&self, mut batch: Self::DBWriteBatch) -> Result<(), Error> {
+        if !batch.account_writes.is_empty() {
+            let address_to_account_cf = self
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            // Stable sort by key: equal keys keep insertion order, so the last
+            // write per key is naturally the last entry within its run.
+            batch.account_writes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut last_write: Option<([u8; 64], Vec<u8>)> = None;
+            for (key, value) in batch.account_writes {
+                if let Some((prev_key, prev_value)) = last_write.take() {
+                    if prev_key != key {
+                        batch
+                            .inner
+                            .put_cf(address_to_account_cf, prev_key, prev_value);
+                    }
+                }
+                last_write = Some((key, value));
+            }
+            if let Some((key, value)) = last_write {
+                batch.inner.put_cf(address_to_account_cf, key, value);
+            }
+        }
+
+        if !batch.storage_writes.is_empty() {
+            let address_to_storage_cf = self
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            // Stable sort by key: equal keys keep insertion order, so the last
+            // write per key is naturally the last entry within its run.
+            batch.storage_writes.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut last_write: Option<([u8; 96], [u8; 32])> = None;
+            for (key, value) in batch.storage_writes {
+                if let Some((prev_key, prev_value)) = last_write.take() {
+                    if prev_key != key {
+                        batch
+                            .inner
+                            .put_cf(address_to_storage_cf, prev_key, prev_value);
+                    }
+                }
+                last_write = Some((key, value));
+            }
+            if let Some((key, value)) = last_write {
+                batch.inner.put_cf(address_to_storage_cf, key, value);
+            }
+        }
+
+        let mut wo = WriteOptions::default();
+        wo.set_sync(batch.sync);
+        self.db.write_opt(batch.inner, &wo)?;
         Ok(())
     }
 }
+
+/// Serializes tests that call [`DataBaseRef::open`]. The archive backend keeps
+/// the open DB in a process-global `static mut DATA_BASE` and hands out a
+/// pointer into it, so two concurrent opens invalidate each other's reference.
+/// Every test that opens an archive DB must hold this lock for its duration.
+#[cfg(test)]
+pub(crate) static ARCHIVE_DB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1557,7 +2059,440 @@ mod tests {
         let encoded = encode_block_info(&original);
         let decoded = decode_block_info_bytes(H256::ZERO, &encoded).expect("decode should succeed");
 
-        assert_eq!(decoded.other.get("l1FeeRate"), original.other.get("l1FeeRate"));
-        assert_eq!(decoded.other.get("customField"), original.other.get("customField"));
+        assert_eq!(
+            decoded.other.get("l1FeeRate"),
+            original.other.get("l1FeeRate")
+        );
+        assert_eq!(
+            decoded.other.get("customField"),
+            original.other.get("customField")
+        );
+    }
+}
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+    use crate::db::StateDBWrapper;
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+
+    fn make_block_info_at(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
+        let mut raw = RawHeader::default();
+        raw.number = number;
+        raw.parent_hash = parent_hash;
+        BlockInfo::new(Block {
+            header: Header {
+                hash,
+                inner: raw,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStorageDiff {
+        BlockStorageDiff {
+            new_accounts: vec![NewAccount {
+                address: addr,
+                balance: U256::from(balance),
+                nonce,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            }],
+            storage_diffs: vec![AccountStorageDiff {
+                address: addr,
+                diffs: vec![IndexValuePair {
+                    index: slot,
+                    value: U256::from(value),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Archive-mode counterpart of the snapshot rewind invariant test: an
+    /// empty-diff `update_block` must move the committed-head pointer
+    /// without touching the height-versioned state, reads pinned at the
+    /// rewound head must see that height's values (not the newer ones),
+    /// and replaying the skipped diff must converge back to the old head.
+    #[test]
+    fn test_empty_diff_update_block_rewinds_head_pointer_archive() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-rewind-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let latest = |db: &Arc<DataBaseRef>| {
+                StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+
+            let addr = H256::repeat_byte(0xaa);
+            let slot = H256::repeat_byte(0x01);
+
+            let block1 = make_block_info_at(1, H256::repeat_byte(0x11), H256::ZERO);
+            latest(&db)
+                .update_block(block1.clone(), make_diff(addr, slot, 100, 1, 7))
+                .unwrap();
+            let block2 = make_block_info_at(2, H256::repeat_byte(0x22), block1.header.hash);
+            let diff2 = make_diff(addr, slot, 200, 2, 9);
+            latest(&db).update_block(block2.clone(), diff2.clone()).unwrap();
+
+            // Rewind the head pointer to block 1 with an empty diff.
+            latest(&db)
+                .update_block(block1.clone(), BlockStorageDiff::default())
+                .unwrap();
+            let state = latest(&db);
+            let head = state.last_committed_block().unwrap().unwrap();
+            assert_eq!(head.header.number, 1);
+            assert_eq!(head.header.hash, block1.header.hash);
+
+            // A handle pinned at the rewound head sees block-1 values...
+            let account = state.0.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(100));
+            assert_eq!(account.nonce, 1);
+            assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(7));
+
+            // ...while the block-2 versions remain queryable as history.
+            let state_at_2 = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(2)))
+                    .unwrap()
+                    .unwrap(),
+            );
+            let account = state_at_2.0.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(state_at_2.0.read_storage(addr, slot).unwrap(), U256::from(9));
+
+            // Replaying block 2's diff converges back to the old head.
+            latest(&db).update_block(block2.clone(), diff2).unwrap();
+            let state = latest(&db);
+            let head = state.last_committed_block().unwrap().unwrap();
+            assert_eq!(head.header.number, 2);
+            assert_eq!(head.header.hash, block2.header.hash);
+            let account = state.0.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod inverted_encoding_tests {
+    use super::*;
+    use crate::db::{LatestStateDBIterator, StateDBRead, StateDBWrapper};
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+
+    fn block_info(number: u64) -> BlockInfo {
+        let mut raw = RawHeader::default();
+        raw.number = number;
+        BlockInfo::new(Block {
+            header: Header {
+                hash: H256::with_last_byte(number as u8),
+                inner: raw,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn slot_diff(addr: H256, slot: H256, balance: u64, value: u64) -> BlockStorageDiff {
+        BlockStorageDiff {
+            new_accounts: vec![NewAccount {
+                address: addr,
+                balance: U256::from(balance),
+                nonce: 1,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            }],
+            storage_diffs: vec![AccountStorageDiff {
+                address: addr,
+                diffs: vec![IndexValuePair {
+                    index: slot,
+                    value: U256::from(value),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// End-to-end versioned read/write round-trip, parameterized by encoding
+    /// mode. Writing a slot at blocks 5/10/20 and reading at arbitrary heights
+    /// must return the greatest version <= H, absence below the first write,
+    /// and the latest-state iterators must surface the newest version — under
+    /// BOTH the legacy ascending and the inverted descending encodings.
+    fn run_versioned_roundtrip(inverted: bool) {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(inverted);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-enc-{}-{}",
+            inverted,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let addr = H256::repeat_byte(0xab);
+            let slot = H256::repeat_byte(0x01);
+
+            // Contiguous blocks 1..=20; the slot/account change only at 5/10/20.
+            for n in 1..=20u64 {
+                let diff = match n {
+                    5 => slot_diff(addr, slot, 100, 7),
+                    10 => slot_diff(addr, slot, 200, 9),
+                    20 => slot_diff(addr, slot, 300, 11),
+                    _ => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+
+            // Below the first write: slot empty, account absent.
+            assert_eq!(at(4).read_storage(addr, slot).unwrap(), U256::ZERO);
+            assert!(at(4).read_account(addr).unwrap().is_none());
+
+            // greatest version <= H at and between change points.
+            for (h, val, bal) in [
+                (5u64, 7u64, 100u64),
+                (7, 7, 100),
+                (9, 7, 100),
+                (10, 9, 200),
+                (15, 9, 200),
+                (19, 9, 200),
+                (20, 11, 300),
+            ] {
+                assert_eq!(
+                    at(h).read_storage(addr, slot).unwrap(),
+                    U256::from(val),
+                    "storage at height {h} (inverted={inverted})"
+                );
+                assert_eq!(
+                    at(h).read_account(addr).unwrap().unwrap().balance,
+                    U256::from(bal),
+                    "balance at height {h} (inverted={inverted})"
+                );
+            }
+
+            // Latest-state iterators surface the newest version.
+            let storages: Vec<_> = db.storage_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(storages, vec![(addr, slot, U256::from(11))]);
+            let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].0, addr);
+            assert_eq!(accounts[0].1.balance, U256::from(300));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Restore the default so other tests aren't affected.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    #[test]
+    fn test_versioned_read_greatest_leq_height_inverted() {
+        run_versioned_roundtrip(true);
+    }
+
+    #[test]
+    fn test_versioned_read_greatest_leq_height_legacy() {
+        run_versioned_roundtrip(false);
+    }
+
+    /// Legacy DBs built before #104 carry orphaned dual-write "latest" pointers
+    /// at `address(‖slot) ‖ u64::MAX`. When such a pointer is *stale* (the
+    /// account/slot was modified after the node upgraded past #104, so only the
+    /// historical record was rewritten), the latest-state iterators must still
+    /// surface the real newest version — not the frozen sentinel. This is the
+    /// db-migrate lost/wrong-slot bug; the iterators must skip the sentinel.
+    #[test]
+    fn test_iterators_skip_stale_dual_write_sentinel_legacy() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-sentinel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let addr = H256::repeat_byte(0xcd);
+            let slot = H256::repeat_byte(0x02);
+
+            // Real history: account/slot change at blocks 5/10/20; the true
+            // newest state is balance 300 / slot value 11.
+            for n in 1..=20u64 {
+                let diff = match n {
+                    5 => slot_diff(addr, slot, 100, 7),
+                    10 => slot_diff(addr, slot, 200, 9),
+                    20 => slot_diff(addr, slot, 300, 11),
+                    _ => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+
+            // Inject STALE orphaned dual-write sentinels (address(‖slot) ‖
+            // u64::MAX) holding an early state (balance 100 / slot value 7), as
+            // a pre-#104 DB would carry after later single-write updates.
+            let acct_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            let stale_acct =
+                crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                    address: addr,
+                    balance: U256::from(100u64),
+                    nonce: 1,
+                    code_hash: KECCAK256_EMPTY.0.into(),
+                });
+            db.db
+                .put_cf(
+                    acct_cf,
+                    crate::db_impl::archive_encoding::encode_account_key(addr, u64::MAX),
+                    &stale_acct,
+                )
+                .unwrap();
+
+            let stor_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            let stale_val: [u8; 32] = U256::from(7u64).to_be_bytes();
+            db.db
+                .put_cf(
+                    stor_cf,
+                    crate::db_impl::archive_encoding::encode_storage_key(addr, slot, u64::MAX),
+                    stale_val,
+                )
+                .unwrap();
+
+            // Latest-state iterators must surface the REAL newest, not the
+            // stale sentinel (which without the fix sorts last and wins).
+            let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(
+                accounts[0].1.balance,
+                U256::from(300u64),
+                "account_iter must pick real newest balance, not stale u64::MAX sentinel"
+            );
+
+            let storages: Vec<_> = db.storage_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(
+                storages,
+                vec![(addr, slot, U256::from(11u64))],
+                "storage_iter must pick real newest slot, not stale u64::MAX sentinel"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+}
+
+#[cfg(test)]
+mod scan_completeness_tests {
+    use super::*;
+    use crate::db::StateDBWrite;
+
+    fn addr(i: u64) -> H256 {
+        // Spread addresses across the keyspace by varying the high bytes, so
+        // distinct prefixes land in different SST key ranges / files.
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&i.to_be_bytes());
+        H256::from(b)
+    }
+
+    /// Settles empirically that a full-CF scan over the prefix-extractor
+    /// `AddressToStorage` CF (binary-search index, skiplist memtable) returns
+    /// every key in the shipped read mode (`rocksdb_read_options`, i.e. prefix
+    /// seek) — no `total_order_seek` required. Writes N distinct `address||slot`
+    /// prefixes across many overlapping flushed L0 SSTs (and again after a
+    /// compaction), then asserts the full scan is complete in both layouts.
+    /// This is the regression guard for reverting the `total_order_seek` change.
+    #[test]
+    fn test_full_scan_completeness_prefix_mode() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-scan-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let slot = H256::repeat_byte(0x01);
+            let n: u64 = 20_000;
+            let per_batch: u64 = 1_000;
+
+            // Interleave so each flushed L0 SST spans the whole keyspace ->
+            // all L0 files OVERLAP, forcing the merging iterator to combine
+            // every SST during a full scan (the layout most likely to expose
+            // a prefix-mode skip).
+            let batches = n / per_batch;
+            for b in 0..batches {
+                let mut batch = db.prepare_write_batch().unwrap();
+                let mut j = b;
+                while j < n {
+                    db.write_storage(&mut batch, addr(j), slot, 1, U256::from(j + 1))
+                        .unwrap();
+                    j += batches;
+                }
+                db.commit(batch).unwrap();
+                db.flush().unwrap();
+            }
+
+            let cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            let count = |opts: ReadOptions| {
+                db.db
+                    .iterator_cf_opt(cf, opts, IteratorMode::Start)
+                    .count()
+            };
+
+            let prefix_l0 = count(rocksdb_read_options());
+            eprintln!("[scan-test] L0 (multi-SST): expected={n} prefix_mode={prefix_l0}");
+
+            // Compact to push into deeper levels, then re-count.
+            db.compact().unwrap();
+            let prefix_compacted = count(rocksdb_read_options());
+            eprintln!("[scan-test] compacted: expected={n} prefix_mode={prefix_compacted}");
+
+            // The shipped prefix-mode full scan must be complete in both layouts;
+            // this is why total_order_seek is unnecessary.
+            assert_eq!(prefix_l0 as u64, n, "prefix-mode scan missed keys in L0");
+            assert_eq!(
+                prefix_compacted as u64, n,
+                "prefix-mode scan missed keys after compaction"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 }

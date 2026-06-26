@@ -17,17 +17,48 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 
 任何兼容 EVM 的链都有可能获得支持。目前已支持以下链：
 
-| 链 | 仓库 |
-|----|------|
-| ETH | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum) |
-| AVAX | [Chaintable/coreth](https://github.com/Chaintable/coreth) |
-| OP Stack (OP, Base 等) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth) |
-| Gnosis | [Chaintable/erigon](https://github.com/Chaintable/erigon) |
-| Tempo | [Chaintable/tempo](https://github.com/Chaintable/tempo) |
-| Bitlayer | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2) |
-| Oasys | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator) |
-| Kava | [Chaintable/kava](https://github.com/Chaintable/kava) |
-| IoTeX | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x) |
+| 链                                             | 仓库                                                                                               |
+|-----------------------------------------------|--------------------------------------------------------------------------------------------------|
+| ETH, Linea                                    | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)                              |
+| AVAX                                          | [Chaintable/coreth](https://github.com/Chaintable/coreth)                                        |
+| OP Stack op-geth: OP, Base, opBNB, Celo, B2, BOB, DBK, Hemi, Katana, Manta, Mantle, Mode, Orderly, Soneium, Unichain, X Layer, Swell | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                                      |
+| OP Stack op-reth: HSK, Ink, Lisk, Zora, Cyber | [Chaintable/optimism](https://github.com/Chaintable/optimism)                                    |
+| Arb, Gravity, Plume, Hood                     | [Chaintable/nitro](https://github.com/Chaintable/nitro)                                          |
+| Gnosis                                        | [Chaintable/erigon](https://github.com/Chaintable/erigon)                                        |
+| Bitlayer                                      | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)                              |
+| Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
+| Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
+| IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
+| Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
+| Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
+| Tac                                           | [Chaintable/tacchain](https://github.com/Chaintable/tacchain)                                    |
+| Mitosis                                       | [Chaintable/reth-mitosis](https://github.com/Chaintable/reth-mitosis)                            |
+| XDC                                           | [Chaintable/XDPoSChain](https://github.com/Chaintable/XDPoSChain)                                |
+| Citrea                                        | [Chaintable/citrea](https://github.com/Chaintable/citrea)                                        |
+| ZKsync: Lens, Era, Abstract, Sophon           | [Chaintable/zksync-era @ debank](https://github.com/Chaintable/zksync-era/tree/debank)           |
+| Cronos zkEVM (Croze)                          | [Chaintable/zksync-era @ chain/croze](https://github.com/Chaintable/zksync-era/tree/chain/croze) |
+| Fraxtal                                       | [Chaintable/frax-op-reth](https://github.com/Chaintable/frax-op-reth)                            |
+| Ronin                                         | [Chaintable/conduit-op-reth](https://github.com/Chaintable/conduit-op-reth)                      |
+| World Chain                                   | [Chaintable/world-chain](https://github.com/Chaintable/world-chain)                              |
+| Plasma, Botanix                               | [Chaintable/reth-x](https://github.com/Chaintable/reth-x)                                        |
+| BSC                                           | [Chaintable/bsc-x](https://github.com/Chaintable/bsc-x)                                          |
+| Core                                          | [Chaintable/core](https://github.com/Chaintable/core)                                            |
+| Chiliz                                        | [Chaintable/chiliz-chain-v2](https://github.com/Chaintable/chiliz-chain-v2)                      |
+| Morph                                         | [Chaintable/go-ethereum-morph-x](https://github.com/Chaintable/go-ethereum-morph-x)              |
+| Taiko                                         | [Chaintable/taiko-geth](https://github.com/Chaintable/taiko-geth)                                |
+| Metis                                         | [Chaintable/mvm-x](https://github.com/Chaintable/mvm-x)                                          |
+| 0G                                            | [Chaintable/0g-geth](https://github.com/Chaintable/0g-geth)                                      |
+| Immutable zkEVM                               | [Chaintable/immutable-geth](https://github.com/Chaintable/immutable-geth)                        |
+| Kite                                          | [Chaintable/subnet-evm-kite](https://github.com/Chaintable/subnet-evm-kite)                      |
+| Merlin                                        | [Chaintable/cdk-erigon](https://github.com/Chaintable/cdk-erigon)                                |
+| Flare                                         | [Chaintable/go-flare-x](https://github.com/Chaintable/go-flare-x)                                |
+| Moonbeam / Moonriver                          | [Chaintable/moonbeam-x](https://github.com/Chaintable/moonbeam-x)                                |
+| Conflux                                       | [Chaintable/conflux-rust-x](https://github.com/Chaintable/conflux-rust-x)                        |
+| Kaia (Klaytn)                                 | [Chaintable/kaia](https://github.com/Chaintable/kaia)                                            |
+| WEMIX                                         | [Chaintable/go-wemix](https://github.com/Chaintable/go-wemix)                                    |
+| Polygon PoS                                   | [Chaintable/bor](https://github.com/Chaintable/bor)                                              |
+| Sonic                                         | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                          |
 
 ## 支持的 JSON-RPC 方法
 
@@ -112,6 +143,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-type` | rocksdb | 数据库类型：rocksdb/mdbx |
 | `--db-cache` | 2048 | 数据库缓存大小（MB） |
 | `--diff-depth-limit` | 64 | 内存中保留的区块差异深度 |
+| `--catchup-safe-depth` | 0 | S3 catch-up 的 reorg 缓冲深度：靠近 Kafka 链头的这些区块改为沿精确的 parent-hash 链回补，而非按块号索引，避免 reorg 时选错分叉支。0 表示禁用（与旧逻辑完全一致）；应设为大于该链的最大 reorg 深度（如 Moonriver 设 64） |
 | `--archive` | false | 启用归档模式 |
 | `--prometheus-addr` | - | Prometheus 监控地址 |
 | `--kafka-s3-config` | - | Kafka + S3 配置文件路径 |

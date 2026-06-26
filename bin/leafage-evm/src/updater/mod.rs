@@ -29,6 +29,7 @@ pub async fn updater_build<
     max_diff_depth: usize,
     init_task_queue_size: usize,
     sync_mode: SyncMode,
+    catchup_safe_depth: usize,
 ) -> Result<watch::Sender<()>> {
     // `cluster` fetches live statediff through the user-gateway, so it must be
     // configured; catchup still reads from R2.
@@ -87,6 +88,7 @@ pub async fn updater_build<
                 kafka_s3_cfg,
                 max_diff_depth,
                 init_task_queue_size,
+                catchup_safe_depth,
             )
             .await?;
             Ok(updater.start())

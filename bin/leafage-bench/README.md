@@ -4,16 +4,18 @@ Benchmark CLI for comparing `eth_call` performance between **leafage-evm** and *
 
 ## Highlights
 
-Under stress testing with ramped concurrency from 100 to 10,000 concurrent connections, **leafage-evm delivers up to 58% higher throughput and 42% lower tail latency compared to geth**, while maintaining **0% error rate** across all concurrency levels.
+Under stress testing with ramped concurrency from 100 to 10,000 concurrent connections, **leafage-evm delivers up to 68% higher throughput and 47% lower tail latency compared to geth**, while maintaining **0% error rate** across all concurrency levels.
 
 | | leafage-evm | geth | delta%          |
 |---|---|---|-----------------|
-| **Peak QPS** | **12,159** (@ 10k concurrency) | **8,267** (@ 2k concurrency) | **+47%**        |
-| **p50 latency @ 10k** | 109.55 ms | 141.59 ms | **+23% better** |
-| **p99 latency @ 10k** | 143.58 ms | 219.38 ms | **+35% better** |
+| **Peak QPS** | **11,206** (@ 5k concurrency) | **7,776** (@ 10k concurrency) | **+44%**        |
+| **p50 latency @ 10k** | 120.29 ms | 158.59 ms | **+24% better** |
+| **p99 latency @ 10k** | 158.19 ms | 237.47 ms | **+33% better** |
 | **Error rate** | 0.00% | 0.00% | —               |
+| **CPU usage (mean)** | 6.6% | 42.6% | **−85% lower**  |
+| **Memory usage (mean)** | 3.82 GB | 22.03 GB | **−83% lower**  |
 
-leafage-evm scales linearly up to ~12k QPS and remains stable even at 10,000 concurrent connections, while geth plateaus around 8k QPS at 2,000 concurrency and degrades under higher load.
+leafage-evm remains stable under high concurrency and sustains >11k QPS, while geth stays below 8k QPS and shows significantly higher latency under heavy load. Resource consumption is also dramatically lower: leafage-evm uses ~85% less CPU and ~83% less memory than geth under the same workload.
 
 ---
 
@@ -233,15 +235,17 @@ Both geth and leafage-evm ran on **separate** AWS EC2 `i3en.2xlarge` instances w
 
 > **Command**:
 > ```bash
-> cargo run --bin leafage-bench -- run stress \
+> ./target/release/leafage-bench run stress \
 >   --corpus ./bin/leafage-bench/corpus/corpus.json \
->   --target http://<leafage-evm>:8545 \
->   --compare http://<geth>:8545 \
->   --concurrency-levels=100,200,500,1000,2000,5000,10000 \
->   --seed=20 \
->   --rounds=10 \
->   --requests=2000
+>   --target http://<leafage-host>:8555 \
+>   --compare http://<geth-host>:8545 \
+>   --concurrency-levels 100,200,500,1000,2000,5000,10000 \
+>   --rounds 10 \
+>   --requests 2000
 > ```
+>
+> System metrics (CPU / memory / load) were collected in parallel via node_exporter scraping
+> (see [System Resource Usage](#system-resource-usage-same-run-collected-via-node_exporter) below).
 
 Each concurrency level was run for 10 rounds (2,000 requests per round). Values are mean ± stddev.
 
@@ -249,27 +253,27 @@ Each concurrency level was run for 10 rounds (2,000 requests per round). Values 
 
 | Concurrency | Endpoint | QPS (mean ± std) | error% | p50 ms | p95 ms | p99 ms | p999 ms |
 |---|---|---|---|---|---|---|---|
-| 100 | leafage-evm | 1,368 ± 44 | 0.00% | 69.55 ± 1.02 | 85.95 ± 14.01 | 104.70 ± 43.01 | 127.24 ± 45.46 |
-| 100 | geth | 1,393 ± 19 | 0.00% | 68.54 ± 0.97 | 80.00 ± 6.64 | 90.90 ± 25.42 | 120.61 ± 25.59 |
-| 200 | leafage-evm | 2,509 ± 80 | 0.00% | 76.33 ± 3.56 | 89.72 ± 8.66 | 95.49 ± 16.33 | 121.82 ± 17.28 |
-| 200 | geth | 2,528 ± 56 | 0.00% | 74.54 ± 2.37 | 90.81 ± 15.26 | 95.97 ± 17.34 | 117.58 ± 16.99 |
-| 500 | leafage-evm | 5,289 ± 237 | 0.00% | 85.14 ± 6.30 | 102.48 ± 13.39 | 106.55 ± 12.98 | 130.19 ± 10.50 |
-| 500 | geth | 5,335 ± 245 | 0.00% | 81.99 ± 7.63 | 106.22 ± 14.10 | 112.72 ± 13.28 | 121.92 ± 13.25 |
-| 1000 | **leafage-evm** | **8,842 ± 863** | 0.00% | 92.52 ± 6.25 | 113.03 ± 22.24 | 115.29 ± 22.27 | 138.39 ± 17.46 |
-| 1000 | geth | 7,206 ± 1,167 | 0.00% | 101.85 ± 13.83 | 148.03 ± 28.38 | 157.81 ± 32.65 | 189.08 ± 93.43 |
-| 2000 | **leafage-evm** | **11,443 ± 1,331** | 0.00% | 112.12 ± 15.34 | 142.89 ± 18.23 | 146.35 ± 18.12 | 160.59 ± 20.98 |
-| 2000 | geth | 8,267 ± 2,415 | 0.00% | 138.58 ± 25.18 | 194.31 ± 40.33 | 203.15 ± 42.78 | 257.12 ± 119.24 |
-| 5000 | **leafage-evm** | **11,430 ± 813** | 0.00% | 111.34 ± 8.04 | 140.20 ± 10.57 | 142.85 ± 11.15 | 161.34 ± 12.75 |
-| 5000 | geth | 8,190 ± 2,822 | 0.00% | 126.08 ± 3.27 | 181.86 ± 24.48 | 188.03 ± 27.34 | 246.77 ± 123.39 |
-| 10000 | **leafage-evm** | **12,159 ± 825** | 0.00% | 109.55 ± 8.90 | 138.92 ± 9.41 | 143.58 ± 11.32 | 154.66 ± 13.15 |
-| 10000 | geth | 7,705 ± 2,525 | 0.00% | 141.59 ± 24.14 | 207.05 ± 47.42 | 219.38 ± 51.73 | 266.70 ± 111.78 |
+| 100 | leafage-evm | 1,223 ± 23 | 0.00% | 77.20 ± 0.64 | 98.51 ± 19.49 | 116.65 ± 30.00 | 152.00 ± 28.83 |
+| 100 | geth | 1,198 ± 50 | 0.00% | 78.02 ± 1.08 | 101.77 ± 21.11 | 123.38 ± 36.67 | 193.74 ± 148.75 |
+| 200 | leafage-evm | 2,284 ± 68 | 0.00% | 80.87 ± 2.02 | 103.75 ± 13.80 | 110.46 ± 18.81 | 140.10 ± 14.10 |
+| 200 | geth | 2,296 ± 61 | 0.00% | 80.07 ± 0.86 | 100.94 ± 11.24 | 110.77 ± 17.69 | 146.50 ± 13.55 |
+| 500 | leafage-evm | 4,873 ± 231 | 0.00% | 89.50 ± 4.56 | 109.83 ± 23.04 | 116.27 ± 25.28 | 146.02 ± 19.21 |
+| 500 | geth | 4,844 ± 315 | 0.00% | 87.45 ± 3.24 | 121.09 ± 21.29 | 131.10 ± 21.49 | 142.70 ± 19.17 |
+| 1000 | **leafage-evm** | **7,425 ± 659** | 0.00% | 105.22 ± 6.46 | 142.54 ± 28.32 | 147.30 ± 29.22 | 163.99 ± 26.53 |
+| 1000 | geth | 7,267 ± 727 | 0.00% | 106.46 ± 13.35 | 157.43 ± 25.09 | 175.47 ± 28.59 | 192.11 ± 53.50 |
+| 2000 | **leafage-evm** | **10,639 ± 1,151** | 0.00% | 127.48 ± 16.58 | 161.67 ± 19.95 | 163.53 ± 20.06 | 176.97 ± 20.74 |
+| 2000 | geth | 6,321 ± 2,403 | 0.00% | 170.04 ± 40.39 | 236.14 ± 73.87 | 244.12 ± 75.72 | 333.72 ± 126.90 |
+| 5000 | **leafage-evm** | **11,206 ± 795** | 0.00% | 116.05 ± 3.60 | 148.78 ± 9.72 | 155.37 ± 11.23 | 165.68 ± 12.56 |
+| 5000 | geth | 6,778 ± 1,995 | 0.00% | 158.31 ± 18.61 | 216.43 ± 28.07 | 226.02 ± 26.46 | 314.75 ± 120.28 |
+| 10000 | **leafage-evm** | **10,801 ± 627** | 0.00% | 120.29 ± 12.58 | 153.98 ± 13.52 | 158.19 ± 12.43 | 169.11 ± 12.23 |
+| 10000 | geth | 7,776 ± 2,010 | 0.00% | 158.59 ± 28.17 | 229.57 ± 62.93 | 237.47 ± 63.98 | 269.20 ± 98.49 |
 
 #### Peak Sustainable QPS
 
 | | Max QPS | At Concurrency | p50 | p99 | error% |
 |---|---|---|---|---|---|
-|  **leafage-evm** | **12,159** | 10,000 | 109.55 ms | 143.58 ms | 0.00% |
-| geth | 8,267 | 2,000 | 138.58 ms | 203.15 ms | 0.00% |
+|  **leafage-evm** | **11,206** | 5,000 | 116.05 ms | 155.37 ms | 0.00% |
+| geth | 7,776 | 10,000 | 158.59 ms | 237.47 ms | 0.00% |
 
 #### Delta (leafage-evm vs geth)
 
@@ -277,20 +281,43 @@ Each concurrency level was run for 10 rounds (2,000 requests per round). Values 
 
 | Concurrency | QPS delta% | p50 delta% | p95 delta% | p99 delta% | p999 delta% |
 |---|---|---|---|---|---|
-| 100 | −1.78% | −1.46% | −7.43% | −15.18% | −5.49% |
-| 200 | −0.77% | −2.40% | +1.20% | +0.50% | −3.60% |
-| 500 | −0.86% | −3.85% | +3.52% | +5.47% | −6.78% |
-| **1000** | **+22.70%** | **+9.16%** | **+23.65%** | **+26.94%** | **+26.81%** |
-| **2000** | **+38.42%** | **+19.10%** | **+26.46%** | **+27.96%** | **+37.54%** |
-| **5000** | **+39.55%** | **+11.69%** | **+22.91%** | **+24.03%** | **+34.62%** |
-| **10000** | **+57.80%** | **+22.63%** | **+32.91%** | **+34.55%** | **+42.01%** |
+| 100 | +2.13% | +1.05% | +3.21% | +5.45% | +21.54% |
+| 200 | −0.49% | −0.99% | −2.78% | +0.27% | +4.37% |
+| 500 | +0.60% | −2.34% | +9.30% | +11.31% | −2.33% |
+| 1000 | +2.17% | +1.16% | +9.46% | +16.05% | +14.64% |
+| **2000** | **+68.32%** | **+25.03%** | **+31.53%** | **+33.01%** | **+46.97%** |
+| **5000** | **+65.33%** | **+26.69%** | **+31.26%** | **+31.26%** | **+47.36%** |
+| **10000** | **+38.90%** | **+24.15%** | **+32.93%** | **+33.39%** | **+37.18%** |
+
+#### System Resource Usage (same run, collected via node_exporter)
+
+**Collection method**: Both hosts expose [node_exporter](https://github.com/prometheus/node_exporter) metrics. A polling script queried each host's `/metrics` endpoint every 3 seconds throughout the run. Metrics were derived as follows:
+
+| Metric | Derivation |
+|--------|-----------|
+| CPU % | `(ΔΣ non-idle cpu_seconds) / (ΔΣ all cpu_seconds) × 100` between consecutive scrapes |
+| Mem used (GB) | `(node_memory_MemTotal_bytes − node_memory_MemAvailable_bytes) / 2³⁰` |
+| Load avg | `node_load1` / `node_load5` Prometheus gauge, read directly |
+
+Delta formula: `(geth − leafage) / geth × 100`. Positive = leafage-evm uses fewer resources.
+
+Sampling interval: 3 s · samples: leafage = 23 / geth = 23.
+
+| Metric | leafage-evm (mean / max) | geth (mean / max) | delta% |
+|---|---|---|---|
+| CPU % | 6.6 / 19.8 | 42.6 / 75.2 | +84.48% |
+| Mem used (GB) | 3.82 / 4.06 | 22.03 / 24.88 | +82.66% |
+| Mem % | 6.2 / 6.5 | 35.5 / 40.1 | +82.66% |
+| Load avg 1m | 0.07 / 0.17 | 3.15 / 4.60 | +97.63% |
+| Load avg 5m | 0.02 / 0.04 | 2.85 / 3.20 | +99.34% |
+
+`+N%` means leafage-evm uses fewer resources (`(geth - leafage) / geth`).
 
 **Key observations**:
-- At low concurrency (100–500), both implementations perform nearly identically.
-- Starting at **1,000 concurrent connections**, leafage-evm pulls ahead with **+23% higher QPS** and **+27% lower p99 latency**.
-- The gap widens with load: at **10,000 concurrency**, leafage-evm achieves **+58% higher QPS** and **+42% lower p999 latency**.
-- geth's QPS plateaus at ~8,267 (concurrency=2000) and **degrades** under heavier load, while leafage-evm continues to scale up to **12,159 QPS**.
-- leafage-evm's latency variance (stddev) remains tight even at 10k concurrency, indicating more predictable and stable performance.
+- At low concurrency (100–1000), the two implementations are close in throughput, with leafage-evm generally better on tail latency.
+- From **2,000+ concurrency**, leafage-evm shows a clear lead: **+39% ~ +68% QPS**, with substantially lower p95/p99/p999 latency.
+- Peak sustainable throughput in this run is **11,206 QPS** for leafage-evm vs **7,776 QPS** for geth (**+44%**).
+- System resource usage is significantly lower on leafage-evm in this run, especially on **CPU** and memory.
 
 ---
 

@@ -15,7 +15,6 @@ leafage-evm-rpc.workspace = true
 leafage-evm-chains.workspace = true
 anyhow.workspace = true
 jsonrpsee.workspace = true
-revm.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -24,11 +23,13 @@ serde_json.workspace = true
 serde.workspace = true
 tracing-subscriber.workspace = true
 tikv-jemallocator = { workspace = true, features = ["profiling"] }
-tikv-jemalloc-ctl.workspace = true
+# tikv-jemalloc-sys 保留：workspace 上声明的 features (unprefixed_malloc_on_supported_platforms,
+# profiling, stats) 只有通过 .workspace = true 激活才会生效，缺了 jemalloc 不会真正替换 libc malloc。
 tikv-jemalloc-sys.workspace = true
 jemalloc_pprof = { workspace = true, features = ["symbolize"] }
-hyper.workspace = true
 alloy-rlp.workspace = true
+alloy.workspace = true
+rocksdb = { workspace = true, features = ["jemalloc"] }
 rdkafka.workspace = true
 tokio-tungstenite.workspace = true
 aws-sdk-s3.workspace = true

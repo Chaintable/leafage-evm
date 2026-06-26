@@ -146,9 +146,22 @@ where
             }
         }
 
+        // For 2D-nonce AA (nonceKey > 0) the request/auto-filled nonce — not the
+        // account's protocol nonce — drives TIP-1000 gas: a nonce of 0 adds the
+        // 250k new_account_cost. The shared create_mainnet_txn_env deliberately
+        // reads the DB nonce (so the other chains' simulate/trace RPCs keep
+        // matching on-chain account state and don't spuriously fail the nonce
+        // check); re-apply the AA nonce to the TxEnv here. The protocol nonce
+        // check is bypassed for nonceKey > 0 in pre_execution, so a request nonce
+        // that differs from the account nonce won't trip NonceTooLow/High.
+        let aa_nonce = nonce_key.filter(|nk| !nk.is_zero()).and(request.inner.nonce);
+
         // Build standard TxEnv.
-        let base =
+        let mut base =
             create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
+        if let Some(nonce) = aa_nonce {
+            base.nonce = nonce;
+        }
 
         // Determine if this is an AA transaction (same logic as writer compat.rs:136-144).
         let has_aa_fields = tempo_calls.as_ref().is_some_and(|c| !c.is_empty())
@@ -344,14 +357,17 @@ impl<DB> GasFeeHandler for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {
+
+    type Tx = TempoTxEnv;
+
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         Some(leafage_evm_chains::tempo::VIRTUAL_BALANCE)
     }
 
-    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
+    fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         request: &CallRequest,
-        tx: &Tx,
+        tx: &Self::Tx,
         db: &StateDB,
         block_env: &BlockEnv,
     ) -> RpcResult<u64> {

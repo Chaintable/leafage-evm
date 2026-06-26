@@ -1,9 +1,11 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::state_tree::error::Error;
 use leafage_evm_types::{AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, H256, U256};
-use quick_cache::sync::Cache;
+use moka::ops::compute::Op;
+use moka::sync::Cache;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tracing::info;
 
 /// [`LinkedDiffLayer`] is a single linked list that stores the state of the EVM.
@@ -52,13 +54,12 @@ impl LinkedDiffLayer {
             *next_diff_layer.unwrap_diff_layer().next.write().unwrap() = cache_layer.clone();
         }
         if bottom_num == 0 {
-            bottom_num = HybridStateDB {
-                memory_layer: cache_layer.clone(),
-                statedb,
-            }
-            .block_info_arc()?
-            .header
-            .number;
+            // Metadata-only handle (block_info_arc). `None` disables cache
+            // refills; block_info_arc itself reads old_diff_layer / statedb.
+            bottom_num = HybridStateDB::new(cache_layer.clone(), statedb, None)
+                .block_info_arc()?
+                .header
+                .number;
         }
         Ok(bottom_num)
     }
@@ -114,17 +115,28 @@ impl LinkedDiffLayer {
     }
 }
 
-/// [`CacheDiskLayer`] is the bottom layer of the linked list.
-/// It stores the on-disk db of the EVM
-/// It is also a cache layer, which caches the
-/// (top-diff_tree_depth_limit,top-diff_tree_depth_limit-cache_tree_depth_limit] diff layers.
+/// [`CacheDiskLayer`] is the bottom layer of the linked list. It backs the
+/// on-disk DB and caches recently committed state.
+///
+/// Each entry is tagged with a block height (commit block_num for
+/// write-through, handle snapshot for refill). Both paths go through
+/// `entry().and_compute_with` so the "only overwrite if new tag is
+/// strictly higher" rule holds atomically — no TOCTOU window between
+/// the tag check and the write.
 #[derive(Debug)]
 pub struct CacheDiskLayer {
-    accounts: Cache<H256, Option<AccountInfo>>,
-    storages: Cache<(H256, H256), U256>,
-    contracts: Cache<H256, Bytecode>,
-    block_hashes: Cache<u64, H256>,
+    accounts: Cache<H256, (u64, Option<AccountInfo>)>,
+    storages: Cache<(H256, H256), (u64, U256)>,
+    contracts: Cache<H256, (u64, Bytecode)>,
+    block_hashes: Cache<u64, (u64, H256)>,
     old_diff_layer: Mutex<Option<Arc<LinkedDiffLayer>>>,
+    /// Latest committed block height. Published after write-through so
+    /// handles snapshotting it find the diff's keys already tagged.
+    committed_height: AtomicU64,
+    /// When false the moka caches are never read or written. Backends
+    /// with per-handle snapshot isolation (MDBX) set this to skip the
+    /// shared cache entirely.
+    enabled: bool,
 }
 
 impl CacheDiskLayer {
@@ -132,48 +144,95 @@ impl CacheDiskLayer {
         accounts_cache_size: usize,
         storage_cache_size: usize,
         contract_cache_size: usize,
+        initial_committed_height: u64,
+        enabled: bool,
     ) -> Self {
+        // When disabled, build with capacity 0; the caches are never
+        // consulted but the fields still need valid values.
+        let (a, s, c, b) = if enabled {
+            (accounts_cache_size as u64, storage_cache_size as u64, contract_cache_size as u64, 1_000)
+        } else {
+            (0, 0, 0, 0)
+        };
         Self {
-            accounts: Cache::new(accounts_cache_size),
-            storages: Cache::new(storage_cache_size),
-            contracts: Cache::new(contract_cache_size),
-            block_hashes: Cache::new(1_000),
+            accounts: Cache::builder().max_capacity(a).build(),
+            storages: Cache::builder().max_capacity(s).build(),
+            contracts: Cache::builder().max_capacity(c).build(),
+            block_hashes: Cache::builder().max_capacity(b).build(),
             old_diff_layer: Mutex::new(None),
+            committed_height: AtomicU64::new(initial_committed_height),
+            enabled,
         }
+    }
+
+    /// Refill tag for handles built on top of this layer. `None` when
+    /// the cache is disabled so callers skip refill entirely.
+    #[inline]
+    pub fn cache_view_height(&self) -> Option<u64> {
+        if self.enabled {
+            Some(self.committed_height.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn old_diff_layer_lock(&self) -> MutexGuard<'_, Option<Arc<LinkedDiffLayer>>> {
+        self.old_diff_layer
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
     pub fn commit<DB, E>(&self, diff_layer: Arc<LinkedDiffLayer>, db: &DB) -> Result<(), E>
     where
         DB: EvmStorageWrite<Error = E> + BlockContext<Error = E>,
     {
-        let old_head = self.old_diff_layer.lock().unwrap().clone();
+        let diff = diff_layer.unwrap_diff_layer();
+        let block_num = diff.block_info.header.number;
+        let (block_info, block_diff) = diff.storage_diff();
+        info!(target: "storage",
+            "commit diff layer to db, block number: {}, block hash: {}, account cache size: {}, storage cache size: {}, contract cache size: {}",
+            block_info.header.number, block_info.header.hash,
+            self.accounts.entry_count(), self.storages.entry_count(), self.contracts.entry_count()
+        );
+
+        let old_head = self.old_diff_layer_lock().clone();
         if let Some(old_head) = old_head {
             assert_eq!(
                 old_head.unwrap_diff_layer().block_info.header.hash,
-                diff_layer.unwrap_diff_layer().block_info.header.parent_hash
+                diff.block_info.header.parent_hash
             );
         }
-        *self.old_diff_layer.lock().unwrap() = Some(diff_layer.clone());
-        let diff_layer = diff_layer.unwrap_diff_layer();
-        for (key, _value) in diff_layer.accounts.iter() {
-            self.accounts.remove(key);
+
+        // DB write is expected atomic; on Err nothing below runs.
+        db.update_block(block_info, block_diff)?;
+        *self.old_diff_layer_lock() = Some(diff_layer.clone());
+
+        if self.enabled {
+            // Unconditional write-through. Safe because (a) commits are
+            // serialized so block_num is monotonically increasing, and
+            // (b) any existing tag at this point is < block_num (refills
+            // tag with committed_height which has not yet advanced to
+            // block_num) — so a CAS would always pass.
+            for (key, value) in diff.accounts.iter() {
+                self.accounts.insert(*key, (block_num, value.clone()));
+            }
+            for (key, value) in diff.storage.iter() {
+                self.storages.insert(*key, (block_num, *value));
+            }
+            for (key, value) in diff.contracts.iter() {
+                self.contracts.insert(*key, (block_num, value.clone()));
+            }
+            self.block_hashes
+                .insert(block_num, (block_num, diff.block_info.header.hash));
         }
-        for (key, _value) in diff_layer.storage.iter() {
-            self.storages.remove(key);
-        }
-        for (key, _value) in diff_layer.contracts.iter() {
-            self.contracts.remove(key);
-        }
-        self.block_hashes.insert(
-            diff_layer.block_info.header.number,
-            diff_layer.block_info.header.hash,
-        );
-        let (block_info, block_diff) = diff_layer.storage_diff();
-        info!(target: "storage",
-            "commit diff layer to db, block number: {}, block hash: {}, account cache size: {}, storage cache size: {}, contract cache size: {}",
-            block_info.header.number, block_info.header.hash, self.accounts.len(), self.storages.len(), self.contracts.len()
-        );
-        db.update_block(block_info, block_diff)
+
+        // Publish AFTER write-through: later handles snapshot block_num
+        // and find diff keys already tagged, so their refills skip.
+        self.committed_height
+            .store(block_num, Ordering::Release);
+
+        Ok(())
     }
 }
 
@@ -253,25 +312,49 @@ impl DiffLayer {
 pub struct HybridStateDB<DB> {
     pub memory_layer: Arc<LinkedDiffLayer>,
     pub statedb: DB,
+    /// `Some(h)` enables cache refill on miss, tagging the insert with
+    /// `h` and only overwriting strictly-lower-tagged entries. `None`
+    /// disables refill (metadata-only handles).
+    pub cache_view_height: Option<u64>,
+}
+
+impl<DB> HybridStateDB<DB> {
+    pub fn new(
+        memory_layer: Arc<LinkedDiffLayer>,
+        statedb: DB,
+        cache_view_height: Option<u64>,
+    ) -> Self {
+        Self {
+            memory_layer,
+            statedb,
+            cache_view_height,
+        }
+    }
 }
 
 impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
-        Self::basic_from_layer(&self.memory_layer, address, &self.statedb)
+        Self::basic_from_layer(&self.memory_layer, address, &self.statedb, self.cache_view_height)
     }
 
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error> {
-        Self::storage_from_layer(&self.memory_layer, address, index, &self.statedb)
+        Self::storage_from_layer(
+            &self.memory_layer,
+            address,
+            index,
+            &self.statedb,
+            self.cache_view_height,
+        )
     }
 
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
-        Self::code_from_layer(&self.memory_layer, code_hash, &self.statedb)
+        Self::code_from_layer(&self.memory_layer, code_hash, &self.statedb, self.cache_view_height)
     }
 
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
-        Self::block_hash_from_layer(&self.memory_layer, number, &self.statedb)
+        Self::block_hash_from_layer(&self.memory_layer, number, &self.statedb, self.cache_view_height)
     }
 }
 
@@ -282,6 +365,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
         layer: &Arc<LinkedDiffLayer>,
         address: H256,
         statedb: &DB,
+        cache_view_height: Option<u64>,
     ) -> Result<Option<AccountInfo>, Error<DB::Error>> {
         match layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => match diff.accounts.get(&address) {
@@ -291,14 +375,23 @@ impl<DB: StateDB> HybridStateDB<DB> {
                         .next
                         .read()
                         .expect("Failed to acquire read lock on diff layer");
-                    Self::basic_from_layer(&next, address, statedb)
+                    Self::basic_from_layer(&next, address, statedb, cache_view_height)
                 }
             },
+            LinkedDiffLayer::CacheDiskLayer(cache) if !cache.enabled => {
+                Ok(statedb.basic(address)?)
+            }
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.accounts.get(&address) {
-                Some(value) => Ok(value.clone()),
+                Some((_, value)) => Ok(value),
                 None => {
                     let res = statedb.basic(address)?;
-                    cache.accounts.insert(address, res.clone());
+                    if let Some(h) = cache_view_height {
+                        let new_val = (h, res.clone());
+                        cache.accounts.entry(address).and_compute_with(|maybe| match maybe {
+                            Some(e) if e.value().0 >= h => Op::Nop,
+                            _ => Op::Put(new_val),
+                        });
+                    }
                     Ok(res)
                 }
             },
@@ -313,6 +406,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
         address: H256,
         index: H256,
         statedb: &DB,
+        cache_view_height: Option<u64>,
     ) -> Result<U256, Error<DB::Error>> {
         match layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => match diff.storage.get(&(address, index)) {
@@ -322,14 +416,23 @@ impl<DB: StateDB> HybridStateDB<DB> {
                         .next
                         .read()
                         .expect("Failed to acquire read lock on diff layer");
-                    Self::storage_from_layer(&next, address, index, statedb)
+                    Self::storage_from_layer(&next, address, index, statedb, cache_view_height)
                 }
             },
+            LinkedDiffLayer::CacheDiskLayer(cache) if !cache.enabled => {
+                Ok(statedb.storage(address, index)?)
+            }
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.storages.get(&(address, index)) {
-                Some(value) => Ok(value),
+                Some((_, value)) => Ok(value),
                 None => {
                     let res = statedb.storage(address, index)?;
-                    cache.storages.insert((address, index), res);
+                    if let Some(h) = cache_view_height {
+                        let new_val = (h, res);
+                        cache.storages.entry((address, index)).and_compute_with(|maybe| match maybe {
+                            Some(e) if e.value().0 >= h => Op::Nop,
+                            _ => Op::Put(new_val),
+                        });
+                    }
                     Ok(res)
                 }
             },
@@ -343,6 +446,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
         layer: &Arc<LinkedDiffLayer>,
         code_hash: H256,
         statedb: &DB,
+        cache_view_height: Option<u64>,
     ) -> Result<Bytecode, Error<DB::Error>> {
         match layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => match diff.contracts.get(&code_hash) {
@@ -352,14 +456,23 @@ impl<DB: StateDB> HybridStateDB<DB> {
                         .next
                         .read()
                         .expect("Failed to acquire read lock on diff layer");
-                    Self::code_from_layer(&next, code_hash, statedb)
+                    Self::code_from_layer(&next, code_hash, statedb, cache_view_height)
                 }
             },
+            LinkedDiffLayer::CacheDiskLayer(cache) if !cache.enabled => {
+                Ok(statedb.code_by_hash(code_hash)?)
+            }
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.contracts.get(&code_hash) {
-                Some(value) => Ok(value.clone()),
+                Some((_, value)) => Ok(value),
                 None => {
                     let res = statedb.code_by_hash(code_hash)?;
-                    cache.contracts.insert(code_hash, res.clone());
+                    if let Some(h) = cache_view_height {
+                        let new_val = (h, res.clone());
+                        cache.contracts.entry(code_hash).and_compute_with(|maybe| match maybe {
+                            Some(e) if e.value().0 >= h => Op::Nop,
+                            _ => Op::Put(new_val),
+                        });
+                    }
                     Ok(res)
                 }
             },
@@ -373,6 +486,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
         layer: &Arc<LinkedDiffLayer>,
         number: u64,
         statedb: &DB,
+        cache_view_height: Option<u64>,
     ) -> Result<H256, Error<DB::Error>> {
         match layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => {
@@ -383,14 +497,23 @@ impl<DB: StateDB> HybridStateDB<DB> {
                         .next
                         .read()
                         .expect("Failed to acquire read lock on diff layer");
-                    Self::block_hash_from_layer(&next, number, statedb)
+                    Self::block_hash_from_layer(&next, number, statedb, cache_view_height)
                 }
             }
+            LinkedDiffLayer::CacheDiskLayer(cache) if !cache.enabled => {
+                Ok(statedb.block_hash(number)?)
+            }
             LinkedDiffLayer::CacheDiskLayer(cache) => match cache.block_hashes.get(&number) {
-                Some(value) => Ok(value),
+                Some((_, value)) => Ok(value),
                 None => {
                     let res = statedb.block_hash(number)?;
-                    cache.block_hashes.insert(number, res);
+                    if let Some(h) = cache_view_height {
+                        let new_val = (h, res);
+                        cache.block_hashes.entry(number).and_compute_with(|maybe| match maybe {
+                            Some(e) if e.value().0 >= h => Op::Nop,
+                            _ => Op::Put(new_val),
+                        });
+                    }
                     Ok(res)
                 }
             },
@@ -406,7 +529,7 @@ impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
         match self.memory_layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {
-                let last_diff = cache.old_diff_layer.lock().unwrap().clone();
+                let last_diff = cache.old_diff_layer_lock().clone();
                 if let Some(last_diff) = last_diff {
                     return Ok(last_diff.unwrap_diff_layer().block_info.clone());
                 }
@@ -424,7 +547,7 @@ impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
         match self.memory_layer.as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_diff.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {
-                let last_diff = cache.old_diff_layer.lock().unwrap().clone();
+                let last_diff = cache.old_diff_layer_lock().clone();
                 if let Some(last_diff) = last_diff {
                     return Ok(last_diff.unwrap_diff_layer().block_diff.clone());
                 }

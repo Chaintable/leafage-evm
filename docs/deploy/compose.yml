@@ -30,7 +30,7 @@ services:
   geth:
     networks:
       - eth
-    image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain-gethx:amd64-v1.16.7-debank-4
+    image: public.ecr.aws/b2h7a5c4/chaintable/ethereum-writer:v1.17.3-debank-3
     volumes:
       - ${ETH_DATA_DIR:-/eth}:/var/data/
     deploy:
@@ -59,7 +59,7 @@ services:
       - --http.api=net,web3,eth,admin,debug,txpool,engine,trace
 
   leafage-evm-x-eth:
-    image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/leafage-evm-x:amd64-chaintable-v102-debank-7
+    image: public.ecr.aws/b2h7a5c4/chaintable/leafage-evm-x:v1.2.31
     networks:
       - eth
     environment:

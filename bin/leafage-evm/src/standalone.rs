@@ -3,7 +3,10 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config, SyncMode};
+use crate::utils::{
+    parse_kafka_s3_config, EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config, NodeTypeArg,
+    SyncMode,
+};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -14,6 +17,7 @@ use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
+use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use metrics::gauge;
 use std::path::PathBuf;
@@ -34,7 +38,25 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea"], default_value = "mainnet")]
+    #[arg(
+        long,
+        value_parser = [
+            "mainnet",
+            "arbitrum",
+            "op",
+            "base",
+            "bsc",
+            "cosmos",
+            "mantlev2",
+            "tempo",
+            "citrea",
+            "iotex",
+            "moonbeam",
+            "moonriver",
+            "polygon",
+        ],
+        default_value = "mainnet"
+    )]
     evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
@@ -104,6 +126,19 @@ pub struct Command {
     /// This limit is finalized block number - current block number.
     #[arg(long, default_value = "64")]
     diff_depth_limit: usize,
+
+    /// The reorg buffer depth for S3 catch-up.
+    ///
+    /// During S3 catch-up the by-number index can resolve a wrong branch
+    /// around the chain tip while a reorg is in flight, leaving the hand-off
+    /// block disconnected from the Kafka stream. With a non-zero value, the
+    /// last `catchup_safe_depth` blocks below the Kafka head are backfilled by
+    /// following the exact parent-hash chain instead of the by-number index.
+    /// Set it above the chain's maximum reorg depth (e.g. 64 for Moonriver).
+    ///
+    /// Default: 0 (disabled; identical to the legacy by-number-only behavior).
+    #[arg(long, default_value = "0")]
+    catchup_safe_depth: usize,
 
     /// The size of the account cache.
     /// Default: 200000
@@ -277,6 +312,19 @@ pub struct Command {
     #[arg(long, default_value = "false")]
     disable_auto_compactions: bool,
 
+    /// Use ZSTD-with-dict compression at deep levels for the three large
+    /// archive CFs (BlockHashToBlockInfo, AddressToAccount, AddressToStorage).
+    /// Default: false (uniform LZ4 — same as the pre-refactor build).
+    ///
+    /// When enabled, archive disk usage shrinks by ~15-20% over time as
+    /// compaction rewrites deep levels, at the cost of ~2× compaction CPU and
+    /// ~3× cold-read decompression latency on deep-level reads. RocksDB
+    /// records compression type per SST, so existing data remains readable
+    /// regardless of this flag — toggling only affects newly written SSTs.
+    /// Archive-only (RocksDB archive mode).
+    #[arg(long, default_value = "false")]
+    archive_zstd_compression: bool,
+
     /// Iterator timeout in seconds for archive mode.
     /// Default: 0 (disabled)
     /// When > 0, StateDB iterators will be tracked and logged when they exceed this timeout.
@@ -298,6 +346,26 @@ pub struct Command {
     /// will be automatically saved to this file for future warmup use.
     #[arg(long, default_value = "")]
     token_collector_path: String,
+
+    /// The node type to register to etcd.
+    /// Default: auto (derive from --archive)
+    ///
+    /// `auto` registers archive nodes as archive and all others as state.
+    /// `state` / `archive` override that explicitly, regardless of --archive.
+    #[arg(long, value_enum, default_value_t = NodeTypeArg::Auto)]
+    node_type: NodeTypeArg,
+
+    /// Use the inverted (descending) block-height key encoding for archive
+    /// account/storage reads and writes.
+    /// Default: false (legacy ascending encoding)
+    ///
+    /// The descending encoding turns historical reads into forward seeks that
+    /// use the prefix bloom (much faster `eth_call`). It is a different on-disk
+    /// key layout: only enable this against an archive DB built (via
+    /// `archive-init` / re-sync) with the same flag — mixing layouts silently
+    /// returns wrong values. Has no effect in state-node (non-archive) mode.
+    #[arg(long, default_value_t = false)]
+    inverted_block_encoding: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -342,17 +410,6 @@ fn parse_gateway_object_config(arg: &str) -> Result<GatewayObjectConfig> {
     Ok(cfg)
 }
 
-fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
-    let kafka_s3_config: KafkaS3Config;
-    if arg.starts_with("/") {
-        let file = std::fs::File::open(arg)?;
-        kafka_s3_config = serde_json::from_reader(file)?;
-    } else {
-        kafka_s3_config = serde_json::from_str(arg)?;
-    }
-    Ok(kafka_s3_config)
-}
-
 fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
     let etcd_config: EtcdRegisterConfig;
     if arg.starts_with("/") {
@@ -384,6 +441,15 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
+/// Resolve `--spec-id` to a typed EVM spec; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
+fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Result<T> {
+    if spec_id == u8::MAX {
+        return Ok(default);
+    }
+    T::try_from(spec_id)
+        .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
+}
+
 impl Command {
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
@@ -392,8 +458,8 @@ impl Command {
         let gas_cap = self.rpc_gas_cap;
         match evm_type.as_str() {
             "mainnet" => {
-                // Use AMSTERDAM (latest) spec for mainnet
-                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -401,6 +467,31 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "arbitrum" => {
+                // Arbitrum Orbit (Nitro) on ArbOS >= 40 is Prague-level. Its EIP-7623
+                // calldata floor is a runtime feature flag (default off, e.g. Robinhood),
+                // so default to PRAGUE: it matches the chain's Prague EVM and never
+                // *under*-estimates the floor — if a chain enables 7623 PRAGUE is exact,
+                // if it's off the floor only over-estimates rare calldata-heavy txs (the
+                // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
+                // chains. The L1 cost is added separately in estimate_l1_overhead.
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::PRAGUE, "arbitrum")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                let custom_evm_cfg = custom_evm_cfg
+                    .map(|str| {
+                        serde_json::from_str(&str).map_err(|err| {
+                            anyhow!("cannot parse arbitrum custom evm config: {}", err)
+                        })
+                    })
+                    .transpose()?;
+                Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
@@ -411,6 +502,19 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
+            }
+            "base" => {
+                // Base forked from the OP stack; execution is OP-equivalent
+                // (Beryl precompiles are layered on separately).
+                let mut chain_cfg =
+                    CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Base(chain_cfg))
             }
             "bsc" => {
                 let mut chain_cfg = CfgEnv::default();
@@ -438,6 +542,47 @@ impl Command {
                     })
                     .transpose()?;
                 Ok(MultiChainCfgEnv::Cosmos((chain_cfg, custom_evm_cfg)))
+            }
+            "iotex" => {
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "iotex")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Iotex(chain_cfg))
+            }
+            "polygon" => {
+                let spec = resolve_spec(
+                    self.spec_id,
+                    leafage_evm_chains::polygon::PolygonHardfork::default(),
+                    "polygon",
+                )?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Polygon(chain_cfg))
+            }
+            // Moonbeam and Moonriver share an identical EVM and precompile set;
+            // they differ only by chain id (passed via --chain-cfg) and native
+            // token metadata, which leafage does not need. Both map to the same
+            // MoonbeamHardfork executor.
+            "moonbeam" | "moonriver" => {
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, &evm_type)?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Moonbeam(chain_cfg))
             }
             "mantlev2" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
@@ -560,6 +705,7 @@ impl Command {
             self.db_type,
             self.archive,
             self.disable_auto_compactions,
+            self.archive_zstd_compression,
         )?;
 
         // check if db shoud be initialized
@@ -574,6 +720,9 @@ impl Command {
         )
         .await?;
 
+        // MDBX has per-handle ro_txn snapshots; the shared CacheDiskLayer
+        // would blur those boundaries, so disable it for MDBX backends.
+        let enable_cache = matches!(self.db_type, StorageKind::Rocksdb);
         let tree = Arc::new(StateTree::new(
             db,
             StateTreeConfig::new(
@@ -581,6 +730,7 @@ impl Command {
                 self.account_cache_size,
                 self.storage_cache_size,
                 self.code_cache_size,
+                enable_cache,
             ),
         )?);
 
@@ -643,6 +793,7 @@ impl Command {
             self.diff_depth_limit,
             self.init_task_queue_size,
             self.sync_mode,
+            self.catchup_safe_depth,
         )
         .await?;
 
@@ -650,7 +801,7 @@ impl Command {
             chain_cfg.chain_id(),
             self.kafka_s3_config.clone().unwrap_or_default().version,
             etcd_config.clone(),
-            self.archive,
+            self.node_type.resolve(self.archive),
         )
         .await?;
 
@@ -661,6 +812,8 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Fix the versioned-key encoding mode before any archive DB access.
+        leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         let (updater_handle, rpc_handle, resgitry_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {

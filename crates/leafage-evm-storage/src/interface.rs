@@ -83,17 +83,23 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     type Error = T::Error;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let account = self.db.basic(keccak256(address.as_slice()))?;
-        if account.is_none() {
-            return Ok(None);
-        }
-        let mut account = account.unwrap();
         if let Some(ovm_address) = self.ovm_address {
             let balance = self
                 .db
                 .storage(ovm_address, keccak256(get_ovm_balance_key(address)))?;
-            account.balance = balance;
+
+            if let Some(mut account) = account {
+                account.balance = balance;
+                return Ok(Some(account));
+            }
+
+            if balance != U256::ZERO {
+                let mut account = AccountInfo::default();
+                account.balance = balance;
+                return Ok(Some(account));
+            }
         }
-        Ok(Some(account))
+        Ok(account)
     }
     fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         self.db.code_by_hash(code_hash.0.into())

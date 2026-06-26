@@ -35,7 +35,7 @@ Beacon chain client for consensus layer:
 
 Modified Geth client for execution layer:
 
-- **Image**: `294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain-gethx:amd64-v1.16.7-debank-4`
+- **Image**: `public.ecr.aws/b2h7a5c4/chaintable/ethereum-writer:v1.17.3-debank-3`
 - **Resources**: 4 CPU / 24GB memory
 - **Port Mapping**: 8666 → 8545 (HTTP RPC)
 - **Sync Mode**: full sync + archive mode
@@ -45,7 +45,7 @@ Modified Geth client for execution layer:
 
 Lightweight EVM executor for state queries:
 
-- **Image**: `294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/leafage-evm-x:amd64-chaintable-v102-debank-7`
+- **Image**: `public.ecr.aws/b2h7a5c4/chaintable/leafage-evm-x:v1.2.31`
 - **Typical Resources**: 4 CPU / 16GB memory
 - **Port Mapping**: 8659 → 8659
 - **Features**:

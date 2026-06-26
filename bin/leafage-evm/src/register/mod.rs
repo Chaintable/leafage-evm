@@ -32,7 +32,7 @@ impl Register {
         chain_id: u64,
         version: String,
         etcd_cfg: EtcdRegisterConfig,
-        is_archive: bool,
+        node_type: NodeType,
     ) -> Result<Self> {
         let etcd_client = etcd_client::Client::connect(&etcd_cfg.endpoints, None).await?;
         let meta = etcd_cfg.meta.clone();
@@ -54,11 +54,7 @@ impl Register {
             state_type: StateType::Delay as u64,
             address: ip.to_string(),
             port,
-            node_type: if is_archive {
-                NodeType::Archive
-            } else {
-                NodeType::State
-            } as u64,
+            node_type: node_type as u64,
         })?;
 
         Ok(Self {
@@ -115,10 +111,10 @@ pub async fn register_build(
     chain_id: u64,
     version: String,
     etcd_cfg: Option<EtcdRegisterConfig>,
-    is_archive: bool,
+    node_type: NodeType,
 ) -> Result<watch::Sender<()>> {
     if let Some(etcd_cfg) = etcd_cfg {
-        let register = Register::new(chain_id, version, etcd_cfg, is_archive).await?;
+        let register = Register::new(chain_id, version, etcd_cfg, node_type).await?;
         let register_handle = register.start().await?;
         Ok(register_handle)
     } else {

@@ -2,10 +2,15 @@ use crate::api_impl::token_collector::TokenCollector;
 use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
+use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
+use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
+use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
+use leafage_evm_chains::moonbeam::MoonbeamHardfork;
+use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
@@ -27,7 +32,10 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub custom_cfg: Option<CustomCfg>,
 }
 
-pub(crate) trait ApiCore: ApiBase + EvmExecutor + GasFeeHandler {}
+pub(crate) trait ApiCore:
+    ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
+{
+}
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
@@ -46,14 +54,15 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 }
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
+    type Tx: TxSetter + TransactionTrait + Clone;
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         None
     }
 
-    fn gas_allowance<Tx: TransactionTrait, StateDB: DatabaseRef>(
+    fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,
-        tx: &Tx,
+        tx: &Self::Tx,
         db: &StateDB,
         _block_env: &BlockEnv,
     ) -> RpcResult<u64> {
@@ -78,6 +87,20 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
             .unwrap_or_default()
             .try_into()
             .unwrap())
+    }
+
+    fn estimate_l1_overhead<StateDB: DatabaseRef>(
+        &self,
+        _block: &BlockInfo,
+        _block_env: &BlockEnv,
+        _tx: Self::Tx,
+        _state: &StateDB,
+    ) -> u64
+    where
+        StateDB::Error: Sync + Send + 'static,
+        StateDB: Debug,
+    {
+        0
     }
 }
 
@@ -137,20 +160,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
-
-    fn estimate_l1_overhead<StateDB>(
-        &self,
-        _block: &BlockInfo,
-        _block_env: &BlockEnv,
-        _state: StateDB,
-        _tx: Self::Tx,
-    ) -> u64
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        0
-    }
 }
 
 pub(crate) trait TxSetter {
@@ -184,10 +193,15 @@ impl<C> Clone for Api<C> {
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    Arbitrum((CfgEnv<MainnetSpecId>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
+    Base(CfgEnv<BaseHardfork>),
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
+    Iotex(CfgEnv<IotexHardfork>),
     Mantle(CfgEnv<MantleHardfork>),
+    Moonbeam(CfgEnv<MoonbeamHardfork>),
+    Polygon(CfgEnv<PolygonHardfork>),
     Tempo(CfgEnv<TempoHardfork>),
     Citrea(CfgEnv<CitreaHardfork>),
 }
@@ -196,10 +210,15 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Base(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
+            MultiChainCfgEnv::Iotex(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Moonbeam(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Polygon(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }

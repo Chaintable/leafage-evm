@@ -1,13 +1,17 @@
 use crate::utils::{
-    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number, KafkaS3Config,
+    s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
+    s3_get_block_info_and_diff_by_number, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use leafage_evm_storage::{read_offset, write_offset, EvmStorageRead, EvmStorageWrite};
+use leafage_evm_storage::{
+    read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
+};
 use leafage_evm_types::{
-    BlockInfo, BlockStorageDiff, KafkaBlockChangeNotification, KafkaBlockContext, H256,
+    BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, KafkaBlockChangeNotification,
+    KafkaBlockContext, H256,
 };
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
@@ -39,6 +43,10 @@ pub struct Updater<Tree> {
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
     read_from_kafka: bool,
     init_task_queue_size: usize,
+    /// Reorg buffer depth for S3 catch-up: the number of blocks below the
+    /// Kafka head that are backfilled by following the exact parent-hash chain
+    /// instead of the by-number index. 0 disables it (legacy behavior).
+    catchup_safe_depth: usize,
 }
 
 impl<Tree> Updater<Tree>
@@ -55,6 +63,7 @@ where
         kafka_s3_cfg: KafkaS3Config,
         max_diff_depth: usize,
         init_task_queue_size: usize,
+        catchup_safe_depth: usize,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -85,6 +94,7 @@ where
             hash_to_blockctx: Mutex::new(HashMap::default()),
             read_from_kafka: true,
             init_task_queue_size,
+            catchup_safe_depth,
         })
     }
 
@@ -291,16 +301,99 @@ where
             .first()
             .ok_or_else(|| anyhow::anyhow!("No new blocks in the message"))?
             .clone();
-        let target_block_number = target_block.block_number - 1;
-        let mut start_block_number = self.tree.last_committed_block()?.unwrap().header.number + 1;
+        let last_committed_number = self.tree.last_committed_block()?.unwrap().header.number;
+        let tip_block_number = target_block.block_number.saturating_sub(1);
+
+        // The by-number S3 index can resolve the wrong branch around the chain
+        // tip during a reorg, which leaves the hand-off block disconnected from
+        // the Kafka stream. So only trust by-number for the stable segment and
+        // leave a `catchup_safe_depth` buffer below the Kafka head; that buffer
+        // must exceed the chain's maximum reorg depth so the by-number hand-off
+        // block is always canonical. The buffered tip is then backfilled along
+        // the exact parent-hash links from Kafka (phase 2 below). A depth of 0
+        // disables the buffer entirely, falling back to the legacy
+        // by-number-only catch-up.
+        let depth = self.catchup_safe_depth as u64;
+        // Backfill the `depth` blocks immediately below the Kafka head (the tip
+        // and the `depth - 1` blocks beneath it), so the by-number hand-off
+        // block sits `depth` blocks below the tip — outside a reorg of depth
+        // `<= depth`. Basing this on `tip` (not the Kafka head) keeps the flag
+        // honest: `depth = 1` protects exactly the tip, `depth = 0` protects
+        // nothing (legacy by-number-only catch-up).
+        let by_number_target = tip_block_number
+            .saturating_sub(depth)
+            .max(last_committed_number)
+            .min(tip_block_number);
+
+        // Phase 1: by-number catch-up over the stable segment.
         let batch_size = self.init_task_queue_size as u64;
-        info!(target:"updater", "[catchup][s3] update from s3, start block number {}, target block number {}", start_block_number, target_block_number);
-        while start_block_number <= target_block_number {
+        let mut start_block_number = last_committed_number + 1;
+        info!(target:"updater", "[catchup][s3] update from s3 by number, start block number {}, target block number {}", start_block_number, by_number_target);
+        while start_block_number <= by_number_target {
             let end_block_number =
-                std::cmp::min(start_block_number + batch_size - 1, target_block_number);
+                std::cmp::min(start_block_number + batch_size - 1, by_number_target);
             self.update_range_from_s3(start_block_number, end_block_number)
                 .await?;
             start_block_number += batch_size;
+        }
+
+        // Phase 2: backfill (by_number_target, tip] by walking the parent-hash
+        // chain from the Kafka head, reading each block strictly by hash so a
+        // tip reorg cannot swap in a sibling from the wrong branch.
+        let mut backfill = Vec::new();
+        if tip_block_number > by_number_target {
+            let mut parent_hash = target_block.parent_hash;
+            // A healthy parent-hash chain decrements the block number by one per
+            // hop, so it reaches `by_number_target` within exactly this many
+            // blocks. The bound guards against an unbounded walk (and S3 request
+            // storm) should the chain data be corrupt or non-decreasing.
+            let max_hops = tip_block_number - by_number_target;
+            loop {
+                let (block_info, block_diff) = s3_get_block_info_and_diff_by_hash(
+                    &self.s3_client,
+                    &self.kafka_s3_cfg.bucket_name,
+                    &self.kafka_s3_cfg.s3_chain_id,
+                    &self.kafka_s3_cfg.version,
+                    parent_hash,
+                )
+                .await?;
+                if block_info.header.number <= by_number_target {
+                    break;
+                }
+                parent_hash = block_info.header.parent_hash;
+                backfill.push((block_info, block_diff));
+                if backfill.len() as u64 >= max_hops {
+                    break;
+                }
+            }
+        }
+        // A reorg deeper than the buffer would leave the by-number hand-off
+        // block on a stale branch: the oldest backfilled block then links to a
+        // parent that isn't in the tree, and update_block would fail with an
+        // opaque ParentBlockHashNotFound. Detect it here and report the real
+        // cause (and the fix) instead. The chain anchor is the oldest block's
+        // parent_hash, so no extra S3 read is needed.
+        if let Some((oldest, _)) = backfill.last() {
+            let tree_anchor_hash = self
+                .tree
+                .state_at(BlockId::Number(BlockNumberOrTag::Number(by_number_target)))?
+                .map(|s| s.block_info())
+                .transpose()?
+                .map(|b| b.header.hash);
+            if tree_anchor_hash != Some(oldest.header.parent_hash) {
+                return Err(anyhow::anyhow!(
+                    "S3 catch-up hand-off mismatch at block {}: by-number anchor {:?} != Kafka chain parent {}; \
+                     reorg is deeper than --catchup-safe-depth ({}), increase it",
+                    by_number_target,
+                    tree_anchor_hash,
+                    oldest.header.parent_hash,
+                    depth
+                ));
+            }
+        }
+        for (block_info, block_diff) in backfill.into_iter().rev() {
+            info!(target:"updater", "update from s3 by hash, block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+            self.tree.update_block(block_info, block_diff)?;
         }
         Ok(())
     }
