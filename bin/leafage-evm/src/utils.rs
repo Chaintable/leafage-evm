@@ -41,8 +41,12 @@ pub struct GatewayObjectConfig {
     pub chain_id: String,
     #[serde(default)]
     pub version: String,
+    /// Base URL of the user-gateway used for real-time (live) statediff in
+    /// `cluster` sync mode: live block info + state diff are fetched from
+    /// `{user_gateway_url}/v1/object`. Empty falls back to `base_url`.
+    /// Catchup always reads directly from R2 regardless of this field.
     #[serde(default)]
-    pub ws_protocol: String,
+    pub user_gateway_url: String,
     #[serde(default)]
     pub api_key: String,
     #[serde(default)]
@@ -67,6 +71,20 @@ pub struct GatewayObjectConfig {
     pub snapshot_is_archive: bool,
 }
 
+/// Node sync / startup mode. Selected with `--sync-mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SyncMode {
+    /// kafka + s3 internal mode (requires `--kafka-s3-config`).
+    #[default]
+    Internal,
+    /// Single node: pull statediff directly from R2 for both catchup and live
+    /// (requires `--gateway-object-config`).
+    Standalone,
+    /// Cluster: catchup from R2, real-time sync via the user-gateway
+    /// (requires `--gateway-object-config` with `user_gateway_url`).
+    Cluster,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CanonicalIndex {
     pub chain_id: String,
@@ -79,7 +97,7 @@ pub struct CanonicalIndex {
 }
 
 fn default_prefetch_window() -> usize {
-    8
+    256
 }
 
 pub async fn s3_get_canonical_index_by_number(

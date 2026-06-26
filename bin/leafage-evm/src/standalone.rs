@@ -1,10 +1,9 @@
 use crate::initializer::initialize_check;
 use crate::pprof::PProf;
 use crate::register::register_build;
-use crate::rpc_proxy_register::rpc_proxy_register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config};
+use crate::utils::{EtcdRegisterConfig, GatewayObjectConfig, KafkaS3Config, SyncMode};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -167,6 +166,16 @@ pub struct Command {
     #[arg(long, value_parser = parse_gateway_object_config, value_name = "GATEWAY_OBJECT_CONFIG_PATH")]
     gateway_object_config: Option<GatewayObjectConfig>,
 
+    /// Node sync / startup mode.
+    /// Default: internal
+    ///
+    /// - internal:   kafka + s3 (requires --kafka-s3-config)
+    /// - standalone: single node, statediff direct from R2 (requires --gateway-object-config)
+    /// - cluster:    catchup from R2, live statediff via user-gateway
+    ///               (requires --gateway-object-config with user_gateway_url)
+    #[arg(long, value_enum, default_value_t = SyncMode::Internal)]
+    sync_mode: SyncMode,
+
     /// The etcd register config path
     /// Default: None
     ///
@@ -289,17 +298,6 @@ pub struct Command {
     /// will be automatically saved to this file for future warmup use.
     #[arg(long, default_value = "")]
     token_collector_path: String,
-
-    /// Admin URL of rpc-proxy for self-registration.
-    /// Default: "" (disabled)
-    ///
-    /// When set, after the node is ready, it will register itself to rpc-proxy via
-    /// POST {rpc_proxy_admin_url}/chains/{chain_id}/upstreams with retries every 60s.
-    /// On shutdown, it sends DELETE to deregister.
-    ///
-    /// Example: --rpc-proxy-admin-url=http://localhost:9104
-    #[arg(long, default_value = "")]
-    rpc_proxy_admin_url: String,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -481,7 +479,6 @@ impl Command {
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
-        Option<tokio::sync::watch::Sender<()>>,
     )> {
         info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
@@ -645,6 +642,7 @@ impl Command {
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,
+            self.sync_mode,
         )
         .await?;
 
@@ -659,29 +657,19 @@ impl Command {
         ready.store(true, std::sync::atomic::Ordering::SeqCst);
         info!(target:"updater", "leafage server started");
 
-        let rpc_proxy_handle = rpc_proxy_register_build(
-            self.rpc_proxy_admin_url.clone(),
-            format!("{}", chain_cfg.chain_id()),
-            self.meta.clone(),
-        )
-        .await;
-
-        Ok((updater_handle, rpc_handle, registry_handle, rpc_proxy_handle))
+        Ok((updater_handle, rpc_handle, registry_handle))
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, resgitry_handle, rpc_proxy_handle) =
+        let (updater_handle, rpc_handle, resgitry_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
-            if let Some(h) = rpc_proxy_handle {
-                let _ = h.send(());
-            }
-            // wait for lease to unregist
+            // give the etcd unregister (key delete) time to complete before exit
             info!(
-                "waiting for etcd lease to expire in {} seconds...",
+                "waiting for etcd unregister in {} seconds...",
                 self.stop_wait_timeout
             );
             time::sleep(std::time::Duration::from_secs(

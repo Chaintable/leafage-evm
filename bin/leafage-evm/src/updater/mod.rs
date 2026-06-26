@@ -7,7 +7,7 @@ pub use kafka_updater::Updater as KafkaUpdater;
 mod ws_updater;
 pub use ws_updater::Updater as WsUpdater;
 
-use crate::utils::{GatewayObjectConfig, KafkaS3Config};
+use crate::utils::{GatewayObjectConfig, KafkaS3Config, SyncMode};
 use anyhow::Result;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use std::time::Duration;
@@ -28,7 +28,20 @@ pub async fn updater_build<
     update_interval: Duration,
     max_diff_depth: usize,
     init_task_queue_size: usize,
+    sync_mode: SyncMode,
 ) -> Result<watch::Sender<()>> {
+    // `cluster` fetches live statediff through the user-gateway, so it must be
+    // configured; catchup still reads from R2.
+    if sync_mode == SyncMode::Cluster {
+        match &gateway_object_cfg {
+            Some(cfg) if !cfg.user_gateway_url.is_empty() => {}
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "sync-mode=cluster requires --gateway-object-config with a non-empty user_gateway_url"
+                ))
+            }
+        }
+    }
     // ws_url replaces kafka as the block-notification source; it still needs
     // KafkaS3Config for S3 (block_info / block_diff) access. When ws_url is
     // set without a KafkaS3Config it is silently ignored and the old
@@ -43,6 +56,7 @@ pub async fn updater_build<
                 None,
                 max_diff_depth,
                 init_task_queue_size,
+                sync_mode,
             )
             .await?;
             Ok(updater.start())
@@ -56,6 +70,7 @@ pub async fn updater_build<
                 Some(gateway_object_cfg),
                 max_diff_depth,
                 init_task_queue_size,
+                sync_mode,
             )
             .await?;
             Ok(updater.start())

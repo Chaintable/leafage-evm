@@ -360,8 +360,9 @@ impl Initializer {
         let mut last_err: Option<anyhow::Error> = None;
         let mut delay_ms = OUTER_RETRY_INITIAL_DELAY_MS;
         for attempt in 1..=self.outer_retry_attempts {
-            // Per-attempt counter: only merged into global on success, so retries
-            // never inflate the progress percentage above 100%.
+            // Per-attempt counter feeds the global progress live (so the percentage
+            // moves while an archive downloads), but is rolled back on failure so a
+            // retry re-counts from zero and never inflates progress above 100%.
             let attempt_bytes = Arc::new(AtomicU64::new(0));
             match self
                 .try_extract_one_archive(
@@ -370,6 +371,7 @@ impl Initializer {
                     compressed,
                     entry.size_bytes,
                     Arc::clone(&attempt_bytes),
+                    Arc::clone(&progress.downloaded_bytes),
                 )
                 .await
             {
@@ -379,16 +381,21 @@ impl Initializer {
                         "archive done index={} name={} attempt={}",
                         idx, entry.name, attempt,
                     );
-                    progress.downloaded_bytes.fetch_add(
-                        attempt_bytes.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
+                    // Bytes already added to the global counter live; just mark done.
                     progress
                         .completed_archives
                         .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(err) => {
+                    // Roll back this attempt's live contribution before retrying, so
+                    // the next attempt's re-download does not double-count.
+                    let added = attempt_bytes.load(Ordering::Relaxed);
+                    if added > 0 {
+                        progress
+                            .downloaded_bytes
+                            .fetch_sub(added, Ordering::Relaxed);
+                    }
                     warn!(
                         target: "snapshot_init",
                         "archive {} attempt {}/{} failed: {:#}",
@@ -412,14 +419,16 @@ impl Initializer {
 
     /// 单次尝试:完整跑一遍流式管道(GET → StreamReader → SyncIoBridge → tar::Archive::unpack)。
     /// 中途任何错(GET 失败 / 非 2xx / tar 解析 / 写盘)直接抛出,由外层 wrapper 决定是否重试。
-    /// bytes_counter 是本次 attempt 的独立计数器,由调用方决定是否合并进全局进度。
+    /// attempt_counter 记录本次 attempt 已下载字节(用于失败回滚);global_counter 是全局进度计数器,
+    /// 边读边累加以驱动实时进度。两者同步累加,失败时由调用方从全局回滚 attempt_counter 的量。
     async fn try_extract_one_archive(
         &self,
         key: &str,
         archive_url: Option<&str>,
         compressed: bool,
         archive_size_bytes: i64,
-        bytes_counter: Arc<AtomicU64>,
+        attempt_counter: Arc<AtomicU64>,
+        global_counter: Arc<AtomicU64>,
     ) -> Result<()> {
         let url = archive_url
             .map(str::to_string)
@@ -446,7 +455,8 @@ impl Initializer {
         // SyncIoBridge 需要在 tokio runtime context 内构造(捕获 Handle),再 move 进 spawn_blocking。
         let sync_read = SyncIoBridge::new(CountedAsyncRead::new(
             async_read,
-            bytes_counter,
+            attempt_counter,
+            global_counter,
             total_bytes,
         ));
         tokio::task::spawn_blocking(move || extract_tar(sync_read, &db_path, compressed))
@@ -560,15 +570,24 @@ fn extract_tar<R: std::io::Read>(reader: R, db_path: &Path, compressed: bool) ->
 
 struct CountedAsyncRead<R> {
     inner: R,
+    /// 本次 attempt 的累计字节,失败时供调用方从全局回滚。
+    attempt_count: Arc<AtomicU64>,
+    /// 全局进度计数器,边读边累加以驱动实时进度。
     global_count: Arc<AtomicU64>,
     total_bytes: u64,
     local_count: u64,
 }
 
 impl<R> CountedAsyncRead<R> {
-    fn new(inner: R, global_count: Arc<AtomicU64>, total_bytes: u64) -> Self {
+    fn new(
+        inner: R,
+        attempt_count: Arc<AtomicU64>,
+        global_count: Arc<AtomicU64>,
+        total_bytes: u64,
+    ) -> Self {
         Self {
             inner,
+            attempt_count,
             global_count,
             total_bytes,
             local_count: 0,
@@ -592,6 +611,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedAsyncRead<
                     let accounted = delta.min(remaining);
                     self.local_count = self.local_count.saturating_add(accounted);
                     if accounted > 0 {
+                        self.attempt_count.fetch_add(accounted, Ordering::Relaxed);
                         self.global_count.fetch_add(accounted, Ordering::Relaxed);
                     }
                 }

@@ -1,6 +1,7 @@
 use alloy_rlp::Decodable;
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_number, GatewayObjectConfig, KafkaS3Config,
+    SyncMode,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -212,6 +213,7 @@ pub struct Updater<Tree> {
     init_task_queue_size: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextCache>>,
     read_from_ws: bool,
+    sync_mode: SyncMode,
 }
 
 impl<Tree> Updater<Tree>
@@ -230,6 +232,7 @@ where
         gateway_object_cfg: Option<GatewayObjectConfig>,
         max_diff_depth: usize,
         init_task_queue_size: usize,
+        sync_mode: SyncMode,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -262,6 +265,7 @@ where
             init_task_queue_size,
             hash_to_blockctx: Mutex::new(HashMap::default()),
             read_from_ws: false,
+            sync_mode,
         })
     }
 
@@ -290,19 +294,15 @@ where
         self.gateway_object_cfg
             .as_ref()
             .map(|cfg| cfg.prefetch_window.max(1))
-            .unwrap_or(8)
+            .unwrap_or(256)
     }
 
-    fn ws_protocol(&self) -> &str {
-        self.gateway_object_cfg
-            .as_ref()
-            .map(|cfg| cfg.ws_protocol.as_str())
-            .filter(|protocol| *protocol == "official")
-            .unwrap_or("leafage")
-    }
-
+    /// Whether to use the "official" ws protocol + direct-R2 object fetch for
+    /// live blocks. Only `standalone` (single-node) does so; `cluster` uses the
+    /// leafage protocol and fetches live objects through the user-gateway.
+    /// (`internal`/kafka never reaches the gateway-object dispatch.)
     fn is_official_ws(&self) -> bool {
-        self.ws_protocol() == "official"
+        self.sync_mode == SyncMode::Standalone
     }
 
     fn gateway_object_fetch_mode(cfg: &GatewayObjectConfig) -> &str {
@@ -540,7 +540,13 @@ where
             .gateway_object_cfg
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("gateway object mode disabled"))?;
-        let base = cfg.base_url.trim_end_matches('/');
+        // In cluster mode live objects come from the user-gateway; fall back to
+        // base_url when user_gateway_url is not set.
+        let base = if cfg.user_gateway_url.is_empty() {
+            cfg.base_url.trim_end_matches('/')
+        } else {
+            cfg.user_gateway_url.trim_end_matches('/')
+        };
         let url = format!(
             "{}/v1/object?chain_id={}&ref_id={}&kind={}&block_number={}",
             base,
@@ -645,7 +651,7 @@ where
             for result in batch_results {
                 let (_, block_info, block_diff) = result?;
                 self.tree.update_block(block_info.clone(), block_diff)?;
-                info!(target:"updater", "update block number {}, hash {:?}, parent hash {:?}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                info!(target:"updater", "[catchup][r2] update block number {}, hash {:?}, parent hash {:?}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
             }
             start = end;
         }
@@ -836,12 +842,12 @@ where
                 });
                 for result in batch_results {
                     let (_, block_info, block_diff) = result?;
-                    info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                    info!(target:"updater", "[catchup][r2] update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
                     self.tree.update_block(block_info, block_diff)?;
                 }
                 batch_start = batch_end.saturating_add(1);
             }
-            info!(target:"updater", "update from r2, start block number {}, end block number {}, prefetch window {}", start_block_number, end_block_number, batch_size);
+            info!(target:"updater", "[catchup][r2] update from r2, start block number {}, end block number {}, prefetch window {}", start_block_number, end_block_number, batch_size);
             return Ok(());
         }
 
@@ -878,7 +884,7 @@ where
         for (_, res) in all_results {
             match res {
                 Ok((block_info, block_diff)) => {
-                    info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                    info!(target:"updater", "[catchup][s3] update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
                     self.tree.update_block(block_info.clone(), block_diff)?;
                 }
                 Err(e) => {
@@ -887,7 +893,7 @@ where
                 }
             }
         }
-        info!(target:"updater", "update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
+        info!(target:"updater", "[catchup][s3] update from s3, start block number {}, end block number {}", start_block_number, end_block_number);
         Ok(())
     }
 
@@ -900,7 +906,8 @@ where
         let target_block_number = target_block.block_number.saturating_sub(1);
         let mut start_block_number = self.tree.last_committed_block()?.unwrap().header.number + 1;
         let batch_size = self.init_task_queue_size as u64;
-        info!(target:"updater", "update from source, start block number {}, target block number {}", start_block_number, target_block_number);
+        let catchup_source = if self.gateway_object_cfg.is_some() { "r2" } else { "s3" };
+        info!(target:"updater", "[catchup][{}] update from source, start block number {}, target block number {}", catchup_source, start_block_number, target_block_number);
         while start_block_number <= target_block_number {
             let end_block_number = std::cmp::min(start_block_number + batch_size - 1, target_block_number);
             self.update_range_from_s3(start_block_number, end_block_number).await?;
@@ -924,7 +931,7 @@ where
         let last_committed = self.tree.last_committed_block()?.unwrap().header.number;
         info!(
             target:"updater",
-            "ws parent gap detected, catchup before apply, last_committed={}, incoming_block={}, parent_hash={}",
+            "[catchup] ws parent gap detected, catchup before apply, last_committed={}, incoming_block={}, parent_hash={}",
             last_committed,
             target_block.block_number,
             target_block.parent_hash,
@@ -961,7 +968,7 @@ where
             histogram!("pipeline_leafage_apply_block_duration_seconds").record(apply_started.elapsed().as_secs_f64());
             gauge!("pipeline_leafage_applied_block").set(block_num as f64);
             set_progress("applied_block");
-            info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
+            info!(target:"updater", "[live][ws] update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
         self.prune_cache()
