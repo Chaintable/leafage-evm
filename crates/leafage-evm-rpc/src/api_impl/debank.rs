@@ -471,6 +471,7 @@ where
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
         let tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request,
             &db,
@@ -640,6 +641,7 @@ where
                 .set_steps(true);
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 tx,
                 &memory_db,
@@ -713,6 +715,7 @@ where
             })
             .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request.clone(),
             &memory_db,
@@ -862,7 +865,9 @@ where
         };
 
         tx.set_gas_limit(final_gas);
-        let l1_overhead = self.inner.estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
+        let l1_overhead =
+            self.inner
+                .estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
 
         Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }

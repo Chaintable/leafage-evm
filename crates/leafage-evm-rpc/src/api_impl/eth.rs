@@ -1,7 +1,5 @@
 use crate::api::EthApiServer;
-use crate::api_impl::core::{
-    Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError,
-};
+use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError};
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
@@ -28,6 +26,7 @@ where
     C::DB: EvmStorageRead + BlockIndex,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<C::EvmHaltReason>,
 {
     async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
@@ -115,6 +114,7 @@ where
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
         let tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request,
             &db,
@@ -346,6 +346,7 @@ where
                 }
             }
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 request,
                 state.clone(),
@@ -571,6 +572,7 @@ where
     C::DB: EvmStorageRead + BlockIndex,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<C::EvmHaltReason>,
 {
     async fn call(
         &self,

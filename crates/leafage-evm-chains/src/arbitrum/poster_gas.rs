@@ -29,6 +29,8 @@ const UNITS_PADDING_BIPS: u128 = 10_100;
 /// `GasEstimationL1PricePadding` (`tx_processor.go:33`): ×1.10.
 const PRICE_PADDING_BIPS: u64 = 11_000;
 const ONE_IN_BIPS: u64 = 10_000;
+const LEGACY_TX_TYPE: u8 = 0;
+const ACCESS_LIST_TX_TYPE: u8 = 1;
 
 // Fixed fields for the gas-estimation fake tx (`l1pricing.go:560-566`). The tx is
 // intentionally invalid; only its compressed byte count matters, so these merely
@@ -50,25 +52,37 @@ static RANDOM_S: Lazy<U256> = Lazy::new(|| U256::from_be_bytes::<32>(keccak256("
 /// reproducing it keeps the fake tx the same size as Nitro's before brotli.
 const FAKE_SIG_V: u64 = 126_483;
 
-/// EIP-2718 bytes of Nitro's gas-estimation fake tx: the request's
+/// EIP-2718 bytes of Nitro's fake tx: the request's
 /// to/value/data/access_list, with Nitro's fixed random values for everything else
 /// (gas is always `RandomGas` during estimation). Hand-rolled RLP rather than alloy's
 /// signed encoding, because Nitro's `V` is a 4-byte integer ([`FAKE_SIG_V`]) that
 /// alloy's bool-parity `Signature` can't express — and the byte count feeds brotli, so
 /// it must match Nitro exactly.
-fn fake_tx_bytes(tx: &TxEnv) -> Vec<u8> {
+fn fake_tx_bytes(tx: &TxEnv, force_random_gas: bool) -> Vec<u8> {
     let chain_id: u64 = 0; // Nitro leaves the fake tx's ChainID unset (encodes as 0)
-    let nonce: u64 = if tx.nonce == 0 { *RANDOM_NONCE } else { tx.nonce };
+    let nonce: u64 = if tx.nonce == 0 {
+        *RANDOM_NONCE
+    } else {
+        tx.nonce
+    };
     let tip: u128 = tx
         .gas_priority_fee
         .filter(|v| *v != 0)
+        .or_else(|| {
+            (matches!(tx.tx_type, LEGACY_TX_TYPE | ACCESS_LIST_TX_TYPE) && tx.gas_price != 0)
+                .then_some(tx.gas_price)
+        })
         .unwrap_or(*RANDOM_GAS_TIP_CAP);
     let fee: u128 = if tx.gas_price == 0 {
         *RANDOM_GAS_FEE_CAP
     } else {
         tx.gas_price
     };
-    let gas: u64 = *RANDOM_GAS;
+    let gas: u64 = if force_random_gas || tx.gas_limit == 0 {
+        *RANDOM_GAS
+    } else {
+        tx.gas_limit
+    };
     let r: U256 = *RANDOM_R;
     let s: U256 = *RANDOM_S;
 
@@ -121,37 +135,62 @@ fn brotli_len(input: &[u8], level: u64) -> Option<usize> {
     Some(out.len())
 }
 
-/// Turn a compressed-byte count into posterGas (the L1-cost-as-L2-gas value).
-/// Separated from compression so the arithmetic is deterministic and testable.
-fn poster_gas_from_l1_bytes(l1_bytes: u64, l2_base_fee: u64, pricing: &ArbPricing) -> u64 {
-    let raw_units = TX_DATA_NON_ZERO_GAS.saturating_mul(l1_bytes);
-    let units = (raw_units as u128 + ESTIMATION_PADDING_UNITS as u128) * UNITS_PADDING_BIPS
-        / ONE_IN_BIPS as u128;
-
-    let cost = pricing.price_per_unit.saturating_mul(U256::from(units));
-    let cost = cost.saturating_mul(U256::from(PRICE_PADDING_BIPS)) / U256::from(ONE_IN_BIPS);
-
-    // gas price basis: the block base fee (see docs/todo.md for why not tx price),
-    // reduced to 7/8 to simulate congestion, floored at the L2 minimum base fee.
-    let mut price = U256::from(l2_base_fee).saturating_mul(U256::from(7u64)) / U256::from(8u64);
-    if price < pricing.min_base_fee {
-        price = pricing.min_base_fee;
-    }
-    if price.is_zero() {
-        return 0;
+impl ArbPricing {
+    /// Replicate Nitro's gas-estimation posterGas for `tx`. `l2_base_fee` is the
+    /// block base fee. Returns 0 if the fake tx can't be compressed.
+    pub fn poster_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
+        let l1_bytes = match brotli_len(&fake_tx_bytes(tx, true), self.brotli_level) {
+            Some(n) => n as u64,
+            None => return 0,
+        };
+        self.poster_gas_from_l1_bytes(l1_bytes, l2_base_fee)
     }
 
-    u64::try_from(cost / price).unwrap_or(u64::MAX)
-}
+    /// Compute the current tx L1 fee using the same conservative posterGas
+    /// formula used by gas estimation.
+    pub(crate) fn current_tx_l1_fee(&self, tx: &TxEnv, paid_gas_price: U256) -> U256 {
+        if paid_gas_price.is_zero() {
+            return U256::ZERO;
+        }
 
-/// Replicate Nitro's gas-estimation posterGas for `tx`. `l2_base_fee` is the
-/// block base fee. Returns 0 if the fake tx can't be compressed.
-pub fn compute(tx: &TxEnv, l2_base_fee: u64, pricing: &ArbPricing) -> u64 {
-    let l1_bytes = match brotli_len(&fake_tx_bytes(tx), pricing.brotli_level) {
-        Some(n) => n as u64,
-        None => return 0,
-    };
-    poster_gas_from_l1_bytes(l1_bytes, l2_base_fee, pricing)
+        let l1_bytes = match brotli_len(&fake_tx_bytes(tx, true), self.brotli_level) {
+            Some(n) => n as u64,
+            None => return U256::ZERO,
+        };
+        let cost = self.cost_for_l1_bytes(l1_bytes);
+        let adjusted = paid_gas_price.saturating_mul(U256::from(7u64)) / U256::from(8u64);
+        let price_for_gas = adjusted.max(self.min_base_fee);
+        if price_for_gas.is_zero() {
+            return U256::ZERO;
+        }
+
+        let poster_gas = u64::try_from(cost / price_for_gas).unwrap_or(u64::MAX);
+        paid_gas_price.saturating_mul(U256::from(poster_gas))
+    }
+
+    /// Turn a compressed-byte count into posterGas (the L1-cost-as-L2-gas value).
+    /// Separated from compression so the arithmetic is deterministic and testable.
+    fn poster_gas_from_l1_bytes(&self, l1_bytes: u64, l2_base_fee: u64) -> u64 {
+        // gas price basis: the block base fee (see docs/todo.md for why not tx price),
+        // reduced to 7/8 to simulate congestion, floored at the L2 minimum base fee.
+        let mut price = U256::from(l2_base_fee).saturating_mul(U256::from(7u64)) / U256::from(8u64);
+        if price < self.min_base_fee {
+            price = self.min_base_fee;
+        }
+        if price.is_zero() {
+            return 0;
+        }
+
+        u64::try_from(self.cost_for_l1_bytes(l1_bytes) / price).unwrap_or(u64::MAX)
+    }
+
+    fn cost_for_l1_bytes(&self, l1_bytes: u64) -> U256 {
+        let raw_units = TX_DATA_NON_ZERO_GAS.saturating_mul(l1_bytes);
+        let units = (raw_units as u128 + ESTIMATION_PADDING_UNITS as u128) * UNITS_PADDING_BIPS
+            / ONE_IN_BIPS as u128;
+        let cost = self.price_per_unit.saturating_mul(U256::from(units));
+        cost.saturating_mul(U256::from(PRICE_PADDING_BIPS)) / U256::from(ONE_IN_BIPS)
+    }
 }
 
 #[cfg(test)]
@@ -177,7 +216,7 @@ mod tests {
     ///   gas   = 662_292_943_173 / 1e8 = 6622
     #[test]
     fn arithmetic_matches_nitro_formula() {
-        let gas = poster_gas_from_l1_bytes(100, 100_000_000, &robinhood_pricing());
+        let gas = robinhood_pricing().poster_gas_from_l1_bytes(100, 100_000_000);
         assert_eq!(gas, 6622);
     }
 
@@ -186,14 +225,14 @@ mod tests {
     #[test]
     fn price_is_floored_at_min_base_fee() {
         let p = robinhood_pricing();
-        let floored = poster_gas_from_l1_bytes(100, 100_000_000, &p);
+        let floored = p.poster_gas_from_l1_bytes(100, 100_000_000);
         // base_fee at/below the floor uses min_base_fee: base_fee=0 == base_fee=floor.
-        assert_eq!(poster_gas_from_l1_bytes(100, 0, &p), floored);
-        // 1 gwei base fee: price = max(1e9*7/8, 1e8) = 875_000_000 → smaller gas.
-        let high = poster_gas_from_l1_bytes(100, 1_000_000_000, &p);
+        assert_eq!(p.poster_gas_from_l1_bytes(100, 0), floored);
+        // 1 gwei base fee: price = max(1e9*7/8, 1e8) = 875_000_000 -> smaller gas.
+        let high = p.poster_gas_from_l1_bytes(100, 1_000_000_000);
         assert!(
             high < floored,
-            "higher base fee → smaller posterGas, got {high}"
+            "higher base fee -> smaller posterGas, got {high}"
         );
     }
 
@@ -205,7 +244,7 @@ mod tests {
             min_base_fee: U256::ZERO,
             brotli_level: 1,
         };
-        assert_eq!(poster_gas_from_l1_bytes(100, 0, &p), 0);
+        assert_eq!(p.poster_gas_from_l1_bytes(100, 0), 0);
     }
 
     fn sample_tx(data: Vec<u8>) -> TxEnv {
@@ -219,8 +258,8 @@ mod tests {
     /// calldata — the dominant input to compression.
     #[test]
     fn fake_tx_is_eip1559_and_tracks_calldata() {
-        let small = fake_tx_bytes(&sample_tx(vec![0u8; 4]));
-        let large = fake_tx_bytes(&sample_tx(vec![0u8; 4096]));
+        let small = fake_tx_bytes(&sample_tx(vec![0u8; 4]), true);
+        let large = fake_tx_bytes(&sample_tx(vec![0u8; 4096]), true);
         assert_eq!(small[0], 0x02, "EIP-2718 type byte for EIP-1559");
         assert_eq!(large[0], 0x02);
         assert!(large.len() > small.len());
@@ -233,14 +272,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gas_price_populates_fake_tx_fee_and_tip_caps_for_legacy_and_access_list() {
+        fn encoded_gas_price_count(tx_type: u8) -> usize {
+            let mut tx = sample_tx(vec![0u8; 4]);
+            tx.tx_type = tx_type;
+            tx.gas_price = 123_456;
+            tx.gas_priority_fee = None;
+
+            let bytes = fake_tx_bytes(&tx, true);
+            let encoded_gas_price = [0x83, 0x01, 0xE2, 0x40];
+            bytes
+                .windows(encoded_gas_price.len())
+                .filter(|window| *window == encoded_gas_price)
+                .count()
+        }
+
+        assert!(
+            encoded_gas_price_count(LEGACY_TX_TYPE) >= 2,
+            "legacy gasPrice must populate both GasTipCap and GasFeeCap"
+        );
+        assert!(
+            encoded_gas_price_count(ACCESS_LIST_TX_TYPE) >= 2,
+            "EIP-2930 gasPrice must populate both GasTipCap and GasFeeCap"
+        );
+    }
+
+    #[test]
+    fn eip1559_max_fee_without_priority_fee_keeps_random_fake_tx_tip_cap() {
+        let mut tx = sample_tx(vec![0u8; 4]);
+        tx.tx_type = 2;
+        tx.gas_price = 123_456;
+        tx.gas_priority_fee = None;
+
+        let bytes = fake_tx_bytes(&tx, true);
+        let encoded_gas_price = [0x83, 0x01, 0xE2, 0x40];
+        let count = bytes
+            .windows(encoded_gas_price.len())
+            .filter(|window| *window == encoded_gas_price)
+            .count();
+        assert_eq!(count, 1, "EIP-1559 maxFeePerGas is not GasTipCap");
+    }
+
     /// posterGas is non-zero end-to-end for a realistic call and scales up with
     /// calldata size.
     #[test]
     fn compute_is_nonzero_and_monotonic_in_calldata() {
         let p = robinhood_pricing();
-        let small = compute(&sample_tx(vec![0xabu8; 100]), 100_000_000, &p);
-        let large = compute(&sample_tx(vec![0xabu8; 10_000]), 100_000_000, &p);
+        let small = p.poster_gas(&sample_tx(vec![0xabu8; 100]), 100_000_000);
+        let large = p.poster_gas(&sample_tx(vec![0xabu8; 10_000]), 100_000_000);
         assert!(small > 0);
         assert!(large > small);
+    }
+
+    #[test]
+    fn current_tx_l1_fee_matches_estimation_poster_gas() {
+        let p = robinhood_pricing();
+        let mut tx = sample_tx(vec![0xabu8; 128]);
+        tx.gas_limit = 21_000;
+        let paid_gas_price = U256::from(100_000_000u64);
+
+        assert_eq!(
+            p.current_tx_l1_fee(&tx, paid_gas_price),
+            U256::from(p.poster_gas(&tx, 100_000_000)).saturating_mul(paid_gas_price)
+        );
+    }
+
+    #[test]
+    fn current_tx_l1_fee_saturates_poster_gas_to_u64() {
+        let p = ArbPricing {
+            price_per_unit: U256::MAX,
+            min_base_fee: U256::from(1u64),
+            brotli_level: 1,
+        };
+        let mut tx = sample_tx(vec![0xabu8; 128]);
+        tx.gas_limit = 21_000;
+
+        assert_eq!(
+            p.current_tx_l1_fee(&tx, U256::from(1u64)),
+            U256::from(u64::MAX)
+        );
     }
 }
