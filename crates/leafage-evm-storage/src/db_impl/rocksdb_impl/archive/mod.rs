@@ -686,6 +686,7 @@ fn reencode_versioned_cf(
     let stop = AtomicBool::new(false);
     let start = std::time::Instant::now();
     let name = col.to_str();
+    let label = col.to_display();
 
     let paths = std::thread::scope(|scope| -> Result<Vec<std::path::PathBuf>, Error> {
         // Progress monitor: keyspace position (leading byte), robust to the
@@ -717,8 +718,8 @@ fn reencode_versioned_cf(
                     0.0
                 };
                 info!(target: "migrate",
-                    "reencode {} progress: {:.1}% of keyspace, {} records, elapsed={} eta~{}",
-                    name, frac * 100.0, processed.load(Ordering::Relaxed),
+                    "reencode {} progress: {:.2}% of keyspace, {} records, elapsed={} eta~{}",
+                    label, frac * 100.0, processed.load(Ordering::Relaxed),
                     fmt_hms(elapsed), fmt_hms(eta));
             }
         });
@@ -740,7 +741,12 @@ fn reencode_versioned_cf(
                     if let Some(h) = hi {
                         ro.set_iterate_upper_bound(vec![h]);
                     }
-                    let width = (hi.map(u32::from).unwrap_or(256) - lo as u32).max(1);
+                    // Shard position is taken from the leading 4 key bytes
+                    // (uniform hash) for smooth sub-byte progress; a single byte
+                    // is too coarse (billions of keys share one leading byte).
+                    let lo_w = (lo as u64) << 24;
+                    let hi_w = hi.map(|h| (h as u64) << 24).unwrap_or(1u64 << 32);
+                    let range_w = (hi_w - lo_w).max(1);
                     let mut sink = SstSink::new(
                         sst_opts,
                         tmp_dir.to_path_buf(),
@@ -774,8 +780,9 @@ fn reencode_versioned_cf(
                         if since_report >= 50_000 {
                             processed.fetch_add(since_report, Ordering::Relaxed);
                             since_report = 0;
-                            let pos =
-                                (key[0] as u32).saturating_sub(lo as u32) as f64 / width as f64;
+                            let key_w =
+                                u32::from_be_bytes(key[0..4].try_into().unwrap()) as u64;
+                            let pos = key_w.saturating_sub(lo_w) as f64 / range_w as f64;
                             progress_bps[i]
                                 .store((pos.clamp(0.0, 1.0) * 10_000.0) as u32, Ordering::Relaxed);
                         }
