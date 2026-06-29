@@ -1,4 +1,6 @@
-use crate::{archive_init, archive_scan, compact, db_migrate, rewind, standalone};
+use crate::{
+    archive_init, archive_scan, compact, db_migrate, rewind, snapshot_init, standalone,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::future::Future;
@@ -33,6 +35,9 @@ pub(crate) enum Commands {
     /// Compact database to optimize storage
     #[command(name = "compact")]
     Compact(compact::Command),
+    /// Restore database from an R2 snapshot
+    #[command(name = "snapshot-init")]
+    SnapshotInit(snapshot_init::Command),
     /// Rewind the committed head to an earlier block to resync from S3
     #[command(name = "rewind")]
     Rewind(rewind::Command),
@@ -48,6 +53,7 @@ impl Commands {
             Commands::DBMigrate(mut cmd) => cmd.run().await,
             Commands::ArchiveInit(mut cmd) => cmd.run().await,
             Commands::Compact(mut cmd) => cmd.run().await,
+            Commands::SnapshotInit(mut cmd) => cmd.run().await,
             Commands::Rewind(mut cmd) => cmd.run().await,
             Commands::ArchiveScan(mut cmd) => cmd.run().await,
         }
