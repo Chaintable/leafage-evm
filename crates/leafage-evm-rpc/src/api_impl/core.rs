@@ -1,11 +1,10 @@
 use crate::api_impl::token_collector::TokenCollector;
 use alloy::consensus::BlockHeader;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::http_client::HttpClient;
-use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
+use jsonrpsee::{core::RpcResult, http_client::HttpClient};
+use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
+use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
-use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
@@ -113,6 +112,7 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,
@@ -193,7 +193,7 @@ impl<C> Clone for Api<C> {
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
-    Arbitrum((CfgEnv<MainnetSpecId>, Option<ArbitrumEvmConfig>)),
+    Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
     Base(CfgEnv<BaseHardfork>),
     Bsc(CfgEnv<BscHardfork>),

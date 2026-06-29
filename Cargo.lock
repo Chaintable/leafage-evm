@@ -4734,6 +4734,7 @@ dependencies = [
  "elliptic-curve 0.13.8",
  "k256",
  "leafage-evm-types",
+ "libloading",
  "once_cell",
  "p256 0.13.2",
  "parity-bytes",
@@ -4742,6 +4743,7 @@ dependencies = [
  "scoped-tls",
  "secp256k1 0.30.0",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tendermint",
 ]
