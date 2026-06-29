@@ -1202,7 +1202,28 @@ impl DataBaseRef {
 
         dst.flush().map_err(Error::RocksDB)?;
         info!(target: "migrate",
-            "reencode: done in {}, destination flushed and marked inverted",
+            "reencode: ingest done in {}, destination flushed and marked inverted",
+            fmt_hms(start.elapsed().as_secs_f64()));
+
+        // Release the raw handles (locks + fds) before the heavy compaction.
+        drop(dst);
+        drop(src);
+
+        // Compact, like archive-init does: the ingested SSTs carry only default
+        // table properties (no prefix bloom, non-partitioned index), and a
+        // balanced LSM won't auto-compact — so rewrite them through the archive
+        // CF options to regenerate the prefix bloom + partitioned index the
+        // read path is tuned for. Reuses the memory-bounded range-segmented
+        // `compact()`.
+        info!(target: "migrate", "reencode: compacting destination (regenerates bloom/index)...");
+        let compact_start = std::time::Instant::now();
+        {
+            let db = DataBaseRef::open(dst_path.as_ref(), cache_size, true, false);
+            db.compact()?;
+        }
+        info!(target: "migrate",
+            "reencode: compaction done in {}; total {}",
+            fmt_hms(compact_start.elapsed().as_secs_f64()),
             fmt_hms(start.elapsed().as_secs_f64()));
         Ok(())
     }
