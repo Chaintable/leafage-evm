@@ -21,7 +21,8 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 |-----------------------------------------------|--------------------------------------------------------------------------------------------------|
 | ETH, Linea                                    | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)                              |
 | AVAX                                          | [Chaintable/coreth](https://github.com/Chaintable/coreth)                                        |
-| OP Stack op-geth: OP, Base, opBNB, Celo, B2, BOB, DBK, Hemi, Katana, Manta, Mantle, Mode, Orderly, Soneium, Unichain, X Layer, Swell | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                                      |
+| OP Stack op-geth: OP, opBNB, Celo, B2, BOB, DBK, Hemi, Katana, Manta, Mantle, Mode, Orderly, Soneium, Unichain, X Layer, Swell | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                                      |
+| Base                                          | [Chaintable/base-reth](https://github.com/Chaintable/base-reth)                                  |
 | OP Stack op-reth: HSK, Ink, Lisk, Zora, Cyber | [Chaintable/optimism](https://github.com/Chaintable/optimism)                                    |
 | Arb, Gravity, Plume, Hood                     | [Chaintable/nitro](https://github.com/Chaintable/nitro)                                          |
 | Gnosis                                        | [Chaintable/erigon](https://github.com/Chaintable/erigon)                                        |
