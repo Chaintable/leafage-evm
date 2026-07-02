@@ -312,7 +312,24 @@ fn rocksdb_column_options(
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_pin_top_level_index_and_filter(true);
-    block_opts.set_bloom_filter(10.0, fixed_prefix_size != 0);
+    // Hybrid ribbon filter: same 10-bits/key-equivalent FP rate as the
+    // previous bloom at ~30% less filter memory. Levels below 1 (i.e. L0,
+    // where build speed matters on the flush path) keep plain bloom; deeper
+    // levels — holding nearly all filter bytes — use ribbon, whose higher
+    // build cost lands on background compaction. Old SSTs with bloom filters
+    // remain readable; new filters appear as compaction rewrites files.
+    block_opts.set_hybrid_ribbon_filter(10.0, 1);
+    // Size filters to land on allocator bin boundaries (jemalloc) instead of
+    // wasting the slack — a few percent less filter memory for free.
+    block_opts.set_optimize_filters_for_memory(true);
+    if fixed_prefix_size != 0 {
+        // The versioned CFs (AddressToAccount, AddressToStorage) are only
+        // ever read via prefix Seek — never point Get — so whole-key filter
+        // entries can never be consulted. Keeping only the prefix entries
+        // roughly halves the filter size. CFs without a prefix extractor
+        // (HashToCode etc.) are read via Get and keep whole-key filtering.
+        block_opts.set_whole_key_filtering(false);
+    }
     block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
     block_opts.set_partition_filters(true);
     block_opts.set_metadata_block_size(4096);
