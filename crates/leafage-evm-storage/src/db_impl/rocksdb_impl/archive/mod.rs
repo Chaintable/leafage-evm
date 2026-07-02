@@ -35,9 +35,9 @@ use leafage_evm_types::{
     H256, KECCAK256_EMPTY, U256,
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IngestExternalFileOptions,
-    IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter, WriteBatch, WriteOptions,
-    DB,
+    BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
+    CompactOptions, IngestExternalFileOptions, IteratorMode, Options, ReadOptions, SliceTransform,
+    SstFileWriter, WriteBatch, WriteOptions, DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
@@ -1479,6 +1479,26 @@ impl DataBaseRef {
             StorageTypeColumn::HashToCode,
         ];
 
+        // Force bottommost-level compaction. The archive bulk-load path
+        // (`archive-init` and `db-migrate --reencode-inverted`) writes external
+        // SST files via `SstFileWriter` whose options carry only compression —
+        // NO prefix extractor, NO bloom filter, non-partitioned index (see
+        // `sst_writer_options`). On ingest into a fresh/empty DB, RocksDB places
+        // most of these files directly at the bottommost level. RocksDB's
+        // default manual-compaction policy (`kIfHaveCompactionFilter`) then
+        // SKIPS bottommost files that don't need merging, so those directly
+        // ingested files are NEVER rewritten through the CF's block-based table
+        // factory — they keep their default layout and stay filter-less forever.
+        // For the archive read path this is fatal: the inverted-encoding forward
+        // `Seek` relies on the per-CF prefix bloom to skip SSTs, and a file with
+        // no prefix bloom cannot be skipped, so every account/storage lookup
+        // must position inside these giant files. `kForce` guarantees the
+        // bottommost level is rewritten, regenerating the prefix bloom +
+        // partitioned index the read path is tuned for (and resizing the files
+        // to `target_file_size_base`). This makes the final compact O(DB size)
+        // once, which is the intended one-time cost of a bulk-load finalize.
+        let compact_opts = Self::force_bottommost_compact_options();
+
         for cf_type in column_families {
             let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
             info!(target: "archive_compact", "Compacting column family: {}", cf_type);
@@ -1487,16 +1507,21 @@ impl DataBaseRef {
             // to further reduce memory usage
             match cf_type {
                 StorageTypeColumn::AddressToAccount => {
-                    // Key structure: address (32) || block_num (8) = 40 bytes
-                    self.compact_cf_by_prefix::<40>(cf);
+                    // Key structure: address (32) || block_num (32) = 64 bytes.
+                    // KEY_LEN must equal the full encoded key width so the
+                    // per-range `end` bound (`nibble || 0xFF..`) covers every
+                    // reachable key in the range and leaves no gap between
+                    // consecutive ranges.
+                    self.compact_cf_by_prefix::<64>(cf, &compact_opts);
                 }
                 StorageTypeColumn::AddressToStorage => {
-                    // Key structure: address (32) || index (32) || block_num (8) = 72 bytes
-                    self.compact_cf_by_prefix::<72>(cf);
+                    // Key structure: address (32) || slot (32) || block_num (32) = 96 bytes.
+                    self.compact_cf_by_prefix::<96>(cf, &compact_opts);
                 }
                 _ => {
                     // Small column families can be compacted in one go
-                    self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+                    self.db
+                        .compact_range_cf_opt(cf, None::<&[u8]>, None::<&[u8]>, &compact_opts);
                 }
             }
 
@@ -1506,17 +1531,97 @@ impl DataBaseRef {
         Ok(())
     }
 
+    /// `CompactOptions` used by every manual compaction in this module.
+    ///
+    /// The one setting that matters is `bottommost_level_compaction = kForce`:
+    /// without it, externally-ingested SST files that landed at the bottommost
+    /// level keep their (filter-less, non-partitioned-index) default layout,
+    /// defeating the inverted-encoding read path. See [`Self::compact`] for the
+    /// full rationale.
+    fn force_bottommost_compact_options() -> CompactOptions {
+        let mut opts = CompactOptions::default();
+        opts.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+        opts
+    }
+
     /// Compact a column family in 16 ranges based on first byte's high nibble.
     /// This reduces memory usage by processing smaller chunks at a time.
-    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily) {
+    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily, opts: &CompactOptions) {
         for i in 0u8..16 {
             let start = [i << 4];
             let mut end = [0xFFu8; KEY_LEN];
             end[0] = (i << 4) | 0x0F;
             info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
                 i + 1, i << 4, (i << 4) | 0x0F);
-            self.db.compact_range_cf(cf, Some(&start), Some(&end));
+            self.db
+                .compact_range_cf_opt(cf, Some(&start), Some(&end), opts);
         }
+    }
+
+    /// Post-compaction sanity check for the versioned archive CFs.
+    ///
+    /// rust-rocksdb's `compact_range_cf_opt` (and the underlying C
+    /// `rocksdb_compact_range_cf_opt`) return `()` and DISCARD the
+    /// `CompactRange` `Status`, so a manual compaction that fails midway (disk
+    /// full, paused, I/O error) is invisible to [`Self::compact`] — it still
+    /// returns `Ok(())`. For a repair entry point that is dangerous: a
+    /// half-done compaction would be reported as a successful fix.
+    ///
+    /// We verify the *outcome* instead of trusting the (missing) status. After a
+    /// forced full compaction, every SST in `AddressToAccount` /
+    /// `AddressToStorage` must have been rewritten through the CF's block-based
+    /// table factory — which regenerates the prefix bloom + partitioned index —
+    /// and resized to `target_file_size_base` (128 MiB). An SST far larger than
+    /// that is a raw bulk-load ingest (`SstFileWriter`, `ROLL_BYTES = 512 MiB`,
+    /// no prefix bloom) that was never rewritten, so its presence means the
+    /// compaction did not run to completion. Surface it as an error.
+    ///
+    /// Also logs a per-CF summary (file count / max size / total) so operators
+    /// can see the LSM shape before/after.
+    pub fn verify_archive_compacted(&self) -> Result<(), Error> {
+        // 2x target_file_size_base (128 MiB). RocksDB may slightly exceed the
+        // target for a single oversized key, but nothing legitimate approaches
+        // 256 MiB under target_file_size_multiplier = 1; a ~512 MiB file is an
+        // un-rewritten bulk-load ingest.
+        const OVERSIZED_BYTES: usize = 256 * 1024 * 1024;
+
+        let versioned = [
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+        ];
+        let files = self.db.live_files()?;
+
+        let mut oversized: Vec<&rocksdb::LiveFile> = Vec::new();
+        for cf in versioned {
+            let name = cf.to_str();
+            let cf_files: Vec<_> = files
+                .iter()
+                .filter(|f| f.column_family_name == name)
+                .collect();
+            let count = cf_files.len();
+            let total: usize = cf_files.iter().map(|f| f.size).sum();
+            let max = cf_files.iter().map(|f| f.size).max().unwrap_or(0);
+            info!(
+                target: "archive_compact",
+                "CF {} post-compaction: files={} total={}MiB max_file={}MiB",
+                cf, count, total / (1024 * 1024), max / (1024 * 1024),
+            );
+            oversized.extend(cf_files.into_iter().filter(|f| f.size > OVERSIZED_BYTES));
+        }
+
+        if !oversized.is_empty() {
+            let total: usize = oversized.iter().map(|f| f.size).sum();
+            return Err(Error::UnSupported(format!(
+                "archive compaction incomplete: {} oversized SST file(s) (~{}MiB) remain in the \
+                 versioned CFs — they were never rewritten through the table factory and still \
+                 lack the prefix bloom the read path depends on. The manual compaction likely \
+                 failed silently (RocksDB CompactRange discards its Status). Check the logs and \
+                 free disk, then re-run.",
+                oversized.len(),
+                total / (1024 * 1024),
+            )));
+        }
+        Ok(())
     }
 }
 

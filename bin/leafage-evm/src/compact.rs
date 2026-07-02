@@ -4,7 +4,14 @@ use leafage_evm_storage::ArchiveRocksDBStorage;
 use std::path::PathBuf;
 use tracing::info;
 
-/// `leafage-evm compact` command
+/// `leafage-evm compact` command.
+///
+/// Runs the archive DB's range-segmented `compact()`. As of the bottommost-force
+/// fix this rewrites the bottommost level too, so it also regenerates the prefix
+/// bloom / partitioned index on bulk-loaded SSTs — i.e. it is now functionally a
+/// full rewrite, not a light "optimize" pass. For repairing an existing
+/// production DB, prefer the `force-compact` command, which is the documented
+/// repair entry point (path guard + post-compaction verification).
 #[derive(Debug, Parser)]
 pub struct Command {
     /// The path to the database

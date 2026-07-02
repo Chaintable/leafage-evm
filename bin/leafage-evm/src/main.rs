@@ -3,6 +3,7 @@ mod archive_init;
 mod archive_scan;
 mod compact;
 mod db_migrate;
+mod force_compact;
 mod initializer;
 mod register;
 mod rewind;
