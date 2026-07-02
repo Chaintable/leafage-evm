@@ -1237,6 +1237,11 @@ impl DataBaseRef {
         {
             let db = DataBaseRef::open(dst_path.as_ref(), cache_size, true, false);
             db.compact()?;
+            // RocksDB's manual CompactRange discards its Status, so a silently
+            // failed compaction would leave un-rewritten (filter-less) bulk-load
+            // SSTs while `compact()` still returns Ok. Verify the outcome so the
+            // migration can't report success on a half-compacted DB.
+            db.verify_archive_compacted()?;
         }
         info!(target: "migrate",
             "reencode: compaction done in {}; total {}",
