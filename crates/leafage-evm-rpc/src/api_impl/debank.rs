@@ -733,9 +733,19 @@ where
                     if no_code_callee {
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
-                        if let Ok(exec_res) = self.inner.transact(&block_env, &memory_db, tx) {
+                        if let Ok(exec_res) =
+                            self.inner.transact(&block_env, &memory_db, tx.clone())
+                        {
                             if exec_res.is_success() {
-                                return Ok(U256::from(MIN_TRANSACTION_GAS));
+                                let l1_overhead = self.inner.estimate_l1_overhead(
+                                    &block,
+                                    &block_env,
+                                    tx,
+                                    &memory_db,
+                                );
+                                return Ok(U256::from(
+                                    MIN_TRANSACTION_GAS.saturating_add(l1_overhead),
+                                ));
                             }
                         }
                     }
