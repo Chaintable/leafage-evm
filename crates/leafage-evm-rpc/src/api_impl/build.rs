@@ -71,6 +71,7 @@ where
         if let Some(url) = historical_rpc {
             if let Ok(http_client) = HttpClientBuilder::default()
                 .request_timeout(Duration::from_secs(30))
+                .max_response_size(u32::MAX)
                 .build(&url)
             {
                 self.historical_client = Some(http_client);
