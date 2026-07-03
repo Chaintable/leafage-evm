@@ -58,7 +58,13 @@ const FAKE_SIG_V: u64 = 126_483;
 /// it must match Nitro exactly.
 fn fake_tx_bytes(tx: &TxEnv) -> Vec<u8> {
     let chain_id: u64 = 0; // Nitro leaves the fake tx's ChainID unset (encodes as 0)
-    let nonce: u64 = if tx.nonce == 0 { *RANDOM_NONCE } else { tx.nonce };
+    // Always the random nonce: Nitro's estimation message carries nonce 0 (geth
+    // CallDefaults fills nil with 0, not the state nonce) -> randomNonce, while our
+    // TxEnv.nonce is state-filled by create_txn_env (the request nonce is discarded
+    // in debank_estimate_gas). Using the state nonce here shrinks the fake tx by up
+    // to 8 bytes vs Nitro's and underestimates posterGas for any sender with
+    // nonce > 0.
+    let nonce: u64 = *RANDOM_NONCE;
     let tip: u128 = tx
         .gas_priority_fee
         .filter(|v| *v != 0)
@@ -230,6 +236,20 @@ mod tests {
         assert!(
             small.windows(4).any(|w| w == [0x83, 0x01, 0xEE, 0x13]),
             "fake tx must encode V=126483 as 4 bytes (matches Nitro's randV)"
+        );
+    }
+
+    /// The state-filled TxEnv nonce must not leak into the fake tx: Nitro's
+    /// estimation message always carries nonce 0 (geth CallDefaults) and thus
+    /// always encodes randomNonce. A real (small) nonce would shrink the fake tx
+    /// by up to 8 bytes and underestimate posterGas for senders with nonce > 0.
+    #[test]
+    fn fake_tx_ignores_state_nonce() {
+        let mut with_nonce = sample_tx(vec![0xabu8; 100]);
+        with_nonce.nonce = 7;
+        assert_eq!(
+            fake_tx_bytes(&with_nonce),
+            fake_tx_bytes(&sample_tx(vec![0xabu8; 100])),
         );
     }
 
