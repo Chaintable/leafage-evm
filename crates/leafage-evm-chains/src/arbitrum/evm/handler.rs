@@ -188,7 +188,7 @@ where
                 .current_l2_basefee()
                 .unwrap_or_else(|| ctx.block().basefee());
 
-            if l2_basefee == 0 || tx.is_zero_gas_price_retryable() {
+            if l2_basefee == 0 || tx.is_retryable_redeem() {
                 ArbPosterCharge::default()
             } else {
                 let pricing = ctx.db().read_pricing();
@@ -413,8 +413,9 @@ mod tests {
     use super::*;
     use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
+    use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
     use crate::arbitrum::tx::ArbitrumTxEnv;
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, Bytes, B256};
     use leafage_evm_types::{BlockEnv, CfgEnv};
     use revm::context::{Context, TxEnv};
     use revm::database::{in_memory_db::CacheDB, EmptyDB};
@@ -462,6 +463,50 @@ mod tests {
             .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
             .with_db(db)
             .with_chain(ArbitrumExecutionContext::default())
+    }
+
+    fn db_with_pricing() -> TestDb {
+        let mut db = CacheDB::new(EmptyDB::default());
+        let l1_pricing_key = arbos_state::child_key(&[], arbos_state::L1_PRICING_SUBSPACE);
+        let l2_pricing_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
+        db.insert_account_storage(
+            arbos_state::ARBOS_STATE_ADDRESS,
+            arbos_state::slot_at(&l1_pricing_key, arbos_state::L1_PRICE_PER_UNIT_OFFSET),
+            U256::from(1_000u64),
+        )
+        .expect("write L1 price per unit");
+        db.insert_account_storage(
+            arbos_state::ARBOS_STATE_ADDRESS,
+            arbos_state::slot_at(&l2_pricing_key, arbos_state::L2_MIN_BASE_FEE_WEI_OFFSET),
+            U256::ONE,
+        )
+        .expect("write L2 minimum base fee");
+        db.insert_account_storage(
+            arbos_state::ARBOS_STATE_ADDRESS,
+            arbos_state::slot_at(&[], arbos_state::BROTLI_COMPRESSION_LEVEL_OFFSET),
+            U256::ZERO,
+        )
+        .expect("write brotli compression level");
+        db
+    }
+
+    fn evm_with_tx(tx: ArbitrumTxEnv) -> ArbitrumEvm<TestDb, ()> {
+        let mut execution_context = ArbitrumExecutionContext::default();
+        execution_context.set_current_l2_context(U256::ZERO, 100);
+        let mut evm = ArbitrumEvm::new(
+            BlockEnv {
+                basefee: 100,
+                gas_limit: 1_000_000,
+                ..Default::default()
+            },
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            db_with_pricing(),
+            (),
+            ArbitrumPrecompileEnv::default(),
+            execution_context,
+        );
+        evm.inner.ctx.tx = tx;
+        evm
     }
 
     fn read_l1_pricing_slot(ctx: &mut ArbitrumContext<TestDb>, offset: u64) -> U256 {
@@ -521,6 +566,64 @@ mod tests {
             ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&delayed, 100),
             U256::from(100)
         );
+    }
+
+    #[test]
+    fn retryable_redeem_skips_l1_poster_charge_even_with_nonzero_gas_price() {
+        let handler = ArbitrumHandler::<TestDb, ()>::new();
+        let data = Bytes::from(vec![0xab; 100]);
+        let normal_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                gas_limit: 1_000_000,
+                gas_price: 100,
+                data: data.clone(),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        let mut normal_evm = evm_with_tx(normal_tx);
+        let mut normal_gas_remaining = 900_000;
+
+        handler
+            .gas_charging_hook(&mut normal_evm, &mut normal_gas_remaining, 21_000)
+            .expect("normal transaction poster gas should be chargeable");
+        assert!(
+            normal_evm
+                .ctx()
+                .chain()
+                .current_poster_charge()
+                .expect("normal poster charge should be recorded")
+                .poster_gas
+                > 0
+        );
+
+        let retryable_tx = ArbitrumTxEnv::retryable_redeem(
+            TxEnv {
+                gas_limit: 1_000_000,
+                gas_price: 100,
+                data,
+                ..Default::default()
+            },
+            Some(B256::with_last_byte(1)),
+            Address::with_last_byte(2),
+            Default::default(),
+        );
+        let mut retryable_evm = evm_with_tx(retryable_tx);
+        let mut retryable_gas_remaining = 900_000;
+
+        handler
+            .gas_charging_hook(&mut retryable_evm, &mut retryable_gas_remaining, 21_000)
+            .expect("retryable redeem should not charge L1 poster gas");
+        assert_eq!(
+            retryable_evm
+                .ctx()
+                .chain()
+                .current_poster_charge()
+                .expect("retryable poster charge should be recorded")
+                .poster_gas,
+            0
+        );
+        assert_eq!(retryable_gas_remaining, 900_000);
     }
 }
 

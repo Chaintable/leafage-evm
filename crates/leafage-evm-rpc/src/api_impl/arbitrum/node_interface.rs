@@ -3,7 +3,7 @@ use crate::error::internal_rpc_err;
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{decode_revert_reason, SolInterface, SolValue};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
+use leafage_evm_chains::arbitrum::arbos_state::{ArbStateReader, ARBOS_STATE_ADDRESS};
 use leafage_evm_chains::arbitrum::precompile::{
     NODE_INTERFACE_ADDRESS, NODE_INTERFACE_DEBUG_ADDRESS,
 };
@@ -15,9 +15,11 @@ use revm::context::result::{
     EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output, ResultGas, SuccessReason,
 };
 use revm::context::Transaction as _;
+use revm::database::CacheDB;
 use revm::primitives::{StorageKey, StorageValue, TxKind};
 use revm::state::{AccountInfo, Bytecode};
 use revm::DatabaseRef;
+use revm_inspectors::tracing::TracingInspector;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -30,6 +32,12 @@ const COPY_GAS: u64 = 3;
 const STORAGE_READ_GAS: u64 = 800;
 const NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS: u64 = 5;
 const NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_READS: u64 = 5;
+const RETRYABLE_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
+const RETRYABLE_SUBSPACE: &[u8] = &[2];
+const L2_PRICING_SUBSPACE: &[u8] = &[1];
+const L2_BASE_FEE_WEI_OFFSET: u64 = 2;
+const RETRYABLE_TIMEOUT_QUEUE_SUBSPACE: &[u8] = &[0];
+const RETRYABLE_CALLDATA_SUBSPACE: &[u8] = &[1];
 
 fn random_gas_for_l1_component() -> u64 {
     u32::from_be_bytes(
@@ -41,6 +49,51 @@ fn random_gas_for_l1_component() -> u64 {
 
 fn copy_gas(byte_count: usize) -> u64 {
     COPY_GAS.saturating_mul((byte_count as u64).div_ceil(32))
+}
+
+fn arbos_child_key(parent_key: &[u8], id: &[u8]) -> [u8; 32] {
+    keccak256([parent_key, id].concat()).0
+}
+
+fn arbos_slot_for_key(storage_key: &[u8], key: [u8; 32]) -> U256 {
+    let mut input = Vec::with_capacity(storage_key.len() + 31);
+    input.extend_from_slice(storage_key);
+    input.extend_from_slice(&key[..31]);
+    let hashed = keccak256(&input).0;
+    let mut slot = [0u8; 32];
+    slot[..31].copy_from_slice(&hashed[..31]);
+    slot[31] = key[31];
+    U256::from_be_bytes::<32>(slot)
+}
+
+fn arbos_slot_at(storage_key: &[u8], offset: u64) -> U256 {
+    arbos_slot_for_key(storage_key, U256::from(offset).to_be_bytes())
+}
+
+fn address_word(address: Address) -> U256 {
+    U256::from_be_slice(address.as_slice())
+}
+
+fn optional_address_word(address: Option<Address>) -> U256 {
+    address
+        .map(address_word)
+        .unwrap_or_else(|| U256::from(1u8) << 255)
+}
+
+fn retryable_escrow_address(ticket_id: B256) -> Address {
+    let hash = keccak256([b"retryable escrow".as_slice(), ticket_id.as_slice()].concat());
+    Address::from_slice(&hash.as_slice()[12..])
+}
+
+fn take_funds(pool: &mut U256, amount: U256) -> U256 {
+    if *pool < amount {
+        let taken = *pool;
+        *pool = U256::ZERO;
+        taken
+    } else {
+        *pool -= amount;
+        amount
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -411,6 +464,29 @@ impl<DB> ArbitrumApiImpl<DB> {
         11u64.saturating_add((data_len as u64) / 32)
     }
 
+    fn l2_basefee_from_state<StateDB>(state: &StateDB) -> u64
+    where
+        StateDB: DatabaseRef,
+    {
+        let l2_pricing_key = arbos_child_key(&[], L2_PRICING_SUBSPACE);
+        state
+            .storage_ref(
+                ARBOS_STATE_ADDRESS,
+                arbos_slot_at(&l2_pricing_key, L2_BASE_FEE_WEI_OFFSET),
+            )
+            .ok()
+            .and_then(|basefee| u64::try_from(basefee).ok())
+            .unwrap_or_default()
+    }
+
+    fn retryable_effective_basefee(submit_tx: &ArbitrumSubmitRetryableTx, l2_basefee: u64) -> u64 {
+        if submit_tx.gas_fee_cap.is_zero() {
+            0
+        } else {
+            l2_basefee
+        }
+    }
+
     fn retryable_submission<StateDB>(
         source_tx: &ArbitrumTxEnv,
         block_env: &BlockEnv,
@@ -462,19 +538,312 @@ impl<DB> ArbitrumApiImpl<DB> {
         target_tx.retryable = None;
         target_tx
     }
+
+    fn insert_arbos_storage<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        storage_key: &[u8],
+        offset: u64,
+        value: U256,
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            arbos_slot_at(storage_key, offset),
+            value,
+        )
+        .map_err(EVMError::Database)
+    }
+
+    fn insert_arbos_bytes<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        storage_key: &[u8],
+        value: &[u8],
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        Self::insert_arbos_storage(db, storage_key, 0, U256::from(value.len()))?;
+
+        let mut offset = 1;
+        let mut chunks = value.chunks_exact(32);
+        for chunk in &mut chunks {
+            Self::insert_arbos_storage(db, storage_key, offset, U256::from_be_slice(chunk))?;
+            offset += 1;
+        }
+        Self::insert_arbos_storage(
+            db,
+            storage_key,
+            offset,
+            U256::from_be_slice(chunks.remainder()),
+        )
+    }
+
+    fn account_info<StateDB>(
+        db: &CacheDB<BorrowedState<'_, StateDB>>,
+        address: Address,
+    ) -> Result<AccountInfo, EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        Ok(db
+            .basic_ref(address)
+            .map_err(EVMError::Database)?
+            .unwrap_or_default())
+    }
+
+    fn set_account_balance<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        address: Address,
+        balance: U256,
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        let mut info = Self::account_info(db, address)?;
+        info.balance = balance;
+        db.insert_account_info(address, info);
+        Ok(())
+    }
+
+    fn add_account_balance<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        address: Address,
+        amount: U256,
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        if amount.is_zero() {
+            return Ok(());
+        }
+
+        let balance = Self::account_info(db, address)?
+            .balance
+            .saturating_add(amount);
+        Self::set_account_balance(db, address, balance)
+    }
+
+    fn transfer_account_balance<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        from: Address,
+        to: Address,
+        amount: U256,
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        if amount.is_zero() {
+            return Ok(());
+        }
+        if from == to {
+            return Ok(());
+        }
+
+        let from_balance = Self::account_info(db, from)?.balance;
+        let Some(next_from_balance) = from_balance.checked_sub(amount) else {
+            return Err(evm_custom_error::<StateDB>(
+                "insufficient retryable escrow balance",
+            ));
+        };
+        let to_balance = Self::account_info(db, to)?.balance.saturating_add(amount);
+        Self::set_account_balance(db, from, next_from_balance)?;
+        Self::set_account_balance(db, to, to_balance)
+    }
+
+    fn initialize_retryable_overlay<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        block_env: &BlockEnv,
+        submit_tx: &ArbitrumSubmitRetryableTx,
+        ticket_id: B256,
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        let retryables_key = arbos_child_key(&[], RETRYABLE_SUBSPACE);
+        let retryable_key = arbos_child_key(&retryables_key, ticket_id.as_slice());
+        let timeout = block_env
+            .timestamp
+            .to::<u64>()
+            .saturating_add(RETRYABLE_LIFETIME_SECONDS);
+
+        Self::insert_arbos_storage(db, &retryable_key, 0, U256::ZERO)?;
+        Self::insert_arbos_storage(db, &retryable_key, 1, address_word(submit_tx.from))?;
+        Self::insert_arbos_storage(
+            db,
+            &retryable_key,
+            2,
+            optional_address_word(submit_tx.retry_to),
+        )?;
+        Self::insert_arbos_storage(db, &retryable_key, 3, submit_tx.retry_value)?;
+        Self::insert_arbos_storage(db, &retryable_key, 4, address_word(submit_tx.beneficiary))?;
+        Self::insert_arbos_storage(db, &retryable_key, 5, U256::from(timeout))?;
+        Self::insert_arbos_storage(db, &retryable_key, 6, U256::ZERO)?;
+
+        let calldata_key = arbos_child_key(&retryable_key, RETRYABLE_CALLDATA_SUBSPACE);
+        Self::insert_arbos_bytes(db, &calldata_key, &submit_tx.retry_data)?;
+
+        let timeout_queue_key = arbos_child_key(&retryables_key, RETRYABLE_TIMEOUT_QUEUE_SUBSPACE);
+        let next_put_slot = arbos_slot_at(&timeout_queue_key, 0);
+        let next_get_slot = arbos_slot_at(&timeout_queue_key, 1);
+        let next_put: u64 = db
+            .storage_ref(ARBOS_STATE_ADDRESS, next_put_slot)
+            .map_err(EVMError::Database)?
+            .try_into()
+            .unwrap_or(0);
+        let next_get: u64 = db
+            .storage_ref(ARBOS_STATE_ADDRESS, next_get_slot)
+            .map_err(EVMError::Database)?
+            .try_into()
+            .unwrap_or(0);
+        let next_put = if next_put == 0 { 2 } else { next_put };
+        let next_get = if next_get == 0 { 2 } else { next_get };
+        let next_put_after = next_put
+            .checked_add(1)
+            .ok_or_else(|| evm_custom_error::<StateDB>("retryable timeout queue overflow"))?;
+        Self::insert_arbos_storage(db, &timeout_queue_key, 0, U256::from(next_put_after))?;
+        Self::insert_arbos_storage(db, &timeout_queue_key, 1, U256::from(next_get))?;
+        Self::insert_arbos_storage(
+            db,
+            &timeout_queue_key,
+            next_put,
+            U256::from_be_slice(ticket_id.as_slice()),
+        )?;
+
+        Ok(())
+    }
+
+    fn apply_retryable_submission_overlay<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        block_env: &BlockEnv,
+        submit_tx: &ArbitrumSubmitRetryableTx,
+        ticket_id: B256,
+        l2_basefee: u64,
+    ) -> Result<bool, EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        let network_fee_account = db
+            .network_fee_account()
+            .unwrap_or_else(|| block_env.beneficiary);
+        let escrow = retryable_escrow_address(ticket_id);
+        let basefee = U256::from(l2_basefee);
+
+        Self::add_account_balance(db, submit_tx.from, submit_tx.deposit_value)?;
+
+        let mut available_refund = submit_tx.deposit_value;
+        take_funds(&mut available_refund, submit_tx.retry_value);
+
+        let balance_after_mint = Self::account_info(db, submit_tx.from)?.balance;
+        if balance_after_mint < submit_tx.max_submission_fee {
+            return Err(evm_custom_error::<StateDB>(format!(
+                "insufficient funds for max submission fee: address {:?} have {} want {}",
+                submit_tx.from, balance_after_mint, submit_tx.max_submission_fee
+            )));
+        }
+
+        let submission_fee = ArbitrumSubmitRetryableTx::submission_fee(
+            submit_tx.retry_data.len(),
+            submit_tx.l1_base_fee,
+        );
+        if submit_tx.max_submission_fee < submission_fee {
+            return Err(evm_custom_error::<StateDB>(format!(
+                "max submission fee {} is less than the actual submission fee {}",
+                submit_tx.max_submission_fee, submission_fee
+            )));
+        }
+
+        Self::transfer_account_balance(db, submit_tx.from, network_fee_account, submission_fee)?;
+        let withheld_submission_fee = take_funds(&mut available_refund, submission_fee);
+
+        let excess_submission_fee = submit_tx.max_submission_fee.saturating_sub(submission_fee);
+        let submission_fee_refund = take_funds(&mut available_refund, excess_submission_fee);
+        Self::transfer_account_balance(
+            db,
+            submit_tx.from,
+            submit_tx.fee_refund_addr,
+            submission_fee_refund,
+        )?;
+
+        Self::transfer_account_balance(db, submit_tx.from, escrow, submit_tx.retry_value)?;
+        Self::initialize_retryable_overlay(db, block_env, submit_tx, ticket_id)?;
+
+        let balance = Self::account_info(db, submit_tx.from)?.balance;
+        let max_gas_cost = submit_tx
+            .gas_fee_cap
+            .saturating_mul(U256::from(submit_tx.gas));
+        if balance < max_gas_cost
+            || submit_tx.gas < MIN_TRANSACTION_GAS
+            || submit_tx.gas_fee_cap < basefee
+        {
+            let gas_cost_refund = take_funds(&mut available_refund, max_gas_cost);
+            Self::transfer_account_balance(
+                db,
+                submit_tx.from,
+                submit_tx.fee_refund_addr,
+                gas_cost_refund,
+            )?;
+            return Ok(false);
+        }
+
+        let gas_cost = basefee.saturating_mul(U256::from(submit_tx.gas));
+        Self::transfer_account_balance(db, submit_tx.from, network_fee_account, gas_cost)?;
+        let withheld_gas_funds = take_funds(&mut available_refund, gas_cost);
+
+        let gas_price_refund = submit_tx
+            .gas_fee_cap
+            .saturating_sub(basefee)
+            .saturating_mul(U256::from(submit_tx.gas));
+        let gas_price_refund = take_funds(&mut available_refund, gas_price_refund);
+        Self::transfer_account_balance(
+            db,
+            submit_tx.from,
+            submit_tx.fee_refund_addr,
+            gas_price_refund,
+        )?;
+
+        let _max_refund = available_refund
+            .saturating_add(withheld_gas_funds)
+            .saturating_add(withheld_submission_fee);
+        Ok(true)
+    }
+
+    fn prepare_scheduled_redeem_overlay<StateDB>(
+        db: &mut CacheDB<BorrowedState<'_, StateDB>>,
+        submit_tx: &ArbitrumSubmitRetryableTx,
+        ticket_id: B256,
+        l2_basefee: u64,
+    ) -> Result<(), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        let retryables_key = arbos_child_key(&[], RETRYABLE_SUBSPACE);
+        let retryable_key = arbos_child_key(&retryables_key, ticket_id.as_slice());
+        Self::insert_arbos_storage(db, &retryable_key, 0, U256::ONE)?;
+
+        Self::transfer_account_balance(
+            db,
+            retryable_escrow_address(ticket_id),
+            submit_tx.from,
+            submit_tx.retry_value,
+        )?;
+
+        let prepaid_gas = U256::from(l2_basefee).saturating_mul(U256::from(submit_tx.gas));
+        Self::add_account_balance(db, submit_tx.from, prepaid_gas)
+    }
 }
 
-impl<DB> ArbitrumApiImpl<DB>
-where
-    DB: BlockIndex + Sync + Send + 'static,
-{
+impl<DB> ArbitrumApiImpl<DB> {
     pub(in crate::api_impl::arbitrum) fn try_execute_node_interface<StateDB>(
         &self,
         block_env: &BlockEnv,
         state: &StateDB,
         tx: &ArbitrumTxEnv,
+        inspector: Option<&mut TracingInspector>,
     ) -> Result<Option<ExecutionResult<HaltReason>>, EVMError<StateDB::Error, InvalidTransaction>>
     where
+        DB: BlockIndex + Sync + Send + 'static,
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
@@ -548,6 +917,7 @@ where
                     call.contractCreation,
                     call.data.clone(),
                 );
+                let l2_basefee = Self::l2_basefee_from_state(state);
                 let execution_gas = self.estimate_node_interface_execution_gas(
                     block_env,
                     state,
@@ -557,19 +927,14 @@ where
                 let pricing = state.read_pricing();
                 let l1_gas = pricing
                     .as_ref()
-                    .filter(|_| block_env.basefee != 0)
-                    .map(|pricing| pricing.poster_gas(&target_tx.base, block_env.basefee))
+                    .filter(|_| l2_basefee != 0)
+                    .map(|pricing| pricing.poster_gas(&target_tx.base, l2_basefee))
                     .unwrap_or_default();
                 let l1_base_fee = pricing
                     .as_ref()
                     .map(|pricing| pricing.price_per_unit)
                     .unwrap_or_default();
-                let output: Bytes = (
-                    execution_gas,
-                    l1_gas,
-                    U256::from(block_env.basefee),
-                    l1_base_fee,
-                )
+                let output: Bytes = (execution_gas, l1_gas, U256::from(l2_basefee), l1_base_fee)
                     .abi_encode()
                     .into();
                 let gas_used = Self::virtual_call_gas(
@@ -587,19 +952,18 @@ where
                     call.data.clone(),
                 );
                 target_tx.base.gas_limit = random_gas_for_l1_component();
+                let l2_basefee = Self::l2_basefee_from_state(state);
                 let pricing = state.read_pricing();
                 let l1_gas = pricing
                     .as_ref()
-                    .filter(|_| block_env.basefee != 0)
-                    .map(|pricing| {
-                        pricing.gas_estimate_l1_component(&target_tx.base, block_env.basefee)
-                    })
+                    .filter(|_| l2_basefee != 0)
+                    .map(|pricing| pricing.gas_estimate_l1_component(&target_tx.base, l2_basefee))
                     .unwrap_or_default();
                 let l1_base_fee = pricing
                     .as_ref()
                     .map(|pricing| pricing.price_per_unit)
                     .unwrap_or_default();
-                let output: Bytes = (l1_gas, U256::from(block_env.basefee), l1_base_fee)
+                let output: Bytes = (l1_gas, U256::from(l2_basefee), l1_base_fee)
                     .abi_encode()
                     .into();
                 let gas_used = Self::virtual_call_gas(
@@ -632,9 +996,9 @@ where
                 let call = RetryableRedeemCall::from(call);
                 let submit_tx = Self::retryable_submission(tx, block_env, state, &call);
                 let ticket_id = submit_tx.ticket_id();
-                let output = Bytes::copy_from_slice(ticket_id.as_slice());
-                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 2);
-                let result = Self::virtual_success::<StateDB>(tx, output, gas_used)?;
+                let result = self.execute_retryable_submission(
+                    block_env, state, tx, submit_tx, ticket_id, inspector,
+                )?;
                 return Ok(Some(result));
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::blockL1Num(call)) => {
@@ -710,7 +1074,7 @@ where
             .cfg
             .tx_gas_limit_cap
             .map_or_else(|| block_env.gas_limit, |cap| cap.min(block_env.gas_limit));
-        let mut highest_gas_limit = tx.gas_limit().max(max_gas_limit);
+        let mut highest_gas_limit = max_gas_limit;
 
         if tx.input().is_empty() {
             if let TxKind::Call(to) = tx.kind() {
@@ -744,8 +1108,9 @@ where
                 .unwrap_or(u64::MAX);
             highest_gas_limit = highest_gas_limit.min(gas_allowance);
         }
+        let gas_limit_cap = highest_gas_limit;
 
-        tx.base.gas_limit = tx.gas_limit().min(highest_gas_limit);
+        tx.base.gas_limit = highest_gas_limit;
         let res = self.transact_evm(block_env, BorrowedState(state), tx.clone())?;
         let gas_refund = match &res {
             ExecutionResult::Success { gas, .. } => gas.inner_refunded(),
@@ -823,9 +1188,75 @@ where
         let buffer = self.evm_cfg.estimate_gas_buffer;
         if buffer > 100 {
             let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
-            Ok(buffered.min(u64::MAX as u128) as u64)
+            Ok((buffered.min(u64::MAX as u128) as u64).min(gas_limit_cap))
         } else {
             Ok(highest_gas_limit)
+        }
+    }
+
+    fn execute_retryable_submission<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: &StateDB,
+        source_tx: &ArbitrumTxEnv,
+        submit_tx: ArbitrumSubmitRetryableTx,
+        ticket_id: B256,
+        inspector: Option<&mut TracingInspector>,
+    ) -> Result<ExecutionResult<HaltReason>, EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let output = Bytes::copy_from_slice(ticket_id.as_slice());
+        let mut overlay = CacheDB::new(BorrowedState(state));
+        let l2_basefee = Self::l2_basefee_from_state(state);
+        let retryable_basefee = Self::retryable_effective_basefee(&submit_tx, l2_basefee);
+        let should_schedule = Self::apply_retryable_submission_overlay(
+            &mut overlay,
+            block_env,
+            &submit_tx,
+            ticket_id,
+            retryable_basefee,
+        )?;
+        if !should_schedule {
+            let gas_used = Self::virtual_call_gas(source_tx.input(), output.as_ref(), 2);
+            return Self::virtual_success::<StateDB>(source_tx, output, gas_used);
+        }
+
+        Self::prepare_scheduled_redeem_overlay(
+            &mut overlay,
+            &submit_tx,
+            ticket_id,
+            retryable_basefee,
+        )?;
+
+        let mut redeem_base = source_tx.base.clone();
+        redeem_base.caller = submit_tx.from;
+        redeem_base.gas_limit = submit_tx.gas;
+        redeem_base.gas_price = u128::from(retryable_basefee);
+        redeem_base.gas_priority_fee = Some(0);
+        redeem_base.kind = submit_tx.retry_to.map_or(TxKind::Create, TxKind::Call);
+        redeem_base.value = submit_tx.retry_value;
+        redeem_base.data = submit_tx.retry_data;
+        redeem_base.nonce = 0;
+
+        let redeem_tx = ArbitrumTxEnv::retryable_redeem(
+            redeem_base,
+            Some(ticket_id),
+            submit_tx.fee_refund_addr,
+            source_tx.context.clone(),
+        );
+        let redeem_result = if let Some(inspector) = inspector {
+            self.inspect_evm(block_env, overlay, redeem_tx, inspector)?
+        } else {
+            self.transact_evm(block_env, overlay, redeem_tx)?
+        };
+
+        match redeem_result {
+            ExecutionResult::Success { gas, .. } => {
+                Self::virtual_success::<StateDB>(source_tx, output, gas.spent())
+            }
+            failed => Ok(failed),
         }
     }
 }
@@ -880,8 +1311,40 @@ mod tests {
     use super::*;
     use alloy::sol_types::SolCall;
     use leafage_evm_chains::arbitrum::tx::ArbitrumTxContext;
+    use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+    use leafage_evm_types::CfgEnv;
     use revm::context::TxEnv;
     use revm::database::EmptyDB;
+
+    fn test_api() -> ArbitrumApiImpl<()> {
+        let mut cfg = CfgEnv::new_with_spec(ArbitrumHardfork::Prague);
+        cfg.chain_id = 42161;
+        ArbitrumApiImpl::new(
+            (),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            "test".to_string(),
+            100,
+            None,
+        )
+    }
+
+    fn state_with_l2_basefee(basefee: u64) -> CacheDB<EmptyDB> {
+        let mut db = CacheDB::new(EmptyDB::default());
+        let l2_pricing_key = arbos_child_key(&[], L2_PRICING_SUBSPACE);
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            arbos_slot_at(&l2_pricing_key, L2_BASE_FEE_WEI_OFFSET),
+            U256::from(basefee),
+        )
+        .expect("write L2 base fee");
+        db
+    }
 
     #[test]
     fn retryable_submission_matches_nitro_message_swap_fields() {
@@ -969,6 +1432,440 @@ mod tests {
     #[test]
     fn arbitrum_one_nitro_genesis_block_matches_node_interface() {
         assert_eq!(configured_nitro_genesis_block_num(42161, None), 22_207_817);
+    }
+
+    #[test]
+    fn node_interface_execution_estimate_uses_cap_not_virtual_call_gas() {
+        let api = test_api();
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                gas_limit: 10,
+                kind: TxKind::Call(Address::with_last_byte(2)),
+                data: Bytes::from_static(&[1, 2, 3, 4]),
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+
+        let gas = api
+            .estimate_node_interface_execution_gas(&block_env, &EmptyDB::default(), tx)
+            .expect("target gas estimation should not inherit source gas limit");
+
+        assert!(gas > MIN_TRANSACTION_GAS);
+        assert!(gas < block_env.gas_limit);
+    }
+
+    #[test]
+    fn retryable_submission_runs_scheduled_redeem_and_returns_ticket_id() {
+        let api = test_api();
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let source_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 100_000,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::ZERO,
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+
+        let result = api
+            .execute_retryable_submission(
+                &block_env,
+                &EmptyDB::default(),
+                &source_tx,
+                submit_tx,
+                ticket_id,
+                None,
+            )
+            .expect("scheduled redeem should execute against empty target");
+
+        match result {
+            ExecutionResult::Success {
+                output: Output::Call(output),
+                gas,
+                ..
+            } => {
+                assert_eq!(output.as_ref(), ticket_id.as_slice());
+                assert!(gas.spent() >= MIN_TRANSACTION_GAS);
+            }
+            other => panic!("unexpected retryable submission result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_interface_execution_estimate_does_not_exceed_configured_cap() {
+        let mut api = test_api();
+        api.evm_cfg.cfg.tx_gas_limit_cap = Some(500_000);
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                gas_limit: 2_000_000,
+                kind: TxKind::Call(Address::with_last_byte(2)),
+                data: Bytes::from_static(&[1, 2, 3, 4]),
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+
+        let gas = api
+            .estimate_node_interface_execution_gas(&block_env, &EmptyDB::default(), tx)
+            .expect("source gas above cap should not break target gas estimation");
+
+        assert!(gas > MIN_TRANSACTION_GAS);
+        assert!(gas <= api.evm_cfg.cfg.tx_gas_limit_cap.unwrap());
+    }
+
+    #[test]
+    fn node_interface_execution_estimate_buffer_is_clamped_to_cap() {
+        let mut api = test_api();
+        api.evm_cfg.cfg.tx_gas_limit_cap = Some(30_000);
+        api.evm_cfg.estimate_gas_buffer = 200;
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                gas_limit: 2_000_000,
+                kind: TxKind::Call(Address::with_last_byte(2)),
+                data: Bytes::from_static(&[1, 2, 3, 4]),
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+
+        let gas = api
+            .estimate_node_interface_execution_gas(&block_env, &EmptyDB::default(), tx)
+            .expect("buffered estimate should still obey the cap");
+
+        assert!(gas <= api.evm_cfg.cfg.tx_gas_limit_cap.unwrap());
+    }
+
+    #[test]
+    fn retryable_overlay_initializes_ticket_state() {
+        let block_env = BlockEnv {
+            timestamp: U256::from(1_000u64),
+            ..Default::default()
+        };
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::from(7u64),
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+        let empty = EmptyDB::default();
+        let mut overlay = CacheDB::new(BorrowedState(&empty));
+
+        ArbitrumApiImpl::<()>::initialize_retryable_overlay(
+            &mut overlay,
+            &block_env,
+            &submit_tx,
+            ticket_id,
+        )
+        .expect("retryable overlay should initialize");
+        let info = overlay
+            .read_retryable_info(ticket_id)
+            .expect("retryable info should be readable")
+            .expect("retryable should exist");
+
+        assert_eq!(info.from, submit_tx.from);
+        assert_eq!(info.to, submit_tx.retry_to);
+        assert_eq!(info.value, submit_tx.retry_value);
+        assert_eq!(info.beneficiary, submit_tx.beneficiary);
+        assert_eq!(info.tries, 0);
+        assert_eq!(info.timeout, 1_000 + RETRYABLE_LIFETIME_SECONDS);
+        assert_eq!(info.data, submit_tx.retry_data);
+    }
+
+    #[test]
+    fn scheduled_redeem_overlay_prepares_retry_context() {
+        let block_env = BlockEnv {
+            timestamp: U256::from(1_000u64),
+            ..Default::default()
+        };
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::from(7u64),
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+        let empty = EmptyDB::default();
+        let mut overlay = CacheDB::new(BorrowedState(&empty));
+
+        ArbitrumApiImpl::<()>::initialize_retryable_overlay(
+            &mut overlay,
+            &block_env,
+            &submit_tx,
+            ticket_id,
+        )
+        .expect("retryable overlay should initialize");
+        ArbitrumApiImpl::<()>::add_account_balance(
+            &mut overlay,
+            retryable_escrow_address(ticket_id),
+            submit_tx.retry_value,
+        )
+        .expect("escrow should be funded");
+        ArbitrumApiImpl::<()>::prepare_scheduled_redeem_overlay(
+            &mut overlay,
+            &submit_tx,
+            ticket_id,
+            2,
+        )
+        .expect("scheduled redeem overlay should prepare");
+
+        let info = overlay
+            .read_retryable_info(ticket_id)
+            .expect("retryable info should be readable")
+            .expect("retryable should exist");
+        assert_eq!(info.tries, 1);
+        assert_eq!(
+            overlay
+                .basic_ref(retryable_escrow_address(ticket_id))
+                .expect("escrow account should be readable")
+                .unwrap_or_default()
+                .balance,
+            U256::ZERO
+        );
+        assert_eq!(
+            overlay
+                .basic_ref(submit_tx.from)
+                .expect("sender account should be readable")
+                .expect("sender account should exist")
+                .balance,
+            submit_tx
+                .retry_value
+                .saturating_add(U256::from(2u64 * submit_tx.gas))
+        );
+    }
+
+    #[test]
+    fn retryable_submission_without_enough_fee_cap_does_not_schedule_redeem() {
+        let api = test_api();
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let source_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 100_000,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::from(1_000_000u64),
+            gas_fee_cap: U256::ONE,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::from(7u64),
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+        let state = state_with_l2_basefee(2);
+
+        let result = api
+            .execute_retryable_submission(
+                &block_env, &state, &source_tx, submit_tx, ticket_id, None,
+            )
+            .expect("retryable submission should create ticket without auto-redeem");
+
+        match result {
+            ExecutionResult::Success {
+                output: Output::Call(output),
+                gas,
+                ..
+            } => {
+                assert_eq!(output.as_ref(), ticket_id.as_slice());
+                assert!(gas.spent() < MIN_TRANSACTION_GAS);
+            }
+            other => panic!("unexpected retryable submission result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_gas_price_retryable_submission_still_schedules_redeem() {
+        let api = test_api();
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let source_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 100_000,
+                gas_price: 0,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::ZERO,
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+        let state = state_with_l2_basefee(2);
+
+        let result = api
+            .execute_retryable_submission(
+                &block_env, &state, &source_tx, submit_tx, ticket_id, None,
+            )
+            .expect("zero gas price retryable estimation should still schedule redeem");
+
+        match result {
+            ExecutionResult::Success {
+                output: Output::Call(output),
+                gas,
+                ..
+            } => {
+                assert_eq!(output.as_ref(), ticket_id.as_slice());
+                assert!(gas.spent() >= MIN_TRANSACTION_GAS);
+            }
+            other => panic!("unexpected retryable submission result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retryable_submission_overlay_funds_scheduled_redeem() {
+        let block_env = BlockEnv {
+            timestamp: U256::from(1_000u64),
+            ..Default::default()
+        };
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::from(200_007u64),
+            gas_fee_cap: U256::from(2u64),
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::from(7u64),
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+        let empty = EmptyDB::default();
+        let mut overlay = CacheDB::new(BorrowedState(&empty));
+
+        let should_schedule = ArbitrumApiImpl::<()>::apply_retryable_submission_overlay(
+            &mut overlay,
+            &block_env,
+            &submit_tx,
+            ticket_id,
+            2,
+        )
+        .expect("retryable submission overlay should apply");
+        assert!(should_schedule);
+        ArbitrumApiImpl::<()>::prepare_scheduled_redeem_overlay(
+            &mut overlay,
+            &submit_tx,
+            ticket_id,
+            2,
+        )
+        .expect("scheduled redeem should prepare");
+
+        let info = overlay
+            .read_retryable_info(ticket_id)
+            .expect("retryable info should be readable")
+            .expect("retryable should exist");
+        assert_eq!(info.tries, 1);
+        assert_eq!(
+            overlay
+                .basic_ref(submit_tx.from)
+                .expect("sender account should be readable")
+                .expect("sender account should exist")
+                .balance,
+            submit_tx
+                .retry_value
+                .saturating_add(U256::from(2u64 * submit_tx.gas))
+        );
+        assert_eq!(
+            overlay
+                .basic_ref(retryable_escrow_address(ticket_id))
+                .expect("escrow account should be readable")
+                .unwrap_or_default()
+                .balance,
+            U256::ZERO
+        );
     }
 
     #[test]

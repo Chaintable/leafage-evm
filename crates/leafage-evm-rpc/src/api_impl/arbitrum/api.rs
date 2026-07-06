@@ -27,10 +27,13 @@ use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv};
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, DebankErrorCode};
-use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
+use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output};
 use revm::context::Transaction as _;
 use revm::inspector::NoOpInspector;
+use revm::interpreter::InstructionResult;
+use revm::primitives::{Address, TxKind};
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
+use revm_inspectors::tracing::types::{CallKind, CallTrace, TraceMemberOrder};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
@@ -118,6 +121,113 @@ impl<DB> ArbitrumApiImpl<DB> {
 
         evm.transact(tx).map(|res| res.result.into())
     }
+
+    pub(super) fn inspect_evm<StateDB: DatabaseRef + DatabaseCommit>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: ArbitrumTxEnv,
+        inspector: &mut TracingInspector,
+    ) -> Result<ExecutionResult<HaltReason>, EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
+        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref());
+        let mut evm = create_arbitrum_evm_from_state(
+            evm_block_env,
+            self.cfg_for_tx(&tx),
+            state,
+            inspector,
+            precompile_env,
+            execution_context,
+        );
+
+        evm.inspect_tx_commit(tx).map(Into::into)
+    }
+
+    fn record_virtual_trace(
+        inspector: &mut TracingInspector,
+        tx: &ArbitrumTxEnv,
+        result: &ExecutionResult<HaltReason>,
+    ) {
+        let (success, status, output, gas_used) = match result {
+            ExecutionResult::Success { output, gas, .. } => {
+                let output = match output {
+                    Output::Call(bytes) => bytes.clone(),
+                    Output::Create(bytes, _) => bytes.clone(),
+                };
+                (true, Some(InstructionResult::Return), output, gas.spent())
+            }
+            ExecutionResult::Revert { output, gas, .. } => (
+                false,
+                Some(InstructionResult::Revert),
+                output.clone(),
+                gas.spent(),
+            ),
+            ExecutionResult::Halt { gas, .. } => (
+                false,
+                Some(InstructionResult::FatalExternalError),
+                Bytes::new(),
+                gas.spent(),
+            ),
+        };
+
+        let (address, kind) = match tx.kind() {
+            TxKind::Call(to) => (to, CallKind::Call),
+            TxKind::Create => (Address::ZERO, CallKind::Create),
+        };
+        let nodes = inspector.traces_mut().nodes_mut();
+        let mut root = revm_inspectors::tracing::types::CallTraceNode {
+            idx: 0,
+            trace: CallTrace {
+                depth: 0,
+                success,
+                caller: tx.caller(),
+                address,
+                maybe_precompile: Some(true),
+                kind,
+                value: tx.value(),
+                data: tx.input().clone(),
+                output,
+                gas_used,
+                gas_limit: tx.gas_limit(),
+                status,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let has_recorded_child = nodes.iter().any(|node| {
+            node.trace.gas_limit != 0
+                || node.trace.gas_used != 0
+                || !node.trace.data.is_empty()
+                || !node.trace.output.is_empty()
+                || node.trace.caller != Address::ZERO
+                || node.trace.address != Address::ZERO
+                || !node.children.is_empty()
+                || !node.logs.is_empty()
+        });
+
+        if !has_recorded_child {
+            if nodes.is_empty() {
+                nodes.push(root);
+            } else {
+                nodes[0] = root;
+            }
+            return;
+        }
+
+        for node in nodes.iter_mut() {
+            node.idx += 1;
+            node.parent = node.parent.map(|parent| parent + 1).or(Some(0));
+            node.children.iter_mut().for_each(|child| *child += 1);
+            node.trace.depth += 1;
+        }
+        root.children.push(1);
+        root.ordering.push(TraceMemberOrder::Call(0));
+        nodes.insert(0, root);
+    }
 }
 
 // create_txn_env reuses mainnet's free function; execution uses Arbitrum
@@ -153,7 +263,7 @@ where
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
-        if let Some(result) = self.try_execute_node_interface(&block_env, &state, &tx)? {
+        if let Some(result) = self.try_execute_node_interface(&block_env, &state, &tx, None)? {
             return Ok(result);
         }
 
@@ -176,7 +286,10 @@ where
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
         let mut inspector = TracingInspector::new(inspector_cfg);
-        if let Some(result) = self.try_execute_node_interface(&block_env, &state, &tx)? {
+        if let Some(result) =
+            self.try_execute_node_interface(&block_env, &state, &tx, Some(&mut inspector))?
+        {
+            Self::record_virtual_trace(&mut inspector, &tx, &result);
             return Ok((result, inspector_collect(inspector)));
         }
 
@@ -245,6 +358,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leafage_evm_chains::arbitrum::precompile::NODE_INTERFACE_ADDRESS;
+    use revm::context::result::{ResultGas, SuccessReason};
     use revm::context::TxEnv;
 
     #[test]
@@ -297,5 +412,78 @@ mod tests {
         assert_eq!(evm_block_env.number, U256::from(123_456u64));
         assert_eq!(evm_block_env.basefee, 0);
         assert_eq!(evm_block_env.prevrandao, Some(B256::with_last_byte(1)));
+    }
+
+    #[test]
+    fn virtual_node_interface_result_records_root_trace() {
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 10_000,
+                data: Bytes::from_static(&[0xaa, 0xbb, 0xcc, 0xdd]),
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+        let output = Bytes::from_static(&[1, 2, 3]);
+        let result = ExecutionResult::Success {
+            reason: SuccessReason::Return,
+            gas: ResultGas::new(10_000, 123, 0, 0, 0),
+            logs: Vec::new(),
+            output: Output::Call(output.clone()),
+        };
+        let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
+
+        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result);
+
+        let traces = inspector.into_traces().into_nodes();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].trace.caller, tx.caller());
+        assert_eq!(traces[0].trace.address, NODE_INTERFACE_ADDRESS);
+        assert_eq!(traces[0].trace.data, tx.input().clone());
+        assert_eq!(traces[0].trace.output, output);
+        assert_eq!(traces[0].trace.gas_used, 123);
+        assert!(traces[0].trace.success);
+    }
+
+    #[test]
+    fn virtual_node_interface_trace_wraps_existing_child_trace() {
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 10_000,
+                data: Bytes::from_static(&[0xaa, 0xbb, 0xcc, 0xdd]),
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+        let child = CallTrace {
+            depth: 0,
+            caller: Address::with_last_byte(2),
+            address: Address::with_last_byte(3),
+            gas_limit: 9_000,
+            ..Default::default()
+        };
+        let result = ExecutionResult::Success {
+            reason: SuccessReason::Return,
+            gas: ResultGas::new(10_000, 123, 0, 0, 0),
+            logs: Vec::new(),
+            output: Output::Call(Bytes::from_static(&[1, 2, 3])),
+        };
+        let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
+        inspector.traces_mut().nodes_mut()[0].trace = child;
+
+        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result);
+
+        let traces = inspector.into_traces().into_nodes();
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].trace.address, NODE_INTERFACE_ADDRESS);
+        assert_eq!(traces[0].children, vec![1]);
+        assert_eq!(traces[1].idx, 1);
+        assert_eq!(traces[1].parent, Some(0));
+        assert_eq!(traces[1].trace.depth, 1);
+        assert_eq!(traces[1].trace.address, Address::with_last_byte(3));
     }
 }
