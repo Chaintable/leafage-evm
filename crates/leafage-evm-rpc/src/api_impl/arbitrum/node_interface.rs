@@ -26,6 +26,10 @@ const ARBOS_VERSION_40: u64 = 40;
 const MIN_TRANSACTION_GAS: u64 = 21_000;
 const CALL_STIPEND_GAS: u64 = 2_300;
 const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
+const COPY_GAS: u64 = 3;
+const STORAGE_READ_GAS: u64 = 800;
+const NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS: u64 = 5;
+const NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_READS: u64 = 5;
 
 fn random_gas_for_l1_component() -> u64 {
     u32::from_be_bytes(
@@ -33,6 +37,10 @@ fn random_gas_for_l1_component() -> u64 {
             .try_into()
             .expect("fixed-size keccak prefix"),
     ) as u64
+}
+
+fn copy_gas(byte_count: usize) -> u64 {
+    COPY_GAS.saturating_mul((byte_count as u64).div_ceil(32))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -367,37 +375,52 @@ impl<DB> ArbitrumApiImpl<DB> {
         Address::from_slice(&bytes[12..])
     }
 
-    pub(in crate::api_impl::arbitrum) fn retryable_redeem_gas_price(
-        source_message_gas_price: u128,
-        block_env: &BlockEnv,
-    ) -> u128 {
-        if source_message_gas_price == 0 {
-            0
-        } else {
-            block_env.basefee as u128
+    fn virtual_success<StateDB>(
+        tx: &ArbitrumTxEnv,
+        output: Bytes,
+        gas_used: u64,
+    ) -> Result<ExecutionResult<HaltReason>, EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB: DatabaseRef,
+    {
+        if tx.gas_limit() < gas_used {
+            return Err(EVMError::Transaction(
+                InvalidTransaction::CallGasCostMoreThanGasLimit {
+                    initial_gas: gas_used,
+                    gas_limit: tx.gas_limit(),
+                },
+            ));
         }
-    }
 
-    fn virtual_success(tx: &ArbitrumTxEnv, output: Bytes) -> ExecutionResult<HaltReason> {
-        ExecutionResult::Success {
+        Ok(ExecutionResult::Success {
             reason: SuccessReason::Return,
-            gas: ResultGas::new(tx.gas_limit(), 0, 0, 0, 0),
+            gas: ResultGas::new(tx.gas_limit(), gas_used, 0, 0, 0),
             logs: Vec::new(),
             output: Output::Call(output),
-        }
+        })
     }
 
-    fn retryable_redeem_tx<StateDB>(
+    fn virtual_call_gas(data: &[u8], output: &[u8], context_storage_reads: u64) -> u64 {
+        copy_gas(data.len().saturating_sub(4))
+            .saturating_add(copy_gas(output.len()))
+            .saturating_add(STORAGE_READ_GAS.saturating_mul(context_storage_reads))
+    }
+
+    fn retryable_info_storage_reads(data_len: usize) -> u64 {
+        // OpenArbosState, retryable scalar fields, calldata length, and calldata words.
+        11u64.saturating_add((data_len as u64) / 32)
+    }
+
+    fn retryable_submission<StateDB>(
         source_tx: &ArbitrumTxEnv,
         block_env: &BlockEnv,
         state: &StateDB,
-        call: RetryableRedeemCall,
-    ) -> ArbitrumTxEnv
+        call: &RetryableRedeemCall,
+    ) -> ArbitrumSubmitRetryableTx
     where
         StateDB: DatabaseRef,
     {
         let source_message_gas_price = source_tx.effective_gas_price(block_env.basefee as u128);
-        let retry_gas_price = Self::retryable_redeem_gas_price(source_message_gas_price, block_env);
         let l1_base_fee = state
             .read_pricing()
             .map(|pricing| pricing.price_per_unit)
@@ -405,7 +428,8 @@ impl<DB> ArbitrumApiImpl<DB> {
         let max_submission_fee =
             ArbitrumSubmitRetryableTx::submission_fee(call.data.len(), l1_base_fee);
         let retry_to = (call.to != Address::ZERO).then_some(call.to);
-        let submit_tx = ArbitrumSubmitRetryableTx {
+
+        ArbitrumSubmitRetryableTx {
             chain_id: U256::ZERO,
             request_id: B256::ZERO,
             from: Self::remap_l1_address(call.sender),
@@ -419,23 +443,7 @@ impl<DB> ArbitrumApiImpl<DB> {
             max_submission_fee,
             fee_refund_addr: call.excess_fee_refund_address,
             retry_data: call.data.clone(),
-        };
-
-        let mut base = source_tx.base.clone();
-        base.caller = Self::remap_l1_address(call.sender);
-        base.kind = retry_to.map_or(TxKind::Create, TxKind::Call);
-        base.value = call.l2_call_value;
-        base.data = call.data;
-        base.nonce = 0;
-        base.gas_price = retry_gas_price;
-        base.gas_priority_fee = None;
-
-        ArbitrumTxEnv::retryable_redeem(
-            base,
-            Some(submit_tx.ticket_id()),
-            call.excess_fee_refund_address,
-            source_tx.context.clone(),
-        )
+        }
     }
 
     fn gas_estimate_target_tx(
@@ -502,7 +510,15 @@ where
                         tries: info.tries,
                         data: info.data,
                     };
-                    Ok(Some(Self::virtual_success(tx, ret.abi_encode().into())))
+                    let retryable_data_len = ret.data.len();
+                    let output: Bytes = ret.abi_encode().into();
+                    let gas_used = Self::virtual_call_gas(
+                        data,
+                        output.as_ref(),
+                        Self::retryable_info_storage_reads(retryable_data_len),
+                    );
+                    let result = Self::virtual_success::<StateDB>(tx, output, gas_used)?;
+                    Ok(Some(result))
                 }
                 Err(err) => Err(evm_custom_error::<StateDB>(format!(
                     "invalid NodeInterfaceDebug calldata: {err}",
@@ -516,7 +532,9 @@ where
 
         let data = tx.input().as_ref();
 
-        let output = match INodeInterfaceVirtual::INodeInterfaceVirtualCalls::abi_decode(data) {
+        let (output, gas_used) = match INodeInterfaceVirtual::INodeInterfaceVirtualCalls::abi_decode(
+            data,
+        ) {
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::gasEstimateComponents(call)) => {
                 if call.to == NODE_INTERFACE_ADDRESS || call.to == NODE_INTERFACE_DEBUG_ADDRESS {
                     return Err(evm_custom_error::<StateDB>(
@@ -546,14 +564,20 @@ where
                     .as_ref()
                     .map(|pricing| pricing.price_per_unit)
                     .unwrap_or_default();
-                (
+                let output: Bytes = (
                     execution_gas,
                     l1_gas,
                     U256::from(block_env.basefee),
                     l1_base_fee,
                 )
                     .abi_encode()
-                    .into()
+                    .into();
+                let gas_used = Self::virtual_call_gas(
+                    data,
+                    output.as_ref(),
+                    NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS,
+                );
+                (output, gas_used)
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::gasEstimateL1Component(call)) => {
                 let mut target_tx = Self::gas_estimate_target_tx(
@@ -575,17 +599,25 @@ where
                     .as_ref()
                     .map(|pricing| pricing.price_per_unit)
                     .unwrap_or_default();
-                (l1_gas, U256::from(block_env.basefee), l1_base_fee)
+                let output: Bytes = (l1_gas, U256::from(block_env.basefee), l1_base_fee)
                     .abi_encode()
-                    .into()
+                    .into();
+                let gas_used = Self::virtual_call_gas(
+                    data,
+                    output.as_ref(),
+                    NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_READS,
+                );
+                (output, gas_used)
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::nitroGenesisBlock(_)) => {
-                configured_nitro_genesis_block_num(
+                let output: Bytes = configured_nitro_genesis_block_num(
                     self.evm_cfg.cfg.chain_id,
                     self.evm_cfg.custom_cfg.as_ref(),
                 )
                 .abi_encode()
-                .into()
+                .into();
+                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 0);
+                (output, gas_used)
             }
             Ok(
                 INodeInterfaceVirtual::INodeInterfaceVirtualCalls::legacyLookupMessageBatchProof(_),
@@ -597,28 +629,24 @@ where
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::estimateRetryableTicket(
                 call,
             )) => {
-                let target_tx = Self::retryable_redeem_tx(tx, block_env, state, call.into());
-                match self.transact_evm(block_env, BorrowedState(state), target_tx)? {
-                    ExecutionResult::Success { output, .. } => output.into_data().0.into(),
-                    ExecutionResult::Revert { output, .. } => {
-                        return Err(evm_custom_error::<StateDB>(format!(
-                            "Reverted: {:?}",
-                            decode_revert_reason(&output).unwrap_or("execution revert".to_string())
-                        )))
-                    }
-                    ExecutionResult::Halt { reason, .. } => {
-                        return Err(evm_custom_error::<StateDB>(format!("Halted: {:?}", reason)))
-                    }
-                }
+                let call = RetryableRedeemCall::from(call);
+                let submit_tx = Self::retryable_submission(tx, block_env, state, &call);
+                let ticket_id = submit_tx.ticket_id();
+                let output = Bytes::copy_from_slice(ticket_id.as_slice());
+                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 2);
+                let result = Self::virtual_success::<StateDB>(tx, output, gas_used)?;
+                return Ok(Some(result));
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::blockL1Num(call)) => {
-                rpc_to_evm_result::<StateDB, _>(block_l1_num(
+                let output: Bytes = rpc_to_evm_result::<StateDB, _>(block_l1_num(
                     &self.db,
                     call.l2BlockNum,
                     configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref()),
                 ))?
                 .abi_encode()
-                .into()
+                .into();
+                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 1);
+                (output, gas_used)
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::l2BlockRangeForL1(call)) => {
                 let genesis_block_num = configured_nitro_genesis_block_num(
@@ -637,7 +665,9 @@ where
                         call.blockNum,
                         legacy_zero_base_fee_until,
                     ))?;
-                (first_block, last_block).abi_encode().into()
+                let output: Bytes = (first_block, last_block).abi_encode().into();
+                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 1);
+                (output, gas_used)
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::getL1Confirmations(_)) => {
                 return Err(evm_custom_error::<StateDB>(
@@ -661,7 +691,8 @@ where
             }
         };
 
-        Ok(Some(Self::virtual_success(tx, output)))
+        let result = Self::virtual_success::<StateDB>(tx, output, gas_used)?;
+        Ok(Some(result))
     }
 
     fn estimate_node_interface_execution_gas<StateDB>(
@@ -847,12 +878,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::sol_types::SolCall;
     use leafage_evm_chains::arbitrum::tx::ArbitrumTxContext;
     use revm::context::TxEnv;
     use revm::database::EmptyDB;
 
     #[test]
-    fn retryable_redeem_tx_matches_nitro_message_swap_fields() {
+    fn retryable_submission_matches_nitro_message_swap_fields() {
         let sender = Address::ZERO;
         let target = Address::with_last_byte(0xaa);
         let fee_refund = Address::with_last_byte(0xbb);
@@ -879,26 +911,24 @@ mod tests {
             },
             ArbitrumTxContext::default(),
         );
-        let target_tx = ArbitrumApiImpl::<()>::retryable_redeem_tx(
+        let submit_tx = ArbitrumApiImpl::<()>::retryable_submission(
             &source_tx,
             &block_env,
             &EmptyDB::default(),
-            call.clone(),
+            &call,
         );
 
         assert_eq!(
-            target_tx.caller(),
+            submit_tx.from,
             alloy::primitives::address!("1111000000000000000000000000000000001111")
         );
-        assert_eq!(target_tx.kind(), TxKind::Call(target));
-        assert_eq!(target_tx.value(), U256::from(7u64));
-        assert_eq!(target_tx.input().as_ref(), data.as_ref());
-        assert_eq!(target_tx.gas_limit(), 777_000);
-        assert_eq!(target_tx.gas_price(), 42);
-        assert_eq!(
-            target_tx.retryable.as_ref().map(|ctx| ctx.refund_to),
-            Some(fee_refund)
-        );
+        assert_eq!(submit_tx.retry_to, Some(target));
+        assert_eq!(submit_tx.retry_value, U256::from(7u64));
+        assert_eq!(submit_tx.retry_data.as_ref(), data.as_ref());
+        assert_eq!(submit_tx.gas, 777_000);
+        assert_eq!(submit_tx.gas_fee_cap, U256::from(999u64));
+        assert_eq!(submit_tx.fee_refund_addr, fee_refund);
+        assert_eq!(submit_tx.beneficiary, call_value_refund);
     }
 
     #[test]
@@ -937,45 +967,51 @@ mod tests {
     }
 
     #[test]
-    fn retryable_redeem_gas_price_matches_scheduled_retry_basefee() {
-        let mut block_env = BlockEnv::default();
-        block_env.basefee = 42;
-
-        assert_eq!(
-            ArbitrumApiImpl::<()>::retryable_redeem_gas_price(0, &block_env),
-            0
-        );
-        assert_eq!(
-            ArbitrumApiImpl::<()>::retryable_redeem_gas_price(7, &block_env),
-            42
-        );
-    }
-
-    #[test]
     fn arbitrum_one_nitro_genesis_block_matches_node_interface() {
         assert_eq!(configured_nitro_genesis_block_num(42161, None), 22_207_817);
     }
 
     #[test]
-    fn retryable_redeem_tx_uses_create_for_zero_target() {
-        let call = RetryableRedeemCall {
-            sender: Address::ZERO,
-            deposit: U256::ZERO,
-            to: Address::ZERO,
-            l2_call_value: U256::ZERO,
-            excess_fee_refund_address: Address::ZERO,
-            call_value_refund_address: Address::ZERO,
-            data: Bytes::new(),
+    fn virtual_call_gas_charges_copy_and_storage_reads() {
+        let call = INodeInterfaceVirtual::gasEstimateComponentsCall {
+            to: Address::with_last_byte(0xaa),
+            contractCreation: false,
+            data: Bytes::from_static(&[0x95, 0xd8, 0x9b, 0x41]),
         };
+        let data = call.abi_encode();
+        let output = (1u64, 2u64, U256::from(3), U256::from(4)).abi_encode();
 
-        let target_tx = ArbitrumApiImpl::<()>::retryable_redeem_tx(
-            &ArbitrumTxEnv::new(TxEnv::default(), ArbitrumTxContext::default()),
-            &BlockEnv::default(),
-            &EmptyDB::default(),
-            call,
+        assert_eq!(
+            ArbitrumApiImpl::<()>::virtual_call_gas(
+                &data,
+                &output,
+                NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS,
+            ),
+            copy_gas(data.len() - 4)
+                + copy_gas(output.len())
+                + STORAGE_READ_GAS * NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS
+        );
+    }
+
+    #[test]
+    fn virtual_success_rejects_insufficient_gas_limit() {
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                gas_limit: 10,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
         );
 
-        assert_eq!(target_tx.kind(), TxKind::Create);
-        assert_eq!(target_tx.gas_price(), 0);
+        let err = ArbitrumApiImpl::<()>::virtual_success::<EmptyDB>(&tx, Bytes::new(), 11)
+            .expect_err("insufficient gas should fail");
+
+        assert!(matches!(
+            err,
+            EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit {
+                initial_gas: 11,
+                gas_limit: 10,
+            })
+        ));
     }
 }

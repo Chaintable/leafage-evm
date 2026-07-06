@@ -29,7 +29,9 @@ use self::env::ArbPrecompileInput;
 pub use self::env::ArbitrumPrecompileEnv;
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
-use self::util::{decode_revert, empty_revert, to_interpreter_result};
+use self::util::{
+    charge_precompile_context_gas, decode_revert, empty_revert, to_interpreter_result,
+};
 use crate::arbitrum::evm::ArbitrumExecutionContext;
 use crate::arbitrum::hardforks::ArbitrumHardfork;
 use crate::arbitrum::tx::ArbitrumTxEnv;
@@ -75,7 +77,7 @@ pub(crate) const BATCH_POSTER_ADDRESS: Address =
     address!("A4B000000000000000000073657175656e636572");
 
 const STORAGE_READ_GAS: u64 = 800;
-const BASE_PRECOMPILE_GAS: u64 = 120;
+const BASE_PRECOMPILE_GAS: u64 = 0;
 const STORAGE_WRITE_COST: u64 = 20_000;
 const STORAGE_WRITE_ZERO_COST: u64 = 5_000;
 const ASSUMED_SIMPLE_TX_SIZE: u64 = 140;
@@ -138,7 +140,9 @@ impl ArbitrumPrecompiles {
         data: &[u8],
         is_valid_call_context: bool,
     ) -> PrecompileResult {
-        if !matches!(precompile, ArbitrumPrecompile::ArbOwner) {
+        let purity = if matches!(precompile, ArbitrumPrecompile::ArbOwner) {
+            None
+        } else {
             let Some(purity) = precompile.purity(data) else {
                 return decode_revert(inputs.gas_limit, "unknown Arbitrum precompile selector");
             };
@@ -154,7 +158,19 @@ impl ArbitrumPrecompiles {
             if !inputs.call_value().is_zero() && !purity.accepts_value() {
                 return decode_revert(inputs.gas_limit, "non-payable Arbitrum precompile method");
             }
+
+            Some(purity)
+        };
+
+        let context_gas = if purity.is_some_and(|purity| purity.uses_precompile_context()) {
+            STORAGE_READ_GAS
+        } else {
+            0
+        };
+        if context_gas > inputs.gas_limit {
+            return Err(revm::precompile::PrecompileError::OutOfGas);
         }
+        let precompile_gas_limit = inputs.gas_limit - context_gas;
 
         let charge = context.chain().current_poster_charge();
         let current_tx_l1_gas_fees = charge
@@ -166,9 +182,9 @@ impl ArbitrumPrecompiles {
             self.env.current_tx_l1_gas_units
         };
 
-        precompile.run(ArbPrecompileInput {
+        let result = precompile.run(ArbPrecompileInput {
             data,
-            gas: inputs.gas_limit,
+            gas: precompile_gas_limit,
             caller: inputs.caller,
             value: inputs.call_value(),
             is_static: inputs.is_static,
@@ -182,7 +198,9 @@ impl ArbitrumPrecompiles {
             allow_debug_precompiles: self.env.allow_debug_precompiles,
             current_chain_config: self.env.current_chain_config.as_ref().map(Bytes::as_ref),
             context,
-        })
+        });
+
+        charge_precompile_context_gas(context_gas, inputs.gas_limit, result)
     }
 }
 
@@ -302,7 +320,7 @@ fn cancun_with_p256() -> &'static Precompiles {
 
 #[cfg(test)]
 mod tests {
-    use super::util::{alias_l1_address, inverse_alias_l1_address, signed_diff};
+    use super::util::{alias_l1_address, copy_gas, inverse_alias_l1_address, signed_diff};
     use super::*;
     use crate::arbitrum::arbos_state;
     use crate::arbitrum::evm::ArbPosterCharge;
@@ -542,6 +560,42 @@ mod tests {
             .expect("decode return"),
             1_023
         );
+    }
+
+    #[test]
+    fn provider_charges_context_gas_for_view_precompiles() {
+        let mut context = context();
+        let mut precompiles = ArbitrumPrecompiles::new_with_env(
+            ArbitrumHardfork::Prague,
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 11,
+                ..Default::default()
+            },
+        );
+        let data = abi::IArbSys::arbBlockNumberCall {}.abi_encode();
+        let inputs = CallInputs {
+            input: CallInput::Bytes(Bytes::from(data)),
+            return_memory_offset: 0..0,
+            gas_limit: 100_000,
+            bytecode_address: ARB_SYS_ADDRESS,
+            known_bytecode: None,
+            target_address: ARB_SYS_ADDRESS,
+            caller: Address::from([1; 20]),
+            value: CallValue::default(),
+            scheme: CallScheme::Call,
+            is_static: false,
+        };
+
+        let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
+            &mut precompiles,
+            &mut context,
+            &inputs,
+        )
+        .expect("provider run should not fail")
+        .expect("ArbSys should be handled");
+
+        assert_eq!(result.result, InstructionResult::Return);
+        assert_eq!(result.gas.spent(), STORAGE_READ_GAS + copy_gas(32));
     }
 
     #[test]

@@ -45,6 +45,25 @@ pub(super) fn to_interpreter_result(
     Ok(interpreter_result)
 }
 
+pub(super) fn charge_precompile_context_gas(
+    context_gas: u64,
+    gas_limit: u64,
+    result: PrecompileResult,
+) -> PrecompileResult {
+    if context_gas == 0 {
+        return result;
+    }
+
+    let mut output = result?;
+
+    output.gas_used = output.gas_used.saturating_add(context_gas);
+    if output.gas_used > gas_limit {
+        return Err(PrecompileError::OutOfGas);
+    }
+
+    Ok(output)
+}
+
 pub(super) fn copy_gas(byte_count: usize) -> u64 {
     COPY_GAS.saturating_mul((byte_count as u64).div_ceil(32))
 }
