@@ -299,7 +299,7 @@ mod tests {
     use super::super::state::StylusParams;
     use super::*;
     use crate::arbitrum::arbos_state;
-    use crate::arbitrum::context::ArbitrumExecutionContext;
+    use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::primitives::U256;
@@ -423,6 +423,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: ARBOS_VERSION_STYLUS,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -448,6 +449,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: ARBOS_VERSION_STYLUS_FIXES,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,

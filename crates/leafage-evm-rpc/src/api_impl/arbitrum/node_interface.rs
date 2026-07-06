@@ -7,9 +7,7 @@ use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
 use leafage_evm_chains::arbitrum::precompile::{
     NODE_INTERFACE_ADDRESS, NODE_INTERFACE_DEBUG_ADDRESS,
 };
-use leafage_evm_chains::arbitrum::tx::{
-    ArbitrumSubmitRetryableTx, ArbitrumTxContext, ArbitrumTxEnv,
-};
+use leafage_evm_chains::arbitrum::tx::{ArbitrumSubmitRetryableTx, ArbitrumTxEnv};
 use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockId, BlockInfo, BlockNumberOrTag};
@@ -541,15 +539,15 @@ where
                 let pricing = state.read_pricing();
                 let l1_gas = pricing
                     .as_ref()
+                    .filter(|_| block_env.basefee != 0)
                     .map(|pricing| pricing.poster_gas(&target_tx.base, block_env.basefee))
                     .unwrap_or_default();
                 let l1_base_fee = pricing
                     .as_ref()
                     .map(|pricing| pricing.price_per_unit)
                     .unwrap_or_default();
-                let gas_estimate = execution_gas.saturating_add(l1_gas);
                 (
-                    gas_estimate,
+                    execution_gas,
                     l1_gas,
                     U256::from(block_env.basefee),
                     l1_base_fee,
@@ -568,7 +566,10 @@ where
                 let pricing = state.read_pricing();
                 let l1_gas = pricing
                     .as_ref()
-                    .map(|pricing| pricing.poster_gas(&target_tx.base, block_env.basefee))
+                    .filter(|_| block_env.basefee != 0)
+                    .map(|pricing| {
+                        pricing.gas_estimate_l1_component(&target_tx.base, block_env.basefee)
+                    })
                     .unwrap_or_default();
                 let l1_base_fee = pricing
                     .as_ref()
@@ -729,7 +730,7 @@ where
         };
 
         highest_gas_limit = tx.gas_limit();
-        let mut gas_used = res.gas_used();
+        let gas_used = res.gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
         let optimistic_gas_limit = ((gas_used as u128)
             .saturating_add(gas_refund as u128)
@@ -741,7 +742,6 @@ where
         if optimistic_gas_limit < highest_gas_limit {
             tx.base.gas_limit = optimistic_gas_limit;
             let res = self.transact_evm(block_env, BorrowedState(state), tx.clone())?;
-            gas_used = res.gas_used();
             update_estimated_gas_range::<StateDB>(
                 &res,
                 optimistic_gas_limit,
@@ -749,11 +749,6 @@ where
                 &mut lowest_gas_limit,
             )?;
         }
-
-        let mut mid_gas_limit = std::cmp::min(
-            (gas_used as u128).saturating_mul(3).min(u64::MAX as u128) as u64,
-            ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
-        );
 
         loop {
             let gas_limit_range = highest_gas_limit.saturating_sub(lowest_gas_limit);
@@ -764,6 +759,10 @@ where
                 break;
             }
 
+            let mut mid_gas_limit = lowest_gas_limit + (highest_gas_limit - lowest_gas_limit) / 2;
+            if mid_gas_limit > lowest_gas_limit.saturating_mul(2) {
+                mid_gas_limit = lowest_gas_limit.saturating_mul(2);
+            }
             tx.base.gas_limit = mid_gas_limit;
             match self.transact_evm(block_env, BorrowedState(state), tx.clone()) {
                 Ok(res) => update_estimated_gas_range::<StateDB>(
@@ -788,8 +787,6 @@ where
                     err => return Err(err),
                 },
             }
-
-            mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
         let buffer = self.evm_cfg.estimate_gas_buffer;
@@ -850,6 +847,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leafage_evm_chains::arbitrum::tx::ArbitrumTxContext;
     use revm::context::TxEnv;
     use revm::database::EmptyDB;
 

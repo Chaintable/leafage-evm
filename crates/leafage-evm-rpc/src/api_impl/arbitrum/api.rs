@@ -6,9 +6,9 @@
 //! available in `eth_call` / gas simulation. The pre-execution hook stays at its
 //! no-op default even on Prague: Arbitrum skips the EIP-2935 parent-blockhash
 //! system call (go-ethereum-arb gates it on `!IsArbitrum`; block hashes come
-//! from the per-block internal tx instead). Gas estimation still overrides
-//! [`GasFeeHandler::estimate_l1_overhead`] to add Nitro's L1 data-posting cost
-//! (posterGas), gated by the per-chain `enable_l1_gas` switch (off by default).
+//! from the per-block internal tx instead). Nitro's L1 data-posting cost is
+//! charged by the Arbitrum EVM handler so RPC gas estimation does not add a
+//! second `estimate_l1_overhead`.
 
 use crate::api_impl::arbitrum::evm::create_arbitrum_evm_from_state;
 use crate::api_impl::arbitrum::node_interface::{
@@ -21,7 +21,7 @@ use crate::error::rpc_error_with_code;
 use alloy::primitives::{Bytes, B256, U256};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
-use leafage_evm_chains::arbitrum::context::ArbitrumExecutionContext;
+use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
 use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv};
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
@@ -37,19 +37,14 @@ use std::fmt::Debug;
 pub(super) type ArbitrumApiImpl<DB> = ApiImpl<DB, ArbitrumHardfork, ArbitrumEvmConfig>;
 
 fn precompile_env<StateDB: DatabaseRef>(
-    block_env: &BlockEnv,
     state: &StateDB,
     tx: &ArbitrumTxEnv,
     custom_cfg: Option<&ArbitrumEvmConfig>,
 ) -> ArbitrumPrecompileEnv {
-    let l1_fee_basefee = if tx.is_zero_gas_price_retryable() {
-        0
-    } else {
-        block_env.basefee
-    };
     ArbitrumPrecompileEnv {
         current_arbos_version: state.arbos_version(),
-        current_tx_l1_gas_fees: state.current_tx_l1_gas_fee(&tx.base, l1_fee_basefee),
+        current_tx_l1_gas_fees: U256::ZERO,
+        current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,
         current_retryable_ticket: tx.retryable.as_ref().and_then(|ctx| ctx.ticket_id),
         current_refund_to: tx.retryable.as_ref().map(|ctx| ctx.refund_to),
@@ -97,6 +92,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 block,
                 configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref()),
             ),
+            ..Default::default()
         }
     }
 
@@ -110,8 +106,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB::Error: Sync + Send + 'static,
     {
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env =
-            precompile_env(block_env, &state, &tx, self.evm_cfg.custom_cfg.as_ref());
+        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -186,8 +181,7 @@ where
         }
 
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env =
-            precompile_env(&block_env, &state, &tx, self.evm_cfg.custom_cfg.as_ref());
+        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -246,105 +240,12 @@ where
             .try_into()
             .unwrap_or(u64::MAX))
     }
-
-    fn estimate_l1_overhead<StateDB>(
-        &self,
-        _block: &BlockInfo,
-        block_env: &BlockEnv,
-        tx: Self::Tx,
-        state: &StateDB,
-    ) -> u64
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        // Per-chain opt-in: off (other arb chains / no config) -> behave like mainnet.
-        if !self
-            .evm_cfg
-            .custom_cfg
-            .as_ref()
-            .is_some_and(|c| c.enable_l1_gas)
-        {
-            return 0;
-        }
-
-        // Pricing read straight from ArbOS state; missing / pre-pricing -> 0 (safe degrade).
-        let pricing = match state.read_pricing() {
-            Some(p) => p,
-            None => return 0,
-        };
-
-        pricing.poster_gas(&tx.base, block_env.basefee)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leafage_evm_chains::arbitrum::arbos_state::ARBOS_STATE_ADDRESS;
     use revm::context::TxEnv;
-    use revm::primitives::{Address, StorageKey, StorageValue};
-    use revm::state::{AccountInfo, Bytecode};
-    use revm::DatabaseRef;
-    use std::convert::Infallible;
-
-    fn arbos_slot(hex: &str) -> U256 {
-        U256::from_str_radix(hex, 16).expect("valid ArbOS slot")
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct PricingState;
-
-    impl DatabaseRef for PricingState {
-        type Error = Infallible;
-
-        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-            Ok(None)
-        }
-
-        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
-            Ok(Bytecode::default())
-        }
-
-        fn storage_ref(
-            &self,
-            address: Address,
-            index: StorageKey,
-        ) -> Result<StorageValue, Self::Error> {
-            if address != ARBOS_STATE_ADDRESS {
-                return Ok(U256::ZERO);
-            }
-            if index
-                == arbos_slot("a9f6f085d78d1d37c5819e5c16c9e03198bd14e08cd1f6f8191bc6207b9e9707")
-            {
-                return Ok(U256::from(1_000_000_000u64));
-            }
-            if index
-                == arbos_slot("e54de2a4cdacc0a0059d2b6e16348103df8c4aff409c31e40ec73d11926c8203")
-            {
-                return Ok(U256::ONE);
-            }
-            if index
-                == arbos_slot("15fed0451499512d95f3ec5a41c878b9de55f21878b5b4e190d4667ec709b407")
-            {
-                return Ok(U256::from(1));
-            }
-            Ok(U256::ZERO)
-        }
-
-        fn storage_by_account_id_ref(
-            &self,
-            address: Address,
-            _account_id: usize,
-            storage_key: StorageKey,
-        ) -> Result<StorageValue, Self::Error> {
-            self.storage_ref(address, storage_key)
-        }
-
-        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
-            Ok(B256::ZERO)
-        }
-    }
 
     #[test]
     fn execution_env_for_tx_matches_arbitrum_contexts() {
@@ -396,37 +297,5 @@ mod tests {
         assert_eq!(evm_block_env.number, U256::from(123_456u64));
         assert_eq!(evm_block_env.basefee, 0);
         assert_eq!(evm_block_env.prevrandao, Some(B256::with_last_byte(1)));
-    }
-
-    #[test]
-    fn precompile_env_keeps_zero_l1_fee_for_zero_gas_retryable() {
-        let block_env = BlockEnv {
-            basefee: 10_000_000,
-            ..Default::default()
-        };
-        let state = PricingState;
-        let normal_tx = ArbitrumTxEnv::new(
-            TxEnv {
-                gas_price: 10_000_000,
-                gas_limit: 100_000,
-                ..Default::default()
-            },
-            ArbitrumTxContext::default(),
-        );
-        let normal_env = precompile_env(&block_env, &state, &normal_tx, None);
-        assert!(normal_env.current_tx_l1_gas_fees > U256::ZERO);
-
-        let retryable = ArbitrumTxEnv::retryable_redeem(
-            TxEnv {
-                gas_price: 0,
-                gas_limit: 100_000,
-                ..Default::default()
-            },
-            None,
-            Address::ZERO,
-            ArbitrumTxContext::default(),
-        );
-        let retryable_env = precompile_env(&block_env, &state, &retryable, None);
-        assert_eq!(retryable_env.current_tx_l1_gas_fees, U256::ZERO);
     }
 }

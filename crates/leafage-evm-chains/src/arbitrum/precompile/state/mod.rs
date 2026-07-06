@@ -514,7 +514,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arbitrum::context::ArbitrumExecutionContext;
+    use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use leafage_evm_types::{BlockEnv, CfgEnv};

@@ -30,7 +30,7 @@ pub use self::env::ArbitrumPrecompileEnv;
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
 use self::util::{decode_revert, empty_revert, to_interpreter_result};
-use crate::arbitrum::context::ArbitrumExecutionContext;
+use crate::arbitrum::evm::ArbitrumExecutionContext;
 use crate::arbitrum::hardforks::ArbitrumHardfork;
 use crate::arbitrum::tx::ArbitrumTxEnv;
 use alloy::primitives::{address, Address, Bytes, U256};
@@ -69,8 +69,10 @@ pub const NODE_INTERFACE_DEBUG_ADDRESS: Address =
     address!("00000000000000000000000000000000000000c9");
 pub const ARB_DEBUG_ADDRESS: Address = address!("00000000000000000000000000000000000000ff");
 pub const ARBOS_ACTS_ADDRESS: Address = address!("00000000000000000000000000000000000a4b05");
-const L1_PRICER_FUNDS_POOL_ADDRESS: Address = address!("A4B00000000000000000000000000000000000f6");
-const BATCH_POSTER_ADDRESS: Address = address!("A4B000000000000000000073657175656e636572");
+pub(crate) const L1_PRICER_FUNDS_POOL_ADDRESS: Address =
+    address!("A4B00000000000000000000000000000000000f6");
+pub(crate) const BATCH_POSTER_ADDRESS: Address =
+    address!("A4B000000000000000000073657175656e636572");
 
 const STORAGE_READ_GAS: u64 = 800;
 const BASE_PRECOMPILE_GAS: u64 = 120;
@@ -154,6 +156,16 @@ impl ArbitrumPrecompiles {
             }
         }
 
+        let charge = context.chain().current_poster_charge();
+        let current_tx_l1_gas_fees = charge
+            .map(|charge| charge.poster_fee)
+            .unwrap_or(self.env.current_tx_l1_gas_fees);
+        let current_tx_l1_gas_units = if charge.is_some() {
+            0
+        } else {
+            self.env.current_tx_l1_gas_units
+        };
+
         precompile.run(ArbPrecompileInput {
             data,
             gas: inputs.gas_limit,
@@ -162,7 +174,8 @@ impl ArbitrumPrecompiles {
             is_static: inputs.is_static,
             is_valid_call_context,
             current_arbos_version: self.env.current_arbos_version,
-            current_tx_l1_gas_fees: self.env.current_tx_l1_gas_fees,
+            current_tx_l1_gas_fees,
+            current_tx_l1_gas_units,
             current_l1_block_number: self.env.current_l1_block_number,
             current_retryable_ticket: self.env.current_retryable_ticket,
             current_refund_to: self.env.current_refund_to,
@@ -292,6 +305,8 @@ mod tests {
     use super::util::{alias_l1_address, inverse_alias_l1_address, signed_diff};
     use super::*;
     use crate::arbitrum::arbos_state;
+    use crate::arbitrum::evm::ArbPosterCharge;
+    use alloy::sol_types::SolCall;
     use revm::context::JournalTr;
     use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
@@ -466,6 +481,67 @@ mod tests {
         .expect("provider run should not fail");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn current_poster_charge_units_are_not_added_twice() {
+        let mut context = context();
+        let l1_key = arbos_state::child_key(&[], arbos_state::L1_PRICING_SUBSPACE);
+        let units_slot = arbos_state::slot_at(&l1_key, arbos_state::L1_UNITS_SINCE_UPDATE_OFFSET);
+        context
+            .journal_mut()
+            .sstore(
+                arbos_state::ARBOS_STATE_ADDRESS,
+                units_slot,
+                U256::from(1_023),
+            )
+            .expect("write units since update");
+        context
+            .chain_mut()
+            .set_current_poster_charge(ArbPosterCharge {
+                calldata_units: 23,
+                poster_fee: U256::from(5),
+                ..Default::default()
+            });
+
+        let mut precompiles = ArbitrumPrecompiles::new_with_env(
+            ArbitrumHardfork::Prague,
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 20,
+                current_tx_l1_gas_units: 23,
+                ..Default::default()
+            },
+        );
+        let data = abi::IArbGasInfo::getL1PricingUnitsSinceUpdateCall {}.abi_encode();
+        let inputs = CallInputs {
+            input: CallInput::Bytes(Bytes::from(data)),
+            return_memory_offset: 0..0,
+            gas_limit: 100_000,
+            bytecode_address: ARB_GAS_INFO_ADDRESS,
+            known_bytecode: None,
+            target_address: ARB_GAS_INFO_ADDRESS,
+            caller: Address::from([1; 20]),
+            value: CallValue::default(),
+            scheme: CallScheme::Call,
+            is_static: false,
+        };
+
+        let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
+            &mut precompiles,
+            &mut context,
+            &inputs,
+        )
+        .expect("provider run should not fail")
+        .expect("ArbGasInfo should be handled");
+
+        assert_eq!(result.result, InstructionResult::Return);
+        assert_eq!(
+            abi::IArbGasInfo::getL1PricingUnitsSinceUpdateCall::abi_decode_returns(
+                result.output.as_ref()
+            )
+            .expect("decode return"),
+            1_023
+        );
     }
 
     #[test]

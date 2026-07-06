@@ -5,7 +5,7 @@ use super::util::{
     log_gas,
 };
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_SYS_ADDRESS};
-use crate::arbitrum::context::ArbitrumCallContext;
+use crate::arbitrum::evm::ArbitrumCallContext;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolError, SolEvent};
 use revm::context::{Cfg, ContextTr, Transaction};
@@ -420,7 +420,7 @@ mod tests {
     use super::super::util::{topic_address, topic_u256};
     use super::*;
     use crate::arbitrum::arbos_state;
-    use crate::arbitrum::context::ArbitrumExecutionContext;
+    use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::sol_types::{SolCall, SolError, SolEvent};
@@ -455,6 +455,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -495,6 +496,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 11,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -520,6 +522,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 10,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -546,6 +549,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 10,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -587,6 +591,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 11,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -619,6 +624,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 11,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -640,6 +646,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 10,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -912,6 +919,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 4,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: eth_block_num.to(),
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -937,6 +945,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 4,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: eth_block_num.to(),
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -1036,6 +1045,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 3,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: eth_block_num.to(),
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -1131,6 +1141,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 41,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -1156,6 +1167,7 @@ mod tests {
             is_valid_call_context: true,
             current_arbos_version: 40,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,

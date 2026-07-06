@@ -142,7 +142,8 @@ static BROTLI_LEVEL_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], BROTLI_COMPRESS
 static ARBOS_VERSION_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], ARBOS_VERSION_OFFSET));
 static COLLECT_TIPS_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], COLLECT_TIPS_OFFSET));
 static GENESIS_BLOCK_NUM_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], GENESIS_BLOCK_NUM_OFFSET));
-
+static NETWORK_FEE_ACCOUNT_SLOT: Lazy<U256> =
+    Lazy::new(|| slot_at(&[], NETWORK_FEE_ACCOUNT_OFFSET));
 /// The three ArbOS pricing values posterGas estimation needs.
 #[derive(Debug, Clone)]
 pub struct ArbPricing {
@@ -188,6 +189,25 @@ pub trait ArbStateReader: DatabaseRef {
         self.read_root(*GENESIS_BLOCK_NUM_SLOT).unwrap_or_default()
     }
 
+    fn collect_tips(&self) -> bool {
+        collect_tips(self)
+    }
+
+    fn network_fee_account(&self) -> Option<Address> {
+        self.read_root(*NETWORK_FEE_ACCOUNT_SLOT)
+            .map(address_from_word)
+    }
+
+    fn paid_l1_gas_price(&self, tx: &TxEnv, block_base_fee: u64) -> U256 {
+        if self.collect_tips() {
+            let price = tx.effective_gas_price(block_base_fee as u128);
+            if price != 0 {
+                return U256::from(price);
+            }
+        }
+        U256::from(block_base_fee)
+    }
+
     fn current_tx_l1_gas_fee(&self, tx: &TxEnv, block_base_fee: u64) -> U256 {
         if block_base_fee == 0 {
             return U256::ZERO;
@@ -197,18 +217,19 @@ pub trait ArbStateReader: DatabaseRef {
             return U256::ZERO;
         };
 
-        let paid_gas_price = if collect_tips(self) {
-            let price = tx.effective_gas_price(block_base_fee as u128);
-            if price == 0 {
-                U256::from(block_base_fee)
-            } else {
-                U256::from(price)
-            }
-        } else {
-            U256::from(block_base_fee)
-        };
+        let paid_gas_price = self.paid_l1_gas_price(tx, block_base_fee);
 
         pricing.current_tx_l1_fee(tx, paid_gas_price)
+    }
+
+    fn current_tx_l1_gas_units(&self, tx: &TxEnv, block_base_fee: u64) -> u64 {
+        if block_base_fee == 0 {
+            return 0;
+        }
+
+        self.read_pricing()
+            .map(|pricing| pricing.current_tx_l1_units(tx))
+            .unwrap_or_default()
     }
 
     fn read_retryable_info(&self, ticket_id: B256) -> Result<Option<ArbRetryableInfo>, String>

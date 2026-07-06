@@ -1,6 +1,8 @@
 use alloy::primitives::{Address, Bytes, B256, U256};
 use std::collections::HashMap;
 
+use super::poster_gas::ArbPosterCharge;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArbitrumCallContext {
     pub depth: usize,
@@ -21,6 +23,7 @@ pub struct ArbitrumExecutionContext {
     current_call: ArbitrumCallContext,
     current_l2_block_number: Option<U256>,
     current_l2_basefee: Option<u64>,
+    current_poster_charge: Option<ArbPosterCharge>,
     activated_wasm_modules: HashMap<B256, Bytes>,
     stylus_pages_open: u16,
     stylus_pages_ever: u16,
@@ -38,6 +41,18 @@ impl ArbitrumExecutionContext {
 
     pub fn current_l2_basefee(&self) -> Option<u64> {
         self.current_l2_basefee
+    }
+
+    pub fn set_current_poster_charge(&mut self, charge: ArbPosterCharge) {
+        self.current_poster_charge = Some(charge);
+    }
+
+    pub fn current_poster_charge(&self) -> Option<ArbPosterCharge> {
+        self.current_poster_charge
+    }
+
+    pub fn clear_current_poster_charge(&mut self) {
+        self.current_poster_charge = None;
     }
 
     pub fn set_current_call(&mut self, depth: usize, callers_caller: Address) {
@@ -86,10 +101,15 @@ mod tests {
         context.insert_activated_wasm_module(module_hash, module.clone());
         context.set_stylus_pages_open(5);
         context.set_current_l2_context(U256::from(123), 456);
+        context.set_current_poster_charge(ArbPosterCharge {
+            poster_gas: 7,
+            ..Default::default()
+        });
 
         assert_eq!(context.activated_wasm_module(module_hash), Some(&module));
         assert_eq!(context.current_l2_block_number(), Some(U256::from(123)));
         assert_eq!(context.current_l2_basefee(), Some(456));
+        assert_eq!(context.current_poster_charge().unwrap().poster_gas, 7);
         assert_eq!(context.stylus_pages_open(), 5);
         assert_eq!(context.remaining_stylus_page_limit(8), 3);
         assert_eq!(context.remaining_stylus_page_limit(4), 0);

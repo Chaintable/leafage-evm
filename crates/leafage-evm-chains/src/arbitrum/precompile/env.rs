@@ -4,6 +4,7 @@ use alloy::primitives::{Address, Bytes, B256, U256};
 pub struct ArbitrumPrecompileEnv {
     pub current_arbos_version: u64,
     pub current_tx_l1_gas_fees: U256,
+    pub current_tx_l1_gas_units: u64,
     pub current_l1_block_number: u64,
     pub current_retryable_ticket: Option<B256>,
     pub current_refund_to: Option<Address>,
@@ -16,6 +17,7 @@ impl Default for ArbitrumPrecompileEnv {
         Self {
             current_arbos_version: 0,
             current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
             current_l1_block_number: 0,
             current_retryable_ticket: None,
             current_refund_to: None,
@@ -34,6 +36,7 @@ pub(super) struct ArbPrecompileInput<'a, CTX> {
     pub(super) is_valid_call_context: bool,
     pub(super) current_arbos_version: u64,
     pub(super) current_tx_l1_gas_fees: U256,
+    pub(super) current_tx_l1_gas_units: u64,
     pub(super) current_l1_block_number: u64,
     pub(super) current_retryable_ticket: Option<B256>,
     pub(super) current_refund_to: Option<Address>,

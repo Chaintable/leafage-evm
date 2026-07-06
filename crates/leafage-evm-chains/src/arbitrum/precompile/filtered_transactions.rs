@@ -141,7 +141,7 @@ mod tests {
     use super::super::{ArbitrumPrecompileEnv, ArbitrumPrecompiles, STORAGE_READ_GAS};
     use super::*;
     use crate::arbitrum::arbos_state;
-    use crate::arbitrum::context::ArbitrumExecutionContext;
+    use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::primitives::U256;

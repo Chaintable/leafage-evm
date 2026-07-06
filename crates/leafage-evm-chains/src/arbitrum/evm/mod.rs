@@ -1,4 +1,7 @@
-use crate::arbitrum::context::ArbitrumExecutionContext;
+mod context;
+mod handler;
+mod poster_gas;
+
 use crate::arbitrum::hardforks::ArbitrumHardfork;
 use crate::arbitrum::precompile::{ArbitrumContext, ArbitrumPrecompileEnv, ArbitrumPrecompiles};
 use crate::arbitrum::tx::ArbitrumTxEnv;
@@ -8,7 +11,6 @@ use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
 use revm::handler::{
     EthFrame, EvmTr, ExecuteCommitEvm, ExecuteEvm, FrameInitOrResult, FrameResult, Handler,
-    MainnetHandler,
 };
 use revm::inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorEvmTr, InspectorHandler};
 use revm::interpreter::interpreter::EthInterpreter;
@@ -23,6 +25,10 @@ use revm::{
     Database, DatabaseCommit, DatabaseRef, Journal,
 };
 use std::ops::{Deref, DerefMut};
+
+pub use self::context::{ArbitrumCallContext, ArbitrumExecutionContext};
+use self::handler::ArbitrumHandler;
+pub use self::poster_gas::ArbPosterCharge;
 
 pub struct ArbitrumEvm<DB: Database + DatabaseRef, I> {
     pub inner: Evm<
@@ -176,7 +182,7 @@ where
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        MainnetHandler::default().run(self)
+        ArbitrumHandler::new().run(self)
     }
 
     fn finalize(&mut self) -> Self::State {
@@ -184,7 +190,7 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
-        MainnetHandler::default().run(self).map(|result| {
+        ArbitrumHandler::new().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
         })
@@ -213,7 +219,7 @@ where
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        MainnetHandler::default().inspect_run(self)
+        ArbitrumHandler::new().inspect_run(self)
     }
 }
 

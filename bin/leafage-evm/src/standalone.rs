@@ -439,7 +439,7 @@ impl Command {
                 // *under*-estimates the floor — if a chain enables 7623 PRAGUE is exact,
                 // if it's off the floor only over-estimates rare calldata-heavy txs (the
                 // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
-                // chains. The L1 cost is added separately in estimate_l1_overhead.
+                // chains. The Arbitrum EVM handler accounts for Nitro's L1 poster gas.
                 let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;

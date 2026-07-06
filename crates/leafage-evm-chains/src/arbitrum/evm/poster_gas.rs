@@ -1,20 +1,22 @@
-//! Port of Nitro's gas-estimation posterGas (the path `eth_estimateGas`
-//! exercises), from `arbos/l1pricing/l1pricing.go` + `arbos/tx_processor.go`
-//! (nitro commit `e8fa8e05a`).
+//! Port of Nitro's fake-transaction L1 poster gas paths, from
+//! `arbos/l1pricing/l1pricing.go` + `arbos/tx_processor.go` (nitro commit
+//! `e8fa8e05a`).
 //!
 //! Nitro expresses the L1 calldata cost of posting a tx as an equivalent number
-//! of L2 gas units. During estimation it builds a *fake* tx from the message,
-//! brotli-compresses it, and pads conservatively. We replicate that here:
+//! of L2 gas units. For gas-estimation paths, it builds a fake dynamic-fee tx,
+//! brotli-compresses it, pads the units by 1.01, adds an additional 1.10 cost
+//! padding, and uses the 7/8 gas-price adjustment:
 //!
 //! ```text
 //! l1_bytes = brotli(level, marshal_2718(fake_tx))
 //! units    = (16 * l1_bytes + 256) * 1.01
-//! cost_wei = price_per_unit * units * 1.10
+//! cost_wei = price_per_unit * units
+//! estimate_cost_wei = cost_wei * 1.10
 //! price    = max(l2_base_fee * 7/8, min_base_fee)
-//! posterGas = cost_wei / price            // 0 if price == 0
+//! posterGas = estimate_cost_wei / price   // 0 if price == 0
 //! ```
 
-use super::arbos_state::ArbPricing;
+use crate::arbitrum::arbos_state::ArbPricing;
 use alloy::primitives::{keccak256, U256};
 use alloy_rlp::Encodable;
 use once_cell::sync::Lazy;
@@ -51,6 +53,14 @@ static RANDOM_S: Lazy<U256> = Lazy::new(|| U256::from_be_bytes::<32>(keccak256("
 /// 4 bytes (`0x83 01EE13`), vs a normal EIP-1559 signature's 1-byte `y_parity`, so
 /// reproducing it keeps the fake tx the same size as Nitro's before brotli.
 const FAKE_SIG_V: u64 = 126_483;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArbPosterCharge {
+    pub poster_gas: u64,
+    pub poster_fee: U256,
+    pub calldata_units: u64,
+    pub paid_gas_price: U256,
+}
 
 /// EIP-2718 bytes of Nitro's fake tx: the request's
 /// to/value/data/access_list, with Nitro's fixed random values for everything else
@@ -139,56 +149,110 @@ impl ArbPricing {
     /// Replicate Nitro's gas-estimation posterGas for `tx`. `l2_base_fee` is the
     /// block base fee. Returns 0 if the fake tx can't be compressed.
     pub fn poster_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
-        let l1_bytes = match brotli_len(&fake_tx_bytes(tx, true), self.brotli_level) {
-            Some(n) => n as u64,
+        let cost = match self.poster_data_cost(tx, true) {
+            Some(cost) => self.pad_estimation_cost(cost),
             None => return 0,
         };
-        self.poster_gas_from_l1_bytes(l1_bytes, l2_base_fee)
+        self.poster_gas_from_cost(cost, U256::from(l2_base_fee), true)
     }
 
-    /// Compute the current tx L1 fee using the same conservative posterGas
-    /// formula used by gas estimation.
+    /// Replicate Nitro's `NodeInterface.gasEstimateL1Component` conversion. It
+    /// uses the fake tx with random gas and L1 price padding, but divides by the
+    /// current L2 base fee directly instead of applying gas-estimation's 7/8
+    /// price adjustment.
+    pub fn gas_estimate_l1_component(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
+        let cost = match self.poster_data_cost(tx, true) {
+            Some(cost) => self.pad_estimation_cost(cost),
+            None => return 0,
+        };
+        self.poster_gas_from_cost(cost, U256::from(l2_base_fee), false)
+    }
+
+    /// Compute `GetCurrentTxL1GasFees` for an eth_call-style message. This
+    /// mirrors Nitro's `GasChargingHook`: fake tx units are padded by
+    /// `PosterDataCost`, but `GetPosterGas` does not apply gas-estimation price
+    /// or cost padding for eth_call run mode.
     pub(crate) fn current_tx_l1_fee(&self, tx: &TxEnv, paid_gas_price: U256) -> U256 {
         if paid_gas_price.is_zero() {
             return U256::ZERO;
         }
 
-        let l1_bytes = match brotli_len(&fake_tx_bytes(tx, true), self.brotli_level) {
-            Some(n) => n as u64,
+        let cost = match self.poster_data_cost(tx, false) {
+            Some(cost) => cost,
             None => return U256::ZERO,
         };
-        let cost = self.cost_for_l1_bytes(l1_bytes);
-        let adjusted = paid_gas_price.saturating_mul(U256::from(7u64)) / U256::from(8u64);
-        let price_for_gas = adjusted.max(self.min_base_fee);
-        if price_for_gas.is_zero() {
-            return U256::ZERO;
-        }
-
-        let poster_gas = u64::try_from(cost / price_for_gas).unwrap_or(u64::MAX);
+        let poster_gas = u64::try_from(cost / paid_gas_price).unwrap_or(u64::MAX);
         paid_gas_price.saturating_mul(U256::from(poster_gas))
     }
 
-    /// Turn a compressed-byte count into posterGas (the L1-cost-as-L2-gas value).
-    /// Separated from compression so the arithmetic is deterministic and testable.
-    fn poster_gas_from_l1_bytes(&self, l1_bytes: u64, l2_base_fee: u64) -> u64 {
-        // gas price basis: the block base fee (see docs/todo.md for why not tx price),
-        // reduced to 7/8 to simulate congestion, floored at the L2 minimum base fee.
-        let mut price = U256::from(l2_base_fee).saturating_mul(U256::from(7u64)) / U256::from(8u64);
-        if price < self.min_base_fee {
-            price = self.min_base_fee;
+    /// Units added to `UnitsSinceUpdate` by Nitro's `GasChargingHook` before
+    /// executing an eth_call-style message.
+    pub(crate) fn current_tx_l1_units(&self, tx: &TxEnv) -> u64 {
+        self.poster_data_units(tx, false).unwrap_or_default()
+    }
+
+    /// Compute the transaction-local values Nitro's `GasChargingHook` exposes
+    /// through ArbGasInfo during call execution. Leafage runs this uniformly for
+    /// call and estimate paths so RPC gas estimation does not need a separate
+    /// `estimate_l1_overhead` pass.
+    pub fn gas_charging_charge(&self, tx: &TxEnv, paid_gas_price: U256) -> ArbPosterCharge {
+        let calldata_units = self.poster_data_units(tx, true).unwrap_or_default();
+        if paid_gas_price.is_zero() || calldata_units == 0 {
+            return ArbPosterCharge {
+                calldata_units,
+                paid_gas_price,
+                ..Default::default()
+            };
+        }
+
+        let poster_cost = self
+            .price_per_unit
+            .saturating_mul(U256::from(calldata_units));
+        let poster_cost = self.pad_estimation_cost(poster_cost);
+
+        let poster_gas = self.poster_gas_from_cost(poster_cost, paid_gas_price, true);
+        let poster_fee = paid_gas_price.saturating_mul(U256::from(poster_gas));
+
+        ArbPosterCharge {
+            poster_gas,
+            poster_fee,
+            calldata_units,
+            paid_gas_price,
+        }
+    }
+
+    /// Turn L1 poster cost into posterGas (the L1-cost-as-L2-gas value).
+    fn poster_gas_from_cost(&self, cost: U256, l2_gas_price: U256, adjust_price: bool) -> u64 {
+        let mut price = l2_gas_price;
+        if adjust_price {
+            price = price.saturating_mul(U256::from(7u64)) / U256::from(8u64);
+            if price < self.min_base_fee {
+                price = self.min_base_fee;
+            }
         }
         if price.is_zero() {
             return 0;
         }
 
-        u64::try_from(self.cost_for_l1_bytes(l1_bytes) / price).unwrap_or(u64::MAX)
+        u64::try_from(cost / price).unwrap_or(u64::MAX)
     }
 
-    fn cost_for_l1_bytes(&self, l1_bytes: u64) -> U256 {
+    fn poster_data_cost(&self, tx: &TxEnv, force_random_gas: bool) -> Option<U256> {
+        Some(
+            self.price_per_unit
+                .saturating_mul(U256::from(self.poster_data_units(tx, force_random_gas)?)),
+        )
+    }
+
+    fn poster_data_units(&self, tx: &TxEnv, force_random_gas: bool) -> Option<u64> {
+        let l1_bytes = brotli_len(&fake_tx_bytes(tx, force_random_gas), self.brotli_level)? as u64;
         let raw_units = TX_DATA_NON_ZERO_GAS.saturating_mul(l1_bytes);
         let units = (raw_units as u128 + ESTIMATION_PADDING_UNITS as u128) * UNITS_PADDING_BIPS
             / ONE_IN_BIPS as u128;
-        let cost = self.price_per_unit.saturating_mul(U256::from(units));
+        Some(units.min(u64::MAX as u128) as u64)
+    }
+
+    fn pad_estimation_cost(&self, cost: U256) -> U256 {
         cost.saturating_mul(U256::from(PRICE_PADDING_BIPS)) / U256::from(ONE_IN_BIPS)
     }
 }
@@ -216,20 +280,27 @@ mod tests {
     ///   gas   = 662_292_943_173 / 1e8 = 6622
     #[test]
     fn arithmetic_matches_nitro_formula() {
-        let gas = robinhood_pricing().poster_gas_from_l1_bytes(100, 100_000_000);
+        let p = robinhood_pricing();
+        let cost = p.price_per_unit.saturating_mul(U256::from(1874u64));
+        let gas = p.poster_gas_from_cost(
+            p.pad_estimation_cost(cost),
+            U256::from(100_000_000u64),
+            true,
+        );
         assert_eq!(gas, 6622);
     }
 
-    /// Base fee at/below the floor uses `min_base_fee`; the 7/8 reduction only
-    /// bites above it. base_fee=0 must give the same gas as base_fee=floor.
+    /// This checks the raw Nitro price-floor conversion. Public handler/RPC
+    /// entry points still skip L1 poster gas entirely when the block basefee is 0.
     #[test]
     fn price_is_floored_at_min_base_fee() {
         let p = robinhood_pricing();
-        let floored = p.poster_gas_from_l1_bytes(100, 100_000_000);
-        // base_fee at/below the floor uses min_base_fee: base_fee=0 == base_fee=floor.
-        assert_eq!(p.poster_gas_from_l1_bytes(100, 0), floored);
+        let cost = p.pad_estimation_cost(U256::from(1_000_000_000_000u64));
+        let floored = p.poster_gas_from_cost(cost, U256::from(100_000_000u64), true);
+        // Inside this helper, base_fee at/below the floor uses min_base_fee.
+        assert_eq!(p.poster_gas_from_cost(cost, U256::ZERO, true), floored);
         // 1 gwei base fee: price = max(1e9*7/8, 1e8) = 875_000_000 -> smaller gas.
-        let high = p.poster_gas_from_l1_bytes(100, 1_000_000_000);
+        let high = p.poster_gas_from_cost(cost, U256::from(1_000_000_000u64), true);
         assert!(
             high < floored,
             "higher base fee -> smaller posterGas, got {high}"
@@ -244,7 +315,10 @@ mod tests {
             min_base_fee: U256::ZERO,
             brotli_level: 1,
         };
-        assert_eq!(p.poster_gas_from_l1_bytes(100, 0), 0);
+        assert_eq!(
+            p.poster_gas_from_cost(U256::from(100u64), U256::ZERO, false),
+            0
+        );
     }
 
     fn sample_tx(data: Vec<u8>) -> TxEnv {
@@ -326,15 +400,29 @@ mod tests {
     }
 
     #[test]
-    fn current_tx_l1_fee_matches_estimation_poster_gas() {
+    fn current_tx_l1_fee_uses_eth_call_poster_cost_without_estimation_padding() {
         let p = robinhood_pricing();
         let mut tx = sample_tx(vec![0xabu8; 128]);
         tx.gas_limit = 21_000;
         let paid_gas_price = U256::from(100_000_000u64);
+        let cost = p.poster_data_cost(&tx, false).expect("poster data cost");
+        let poster_gas = cost / paid_gas_price;
 
         assert_eq!(
             p.current_tx_l1_fee(&tx, paid_gas_price),
-            U256::from(p.poster_gas(&tx, 100_000_000)).saturating_mul(paid_gas_price)
+            poster_gas.saturating_mul(paid_gas_price)
+        );
+    }
+
+    #[test]
+    fn gas_estimate_l1_component_does_not_apply_price_adjustment() {
+        let p = robinhood_pricing();
+        let tx = sample_tx(vec![0xabu8; 128]);
+        let high_base_fee = 1_000_000_000u64;
+
+        assert!(
+            p.gas_estimate_l1_component(&tx, high_base_fee) < p.poster_gas(&tx, high_base_fee),
+            "l1 component divides by base fee directly; poster_gas uses 7/8 adjusted price"
         );
     }
 

@@ -22,6 +22,7 @@ impl ArbGasInfo {
         let data = input.data;
         let current_arbos_version = input.current_arbos_version;
         let current_tx_l1_gas_fees = input.current_tx_l1_gas_fees;
+        let current_tx_l1_gas_units = input.current_tx_l1_gas_units;
         let context = input.context;
         dispatch::<IArbGasInfo::IArbGasInfoCalls>(data, gas_limit, |call, initial_gas| {
             if current_arbos_version < Self::required_arbos_version(&call) {
@@ -249,8 +250,9 @@ impl ArbGasInfo {
                 }
                 IArbGasInfo::IArbGasInfoCalls::getL1PricingUnitsSinceUpdate(_) => {
                     let l1_key = storage.l1_key();
-                    let value =
-                        storage.read_u64(&l1_key, arbos_state::L1_UNITS_SINCE_UPDATE_OFFSET)?;
+                    let value = storage
+                        .read_u64(&l1_key, arbos_state::L1_UNITS_SINCE_UPDATE_OFFSET)?
+                        .saturating_add(current_tx_l1_gas_units);
                     finish_call::<IArbGasInfo::getL1PricingUnitsSinceUpdateCall>(
                         gas_limit,
                         storage.gas_used,
@@ -350,6 +352,76 @@ impl ArbGasInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arbitrum::evm::ArbitrumExecutionContext;
+    use crate::arbitrum::hardforks::ArbitrumHardfork;
+    use crate::arbitrum::precompile::state::ArbStorage;
+    use crate::arbitrum::tx::ArbitrumTxEnv;
+    use alloy::sol_types::SolCall;
+    use leafage_evm_types::{BlockEnv, CfgEnv, U256};
+    use revm::context::{ContextTr, JournalTr};
+    use revm::database::in_memory_db::CacheDB;
+    use revm::database::EmptyDB;
+    use revm::{Context, MainContext};
+
+    fn context() -> ArbitrumContext<CacheDB<EmptyDB>> {
+        let db = CacheDB::new(EmptyDB::default());
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv::default())
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(db)
+            .with_chain(ArbitrumExecutionContext::default());
+        context
+            .journal_mut()
+            .load_account(arbos_state::ARBOS_STATE_ADDRESS)
+            .expect("load ArbOS state account");
+        context
+    }
+
+    #[test]
+    fn l1_pricing_units_since_update_includes_current_tx_units() {
+        let mut context = context();
+        {
+            let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+            storage
+                .write(&[], arbos_state::ARBOS_VERSION_OFFSET, U256::from(20))
+                .expect("write ArbOS version");
+            let l1_key = storage.l1_key();
+            storage
+                .write(
+                    &l1_key,
+                    arbos_state::L1_UNITS_SINCE_UPDATE_OFFSET,
+                    U256::from(1_000),
+                )
+                .expect("write units since update");
+        }
+
+        let data = IArbGasInfo::getL1PricingUnitsSinceUpdateCall {}.abi_encode();
+        let output = ArbGasInfo::run(ArbPrecompileInput {
+            data: &data,
+            gas: u64::MAX,
+            caller: Default::default(),
+            value: U256::ZERO,
+            is_static: false,
+            is_valid_call_context: true,
+            current_arbos_version: 20,
+            current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 23,
+            current_l1_block_number: 0,
+            current_retryable_ticket: None,
+            current_refund_to: None,
+            allow_debug_precompiles: false,
+            current_chain_config: None,
+            context: &mut context,
+        })
+        .expect("getL1PricingUnitsSinceUpdate");
+
+        assert_eq!(
+            IArbGasInfo::getL1PricingUnitsSinceUpdateCall::abi_decode_returns(&output.bytes)
+                .expect("decode return"),
+            1_023
+        );
+    }
 
     #[test]
     fn method_versions_match_nitro_registration() {
