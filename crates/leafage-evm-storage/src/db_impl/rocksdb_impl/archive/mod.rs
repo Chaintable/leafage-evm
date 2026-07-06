@@ -24,7 +24,7 @@
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding,
+    inverted_block_encoding, set_inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
@@ -35,9 +35,9 @@ use leafage_evm_types::{
     H256, KECCAK256_EMPTY, U256,
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, IngestExternalFileOptions,
-    IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter, WriteBatch, WriteOptions,
-    DB,
+    BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
+    CompactOptions, IngestExternalFileOptions, IteratorMode, Options, ReadOptions, SliceTransform,
+    SstFileWriter, WriteBatch, WriteOptions, DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
@@ -51,7 +51,7 @@ use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 /// Global iterator tracker for StateDB instances
@@ -99,6 +99,20 @@ fn rocksdb_read_options() -> ReadOptions {
     let mut read_options = ReadOptions::default();
     read_options.set_verify_checksums(false);
     read_options
+}
+
+/// Reserved key (stored in the `LatestBlockHash` CF) recording whether this
+/// archive DB uses the inverted (descending) block-height key encoding. Lets
+/// the node auto-detect the encoding at open time instead of relying solely on
+/// the `--inverted-block-encoding` flag (which, if wrong, silently corrupts
+/// reads). Value: a single byte, `1` = inverted, `0` = legacy. Absent = a
+/// legacy DB, or one written before the marker existed.
+const ENCODING_MARKER_KEY: &[u8] = b"leafage:block_encoding_inverted";
+
+/// Format a duration (seconds) as `HhMMmSSs` for progress/ETA logs.
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}h{:02}m{:02}s", s / 3600, (s % 3600) / 60, s % 60)
 }
 
 /// Debug aid for migration: when `MIGRATE_DEBUG_ADDR_HASH` is set to the
@@ -298,16 +312,33 @@ fn rocksdb_column_options(
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_pin_top_level_index_and_filter(true);
-    block_opts.set_bloom_filter(10.0, fixed_prefix_size != 0);
+    // Hybrid ribbon filter: same 10-bits/key-equivalent FP rate as the
+    // previous bloom at ~30% less filter memory. Levels below 1 (i.e. L0,
+    // where build speed matters on the flush path) keep plain bloom; deeper
+    // levels — holding nearly all filter bytes — use ribbon, whose higher
+    // build cost lands on background compaction. Old SSTs with bloom filters
+    // remain readable; new filters appear as compaction rewrites files.
+    block_opts.set_hybrid_ribbon_filter(10.0, 1);
+    // Size filters to land on allocator bin boundaries (jemalloc) instead of
+    // wasting the slack — a few percent less filter memory for free.
+    block_opts.set_optimize_filters_for_memory(true);
+    if fixed_prefix_size != 0 {
+        // The versioned CFs (AddressToAccount, AddressToStorage) are only
+        // ever read via prefix Seek — never point Get — so whole-key filter
+        // entries can never be consulted. Keeping only the prefix entries
+        // roughly halves the filter size. CFs without a prefix extractor
+        // (HashToCode etc.) are read via Get and keep whole-key filtering.
+        block_opts.set_whole_key_filtering(false);
+    }
     block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
     block_opts.set_partition_filters(true);
     block_opts.set_metadata_block_size(4096);
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
-    // Allow the writer to roll into a fresh memtable while older ones are
-    // still being flushed (default is 2). Helps under sustained write load
-    // such as archive bulk-load.
+                                                              // Allow the writer to roll into a fresh memtable while older ones are
+                                                              // still being flushed (default is 2). Helps under sustained write load
+                                                              // such as archive bulk-load.
     cf_opts.set_max_write_buffer_number(4);
     // Larger SST files = fewer files at every level = less metadata,
     // smaller index/bloom overhead, fewer files for compaction to track.
@@ -435,11 +466,11 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.set_write_buffer_size(1 << 28); // e.g., 256MB
     opts.set_max_bytes_for_level_base(1 << 28); // e.g., 256MB
     opts.set_max_total_wal_size(1 << 29); // e.g., 512MB
-    // Background concurrency. The previous value (2) covered flush + a single
-    // compaction job, which serialised L0 → L1 across CFs and bottlenecked
-    // archive bulk-load; standalone reads/writes also benefit from faster
-    // background compaction. `max_subcompactions` lets a single big
-    // compaction (e.g. AddressToStorage) split into parallel ranges.
+                                          // Background concurrency. The previous value (2) covered flush + a single
+                                          // compaction job, which serialised L0 → L1 across CFs and bottlenecked
+                                          // archive bulk-load; standalone reads/writes also benefit from faster
+                                          // background compaction. `max_subcompactions` lets a single big
+                                          // compaction (e.g. AddressToStorage) split into parallel ranges.
     opts.increase_parallelism(8);
     opts.set_max_subcompactions(4);
     opts.set_use_direct_io_for_flush_and_compaction(true);
@@ -467,6 +498,362 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts.set_stats_dump_period_sec(0);
 
     opts
+}
+
+/// Build the six archive column-family descriptors with the standard archive
+/// options. Shared by [`DataBaseRef::open_inner`] and the offline re-encode
+/// path so a re-encoded DB is option-compatible with a normally-opened one.
+fn archive_cf_descriptors(
+    shared_cache: &Cache,
+    disable_auto_compactions: bool,
+    bulk_load: bool,
+    archive_zstd_compression: bool,
+) -> Vec<ColumnFamilyDescriptor> {
+    // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
+    // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at deep
+    // levels via `archive_zstd_compression` for ~15-20% extra ratio at the cost
+    // of ~2× compaction CPU and ~3× cold-read decode latency. HashToCode is
+    // always Zstd: code blobs benefit from dict compression regardless.
+    let big_cf_compression = if archive_zstd_compression {
+        CfCompression::Zstd
+    } else {
+        CfCompression::Lz4
+    };
+    vec![
+        // LatestBlockHash: single record, no compression needed
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::LatestBlockHash.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        // BlockNumToBlockHash: 32 bytes value, no compression needed
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::BlockNumToBlockHash.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::AddressToAccount.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                32,
+                disable_auto_compactions,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::AddressToStorage.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                64,
+                disable_auto_compactions,
+                big_cf_compression,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::HashToCode.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                0,
+                disable_auto_compactions,
+                CfCompression::Zstd,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
+    ]
+}
+
+/// Streams **strictly-ascending** `(key, value)` pairs into a series of rolled
+/// SST files for later `ingest_external_file`. Keys must be globally ascending
+/// across all `put` calls; the file is rolled whenever it exceeds `roll_bytes`
+/// (any split of an ascending stream yields non-overlapping files, which ingest
+/// can place across levels instead of piling into L0).
+struct SstSink<'a> {
+    opts: &'a Options,
+    tmp_dir: std::path::PathBuf,
+    name: String,
+    roll_bytes: u64,
+    seq: u64,
+    writer: Option<SstFileWriter<'a>>,
+    cur_path: std::path::PathBuf,
+    has_rows: bool,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl<'a> SstSink<'a> {
+    fn new(opts: &'a Options, tmp_dir: std::path::PathBuf, name: String, roll_bytes: u64) -> Self {
+        Self {
+            opts,
+            tmp_dir,
+            name,
+            roll_bytes,
+            seq: 0,
+            writer: None,
+            cur_path: std::path::PathBuf::new(),
+            has_rows: false,
+            paths: Vec::new(),
+        }
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        if self.writer.is_none() {
+            let p = self
+                .tmp_dir
+                .join(format!("{}_{:06}.sst", self.name, self.seq));
+            self.seq += 1;
+            let w = SstFileWriter::create(self.opts);
+            w.open(&p)?;
+            self.writer = Some(w);
+            self.cur_path = p;
+            self.has_rows = false;
+        }
+        let w = self.writer.as_mut().unwrap();
+        w.put(key, value)?;
+        self.has_rows = true;
+        if w.file_size() >= self.roll_bytes {
+            self.writer.take().unwrap().finish()?;
+            self.paths.push(std::mem::take(&mut self.cur_path));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<std::path::PathBuf>, Error> {
+        if let Some(mut w) = self.writer.take() {
+            if self.has_rows {
+                w.finish()?;
+                self.paths.push(self.cur_path);
+            }
+        }
+        Ok(self.paths)
+    }
+}
+
+/// Split the leading-byte keyspace `0..=255` into `jobs` contiguous shards,
+/// each `(lo, hi)` covering first-byte `[lo, hi)` (`hi = None` = to the end).
+/// Account/storage keys begin with a uniformly-distributed 32-byte hash, so
+/// equal byte ranges give roughly balanced shards.
+fn shard_bounds(jobs: usize) -> Vec<(u8, Option<u8>)> {
+    let jobs = jobs.clamp(1, 256);
+    (0..jobs)
+        .map(|i| {
+            let lo = (i * 256 / jobs) as u8;
+            let hi_idx = (i + 1) * 256 / jobs;
+            let hi = if hi_idx >= 256 {
+                None
+            } else {
+                Some(hi_idx as u8)
+            };
+            (lo, hi)
+        })
+        .collect()
+}
+
+/// Re-encode one versioned CF (`AddressToAccount`/`AddressToStorage`) from
+/// legacy into inverted SST files using `jobs` parallel workers sharded by the
+/// leading key byte, then ingest them. Each worker scans its disjoint key
+/// range, buffers one prefix at a time and emits it sorted (the tail rewrite
+/// reverses order within a prefix), and drops orphaned `u64::MAX` sentinels.
+/// Returns `(kept, dropped)`.
+#[allow(clippy::too_many_arguments)]
+fn reencode_versioned_cf(
+    src: &DB,
+    dst: &DB,
+    col: StorageTypeColumn,
+    prefix_len: usize,
+    jobs: usize,
+    sst_opts: &Options,
+    tmp_dir: &Path,
+    roll_bytes: u64,
+) -> Result<(u64, u64), Error> {
+    let bounds = shard_bounds(jobs);
+    let n = bounds.len();
+    let processed = AtomicU64::new(0);
+    let kept = AtomicU64::new(0);
+    let dropped = AtomicU64::new(0);
+    let progress_bps: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let stop = AtomicBool::new(false);
+    let start = std::time::Instant::now();
+    let name = col.to_str();
+    let label = col.to_display();
+
+    let paths = std::thread::scope(|scope| -> Result<Vec<std::path::PathBuf>, Error> {
+        // Progress monitor: keyspace position (leading byte), robust to the
+        // obsolete-entry inflation that makes key counts useless here.
+        scope.spawn(|| {
+            let mut ticks = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticks += 1;
+                if ticks % 5 != 0 {
+                    continue; // log every ~5s, but check `stop` every 1s
+                }
+                let covered: f64 = bounds
+                    .iter()
+                    .zip(&progress_bps)
+                    .map(|((lo, hi), bps)| {
+                        let width = (hi.map(u32::from).unwrap_or(256) - *lo as u32) as f64;
+                        width * (bps.load(Ordering::Relaxed) as f64 / 10_000.0)
+                    })
+                    .sum();
+                let frac = (covered / 256.0).clamp(0.0, 1.0);
+                let elapsed = start.elapsed().as_secs_f64();
+                let eta = if frac > 0.0001 {
+                    elapsed * (1.0 - frac) / frac
+                } else {
+                    0.0
+                };
+                info!(target: "migrate",
+                    "reencode {} progress: {:.2}% of keyspace, {} records, elapsed={} eta~{}",
+                    label, frac * 100.0, processed.load(Ordering::Relaxed),
+                    fmt_hms(elapsed), fmt_hms(eta));
+            }
+        });
+
+        let mut handles = Vec::with_capacity(n);
+        for (i, (lo, hi)) in bounds.iter().copied().enumerate() {
+            let processed = &processed;
+            let kept = &kept;
+            let dropped = &dropped;
+            let progress_bps = &progress_bps;
+            handles.push(
+                scope.spawn(move || -> Result<Vec<std::path::PathBuf>, Error> {
+                    let cf = src.cf_handle(name).unwrap();
+                    let mut ro = ReadOptions::default();
+                    ro.set_verify_checksums(false);
+                    ro.set_total_order_seek(true);
+                    ro.set_readahead_size(16 * 1024 * 1024);
+                    ro.set_iterate_lower_bound(vec![lo]);
+                    if let Some(h) = hi {
+                        ro.set_iterate_upper_bound(vec![h]);
+                    }
+                    // Shard position is taken from the leading 4 key bytes
+                    // (uniform hash) for smooth sub-byte progress; a single byte
+                    // is too coarse (billions of keys share one leading byte).
+                    let lo_w = (lo as u64) << 24;
+                    let hi_w = hi.map(|h| (h as u64) << 24).unwrap_or(1u64 << 32);
+                    let range_w = (hi_w - lo_w).max(1);
+                    let mut sink = SstSink::new(
+                        sst_opts,
+                        tmp_dir.to_path_buf(),
+                        format!("{name}_{i}"),
+                        roll_bytes,
+                    );
+                    let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let mut cur_prefix: Option<Vec<u8>> = None;
+                    let mut local_kept = 0u64;
+                    let mut local_dropped = 0u64;
+                    let mut since_report = 0u64;
+
+                    fn flush_prefix(
+                        buf: &mut Vec<(Vec<u8>, Vec<u8>)>,
+                        sink: &mut SstSink,
+                    ) -> Result<u64, Error> {
+                        buf.sort_by(|a, b| a.0.cmp(&b.0));
+                        for (k, v) in buf.iter() {
+                            sink.put(k, v)?;
+                        }
+                        let c = buf.len() as u64;
+                        buf.clear();
+                        Ok(c)
+                    }
+
+                    for item in src.iterator_cf_opt(cf, ro, IteratorMode::Start) {
+                        let (key, value) = item.map_err(Error::RocksDB)?;
+                        let klen = key.len();
+                        let block = u64::from_be_bytes(key[klen - 8..].try_into().unwrap());
+                        since_report += 1;
+                        if since_report >= 50_000 {
+                            processed.fetch_add(since_report, Ordering::Relaxed);
+                            since_report = 0;
+                            let key_w =
+                                u32::from_be_bytes(key[0..4].try_into().unwrap()) as u64;
+                            let pos = key_w.saturating_sub(lo_w) as f64 / range_w as f64;
+                            progress_bps[i]
+                                .store((pos.clamp(0.0, 1.0) * 10_000.0) as u32, Ordering::Relaxed);
+                        }
+                        if block == u64::MAX {
+                            local_dropped += 1; // orphaned pre-#104 dual-write sentinel
+                            continue;
+                        }
+                        if cur_prefix.as_deref() != Some(&key[..prefix_len]) {
+                            if !buf.is_empty() {
+                                local_kept += flush_prefix(&mut buf, &mut sink)?;
+                            }
+                            cur_prefix = Some(key[..prefix_len].to_vec());
+                        }
+                        let mut new_key = key.to_vec();
+                        new_key[klen - 8..].copy_from_slice(&(u64::MAX - block).to_be_bytes());
+                        buf.push((new_key, value.to_vec()));
+                    }
+                    if !buf.is_empty() {
+                        local_kept += flush_prefix(&mut buf, &mut sink)?;
+                    }
+                    processed.fetch_add(since_report, Ordering::Relaxed);
+                    kept.fetch_add(local_kept, Ordering::Relaxed);
+                    dropped.fetch_add(local_dropped, Ordering::Relaxed);
+                    progress_bps[i].store(10_000, Ordering::Relaxed);
+                    sink.finish()
+                }),
+            );
+        }
+
+        let mut paths = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(r) => paths.extend(r?),
+                Err(_) => {
+                    stop.store(true, Ordering::Relaxed);
+                    return Err(Error::UnSupported(format!(
+                        "reencode worker for {name} panicked"
+                    )));
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        Ok(paths)
+    })?;
+
+    if !paths.is_empty() {
+        let cf = dst.cf_handle(name).unwrap();
+        dst.ingest_external_file_cf_opts(cf, &DataBaseRef::ingest_external_file_options(), paths)
+            .map_err(Error::RocksDB)?;
+    }
+    Ok((
+        kept.load(Ordering::Relaxed),
+        dropped.load(Ordering::Relaxed),
+    ))
 }
 
 impl DataBaseRef {
@@ -542,95 +929,12 @@ impl DataBaseRef {
             archive_zstd_compression,
         );
 
-        // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
-        // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at
-        // deep levels via `archive_zstd_compression` for ~15-20% extra ratio
-        // at the cost of ~2× compaction CPU and ~3× cold-read decode latency.
-        // HashToCode is always Zstd: code blobs benefit from dict compression
-        // regardless of the flag.
-        let big_cf_compression = if archive_zstd_compression {
-            CfCompression::Zstd
-        } else {
-            CfCompression::Lz4
-        };
-
-        // LatestBlockHash: single record, no compression needed
-        let latest_block_hash_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
+        let cfs = archive_cf_descriptors(
+            &shared_cache,
+            disable_auto_compactions,
+            bulk_load,
+            archive_zstd_compression,
         );
-        let block_hash_to_block_info_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        // BlockNumToBlockHash: 32 bytes value, no compression needed
-        let block_num_to_block_hash_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        let address_to_account_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                32,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        let address_to_storage_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                64,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
-        let hash_to_code_cf = ColumnFamilyDescriptor::new(
-            StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(
-                &shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::Zstd,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        );
-        let cfs = vec![
-            latest_block_hash_cf,
-            block_hash_to_block_info_cf,
-            block_num_to_block_hash_cf,
-            address_to_account_cf,
-            address_to_storage_cf,
-            hash_to_code_cf,
-        ];
         let db_opt = rocksdb_options(disable_auto_compactions);
         let db = DB::open_cf_descriptors(&db_opt, path, cfs).unwrap();
         let cols = vec![
@@ -684,13 +988,263 @@ impl DataBaseRef {
             ),
         ];
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
-        Self {
+        let db_ref = Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
-        }
+        };
+        // Self-describing encoding: if the DB records its block-height key
+        // encoding, honor it (a legacy DB has no marker and is left untouched),
+        // so the node can't mistake an inverted DB for a legacy one.
+        db_ref.align_encoding_from_marker();
+        db_ref
     }
 }
 
 impl DataBaseRef {
+    /// Read the stored block-height encoding marker: `Some(true)` = inverted,
+    /// `Some(false)` = legacy, `None` = unmarked (legacy / pre-marker).
+    pub fn read_encoding_marker(&self) -> Result<Option<bool>, Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        Ok(self
+            .db
+            .get_cf_opt(cf, ENCODING_MARKER_KEY, &rocksdb_read_options())?
+            .and_then(|v| v.first().copied())
+            .map(|b| b == 1))
+    }
+
+    /// Record this DB's block-height encoding so future opens are self-describing.
+    pub fn write_encoding_marker(&self, inverted: bool) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+            .unwrap();
+        self.db.put_cf(cf, ENCODING_MARKER_KEY, [inverted as u8])?;
+        Ok(())
+    }
+
+    /// If the DB carries an encoding marker, align the process-wide
+    /// `inverted_block_encoding` flag to it (warning if the configured flag
+    /// disagreed). The DB is the source of truth; the CLI flag is only a
+    /// fallback for unmarked legacy DBs.
+    fn align_encoding_from_marker(&self) {
+        match self.read_encoding_marker() {
+            Ok(Some(inv)) => {
+                if inv != inverted_block_encoding() {
+                    warn!(
+                        target: "rocksdb",
+                        "archive DB encoding marker = inverted:{}, but configured \
+                         --inverted-block-encoding = {}; trusting the DB marker",
+                        inv,
+                        inverted_block_encoding()
+                    );
+                }
+                set_inverted_block_encoding(inv);
+            }
+            Ok(None) => {} // unmarked legacy DB: keep the configured flag
+            Err(e) => warn!(target: "rocksdb", "failed to read encoding marker: {e}"),
+        }
+    }
+
+    /// Offline rebuild of a **legacy (ascending)** archive RocksDB into the
+    /// **inverted (descending)** block-height key encoding, without re-syncing
+    /// from S3.
+    ///
+    /// Pure byte-level transform: only the `AddressToAccount` /
+    /// `AddressToStorage` version tails are rewritten (`block_num` ->
+    /// `u64::MAX - block_num`); every other CF is copied verbatim. Orphaned
+    /// pre-#104 dual-write `u64::MAX` latest-pointer rows are dropped — the
+    /// inverted reader (forward `seek` to the real head) never uses them, and
+    /// keeping them would shadow the real newest version.
+    ///
+    /// Uses raw `rocksdb::DB` handles rather than the `DATA_BASE` singleton, so
+    /// source and destination can be open at once; the source is opened
+    /// read-only and is never modified. The destination is created fresh with
+    /// the standard archive CF options, so it is option-compatible with a
+    /// normally-opened archive DB. The destination must not already exist /
+    /// contain these CFs.
+    pub fn reencode_legacy_to_inverted<P: AsRef<Path>>(
+        src_path: P,
+        dst_path: P,
+        cache_size: usize,
+        jobs: usize,
+    ) -> Result<(), Error> {
+        // 0 = auto: one worker per core, capped (more than ~16 rarely helps and
+        // just multiplies the per-shard read/SST overhead).
+        let jobs = if jobs == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 16)
+        } else {
+            jobs.clamp(1, 16)
+        };
+        info!(target: "migrate", "reencode: legacy -> inverted with {jobs} worker(s)");
+
+        // Source: read-only, bounded fds (archive DBs have very many SSTs, so
+        // the default unlimited max_open_files trips the OS fd limit).
+        let mut src_opts = Options::default();
+        src_opts.set_max_open_files(
+            env::var("ROCKSDB_MAX_OPEN_FILE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(512),
+        );
+        let cf_names = [
+            StorageTypeColumn::LatestBlockHash.to_str(),
+            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
+            StorageTypeColumn::BlockNumToBlockHash.to_str(),
+            StorageTypeColumn::AddressToAccount.to_str(),
+            StorageTypeColumn::AddressToStorage.to_str(),
+            StorageTypeColumn::HashToCode.to_str(),
+        ];
+        let src = DB::open_cf_for_read_only(&src_opts, &src_path, cf_names, false)
+            .map_err(Error::RocksDB)?;
+
+        // Guard: refuse to re-encode a source that is already inverted.
+        {
+            let src_cf1 = src
+                .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+                .unwrap();
+            let marker = src
+                .get_cf(src_cf1, ENCODING_MARKER_KEY)
+                .map_err(Error::RocksDB)?
+                .and_then(|v| v.first().copied());
+            if marker == Some(1) {
+                return Err(Error::UnSupported(
+                    "source archive is already inverted (encoding marker = inverted); \
+                     nothing to re-encode"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Destination: fresh DB with the standard archive CF options.
+        let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * cache_size, 8192);
+        let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false);
+        let dst = DB::open_cf_descriptors(&rocksdb_options(false), &dst_path, dst_cfs)
+            .map_err(Error::RocksDB)?;
+
+        // Full-scan read options: total_order_seek so the prefix-extractor CFs
+        // are traversed completely (a migration must not drop any key), plus a
+        // large readahead so the sequential scan stays disk-sequential.
+        let scan_ro = || {
+            let mut r = ReadOptions::default();
+            r.set_verify_checksums(false);
+            r.set_total_order_seek(true);
+            r.set_readahead_size(16 * 1024 * 1024);
+            r
+        };
+
+        let start = std::time::Instant::now();
+
+        // SST staging dir on the SAME filesystem as the destination, so ingest
+        // with move_files=true renames files in instead of copying them.
+        let tmp_dir = dst_path.as_ref().join(".reencode_tmp");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| Error::UnSupported(format!("create SST staging dir: {e}")))?;
+        let sst_opts = Self::sst_writer_options();
+        const ROLL_BYTES: u64 = 512 * 1024 * 1024;
+
+        // 1) Non-versioned CFs: copy verbatim (src is already key-ascending).
+        for col in [
+            StorageTypeColumn::LatestBlockHash,
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::HashToCode,
+        ] {
+            let src_cf = src.cf_handle(col.to_str()).unwrap();
+            let mut sink = SstSink::new(
+                &sst_opts,
+                tmp_dir.clone(),
+                col.to_str().to_string(),
+                ROLL_BYTES,
+            );
+            let mut n = 0usize;
+            for item in src.iterator_cf_opt(src_cf, scan_ro(), IteratorMode::Start) {
+                let (key, value) = item.map_err(Error::RocksDB)?;
+                sink.put(&key, &value)?;
+                n += 1;
+            }
+            let paths = sink.finish()?;
+            if !paths.is_empty() {
+                let cf = dst.cf_handle(col.to_str()).unwrap();
+                dst.ingest_external_file_cf_opts(cf, &Self::ingest_external_file_options(), paths)
+                    .map_err(Error::RocksDB)?;
+            }
+            info!(target: "migrate", "reencode: copied {} {} records", n, col);
+        }
+
+        // 2) Versioned CFs: parallel sharded re-encode (tail rewrite + sentinel
+        //    drop) into SSTs, then ingest. See `reencode_versioned_cf`.
+        let (acc_kept, acc_dropped) = reencode_versioned_cf(
+            &src,
+            &dst,
+            StorageTypeColumn::AddressToAccount,
+            32,
+            jobs,
+            &sst_opts,
+            &tmp_dir,
+            ROLL_BYTES,
+        )?;
+        info!(target: "migrate",
+            "reencode: rewrote {} AddressToAccount records ({} u64::MAX sentinels dropped)",
+            acc_kept, acc_dropped);
+        let (sto_kept, sto_dropped) = reencode_versioned_cf(
+            &src,
+            &dst,
+            StorageTypeColumn::AddressToStorage,
+            64,
+            jobs,
+            &sst_opts,
+            &tmp_dir,
+            ROLL_BYTES,
+        )?;
+        info!(target: "migrate",
+            "reencode: rewrote {} AddressToStorage records ({} u64::MAX sentinels dropped)",
+            sto_kept, sto_dropped);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // Mark the destination as inverted so the node auto-detects it at open.
+        {
+            let dst_cf1 = dst
+                .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+                .unwrap();
+            dst.put_cf(dst_cf1, ENCODING_MARKER_KEY, [1u8])
+                .map_err(Error::RocksDB)?;
+        }
+
+        dst.flush().map_err(Error::RocksDB)?;
+        info!(target: "migrate",
+            "reencode: ingest done in {}, destination flushed and marked inverted",
+            fmt_hms(start.elapsed().as_secs_f64()));
+
+        // Release the raw handles (locks + fds) before the heavy compaction.
+        drop(dst);
+        drop(src);
+
+        // Compact, like archive-init does: the ingested SSTs carry only default
+        // table properties (no prefix bloom, non-partitioned index), and a
+        // balanced LSM won't auto-compact — so rewrite them through the archive
+        // CF options to regenerate the prefix bloom + partitioned index the
+        // read path is tuned for. Reuses the memory-bounded range-segmented
+        // `compact()`.
+        info!(target: "migrate", "reencode: compacting destination (regenerates bloom/index)...");
+        let compact_start = std::time::Instant::now();
+        {
+            let db = DataBaseRef::open(dst_path.as_ref(), cache_size, true, false);
+            db.compact()?;
+        }
+        info!(target: "migrate",
+            "reencode: compaction done in {}; total {}",
+            fmt_hms(compact_start.elapsed().as_secs_f64()),
+            fmt_hms(start.elapsed().as_secs_f64()));
+        Ok(())
+    }
+
     pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
         let block_num_to_block_hash_cf = self
@@ -942,6 +1496,26 @@ impl DataBaseRef {
             StorageTypeColumn::HashToCode,
         ];
 
+        // Force bottommost-level compaction. The archive bulk-load path
+        // (`archive-init` and `db-migrate --reencode-inverted`) writes external
+        // SST files via `SstFileWriter` whose options carry only compression —
+        // NO prefix extractor, NO bloom filter, non-partitioned index (see
+        // `sst_writer_options`). On ingest into a fresh/empty DB, RocksDB places
+        // most of these files directly at the bottommost level. RocksDB's
+        // default manual-compaction policy (`kIfHaveCompactionFilter`) then
+        // SKIPS bottommost files that don't need merging, so those directly
+        // ingested files are NEVER rewritten through the CF's block-based table
+        // factory — they keep their default layout and stay filter-less forever.
+        // For the archive read path this is fatal: the inverted-encoding forward
+        // `Seek` relies on the per-CF prefix bloom to skip SSTs, and a file with
+        // no prefix bloom cannot be skipped, so every account/storage lookup
+        // must position inside these giant files. `kForce` guarantees the
+        // bottommost level is rewritten, regenerating the prefix bloom +
+        // partitioned index the read path is tuned for (and resizing the files
+        // to `target_file_size_base`). This makes the final compact O(DB size)
+        // once, which is the intended one-time cost of a bulk-load finalize.
+        let compact_opts = Self::force_bottommost_compact_options();
+
         for cf_type in column_families {
             let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
             info!(target: "archive_compact", "Compacting column family: {}", cf_type);
@@ -950,16 +1524,21 @@ impl DataBaseRef {
             // to further reduce memory usage
             match cf_type {
                 StorageTypeColumn::AddressToAccount => {
-                    // Key structure: address (32) || block_num (8) = 40 bytes
-                    self.compact_cf_by_prefix::<40>(cf);
+                    // Key structure: address (32) || block_num (32) = 64 bytes.
+                    // KEY_LEN must equal the full encoded key width so the
+                    // per-range `end` bound (`nibble || 0xFF..`) covers every
+                    // reachable key in the range and leaves no gap between
+                    // consecutive ranges.
+                    self.compact_cf_by_prefix::<64>(cf, &compact_opts);
                 }
                 StorageTypeColumn::AddressToStorage => {
-                    // Key structure: address (32) || index (32) || block_num (8) = 72 bytes
-                    self.compact_cf_by_prefix::<72>(cf);
+                    // Key structure: address (32) || slot (32) || block_num (32) = 96 bytes.
+                    self.compact_cf_by_prefix::<96>(cf, &compact_opts);
                 }
                 _ => {
                     // Small column families can be compacted in one go
-                    self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+                    self.db
+                        .compact_range_cf_opt(cf, None::<&[u8]>, None::<&[u8]>, &compact_opts);
                 }
             }
 
@@ -969,17 +1548,97 @@ impl DataBaseRef {
         Ok(())
     }
 
+    /// `CompactOptions` used by every manual compaction in this module.
+    ///
+    /// The one setting that matters is `bottommost_level_compaction = kForce`:
+    /// without it, externally-ingested SST files that landed at the bottommost
+    /// level keep their (filter-less, non-partitioned-index) default layout,
+    /// defeating the inverted-encoding read path. See [`Self::compact`] for the
+    /// full rationale.
+    fn force_bottommost_compact_options() -> CompactOptions {
+        let mut opts = CompactOptions::default();
+        opts.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+        opts
+    }
+
     /// Compact a column family in 16 ranges based on first byte's high nibble.
     /// This reduces memory usage by processing smaller chunks at a time.
-    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily) {
+    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily, opts: &CompactOptions) {
         for i in 0u8..16 {
             let start = [i << 4];
             let mut end = [0xFFu8; KEY_LEN];
             end[0] = (i << 4) | 0x0F;
             info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
                 i + 1, i << 4, (i << 4) | 0x0F);
-            self.db.compact_range_cf(cf, Some(&start), Some(&end));
+            self.db
+                .compact_range_cf_opt(cf, Some(&start), Some(&end), opts);
         }
+    }
+
+    /// Post-compaction sanity check for the versioned archive CFs.
+    ///
+    /// rust-rocksdb's `compact_range_cf_opt` (and the underlying C
+    /// `rocksdb_compact_range_cf_opt`) return `()` and DISCARD the
+    /// `CompactRange` `Status`, so a manual compaction that fails midway (disk
+    /// full, paused, I/O error) is invisible to [`Self::compact`] — it still
+    /// returns `Ok(())`. For a repair entry point that is dangerous: a
+    /// half-done compaction would be reported as a successful fix.
+    ///
+    /// We verify the *outcome* instead of trusting the (missing) status. After a
+    /// forced full compaction, every SST in `AddressToAccount` /
+    /// `AddressToStorage` must have been rewritten through the CF's block-based
+    /// table factory — which regenerates the prefix bloom + partitioned index —
+    /// and resized to `target_file_size_base` (128 MiB). An SST far larger than
+    /// that is a raw bulk-load ingest (`SstFileWriter`, `ROLL_BYTES = 512 MiB`,
+    /// no prefix bloom) that was never rewritten, so its presence means the
+    /// compaction did not run to completion. Surface it as an error.
+    ///
+    /// Also logs a per-CF summary (file count / max size / total) so operators
+    /// can see the LSM shape before/after.
+    pub fn verify_archive_compacted(&self) -> Result<(), Error> {
+        // 2x target_file_size_base (128 MiB). RocksDB may slightly exceed the
+        // target for a single oversized key, but nothing legitimate approaches
+        // 256 MiB under target_file_size_multiplier = 1; a ~512 MiB file is an
+        // un-rewritten bulk-load ingest.
+        const OVERSIZED_BYTES: usize = 256 * 1024 * 1024;
+
+        let versioned = [
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+        ];
+        let files = self.db.live_files()?;
+
+        let mut oversized: Vec<&rocksdb::LiveFile> = Vec::new();
+        for cf in versioned {
+            let name = cf.to_str();
+            let cf_files: Vec<_> = files
+                .iter()
+                .filter(|f| f.column_family_name == name)
+                .collect();
+            let count = cf_files.len();
+            let total: usize = cf_files.iter().map(|f| f.size).sum();
+            let max = cf_files.iter().map(|f| f.size).max().unwrap_or(0);
+            info!(
+                target: "archive_compact",
+                "CF {} post-compaction: files={} total={}MiB max_file={}MiB",
+                cf, count, total / (1024 * 1024), max / (1024 * 1024),
+            );
+            oversized.extend(cf_files.into_iter().filter(|f| f.size > OVERSIZED_BYTES));
+        }
+
+        if !oversized.is_empty() {
+            let total: usize = oversized.iter().map(|f| f.size).sum();
+            return Err(Error::UnSupported(format!(
+                "archive compaction incomplete: {} oversized SST file(s) (~{}MiB) remain in the \
+                 versioned CFs — they were never rewritten through the table factory and still \
+                 lack the prefix bloom the read path depends on. The manual compaction likely \
+                 failed silently (RocksDB CompactRange discards its Status). Check the logs and \
+                 free disk, then re-run.",
+                oversized.len(),
+                total / (1024 * 1024),
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1049,7 +1708,10 @@ impl LatestStateDBIterator for DataBaseRef {
                             "skip(deleted = absent at head)".to_string()
                         } else {
                             let acc = SlimAccount::decode(&mut value.as_ref()).unwrap();
-                            format!("EMIT -> snapshot (nonce={}, balance={})", acc.nonce, acc.balance)
+                            format!(
+                                "EMIT -> snapshot (nonce={}, balance={})",
+                                acc.nonce, acc.balance
+                            )
                         };
                         debug!(target: "migrate_debug",
                             "account key=0x{} tail=0x{} block={} newest={} -> {}",
@@ -2144,7 +2806,9 @@ mod rewind_tests {
                 .unwrap();
             let block2 = make_block_info_at(2, H256::repeat_byte(0x22), block1.header.hash);
             let diff2 = make_diff(addr, slot, 200, 2, 9);
-            latest(&db).update_block(block2.clone(), diff2.clone()).unwrap();
+            latest(&db)
+                .update_block(block2.clone(), diff2.clone())
+                .unwrap();
 
             // Rewind the head pointer to block 1 with an empty diff.
             latest(&db)
@@ -2169,7 +2833,10 @@ mod rewind_tests {
             );
             let account = state_at_2.0.read_account(addr).unwrap().unwrap();
             assert_eq!(account.balance, U256::from(200));
-            assert_eq!(state_at_2.0.read_storage(addr, slot).unwrap(), U256::from(9));
+            assert_eq!(
+                state_at_2.0.read_storage(addr, slot).unwrap(),
+                U256::from(9)
+            );
 
             // Replaying block 2's diff converges back to the old head.
             latest(&db).update_block(block2.clone(), diff2).unwrap();
@@ -2328,10 +2995,8 @@ mod inverted_encoding_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
-        let dir = std::env::temp_dir().join(format!(
-            "leafage-archive-sentinel-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leafage-archive-sentinel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
             let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
@@ -2362,13 +3027,12 @@ mod inverted_encoding_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                 .unwrap();
-            let stale_acct =
-                crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
-                    address: addr,
-                    balance: U256::from(100u64),
-                    nonce: 1,
-                    code_hash: KECCAK256_EMPTY.0.into(),
-                });
+            let stale_acct = crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                address: addr,
+                balance: U256::from(100u64),
+                nonce: 1,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            });
             db.db
                 .put_cf(
                     acct_cf,
@@ -2410,6 +3074,127 @@ mod inverted_encoding_tests {
         let _ = std::fs::remove_dir_all(&dir);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
+
+    /// End-to-end offline re-encode: build a LEGACY archive (with a stale
+    /// dual-write sentinel), run `reencode_legacy_to_inverted`, then open the
+    /// result as INVERTED and confirm every historical read matches and the
+    /// sentinel was dropped (so the real newest version wins).
+    #[test]
+    fn test_reencode_legacy_to_inverted_roundtrip() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("leafage-reencode-{}", std::process::id()));
+        let src_dir = base.join("legacy");
+        let dst_dir = base.join("inverted");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let addr = H256::repeat_byte(0xab);
+        let slot = H256::repeat_byte(0x01);
+
+        // 1) Build the LEGACY source.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        {
+            let db = Arc::new(DataBaseRef::open(&src_dir, 64, false, false));
+            for n in 1..=20u64 {
+                let diff = match n {
+                    5 => slot_diff(addr, slot, 100, 7),
+                    10 => slot_diff(addr, slot, 200, 9),
+                    20 => slot_diff(addr, slot, 300, 11),
+                    _ => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+            // Inject STALE orphaned dual-write sentinels (legacy tail u64::MAX)
+            // with values that must NOT survive the re-encode.
+            let acct_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+                .unwrap();
+            let stale_acct = crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
+                address: addr,
+                balance: U256::from(999u64),
+                nonce: 1,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            });
+            db.db
+                .put_cf(
+                    acct_cf,
+                    crate::db_impl::archive_encoding::encode_account_key(addr, u64::MAX),
+                    &stale_acct,
+                )
+                .unwrap();
+            let stor_cf = db
+                .db
+                .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+                .unwrap();
+            let stale_val: [u8; 32] = U256::from(77u64).to_be_bytes();
+            db.db
+                .put_cf(
+                    stor_cf,
+                    crate::db_impl::archive_encoding::encode_storage_key(addr, slot, u64::MAX),
+                    stale_val,
+                )
+                .unwrap();
+        } // src DataBaseRef dropped here -> flushed, singleton released
+
+        // 2) Re-encode legacy -> inverted (raw handles; src untouched). Use
+        //    jobs=4 to exercise the parallel sharded path.
+        DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64, 4).unwrap();
+
+        // 3) Open the result WITHOUT setting the inverted flag — the DB's
+        //    encoding marker must auto-align it (self-describing), proving the
+        //    node can't mistake an inverted DB for a legacy one.
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        {
+            let db = Arc::new(DataBaseRef::open(&dst_dir, 64, false, false));
+            assert!(
+                crate::db_impl::archive_encoding::inverted_block_encoding(),
+                "open() must auto-align the encoding flag from the DB marker"
+            );
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+            // Below first write: absent/zero.
+            assert_eq!(at(4).read_storage(addr, slot).unwrap(), U256::ZERO);
+            assert!(at(4).read_account(addr).unwrap().is_none());
+            // greatest version <= H across change points.
+            for (h, val, bal) in [
+                (5u64, 7u64, 100u64),
+                (9, 7, 100),
+                (10, 9, 200),
+                (19, 9, 200),
+                (20, 11, 300),
+            ] {
+                assert_eq!(
+                    at(h).read_storage(addr, slot).unwrap(),
+                    U256::from(val),
+                    "storage at height {h} after re-encode"
+                );
+                assert_eq!(
+                    at(h).read_account(addr).unwrap().unwrap().balance,
+                    U256::from(bal),
+                    "balance at height {h} after re-encode"
+                );
+            }
+            // Latest-state iterators surface the REAL newest, not the dropped
+            // sentinel (999 / 77).
+            let storages: Vec<_> = db.storage_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(storages, vec![(addr, slot, U256::from(11u64))]);
+            let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].1.balance, U256::from(300u64));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
 }
 
 #[cfg(test)]
@@ -2438,10 +3223,8 @@ mod scan_completeness_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
-        let dir = std::env::temp_dir().join(format!(
-            "leafage-archive-scan-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leafage-archive-scan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
             let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
@@ -2470,11 +3253,8 @@ mod scan_completeness_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
                 .unwrap();
-            let count = |opts: ReadOptions| {
-                db.db
-                    .iterator_cf_opt(cf, opts, IteratorMode::Start)
-                    .count()
-            };
+            let count =
+                |opts: ReadOptions| db.db.iterator_cf_opt(cf, opts, IteratorMode::Start).count();
 
             let prefix_l0 = count(rocksdb_read_options());
             eprintln!("[scan-test] L0 (multi-SST): expected={n} prefix_mode={prefix_l0}");

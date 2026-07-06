@@ -62,15 +62,26 @@ pub struct ArbPosterCharge {
     pub paid_gas_price: U256,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PosterDataMode {
+    Estimate,
+    CurrentTx,
+}
+
 /// EIP-2718 bytes of Nitro's fake tx: the request's
 /// to/value/data/access_list, with Nitro's fixed random values for everything else
 /// (gas is always `RandomGas` during estimation). Hand-rolled RLP rather than alloy's
 /// signed encoding, because Nitro's `V` is a 4-byte integer ([`FAKE_SIG_V`]) that
 /// alloy's bool-parity `Signature` can't express — and the byte count feeds brotli, so
 /// it must match Nitro exactly.
-fn fake_tx_bytes(tx: &TxEnv, force_random_gas: bool) -> Vec<u8> {
-    let chain_id: u64 = 0; // Nitro leaves the fake tx's ChainID unset (encodes as 0)
-    let nonce: u64 = if tx.nonce == 0 {
+fn fake_tx_bytes(tx: &TxEnv, mode: PosterDataMode) -> Vec<u8> {
+    // Nitro leaves the fake tx's ChainID unset (encodes as 0).
+    let chain_id: u64 = 0;
+    // Estimation messages carry nonce 0 in Nitro's CallDefaults path, which is
+    // then replaced with randomNonce. Leafage's TxEnv may already be filled
+    // with the sender's state nonce, so the estimation path must ignore it.
+    let use_estimation_defaults = matches!(mode, PosterDataMode::Estimate);
+    let nonce: u64 = if use_estimation_defaults || tx.nonce == 0 {
         *RANDOM_NONCE
     } else {
         tx.nonce
@@ -88,7 +99,7 @@ fn fake_tx_bytes(tx: &TxEnv, force_random_gas: bool) -> Vec<u8> {
     } else {
         tx.gas_price
     };
-    let gas: u64 = if force_random_gas || tx.gas_limit == 0 {
+    let gas: u64 = if use_estimation_defaults || tx.gas_limit == 0 {
         *RANDOM_GAS
     } else {
         tx.gas_limit
@@ -149,7 +160,7 @@ impl ArbPricing {
     /// Replicate Nitro's gas-estimation posterGas for `tx`. `l2_base_fee` is the
     /// block base fee. Returns 0 if the fake tx can't be compressed.
     pub fn poster_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
-        let cost = match self.poster_data_cost(tx, true) {
+        let cost = match self.poster_data_cost(tx, PosterDataMode::Estimate) {
             Some(cost) => self.pad_estimation_cost(cost),
             None => return 0,
         };
@@ -161,7 +172,7 @@ impl ArbPricing {
     /// current L2 base fee directly instead of applying gas-estimation's 7/8
     /// price adjustment.
     pub fn gas_estimate_l1_component(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
-        let cost = match self.poster_data_cost(tx, true) {
+        let cost = match self.poster_data_cost(tx, PosterDataMode::Estimate) {
             Some(cost) => self.pad_estimation_cost(cost),
             None => return 0,
         };
@@ -177,7 +188,7 @@ impl ArbPricing {
             return U256::ZERO;
         }
 
-        let cost = match self.poster_data_cost(tx, false) {
+        let cost = match self.poster_data_cost(tx, PosterDataMode::CurrentTx) {
             Some(cost) => cost,
             None => return U256::ZERO,
         };
@@ -188,7 +199,8 @@ impl ArbPricing {
     /// Units added to `UnitsSinceUpdate` by Nitro's `GasChargingHook` before
     /// executing an eth_call-style message.
     pub(crate) fn current_tx_l1_units(&self, tx: &TxEnv) -> u64 {
-        self.poster_data_units(tx, false).unwrap_or_default()
+        self.poster_data_units(tx, PosterDataMode::CurrentTx)
+            .unwrap_or_default()
     }
 
     /// Compute the transaction-local values Nitro's `GasChargingHook` exposes
@@ -196,7 +208,9 @@ impl ArbPricing {
     /// call and estimate paths so RPC gas estimation does not need a separate
     /// `estimate_l1_overhead` pass.
     pub fn gas_charging_charge(&self, tx: &TxEnv, paid_gas_price: U256) -> ArbPosterCharge {
-        let calldata_units = self.poster_data_units(tx, true).unwrap_or_default();
+        let calldata_units = self
+            .poster_data_units(tx, PosterDataMode::Estimate)
+            .unwrap_or_default();
         if paid_gas_price.is_zero() || calldata_units == 0 {
             return ArbPosterCharge {
                 calldata_units,
@@ -237,15 +251,15 @@ impl ArbPricing {
         u64::try_from(cost / price).unwrap_or(u64::MAX)
     }
 
-    fn poster_data_cost(&self, tx: &TxEnv, force_random_gas: bool) -> Option<U256> {
+    fn poster_data_cost(&self, tx: &TxEnv, mode: PosterDataMode) -> Option<U256> {
         Some(
             self.price_per_unit
-                .saturating_mul(U256::from(self.poster_data_units(tx, force_random_gas)?)),
+                .saturating_mul(U256::from(self.poster_data_units(tx, mode)?)),
         )
     }
 
-    fn poster_data_units(&self, tx: &TxEnv, force_random_gas: bool) -> Option<u64> {
-        let l1_bytes = brotli_len(&fake_tx_bytes(tx, force_random_gas), self.brotli_level)? as u64;
+    fn poster_data_units(&self, tx: &TxEnv, mode: PosterDataMode) -> Option<u64> {
+        let l1_bytes = brotli_len(&fake_tx_bytes(tx, mode), self.brotli_level)? as u64;
         let raw_units = TX_DATA_NON_ZERO_GAS.saturating_mul(l1_bytes);
         let units = (raw_units as u128 + ESTIMATION_PADDING_UNITS as u128) * UNITS_PADDING_BIPS
             / ONE_IN_BIPS as u128;
@@ -332,8 +346,8 @@ mod tests {
     /// calldata — the dominant input to compression.
     #[test]
     fn fake_tx_is_eip1559_and_tracks_calldata() {
-        let small = fake_tx_bytes(&sample_tx(vec![0u8; 4]), true);
-        let large = fake_tx_bytes(&sample_tx(vec![0u8; 4096]), true);
+        let small = fake_tx_bytes(&sample_tx(vec![0u8; 4]), PosterDataMode::Estimate);
+        let large = fake_tx_bytes(&sample_tx(vec![0u8; 4096]), PosterDataMode::Estimate);
         assert_eq!(small[0], 0x02, "EIP-2718 type byte for EIP-1559");
         assert_eq!(large[0], 0x02);
         assert!(large.len() > small.len());
@@ -354,7 +368,7 @@ mod tests {
             tx.gas_price = 123_456;
             tx.gas_priority_fee = None;
 
-            let bytes = fake_tx_bytes(&tx, true);
+            let bytes = fake_tx_bytes(&tx, PosterDataMode::Estimate);
             let encoded_gas_price = [0x83, 0x01, 0xE2, 0x40];
             bytes
                 .windows(encoded_gas_price.len())
@@ -379,13 +393,27 @@ mod tests {
         tx.gas_price = 123_456;
         tx.gas_priority_fee = None;
 
-        let bytes = fake_tx_bytes(&tx, true);
+        let bytes = fake_tx_bytes(&tx, PosterDataMode::Estimate);
         let encoded_gas_price = [0x83, 0x01, 0xE2, 0x40];
         let count = bytes
             .windows(encoded_gas_price.len())
             .filter(|window| *window == encoded_gas_price)
             .count();
         assert_eq!(count, 1, "EIP-1559 maxFeePerGas is not GasTipCap");
+    }
+
+    /// The state-filled TxEnv nonce must not leak into the gas-estimation fake
+    /// tx: Nitro's estimation message carries nonce 0 and therefore encodes
+    /// randomNonce. A real small nonce would shrink the fake tx and undercount
+    /// posterGas for senders with nonce > 0.
+    #[test]
+    fn fake_tx_ignores_state_nonce_during_estimation() {
+        let mut with_nonce = sample_tx(vec![0xabu8; 100]);
+        with_nonce.nonce = 7;
+        assert_eq!(
+            fake_tx_bytes(&with_nonce, PosterDataMode::Estimate),
+            fake_tx_bytes(&sample_tx(vec![0xabu8; 100]), PosterDataMode::Estimate),
+        );
     }
 
     /// posterGas is non-zero end-to-end for a realistic call and scales up with
@@ -405,7 +433,9 @@ mod tests {
         let mut tx = sample_tx(vec![0xabu8; 128]);
         tx.gas_limit = 21_000;
         let paid_gas_price = U256::from(100_000_000u64);
-        let cost = p.poster_data_cost(&tx, false).expect("poster data cost");
+        let cost = p
+            .poster_data_cost(&tx, PosterDataMode::CurrentTx)
+            .expect("poster data cost");
         let poster_gas = cost / paid_gas_price;
 
         assert_eq!(

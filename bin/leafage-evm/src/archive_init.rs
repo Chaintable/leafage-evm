@@ -913,6 +913,14 @@ impl Command {
             }
         });
 
+        // Record the block-height key encoding in the DB so the node
+        // auto-detects it at startup (the flag is already marker-aligned by the
+        // open above for a resumed DB). RocksDB only; MDBX is unaffected.
+        if let ArchiveStorage::RocksDB(rdb) = db.as_ref() {
+            rdb.write_encoding_marker(leafage_evm_storage::inverted_block_encoding())
+                .map_err(|e| anyhow::anyhow!("failed to write encoding marker: {e}"))?;
+        }
+
         // Determine start block (support resume)
         let start_block = self.get_start_block(&db)?;
 
