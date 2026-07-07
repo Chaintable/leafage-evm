@@ -97,6 +97,34 @@ where
     }
 }
 
+/// Bind a non-blocking TCP listener with an explicit accept-queue `backlog`.
+///
+/// jsonrpsee's `build(addr)` binds via tokio's `TcpListener::bind`, which uses a
+/// fixed default backlog (~1024). The effective accept queue is
+/// `min(backlog, net.core.somaxconn)`; when it's exceeded during a connection
+/// burst the kernel drops the completing handshake (`ListenOverflows`) and the
+/// client sees `dial …: i/o timeout`. Binding the socket ourselves lets the
+/// backlog be raised up to `somaxconn`.
+fn bind_listener(addr: &str, backlog: u32) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let sockaddr: std::net::SocketAddr = addr.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid listen address {addr:?} (expected IP:port): {e}"),
+        )
+    })?;
+    let socket = Socket::new(Domain::for_address(sockaddr), Type::STREAM, None)?;
+    // jsonrpsee/tokio require the std listener to be non-blocking.
+    socket.set_nonblocking(true)?;
+    // Allow a fast rebind on restart instead of failing on a lingering socket.
+    socket.set_reuse_address(true)?;
+    socket.bind(&sockaddr.into())?;
+    // The kernel clamps this to net.core.somaxconn.
+    socket.listen(backlog.min(i32::MAX as u32) as i32)?;
+    Ok(socket.into())
+}
+
 impl<DB> ApiBuilder<DB>
 where
     DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
@@ -110,6 +138,7 @@ where
         normalize_state_key: bool,
         version: String,
         estimate_gas_buffer: u64,
+        listen_backlog: u32,
     ) -> std::io::Result<ServerHandle> {
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
@@ -118,14 +147,19 @@ where
         ));
 
         let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
+        // Bind the listener ourselves so we can set the accept-queue backlog
+        // (jsonrpsee's `build(addr)` uses tokio's default of ~1024). The kernel
+        // caps the effective queue at `min(backlog, net.core.somaxconn)`, so a
+        // too-small app backlog silently drops completing handshakes under
+        // bursts (ListenOverflows) -> the proxy sees `dial ...: i/o timeout`.
+        let listener = bind_listener(addr, listen_backlog)?;
         let server = ServerBuilder::default()
             .max_connections(max_connects)
             .http_only()
             .max_response_body_size(u32::MAX)
             .set_http_middleware(http_middleware)
             .set_rpc_middleware(rpc_middleware)
-            .build(addr)
-            .await?;
+            .build_from_tcp(listener)?;
         let mut rpc_module = RpcModule::new(());
         macro_rules! run_chain_setup {
             ($cfg:expr, $custom_evm_cfg: expr) => {{
