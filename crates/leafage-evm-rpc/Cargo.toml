@@ -29,6 +29,7 @@ alloy-contract.workspace = true  # sol! 宏展开需要
 metrics.workspace = true
 hyper.workspace = true
 http-body.workspace = true
+socket2 = "0.6"
 http.workspace = true
 thiserror.workspace = true
 serde.workspace = true

@@ -109,6 +109,16 @@ pub struct Command {
     #[arg(long, default_value = "5000")]
     max_connections: u32,
 
+    /// The TCP accept-queue backlog for the HTTP-RPC listener.
+    /// Default: 4096
+    ///
+    /// The kernel caps the effective queue at `min(this, net.core.somaxconn)`.
+    /// A too-small backlog drops completing handshakes under connection bursts
+    /// (kernel `ListenOverflows`), which upstream proxies observe as
+    /// `dial ...: i/o timeout`. Keep this <= the pod's `net.core.somaxconn`.
+    #[arg(long, default_value = "4096")]
+    listen_backlog: u32,
+
     /// The depth limit of the diff tree.
     /// Default: 64 for eth mainnet
     ///
@@ -742,6 +752,7 @@ impl Command {
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
                 self.estimate_gas_buffer,
+                self.listen_backlog,
             )
             .await?;
 

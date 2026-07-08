@@ -4770,6 +4770,7 @@ dependencies = [
  "revm-inspectors",
  "serde",
  "serde_json",
+ "socket2 0.6.0",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
