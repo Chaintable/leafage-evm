@@ -601,9 +601,22 @@ impl Command {
         info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
         if !self.prometheus_addr.is_empty() {
+            // Latency buckets (seconds) so `leafage_rpc_call_time` exports as a
+            // Prometheus `_bucket`/`_count`/`_sum` histogram (queryable via
+            // `histogram_quantile(... by (method_name, le))`) instead of the
+            // exporter's default summary rendering. This replaces the previous
+            // `{quantile=...}` series; `_count`/`_sum` are unchanged.
+            const LATENCY_BUCKETS: &[f64] = &[
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                10.0,
+            ];
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
                 .add_global_label("chain_id", format!("{}", chain_cfg.chain_id()))
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full("leafage_rpc_call_time".to_string()),
+                    LATENCY_BUCKETS,
+                )?
                 .install()?;
             let labels = [("role", "replica".to_string())];
             let gauge = gauge!("pipeline_node_info", &labels);
