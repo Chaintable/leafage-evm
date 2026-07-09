@@ -9,7 +9,7 @@ use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
     ToJsonRpcError,
 };
-use crate::metrics::RpcMetric;
+use crate::metrics::{HttpMetricLayer, RpcMetric};
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
@@ -140,7 +140,12 @@ where
         estimate_gas_buffer: u64,
         listen_backlog: u32,
     ) -> std::io::Result<ServerHandle> {
-        let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
+        // HttpMetricLayer is outermost so `leafage_rpc_http_time` covers the
+        // whole HTTP pipeline (parse/serialize + the timeout + interceptor
+        // layers), including 429/timeout rejections.
+        let http_middleware = tower::ServiceBuilder::new()
+            .layer(HttpMetricLayer)
+            .timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
         let http_middleware = http_middleware.layer(InterceptorLayer::new(
             &self.interceptor_cfg.unwrap_or_default(),
