@@ -204,7 +204,7 @@ where
         Ok(block.into())
     }
 
-    fn debank_get_address_nonce_impl(
+    fn debank_get_address_nonce_inner(
         &self,
         address: Address,
         block_ctx: Option<DebankBlockContext>,
@@ -222,7 +222,20 @@ where
         Ok(U256::from(nonce.unwrap_or_default()))
     }
 
-    fn debank_get_address_balance_impl(
+    async fn debank_get_address_nonce_impl(
+        &self,
+        address: Address,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<U256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.debank_get_address_nonce_inner(address, block_ctx)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("get address nonce failed"))?
+    }
+
+    fn debank_get_address_balance_inner(
         &self,
         address: Address,
         block_ctx: Option<DebankBlockContext>,
@@ -243,7 +256,20 @@ where
         Ok(U256::from(balance.unwrap_or_default()))
     }
 
-    fn debank_get_storage_at_impl(
+    async fn debank_get_address_balance_impl(
+        &self,
+        address: Address,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<U256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.debank_get_address_balance_inner(address, block_ctx)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("get address balance failed"))?
+    }
+
+    fn debank_get_storage_at_inner(
         &self,
         address: Address,
         index: H256,
@@ -267,7 +293,21 @@ where
         Ok(value.into())
     }
 
-    fn debank_get_code_impl(
+    async fn debank_get_storage_at_impl(
+        &self,
+        address: Address,
+        index: H256,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<H256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.debank_get_storage_at_inner(address, index, block_ctx)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("get address storage failed"))?
+    }
+
+    fn debank_get_code_inner(
         &self,
         address: Address,
         block_ctx: Option<DebankBlockContext>,
@@ -293,6 +333,18 @@ where
             })?;
             Ok(code.original_bytes().0.clone().into())
         }
+    }
+    async fn debank_get_code_impl(
+        &self,
+        address: Address,
+        block_ctx: Option<DebankBlockContext>,
+    ) -> RpcResult<Bytes> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.debank_get_code_inner(address, block_ctx)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("get address code failed"))?
     }
 
     fn debank_eth_erc20_handle<StateDB>(
@@ -737,12 +789,9 @@ where
                             self.inner.transact(&block_env, &memory_db, tx.clone())
                         {
                             if exec_res.is_success() {
-                                let l1_overhead = self.inner.estimate_l1_overhead(
-                                    &block,
-                                    &block_env,
-                                    tx,
-                                    &memory_db,
-                                );
+                                let l1_overhead = self
+                                    .inner
+                                    .estimate_l1_overhead(&block, &block_env, tx, &memory_db);
                                 return Ok(U256::from(
                                     MIN_TRANSACTION_GAS.saturating_add(l1_overhead),
                                 ));
@@ -872,7 +921,9 @@ where
         };
 
         tx.set_gas_limit(final_gas);
-        let l1_overhead = self.inner.estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
+        let l1_overhead =
+            self.inner
+                .estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
 
         Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }
@@ -1002,7 +1053,7 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        match self.debank_get_address_nonce_impl(address, block_ctx.clone()) {
+        match self.debank_get_address_nonce_impl(address, block_ctx.clone()).await {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
@@ -1025,7 +1076,10 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        match self.debank_get_address_balance_impl(address, block_ctx.clone()) {
+        match self
+            .debank_get_address_balance_impl(address, block_ctx.clone())
+            .await
+        {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
@@ -1048,7 +1102,7 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes> {
-        match self.debank_get_code_impl(address, block_ctx.clone()) {
+        match self.debank_get_code_impl(address, block_ctx.clone()).await {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
@@ -1069,7 +1123,10 @@ where
         position: JsonStorageKey,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<H256> {
-        match self.debank_get_storage_at_impl(address, position.as_b256(), block_ctx.clone()) {
+        match self
+            .debank_get_storage_at_impl(address, position.as_b256(), block_ctx.clone())
+            .await
+        {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
