@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
   IMAGE_NAME: leafage-evm-x
@@ -17,10 +21,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu2404-linux-x86-64-16c
             arch: amd64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu2204-arm64-16c
             arch: arm64
     runs-on: ${{ matrix.runner }}
 
@@ -29,16 +33,6 @@ jobs:
       id-token: write
 
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: false
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -76,7 +70,7 @@ jobs:
   manifest:
     name: merge-manifest
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu2404-linux-x86-64-16c
 
     permissions:
       contents: read
