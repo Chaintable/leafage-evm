@@ -624,6 +624,88 @@ mod tests {
         );
         assert_eq!(retryable_gas_remaining, 900_000);
     }
+
+    /// Pins the `inspect_execution` override: the traced path must charge the
+    /// same L1 poster gas as the untraced path for an identical transaction.
+    #[test]
+    fn inspected_execution_charges_poster_gas_like_transact() {
+        use revm::inspector::NoOpInspector;
+        use revm::primitives::TxKind;
+        use revm::state::AccountInfo;
+        use revm::{ExecuteEvm, InspectEvm};
+
+        let caller = Address::with_last_byte(0xc1);
+        let make_tx = || {
+            ArbitrumTxEnv::new(
+                TxEnv {
+                    caller,
+                    kind: TxKind::Call(Address::with_last_byte(0xee)),
+                    gas_limit: 1_000_000,
+                    gas_price: 100,
+                    data: Bytes::from(vec![0xab; 100]),
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+        };
+        let funded_db = || {
+            let mut db = db_with_pricing();
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    ..Default::default()
+                },
+            );
+            db
+        };
+        let block_env = || BlockEnv {
+            basefee: 100,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let execution_context = || {
+            let mut context = ArbitrumExecutionContext::default();
+            context.set_current_l2_context(U256::ZERO, 100);
+            context
+        };
+
+        let mut transact_evm = ArbitrumEvm::new(
+            block_env(),
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            funded_db(),
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            execution_context(),
+        );
+        let transact_result = transact_evm.transact(make_tx()).expect("transact");
+        let transact_poster = transact_evm
+            .ctx()
+            .chain()
+            .current_poster_charge()
+            .expect("transact path records the poster charge")
+            .poster_gas;
+        assert!(transact_poster > 0);
+
+        let mut inspect_evm = ArbitrumEvm::new(
+            block_env(),
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            funded_db(),
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            execution_context(),
+        );
+        let inspect_result = inspect_evm.inspect_one_tx(make_tx()).expect("inspect");
+        let inspect_poster = inspect_evm
+            .ctx()
+            .chain()
+            .current_poster_charge()
+            .expect("inspected path records the poster charge")
+            .poster_gas;
+
+        assert_eq!(inspect_poster, transact_poster);
+        assert_eq!(inspect_result.gas_used(), transact_result.result.gas_used());
+    }
 }
 
 impl<DB, INSP> InspectorHandler for ArbitrumHandler<DB, INSP>
@@ -632,4 +714,29 @@ where
     INSP: Inspector<ArbitrumContext<DB>, EthInterpreter>,
 {
     type IT = EthInterpreter;
+
+    /// Mirrors this handler's `execution` override on the inspected path.
+    /// `inspect_run` calls `inspect_execution`, not `Handler::execution`, so
+    /// without this override every traced run (pre_traceCall / pre_traceMany /
+    /// simulateTransactions) would skip nitro's L1 poster-gas charging that
+    /// the untraced path applies.
+    fn inspect_execution(
+        &mut self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &InitialAndFloorGas,
+    ) -> Result<FrameResult, Self::Error> {
+        evm.ctx_mut().chain_mut().clear_current_poster_charge();
+
+        let mut gas_limit = evm
+            .ctx()
+            .tx()
+            .gas_limit()
+            .saturating_sub(init_and_floor_gas.initial_gas);
+        self.gas_charging_hook(evm, &mut gas_limit, init_and_floor_gas.initial_gas)?;
+
+        let first_frame_input = self.first_frame_input(evm, gas_limit)?;
+        let mut frame_result = self.inspect_run_exec_loop(evm, first_frame_input)?;
+        self.last_frame_result(evm, &mut frame_result)?;
+        Ok(frame_result)
+    }
 }
