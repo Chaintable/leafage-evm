@@ -1,7 +1,5 @@
 use crate::api::EthApiServer;
-use crate::api_impl::core::{
-    Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError,
-};
+use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError};
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
@@ -29,7 +27,7 @@ where
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
 {
-    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
+    fn base_fee_inner(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
             .inner
             .db()
@@ -61,7 +59,14 @@ where
         Ok(base_fee)
     }
 
-    async fn call_impl(
+    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.base_fee_inner(block_id))
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))?
+    }
+
+    fn call_inner(
         &self,
         request: CallRequest,
         block_id: BlockId,
@@ -136,6 +141,21 @@ where
                 Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.used())).into())
             }
         }
+    }
+
+    async fn call_impl(
+        &self,
+        request: CallRequest,
+        block_id: BlockId,
+        state_override: Option<StateOverride>,
+        block_overrides: Option<BlockOverrides>,
+    ) -> RpcResult<Bytes> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.call_inner(request, block_id, state_override, block_overrides)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
     fn eth_erc20_handle<StateDB>(
@@ -368,7 +388,7 @@ where
         Ok(rsp)
     }
 
-    fn block_number_impl(&self) -> RpcResult<U256> {
+    fn block_number_inner(&self) -> RpcResult<U256> {
         let state = self
             .inner
             .db()
@@ -384,7 +404,14 @@ where
         Ok(U256::from(block.header.number))
     }
 
-    fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
+    async fn block_number_impl(&self) -> RpcResult<U256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.block_number_inner())
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))?
+    }
+
+    fn get_balance_inner(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
         if let Some(vb) = self.inner.virtual_balance() {
             return Ok(vb);
         }
@@ -417,7 +444,14 @@ where
         .map_err(|e| internal_rpc_err(e.to_string()))
     }
 
-    fn get_block_by_id_impl(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
+    async fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.get_balance_inner(address, block_id))
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))?
+    }
+
+    fn get_block_by_id_inner(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
         let block = self
             .inner
             .db()
@@ -441,7 +475,18 @@ where
         Ok(Some(value))
     }
 
-    fn get_code_impl(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
+    async fn get_block_by_id_impl(
+        &self,
+        block_id: BlockId,
+        full: bool,
+    ) -> RpcResult<Option<Value>> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.get_block_by_id_inner(block_id, full))
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))?
+    }
+
+    fn get_code_inner(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
         let state = self
             .inner
             .db()
@@ -482,7 +527,14 @@ where
         }
     }
 
-    fn get_storage_at_impl(
+    async fn get_code_impl(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.get_code_inner(address, block_number))
+            .await
+            .map_err(|e| internal_rpc_err(e.to_string()))?
+    }
+
+    fn get_storage_at_inner(
         &self,
         address: Address,
         index: H256,
@@ -524,7 +576,21 @@ where
         Ok(value.into())
     }
 
-    fn get_transaction_count_impl(
+    async fn get_storage_at_impl(
+        &self,
+        address: Address,
+        index: H256,
+        block_number: BlockId,
+    ) -> RpcResult<H256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.get_storage_at_inner(address, index, block_number)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
+    }
+
+    fn get_transaction_count_inner(
         &self,
         address: Address,
         block_number: BlockId,
@@ -557,6 +623,19 @@ where
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let nonce = account.map(|a| a.nonce);
         Ok(U256::from(nonce.unwrap_or_default()))
+    }
+
+    async fn get_transaction_count_impl(
+        &self,
+        address: Address,
+        block_number: BlockId,
+    ) -> RpcResult<U256> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.get_transaction_count_inner(address, block_number)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
     fn chain_id_impl(&self) -> RpcResult<U256> {
@@ -596,11 +675,11 @@ where
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        self.block_number_impl()
+        self.block_number_impl().await
     }
 
     async fn get_balance(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
-        self.get_balance_impl(address, block_id)
+        self.get_balance_impl(address, block_id).await
     }
 
     async fn get_block_by_number(
@@ -609,14 +688,16 @@ where
         full: bool,
     ) -> RpcResult<Option<Value>> {
         self.get_block_by_id_impl(BlockId::Number(block_number), full)
+            .await
     }
 
     async fn get_block_by_hash(&self, block_hash: H256, full: bool) -> RpcResult<Option<Value>> {
         self.get_block_by_id_impl(BlockId::Hash(block_hash.into()), full)
+            .await
     }
 
     async fn get_code(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
-        self.get_code_impl(address, block_number)
+        self.get_code_impl(address, block_number).await
     }
 
     async fn get_storage_at(
@@ -626,6 +707,7 @@ where
         block_number: BlockId,
     ) -> RpcResult<H256> {
         self.get_storage_at_impl(address, position.as_b256(), block_number)
+            .await
     }
 
     async fn get_transaction_count(
@@ -633,7 +715,7 @@ where
         address: Address,
         block_number: BlockId,
     ) -> RpcResult<U256> {
-        self.get_transaction_count_impl(address, block_number)
+        self.get_transaction_count_impl(address, block_number).await
     }
 
     async fn chain_id(&self) -> RpcResult<U256> {
