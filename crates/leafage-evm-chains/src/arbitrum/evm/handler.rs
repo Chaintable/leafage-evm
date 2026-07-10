@@ -3,9 +3,7 @@
 use super::poster_gas::ArbPosterCharge;
 use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::{self, ArbStateReader};
-use crate::arbitrum::precompile::{
-    ArbitrumContext, BATCH_POSTER_ADDRESS, L1_PRICER_FUNDS_POOL_ADDRESS,
-};
+use crate::arbitrum::precompile::{ArbitrumContext, L1_PRICER_FUNDS_POOL_ADDRESS};
 use alloy::primitives::U256;
 use revm::{
     context::{
@@ -59,7 +57,7 @@ where
     }
 
     fn collect_tips(ctx: &ArbitrumContext<DB>) -> bool {
-        ctx.db().collect_tips() && ctx.block().beneficiary() == BATCH_POSTER_ADDRESS
+        super::instructions::collects_tips(ctx)
     }
 
     fn effective_gas_price(ctx: &ArbitrumContext<DB>) -> u128 {
@@ -412,6 +410,7 @@ where
 mod tests {
     use super::*;
     use crate::arbitrum::evm::ArbitrumExecutionContext;
+    use crate::arbitrum::precompile::BATCH_POSTER_ADDRESS;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
     use crate::arbitrum::tx::ArbitrumTxEnv;

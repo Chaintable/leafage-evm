@@ -1,5 +1,6 @@
 mod context;
 mod handler;
+mod instructions;
 mod poster_gas;
 
 use crate::arbitrum::hardforks::ArbitrumHardfork;
@@ -63,7 +64,7 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: EthInstructions::new_mainnet_with_spec(spec),
+                instruction: instructions::arbitrum_instructions(spec),
                 precompiles: ArbitrumPrecompiles::new_with_env(hardfork, precompile_env),
                 frame_stack: Default::default(),
             },
