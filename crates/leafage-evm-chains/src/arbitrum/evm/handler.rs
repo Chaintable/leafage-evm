@@ -193,8 +193,11 @@ where
                 pricing
                     .as_ref()
                     .map(|pricing| {
-                        pricing
-                            .gas_charging_charge(&tx.base, Self::paid_l1_gas_price(ctx, l2_basefee))
+                        pricing.gas_charging_charge(
+                            &tx.base,
+                            Self::paid_l1_gas_price(ctx, l2_basefee),
+                            tx.context.gas_estimation,
+                        )
                     })
                     .unwrap_or_default()
             }
@@ -623,6 +626,49 @@ mod tests {
             0
         );
         assert_eq!(retryable_gas_remaining, 900_000);
+    }
+
+    /// The tx-level gas-estimation flag switches poster charging between
+    /// nitro's padded estimation mode and the unpadded call mode.
+    #[test]
+    fn gas_charging_hook_pads_only_estimation_runs() {
+        use crate::arbitrum::tx::ArbitrumTxContext;
+
+        let handler = ArbitrumHandler::<TestDb, ()>::new();
+        let base = TxEnv {
+            gas_limit: 1_000_000,
+            gas_price: 100,
+            data: Bytes::from(vec![0xab; 100]),
+            ..Default::default()
+        };
+
+        let mut poster_gas_for = |gas_estimation: bool| {
+            let tx = ArbitrumTxEnv::new(
+                base.clone(),
+                ArbitrumTxContext {
+                    gas_estimation,
+                    ..Default::default()
+                },
+            );
+            let mut evm = evm_with_tx(tx);
+            let mut gas_remaining = 900_000;
+            handler
+                .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000)
+                .expect("poster gas should be chargeable");
+            evm.ctx()
+                .chain()
+                .current_poster_charge()
+                .expect("poster charge should be recorded")
+                .poster_gas
+        };
+
+        let call_gas = poster_gas_for(false);
+        let estimation_gas = poster_gas_for(true);
+        assert!(call_gas > 0);
+        assert_ne!(
+            estimation_gas, call_gas,
+            "estimation padding must not leak into call runs"
+        );
     }
 
     /// Pins the `inspect_execution` override: the traced path must charge the

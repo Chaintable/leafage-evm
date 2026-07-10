@@ -204,13 +204,22 @@ impl ArbPricing {
     }
 
     /// Compute the transaction-local values Nitro's `GasChargingHook` exposes
-    /// through ArbGasInfo during call execution. Leafage runs this uniformly for
-    /// call and estimate paths so RPC gas estimation does not need a separate
-    /// `estimate_l1_overhead` pass.
-    pub fn gas_charging_charge(&self, tx: &TxEnv, paid_gas_price: U256) -> ArbPosterCharge {
-        let calldata_units = self
-            .poster_data_units(tx, PosterDataMode::Estimate)
-            .unwrap_or_default();
+    /// through ArbGasInfo during execution. Nitro's `GetPosterGas` applies the
+    /// ×1.10 cost padding and the 7/8 price adjustment only under
+    /// `runCtx.IsGasEstimation()` (`tx_processor.go`); eth_call-style runs
+    /// divide the unpadded cost by the unadjusted paid price.
+    pub fn gas_charging_charge(
+        &self,
+        tx: &TxEnv,
+        paid_gas_price: U256,
+        gas_estimation: bool,
+    ) -> ArbPosterCharge {
+        let mode = if gas_estimation {
+            PosterDataMode::Estimate
+        } else {
+            PosterDataMode::CurrentTx
+        };
+        let calldata_units = self.poster_data_units(tx, mode).unwrap_or_default();
         if paid_gas_price.is_zero() || calldata_units == 0 {
             return ArbPosterCharge {
                 calldata_units,
@@ -219,12 +228,14 @@ impl ArbPricing {
             };
         }
 
-        let poster_cost = self
+        let mut poster_cost = self
             .price_per_unit
             .saturating_mul(U256::from(calldata_units));
-        let poster_cost = self.pad_estimation_cost(poster_cost);
+        if gas_estimation {
+            poster_cost = self.pad_estimation_cost(poster_cost);
+        }
 
-        let poster_gas = self.poster_gas_from_cost(poster_cost, paid_gas_price, true);
+        let poster_gas = self.poster_gas_from_cost(poster_cost, paid_gas_price, gas_estimation);
         let poster_fee = paid_gas_price.saturating_mul(U256::from(poster_gas));
 
         ArbPosterCharge {
@@ -340,6 +351,27 @@ mod tests {
         tx.kind = TxKind::Call(revm::primitives::Address::repeat_byte(0x11));
         tx.data = Bytes::from(data);
         tx
+    }
+
+    /// Nitro's `GetPosterGas` pads only under `IsGasEstimation`: call-mode
+    /// runs divide the raw poster cost by the unadjusted paid price.
+    #[test]
+    fn gas_charging_charge_pads_only_for_estimation() {
+        let p = robinhood_pricing();
+        let tx = sample_tx(vec![0xab; 200]);
+        let paid = U256::from(200_000_000u64); // 0.2 gwei, above the 0.1 gwei floor
+
+        let call = p.gas_charging_charge(&tx, paid, false);
+        let call_cost = p.price_per_unit * U256::from(call.calldata_units);
+        assert_eq!(U256::from(call.poster_gas), call_cost / paid);
+        assert_eq!(call.poster_fee, paid * U256::from(call.poster_gas));
+
+        let estimate = p.gas_charging_charge(&tx, paid, true);
+        let padded_cost =
+            p.pad_estimation_cost(p.price_per_unit * U256::from(estimate.calldata_units));
+        let adjusted_price = paid * U256::from(7u64) / U256::from(8u64); // above the floor
+        assert_eq!(U256::from(estimate.poster_gas), padded_cost / adjusted_price);
+        assert!(estimate.poster_gas > call.poster_gas);
     }
 
     /// Fake tx is an EIP-1559 (type 0x02) envelope and its size tracks the

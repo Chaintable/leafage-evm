@@ -320,6 +320,10 @@ impl TxSetter for ArbitrumTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.gas_limit = gas_limit;
     }
+
+    fn set_gas_estimation(&mut self) {
+        self.context.gas_estimation = true;
+    }
 }
 
 impl<DB> GasFeeHandler for ArbitrumApiImpl<DB>
@@ -382,6 +386,7 @@ mod tests {
             TxEnv::default(),
             ArbitrumTxContext {
                 current_l1_block_number: 99_999,
+                ..Default::default()
             },
         );
 
@@ -413,6 +418,7 @@ mod tests {
             },
             ArbitrumTxContext {
                 current_l1_block_number: 99_999,
+                ..Default::default()
             },
         );
 
@@ -433,6 +439,7 @@ mod tests {
             TxEnv::default(),
             ArbitrumTxContext {
                 current_l1_block_number: 0,
+                ..Default::default()
             },
         );
 
