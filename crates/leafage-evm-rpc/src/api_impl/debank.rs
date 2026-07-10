@@ -134,7 +134,7 @@ where
         Ok(state)
     }
 
-    fn debank_get_latest_block_impl(&self) -> RpcResult<DebankBlock> {
+    fn debank_get_latest_block_inner(&self) -> RpcResult<DebankBlock> {
         let block = self
             .inner
             .db()
@@ -147,7 +147,14 @@ where
         Ok(block.into())
     }
 
-    fn debank_get_block_by_height_impl(&self, height: U256) -> RpcResult<DebankBlock> {
+    async fn debank_get_latest_block_impl(&self) -> RpcResult<DebankBlock> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.debank_get_latest_block_inner())
+            .await
+            .map_err(|_| internal_rpc_err("get latest block failed"))?
+    }
+
+    fn debank_get_block_by_height_inner(&self, height: U256) -> RpcResult<DebankBlock> {
         let number: u64 = height.try_into().map_err(|_| {
             rpc_error_with_code(
                 DebankErrorCode::InvalidParams as i32,
@@ -179,7 +186,16 @@ where
         Ok(block.into())
     }
 
-    fn debank_get_block_by_id_impl(&self, id: H256) -> RpcResult<DebankBlock> {
+    async fn debank_get_block_by_height_impl(&self, height: U256) -> RpcResult<DebankBlock> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.debank_get_block_by_height_inner(height)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("get block by height failed"))?
+    }
+
+    fn debank_get_block_by_id_inner(&self, id: H256) -> RpcResult<DebankBlock> {
         let block = self
             .inner
             .db()
@@ -202,6 +218,13 @@ where
         }
         let block = block.unwrap();
         Ok(block.into())
+    }
+
+    async fn debank_get_block_by_id_impl(&self, id: H256) -> RpcResult<DebankBlock> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.debank_get_block_by_id_inner(id))
+            .await
+            .map_err(|_| internal_rpc_err("get block by id failed"))?
     }
 
     fn debank_get_address_nonce_inner(
@@ -943,7 +966,7 @@ where
         .map_err(|_| internal_rpc_err("estimate failed".to_string()))?
     }
 
-    fn block_is_valid_impl(&self, id: H256) -> RpcResult<bool> {
+    fn block_is_valid_inner(&self, id: H256) -> RpcResult<bool> {
         let block = self
             .inner
             .db()
@@ -976,6 +999,13 @@ where
             return Ok(false);
         }
         Ok(block.header.hash == canonical_block.unwrap().header.hash)
+    }
+
+    async fn block_is_valid_impl(&self, id: H256) -> RpcResult<bool> {
+        let this = self.clone();
+        utils::spawn_blocking_with_cancel(move |_token| this.block_is_valid_inner(id))
+            .await
+            .map_err(|_| internal_rpc_err("block is valid failed"))?
     }
 }
 
@@ -1053,7 +1083,10 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        match self.debank_get_address_nonce_impl(address, block_ctx.clone()).await {
+        match self
+            .debank_get_address_nonce_impl(address, block_ctx.clone())
+            .await
+        {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
@@ -1223,7 +1256,7 @@ where
     }
 
     async fn get_latest_block(&self) -> RpcResult<DebankBlock> {
-        self.debank_get_latest_block_impl()
+        self.debank_get_latest_block_impl().await
     }
 
     async fn get_block_by_height(&self, height: U256) -> RpcResult<DebankBlock> {
@@ -1253,11 +1286,11 @@ where
             }
         }
 
-        self.debank_get_block_by_height_impl(height)
+        self.debank_get_block_by_height_impl(height).await
     }
 
     async fn get_block_by_id(&self, id: H256) -> RpcResult<DebankBlock> {
-        match self.debank_get_block_by_id_impl(id) {
+        match self.debank_get_block_by_id_impl(id).await {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.inner.historical_client() {
@@ -1273,7 +1306,7 @@ where
     }
 
     async fn block_is_valid(&self, id: H256) -> RpcResult<bool> {
-        match self.block_is_valid_impl(id) {
+        match self.block_is_valid_impl(id).await {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.inner.historical_client() {
