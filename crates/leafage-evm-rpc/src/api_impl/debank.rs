@@ -18,6 +18,7 @@ use leafage_evm_types::{
     U256,
 };
 use revm::bytecode::OpCode;
+use revm::context_interface::Cfg;
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
@@ -772,12 +773,8 @@ where
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
         let block_env_gas_limit = block_env.gas_limit;
-        let max_gas_limit = self
-            .inner
-            .evm_cfg()
-            .cfg
-            .tx_gas_limit_cap
-            .map_or_else(|| block_env_gas_limit, |cap| cap.min(block_env_gas_limit));
+        let cfg = &self.inner.evm_cfg().cfg;
+        let max_gas_limit = cfg.tx_gas_limit_cap().min(block_env_gas_limit);
         let mut highest_gas_limit = tx_request_gas_limit
             .map(|tx_gas_limit| {
                 if tx_gas_limit > max_gas_limit {

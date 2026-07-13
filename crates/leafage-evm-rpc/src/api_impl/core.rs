@@ -39,7 +39,7 @@ pub(crate) trait ApiCore:
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
-    type SpecId;
+    type SpecId: Into<revm::primitives::hardfork::SpecId> + Clone;
     type CustomCfg;
 
     fn db(&self) -> &Self::DB;
