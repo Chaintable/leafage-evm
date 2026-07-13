@@ -1,4 +1,4 @@
-use metrics::{Gauge, Histogram};
+use metrics::{Counter, Gauge, Histogram};
 use metrics_derive::Metrics;
 use std::sync::LazyLock;
 
@@ -22,8 +22,12 @@ pub struct StorageMetrics {
     pub read_account_latency: Histogram,
     /// Read storage latency.
     pub read_storage_latency: Histogram,
-    /// Read code latency.
+    /// Read code latency (disk reads only; code-cache hits are not recorded).
     pub read_code_latency: Histogram,
+    /// Archive code-cache hits (cumulative).
+    pub code_cache_hits: Counter,
+    /// Archive code-cache misses (cumulative).
+    pub code_cache_misses: Counter,
     /// Commit block latency.
     pub commit_block_latency: Histogram,
     /// latest commit block.
