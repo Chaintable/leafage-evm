@@ -27,8 +27,6 @@ fn default_cpu_threshold() -> Vec<f64> {
     vec![65.0, 80.0, 95.0]
 }
 
-const IO_FULL_THRESHOLD: [f64; 3] = [5.0, 10.0, 15.0];
-
 fn default_io_threshold() -> [f64; 3] {
     // PSI has no standardized low/middle/high levels. The 10% low watermark is based on:
     // systemd `some`: 200ms per 2s (~10%):
@@ -36,10 +34,14 @@ fn default_io_threshold() -> [f64; 3] {
     // PSI `some` semantics:
     // https://docs.kernel.org/accounting/psi.html#pressure-interface
     // The 20% and 50% watermarks are service-level load-shedding policy values.
-    // Fixed `full` thresholds use the Linux 5% trigger example and psi-notify's 15% default:
+    [10.0, 20.0, 50.0]
+}
+
+fn default_io_full_threshold() -> [f64; 3] {
+    // The defaults use the Linux 5% trigger example and psi-notify's 15% default as anchors:
     // https://docs.kernel.org/accounting/psi.html#monitoring-for-pressure-thresholds
     // https://github.com/cdown/psi-notify#config
-    [10.0, 20.0, 50.0]
+    [5.0, 10.0, 15.0]
 }
 
 fn default_max_retries() -> u64 {
@@ -65,6 +67,9 @@ pub struct InterceptorConfig {
     /// IO PSI some.avg10 thresholds ordered as low, middle, and high.
     #[serde(default = "default_io_threshold")]
     pub io_threshold: [f64; 3],
+    /// IO PSI full.avg10 thresholds ordered as low, middle, and high.
+    #[serde(default = "default_io_full_threshold")]
+    pub io_full_threshold: [f64; 3],
     #[serde(default = "default_max_retries")]
     pub max_retries: u64,
     #[serde(default = "default_window")]
@@ -80,6 +85,7 @@ impl Default for InterceptorConfig {
         InterceptorConfig {
             cpu_threshold: default_cpu_threshold(),
             io_threshold: default_io_threshold(),
+            io_full_threshold: default_io_full_threshold(),
             max_retries: default_max_retries(),
             window: default_window(),
             stat_interval: default_stat_interval(),
@@ -195,27 +201,16 @@ fn get_max_memory() -> Result<u64, Box<dyn std::error::Error>> {
 }
 
 fn discover_io_pressure_path(process: &Process) -> Option<PathBuf> {
-    const SYSTEM_IO_PRESSURE_PATH: &str = "/proc/pressure/io";
-    if let (Ok(cgroups), Ok(mounts)) = (process.cgroups(), process.mountinfo()) {
-        if let Some(cgroup) = cgroups
-            .into_iter()
-            .find(|cgroup| cgroup.hierarchy == 0 && cgroup.controllers.is_empty())
-        {
-            for mount in mounts
-                .into_iter()
-                .filter(|mount| mount.fs_type == "cgroup2")
-            {
-                let path =
-                    cgroup_io_pressure_path(&mount.mount_point, &mount.root, &cgroup.pathname);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-
-    let system_path = PathBuf::from(SYSTEM_IO_PRESSURE_PATH);
-    system_path.exists().then_some(system_path)
+    let cgroups = process.cgroups().ok()?;
+    let cgroup = cgroups
+        .into_iter()
+        .find(|cgroup| cgroup.hierarchy == 0 && cgroup.controllers.is_empty())?;
+    let mounts = process.mountinfo().ok()?;
+    mounts
+        .into_iter()
+        .filter(|mount| mount.fs_type == "cgroup2")
+        .map(|mount| cgroup_io_pressure_path(&mount.mount_point, &mount.root, &cgroup.pathname))
+        .find(|path| path.exists())
 }
 
 fn cgroup_io_pressure_path(
@@ -244,6 +239,7 @@ impl InterceptorLayer {
             cfg.window,
             cfg.cpu_threshold.clone(),
             cfg.io_threshold,
+            cfg.io_full_threshold,
             cfg.stat_interval,
             cfg.not_retry_threshold,
         );
@@ -283,6 +279,7 @@ struct InterceptorWorker {
     stat_interval: u64,      // 采样间隔 (单位: ms)
     cpu_threshold: Vec<f64>, // CPU 使用率阈值, 例如 [45.0, 65.0, 85.0]
     io_threshold: [f64; 3],
+    io_full_threshold: [f64; 3],
     not_retry_threshold: f64,
 }
 
@@ -292,6 +289,7 @@ impl InterceptorWorker {
         window: u64,
         cpu_threshold: Vec<f64>,
         io_threshold: [f64; 3],
+        io_full_threshold: [f64; 3],
         stat_interval: u64,
         not_retry_threshold: f64,
     ) -> (Self, UnboundedSender<u64>, Arc<AtomicU64>, Arc<AtomicBool>) {
@@ -304,6 +302,7 @@ impl InterceptorWorker {
             }
         }
         validate_io_threshold(io_threshold);
+        validate_io_threshold(io_full_threshold);
         let (retries_sender, retries_receiver) = unbounded_channel();
         let load_status = Arc::new(AtomicU64::new(0));
         let other_overloaded = Arc::new(AtomicBool::new(false));
@@ -325,6 +324,7 @@ impl InterceptorWorker {
             stat_interval,
             cpu_threshold,
             io_threshold,
+            io_full_threshold,
             not_retry_threshold,
         };
         info!(
@@ -339,7 +339,7 @@ impl InterceptorWorker {
         if worker.io_pressure_path.is_none() {
             warn!(
                 target = "interceptor",
-                "IO pressure information is unavailable; IO overload protection will fail open"
+                "cgroup v2 IO pressure information is unavailable; IO overload protection will fail open"
             );
         }
         (worker, retries_sender, load_status, other_overloaded)
@@ -363,9 +363,12 @@ impl InterceptorWorker {
         };
 
         match IoPressure::from_file(path) {
-            Ok(pressure) => {
-                io_pressure_load_status(pressure.some.avg10, pressure.full.avg10, self.io_threshold)
-            }
+            Ok(pressure) => io_pressure_load_status(
+                pressure.some.avg10,
+                pressure.full.avg10,
+                self.io_threshold,
+                self.io_full_threshold,
+            ),
             Err(err) => {
                 debug!(
                     target = "interceptor",
@@ -471,15 +474,16 @@ fn io_pressure_load_status(
     some_avg10: f32,
     full_avg10: f32,
     some_thresholds: [f64; 3],
+    full_thresholds: [f64; 3],
 ) -> LoadStatus {
     let some_avg10 = some_avg10 as f64;
     let full_avg10 = full_avg10 as f64;
 
-    if some_avg10 >= some_thresholds[2] || full_avg10 >= IO_FULL_THRESHOLD[2] {
+    if some_avg10 >= some_thresholds[2] || full_avg10 >= full_thresholds[2] {
         LoadStatus::AllRefused
-    } else if some_avg10 >= some_thresholds[1] || full_avg10 >= IO_FULL_THRESHOLD[1] {
+    } else if some_avg10 >= some_thresholds[1] || full_avg10 >= full_thresholds[1] {
         LoadStatus::MiddleRefused
-    } else if some_avg10 >= some_thresholds[0] || full_avg10 >= IO_FULL_THRESHOLD[0] {
+    } else if some_avg10 >= some_thresholds[0] || full_avg10 >= full_thresholds[0] {
         LoadStatus::LowRefused
     } else {
         LoadStatus::NoRefused
@@ -723,10 +727,17 @@ mod tests {
     fn test_io_threshold_config() {
         let default_config: InterceptorConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default_config.io_threshold, default_io_threshold());
+        assert_eq!(
+            default_config.io_full_threshold,
+            default_io_full_threshold()
+        );
 
-        let custom_config: InterceptorConfig =
-            serde_json::from_str(r#"{"io_threshold":[5.0,15.0,25.0]}"#).unwrap();
+        let custom_config: InterceptorConfig = serde_json::from_str(
+            r#"{"io_threshold":[5.0,15.0,25.0],"io_full_threshold":[1.0,3.0,8.0]}"#,
+        )
+        .unwrap();
         assert_eq!(custom_config.io_threshold, [5.0, 15.0, 25.0]);
+        assert_eq!(custom_config.io_full_threshold, [1.0, 3.0, 8.0]);
     }
 
     #[test]
@@ -740,16 +751,17 @@ mod tests {
     #[test]
     fn test_io_pressure_load_status() {
         let thresholds = default_io_threshold();
-        let status = |some, full| io_pressure_load_status(some, full, thresholds);
+        let full_thresholds = [1.0, 3.0, 8.0];
+        let status = |some, full| io_pressure_load_status(some, full, thresholds, full_thresholds);
 
-        assert_eq!(status(9.99, 4.99), LoadStatus::NoRefused);
+        assert_eq!(status(9.99, 0.99), LoadStatus::NoRefused);
         assert_eq!(status(10.0, 0.0), LoadStatus::LowRefused);
-        assert_eq!(status(0.0, 5.0), LoadStatus::LowRefused);
+        assert_eq!(status(0.0, 1.0), LoadStatus::LowRefused);
         assert_eq!(status(20.0, 0.0), LoadStatus::MiddleRefused);
-        assert_eq!(status(0.0, 10.0), LoadStatus::MiddleRefused);
+        assert_eq!(status(0.0, 3.0), LoadStatus::MiddleRefused);
         assert_eq!(status(49.99, 0.0), LoadStatus::MiddleRefused);
         assert_eq!(status(50.0, 0.0), LoadStatus::AllRefused);
-        assert_eq!(status(0.0, 15.0), LoadStatus::AllRefused);
+        assert_eq!(status(0.0, 8.0), LoadStatus::AllRefused);
     }
 
     #[test]
@@ -790,6 +802,7 @@ mod tests {
                 pressure.some.avg10,
                 pressure.full.avg10,
                 default_io_threshold(),
+                default_io_full_threshold(),
             ),
             LoadStatus::LowRefused
         );
