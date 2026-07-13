@@ -5,6 +5,7 @@ use jsonrpsee::http_client::HttpClient;
 use leafage_evm_types::{Address, DebankErrorCode};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::CfgEnv;
+use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm::primitives::keccak256;
 use std::str::FromStr;
 
@@ -52,7 +53,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
 impl<DB, SpecId, CustomCfg> ApiBase for ApiImpl<DB, SpecId, CustomCfg>
 where
     DB: Sync + Send + 'static,
-    SpecId: Send + Sync + 'static,
+    SpecId: Send + Sync + 'static + Into<EthSpecId> + Clone,
     CustomCfg: Send + Sync + 'static,
 {
     type DB = DB;

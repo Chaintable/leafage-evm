@@ -7,6 +7,8 @@ use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, Nod
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
+use leafage_evm_chains::base::BaseHardfork;
+use leafage_evm_chains::citrea::CitreaHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv, TokenCollector};
@@ -14,8 +16,6 @@ use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
-use leafage_evm_chains::base::BaseHardfork;
-use leafage_evm_chains::citrea::CitreaHardfork;
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -479,14 +479,12 @@ impl Command {
             "base" => {
                 // Base forked from the OP stack; execution is OP-equivalent
                 // (Beryl precompiles are layered on separately).
-                let mut chain_cfg =
-                    CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
+                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
-                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Base(chain_cfg))
             }
             "bsc" => {
@@ -568,7 +566,9 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mantle(chain_cfg))
             }
             "tempo" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(leafage_evm_chains::tempo::hardfork::TempoHardfork::default());
+                let mut chain_cfg = CfgEnv::new_with_spec(
+                    leafage_evm_chains::tempo::hardfork::TempoHardfork::default(),
+                );
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -578,7 +578,8 @@ impl Command {
                 Ok(MultiChainCfgEnv::Tempo(chain_cfg))
             }
             "citrea" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
+                let mut chain_cfg =
+                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -730,13 +731,13 @@ impl Command {
         }
         if !self.readiness_addr.is_empty() {
             // Initialize token collector if path is configured (before warmup so it can be used)
-            let token_collector_path =   if !self.token_collector_path.is_empty(){
+            let token_collector_path = if !self.token_collector_path.is_empty() {
                 let collector_path = PathBuf::from(&self.token_collector_path);
                 if let Some(parent) = collector_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 collector_path
-            }else{
+            } else {
                 self.db_path.join("tokens.json")
             };
             info!(target: "updater", "token collector enabled, saving to {:?}", token_collector_path);
@@ -754,7 +755,6 @@ impl Command {
             rpc_builder = warmup.with_warmup_data(rpc_builder).await;
             rpc_builder = rpc_builder.with_token_collector(token_collector);
         }
-
 
         let rpc_handle = rpc_builder
             .build_and_run(
