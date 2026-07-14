@@ -86,14 +86,13 @@ fn fake_tx_bytes(tx: &TxEnv, mode: PosterDataMode) -> Vec<u8> {
     } else {
         tx.nonce
     };
-    let tip: u128 = tx
-        .gas_priority_fee
-        .filter(|v| *v != 0)
-        .or_else(|| {
-            (matches!(tx.tx_type, LEGACY_TX_TYPE | ACCESS_LIST_TX_TYPE) && tx.gas_price != 0)
-                .then_some(tx.gas_price)
-        })
-        .unwrap_or(*RANDOM_GAS_TIP_CAP);
+    // Nitro ignores the message's priority fee when pricing RPC calldata: every
+    // eth_call / estimate / simulate builds the fake tx with the fixed
+    // `randomGasTipCap` (the executed RPC message carries GasTipCap 0, so
+    // `makeFakeTxForMessage` falls back to the random cap). Mirroring the request
+    // tip here made the fake tx's tip vary in RLP byte length — changing the
+    // brotli size and thus the L1 poster fee — while Nitro's stayed constant.
+    let tip: u128 = *RANDOM_GAS_TIP_CAP;
     let fee: u128 = if tx.gas_price == 0 {
         *RANDOM_GAS_FEE_CAP
     } else {
@@ -420,7 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn gas_price_populates_fake_tx_fee_and_tip_caps_for_legacy_and_access_list() {
+    fn gas_price_populates_only_the_fake_tx_fee_cap() {
+        // Nitro prices RPC calldata with a fixed randomGasTipCap, so gasPrice
+        // must appear exactly once — as the fee cap, never as the tip cap —
+        // regardless of tx type.
         fn encoded_gas_price_count(tx_type: u8) -> usize {
             let mut tx = sample_tx(vec![0u8; 4]);
             tx.tx_type = tx_type;
@@ -435,13 +437,31 @@ mod tests {
                 .count()
         }
 
-        assert!(
-            encoded_gas_price_count(LEGACY_TX_TYPE) >= 2,
-            "legacy gasPrice must populate both GasTipCap and GasFeeCap"
-        );
-        assert!(
-            encoded_gas_price_count(ACCESS_LIST_TX_TYPE) >= 2,
-            "EIP-2930 gasPrice must populate both GasTipCap and GasFeeCap"
+        for tx_type in [LEGACY_TX_TYPE, ACCESS_LIST_TX_TYPE, 2] {
+            assert_eq!(
+                encoded_gas_price_count(tx_type),
+                1,
+                "gasPrice is the fee cap only, not the tip cap"
+            );
+        }
+    }
+
+    #[test]
+    fn priority_fee_does_not_change_the_fake_tx() {
+        // P1-A: Nitro ignores the message tip when pricing RPC calldata, so a
+        // priority fee must not change the fake tx (and thus the poster gas). A
+        // 2-byte tip like 0x1234 previously shrank the fake tx and undercounted.
+        let base = |prio: Option<u128>| {
+            let mut tx = sample_tx(vec![0xabu8; 100]);
+            tx.tx_type = 2;
+            tx.gas_price = 0x5e6156bc;
+            tx.gas_priority_fee = prio;
+            fake_tx_bytes(&tx, PosterDataMode::CurrentTx)
+        };
+        assert_eq!(
+            base(Some(0x1234)),
+            base(None),
+            "priority fee must not change the fake tx (Nitro uses randomGasTipCap)"
         );
     }
 
