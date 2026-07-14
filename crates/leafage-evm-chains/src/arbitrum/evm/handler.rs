@@ -642,7 +642,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut poster_gas_for = |gas_estimation: bool| {
+        let poster_gas_for = |gas_estimation: bool| {
             let tx = ArbitrumTxEnv::new(
                 base.clone(),
                 ArbitrumTxContext {
