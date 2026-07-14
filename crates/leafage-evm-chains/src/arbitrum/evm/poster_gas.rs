@@ -145,15 +145,24 @@ fn fake_tx_bytes(tx: &TxEnv, mode: PosterDataMode) -> Vec<u8> {
 }
 
 fn brotli_len(input: &[u8], level: u64) -> Option<usize> {
-    use brotli::enc::BrotliEncoderParams;
-    let params = BrotliEncoderParams {
-        quality: level as i32,
-        ..Default::default()
-    };
-    let mut out = Vec::new();
-    let mut reader = input;
-    brotli::BrotliCompress(&mut reader, &mut out, &params).ok()?;
-    Some(out.len())
+    use brotlic::encode::BrotliEncoderOptions;
+    use brotlic::{CompressorWriter, Quality, WindowSize};
+    use std::io::Write;
+
+    // Nitro compresses the fake tx with Google libbrotli at the ArbOS brotli
+    // level and `BROTLI_DEFAULT_WINDOW` (22), empty dictionary
+    // (`arbos/l1pricing/l1pricing.go`; `crates/brotli` pins google/brotli 1.0.9).
+    // The pure-Rust `brotli` crate diverges from libbrotli at low quality — its
+    // output grows with input size instead of staying flat — so the byte count,
+    // which feeds the L1 poster fee, must come from the same C encoder.
+    let encoder = BrotliEncoderOptions::new()
+        .quality(Quality::new(u8::try_from(level).ok()?).ok()?)
+        .window_size(WindowSize::new(22).ok()?)
+        .build()
+        .ok()?;
+    let mut writer = CompressorWriter::with_encoder(encoder, Vec::new());
+    writer.write_all(input).ok()?;
+    Some(writer.into_inner().ok()?.len())
 }
 
 impl ArbPricing {
@@ -294,6 +303,24 @@ mod tests {
             min_base_fee: U256::from(0x05f5e100u64),   // 100_000_000 = 0.1 gwei
             brotli_level: 1,
         }
+    }
+
+    /// libbrotli (Nitro's consensus encoder) compresses repetitive calldata to
+    /// a constant size; the pure-Rust `brotli` crate grew with input size,
+    /// inflating the L1 poster fee for large calldata. Guard the C backend.
+    #[test]
+    fn brotli_len_is_flat_like_libbrotli() {
+        let fake = |n: usize| {
+            let mut v = vec![0x02u8, 0xf8, 0x00, 0x80, 0x84, 0x11, 0x22, 0x33, 0x44];
+            v.extend(std::iter::repeat(0xab).take(n));
+            v
+        };
+        let small = brotli_len(&fake(4096), 1).unwrap();
+        let large = brotli_len(&fake(16384), 1).unwrap();
+        assert_eq!(
+            small, large,
+            "repetitive calldata must compress flat (libbrotli), got {small} vs {large}"
+        );
     }
 
     /// Hand-computed against the Nitro formula for a fixed compressed size

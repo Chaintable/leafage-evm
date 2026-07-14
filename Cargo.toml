@@ -48,6 +48,7 @@ aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
 flate2 = "1.0.34"
 brotli = "7"
+brotlic = "0.8"
 etcd-client = "0.14"
 md-5 = "0.10.6"
 http = "1.3"
