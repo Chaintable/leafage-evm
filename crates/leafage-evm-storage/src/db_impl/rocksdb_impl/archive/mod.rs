@@ -34,6 +34,7 @@ use leafage_evm_types::{
     Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
     H256, KECCAK256_EMPTY, U256,
 };
+use moka::sync::Cache as MokaCache;
 use rocksdb::{
     BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
     CompactOptions, IngestExternalFileOptions, IteratorMode, Options, ReadOptions, SliceTransform,
@@ -99,6 +100,38 @@ fn rocksdb_read_options() -> ReadOptions {
     let mut read_options = ReadOptions::default();
     read_options.set_verify_checksums(false);
     read_options
+}
+
+/// Default weighted capacity (MB) of the content-addressed code cache.
+const DEFAULT_CODE_CACHE_MB: u64 = 256;
+
+/// Build the code cache honoring `ARCHIVE_CODE_CACHE_MB` (`0` disables;
+/// unset/unparsable falls back to [`DEFAULT_CODE_CACHE_MB`]). Weighted by
+/// payload size (key + code bytes), so the capacity is a payload budget —
+/// per-entry allocator and moka bookkeeping overhead sits on top of it.
+fn build_code_cache() -> Option<MokaCache<H256, Bytes>> {
+    let mb = env::var("ARCHIVE_CODE_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CODE_CACHE_MB);
+    if mb == 0 {
+        info!(
+            target = "rocksdb",
+            "archive code cache disabled (ARCHIVE_CODE_CACHE_MB=0)"
+        );
+        return None;
+    }
+    info!(target = "rocksdb", "archive code cache enabled: {}MB", mb);
+    Some(
+        MokaCache::builder()
+            .max_capacity(mb.saturating_mul(1024 * 1024))
+            .weigher(|_k: &H256, v: &Bytes| {
+                (v.len() + std::mem::size_of::<H256>())
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+            })
+            .build(),
+    )
 }
 
 /// Reserved key (stored in the `LatestBlockHash` CF) recording whether this
@@ -211,6 +244,15 @@ struct DataBaseInner {
 #[derive(Debug)]
 pub struct DataBaseRef {
     db: &'static DB,
+    /// Content-addressed code cache (code_hash → code), shared by every state
+    /// handle regardless of block height. `code_hash` is keccak256(code), so
+    /// an entry can never go stale and needs no invalidation — unlike
+    /// accounts/storage, whose height-versioned reads cannot be cached this
+    /// way. Historical reads bypass the `StateTree` moka caches entirely, so
+    /// without this every `getAddressCode`/multicall at an old height pays a
+    /// HashToCode disk get + zstd decode even for hot contracts. `None` =
+    /// disabled via `ARCHIVE_CODE_CACHE_MB=0`.
+    code_cache: Option<MokaCache<H256, Bytes>>,
 }
 
 pub struct ArchiveRocksDBWriteBatch {
@@ -990,6 +1032,7 @@ impl DataBaseRef {
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
         let db_ref = Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
+            code_cache: build_code_cache(),
         };
         // Self-describing encoding: if the DB records its block-height key
         // encoding, honor it (a legacy DB has no marker and is left untouched),
@@ -1354,6 +1397,39 @@ impl DataBaseRef {
         let block_hash_bytes = block_hash_bytes.unwrap();
         let block_hash = H256::from_slice(block_hash_bytes.as_slice());
         Ok(block_hash)
+    }
+
+    /// Read a contract's code by hash through the content-addressed cache.
+    /// Only present codes are cached: an absent hash may be written by a
+    /// later block commit, so negative results always re-check the CF.
+    pub fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
+        if let Some(cache) = &self.code_cache {
+            if let Some(code) = cache.get(&code_hash) {
+                STORAGE_METRICS.code_cache_hits.increment(1);
+                return Ok(Some(code));
+            }
+            STORAGE_METRICS.code_cache_misses.increment(1);
+        }
+        let start = std::time::Instant::now();
+        let hash_to_code_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::HashToCode.to_str())
+            .unwrap();
+        let code_hash_bytes: [u8; 32] = code_hash.into();
+        let code = self
+            .db
+            .get_cf_opt(hash_to_code_cf, code_hash_bytes, &rocksdb_read_options())?;
+        STORAGE_METRICS
+            .read_code_latency
+            .record(start.elapsed().as_secs_f64());
+        let Some(code) = code else {
+            return Ok(None);
+        };
+        let code = Bytes::from(code);
+        if let Some(cache) = &self.code_cache {
+            cache.insert(code_hash, code.clone());
+        }
+        Ok(Some(code))
     }
 
     pub fn read_latest_block_num(&self) -> Result<Option<u64>, Error> {
@@ -1948,19 +2024,24 @@ impl StateDBProvider for Arc<DataBaseRef> {
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    let latest_block_num = self.read_latest_block_num()?;
-                    match latest_block_num {
-                        Some(num) => {
-                            block_num = num;
-                            let block_hash = self.read_block_hash(num)?;
-                            if block_hash == H256::ZERO {
-                                return Ok(None);
-                            }
-                            let info = self.read_block_info(block_hash)?;
-                            if info.is_none() {
-                                return Ok(None);
-                            }
-                            cached_block_info = Some(info.unwrap());
+                    // The latest hash's block info already carries the number,
+                    // so resolve with one hash read + one info read instead of
+                    // going num → hash → info again on top of
+                    // read_latest_block_num (which reads both a first time).
+                    // The latest pointer is the single source of truth here:
+                    // BlockNumToBlockHash is written in the same atomic batch,
+                    // so re-verifying it would only re-read what commit()
+                    // already guarantees.
+                    let latest_hash = self.read_latest_block_hash()?;
+                    let info = if latest_hash == H256::ZERO {
+                        None
+                    } else {
+                        self.read_block_info(latest_hash)?
+                    };
+                    match info {
+                        Some(info) => {
+                            block_num = info.header.number;
+                            cached_block_info = Some(info);
                         }
                         None => {
                             block_num = 0;
@@ -2206,24 +2287,7 @@ impl StateDBRead for StateDB {
     }
 
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
-        let start = std::time::Instant::now();
-        let address_to_code_cf = self
-            .db
-            .db
-            .cf_handle(StorageTypeColumn::HashToCode.to_str())
-            .unwrap();
-        let code_hash_bytes: [u8; 32] = code_hash.into();
-        let code =
-            self.db
-                .db
-                .get_cf_opt(address_to_code_cf, code_hash_bytes, &rocksdb_read_options())?;
-        STORAGE_METRICS
-            .read_code_latency
-            .record(start.elapsed().as_secs_f64());
-        if code.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(Bytes::from(code.unwrap())))
+        self.db.read_code(code_hash)
     }
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
@@ -2847,6 +2911,102 @@ mod rewind_tests {
             let account = state.0.read_account(addr).unwrap().unwrap();
             assert_eq!(account.balance, U256::from(200));
             assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The code cache is content-addressed, so a repeat read must be served
+    /// from memory: after the first read fills the cache, deleting the row
+    /// from the HashToCode CF must not make the code unreadable.
+    #[test]
+    fn test_code_cache_serves_repeat_reads_without_disk() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Restore the process-global env var when the test ends (or panics)
+        // so later tests in this process see the default cache config.
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("ARCHIVE_CODE_CACHE_MB", v),
+                    None => std::env::remove_var("ARCHIVE_CODE_CACHE_MB"),
+                }
+            }
+        }
+        let _env = EnvGuard(std::env::var("ARCHIVE_CODE_CACHE_MB").ok());
+        std::env::set_var("ARCHIVE_CODE_CACHE_MB", "64");
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-code-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+
+            let code = Bytes::from(vec![0x60u8, 0x80, 0x60, 0x40, 0x52]);
+            let code_hash: H256 = alloy::primitives::keccak256(&code).0.into();
+            let mut batch = db.prepare_write_batch().unwrap();
+            db.write_code(&mut batch, code_hash, code.clone()).unwrap();
+            db.commit(batch).unwrap();
+
+            // Unknown hash: miss straight through to the CF, not cached.
+            assert_eq!(db.read_code(H256::repeat_byte(0xee)).unwrap(), None);
+
+            // First read fills the cache from disk.
+            assert_eq!(db.read_code(code_hash).unwrap(), Some(code.clone()));
+
+            // Remove the row from the CF; the cached entry must still serve it.
+            let cf = db
+                .db
+                .cf_handle(StorageTypeColumn::HashToCode.to_str())
+                .unwrap();
+            let code_hash_bytes: [u8; 32] = code_hash.into();
+            db.db.delete_cf(cf, code_hash_bytes).unwrap();
+            assert_eq!(db.read_code(code_hash).unwrap(), Some(code));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// db_at(Latest) must resolve the head's number and block info from the
+    /// latest hash alone (no num → hash → info round-trip), on both an empty
+    /// and a populated DB.
+    #[test]
+    fn test_db_at_latest_resolves_number_and_info() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-db-at-latest-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+
+            // Empty DB: a handle pinned at height 0 with no block info.
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.block_num, 0);
+            assert!(state.block_info.is_none());
+
+            let addr = H256::repeat_byte(0xaa);
+            let slot = H256::repeat_byte(0x01);
+            let block1 = make_block_info_at(1, H256::repeat_byte(0x11), H256::ZERO);
+            StateDBWrapper(state)
+                .update_block(block1.clone(), make_diff(addr, slot, 100, 1, 7))
+                .unwrap();
+
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.block_num, 1);
+            let info = state.block_info.as_ref().unwrap();
+            assert_eq!(info.header.hash, block1.header.hash);
+            assert_eq!(info.header.number, 1);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

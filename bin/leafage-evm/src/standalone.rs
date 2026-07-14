@@ -316,6 +316,14 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     iterator_timeout_secs: u64,
 
+    /// Size (MB) of the in-memory content-addressed code cache
+    /// (code_hash → code) for archive reads. Serves debank_getAddressCode /
+    /// eth_getCode / multicall code loads at any block height without
+    /// touching the HashToCode CF. 0 disables.
+    /// Archive-only (RocksDB archive mode).
+    #[arg(long, env = "ARCHIVE_CODE_CACHE_MB", default_value = "256")]
+    archive_code_cache_mb: u64,
+
     /// Gas estimation buffer percentage (100 = no buffer, 120 = +20% buffer)
     /// Default: 100
     ///
@@ -683,6 +691,10 @@ impl Command {
             std::env::set_var(
                 "ROCKSDB_ITERATOR_TIMEOUT_SECS",
                 self.iterator_timeout_secs.to_string(),
+            );
+            std::env::set_var(
+                "ARCHIVE_CODE_CACHE_MB",
+                self.archive_code_cache_mb.to_string(),
             );
         }
 
