@@ -26,3 +26,11 @@ metrics-derive.workspace = true
 libmdbx.workspace = true
 page_size.workspace = true
 dashmap.workspace = true
+ahash.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "layer_read"
+harness = false
