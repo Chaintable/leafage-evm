@@ -16,7 +16,6 @@ use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
 use serde_json::Value;
 use std::error::Error;
-use std::str::FromStr;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -150,8 +149,9 @@ where
         state_override: Option<StateOverride>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<Bytes> {
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_evm_with_cancel(limiter, move |_token| {
             this.call_inner(request, block_id, state_override, block_overrides)
         })
         .await
@@ -282,9 +282,10 @@ where
         _: Option<bool>,
         _: Option<bool>,
     ) -> RpcResult<MultiCallResp> {
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
 
-        utils::spawn_blocking_with_cancel(move |token| {
+        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
             this.multi_call_impl_inner(requests, block_id, fast_fail.unwrap_or_default(), token)
         })
         .await
@@ -352,9 +353,7 @@ where
             }
             if let Some(txkind) = request.to {
                 if let Some(address) = txkind.to() {
-                    if *address
-                        == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
-                    {
+                    if *address == *utils::NATIVE_TOKEN_SENTINEL {
                         let mut res = Self::eth_erc20_handle(&block.header, state.clone(), request);
                         if res.code != MultiCallErrorCode::Success as i32 {
                             stats.success = false;
