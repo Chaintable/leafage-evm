@@ -1,8 +1,8 @@
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
-    AccountOverride, BlockOverrides, Bytecode, DebankEvent, DebankID, DebankTrace, Header,
-    StateOverride, H256, U256,
+    AccountInfo, AccountOverride, BlockOverrides, Bytecode, DebankEvent, DebankID, DebankTrace,
+    Header, StateOverride, H256, U256,
 };
 use revm::context::BlockEnv;
 use revm::database::{CacheDB, DatabaseRef};
@@ -11,9 +11,62 @@ use revm::state::{Account, AccountStatus, EvmStorageSlot};
 use revm::{Database, DatabaseCommit};
 use revm_inspectors::tracing::types::{CallTraceNode, TraceMemberOrder};
 use revm_inspectors::tracing::CallTraceArena;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
+
+/// The pseudo token address debank clients use to query the chain's
+/// native token through ERC20-shaped calls. Parsed once instead of per
+/// request on the multicall hot path.
+pub(crate) static NATIVE_TOKEN_SENTINEL: LazyLock<Address> = LazyLock::new(|| {
+    Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
+});
+
+/// Adapter exposing revm's caching `Database` methods (`&mut self`)
+/// through `DatabaseRef`, so repeated reads inside one RPC request —
+/// across the calls of a multicall, or the re-executions of an
+/// estimateGas binary search — hit this request-local cache instead of
+/// re-walking the layered state (keccak + diff layers + shared cache)
+/// every time. Single-threaded by design: it lives inside one blocking
+/// task, which the `RefCell` makes explicit.
+pub(crate) struct RequestCacheDB<DB: DatabaseRef>(RefCell<CacheDB<DB>>);
+
+impl<DB: DatabaseRef> RequestCacheDB<DB> {
+    pub(crate) fn new(db: CacheDB<DB>) -> Self {
+        Self(RefCell::new(db))
+    }
+}
+
+impl<DB: DatabaseRef> std::fmt::Debug for RequestCacheDB<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestCacheDB").finish_non_exhaustive()
+    }
+}
+
+impl<DB: DatabaseRef> DatabaseRef for RequestCacheDB<DB> {
+    type Error = DB::Error;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.0.borrow_mut().basic(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
+        self.0.borrow_mut().code_by_hash(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.0.borrow_mut().storage(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<H256, Self::Error> {
+        self.0.borrow_mut().block_hash(number)
+    }
+}
+
 
 /// Applies the given block overrides to the [`CacheDB`] and [`BlockEnv`].
 ///
@@ -308,6 +361,36 @@ where
 
     tokio::task::spawn_blocking(move || task(token)).await
 }
+
+/// [`spawn_blocking_with_cancel`] gated by the server's optional EVM
+/// execution limiter (`None` keeps the old unbounded behavior). Waiting
+/// happens on the async side (cheap and cancellable — a dropped caller
+/// releases its queue slot); the permit is moved into the blocking task
+/// so it is held until execution really finishes.
+pub async fn spawn_blocking_evm_with_cancel<F, R>(
+    limiter: Option<Arc<Semaphore>>,
+    task: F,
+) -> Result<R, JoinError>
+where
+    F: FnOnce(CancellationToken) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let permit = match limiter {
+        // acquire_owned only errors when the semaphore is closed, which never happens here.
+        Some(sem) => sem.acquire_owned().await.ok(),
+        None => None,
+    };
+
+    let token = CancellationToken::new();
+
+    let _guard = token.clone().drop_guard();
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task(token)
+    })
+    .await
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +398,58 @@ mod tests {
     use std::sync::{atomic, Arc};
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("mock error")]
+    struct MockErr;
+    impl revm::database_interface::DBErrorMarker for MockErr {}
+
+    /// DatabaseRef mock counting underlying reads.
+    #[derive(Debug, Default)]
+    struct Counting {
+        reads: AtomicU64,
+    }
+
+    impl DatabaseRef for &Counting {
+        type Error = MockErr;
+        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, MockErr> {
+            self.reads.fetch_add(1, atomic::Ordering::SeqCst);
+            let mut info = AccountInfo::default();
+            info.nonce = 7;
+            Ok(Some(info))
+        }
+        fn code_by_hash_ref(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
+            self.reads.fetch_add(1, atomic::Ordering::SeqCst);
+            Ok(Bytecode::default())
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, MockErr> {
+            self.reads.fetch_add(1, atomic::Ordering::SeqCst);
+            Ok(U256::from(42u64))
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<H256, MockErr> {
+            self.reads.fetch_add(1, atomic::Ordering::SeqCst);
+            Ok(H256::ZERO)
+        }
+    }
+
+    #[test]
+    fn request_cache_db_caches_repeated_reads() {
+        let counting = Counting::default();
+        let db = RequestCacheDB::new(CacheDB::new(&counting));
+        let addr = Address::with_last_byte(1);
+
+        // Values pass through unchanged...
+        assert_eq!(db.basic_ref(addr).unwrap().unwrap().nonce, 7);
+        assert_eq!(db.storage_ref(addr, U256::from(5u64)).unwrap(), U256::from(42u64));
+        let after_first = counting.reads.load(atomic::Ordering::SeqCst);
+
+        // ...and repeats are served from the request-local cache.
+        for _ in 0..10 {
+            assert_eq!(db.basic_ref(addr).unwrap().unwrap().nonce, 7);
+            assert_eq!(db.storage_ref(addr, U256::from(5u64)).unwrap(), U256::from(42u64));
+        }
+        assert_eq!(counting.reads.load(atomic::Ordering::SeqCst), after_first);
+    }
 
     #[tokio::test]
     async fn test_normal_execution() {
