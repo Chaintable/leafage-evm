@@ -826,6 +826,35 @@ mod tests {
         );
     }
 
+    /// Phase 1 gate (design doc §5): leafage's `stylus_compile` binding must
+    /// turn a real on-chain Stylus program's wasm into non-empty native asm for
+    /// the host target. This exercises the compile FFI + native-target selection
+    /// (empty target => `Target::default()`) without needing a hostio bridge.
+    /// Gated on `LEAFAGE_ARB_STYLUS_LIB`.
+    #[test]
+    fn compiles_arb_one_program_to_native_asm() {
+        if std::env::var_os("LEAFAGE_ARB_STYLUS_LIB").is_none() {
+            eprintln!("skipping compiles_arb_one_program_to_native_asm: LEAFAGE_ARB_STYLUS_LIB not set");
+            return;
+        }
+
+        let code = alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
+            .expect("decode fixture hex");
+        let mut params = test_stylus_params(16 * 1024 * 1024, 0);
+        params.version = 2;
+        let wasm = ArbWasm::check_classic_stylus_code(&code, params.max_wasm_size)
+            .expect("decode classic stylus code");
+
+        let asm = StylusRuntime::compile_from_env(&wasm, params.version).expect("compile");
+        assert!(!asm.is_empty(), "native asm must be non-empty");
+        assert!(
+            asm.len() > wasm.len() / 4,
+            "native asm suspiciously small: {} bytes for {} wasm bytes",
+            asm.len(),
+            wasm.len(),
+        );
+    }
+
     fn brotli_compress(input: &[u8]) -> Vec<u8> {
         let mut reader = Cursor::new(input);
         let mut output = Vec::new();

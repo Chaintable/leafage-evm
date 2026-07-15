@@ -21,6 +21,14 @@ type StylusActivateFn = unsafe extern "C" fn(
     *mut u64,
 ) -> u8;
 type FreeRustBytesFn = unsafe extern "C" fn(RustBytes);
+type StylusCompileFn = unsafe extern "C" fn(
+    GoSliceData,    // wasm
+    u16,            // stylus version
+    bool,           // debug
+    GoSliceData,    // target name (empty => native host target)
+    bool,           // cranelift (false => singlepass)
+    *mut RustBytes, // out: native asm on success, error string otherwise
+) -> u8;
 
 #[derive(Debug)]
 pub(super) enum StylusRuntimeError {
@@ -35,6 +43,10 @@ pub(super) enum StylusRuntimeError {
         error: String,
     },
     Activation {
+        status: u8,
+        message: String,
+    },
+    Compile {
         status: u8,
         message: String,
     },
@@ -195,6 +207,52 @@ impl StylusRuntime {
         }
     }
 
+    /// Compiles on-chain Stylus wasm to native asm for the host target. The
+    /// asm is a node-local derived artifact (not consensus); the moduleHash is
+    /// the consensus anchor. An empty target selects the native host target
+    /// (`target_cache_get("")` -> `Target::default()`), so no `stylus_target_set`
+    /// call is required for single-host execution.
+    pub(super) fn compile_from_env(
+        wasm: &[u8],
+        version: u16,
+    ) -> Result<Vec<u8>, StylusRuntimeError> {
+        let Some(path) = env::var_os(STYLUS_RUNTIME_ENV) else {
+            return Err(StylusRuntimeError::Unconfigured);
+        };
+        Self::from_path(path).and_then(|runtime| runtime.compile(wasm, version))
+    }
+
+    fn compile(&self, wasm: &[u8], version: u16) -> Result<Vec<u8>, StylusRuntimeError> {
+        let compile = self.symbol::<StylusCompileFn>("stylus_compile")?;
+        let free_output = *self.symbol::<FreeRustBytesFn>("free_rust_bytes")?;
+        let wasm = GoSliceData {
+            ptr: if wasm.is_empty() {
+                ptr::null()
+            } else {
+                wasm.as_ptr()
+            },
+            len: wasm.len(),
+        };
+        let target = GoSliceData {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        let mut output = RustBytes {
+            ptr: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+        let status = unsafe { compile(wasm, version, false, target, false, &mut output) };
+        let bytes = unsafe { rust_bytes_to_vec(free_output, output) };
+        match status {
+            0 => Ok(bytes),
+            status => Err(StylusRuntimeError::Compile {
+                status,
+                message: String::from_utf8_lossy(&bytes).into_owned(),
+            }),
+        }
+    }
+
     fn symbol<T>(&self, name: &'static str) -> Result<Symbol<'_, T>, StylusRuntimeError> {
         unsafe { self.library.get(name.as_bytes()) }.map_err(|error| StylusRuntimeError::Symbol {
             path: self.path.clone(),
@@ -233,6 +291,9 @@ impl StylusRuntimeError {
             }
             Self::Activation { status, message } => {
                 format!("stylus activation failed with status {status}: {message}")
+            }
+            Self::Compile { status, message } => {
+                format!("stylus compile failed with status {status}: {message}")
             }
             Self::OutOfInk => "stylus activation ran out of ink".to_owned(),
             Self::OutOfStack => "stylus activation ran out of stack".to_owned(),
