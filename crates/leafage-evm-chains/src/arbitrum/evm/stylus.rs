@@ -14,6 +14,7 @@
 //! diffed against a writer / Arb One traced RPC before shipping.
 
 use super::ArbitrumEvm;
+use crate::arbitrum::arbos_state::ArbStateReader;
 use crate::arbitrum::precompile::{
     ArbWasm, ArbitrumContext, HostioHandler, PreparedStylusProgram, StylusExecInput, StylusOutcome,
     StylusRuntime,
@@ -133,6 +134,16 @@ where
         return finish_frame(evm, InstructionResult::OutOfGas, Bytes::new(), gas);
     }
 
+    // EvmData.block_number is the ArbOS-recorded L1 block number (what the
+    // NUMBER opcode returns on Arbitrum, per PR #184's BLOCKHASH work), falling
+    // back to the L2 number on a read error.
+    let l1_block_number = evm
+        .inner
+        .ctx
+        .db()
+        .blockhashes_l1_block_number()
+        .unwrap_or_else(|| evm.inner.ctx.block().number().saturating_to::<u64>());
+
     // 5. Assemble EvmData inputs.
     let input = StylusExecInput {
         arbos_version: prepared.arbos_version,
@@ -140,8 +151,7 @@ where
         chainid: evm.inner.ctx.cfg().chain_id(),
         block_coinbase: evm.inner.ctx.block().beneficiary(),
         block_gas_limit: evm.inner.ctx.block().gas_limit(),
-        // TODO(Phase 4): should be the ArbOS-recorded L1 block number, not L2.
-        block_number: evm.inner.ctx.block().number().saturating_to::<u64>(),
+        block_number: l1_block_number,
         block_timestamp: timestamp,
         contract_address: contract,
         module_hash: prepared.module_hash,
