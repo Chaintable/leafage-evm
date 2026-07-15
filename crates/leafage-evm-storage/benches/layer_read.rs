@@ -235,8 +235,9 @@ fn bench_walks(c: &mut Criterion) {
             })
         });
 
-        // Concurrent readers on one shared chain: 8 threads × 20k reads,
-        // reproducing the per-layer lock traffic under RPC load.
+        // Concurrent readers sharing one prebuilt flattened view: 8 threads
+        // × 20k reads. Handle clones only clone the view Arc, matching the
+        // StateTree request path.
         const THREADS: usize = 8;
         const READS: usize = 20_000;
         group.throughput(Throughput::Elements((THREADS * READS) as u64));
@@ -247,7 +248,7 @@ fn bench_walks(c: &mut Criterion) {
                     let start = Instant::now();
                     std::thread::scope(|scope| {
                         for t in 0..THREADS {
-                            let handle = make_handle(&top, depth);
+                            let handle = handle.clone();
                             let probes = &probes;
                             scope.spawn(move || {
                                 let mut i = t;
@@ -277,6 +278,10 @@ fn bench_request_case(
     reads_per_request: &[usize],
 ) {
     let mut group = c.benchmark_group(name);
+    // StateTree now builds this flattened index once per uploaded block.
+    // Cloning the handle below only clones Arcs and models state_at() sharing
+    // that prebuilt view across requests.
+    let shared_handle = HybridStateDB::new(top.clone(), DiskMock, None);
 
     for &reads in reads_per_request {
         group.throughput(Throughput::Elements(reads as u64));
@@ -293,40 +298,46 @@ fn bench_request_case(
             });
         });
 
-        let mut flat_offset = 0usize;
-        group.bench_with_input(BenchmarkId::new("flat", reads), &reads, |b, &reads| {
-            b.iter(|| {
-                // Include the eager O(depth) flattening in every measured
-                // request, matching StateTree::state_at's handle lifetime.
-                let handle = HybridStateDB::new(top.clone(), DiskMock, None);
-                for n in 0..reads {
-                    let key = keys[(flat_offset + n) % keys.len()];
-                    black_box(handle.storage(address, key).unwrap());
-                }
-                flat_offset = (flat_offset + reads) % keys.len();
-            });
-        });
+        let mut shared_flat_offset = 0usize;
+        group.bench_with_input(
+            BenchmarkId::new("shared_flat", reads),
+            &reads,
+            |b, &reads| {
+                b.iter(|| {
+                    let handle = shared_handle.clone();
+                    for n in 0..reads {
+                        let key = keys[(shared_flat_offset + n) % keys.len()];
+                        black_box(handle.storage(address, key).unwrap());
+                    }
+                    shared_flat_offset = (shared_flat_offset + reads) % keys.len();
+                });
+            },
+        );
     }
 
     group.finish();
 }
 
 /// Diff-layer handle lifecycle cost for the production Latest depth.
-/// Unlike the steady-state benches above, every iteration constructs and
-/// drops a fresh handle. The comparison isolates flattening from ahash:
-/// both handles read the same current DiffLayer maps, and both use a direct
-/// mock DB terminal. It intentionally does not model the rest of an RPC.
+/// Unlike the steady-state benches above, every iteration creates and drops
+/// a request handle. `eager_flat` is retained only as the rejected per-request
+/// flattening baseline. All paths use the same current DiffLayer maps and a
+/// direct mock DB terminal; this does not model the rest of an RPC.
 fn bench_request_lifecycle(c: &mut Criterion) {
     const DEPTH: usize = 256;
     let top = build_chain_with_cache(DEPTH, false);
+    let shared_handle = HybridStateDB::new(top.clone(), DiskMock, None);
 
     let mut handle_lifecycle = c.benchmark_group("request_lifecycle/depth256/handle_lifecycle");
     handle_lifecycle.throughput(Throughput::Elements(1));
     handle_lifecycle.bench_function("linked", |b| {
         b.iter(|| black_box(LinkedHandle::new(top.clone())));
     });
-    handle_lifecycle.bench_function("flat", |b| {
+    handle_lifecycle.bench_function("eager_flat", |b| {
         b.iter(|| black_box(HybridStateDB::new(top.clone(), DiskMock, None)));
+    });
+    handle_lifecycle.bench_function("shared_flat", |b| {
+        b.iter(|| black_box(shared_handle.clone()));
     });
     handle_lifecycle.finish();
 

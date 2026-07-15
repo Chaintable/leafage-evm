@@ -5,7 +5,7 @@ use moka::ops::compute::Op;
 use moka::sync::Cache;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
 use tracing::info;
 
 /// Keys are already uniformly distributed (keccak-derived), and these
@@ -155,7 +155,12 @@ impl CacheDiskLayer {
         // When disabled, build with capacity 0; the caches are never
         // consulted but the fields still need valid values.
         let (a, s, c, b) = if enabled {
-            (accounts_cache_size as u64, storage_cache_size as u64, contract_cache_size as u64, 1_000)
+            (
+                accounts_cache_size as u64,
+                storage_cache_size as u64,
+                contract_cache_size as u64,
+                1_000,
+            )
         } else {
             (0, 0, 0, 0)
         };
@@ -242,8 +247,7 @@ impl CacheDiskLayer {
 
         // Publish AFTER write-through: later handles snapshot block_num
         // and find diff keys already tagged, so their refills skip.
-        self.committed_height
-            .store(block_num, Ordering::Release);
+        self.committed_height.store(block_num, Ordering::Release);
 
         Ok(())
     }
@@ -321,19 +325,59 @@ impl DiffLayer {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct HybridStateDB<DB> {
-    pub memory_layer: Arc<LinkedDiffLayer>,
-    /// Diff layers from `memory_layer` (inclusive) down to the terminal
-    /// layer (exclusive), flattened once at construction. Per-key reads
-    /// iterate this slice instead of re-walking the `next` RwLocks —
-    /// with a 256-deep chain that removes 256 lock acquisitions per key.
-    /// The snapshot stays valid after a concurrent commit retargets the
-    /// chain: committed layers are immutable and their data is only
-    /// duplicated downward (cache/disk), never changed.
-    layers: Arc<[Arc<LinkedDiffLayer>]>,
+/// Immutable read index over a linked diff-layer head.
+///
+/// The linked representation remains the source of truth for parent/fork/cap
+/// topology. StateTree builds one of these views when it imports a block, and
+/// every state handle for that block shares it through an Arc.
+#[derive(Debug)]
+pub(crate) struct FlattenedLayerView {
+    /// Diff layers from the head (inclusive) down to the terminal layer
+    /// (exclusive), ordered newest to oldest.
+    layers: Box<[Arc<LinkedDiffLayer>]>,
     /// The layer the chain bottoms out in: CacheDiskLayer or Empty.
     terminal: Arc<LinkedDiffLayer>,
+}
+
+impl FlattenedLayerView {
+    pub(crate) fn build(memory_layer: Arc<LinkedDiffLayer>) -> Arc<Self> {
+        let mut layers = Vec::new();
+        let mut cur = memory_layer;
+        while let LinkedDiffLayer::DiffLayer(diff) = cur.as_ref() {
+            let next = diff
+                .next
+                .read()
+                .expect("Failed to acquire read lock on diff layer")
+                .clone();
+            layers.push(cur);
+            cur = next;
+        }
+        Arc::new(Self {
+            layers: layers.into_boxed_slice(),
+            terminal: cur,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn head(&self) -> &Arc<LinkedDiffLayer> {
+        self.layers.first().unwrap_or(&self.terminal)
+    }
+
+    pub(crate) fn empty() -> Arc<Self> {
+        static EMPTY: LazyLock<Arc<FlattenedLayerView>> =
+            LazyLock::new(|| FlattenedLayerView::build(Arc::new(LinkedDiffLayer::Empty)));
+        EMPTY.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diff_layer_count(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HybridStateDB<DB> {
+    pub(crate) flattened: Arc<FlattenedLayerView>,
     pub statedb: DB,
     /// `Some(h)` enables cache refill on miss, tagging the insert with
     /// `h` and only overwriting strictly-lower-tagged entries. `None`
@@ -347,24 +391,17 @@ impl<DB> HybridStateDB<DB> {
         statedb: DB,
         cache_view_height: Option<u64>,
     ) -> Self {
-        let mut layers = Vec::new();
-        let mut cur = memory_layer.clone();
-        loop {
-            let next = match cur.as_ref() {
-                LinkedDiffLayer::DiffLayer(diff) => diff
-                    .next
-                    .read()
-                    .expect("Failed to acquire read lock on diff layer")
-                    .clone(),
-                _ => break,
-            };
-            layers.push(cur);
-            cur = next;
-        }
+        let flattened = FlattenedLayerView::build(memory_layer);
+        Self::from_flattened(flattened, statedb, cache_view_height)
+    }
+
+    pub(crate) fn from_flattened(
+        flattened: Arc<FlattenedLayerView>,
+        statedb: DB,
+        cache_view_height: Option<u64>,
+    ) -> Self {
         Self {
-            memory_layer,
-            layers: layers.into(),
-            terminal: cur,
+            flattened,
             statedb,
             cache_view_height,
         }
@@ -375,12 +412,12 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
-        for layer in self.layers.iter() {
+        for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().accounts.get(&address) {
                 return Ok(value.clone());
             }
         }
-        match self.terminal.as_ref() {
+        match self.flattened.terminal.as_ref() {
             LinkedDiffLayer::CacheDiskLayer(cache) if cache.enabled => {
                 match cache.accounts.get(&address) {
                     Some((_, value)) => Ok(value),
@@ -388,10 +425,13 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                         let res = self.statedb.basic(address)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res.clone());
-                            cache.accounts.entry(address).and_compute_with(|maybe| match maybe {
-                                Some(e) if e.value().0 >= h => Op::Nop,
-                                _ => Op::Put(new_val),
-                            });
+                            cache
+                                .accounts
+                                .entry(address)
+                                .and_compute_with(|maybe| match maybe {
+                                    Some(e) if e.value().0 >= h => Op::Nop,
+                                    _ => Op::Put(new_val),
+                                });
                         }
                         Ok(res)
                     }
@@ -402,12 +442,12 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     }
 
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error> {
-        for layer in self.layers.iter() {
+        for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().storage.get(&(address, index)) {
                 return Ok(*value);
             }
         }
-        match self.terminal.as_ref() {
+        match self.flattened.terminal.as_ref() {
             LinkedDiffLayer::CacheDiskLayer(cache) if cache.enabled => {
                 match cache.storages.get(&(address, index)) {
                     Some((_, value)) => Ok(value),
@@ -415,12 +455,13 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                         let res = self.statedb.storage(address, index)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res);
-                            cache.storages.entry((address, index)).and_compute_with(
-                                |maybe| match maybe {
+                            cache
+                                .storages
+                                .entry((address, index))
+                                .and_compute_with(|maybe| match maybe {
                                     Some(e) if e.value().0 >= h => Op::Nop,
                                     _ => Op::Put(new_val),
-                                },
-                            );
+                                });
                         }
                         Ok(res)
                     }
@@ -431,12 +472,12 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     }
 
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
-        for layer in self.layers.iter() {
+        for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().contracts.get(&code_hash) {
                 return Ok(value.clone());
             }
         }
-        match self.terminal.as_ref() {
+        match self.flattened.terminal.as_ref() {
             LinkedDiffLayer::CacheDiskLayer(cache) if cache.enabled => {
                 match cache.contracts.get(&code_hash) {
                     Some((_, value)) => Ok(value),
@@ -444,10 +485,12 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                         let res = self.statedb.code_by_hash(code_hash)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res.clone());
-                            cache.contracts.entry(code_hash).and_compute_with(|maybe| match maybe {
-                                Some(e) if e.value().0 >= h => Op::Nop,
-                                _ => Op::Put(new_val),
-                            });
+                            cache.contracts.entry(code_hash).and_compute_with(
+                                |maybe| match maybe {
+                                    Some(e) if e.value().0 >= h => Op::Nop,
+                                    _ => Op::Put(new_val),
+                                },
+                            );
                         }
                         Ok(res)
                     }
@@ -458,13 +501,13 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     }
 
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
-        for layer in self.layers.iter() {
+        for layer in self.flattened.layers.iter() {
             let diff = layer.unwrap_diff_layer();
             if diff.block_info.header.number == number {
                 return Ok(diff.block_info.header.hash);
             }
         }
-        match self.terminal.as_ref() {
+        match self.flattened.terminal.as_ref() {
             LinkedDiffLayer::CacheDiskLayer(cache) if cache.enabled => {
                 match cache.block_hashes.get(&number) {
                     Some((_, value)) => Ok(value),
@@ -472,10 +515,12 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                         let res = self.statedb.block_hash(number)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res);
-                            cache.block_hashes.entry(number).and_compute_with(|maybe| match maybe {
-                                Some(e) if e.value().0 >= h => Op::Nop,
-                                _ => Op::Put(new_val),
-                            });
+                            cache.block_hashes.entry(number).and_compute_with(
+                                |maybe| match maybe {
+                                    Some(e) if e.value().0 >= h => Op::Nop,
+                                    _ => Op::Put(new_val),
+                                },
+                            );
                         }
                         Ok(res)
                     }
@@ -660,6 +705,33 @@ mod tests {
     }
 
     #[test]
+    fn handles_share_prebuilt_flattened_view() {
+        let (top, addr) = build_chain(4);
+        let flattened = FlattenedLayerView::build(top.clone());
+        let first = HybridStateDB::from_flattened(flattened.clone(), MockDB::default(), Some(0));
+        let second = HybridStateDB::from_flattened(flattened.clone(), MockDB::default(), Some(0));
+
+        assert!(Arc::ptr_eq(&first.flattened, &flattened));
+        assert!(Arc::ptr_eq(&second.flattened, &flattened));
+        assert!(Arc::ptr_eq(flattened.head(), &top));
+        assert_eq!(flattened.diff_layer_count(), 4);
+        assert_eq!(first.storage(addr, key(1000)).unwrap(), U256::from(1));
+        assert_eq!(second.storage(addr, key(1003)).unwrap(), U256::from(4));
+
+        let empty_a = FlattenedLayerView::empty();
+        let empty_b = FlattenedLayerView::empty();
+        assert!(Arc::ptr_eq(&empty_a, &empty_b));
+        assert_eq!(empty_a.diff_layer_count(), 0);
+        assert!(matches!(empty_a.head().as_ref(), LinkedDiffLayer::Empty));
+
+        let cache = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(
+            1, 1, 1, 0, true,
+        )));
+        let cache_view = FlattenedLayerView::build(cache.clone());
+        assert!(Arc::ptr_eq(cache_view.head(), &cache));
+    }
+
+    #[test]
     fn handle_stays_consistent_across_commit() {
         let (top, addr) = build_chain(4);
         let mock = MockDB::default();
@@ -697,7 +769,7 @@ impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
     type Error = Error<StateDB::Error>;
 
     fn block_info_arc(&self) -> Result<Arc<BlockInfo>, Self::Error> {
-        match self.memory_layer.as_ref() {
+        match self.flattened.head().as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_info.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {
                 let last_diff = cache.old_diff_layer_lock().clone();
@@ -715,7 +787,7 @@ impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
     }
 
     fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
-        match self.memory_layer.as_ref() {
+        match self.flattened.head().as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_diff.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {
                 let last_diff = cache.old_diff_layer_lock().clone();
