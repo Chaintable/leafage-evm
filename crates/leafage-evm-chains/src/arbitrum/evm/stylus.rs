@@ -5,13 +5,15 @@
 //! journal commit/revert, `CallOutcome` wrapping, and parent gas/return wiring
 //! stay identical to an EVM callee. See `docs/stylus-execution-impl-plan.md`.
 //!
-//! Verification status: dispatch, decode, compile, execute, storage/account/log
-//! hostio, and subcall driving are wired. **Gas/trace parity is NOT verified** —
-//! the exact nitro pre-charge (memory model + RecentWasms), the exact hostio
-//! gas/refund (EIP-2929/2200 via nitro `Wasm*Cost`), the subcall base-cost and
-//! status encoding, create (hostio 7/8), capture-hostio (14), and the L1
-//! block-number / paid-gas-price EvmData fields are TODO(Phase 4) and must be
-//! diffed against a writer / Arb One traced RPC before shipping.
+//! Verification status: dispatch, decode, compile, execute, the full hostio
+//! set, and subcall/create driving are wired. Exact gas is in place for the
+//! memory model (nitro table), storage/account access + SSTORE refund (revm
+//! GasParams), init/cached cost, and the L1 block-number EvmData field.
+//! **Gas/trace parity is still NOT verified end to end** and the following stay
+//! approximate: subcall/create base cost + status encoding, capture-hostio (14),
+//! reentrant flag, paid-gas-price EvmData field, RecentWasms (strategy A only),
+//! and enforceStylusPageLimit. All are TODO(Phase 4) and must be diffed against
+//! a writer / Arb One traced RPC before shipping.
 
 use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::ArbStateReader;
@@ -21,6 +23,7 @@ use crate::arbitrum::precompile::{
 };
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use revm::context::{ContextTr, JournalTr};
+use revm::context_interface::cfg::gas_params::GasParams;
 use revm::context_interface::{Block, Cfg, CreateScheme, Transaction};
 use revm::handler::evm::ContextDbError;
 use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult};
@@ -226,6 +229,7 @@ where
     //    subcalls can drive child frames on the shared stack).
     let supplied = gas.remaining();
     let mut call_gas = supplied;
+    let gas_params = evm.inner.ctx.cfg().gas_params().clone();
     let mut hostio = StylusHostio {
         evm,
         contract,
@@ -234,6 +238,7 @@ where
         delegate_value: value,
         free_pages: prepared.free_pages,
         page_gas: prepared.page_gas,
+        gas_params,
         refund: 0,
     };
     let result = StylusRuntime::call_from_env(&asm, &calldata, input, &mut hostio, &mut call_gas);
@@ -350,6 +355,8 @@ struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
     /// StylusParams memory model inputs, for AddPages.
     free_pages: u16,
     page_gas: u16,
+    /// revm gas schedule, for exact SLOAD/SSTORE/account-touch cost + refund.
+    gas_params: GasParams,
     refund: i64,
 }
 
@@ -382,6 +389,26 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         &mut self.evm.inner.ctx
     }
 
+    /// EIP-2929 SLOAD cost (nitro `WasmStateLoadCost`).
+    fn storage_load_cost(&self, is_cold: bool) -> u64 {
+        self.gas_params.warm_storage_read_cost()
+            + if is_cold {
+                self.gas_params.cold_storage_additional_cost()
+            } else {
+                0
+            }
+    }
+
+    /// EIP-2929 account-access cost (nitro `WasmAccountTouchCost`).
+    fn account_touch_cost(&self, is_cold: bool) -> u64 {
+        self.gas_params.warm_storage_read_cost()
+            + if is_cold {
+                self.gas_params.cold_account_additional_cost()
+            } else {
+                0
+            }
+    }
+
     fn get_bytes32(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if input.len() < 32 {
             return (vec![0u8; 32], Vec::new(), 0);
@@ -392,8 +419,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             Ok(load) => (load.data, load.is_cold),
             Err(_) => (U256::ZERO, false),
         };
-        // TODO(Phase 4): nitro WasmStateLoadCost; approximate EIP-2929 SLOAD.
-        let cost = if is_cold { 2100 } else { 100 };
+        let cost = self.storage_load_cost(is_cold);
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), cost)
     }
 
@@ -409,8 +435,14 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             let value = U256::from_be_slice(&input[offset + 32..offset + 64]);
             match self.ctx().journal_mut().sstore(contract, key, value) {
                 Ok(load) => {
-                    // TODO(Phase 4): exact EIP-2200 cost + refund from SStoreResult.
-                    cost = cost.saturating_add(if load.is_cold { 2200 } else { 100 });
+                    // Exact revm SSTORE gas + refund (EIP-2929/2200/3529).
+                    // Arbitrum is always post-Istanbul.
+                    let slot_cost = self.gas_params.sstore_static_gas()
+                        + self
+                            .gas_params
+                            .sstore_dynamic_gas(true, &load.data, load.is_cold);
+                    self.refund += self.gas_params.sstore_refund(true, &load.data);
+                    cost = cost.saturating_add(slot_cost);
                 }
                 Err(_) => return (vec![1], Vec::new(), cost), // Failure
             }
@@ -585,7 +617,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         (
             balance.to_be_bytes::<32>().to_vec(),
             Vec::new(),
-            touch_cost(is_cold),
+            self.account_touch_cost(is_cold),
         )
     }
 
@@ -598,7 +630,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             Ok(load) => (load.data, load.is_cold),
             Err(_) => (B256::ZERO, false),
         };
-        (hash.0.to_vec(), Vec::new(), touch_cost(is_cold))
+        (hash.0.to_vec(), Vec::new(), self.account_touch_cost(is_cold))
     }
 
     /// AccountCode: `addr[20] ++ gas[8]`. Code goes on the `raw_data` channel.
@@ -611,7 +643,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             Ok(load) => (load.data.to_vec(), load.is_cold),
             Err(_) => (Vec::new(), false),
         };
-        (Vec::new(), code, touch_cost(is_cold))
+        (Vec::new(), code, self.account_touch_cost(is_cold))
     }
 
     /// AddPages: `pages[2]` (u16). Charges nitro `MemoryModel.GasCost` and tracks
@@ -629,16 +661,6 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             .chain_mut()
             .set_stylus_pages_open(open.saturating_add(new_pages));
         (Vec::new(), Vec::new(), cost)
-    }
-}
-
-/// EIP-2929 account-touch cost approximation (nitro `WasmAccountTouchCost`).
-/// TODO(Phase 4): match nitro's exact cold/warm accounting.
-fn touch_cost(is_cold: bool) -> u64 {
-    if is_cold {
-        2600
-    } else {
-        100
     }
 }
 
