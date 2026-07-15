@@ -780,6 +780,52 @@ mod tests {
     use revm::state::AccountInfo;
     use revm::{Context, MainContext};
 
+    /// Phase 0 gate (design doc §5): leafage's `stylus_activate` binding must
+    /// reproduce the consensus module hash of a real, already-activated Stylus
+    /// program. Fixture is Arb One `0xe6fc94f78cfec8bdf090ccb854e9b4382870aa7e`
+    /// (classic `0xeff000` prefix, Stylus version 2). The expected module hash
+    /// was read from the ArbOS Programs `{2}` subspace on Arb One at ArbOS 51.
+    /// Gated on `LEAFAGE_ARB_STYLUS_LIB` (needs the real libstylus dylib); skips
+    /// otherwise so the suite stays green without the native lib.
+    #[test]
+    fn reproduces_arb_one_module_hash() {
+        if std::env::var_os("LEAFAGE_ARB_STYLUS_LIB").is_none() {
+            eprintln!("skipping reproduces_arb_one_module_hash: LEAFAGE_ARB_STYLUS_LIB not set");
+            return;
+        }
+
+        let code = alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
+            .expect("decode fixture hex");
+        let code_hash = keccak256(&code);
+        assert_eq!(
+            code_hash,
+            "0x81fed44646b50a25748f80764d1d2f4d3fbbcc49300eb9b52ab197173334e024"
+                .parse::<B256>()
+                .unwrap(),
+            "fixture code hash",
+        );
+
+        // Classic Stylus decode is storage-free: decompress the on-chain blob to raw wasm.
+        let mut params = test_stylus_params(16 * 1024 * 1024, 0);
+        params.version = 2;
+        let wasm = ArbWasm::check_classic_stylus_code(&code, params.max_wasm_size)
+            .expect("decode classic stylus code");
+
+        // Nitro recomputes the module hash on reactivation with arbos_version = 0
+        // and asserts equality with the stored hash, so the hash is a function of
+        // (wasm, stylus_version) only. Pass 0 to match that path.
+        let mut gas = u64::MAX;
+        let activated = StylusRuntime::activate_from_env(&wasm, code_hash, params, 128, 0, &mut gas)
+            .expect("activate");
+        assert_eq!(
+            activated.activation.module_hash,
+            "0xa7c2ce01cea0880198cfc8a35bb3b772babc7ab007a8ebf4f9df1e35f8c6b098"
+                .parse::<B256>()
+                .unwrap(),
+            "module hash must match Arb One Programs {{2}}",
+        );
+    }
+
     fn brotli_compress(input: &[u8]) -> Vec<u8> {
         let mut reader = Cursor::new(input);
         let mut output = Vec::new();
