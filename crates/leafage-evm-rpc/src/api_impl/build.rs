@@ -31,6 +31,7 @@ pub struct ApiBuilder<DB> {
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
     warmup_erc20_addresses: Option<(Address, Vec<Address>)>,
     token_collector: Option<TokenCollector>,
+    evm_exec_concurrency: usize,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -49,6 +50,7 @@ where
             replay_blocks: None,
             warmup_erc20_addresses: None,
             token_collector: None,
+            evm_exec_concurrency: 0,
         }
     }
 
@@ -93,6 +95,13 @@ where
 
     pub fn with_token_collector(mut self, collector: TokenCollector) -> Self {
         self.token_collector = Some(collector);
+        self
+    }
+
+    /// Cap concurrently executing EVM requests (call / multicall /
+    /// estimateGas / simulate / trace). `0` keeps them unbounded.
+    pub fn with_evm_exec_concurrency(mut self, permits: usize) -> Self {
+        self.evm_exec_concurrency = permits;
         self
     }
 }
@@ -140,6 +149,10 @@ where
         estimate_gas_buffer: u64,
         listen_backlog: u32,
     ) -> std::io::Result<ServerHandle> {
+        let exec_limiter = (self.evm_exec_concurrency > 0).then(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(self.evm_exec_concurrency))
+        });
+
         let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
         let http_middleware = http_middleware.layer(InterceptorLayer::new(
@@ -175,6 +188,7 @@ where
                     version.clone(),
                     estimate_gas_buffer,
                     self.token_collector.clone(),
+                    exec_limiter.clone(),
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -225,6 +239,7 @@ where
                     version.clone(),
                     estimate_gas_buffer,
                     self.token_collector.clone(),
+                    exec_limiter.clone(),
                 );
                 let api = Api::new(api_impl);
                 warmup_api(

@@ -31,6 +31,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
         version: String,
         estimate_gas_buffer: u64,
         token_collector: Option<TokenCollector>,
+        exec_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         Self {
             db,
@@ -42,6 +43,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 version,
                 estimate_gas_buffer,
                 custom_cfg,
+                exec_limiter,
             },
             historical_client,
             historical_height,

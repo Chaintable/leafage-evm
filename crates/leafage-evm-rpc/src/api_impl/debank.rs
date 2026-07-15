@@ -11,11 +11,11 @@ use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, Address, BlockId, BlockNumberOrTag, BlockOverrides, BlockType, Bytes,
-    CallRequest, DebankBlock, DebankBlockContext, DebankErrorCode, DebankMultiCallResp,
-    DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats, DebankSingleCallResult,
-    DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo, H256, KECCAK256_EMPTY,
-    U256,
+    block_env_from_block, Address, BlockEnv, BlockId, BlockInfo, BlockNumberOrTag, BlockOverrides,
+    BlockType, Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankErrorCode,
+    DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
+    DebankSingleCallResult, DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo,
+    H256, KECCAK256_EMPTY, U256,
 };
 use revm::bytecode::OpCode;
 use revm::context_interface::Cfg;
@@ -24,7 +24,6 @@ use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -496,14 +495,11 @@ where
     fn debank_single_call_from_state_impl_inner(
         &self,
         state: &<C::DB as EvmStorageRead>::StateDB,
+        block: &BlockInfo,
+        block_env: &BlockEnv,
+        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
         request: CallRequest,
-        block_overrides: Option<BlockOverrides>,
-        state_override: Option<StateOverride>,
     ) -> RpcResult<DebankSingleCallResult> {
-        let block = state.block_info_arc().map_err(|e| {
-            rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-        })?;
-        let mut block_env = block_env_from_block(&block);
         let start = std::time::Instant::now();
 
         // Collect ERC20 token address if token_collector is enabled
@@ -515,9 +511,7 @@ where
 
         if let Some(txkind) = request.to {
             if let Some(address) = txkind.to() {
-                if *address
-                    == Address::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap()
-                {
+                if *address == *utils::NATIVE_TOKEN_SENTINEL {
                     let mut res = Self::debank_eth_erc20_handle(
                         &block.header,
                         state.clone(),
@@ -530,31 +524,15 @@ where
                 }
             }
         }
-        let mut db = CacheDB::new(EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
-        if let Some(overrides) = block_overrides.clone() {
-            super::utils::apply_block_overrides(
-                overrides,
-                &mut db,
-                &mut block_env,
-                block.header.clone(),
-            );
-        }
-        if let Some(state_override) = state_override.clone() {
-            super::utils::apply_state_overrides(state_override, &mut db)?;
-        }
         let tx = self.inner.create_txn_env(
-            &block_env,
+            block_env,
             request,
-            &db,
+            db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         let mut res: DebankSingleCallResult = self
             .inner
-            .transact(&block_env, &db, tx)
+            .transact(block_env, db, tx)
             .map_err(|e| e.to_rpc_error())?
             .into();
         res.time_cost = start.elapsed().as_secs_f64();
@@ -581,6 +559,27 @@ where
             success: true,
             cache_enabled: false,
         };
+        // Block env, overrides and the request-scoped read cache are
+        // shared by every call in this multicall: overrides apply once,
+        // and repeated keys across calls skip the layered-state walk.
+        let mut block_env = block_env_from_block(&block);
+        let mut cache_db = CacheDB::new(EvmStorageWrapper {
+            db: state.clone(),
+            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
+        });
+        if let Some(overrides) = block_overrides {
+            super::utils::apply_block_overrides(
+                overrides,
+                &mut cache_db,
+                &mut block_env,
+                block.header.clone(),
+            );
+        }
+        if let Some(state_override) = state_override {
+            super::utils::apply_state_overrides(state_override, &mut cache_db)?;
+        }
+        let db = utils::RequestCacheDB::new(cache_db);
         // run in sequence
         let mut results: Vec<DebankSingleCallResult> = vec![];
         for request in requests {
@@ -596,9 +595,10 @@ where
             }
             let res = self.debank_single_call_from_state_impl_inner(
                 &state,
+                &block,
+                &block_env,
+                &db,
                 request,
-                block_overrides.clone(),
-                state_override.clone(),
             )?;
             if res.code != 0 {
                 stats.success = false;
@@ -618,8 +618,9 @@ where
         _use_parallel: Option<bool>,
         _disable_cache: Option<bool>,
     ) -> RpcResult<DebankMultiCallResp> {
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |token| {
+        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
             this.debank_multi_call_from_state_impl_inner(
                 requests,
                 block_ctx,
@@ -640,8 +641,9 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |token| {
+        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
             this.debank_simulate_transactions_impl_inner(
                 requests,
                 block_ctx,
@@ -756,7 +758,7 @@ where
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
+        let mut cache_db = CacheDB::new(EvmStorageWrapper {
             db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
@@ -764,11 +766,15 @@ where
         if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(
                 overrides,
-                &mut memory_db,
+                &mut cache_db,
                 &mut block_env,
                 block.header.clone(),
             );
         }
+        // The binary search below re-executes the same tx many times;
+        // the request-scoped cache lets every retry after the first read
+        // its state from memory instead of re-walking the layered state.
+        let memory_db = utils::RequestCacheDB::new(cache_db);
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
@@ -954,8 +960,9 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |token| {
+        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
             this.debank_estimate_gas_inner(request, block_ctx, block_overrides, token)
         })
         .await

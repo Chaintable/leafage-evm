@@ -109,6 +109,18 @@ pub struct Command {
     #[arg(long, default_value = "5000")]
     max_connections: u32,
 
+    /// Maximum number of concurrently executing EVM requests
+    /// (eth_call / multicall / estimateGas / simulate / trace).
+    /// Default: 0 (unbounded, same as before)
+    ///
+    /// EVM execution is CPU-bound; without a cap a load spike can put
+    /// hundreds of executions on the blocking pool at once and inflate
+    /// tail latency through CPU oversubscription. A value around 2-4x
+    /// the core count keeps excess requests queued on the async side
+    /// (cheap and cancellable) instead.
+    #[arg(long, default_value = "0")]
+    evm_exec_concurrency: usize,
+
     /// The TCP accept-queue backlog for the HTTP-RPC listener.
     /// Default: 4096
     ///
@@ -735,7 +747,8 @@ impl Command {
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
-            .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+            .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+            .with_evm_exec_concurrency(self.evm_exec_concurrency);
 
         #[cfg(target_os = "linux")]
         {
