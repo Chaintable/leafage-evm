@@ -20,12 +20,12 @@ use crate::arbitrum::precompile::{
 };
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use revm::context::{ContextTr, JournalTr};
-use revm::context_interface::{Block, Cfg, Transaction};
+use revm::context_interface::{Block, Cfg, CreateScheme, Transaction};
 use revm::handler::evm::ContextDbError;
 use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult};
 use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{
-    CallInput, CallInputs, CallOutcome, CallScheme, CallValue, FrameInput, Gas, InstructionResult,
+    CallInput, CallInputs, CallScheme, CallValue, CreateInputs, FrameInput, Gas, InstructionResult,
     InterpreterAction, InterpreterResult,
 };
 use revm::{Database, DatabaseRef};
@@ -223,7 +223,10 @@ where
 /// frames resolve via the stock `frame_return_result`, but the DIRECT child's
 /// result is captured + popped manually so it never reaches the Stylus parent's
 /// `return_result` (which would corrupt the parent's interpreter gas/stack).
-fn drive_subcall<DB, I>(evm: &mut ArbitrumEvm<DB, I>, inputs: CallInputs) -> Option<CallOutcome>
+fn drive_subframe<DB, I>(
+    evm: &mut ArbitrumEvm<DB, I>,
+    frame_input: FrameInput,
+) -> Option<FrameResult>
 where
     DB: Database + DatabaseRef,
 {
@@ -233,7 +236,7 @@ where
         FrameInit {
             depth: parent.depth + 1,
             memory: parent.interpreter.memory.new_child_context(),
-            frame_input: FrameInput::Call(Box::new(inputs)),
+            frame_input,
         }
     };
     // The Stylus parent's index; the direct child lands one above it.
@@ -241,7 +244,7 @@ where
 
     match evm.frame_init(child_init).ok()? {
         // Resolved without pushing a frame (precompile / empty code).
-        ItemOrResult::Result(frame_result) => return call_outcome(frame_result),
+        ItemOrResult::Result(frame_result) => return Some(frame_result),
         ItemOrResult::Item(_frame) => {}
     }
 
@@ -256,20 +259,13 @@ where
         // If the finished frame is the direct child, capture + pop manually.
         if evm.inner.frame_stack.index() == child_index {
             evm.inner.frame_stack.pop();
-            return call_outcome(result);
+            return Some(result);
         }
         // Deeper frame: return to its (non-Stylus) parent, which resumes.
         match evm.frame_return_result(result) {
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) => continue,
         }
-    }
-}
-
-fn call_outcome(frame_result: FrameResult) -> Option<CallOutcome> {
-    match frame_result {
-        FrameResult::Call(outcome) => Some(outcome),
-        FrameResult::Create(_) => None,
     }
 }
 
@@ -295,6 +291,8 @@ impl<DB: Database + DatabaseRef, I> HostioHandler for StylusHostio<'_, DB, I> {
             4 => self.contract_call(input, CallScheme::Call),
             5 => self.contract_call(input, CallScheme::DelegateCall),
             6 => self.contract_call(input, CallScheme::StaticCall),
+            7 => self.create(input, false),
+            8 => self.create(input, true),
             9 => self.emit_log(input),
             10 => self.account_balance(input),
             11 => self.account_code(input),
@@ -420,8 +418,8 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             is_static,
         };
 
-        match drive_subcall(self.evm, inputs) {
-            Some(outcome) => {
+        match drive_subframe(self.evm, FrameInput::Call(Box::new(inputs))) {
+            Some(FrameResult::Call(outcome)) => {
                 let returned = outcome.gas().remaining();
                 let status = if outcome.instruction_result().is_ok() {
                     0u8
@@ -434,7 +432,50 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
                 let cost = call_gas.saturating_sub(returned);
                 (vec![status], output, cost)
             }
-            None => (vec![2], Vec::new(), call_gas),
+            _ => (vec![2], Vec::new(), call_gas),
+        }
+    }
+
+    /// Create1 (`gas[8] ++ endowment[32] ++ code`) / Create2 (`... ++ salt[32]
+    /// ++ code`). Response: `1 ++ addr[20]` on success (returndata on raw_data),
+    /// else `0` with the revert data on raw_data.
+    /// TODO(Phase 4): exact create gas (CreateGas + keccak word cost for CREATE2)
+    /// and the precise error-response encoding — diff against writer.
+    fn create(&mut self, input: &[u8], is_create2: bool) -> (Vec<u8>, Vec<u8>, u64) {
+        if self.is_static {
+            return (vec![0u8], Vec::new(), 0);
+        }
+        let header = if is_create2 { 72 } else { 40 };
+        if input.len() < header {
+            return (vec![0u8], Vec::new(), 0);
+        }
+        let gas = u64::from_be_bytes(input[0..8].try_into().unwrap());
+        let endowment = U256::from_be_slice(&input[8..40]);
+        let scheme = if is_create2 {
+            CreateScheme::Create2 {
+                salt: U256::from_be_slice(&input[40..72]),
+            }
+        } else {
+            CreateScheme::Create
+        };
+        let init_code = Bytes::copy_from_slice(&input[header..]);
+        let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, gas);
+
+        match drive_subframe(self.evm, FrameInput::Create(Box::new(inputs))) {
+            Some(FrameResult::Create(outcome)) => {
+                let returned = outcome.gas().remaining();
+                let cost = gas.saturating_sub(returned);
+                match (outcome.instruction_result().is_ok(), outcome.address) {
+                    (true, Some(addr)) => {
+                        let mut resp = Vec::with_capacity(21);
+                        resp.push(1);
+                        resp.extend_from_slice(addr.as_slice());
+                        (resp, outcome.output().to_vec(), cost)
+                    }
+                    _ => (vec![0u8], outcome.output().to_vec(), cost),
+                }
+            }
+            _ => (vec![0u8], Vec::new(), gas),
         }
     }
 

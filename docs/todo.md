@@ -56,6 +56,10 @@
 - `[2026-07-15][done] Phase 2d: 最小真 hostio` — `StylusHostio` 实现 `HostioHandler`：GetBytes32(SLOAD)/SetTrieSlots(SSTORE)/GetTransient(TLOAD)/SetTransient(TSTORE) 走 revm journal，wire 逐字节消费，static 保护。其余 req（4-14 calls/create/log/account/pages/capture）返回安全空默认（TODO Phase 3）。
   **未做（Phase 4 gas 对齐）：** SLOAD/SSTORE gas 为近似 EIP-2929/2200（非 nitro `Wasm*Cost` 精确），refund 未从 SStoreResult 累加（现恒 0），memory 页模型/RecentWasms 未接，EvmData.block_number 用 L2（应 L1）、tx_gas_price 用 raw（应 paid price）。全部标 `TODO(Phase 4)`，须对 writer 差分校准。
 
+- `[2026-07-15][done] Phase 3: 完整 hostio` — `StylusHostio` 补齐：storage(0-3)、subcalls(4-6 Call/Delegate/Static 经 `drive_subframe` 同步驱动子帧,直接子帧手动 pop 不走 `frame_return_result`)、create(7-8 Create/Create2)、log(9)、account(10-12 balance/code/codehash)、pages(13)。仅 CaptureHostIO(14) 为 no-op(纯 tracing)+ reentrant flag 恒 0。
+  **Done:** 全部编译干净,287 单测绿,dylib call 测绿,clippy 干净。`StylusHostio` 持 `&mut ArbitrumEvm` 以驱动子帧。
+  **未验证(CRITICAL):** subcall/create 的子帧驱动 —— 正确性(子结果/gas/status/address)与 frame-stack 裸指针·借用**soundness** —— 在本环境**无法执行验证**(无跨合约 Stylus 调用),必须跑真实跨合约调用 + 对 writer 差分。gas 全为近似(见下 Phase 4)。
+
 ### 验证前沿（CRITICAL —— 必须诚实标注）
 
 Phase 2c 起的执行引擎是**共识级 gas/trace 代码，其正确性只能对着活的 Arbitrum writer 或 Arb One traced RPC 差分验证**（设计 §8.1.3 gold standard）。当前环境：
