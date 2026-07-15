@@ -15,7 +15,7 @@ use std::sync::{
     Arc,
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::interval;
 use tower::BoxError;
@@ -56,6 +56,10 @@ fn default_stat_interval() -> u64 {
     1000
 }
 
+fn default_cpu_window() -> u64 {
+    10_000
+}
+
 fn default_not_retry_threshold() -> f64 {
     0.2
 }
@@ -75,7 +79,9 @@ pub struct InterceptorConfig {
     #[serde(default = "default_window")]
     pub window: u64, // 窗口大小 (单位: 分钟)
     #[serde(default = "default_stat_interval")]
-    pub stat_interval: u64, // 采样间隔 (单位: ms)
+    pub stat_interval: u64, // 资源采样及状态刷新间隔 (单位: ms)
+    #[serde(default = "default_cpu_window")]
+    pub cpu_window: u64, // CPU 滑动平均窗口 (单位: ms)
     #[serde(default = "default_not_retry_threshold")]
     pub not_retry_threshold: f64, // 重试次数阈值
 }
@@ -89,8 +95,67 @@ impl Default for InterceptorConfig {
             max_retries: default_max_retries(),
             window: default_window(),
             stat_interval: default_stat_interval(),
+            cpu_window: default_cpu_window(),
             not_retry_threshold: default_not_retry_threshold(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSample {
+    sampled_at: Instant,
+    cpu_time: u64,
+}
+
+#[derive(Debug)]
+struct CpuRecorder {
+    samples: VecDeque<CpuSample>,
+    window: Duration,
+}
+
+impl CpuRecorder {
+    fn new(window: Duration, sampled_at: Instant, cpu_time: u64) -> Self {
+        Self {
+            samples: VecDeque::from([CpuSample {
+                sampled_at,
+                cpu_time,
+            }]),
+            window,
+        }
+    }
+
+    fn record(
+        &mut self,
+        sampled_at: Instant,
+        cpu_time: u64,
+        ticks_per_second: u64,
+        core_count: usize,
+    ) -> Option<f64> {
+        self.samples.push_back(CpuSample {
+            sampled_at,
+            cpu_time,
+        });
+
+        // Keep the newest sample that is at least one full window old. The next
+        // sample, if present, is newer than the window boundary.
+        while self.samples.len() >= 2
+            && sampled_at.saturating_duration_since(self.samples[1].sampled_at) >= self.window
+        {
+            self.samples.pop_front();
+        }
+
+        let oldest = self.samples.front()?;
+        let elapsed = sampled_at.saturating_duration_since(oldest.sampled_at);
+        if elapsed < self.window {
+            return None;
+        }
+
+        let cpu_time_diff = cpu_time.saturating_sub(oldest.cpu_time);
+        Some(
+            cpu_time_diff as f64
+                / (ticks_per_second as f64 * core_count as f64 * elapsed.as_secs_f64())
+                * 100.0,
+        )
     }
 }
 
@@ -241,6 +306,7 @@ impl InterceptorLayer {
             cfg.io_threshold,
             cfg.io_full_threshold,
             cfg.stat_interval,
+            cfg.cpu_window,
             cfg.not_retry_threshold,
         );
         let layer = InterceptorLayer {
@@ -272,7 +338,7 @@ struct InterceptorWorker {
     other_overloaded: Arc<AtomicBool>,
     retries_receiver: UnboundedReceiver<u64>,
     process: Process,
-    latest_stat: Stat,
+    cpu_recorder: CpuRecorder,
     total_core_num: usize,
     total_mem_size: u64,
     io_pressure_path: Option<PathBuf>,
@@ -291,6 +357,7 @@ impl InterceptorWorker {
         io_threshold: [f64; 3],
         io_full_threshold: [f64; 3],
         stat_interval: u64,
+        cpu_window: u64,
         not_retry_threshold: f64,
     ) -> (Self, UnboundedSender<u64>, Arc<AtomicU64>, Arc<AtomicBool>) {
         if cpu_threshold.len() != 3 {
@@ -303,12 +370,26 @@ impl InterceptorWorker {
         }
         validate_io_threshold(io_threshold);
         validate_io_threshold(io_full_threshold);
+        validate_sampling_intervals(stat_interval, cpu_window);
+        if cpu_window < stat_interval {
+            warn!(
+                target = "interceptor",
+                stat_interval,
+                cpu_window,
+                "cpu_window is shorter than stat_interval; the effective CPU window will be limited by the sampling interval"
+            );
+        }
         let (retries_sender, retries_receiver) = unbounded_channel();
         let load_status = Arc::new(AtomicU64::new(0));
         let other_overloaded = Arc::new(AtomicBool::new(false));
         let total_core_num = std::thread::available_parallelism().unwrap().get();
         let process = Process::myself().unwrap();
-        let latest_stat = process.stat().unwrap();
+        let initial_stat = process.stat().unwrap();
+        let cpu_recorder = CpuRecorder::new(
+            Duration::from_millis(cpu_window),
+            Instant::now(),
+            total_cpu_time(&initial_stat),
+        );
         let total_mem_size = get_max_memory().unwrap_or(0);
         let io_pressure_path = discover_io_pressure_path(&process);
         let worker = InterceptorWorker {
@@ -317,7 +398,7 @@ impl InterceptorWorker {
             other_overloaded: other_overloaded.clone(),
             retries_receiver,
             process,
-            latest_stat,
+            cpu_recorder,
             total_core_num,
             total_mem_size,
             io_pressure_path: io_pressure_path.clone(),
@@ -329,9 +410,11 @@ impl InterceptorWorker {
         };
         info!(
             target = "interceptor",
-            "InterceptorWorker initialized with max_retries: {}, window: {:?}, total_core_num: {}, total_mem_size: {}, io_pressure_path: {:?}",
+            "InterceptorWorker initialized with max_retries: {}, window: {:?}, stat_interval: {}ms, cpu_window: {}ms, total_core_num: {}, total_mem_size: {}, io_pressure_path: {:?}",
             max_retries,
             window,
+            stat_interval,
+            cpu_window,
             total_core_num,
             total_mem_size,
             io_pressure_path
@@ -383,22 +466,23 @@ impl InterceptorWorker {
 
     fn set_load_status(&mut self) {
         let stat = self.process.stat().unwrap();
-        let latest_stat = self.latest_stat.clone();
-        let cpu_time_diff = stat.utime + stat.stime - latest_stat.utime - latest_stat.stime;
-        let clk_tck = procfs::ticks_per_second();
-        let cpu_usage = (cpu_time_diff as f64
-            / (clk_tck as f64 * self.total_core_num as f64 * self.stat_interval as f64 / 1000.0))
-            * 100.0;
+        let cpu_usage = self.cpu_recorder.record(
+            Instant::now(),
+            total_cpu_time(&stat),
+            procfs::ticks_per_second(),
+            self.total_core_num,
+        );
         let mem_usage = stat.rss_bytes().get() as f64 / self.total_mem_size as f64 * 100.0;
-        let cpu_status = self.cpu_load_status(cpu_usage);
+        let cpu_status = cpu_usage
+            .map(|usage| self.cpu_load_status(usage))
+            .unwrap_or(LoadStatus::NoRefused);
         let io_status = self.io_load_status();
         let status = cpu_status.max(io_status);
         self.load_status
             .store(status as u64, std::sync::atomic::Ordering::SeqCst);
-        self.latest_stat = stat;
         debug!(
             target = "interceptor",
-            "Load status updated: {status:?} (cpu_status: {cpu_status:?}, io_status: {io_status:?}, usage: {cpu_usage:.2}%, total_core_num: {}, mem_usage: {mem_usage:.2}%, total_mem_size: {})",
+            "Load status updated: {status:?} (cpu_status: {cpu_status:?}, io_status: {io_status:?}, usage: {cpu_usage:.2?}%, total_core_num: {}, mem_usage: {mem_usage:.2}%, total_mem_size: {})",
             self.total_core_num, self.total_mem_size);
     }
 
@@ -468,6 +552,15 @@ fn validate_io_threshold(thresholds: [f64; 3]) {
     if thresholds.windows(2).any(|pair| pair[0] >= pair[1]) {
         panic!("io_threshold values must be strictly increasing");
     }
+}
+
+fn validate_sampling_intervals(stat_interval: u64, cpu_window: u64) {
+    assert!(stat_interval > 0, "stat_interval must be greater than 0");
+    assert!(cpu_window > 0, "cpu_window must be greater than 0");
+}
+
+fn total_cpu_time(stat: &Stat) -> u64 {
+    stat.utime.saturating_add(stat.stime)
 }
 
 fn io_pressure_load_status(
@@ -738,6 +831,91 @@ mod tests {
         .unwrap();
         assert_eq!(custom_config.io_threshold, [5.0, 15.0, 25.0]);
         assert_eq!(custom_config.io_full_threshold, [1.0, 3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_cpu_window_config() {
+        let default_config: InterceptorConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default_config.stat_interval, 1_000);
+        assert_eq!(default_config.cpu_window, 10_000);
+
+        let custom_config: InterceptorConfig =
+            serde_json::from_str(r#"{"stat_interval":500,"cpu_window":5000}"#).unwrap();
+        assert_eq!(custom_config.stat_interval, 500);
+        assert_eq!(custom_config.cpu_window, 5_000);
+    }
+
+    #[test]
+    fn test_cpu_recorder_waits_for_full_window() {
+        let start = Instant::now();
+        let mut recorder = CpuRecorder::new(Duration::from_secs(10), start, 0);
+
+        for second in 1..10 {
+            assert_eq!(
+                recorder.record(start + Duration::from_secs(second), second * 100, 100, 1),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_cpu_recorder_calculates_rolling_average() {
+        let start = Instant::now();
+        let mut recorder = CpuRecorder::new(Duration::from_secs(10), start, 0);
+
+        for second in 1..=9 {
+            recorder.record(start + Duration::from_secs(second), second * 50, 100, 1);
+        }
+
+        // Nine seconds at 50% plus one second at 100% produces a 55% average.
+        let usage = recorder
+            .record(start + Duration::from_secs(10), 550, 100, 1)
+            .unwrap();
+        assert!((usage - 55.0).abs() < f64::EPSILON);
+
+        // The next update drops the oldest second and still uses a ten-second window.
+        let usage = recorder
+            .record(start + Duration::from_secs(11), 650, 100, 1)
+            .unwrap();
+        assert!((usage - 60.0).abs() < f64::EPSILON);
+        assert_eq!(recorder.samples.len(), 11);
+    }
+
+    #[test]
+    fn test_cpu_recorder_uses_actual_elapsed_for_irregular_samples() {
+        let start = Instant::now();
+        let mut recorder = CpuRecorder::new(Duration::from_secs(10), start, 0);
+
+        assert_eq!(
+            recorder.record(start + Duration::from_secs(4), 200, 100, 1),
+            None
+        );
+        assert_eq!(
+            recorder.record(start + Duration::from_secs(9), 700, 100, 1),
+            None
+        );
+
+        // At 15s the boundary is 5s. The 4s sample is the closest sample before
+        // the boundary, so the effective elapsed time is 11s, not a fixed 10s.
+        let usage = recorder
+            .record(start + Duration::from_secs(15), 1_000, 100, 1)
+            .unwrap();
+        assert!((usage - (800.0 / 11.0)).abs() < 1e-10);
+        assert_eq!(
+            recorder.samples.front().unwrap().sampled_at,
+            start + Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn test_sampling_interval_may_exceed_cpu_window_for_backward_compatibility() {
+        validate_sampling_intervals(20_000, 10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "cpu_window must be greater than 0")]
+    fn test_cpu_window_must_be_nonzero() {
+        validate_sampling_intervals(1_000, 0);
     }
 
     #[test]
