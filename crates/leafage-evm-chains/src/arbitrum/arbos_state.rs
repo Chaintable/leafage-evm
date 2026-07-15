@@ -37,6 +37,7 @@ pub(crate) const RETRYABLE_SUBSPACE: &[u8] = &[2];
 pub(crate) const ADDRESS_TABLE_SUBSPACE: &[u8] = &[3];
 pub(crate) const CHAIN_OWNER_SUBSPACE: &[u8] = &[4];
 pub(crate) const SEND_MERKLE_SUBSPACE: &[u8] = &[5];
+pub(crate) const BLOCKHASHES_SUBSPACE: &[u8] = &[6];
 pub(crate) const CHAIN_CONFIG_SUBSPACE: &[u8] = &[7];
 pub(crate) const PROGRAMS_SUBSPACE: &[u8] = &[8];
 pub(crate) const FEATURES_SUBSPACE: &[u8] = &[9];
@@ -86,6 +87,9 @@ pub(crate) const L2_PRICING_INERTIA_OFFSET: u64 = 5;
 pub(crate) const L2_BACKLOG_TOLERANCE_OFFSET: u64 = 6;
 pub(crate) const L2_PER_TX_GAS_LIMIT_OFFSET: u64 = 7;
 const RETRYABLE_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Nitro `ArbosVersion_40`: first version where the EIP-7623 calldata price
+/// increase feature can be enabled (`arbos/tx_processor.go`).
+const ARBOS_VERSION_INCREASED_CALLDATA_PRICE: u64 = 40;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArbRetryableInfo {
@@ -141,6 +145,10 @@ static MIN_BASE_FEE_SLOT: Lazy<U256> = Lazy::new(|| {
 static BROTLI_LEVEL_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], BROTLI_COMPRESSION_LEVEL_OFFSET));
 static ARBOS_VERSION_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], ARBOS_VERSION_OFFSET));
 static COLLECT_TIPS_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], COLLECT_TIPS_OFFSET));
+static FEATURES_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&subspace_key(&[], FEATURES_SUBSPACE), 0));
+static BLOCKHASHES_KEY: Lazy<[u8; 32]> = Lazy::new(|| subspace_key(&[], BLOCKHASHES_SUBSPACE));
+static BLOCKHASHES_L1_BLOCK_NUMBER_SLOT: Lazy<U256> =
+    Lazy::new(|| slot_at(&*BLOCKHASHES_KEY, 0));
 static GENESIS_BLOCK_NUM_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], GENESIS_BLOCK_NUM_OFFSET));
 static NETWORK_FEE_ACCOUNT_SLOT: Lazy<U256> =
     Lazy::new(|| slot_at(&[], NETWORK_FEE_ACCOUNT_OFFSET));
@@ -191,6 +199,31 @@ pub trait ArbStateReader: DatabaseRef {
 
     fn collect_tips(&self) -> bool {
         collect_tips(self)
+    }
+
+    /// Nitro `TxProcessor.IsCalldataPricingIncreaseEnabled`: the EIP-7623
+    /// calldata gas floor applies only from ArbOS 40 with the chain-owner
+    /// feature flag set (features subspace bit 0, `arbos/features/features.go`).
+    fn is_calldata_price_increase_enabled(&self) -> bool {
+        self.arbos_version() >= ARBOS_VERSION_INCREASED_CALLDATA_PRICE
+            && self
+                .read_root(*FEATURES_SLOT)
+                .is_some_and(|value| value.bit(0))
+    }
+
+    /// Next L1 block number recorded in ArbOS `Blockhashes` state
+    /// (`arbos/blockhash/blockhash.go`). `None` means a database error.
+    fn blockhashes_l1_block_number(&self) -> Option<u64> {
+        self.read_root(*BLOCKHASHES_L1_BLOCK_NUMBER_SLOT)
+            .map(|value| value.saturating_to::<u64>())
+    }
+
+    /// ArbOS-recorded L1 block hash for `number`, kept in a 256-entry ring
+    /// buffer at offsets `1 + number % 256`. The BLOCKHASH window check is the
+    /// caller's job. `None` means a database error.
+    fn l1_block_hash(&self, number: u64) -> Option<B256> {
+        self.read_root(slot_at(&*BLOCKHASHES_KEY, 1 + number % 256))
+            .map(|value| B256::from(value.to_be_bytes::<32>()))
     }
 
     fn network_fee_account(&self) -> Option<Address> {
@@ -441,5 +474,83 @@ mod tests {
     fn slot_keeps_offset_low_byte() {
         let slot = slot_at(&[], 7);
         assert_eq!((slot & U256::from(0xff)).to::<u64>(), 7);
+    }
+
+    /// Live vector: hood (Robinhood, ArbOS 61) writer at block 0x59b600 holds
+    /// 0x1851b6c in this slot (2026-07-10), matching the NUMBER opcode value
+    /// observed via eth_call on the same block.
+    #[test]
+    fn blockhashes_slot_matches_live_vector() {
+        assert_eq!(
+            *BLOCKHASHES_L1_BLOCK_NUMBER_SLOT,
+            U256::from_str_radix(
+                "3c79da47f96b0f39664f73c0a1f350580be90742947dddfa21ba64d578dfe600",
+                16
+            )
+            .unwrap(),
+            "blockhashes l1BlockNumber slot (Blockhashes subspace, offset 0)"
+        );
+    }
+
+    #[test]
+    fn reads_blockhashes_and_calldata_price_feature() {
+        use revm::database::{in_memory_db::CacheDB, EmptyDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&[], ARBOS_VERSION_OFFSET),
+            U256::from(40),
+        )
+        .unwrap();
+        db.insert_account_storage(ARBOS_STATE_ADDRESS, *FEATURES_SLOT, U256::ONE)
+            .unwrap();
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            *BLOCKHASHES_L1_BLOCK_NUMBER_SLOT,
+            U256::from(1_000u64),
+        )
+        .unwrap();
+        let hash = B256::repeat_byte(0xab);
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&*BLOCKHASHES_KEY, 1 + 999 % 256),
+            U256::from_be_bytes(hash.0),
+        )
+        .unwrap();
+
+        assert!(db.is_calldata_price_increase_enabled());
+        assert_eq!(db.blockhashes_l1_block_number(), Some(1_000));
+        assert_eq!(db.l1_block_hash(999), Some(hash));
+    }
+
+    /// Nitro gates the feature on ArbOS 40 as well as the flag bit.
+    #[test]
+    fn calldata_price_feature_requires_version_and_flag() {
+        use revm::database::{in_memory_db::CacheDB, EmptyDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(ARBOS_STATE_ADDRESS, *FEATURES_SLOT, U256::ONE)
+            .unwrap();
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&[], ARBOS_VERSION_OFFSET),
+            U256::from(39),
+        )
+        .unwrap();
+        assert!(!db.is_calldata_price_increase_enabled());
+
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&[], ARBOS_VERSION_OFFSET),
+            U256::from(40),
+        )
+        .unwrap();
+        db.insert_account_storage(ARBOS_STATE_ADDRESS, *FEATURES_SLOT, U256::from(2u64))
+            .unwrap();
+        assert!(
+            !db.is_calldata_price_increase_enabled(),
+            "bit 0 is the increasedCalldata feature; other bits must not enable it"
+        );
     }
 }

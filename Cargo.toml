@@ -48,6 +48,7 @@ aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.59.0"
 flate2 = "1.0.34"
 brotli = "7"
+brotlic = "0.8"
 etcd-client = "0.14"
 md-5 = "0.10.6"
 http = "1.3"
@@ -63,6 +64,7 @@ revm = { version = "36.0.0", features = [
     "blst",
     "serde",
     "optional_eip3607",
+    "optional_eip7623",
     "optional_no_base_fee",
     "optional_balance_check",
     "optional_block_gas_limit",

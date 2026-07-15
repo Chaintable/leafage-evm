@@ -721,6 +721,7 @@ where
             &memory_db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
+        tx.set_gas_estimation();
         // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual

@@ -83,7 +83,12 @@ impl<DB> ArbitrumApiImpl<DB> {
         if tx.context.current_l1_block_number != 0 {
             evm_block_env.number = U256::from(tx.context.current_l1_block_number);
         }
-        evm_block_env.basefee = 0;
+        // Nitro lowers the basefee to 0 only for unpriced messages
+        // (`internal/ethapi/api.go` doCall); priced simulations keep the real
+        // basefee so the BASEFEE / GASPRICE opcodes observe it.
+        if tx.effective_gas_price(block_env.basefee as u128) == 0 {
+            evm_block_env.basefee = 0;
+        }
         evm_block_env.difficulty = U256::ONE;
         evm_block_env.prevrandao = Some(B256::with_last_byte(1));
         (evm_block_env, execution_context)
@@ -315,6 +320,10 @@ impl TxSetter for ArbitrumTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.gas_limit = gas_limit;
     }
+
+    fn set_gas_estimation(&mut self) {
+        self.context.gas_estimation = true;
+    }
 }
 
 impl<DB> GasFeeHandler for ArbitrumApiImpl<DB>
@@ -377,6 +386,7 @@ mod tests {
             TxEnv::default(),
             ArbitrumTxContext {
                 current_l1_block_number: 99_999,
+                ..Default::default()
             },
         );
 
@@ -395,6 +405,30 @@ mod tests {
     }
 
     #[test]
+    fn execution_env_for_tx_keeps_basefee_for_priced_tx() {
+        let block_env = BlockEnv {
+            number: U256::from(123_456u64),
+            basefee: 10_000_000,
+            ..Default::default()
+        };
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                gas_price: 20_000_000,
+                ..Default::default()
+            },
+            ArbitrumTxContext {
+                current_l1_block_number: 99_999,
+                ..Default::default()
+            },
+        );
+
+        let (evm_block_env, execution_context) =
+            ArbitrumApiImpl::<()>::execution_env_for_tx(&block_env, &tx);
+        assert_eq!(evm_block_env.basefee, 10_000_000);
+        assert_eq!(execution_context.current_l2_basefee(), Some(10_000_000));
+    }
+
+    #[test]
     fn execution_env_for_tx_keeps_l2_number_when_l1_number_is_unknown() {
         let block_env = BlockEnv {
             number: U256::from(123_456u64),
@@ -405,6 +439,7 @@ mod tests {
             TxEnv::default(),
             ArbitrumTxContext {
                 current_l1_block_number: 0,
+                ..Default::default()
             },
         );
 

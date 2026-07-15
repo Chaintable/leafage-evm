@@ -86,14 +86,13 @@ fn fake_tx_bytes(tx: &TxEnv, mode: PosterDataMode) -> Vec<u8> {
     } else {
         tx.nonce
     };
-    let tip: u128 = tx
-        .gas_priority_fee
-        .filter(|v| *v != 0)
-        .or_else(|| {
-            (matches!(tx.tx_type, LEGACY_TX_TYPE | ACCESS_LIST_TX_TYPE) && tx.gas_price != 0)
-                .then_some(tx.gas_price)
-        })
-        .unwrap_or(*RANDOM_GAS_TIP_CAP);
+    // Nitro ignores the message's priority fee when pricing RPC calldata: every
+    // eth_call / estimate / simulate builds the fake tx with the fixed
+    // `randomGasTipCap` (the executed RPC message carries GasTipCap 0, so
+    // `makeFakeTxForMessage` falls back to the random cap). Mirroring the request
+    // tip here made the fake tx's tip vary in RLP byte length — changing the
+    // brotli size and thus the L1 poster fee — while Nitro's stayed constant.
+    let tip: u128 = *RANDOM_GAS_TIP_CAP;
     let fee: u128 = if tx.gas_price == 0 {
         *RANDOM_GAS_FEE_CAP
     } else {
@@ -145,15 +144,24 @@ fn fake_tx_bytes(tx: &TxEnv, mode: PosterDataMode) -> Vec<u8> {
 }
 
 fn brotli_len(input: &[u8], level: u64) -> Option<usize> {
-    use brotli::enc::BrotliEncoderParams;
-    let params = BrotliEncoderParams {
-        quality: level as i32,
-        ..Default::default()
-    };
-    let mut out = Vec::new();
-    let mut reader = input;
-    brotli::BrotliCompress(&mut reader, &mut out, &params).ok()?;
-    Some(out.len())
+    use brotlic::encode::BrotliEncoderOptions;
+    use brotlic::{CompressorWriter, Quality, WindowSize};
+    use std::io::Write;
+
+    // Nitro compresses the fake tx with Google libbrotli at the ArbOS brotli
+    // level and `BROTLI_DEFAULT_WINDOW` (22), empty dictionary
+    // (`arbos/l1pricing/l1pricing.go`; `crates/brotli` pins google/brotli 1.0.9).
+    // The pure-Rust `brotli` crate diverges from libbrotli at low quality — its
+    // output grows with input size instead of staying flat — so the byte count,
+    // which feeds the L1 poster fee, must come from the same C encoder.
+    let encoder = BrotliEncoderOptions::new()
+        .quality(Quality::new(u8::try_from(level).ok()?).ok()?)
+        .window_size(WindowSize::new(22).ok()?)
+        .build()
+        .ok()?;
+    let mut writer = CompressorWriter::with_encoder(encoder, Vec::new());
+    writer.write_all(input).ok()?;
+    Some(writer.into_inner().ok()?.len())
 }
 
 impl ArbPricing {
@@ -204,13 +212,22 @@ impl ArbPricing {
     }
 
     /// Compute the transaction-local values Nitro's `GasChargingHook` exposes
-    /// through ArbGasInfo during call execution. Leafage runs this uniformly for
-    /// call and estimate paths so RPC gas estimation does not need a separate
-    /// `estimate_l1_overhead` pass.
-    pub fn gas_charging_charge(&self, tx: &TxEnv, paid_gas_price: U256) -> ArbPosterCharge {
-        let calldata_units = self
-            .poster_data_units(tx, PosterDataMode::Estimate)
-            .unwrap_or_default();
+    /// through ArbGasInfo during execution. Nitro's `GetPosterGas` applies the
+    /// ×1.10 cost padding and the 7/8 price adjustment only under
+    /// `runCtx.IsGasEstimation()` (`tx_processor.go`); eth_call-style runs
+    /// divide the unpadded cost by the unadjusted paid price.
+    pub fn gas_charging_charge(
+        &self,
+        tx: &TxEnv,
+        paid_gas_price: U256,
+        gas_estimation: bool,
+    ) -> ArbPosterCharge {
+        let mode = if gas_estimation {
+            PosterDataMode::Estimate
+        } else {
+            PosterDataMode::CurrentTx
+        };
+        let calldata_units = self.poster_data_units(tx, mode).unwrap_or_default();
         if paid_gas_price.is_zero() || calldata_units == 0 {
             return ArbPosterCharge {
                 calldata_units,
@@ -219,12 +236,14 @@ impl ArbPricing {
             };
         }
 
-        let poster_cost = self
+        let mut poster_cost = self
             .price_per_unit
             .saturating_mul(U256::from(calldata_units));
-        let poster_cost = self.pad_estimation_cost(poster_cost);
+        if gas_estimation {
+            poster_cost = self.pad_estimation_cost(poster_cost);
+        }
 
-        let poster_gas = self.poster_gas_from_cost(poster_cost, paid_gas_price, true);
+        let poster_gas = self.poster_gas_from_cost(poster_cost, paid_gas_price, gas_estimation);
         let poster_fee = paid_gas_price.saturating_mul(U256::from(poster_gas));
 
         ArbPosterCharge {
@@ -285,6 +304,24 @@ mod tests {
         }
     }
 
+    /// libbrotli (Nitro's consensus encoder) compresses repetitive calldata to
+    /// a constant size; the pure-Rust `brotli` crate grew with input size,
+    /// inflating the L1 poster fee for large calldata. Guard the C backend.
+    #[test]
+    fn brotli_len_is_flat_like_libbrotli() {
+        let fake = |n: usize| {
+            let mut v = vec![0x02u8, 0xf8, 0x00, 0x80, 0x84, 0x11, 0x22, 0x33, 0x44];
+            v.extend(std::iter::repeat(0xab).take(n));
+            v
+        };
+        let small = brotli_len(&fake(4096), 1).unwrap();
+        let large = brotli_len(&fake(16384), 1).unwrap();
+        assert_eq!(
+            small, large,
+            "repetitive calldata must compress flat (libbrotli), got {small} vs {large}"
+        );
+    }
+
     /// Hand-computed against the Nitro formula for a fixed compressed size
     /// (price_per_unit = 0x13266409 = 321_283_081).
     ///   units = (16*100 + 256) * 10100/10000 = 1856*10100/10000 = 1874
@@ -342,6 +379,27 @@ mod tests {
         tx
     }
 
+    /// Nitro's `GetPosterGas` pads only under `IsGasEstimation`: call-mode
+    /// runs divide the raw poster cost by the unadjusted paid price.
+    #[test]
+    fn gas_charging_charge_pads_only_for_estimation() {
+        let p = robinhood_pricing();
+        let tx = sample_tx(vec![0xab; 200]);
+        let paid = U256::from(200_000_000u64); // 0.2 gwei, above the 0.1 gwei floor
+
+        let call = p.gas_charging_charge(&tx, paid, false);
+        let call_cost = p.price_per_unit * U256::from(call.calldata_units);
+        assert_eq!(U256::from(call.poster_gas), call_cost / paid);
+        assert_eq!(call.poster_fee, paid * U256::from(call.poster_gas));
+
+        let estimate = p.gas_charging_charge(&tx, paid, true);
+        let padded_cost =
+            p.pad_estimation_cost(p.price_per_unit * U256::from(estimate.calldata_units));
+        let adjusted_price = paid * U256::from(7u64) / U256::from(8u64); // above the floor
+        assert_eq!(U256::from(estimate.poster_gas), padded_cost / adjusted_price);
+        assert!(estimate.poster_gas > call.poster_gas);
+    }
+
     /// Fake tx is an EIP-1559 (type 0x02) envelope and its size tracks the
     /// calldata — the dominant input to compression.
     #[test]
@@ -361,7 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn gas_price_populates_fake_tx_fee_and_tip_caps_for_legacy_and_access_list() {
+    fn gas_price_populates_only_the_fake_tx_fee_cap() {
+        // Nitro prices RPC calldata with a fixed randomGasTipCap, so gasPrice
+        // must appear exactly once — as the fee cap, never as the tip cap —
+        // regardless of tx type.
         fn encoded_gas_price_count(tx_type: u8) -> usize {
             let mut tx = sample_tx(vec![0u8; 4]);
             tx.tx_type = tx_type;
@@ -376,13 +437,31 @@ mod tests {
                 .count()
         }
 
-        assert!(
-            encoded_gas_price_count(LEGACY_TX_TYPE) >= 2,
-            "legacy gasPrice must populate both GasTipCap and GasFeeCap"
-        );
-        assert!(
-            encoded_gas_price_count(ACCESS_LIST_TX_TYPE) >= 2,
-            "EIP-2930 gasPrice must populate both GasTipCap and GasFeeCap"
+        for tx_type in [LEGACY_TX_TYPE, ACCESS_LIST_TX_TYPE, 2] {
+            assert_eq!(
+                encoded_gas_price_count(tx_type),
+                1,
+                "gasPrice is the fee cap only, not the tip cap"
+            );
+        }
+    }
+
+    #[test]
+    fn priority_fee_does_not_change_the_fake_tx() {
+        // P1-A: Nitro ignores the message tip when pricing RPC calldata, so a
+        // priority fee must not change the fake tx (and thus the poster gas). A
+        // 2-byte tip like 0x1234 previously shrank the fake tx and undercounted.
+        let base = |prio: Option<u128>| {
+            let mut tx = sample_tx(vec![0xabu8; 100]);
+            tx.tx_type = 2;
+            tx.gas_price = 0x5e6156bc;
+            tx.gas_priority_fee = prio;
+            fake_tx_bytes(&tx, PosterDataMode::CurrentTx)
+        };
+        assert_eq!(
+            base(Some(0x1234)),
+            base(None),
+            "priority fee must not change the fake tx (Nitro uses randomGasTipCap)"
         );
     }
 

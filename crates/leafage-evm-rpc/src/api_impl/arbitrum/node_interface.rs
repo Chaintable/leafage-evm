@@ -1069,6 +1069,9 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
+        // Nitro runs gasEstimateComponents' target message in gas-estimation
+        // mode, so the executions here charge the padded L1 poster gas.
+        tx.context.gas_estimation = true;
         let max_gas_limit = self
             .evm_cfg
             .cfg

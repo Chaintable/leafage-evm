@@ -31,7 +31,8 @@ secp256k1 = { workspace = true, features = [
 p256 = { workspace = true, features = ["ecdsa", "expose-field", "arithmetic"] }
 bech32.workspace = true
 k256.workspace = true
-brotli.workspace = true
+brotli.workspace = true # Stylus payload decompression (wasm.rs)
+brotlic.workspace = true # L1 poster-gas fake-tx compression, byte-identical to Nitro's libbrotli
 libloading.workspace = true
 
 #only use in bsc precompile
