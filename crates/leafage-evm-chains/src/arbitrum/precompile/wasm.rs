@@ -855,6 +855,80 @@ mod tests {
         );
     }
 
+    /// Phase 2a gate (design doc §5): the `stylus_call` FFI + hostio trampoline
+    /// must execute a real Stylus program end to end without corrupting the ABI
+    /// (a wrong struct layout would segfault rather than return). Uses a robust
+    /// zero-hostio (reads see empty state); empty calldata to this erc20-style
+    /// program takes the no-selector revert path. We assert the call *returns*
+    /// (ABI intact) and consumes gas. Gated on `LEAFAGE_ARB_STYLUS_LIB`.
+    #[test]
+    fn calls_arb_one_program_via_ffi() {
+        use crate::arbitrum::precompile::stylus_runtime::{
+            HostioHandler, StylusExecInput, StylusOutcome, StylusRuntime,
+        };
+
+        if std::env::var_os("LEAFAGE_ARB_STYLUS_LIB").is_none() {
+            eprintln!("skipping calls_arb_one_program_via_ffi: LEAFAGE_ARB_STYLUS_LIB not set");
+            return;
+        }
+
+        struct ZeroHostio;
+        impl HostioHandler for ZeroHostio {
+            fn handle(&mut self, _req_type: u32, _input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+                // 32 zero bytes is a safe superset for reads (value/hash/balance);
+                // writes/calls read only the first byte (status 0 = ok). No gas.
+                (vec![0u8; 32], Vec::new(), 0)
+            }
+        }
+
+        let code = alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
+            .expect("decode fixture hex");
+        let mut params = test_stylus_params(16 * 1024 * 1024, 0);
+        params.version = 2;
+        let wasm = ArbWasm::check_classic_stylus_code(&code, params.max_wasm_size)
+            .expect("decode classic stylus code");
+        let asm = StylusRuntime::compile_from_env(&wasm, params.version).expect("compile");
+
+        let input = StylusExecInput {
+            arbos_version: 51,
+            block_basefee: U256::ZERO,
+            chainid: 42161,
+            block_coinbase: Address::ZERO,
+            block_gas_limit: 30_000_000,
+            block_number: 1,
+            block_timestamp: 1,
+            contract_address: "0xe6fc94f78cfec8bdf090ccb854e9b4382870aa7e"
+                .parse()
+                .unwrap(),
+            module_hash: "0xa7c2ce01cea0880198cfc8a35bb3b772babc7ab007a8ebf4f9df1e35f8c6b098"
+                .parse()
+                .unwrap(),
+            msg_sender: Address::ZERO,
+            msg_value: U256::ZERO,
+            tx_gas_price: U256::ZERO,
+            tx_origin: Address::ZERO,
+            reentrant: 0,
+            cached: true,
+            tracing: false,
+            version: 2,
+            max_depth: 65536,
+            ink_price: 10_000,
+        };
+
+        let initial_gas = 100_000_000u64;
+        let mut gas = initial_gas;
+        let mut handler = ZeroHostio;
+        let result = StylusRuntime::call_from_env(&asm, &[], input, &mut handler, &mut gas)
+            .expect("call returns without ABI corruption");
+        // Empty calldata to an erc20-style program: a clean outcome, never a crash.
+        assert!(
+            matches!(result.outcome, StylusOutcome::Success | StylusOutcome::Revert),
+            "unexpected outcome: {:?}",
+            result.outcome,
+        );
+        assert!(gas < initial_gas, "call should consume gas");
+    }
+
     fn brotli_compress(input: &[u8]) -> Vec<u8> {
         let mut reader = Cursor::new(input);
         let mut output = Vec::new();
