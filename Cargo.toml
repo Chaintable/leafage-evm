@@ -122,6 +122,9 @@ dashmap = "6.1"
 # bench
 comfy-table = "7.1"
 rand = "0.10"
+criterion = "0.5"
+
+ahash = "0.8"
 
 [profile.release]
 opt-level = 3

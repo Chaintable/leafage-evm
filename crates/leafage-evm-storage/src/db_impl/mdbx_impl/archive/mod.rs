@@ -706,19 +706,24 @@ impl StateDBProvider for Arc<DataBase> {
             }
             BlockId::Number(block_number_or_tag) => match block_number_or_tag {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    let latest_block_num = self.read_latest_block_num()?;
-                    match latest_block_num {
-                        Some(num) => {
-                            block_num = num;
-                            let block_hash = self.read_block_hash(num)?;
-                            if block_hash == H256::ZERO {
-                                return Ok(None);
-                            }
-                            let info = self.read_block_info(block_hash)?;
-                            if info.is_none() {
-                                return Ok(None);
-                            }
-                            cached_block_info = Some(info.unwrap());
+                    // The latest hash's block info already carries the number,
+                    // so resolve with one hash read + one info read instead of
+                    // going num → hash → info again on top of
+                    // read_latest_block_num (which reads both a first time).
+                    // The latest pointer is the single source of truth here:
+                    // BlockNumToBlockHash is written in the same transaction,
+                    // so re-verifying it would only re-read what commit()
+                    // already guarantees.
+                    let latest_hash = self.read_latest_block_hash()?;
+                    let info = if latest_hash == H256::ZERO {
+                        None
+                    } else {
+                        self.read_block_info(latest_hash)?
+                    };
+                    match info {
+                        Some(info) => {
+                            block_num = info.header.number;
+                            cached_block_info = Some(info);
                         }
                         None => {
                             block_num = 0;
