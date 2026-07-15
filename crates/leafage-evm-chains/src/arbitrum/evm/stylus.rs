@@ -61,6 +61,44 @@ fn cached_gas(program: &PreparedStylusProgram) -> u64 {
     base.saturating_add(dyno.div_ceil(100))
 }
 
+/// nitro `memoryExponents` (`arbos/programs/memory.go`) — the exponential memory
+/// ramp, indexed by page count (0..=128). Transcribed verbatim; must stay
+/// byte-identical to nitro.
+#[rustfmt::skip]
+const MEMORY_EXPONENTS: [u32; 129] = [
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5, 5, 6, 7, 8, 9, 11, 12, 14, 17, 19, 22, 25, 29, 33, 38,
+    43, 50, 57, 65, 75, 85, 98, 112, 128, 147, 168, 193, 221, 253, 289, 331, 379, 434, 497, 569,
+    651, 745, 853, 976, 1117, 1279, 1463, 1675, 1917, 2194, 2511, 2874, 3290, 3765, 4309, 4932,
+    5645, 6461, 7395, 8464, 9687, 11087, 12689, 14523, 16621, 19024, 21773, 24919, 28521, 32642,
+    37359, 42758, 48938, 56010, 64104, 73368, 83971, 96106, 109994, 125890, 144082, 164904, 188735,
+    216010, 247226, 282953, 323844, 370643, 424206, 485509, 555672, 635973, 727880, 833067, 953456,
+    1091243, 1248941, 1429429, 1636000, 1872423, 2143012, 2452704, 2807151, 3212820, 3677113,
+    4208502, 4816684, 5512756, 6309419, 7221210, 8264766, 9459129, 10826093, 12390601, 14181199,
+    16230562, 18576084, 21260563, 24332984, 27849408, 31873999,
+];
+
+fn memory_exp(pages: u16) -> u64 {
+    match MEMORY_EXPONENTS.get(pages as usize) {
+        Some(value) => *value as u64,
+        None => u64::MAX,
+    }
+}
+
+/// nitro `MemoryModel.GasCost` (`memory.go`): linear (`pageGas` per page beyond
+/// `freePages`) + exponential ramp keyed on the high-water page count `ever`.
+fn memory_gas_cost(new: u16, open: u16, ever: u16, free_pages: u16, page_gas: u16) -> u64 {
+    let new_open = open.saturating_add(new);
+    let new_ever = ever.max(new_open);
+    if new_ever <= free_pages {
+        return 0;
+    }
+    let sub_free = |pages: u16| pages.saturating_sub(free_pages);
+    let adding = sub_free(new_open).saturating_sub(sub_free(open));
+    let linear = (adding as u64).saturating_mul(page_gas as u64);
+    let expand = memory_exp(new_ever).saturating_sub(memory_exp(ever));
+    linear.saturating_add(expand)
+}
+
 /// Runs the current (top-of-stack) frame as a Stylus program and produces its
 /// frame result. The caller (`frame_run`) has confirmed the callee bytecode is
 /// a Stylus blob.
@@ -116,23 +154,39 @@ where
         },
     };
 
-    // 4. Gas pre-charge (program init/cached cost). Strategy A for `cached`
-    //    (on-chain flag only, no block RecentWasms LRU).
-    //    TODO(Phase 4): + memory model, RecentWasms, exact CallProgram order.
+    // 4. Gas pre-charge, mirroring nitro `CallProgram` order: memory-init cost
+    //    for the program footprint, then program init/cached cost. Strategy A
+    //    for `cached` (on-chain flag only, no block RecentWasms LRU).
+    //    TODO(Phase 4): RecentWasms (strategy B), enforceStylusPageLimit penalty.
     let mut gas = Gas::new(gas_limit);
-    let precharge = if prepared.cached {
-        cached_gas(&prepared)
-    } else {
-        let mut cost = init_gas(&prepared);
-        if prepared.version > 1 {
-            cost = cost.saturating_add(cached_gas(&prepared));
-        }
-        cost
+    let (open, ever) = {
+        let chain = evm.inner.ctx.chain();
+        (chain.stylus_pages_open(), chain.stylus_pages_ever())
     };
+    let mut precharge = memory_gas_cost(
+        prepared.footprint,
+        open,
+        ever,
+        prepared.free_pages,
+        prepared.page_gas,
+    );
+    if prepared.cached || prepared.version > 1 {
+        precharge = precharge.saturating_add(cached_gas(&prepared));
+    }
+    if !prepared.cached {
+        precharge = precharge.saturating_add(init_gas(&prepared));
+    }
     if !gas.record_cost(precharge) {
         gas.spend_all();
         return finish_frame(evm, InstructionResult::OutOfGas, Bytes::new(), gas);
     }
+    // Reserve the footprint pages for the call (nitro `AddStylusPages`); restored
+    // to `open` after so the reservation is released but the high-water `ever`
+    // sticks.
+    evm.inner
+        .ctx
+        .chain_mut()
+        .set_stylus_pages_open(open.saturating_add(prepared.footprint));
 
     // EvmData.block_number is the ArbOS-recorded L1 block number (what the
     // NUMBER opcode returns on Arbitrum, per PR #184's BLOCKHASH work), falling
@@ -178,10 +232,15 @@ where
         is_static,
         delegate_caller: caller,
         delegate_value: value,
+        free_pages: prepared.free_pages,
+        page_gas: prepared.page_gas,
         refund: 0,
     };
     let result = StylusRuntime::call_from_env(&asm, &calldata, input, &mut hostio, &mut call_gas);
     let refund = hostio.refund;
+    // Release the footprint page reservation (nitro's deferred SetStylusPagesOpen);
+    // the high-water `ever` set during the call is retained.
+    evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
 
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -288,6 +347,9 @@ struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
     /// The Stylus frame's caller/value, used for DELEGATECALL context.
     delegate_caller: Address,
     delegate_value: U256,
+    /// StylusParams memory model inputs, for AddPages.
+    free_pages: u16,
+    page_gas: u16,
     refund: i64,
 }
 
@@ -552,19 +614,20 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         (Vec::new(), code, touch_cost(is_cold))
     }
 
-    /// AddPages: `pages[2]` (u16). Tracks open pages on the execution context.
-    /// TODO(Phase 4): nitro `MemoryModel.GasCost` (exponential table + page
-    /// limit); this charges a flat linear approximation.
+    /// AddPages: `pages[2]` (u16). Charges nitro `MemoryModel.GasCost` and tracks
+    /// open pages on the execution context.
+    /// TODO(Phase 4): enforceStylusPageLimit penalty (breach -> OOG).
     fn add_pages(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if input.len() < 2 {
             return (Vec::new(), Vec::new(), 0);
         }
         let new_pages = u16::from_be_bytes([input[0], input[1]]);
         let open = self.ctx().chain().stylus_pages_open();
+        let ever = self.ctx().chain().stylus_pages_ever();
+        let cost = memory_gas_cost(new_pages, open, ever, self.free_pages, self.page_gas);
         self.ctx()
             .chain_mut()
             .set_stylus_pages_open(open.saturating_add(new_pages));
-        let cost = (new_pages as u64).saturating_mul(1000); // ~InitialPageGas
         (Vec::new(), Vec::new(), cost)
     }
 }
@@ -581,7 +644,25 @@ fn touch_cost(is_cold: bool) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stylus_code;
+    use super::{is_stylus_code, memory_exp, memory_gas_cost};
+
+    #[test]
+    fn memory_model_matches_nitro() {
+        // Exp table endpoints (pins the 129-value transcription).
+        assert_eq!(memory_exp(0), 1);
+        assert_eq!(memory_exp(128), 31_873_999);
+        assert_eq!(memory_exp(129), u64::MAX); // beyond the table
+
+        // GasCost(new, open, ever, free_pages, page_gas) — nitro memory.go.
+        // Within the free window -> 0.
+        assert_eq!(memory_gas_cost(1, 0, 0, 2, 1000), 0);
+        // 3 pages, 2 free: 1 linear page * 1000, exp(3)-exp(0) = 1-1 = 0.
+        assert_eq!(memory_gas_cost(3, 0, 0, 2, 1000), 1000);
+        // 10 pages, 2 free: 8 linear * 1000 + (exp(10)-exp(0)) = 8000 + (3-1).
+        assert_eq!(memory_gas_cost(10, 0, 0, 2, 1000), 8002);
+        // Re-growing already-open pages is linear only (exp keyed on high-water).
+        assert_eq!(memory_gas_cost(0, 10, 10, 2, 1000), 0);
+    }
 
     #[test]
     fn dispatches_only_on_stylus_prefixes() {

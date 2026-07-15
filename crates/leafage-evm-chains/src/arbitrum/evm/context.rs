@@ -91,6 +91,10 @@ impl ArbitrumExecutionContext {
         self.stylus_pages_open
     }
 
+    pub fn stylus_pages_ever(&self) -> u16 {
+        self.stylus_pages_ever
+    }
+
     pub fn set_stylus_pages_open(&mut self, pages: u16) {
         self.stylus_pages_open = pages;
         self.stylus_pages_ever = self.stylus_pages_ever.max(pages);
