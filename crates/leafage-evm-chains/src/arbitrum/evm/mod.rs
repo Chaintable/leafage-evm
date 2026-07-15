@@ -13,7 +13,9 @@ use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
 use revm::handler::{
     EthFrame, EvmTr, ExecuteCommitEvm, ExecuteEvm, FrameInitOrResult, FrameResult, Handler,
+    ItemOrResult,
 };
+use revm::inspector::handler::frame_end;
 use revm::inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorEvmTr, InspectorHandler};
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
@@ -269,5 +271,29 @@ where
         &mut Self::Inspector,
     ) {
         self.inner.all_mut_inspector()
+    }
+
+    fn inspect_frame_run(
+        &mut self,
+    ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+        let is_stylus = {
+            let frame = self.inner.frame_stack.get();
+            stylus::is_stylus_code(frame.interpreter.bytecode.original_byte_slice())
+        };
+        if !is_stylus {
+            return self.inner.inspect_frame_run();
+        }
+        // Traced path: run the Stylus body, not the EVM opcode loop (which would
+        // halt on the 0xEF prefix — the same class as PR #184 B2). Fire the
+        // inspector's call_end so the trace records the frame exit; the `call`
+        // hook already fired in inspect_frame_init, so skipping the end would
+        // corrupt the inspector's call stack.
+        let mut result = stylus::run_stylus_frame(self);
+        if let Ok(ItemOrResult::Result(frame_result)) = &mut result {
+            let (ctx, inspector, frame) = self.inner.ctx_inspector_frame();
+            let input = frame.input.clone();
+            frame_end(ctx, inspector, &input, frame_result);
+        }
+        result
     }
 }

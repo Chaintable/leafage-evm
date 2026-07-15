@@ -48,7 +48,10 @@
 
 - `[2026-07-15][done] Phase 2c: frame seam（frame_run）` — `evm/stylus.rs` 新模块 + `evm/mod.rs` override `frame_run`：检测 `0xEFF0xx` 前缀 → `run_stylus_frame`（gather 帧输入 → `ArbWasm::prepare_stylus_program` 读 Programs 状态+解码 → compile/缓存 → 预扣 init/cached gas → 组装 EvmData → `call_from_env` → 建 `InterpreterResult` → 走 stock `process_next_action`）。非 Stylus 走原 `self.inner.frame_run()`。借用 split（frame_stack vs ctx 两个 disjoint 字段）已验证编译。
   **Done:** 编译干净（dead_code 从 21→0，FFI 全被消费），全量 287 单测绿（含新 dispatch gate 2 测），无回归；dylib FFI 三测（moduleHash/compile/call）仍绿。
-  **未做（Phase 3/4）：** ① `inspect_frame_run` 尚未 override —— **traced RPC（pre_traceCall/simulate）仍会把 Stylus 当坏 EVM 跑（PR #184 B2 同类），必须补**；② 端到端 frame-path 执行集成测试（需 full-transact harness + 播种 Programs 状态）—— 是 Phase 2 真正验收门 + Arb One eth_call 差分起点。
+  **未做（Phase 3/4）：** 端到端 frame-path 执行集成测试（需 full-transact harness + 播种 Programs 状态）—— 是 Phase 2 真正验收门 + Arb One eth_call 差分起点。
+
+- `[2026-07-15][done] Phase 2c+: inspect_frame_run override（traced 路径）` — `evm/mod.rs` 的 `InspectorEvmTr` impl 加 `inspect_frame_run`：检测 `0xEFF0` → `run_stylus_frame` + fire inspector `call_end`（`revm::inspector::handler::frame_end`，用 `ctx_inspector_frame()` 取 ctx/inspector/frame）；非 Stylus 委托 `self.inner.inspect_frame_run()`。闭合 PR #184 B2 同类缺口（traced RPC 不再把 Stylus 当坏 EVM 跑）。
+  **Done:** 编译干净，287 单测绿。`call` hook 已在 inspect_frame_init 触发，此处补 `call_end` 防 inspector 调用栈错乱。
 
 - `[2026-07-15][done] Phase 2d: 最小真 hostio` — `StylusHostio` 实现 `HostioHandler`：GetBytes32(SLOAD)/SetTrieSlots(SSTORE)/GetTransient(TLOAD)/SetTransient(TSTORE) 走 revm journal，wire 逐字节消费，static 保护。其余 req（4-14 calls/create/log/account/pages/capture）返回安全空默认（TODO Phase 3）。
   **未做（Phase 4 gas 对齐）：** SLOAD/SSTORE gas 为近似 EIP-2929/2200（非 nitro `Wasm*Cost` 精确），refund 未从 SStoreResult 累加（现恒 0），memory 页模型/RecentWasms 未接，EvmData.block_number 用 L2（应 L1）、tx_gas_price 用 raw（应 paid price）。全部标 `TODO(Phase 4)`，须对 writer 差分校准。
