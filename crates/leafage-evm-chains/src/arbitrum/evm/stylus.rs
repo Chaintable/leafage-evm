@@ -5,12 +5,13 @@
 //! journal commit/revert, `CallOutcome` wrapping, and parent gas/return wiring
 //! stay identical to an EVM callee. See `docs/stylus-execution-impl-plan.md`.
 //!
-//! Verification status (Phase 2): dispatch, decode, compile, execute, and
-//! return/revert propagation are wired and exercised end to end. Gas is
-//! approximate — the exact nitro pre-charge (memory model + RecentWasms), the
-//! exact hostio gas/refund (EIP-2929/2200 via nitro `Wasm*Cost`), the L1
-//! block-number / paid-gas-price EvmData fields, and subcalls/logs/create
-//! (hostio 4-14) are TODO(Phase 3/4) and must be diffed against a writer.
+//! Verification status: dispatch, decode, compile, execute, storage/account/log
+//! hostio, and subcall driving are wired. **Gas/trace parity is NOT verified** —
+//! the exact nitro pre-charge (memory model + RecentWasms), the exact hostio
+//! gas/refund (EIP-2929/2200 via nitro `Wasm*Cost`), the subcall base-cost and
+//! status encoding, create (hostio 7/8), capture-hostio (14), and the L1
+//! block-number / paid-gas-price EvmData fields are TODO(Phase 4) and must be
+//! diffed against a writer / Arb One traced RPC before shipping.
 
 use super::ArbitrumEvm;
 use crate::arbitrum::precompile::{
@@ -21,8 +22,12 @@ use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::{Block, Cfg, Transaction};
 use revm::handler::evm::ContextDbError;
-use revm::handler::{EthFrame, FrameInitOrResult};
-use revm::interpreter::{Gas, InstructionResult, InterpreterAction, InterpreterResult};
+use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult};
+use revm::interpreter::interpreter_action::FrameInit;
+use revm::interpreter::{
+    CallInput, CallInputs, CallOutcome, CallScheme, CallValue, FrameInput, Gas, InstructionResult,
+    InterpreterAction, InterpreterResult,
+};
 use revm::{Database, DatabaseRef};
 
 /// Stylus program prefixes (nitro `IsStylusProgramPrefix`): classic / fragment
@@ -41,7 +46,7 @@ pub(super) fn is_stylus_code(code: &[u8]) -> bool {
             || code.starts_with(STYLUS_ROOT_PREFIX))
 }
 
-/// nitro `Program::initGas` (programs.go): `MinInitGas*128 + ceil(initCost*InitCostScalar*2/100)`.
+/// nitro `Program::initGas`: `MinInitGas*128 + ceil(initCost*InitCostScalar*2/100)`.
 fn init_gas(program: &PreparedStylusProgram) -> u64 {
     let base = (program.min_init_gas as u64).saturating_mul(128);
     let dyno = (program.init_cost as u64).saturating_mul((program.init_cost_scalar as u64) * 2);
@@ -65,7 +70,7 @@ where
     DB: Database + DatabaseRef,
 {
     // 1. Gather frame inputs, then drop the frame borrow so the body can take
-    //    `&mut ctx` (disjoint field of the same `Evm`).
+    //    `&mut ctx`/`&mut evm` (disjoint field of the same `Evm`).
     let (code, code_hash, calldata, contract, caller, value, is_static, gas_limit) = {
         let frame = evm.inner.frame_stack.get();
         let code = frame.interpreter.bytecode.original_byte_slice().to_vec();
@@ -153,18 +158,20 @@ where
         ink_price: prepared.ink_price,
     };
 
-    // 6. Execute with the hostio bridge (holds `&mut ctx` for the call only).
+    // 6. Execute with the hostio bridge (holds `&mut evm` for the call only, so
+    //    subcalls can drive child frames on the shared stack).
     let supplied = gas.remaining();
     let mut call_gas = supplied;
     let mut hostio = StylusHostio {
-        ctx: &mut evm.inner.ctx,
+        evm,
         contract,
         is_static,
+        delegate_caller: caller,
+        delegate_value: value,
         refund: 0,
     };
     let result = StylusRuntime::call_from_env(&asm, &calldata, input, &mut hostio, &mut call_gas);
     let refund = hostio.refund;
-    drop(hostio);
 
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -210,42 +217,108 @@ where
     })
 }
 
-/// Services Stylus hostio requests against revm state. Phase 2 implements the
-/// storage set (SLOAD/SSTORE/TLOAD/TSTORE); subcalls, create, logs, account and
-/// page requests return safe empty defaults for now (TODO Phase 3).
-struct StylusHostio<'a, DB: Database + DatabaseRef> {
-    ctx: &'a mut ArbitrumContext<DB>,
+/// Drives a Stylus subcall's child frame subtree to completion synchronously
+/// (WASM can't yield to revm's run loop — the G1 problem), returning the direct
+/// child's `CallOutcome`. The child is pushed above the Stylus parent; grandchild
+/// frames resolve via the stock `frame_return_result`, but the DIRECT child's
+/// result is captured + popped manually so it never reaches the Stylus parent's
+/// `return_result` (which would corrupt the parent's interpreter gas/stack).
+fn drive_subcall<DB, I>(evm: &mut ArbitrumEvm<DB, I>, inputs: CallInputs) -> Option<CallOutcome>
+where
+    DB: Database + DatabaseRef,
+{
+    // Build the child FrameInit from the current (Stylus parent) frame.
+    let child_init = {
+        let parent = evm.inner.frame_stack.get();
+        FrameInit {
+            depth: parent.depth + 1,
+            memory: parent.interpreter.memory.new_child_context(),
+            frame_input: FrameInput::Call(Box::new(inputs)),
+        }
+    };
+    // The Stylus parent's index; the direct child lands one above it.
+    let child_index = evm.inner.frame_stack.index().map(|i| i + 1);
+
+    match evm.frame_init(child_init).ok()? {
+        // Resolved without pushing a frame (precompile / empty code).
+        ItemOrResult::Result(frame_result) => return call_outcome(frame_result),
+        ItemOrResult::Item(_frame) => {}
+    }
+
+    loop {
+        let result = match evm.frame_run().ok()? {
+            ItemOrResult::Item(init) => match evm.frame_init(init).ok()? {
+                ItemOrResult::Item(_frame) => continue,
+                ItemOrResult::Result(frame_result) => frame_result,
+            },
+            ItemOrResult::Result(frame_result) => frame_result,
+        };
+        // If the finished frame is the direct child, capture + pop manually.
+        if evm.inner.frame_stack.index() == child_index {
+            evm.inner.frame_stack.pop();
+            return call_outcome(result);
+        }
+        // Deeper frame: return to its (non-Stylus) parent, which resumes.
+        match evm.frame_return_result(result) {
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => continue,
+        }
+    }
+}
+
+fn call_outcome(frame_result: FrameResult) -> Option<CallOutcome> {
+    match frame_result {
+        FrameResult::Call(outcome) => Some(outcome),
+        FrameResult::Create(_) => None,
+    }
+}
+
+/// Services a Stylus program's hostio requests against revm state. Holds
+/// `&mut ArbitrumEvm` so subcalls can drive child frames on the shared stack.
+struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
+    evm: &'a mut ArbitrumEvm<DB, I>,
     contract: Address,
     is_static: bool,
+    /// The Stylus frame's caller/value, used for DELEGATECALL context.
+    delegate_caller: Address,
+    delegate_value: U256,
     refund: i64,
 }
 
-impl<DB: Database + DatabaseRef> HostioHandler for StylusHostio<'_, DB> {
+impl<DB: Database + DatabaseRef, I> HostioHandler for StylusHostio<'_, DB, I> {
     fn handle(&mut self, req_type: u32, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         match req_type {
             0 => self.get_bytes32(input),
             1 => self.set_trie_slots(input),
             2 => self.get_transient(input),
             3 => self.set_transient(input),
+            4 => self.contract_call(input, CallScheme::Call),
+            5 => self.contract_call(input, CallScheme::DelegateCall),
+            6 => self.contract_call(input, CallScheme::StaticCall),
             9 => self.emit_log(input),
             10 => self.account_balance(input),
             11 => self.account_code(input),
             12 => self.account_code_hash(input),
             13 => self.add_pages(input),
-            // TODO(Phase 3): 4-6 calls, 7-8 create (G1 synchronous subcall
-            //   driving); 14 capture-hostio (tracing).
+            // TODO(Phase 3/4): 7-8 create (needs CreateInputs driving), 14
+            //   capture-hostio (tracing).
             _ => (Vec::new(), Vec::new(), 0),
         }
     }
 }
 
-impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
+impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
+    fn ctx(&mut self) -> &mut ArbitrumContext<DB> {
+        &mut self.evm.inner.ctx
+    }
+
     fn get_bytes32(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if input.len() < 32 {
             return (vec![0u8; 32], Vec::new(), 0);
         }
         let key = U256::from_be_slice(&input[..32]);
-        let (value, is_cold) = match self.ctx.journal_mut().sload(self.contract, key) {
+        let contract = self.contract;
+        let (value, is_cold) = match self.ctx().journal_mut().sload(contract, key) {
             Ok(load) => (load.data, load.is_cold),
             Err(_) => (U256::ZERO, false),
         };
@@ -258,19 +331,20 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
         if self.is_static {
             return (vec![3], Vec::new(), 0); // WriteProtection
         }
-        let mut rest: &[u8] = if input.len() >= 8 { &input[8..] } else { &[] };
+        let contract = self.contract;
         let mut cost = 0u64;
-        while rest.len() >= 64 {
-            let key = U256::from_be_slice(&rest[..32]);
-            let value = U256::from_be_slice(&rest[32..64]);
-            match self.ctx.journal_mut().sstore(self.contract, key, value) {
+        let mut offset = if input.len() >= 8 { 8 } else { input.len() };
+        while input.len() >= offset + 64 {
+            let key = U256::from_be_slice(&input[offset..offset + 32]);
+            let value = U256::from_be_slice(&input[offset + 32..offset + 64]);
+            match self.ctx().journal_mut().sstore(contract, key, value) {
                 Ok(load) => {
                     // TODO(Phase 4): exact EIP-2200 cost + refund from SStoreResult.
                     cost = cost.saturating_add(if load.is_cold { 2200 } else { 100 });
                 }
                 Err(_) => return (vec![1], Vec::new(), cost), // Failure
             }
-            rest = &rest[64..];
+            offset += 64;
         }
         (vec![0], Vec::new(), cost) // Success
     }
@@ -280,7 +354,8 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
             return (vec![0u8; 32], Vec::new(), 0);
         }
         let key = U256::from_be_slice(&input[..32]);
-        let value = self.ctx.journal_mut().tload(self.contract, key);
+        let contract = self.contract;
+        let value = self.ctx().journal_mut().tload(contract, key);
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), 0)
     }
 
@@ -290,8 +365,77 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
         }
         let key = U256::from_be_slice(&input[..32]);
         let value = U256::from_be_slice(&input[32..64]);
-        self.ctx.journal_mut().tstore(self.contract, key, value);
+        let contract = self.contract;
+        self.ctx().journal_mut().tstore(contract, key, value);
         (Vec::new(), Vec::new(), 0)
+    }
+
+    /// ContractCall / DelegateCall / StaticCall: `addr[20] ++ value[32] ++
+    /// gasLeft[8] ++ gasReq[8] ++ calldata`. Response: `status[1]`, returndata
+    /// on `raw_data`.
+    /// TODO(Phase 4): exact base cost (nitro `WasmCallCost`), stipend, 63/64,
+    /// and status encoding — diff against writer.
+    fn contract_call(&mut self, input: &[u8], scheme: CallScheme) -> (Vec<u8>, Vec<u8>, u64) {
+        if input.len() < 68 {
+            return (vec![2], Vec::new(), 0);
+        }
+        let addr = Address::from_slice(&input[..20]);
+        let value = U256::from_be_slice(&input[20..52]);
+        let gas_left = u64::from_be_bytes(input[52..60].try_into().unwrap());
+        let gas_req = u64::from_be_bytes(input[60..68].try_into().unwrap());
+        let calldata = Bytes::copy_from_slice(&input[68..]);
+
+        let is_static = self.is_static || scheme == CallScheme::StaticCall;
+        let one_64th = gas_left / 64;
+        let forwarded = gas_req.min(gas_left.saturating_sub(one_64th));
+        let stipend = if value > U256::ZERO && scheme == CallScheme::Call {
+            2300
+        } else {
+            0
+        };
+        let call_gas = forwarded.saturating_add(stipend);
+
+        let (target_address, bytecode_address, caller, call_value) = match scheme {
+            CallScheme::Call => (addr, addr, self.contract, CallValue::Transfer(value)),
+            CallScheme::StaticCall => (addr, addr, self.contract, CallValue::Transfer(U256::ZERO)),
+            CallScheme::DelegateCall => (
+                self.contract,
+                addr,
+                self.delegate_caller,
+                CallValue::Apparent(self.delegate_value),
+            ),
+            CallScheme::CallCode => (self.contract, addr, self.contract, CallValue::Transfer(value)),
+        };
+
+        let inputs = CallInputs {
+            input: CallInput::Bytes(calldata),
+            return_memory_offset: 0..0,
+            gas_limit: call_gas,
+            bytecode_address,
+            known_bytecode: None,
+            target_address,
+            caller,
+            value: call_value,
+            scheme,
+            is_static,
+        };
+
+        match drive_subcall(self.evm, inputs) {
+            Some(outcome) => {
+                let returned = outcome.gas().remaining();
+                let status = if outcome.instruction_result().is_ok() {
+                    0u8
+                } else {
+                    2u8
+                };
+                let output = outcome.output().to_vec();
+                // Program is charged the gas the subcall consumed. TODO(Phase 4):
+                // + nitro base call cost.
+                let cost = call_gas.saturating_sub(returned);
+                (vec![status], output, cost)
+            }
+            None => (vec![2], Vec::new(), call_gas),
+        }
     }
 
     /// EmitLog: `topics[4] ++ topic[32]*n ++ data`. Gas is charged Rust-side
@@ -309,9 +453,10 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
             .map(|i| B256::from_slice(&input[4 + i * 32..4 + (i + 1) * 32]))
             .collect::<Vec<_>>();
         let data = Bytes::copy_from_slice(&input[topics_end..]);
-        self.ctx
+        let contract = self.contract;
+        self.ctx()
             .journal_mut()
-            .log(Log::new_unchecked(self.contract, topics, data));
+            .log(Log::new_unchecked(contract, topics, data));
         (Vec::new(), Vec::new(), 0)
     }
 
@@ -320,7 +465,7 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
             return (vec![0u8; 32], Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
-        let (balance, is_cold) = match self.ctx.journal_mut().load_account(addr) {
+        let (balance, is_cold) = match self.ctx().journal_mut().load_account(addr) {
             Ok(load) => (load.data.info.balance, load.is_cold),
             Err(_) => (U256::ZERO, false),
         };
@@ -336,7 +481,7 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
             return (vec![0u8; 32], Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
-        let (hash, is_cold) = match self.ctx.journal_mut().code_hash(addr) {
+        let (hash, is_cold) = match self.ctx().journal_mut().code_hash(addr) {
             Ok(load) => (load.data, load.is_cold),
             Err(_) => (B256::ZERO, false),
         };
@@ -349,7 +494,7 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
             return (Vec::new(), Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
-        let (code, is_cold) = match self.ctx.journal_mut().code(addr) {
+        let (code, is_cold) = match self.ctx().journal_mut().code(addr) {
             Ok(load) => (load.data.to_vec(), load.is_cold),
             Err(_) => (Vec::new(), false),
         };
@@ -364,8 +509,8 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
             return (Vec::new(), Vec::new(), 0);
         }
         let new_pages = u16::from_be_bytes([input[0], input[1]]);
-        let open = self.ctx.chain().stylus_pages_open();
-        self.ctx
+        let open = self.ctx().chain().stylus_pages_open();
+        self.ctx()
             .chain_mut()
             .set_stylus_pages_open(open.saturating_add(new_pages));
         let cost = (new_pages as u64).saturating_mul(1000); // ~InitialPageGas
