@@ -15,9 +15,9 @@ use std::sync::{
     Arc,
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::time::interval;
+use tokio::time::{interval_at, MissedTickBehavior};
 use tower::BoxError;
 use tower::Layer;
 use tower::Service;
@@ -273,6 +273,7 @@ struct InterceptorWorker {
     retries_receiver: UnboundedReceiver<u64>,
     process: Process,
     latest_stat: Stat,
+    latest_stat_at: Instant,
     total_core_num: usize,
     total_mem_size: u64,
     io_pressure_path: Option<PathBuf>,
@@ -293,14 +294,7 @@ impl InterceptorWorker {
         stat_interval: u64,
         not_retry_threshold: f64,
     ) -> (Self, UnboundedSender<u64>, Arc<AtomicU64>, Arc<AtomicBool>) {
-        if cpu_threshold.len() != 3 {
-            panic!("cpu_threshold must have exactly 3 values");
-        }
-        for threshold in &cpu_threshold {
-            if *threshold < 0.0 || *threshold > 100.0 {
-                panic!("cpu_threshold values must be between 0.0 and 100.0");
-            }
-        }
+        validate_cpu_threshold(&cpu_threshold);
         validate_io_threshold(io_threshold);
         validate_io_threshold(io_full_threshold);
         let (retries_sender, retries_receiver) = unbounded_channel();
@@ -318,6 +312,7 @@ impl InterceptorWorker {
             retries_receiver,
             process,
             latest_stat,
+            latest_stat_at: Instant::now(),
             total_core_num,
             total_mem_size,
             io_pressure_path: io_pressure_path.clone(),
@@ -383,12 +378,16 @@ impl InterceptorWorker {
 
     fn set_load_status(&mut self) {
         let stat = self.process.stat().unwrap();
-        let latest_stat = self.latest_stat.clone();
-        let cpu_time_diff = stat.utime + stat.stime - latest_stat.utime - latest_stat.stime;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.latest_stat_at).as_secs_f64();
+        // 间隔异常偏短时跳过本轮, 避免近零分母把使用率放大成尖刺
+        if elapsed < self.stat_interval as f64 / 1000.0 * 0.5 {
+            return;
+        }
+        let cpu_time_diff =
+            stat.utime + stat.stime - self.latest_stat.utime - self.latest_stat.stime;
         let clk_tck = procfs::ticks_per_second();
-        let cpu_usage = (cpu_time_diff as f64
-            / (clk_tck as f64 * self.total_core_num as f64 * self.stat_interval as f64 / 1000.0))
-            * 100.0;
+        let cpu_usage = cpu_usage_percent(cpu_time_diff, clk_tck, self.total_core_num, elapsed);
         let mem_usage = stat.rss_bytes().get() as f64 / self.total_mem_size as f64 * 100.0;
         let cpu_status = self.cpu_load_status(cpu_usage);
         let io_status = self.io_load_status();
@@ -396,9 +395,10 @@ impl InterceptorWorker {
         self.load_status
             .store(status as u64, std::sync::atomic::Ordering::SeqCst);
         self.latest_stat = stat;
+        self.latest_stat_at = now;
         debug!(
             target = "interceptor",
-            "Load status updated: {status:?} (cpu_status: {cpu_status:?}, io_status: {io_status:?}, usage: {cpu_usage:.2}%, total_core_num: {}, mem_usage: {mem_usage:.2}%, total_mem_size: {})",
+            "Load status updated: {status:?} (cpu_status: {cpu_status:?}, io_status: {io_status:?}, usage: {cpu_usage:.2}%, elapsed: {elapsed:.3}s, total_core_num: {}, mem_usage: {mem_usage:.2}%, total_mem_size: {})",
             self.total_core_num, self.total_mem_size);
     }
 
@@ -419,7 +419,10 @@ impl InterceptorWorker {
     }
 
     async fn run(mut self) {
-        let mut interval = interval(Duration::from_millis(self.stat_interval));
+        let period = Duration::from_millis(self.stat_interval);
+        let mut interval = interval_at(tokio::time::Instant::now() + period, period);
+        // 采样被调度延迟后不补发积压的 tick, 防止背靠背采样
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut now_minute = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -456,6 +459,31 @@ enum LoadStatus {
     LowRefused = 1,
     MiddleRefused = 2,
     AllRefused = 3,
+}
+
+/// CPU 使用率按两次采样间的真实耗时归一化, 采样 tick 被调度延迟时不会虚高。
+fn cpu_usage_percent(
+    cpu_time_diff_ticks: u64,
+    clk_tck: u64,
+    total_core_num: usize,
+    elapsed_secs: f64,
+) -> f64 {
+    (cpu_time_diff_ticks as f64 / (clk_tck as f64 * total_core_num as f64 * elapsed_secs)) * 100.0
+}
+
+fn validate_cpu_threshold(thresholds: &[f64]) {
+    if thresholds.len() != 3 {
+        panic!("cpu_threshold must have exactly 3 values");
+    }
+    if thresholds
+        .iter()
+        .any(|threshold| !(0.0..=100.0).contains(threshold))
+    {
+        panic!("cpu_threshold values must be between 0.0 and 100.0");
+    }
+    if thresholds.windows(2).any(|pair| pair[0] >= pair[1]) {
+        panic!("cpu_threshold values must be strictly increasing");
+    }
 }
 
 fn validate_io_threshold(thresholds: [f64; 3]) {
@@ -738,6 +766,23 @@ mod tests {
         .unwrap();
         assert_eq!(custom_config.io_threshold, [5.0, 15.0, 25.0]);
         assert_eq!(custom_config.io_full_threshold, [1.0, 3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_cpu_usage_percent_uses_real_elapsed() {
+        // 1 秒内 4 核全部跑满 (clk_tck=100)
+        assert_eq!(cpu_usage_percent(400, 100, 4, 1.0), 100.0);
+        // 采样 tick 被延迟到 3 秒: 累计了 3 秒的 CPU 时间, 按真实耗时归一化仍是 100%
+        assert_eq!(cpu_usage_percent(1200, 100, 4, 3.0), 100.0);
+        // 同样的累计值若按固定 1 秒分母折算会虚报成 300%
+        assert_eq!(cpu_usage_percent(1200, 100, 4, 1.0), 300.0);
+        assert_eq!(cpu_usage_percent(200, 100, 4, 1.0), 50.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cpu_threshold values must be strictly increasing")]
+    fn test_cpu_threshold_must_be_increasing() {
+        validate_cpu_threshold(&[90.0, 55.0, 99.0]);
     }
 
     #[test]
