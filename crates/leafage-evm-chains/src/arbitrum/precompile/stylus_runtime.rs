@@ -31,7 +31,7 @@ type StylusCompileFn = unsafe extern "C" fn(
 ) -> u8;
 
 #[derive(Debug)]
-pub(super) enum StylusRuntimeError {
+pub(crate) enum StylusRuntimeError {
     Unconfigured,
     Load {
         path: PathBuf,
@@ -64,7 +64,7 @@ pub(super) struct ActivatedWasm {
     pub(super) module: Bytes,
 }
 
-pub(super) struct StylusRuntime {
+pub(crate) struct StylusRuntime {
     path: PathBuf,
     library: Library,
 }
@@ -396,7 +396,7 @@ impl StylusRuntime {
     /// the consensus anchor. An empty target selects the native host target
     /// (`target_cache_get("")` -> `Target::default()`), so no `stylus_target_set`
     /// call is required for single-host execution.
-    pub(super) fn compile_from_env(
+    pub(crate) fn compile_from_env(
         wasm: &[u8],
         version: u16,
     ) -> Result<Vec<u8>, StylusRuntimeError> {

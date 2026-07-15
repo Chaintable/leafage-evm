@@ -2,6 +2,7 @@ mod context;
 mod handler;
 mod instructions;
 mod poster_gas;
+mod stylus;
 
 use crate::arbitrum::hardforks::ArbitrumHardfork;
 use crate::arbitrum::precompile::{ArbitrumContext, ArbitrumPrecompileEnv, ArbitrumPrecompiles};
@@ -156,7 +157,15 @@ where
     fn frame_run(
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
-        self.inner.frame_run()
+        let is_stylus = {
+            let frame = self.inner.frame_stack.get();
+            stylus::is_stylus_code(frame.interpreter.bytecode.original_byte_slice())
+        };
+        if is_stylus {
+            stylus::run_stylus_frame(self)
+        } else {
+            self.inner.frame_run()
+        }
     }
 
     fn frame_return_result(

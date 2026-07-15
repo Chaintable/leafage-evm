@@ -319,6 +319,18 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         )
     }
 
+    /// Reads the consensus `codeHash -> moduleHash` mapping from the Programs
+    /// `{2}` subspace (the inverse of `save_wasm_module_hash`). The moduleHash
+    /// keys the node-local native-asm cache for execution.
+    pub(in crate::arbitrum::precompile) fn wasm_module_hash(
+        &mut self,
+        code_hash: B256,
+    ) -> Result<B256, PrecompileError> {
+        let module_hashes_key = self.wasm_module_hashes_key();
+        let value = self.read_key(&module_hashes_key, code_hash.0)?;
+        Ok(B256::from(value.to_be_bytes::<32>()))
+    }
+
     pub(in crate::arbitrum::precompile) fn save_activated_wasm_program(
         &mut self,
         code_hash: B256,

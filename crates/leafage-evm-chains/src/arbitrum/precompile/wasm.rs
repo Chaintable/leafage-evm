@@ -36,7 +36,26 @@ const STYLUS_HEADER_LEN: usize = 4;
 const STYLUS_EMPTY_DICTIONARY: u8 = 0;
 const STYLUS_PROGRAM_DICTIONARY: u8 = PROGRAM_DICTIONARY_ID;
 
-pub(super) struct ArbWasm;
+/// Consensus inputs for executing a Stylus program: on-chain wasm (decoded) +
+/// Programs metadata + StylusParams. Plain fields so the frame seam in `evm/`
+/// needs no visibility into the `pub(in precompile)` state types.
+pub(crate) struct PreparedStylusProgram {
+    pub wasm: Vec<u8>,
+    pub module_hash: B256,
+    pub arbos_version: u64,
+    pub version: u16,
+    pub max_stack_depth: u32,
+    pub ink_price: u32,
+    pub init_cost: u16,
+    pub cached_cost: u16,
+    pub cached: bool,
+    pub min_init_gas: u8,
+    pub min_cached_init_gas: u8,
+    pub init_cost_scalar: u8,
+    pub cached_cost_scalar: u8,
+}
+
+pub(crate) struct ArbWasm;
 
 #[derive(Debug)]
 struct StylusRoot {
@@ -589,6 +608,42 @@ impl ArbWasm {
             .timestamp()
             .to::<u64>()
             .saturating_sub(activated_at)
+    }
+
+    /// Reads Programs state + decodes on-chain wasm for a Stylus call. Returns
+    /// `None` when the program is not an up-to-date activated Stylus program
+    /// (the caller reverts). Consensus reads are unmetered here (`gas` = MAX);
+    /// the frame seam applies the real gas pre-charge separately.
+    ///
+    /// TODO(Phase 4): distinguish revert (not-activated / expired) from
+    /// out-of-gas and thread the exact read gas, matching nitro `getActiveProgram`.
+    pub(crate) fn prepare_stylus_program<DB: Database>(
+        context: &mut ArbitrumContext<DB>,
+        code_hash: B256,
+        code: &[u8],
+        timestamp: u64,
+    ) -> Option<PreparedStylusProgram> {
+        let mut storage = ArbStorage::new_with_initial_gas(context, u64::MAX, 0);
+        let arbos_version = storage.arbos_version().ok()?;
+        let params = storage.stylus_params().ok()?;
+        let program = storage.active_wasm_program(code_hash, timestamp, params).ok()?;
+        let module_hash = storage.wasm_module_hash(code_hash).ok()?;
+        let wasm = Self::decode_stylus_wasm(&mut storage, params, code).ok()?;
+        Some(PreparedStylusProgram {
+            wasm,
+            module_hash,
+            arbos_version,
+            version: params.version,
+            max_stack_depth: params.max_stack_depth,
+            ink_price: params.ink_price,
+            init_cost: program.init_cost,
+            cached_cost: program.cached_cost,
+            cached: program.cached,
+            min_init_gas: params.min_init_gas,
+            min_cached_init_gas: params.min_cached_init_gas,
+            init_cost_scalar: params.init_cost_scalar,
+            cached_cost_scalar: params.cached_cost_scalar,
+        })
     }
 
     fn decode_stylus_wasm<DB: Database>(

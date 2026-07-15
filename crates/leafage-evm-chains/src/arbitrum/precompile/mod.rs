@@ -27,6 +27,8 @@ mod wasm_cache;
 
 use self::env::ArbPrecompileInput;
 pub use self::env::ArbitrumPrecompileEnv;
+pub(crate) use self::stylus_runtime::{HostioHandler, StylusExecInput, StylusOutcome, StylusRuntime};
+pub(crate) use self::wasm::{ArbWasm, PreparedStylusProgram};
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
 use self::util::{

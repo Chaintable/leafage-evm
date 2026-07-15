@@ -25,6 +25,7 @@ pub struct ArbitrumExecutionContext {
     current_l2_basefee: Option<u64>,
     current_poster_charge: Option<ArbPosterCharge>,
     activated_wasm_modules: HashMap<B256, Bytes>,
+    compiled_asm: HashMap<B256, Bytes>,
     stylus_pages_open: u16,
     stylus_pages_ever: u16,
 }
@@ -72,6 +73,18 @@ impl ArbitrumExecutionContext {
 
     pub fn activated_wasm_module(&self, module_hash: B256) -> Option<&Bytes> {
         self.activated_wasm_modules.get(&module_hash)
+    }
+
+    /// Node-local native-asm cache keyed by the consensus moduleHash. The asm is
+    /// a per-node derived artifact recompiled deterministically from on-chain
+    /// wasm; the moduleHash anchors it to consensus. Only the native host target
+    /// is compiled, so moduleHash alone is a sufficient key.
+    pub fn insert_compiled_asm(&mut self, module_hash: B256, asm: Bytes) {
+        self.compiled_asm.insert(module_hash, asm);
+    }
+
+    pub fn compiled_asm(&self, module_hash: B256) -> Option<&Bytes> {
+        self.compiled_asm.get(&module_hash)
     }
 
     pub fn stylus_pages_open(&self) -> u16 {

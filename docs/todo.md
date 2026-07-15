@@ -44,11 +44,14 @@
   **Done:** `calls_arb_one_program_via_ffi` 通过：真 Arb One 程序经 leafage call 路径**端到端执行**（无 segfault = repr(C) 布局全对），gas 消耗，clean outcome。即整个 call FFI ABI 已验证。
   **Note:** 这些 pub(crate) 项在 non-test build 暂为 dead_code（21 warning），待 Phase 2c frame seam 消费后消除；仓库无 deny-warnings，不阻塞 CI。
 
-- `[2026-07-15][open] Phase 2b: native-asm 缓存 + wasm_module_hash reader` — 缓存 `HashMap<B256,Bytes>` keyed by module_hash（单 host 只 native target，无需 (hash,target) 复合键）；`state/stylus.rs` 加 `wasm_module_hash(code_hash)->B256` reader（现仅 writer `save_wasm_module_hash`）。均待 frame seam 消费。
+- `[2026-07-15][done] Phase 2b: native-asm 缓存 + wasm_module_hash reader` — `context.rs` 加 `compiled_asm: HashMap<B256,Bytes>` keyed by module_hash（单 host 只 native target）+ 访问器；`state/stylus.rs` 加 `wasm_module_hash(code_hash)->B256` reader。均被 frame seam 消费。
 
-- `[2026-07-15][open] Phase 2c: frame seam（frame_run + inspect_frame_run）` — 见实现计划 §1.1/§3。`evm/mod.rs` override，检测 `0xEFF0` 前缀 → 组装 EvmData（EvmData.block_number = L1 块号）+ 预扣（§6）+ compile/缓存 + `call_from_env` + 建 `InterpreterResult` + `process_next_action`。**inspect_frame_run 必须同步 override（PR #184 B2 同类）。**
+- `[2026-07-15][done] Phase 2c: frame seam（frame_run）` — `evm/stylus.rs` 新模块 + `evm/mod.rs` override `frame_run`：检测 `0xEFF0xx` 前缀 → `run_stylus_frame`（gather 帧输入 → `ArbWasm::prepare_stylus_program` 读 Programs 状态+解码 → compile/缓存 → 预扣 init/cached gas → 组装 EvmData → `call_from_env` → 建 `InterpreterResult` → 走 stock `process_next_action`）。非 Stylus 走原 `self.inner.frame_run()`。借用 split（frame_stack vs ctx 两个 disjoint 字段）已验证编译。
+  **Done:** 编译干净（dead_code 从 21→0，FFI 全被消费），全量 287 单测绿（含新 dispatch gate 2 测），无回归；dylib FFI 三测（moduleHash/compile/call）仍绿。
+  **未做（Phase 3/4）：** ① `inspect_frame_run` 尚未 override —— **traced RPC（pre_traceCall/simulate）仍会把 Stylus 当坏 EVM 跑（PR #184 B2 同类），必须补**；② 端到端 frame-path 执行集成测试（需 full-transact harness + 播种 Programs 状态）—— 是 Phase 2 真正验收门 + Arb One eth_call 差分起点。
 
-- `[2026-07-15][open] Phase 2d: 最小真 hostio` — GetBytes32(SLOAD)/SetTrieSlots(SSTORE + refund 累加)/return，走 revm journal + 现成 gas helper（2929/2200）。wire 格式按实现计划 §5 逐字节消费。
+- `[2026-07-15][done] Phase 2d: 最小真 hostio` — `StylusHostio` 实现 `HostioHandler`：GetBytes32(SLOAD)/SetTrieSlots(SSTORE)/GetTransient(TLOAD)/SetTransient(TSTORE) 走 revm journal，wire 逐字节消费，static 保护。其余 req（4-14 calls/create/log/account/pages/capture）返回安全空默认（TODO Phase 3）。
+  **未做（Phase 4 gas 对齐）：** SLOAD/SSTORE gas 为近似 EIP-2929/2200（非 nitro `Wasm*Cost` 精确），refund 未从 SStoreResult 累加（现恒 0），memory 页模型/RecentWasms 未接，EvmData.block_number 用 L2（应 L1）、tx_gas_price 用 raw（应 paid price）。全部标 `TODO(Phase 4)`，须对 writer 差分校准。
 
 ### 验证前沿（CRITICAL —— 必须诚实标注）
 
