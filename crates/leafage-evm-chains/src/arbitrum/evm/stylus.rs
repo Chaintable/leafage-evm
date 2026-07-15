@@ -17,7 +17,7 @@ use crate::arbitrum::precompile::{
     ArbWasm, ArbitrumContext, HostioHandler, PreparedStylusProgram, StylusExecInput, StylusOutcome,
     StylusRuntime,
 };
-use alloy::primitives::{keccak256, Address, Bytes, U256};
+use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::{Block, Cfg, Transaction};
 use revm::handler::evm::ContextDbError;
@@ -227,8 +227,13 @@ impl<DB: Database + DatabaseRef> HostioHandler for StylusHostio<'_, DB> {
             1 => self.set_trie_slots(input),
             2 => self.get_transient(input),
             3 => self.set_transient(input),
-            // TODO(Phase 3): 4-6 calls, 7-8 create, 9 log, 10-12 account,
-            //   13 pages, 14 capture-hostio.
+            9 => self.emit_log(input),
+            10 => self.account_balance(input),
+            11 => self.account_code(input),
+            12 => self.account_code_hash(input),
+            13 => self.add_pages(input),
+            // TODO(Phase 3): 4-6 calls, 7-8 create (G1 synchronous subcall
+            //   driving); 14 capture-hostio (tracing).
             _ => (Vec::new(), Vec::new(), 0),
         }
     }
@@ -287,6 +292,94 @@ impl<DB: Database + DatabaseRef> StylusHostio<'_, DB> {
         let value = U256::from_be_slice(&input[32..64]);
         self.ctx.journal_mut().tstore(self.contract, key, value);
         (Vec::new(), Vec::new(), 0)
+    }
+
+    /// EmitLog: `topics[4] ++ topic[32]*n ++ data`. Gas is charged Rust-side
+    /// (`pay_for_evm_log`), so the wire cost is 0.
+    fn emit_log(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+        if self.is_static || input.len() < 4 {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        let num_topics = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
+        let topics_end = 4 + num_topics * 32;
+        if input.len() < topics_end {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        let topics = (0..num_topics)
+            .map(|i| B256::from_slice(&input[4 + i * 32..4 + (i + 1) * 32]))
+            .collect::<Vec<_>>();
+        let data = Bytes::copy_from_slice(&input[topics_end..]);
+        self.ctx
+            .journal_mut()
+            .log(Log::new_unchecked(self.contract, topics, data));
+        (Vec::new(), Vec::new(), 0)
+    }
+
+    fn account_balance(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+        if input.len() < 20 {
+            return (vec![0u8; 32], Vec::new(), 0);
+        }
+        let addr = Address::from_slice(&input[..20]);
+        let (balance, is_cold) = match self.ctx.journal_mut().load_account(addr) {
+            Ok(load) => (load.data.info.balance, load.is_cold),
+            Err(_) => (U256::ZERO, false),
+        };
+        (
+            balance.to_be_bytes::<32>().to_vec(),
+            Vec::new(),
+            touch_cost(is_cold),
+        )
+    }
+
+    fn account_code_hash(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+        if input.len() < 20 {
+            return (vec![0u8; 32], Vec::new(), 0);
+        }
+        let addr = Address::from_slice(&input[..20]);
+        let (hash, is_cold) = match self.ctx.journal_mut().code_hash(addr) {
+            Ok(load) => (load.data, load.is_cold),
+            Err(_) => (B256::ZERO, false),
+        };
+        (hash.0.to_vec(), Vec::new(), touch_cost(is_cold))
+    }
+
+    /// AccountCode: `addr[20] ++ gas[8]`. Code goes on the `raw_data` channel.
+    fn account_code(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+        if input.len() < 20 {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        let addr = Address::from_slice(&input[..20]);
+        let (code, is_cold) = match self.ctx.journal_mut().code(addr) {
+            Ok(load) => (load.data.to_vec(), load.is_cold),
+            Err(_) => (Vec::new(), false),
+        };
+        (Vec::new(), code, touch_cost(is_cold))
+    }
+
+    /// AddPages: `pages[2]` (u16). Tracks open pages on the execution context.
+    /// TODO(Phase 4): nitro `MemoryModel.GasCost` (exponential table + page
+    /// limit); this charges a flat linear approximation.
+    fn add_pages(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+        if input.len() < 2 {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        let new_pages = u16::from_be_bytes([input[0], input[1]]);
+        let open = self.ctx.chain().stylus_pages_open();
+        self.ctx
+            .chain_mut()
+            .set_stylus_pages_open(open.saturating_add(new_pages));
+        let cost = (new_pages as u64).saturating_mul(1000); // ~InitialPageGas
+        (Vec::new(), Vec::new(), cost)
+    }
+}
+
+/// EIP-2929 account-touch cost approximation (nitro `WasmAccountTouchCost`).
+/// TODO(Phase 4): match nitro's exact cold/warm accounting.
+fn touch_cost(is_cold: bool) -> u64 {
+    if is_cold {
+        2600
+    } else {
+        100
     }
 }
 
