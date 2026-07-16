@@ -42,20 +42,43 @@ pub struct DebankOutPut {
     pub state_diff: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
-pub struct BlockStorageDiff {
+/// Wire state diff. The container is generic over the account entry type:
+/// standard chains use the default [`NewAccount`] (4 RLP items per account);
+/// chains with a rewritten account model plug in their own wire account
+/// (e.g. [`BlastNewAccount`], 7 items) — same pattern as the internal
+/// [`StoredAccount`]: one generic structure, chain specialization plugs in.
+/// The 6-item top-level RLP layout and the standard-chain bytes are
+/// byte-for-byte unchanged (`BlockStorageDiff` still means
+/// `BlockStorageDiff<NewAccount>` everywhere).
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct BlockStorageDiff<A = NewAccount> {
     /// Block root hash.
     pub hash: H256,
     /// Parent block root hash.
     pub parent_hash: H256,
     /// New accounts
-    pub new_accounts: Vec<NewAccount>,
+    pub new_accounts: Vec<A>,
     /// Deleted accounts
     pub deleted_accounts: Vec<H256>,
     /// Account storage diff
     pub storage_diffs: Vec<AccountStorageDiff>,
     /// New codes
     pub new_codes: Vec<NewCode>,
+}
+
+// Manual impl instead of derive: the derived one would demand `A: Default`,
+// which the account entry types neither have nor need for an empty diff.
+impl<A> Default for BlockStorageDiff<A> {
+    fn default() -> Self {
+        Self {
+            hash: H256::default(),
+            parent_hash: H256::default(),
+            new_accounts: Vec::new(),
+            deleted_accounts: Vec::new(),
+            storage_diffs: Vec::new(),
+            new_codes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
@@ -167,24 +190,10 @@ pub struct BlastNewAccount {
     pub code_hash: H256,
 }
 
-/// Blast wire state diff. Same layout as [`BlockStorageDiff`] except accounts
-/// are [`BlastNewAccount`] (7 RLP items instead of 4). Mirrors
+/// Blast wire state diff: the same [`BlockStorageDiff`] container carrying
+/// Blast wire accounts (7 RLP items instead of 4). Mirrors
 /// Chaintable/pipeline `types.BlastBlockStorageDiff` exactly.
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
-pub struct BlastBlockStorageDiff {
-    /// Block root hash.
-    pub hash: H256,
-    /// Parent block root hash.
-    pub parent_hash: H256,
-    /// New accounts
-    pub new_accounts: Vec<BlastNewAccount>,
-    /// Deleted accounts
-    pub deleted_accounts: Vec<H256>,
-    /// Account storage diff
-    pub storage_diffs: Vec<AccountStorageDiff>,
-    /// New codes
-    pub new_codes: Vec<NewCode>,
-}
+pub type BlastBlockStorageDiff = BlockStorageDiff<BlastNewAccount>;
 
 /// Chain-agnostic internal account value. Wire account types only exist at
 /// decode boundaries and convert into this.
@@ -342,39 +351,33 @@ pub struct BlockStateUpdate {
     pub new_codes: Vec<NewCode>,
 }
 
-impl From<BlockStorageDiff> for BlockStateUpdate {
-    fn from(diff: BlockStorageDiff) -> Self {
-        BlockStateUpdate {
-            hash: diff.hash,
-            parent_hash: diff.parent_hash,
-            new_accounts: diff
-                .new_accounts
-                .into_iter()
-                .map(|account| AccountUpdate {
-                    address: account.address,
-                    account: account.into(),
-                })
-                .collect(),
-            deleted_accounts: diff.deleted_accounts,
-            storage_diffs: diff.storage_diffs,
-            new_codes: diff.new_codes,
+impl From<NewAccount> for AccountUpdate {
+    fn from(account: NewAccount) -> Self {
+        AccountUpdate {
+            address: account.address,
+            account: account.into(),
         }
     }
 }
 
-impl From<BlastBlockStorageDiff> for BlockStateUpdate {
-    fn from(diff: BlastBlockStorageDiff) -> Self {
+impl From<BlastNewAccount> for AccountUpdate {
+    fn from(account: BlastNewAccount) -> Self {
+        AccountUpdate {
+            address: account.address,
+            account: account.into(),
+        }
+    }
+}
+
+impl<A> From<BlockStorageDiff<A>> for BlockStateUpdate
+where
+    AccountUpdate: From<A>,
+{
+    fn from(diff: BlockStorageDiff<A>) -> Self {
         BlockStateUpdate {
             hash: diff.hash,
             parent_hash: diff.parent_hash,
-            new_accounts: diff
-                .new_accounts
-                .into_iter()
-                .map(|account| AccountUpdate {
-                    address: account.address,
-                    account: account.into(),
-                })
-                .collect(),
+            new_accounts: diff.new_accounts.into_iter().map(Into::into).collect(),
             deleted_accounts: diff.deleted_accounts,
             storage_diffs: diff.storage_diffs,
             new_codes: diff.new_codes,
@@ -400,7 +403,9 @@ pub fn decode_state_diff(
         return Ok(BlockStateUpdate::default());
     }
     match codec {
-        StateDiffCodec::Standard => BlockStorageDiff::decode(&mut &*bytes).map(Into::into),
+        StateDiffCodec::Standard => {
+            BlockStorageDiff::<NewAccount>::decode(&mut &*bytes).map(Into::into)
+        }
         StateDiffCodec::BlastV1 => BlastBlockStorageDiff::decode(&mut &*bytes).map(Into::into),
     }
 }
@@ -540,7 +545,7 @@ mod tests {
     fn test_blast_and_standard_wire_reject_each_other() {
         let mut blast_bytes = Vec::new();
         blast_diff_fixture_value().encode(&mut blast_bytes);
-        assert!(BlockStorageDiff::decode(&mut blast_bytes.as_slice()).is_err());
+        assert!(BlockStorageDiff::<NewAccount>::decode(&mut blast_bytes.as_slice()).is_err());
 
         let standard = BlockStorageDiff {
             hash: h256(1),
