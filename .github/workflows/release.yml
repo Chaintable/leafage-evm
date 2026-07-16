@@ -2,8 +2,7 @@ name: Build and Release
 
 on:
   release:
-    types:
-      - created
+    types: [published]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
