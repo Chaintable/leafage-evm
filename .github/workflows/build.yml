@@ -101,6 +101,5 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
-            -t ${REGISTRY}/${IMAGE_NAME}:latest \
             ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64 \
             ${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64
