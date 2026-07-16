@@ -276,25 +276,6 @@ pub struct AccountUpdate {
     pub account: StoredAccount,
 }
 
-/// Internal, non-RLP representation of one block's state changes. Wire types
-/// ([`BlockStorageDiff`], [`BlastBlockStorageDiff`]) convert into this right
-/// after decoding; everything past the decode boundary uses this type.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct BlockStateUpdate {
-    /// Block root hash.
-    pub hash: H256,
-    /// Parent block root hash.
-    pub parent_hash: H256,
-    /// New accounts
-    pub new_accounts: Vec<AccountUpdate>,
-    /// Deleted accounts
-    pub deleted_accounts: Vec<H256>,
-    /// Account storage diff
-    pub storage_diffs: Vec<AccountStorageDiff>,
-    /// New codes
-    pub new_codes: Vec<NewCode>,
-}
-
 impl From<NewAccount> for AccountUpdate {
     fn from(account: NewAccount) -> Self {
         AccountUpdate {
@@ -304,18 +285,30 @@ impl From<NewAccount> for AccountUpdate {
     }
 }
 
-impl<A> From<BlockStorageDiff<A>> for BlockStateUpdate
-where
-    AccountUpdate: From<A>,
-{
-    fn from(diff: BlockStorageDiff<A>) -> Self {
+/// Internal, non-RLP representation of one block's state changes: the same
+/// generic container instantiated with the internal account entry. Wire
+/// instantiations convert into it right after decoding; everything past the
+/// decode boundary uses this type. `AccountUpdate` implements no RLP traits,
+/// so this instantiation structurally has no wire codec.
+pub type BlockStateUpdate = BlockStorageDiff<AccountUpdate>;
+
+impl<A> BlockStorageDiff<A> {
+    /// Convert a decoded wire diff into the internal representation.
+    ///
+    /// An inherent method rather than `From`: with `BlockStateUpdate` being an
+    /// instantiation of this same container, a generic `From` impl would
+    /// overlap the reflexive `impl From<T> for T` at `A = AccountUpdate`.
+    pub fn into_state_update(self) -> BlockStateUpdate
+    where
+        AccountUpdate: From<A>,
+    {
         BlockStateUpdate {
-            hash: diff.hash,
-            parent_hash: diff.parent_hash,
-            new_accounts: diff.new_accounts.into_iter().map(Into::into).collect(),
-            deleted_accounts: diff.deleted_accounts,
-            storage_diffs: diff.storage_diffs,
-            new_codes: diff.new_codes,
+            hash: self.hash,
+            parent_hash: self.parent_hash,
+            new_accounts: self.new_accounts.into_iter().map(Into::into).collect(),
+            deleted_accounts: self.deleted_accounts,
+            storage_diffs: self.storage_diffs,
+            new_codes: self.new_codes,
         }
     }
 }
@@ -338,10 +331,11 @@ pub fn decode_state_diff(
         return Ok(BlockStateUpdate::default());
     }
     match codec {
-        StateDiffCodec::Standard => {
-            BlockStorageDiff::<NewAccount>::decode(&mut &*bytes).map(Into::into)
+        StateDiffCodec::Standard => BlockStorageDiff::<NewAccount>::decode(&mut &*bytes)
+            .map(BlockStorageDiff::into_state_update),
+        StateDiffCodec::BlastV1 => {
+            BlastBlockStorageDiff::decode(&mut &*bytes).map(BlockStorageDiff::into_state_update)
         }
-        StateDiffCodec::BlastV1 => BlastBlockStorageDiff::decode(&mut &*bytes).map(Into::into),
     }
 }
 
