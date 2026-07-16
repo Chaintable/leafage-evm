@@ -163,9 +163,7 @@ where
 {
     fn from(exec_res: ExecutionResult<T>) -> Self {
         let res = match exec_res {
-            ExecutionResult::Success {
-                output, gas, ..
-            } => DebankSingleCallResult {
+            ExecutionResult::Success { output, gas, .. } => DebankSingleCallResult {
                 code: 0,
                 err: "".to_string(),
                 from_cache: false,
@@ -173,9 +171,7 @@ where
                 gas_used: gas.used() as i64,
                 time_cost: 0.0,
             },
-            ExecutionResult::Revert {
-                output, gas, ..
-            } => DebankSingleCallResult {
+            ExecutionResult::Revert { output, gas, .. } => DebankSingleCallResult {
                 code: DebankErrorCode::EvmRevert as i32,
                 err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
