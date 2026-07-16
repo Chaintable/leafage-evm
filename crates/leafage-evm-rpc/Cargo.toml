@@ -39,4 +39,4 @@ anyhow.workspace = true
 procfs.workspace = true
 
 [dev-dependencies]
-metrics-util = "0.19"
+metrics-util.workspace = true

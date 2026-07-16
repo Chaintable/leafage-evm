@@ -123,6 +123,9 @@ criterion = "0.5"
 
 ahash = "0.8"
 
+# for test
+metrics-util = "0.19"
+
 [profile.release]
 opt-level = 3
 debug = true
