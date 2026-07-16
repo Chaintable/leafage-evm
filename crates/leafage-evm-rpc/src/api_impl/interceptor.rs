@@ -1,3 +1,4 @@
+use crate::metrics::record_io_pressure_avg10;
 use futures::TryFutureExt;
 use hyper::{body::Bytes, Response, StatusCode};
 use jsonrpsee::server::{HttpBody, HttpRequest};
@@ -446,12 +447,15 @@ impl InterceptorWorker {
         };
 
         match IoPressure::from_file(path) {
-            Ok(pressure) => io_pressure_load_status(
-                pressure.some.avg10,
-                pressure.full.avg10,
-                self.io_threshold,
-                self.io_full_threshold,
-            ),
+            Ok(pressure) => {
+                record_io_pressure_avg10(pressure.some.avg10, pressure.full.avg10);
+                io_pressure_load_status(
+                    pressure.some.avg10,
+                    pressure.full.avg10,
+                    self.io_threshold,
+                    self.io_full_threshold,
+                )
+            }
             Err(err) => {
                 debug!(
                     target = "interceptor",

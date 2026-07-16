@@ -4,6 +4,8 @@ use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::server::MethodResponse;
 use jsonrpsee::types::Request;
 use metrics::{counter, histogram};
+#[cfg(any(target_os = "linux", test))]
+use metrics::gauge;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{BoxError, Layer, Service};
@@ -96,6 +98,20 @@ fn http_error_outcome(error: &BoxError) -> &'static str {
     } else {
         "error"
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn record_io_pressure_avg10(some_avg10: f32, full_avg10: f32) {
+    gauge!(
+        "leafage_interceptor_io_pressure_avg10",
+        "type" => "some"
+    )
+    .set(f64::from(some_avg10));
+    gauge!(
+        "leafage_interceptor_io_pressure_avg10",
+        "type" => "full"
+    )
+    .set(f64::from(full_avg10));
 }
 
 #[derive(Debug)]
@@ -289,5 +305,35 @@ mod tests {
             })
             .expect("timeout status counter should be recorded");
         assert_eq!(status, &DebugValue::Counter(1));
+    }
+
+    #[test]
+    fn records_io_pressure_avg10_gauges() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || record_io_pressure_avg10(12.34, 2.5));
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge_value = |pressure_type: &str| {
+            snapshot
+                .iter()
+                .find_map(|(key, _, _, value)| {
+                    let matches = key.kind() == MetricKind::Gauge
+                        && key.key().name() == "leafage_interceptor_io_pressure_avg10"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "type" && label.value() == pressure_type);
+                    match (matches, value) {
+                        (true, DebugValue::Gauge(value)) => Some(value.into_inner()),
+                        _ => None,
+                    }
+                })
+                .expect("IO pressure avg10 gauge should be recorded")
+        };
+
+        assert!((gauge_value("some") - 12.34).abs() < 1e-5);
+        assert!((gauge_value("full") - 2.5).abs() < 1e-5);
     }
 }
