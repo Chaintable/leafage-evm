@@ -19,6 +19,7 @@ use leafage_evm_types::{
 };
 use revm::bytecode::OpCode;
 use revm::context_interface::Cfg;
+use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
@@ -780,7 +781,20 @@ where
         // the gas limit of the corresponding block
         let block_env_gas_limit = block_env.gas_limit;
         let cfg = &self.inner.evm_cfg().cfg;
-        let max_gas_limit = cfg.tx_gas_limit_cap().min(block_env_gas_limit);
+        // cfg.tx_gas_limit_cap is the RPC execution cap (--rpc-gas-cap), kept
+        // loose so simulation-only paths (eth_call / contractMultiCall) can use
+        // it in full. An estimate, however, must also fit the chain's consensus
+        // tx cap (EIP-7825, 16.7M from Osaka on), or the returned gas would
+        // build a tx the chain rejects.
+        let chain_spec: EthSpecId = cfg.spec().clone().into();
+        let spec_cap = if chain_spec.is_enabled_in(EthSpecId::OSAKA) {
+            eip7825::TX_GAS_LIMIT_CAP
+        } else {
+            u64::MAX
+        };
+        let max_gas_limit = spec_cap
+            .min(cfg.tx_gas_limit_cap())
+            .min(block_env_gas_limit);
         let mut highest_gas_limit = tx_request_gas_limit
             .map(|tx_gas_limit| {
                 if tx_gas_limit > max_gas_limit {
