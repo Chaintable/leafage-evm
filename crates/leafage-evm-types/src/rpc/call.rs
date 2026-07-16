@@ -135,16 +135,22 @@ mod tests {
         });
 
         let req: CallRequest = serde_json::from_value(json).expect("should deserialize");
-        let t = req
-            .tempo
-            .as_ref()
-            .expect("tempo extension should be present");
+        let t = req.tempo.as_ref().expect("tempo extension should be present");
         assert_eq!(t.nonce_key, Some(U256::from(1)));
         assert_eq!(t.key_type, Some("p256".to_string()));
         assert_eq!(t.key_data, Some(Bytes::from(vec![0xab, 0xcd])));
-        assert_eq!(t.key_id, Some(Address::with_last_byte(0x03)));
-        assert_eq!(t.fee_token, Some(Address::with_last_byte(0x04)));
-        assert_eq!(t.fee_payer, Some(Address::with_last_byte(0x05)));
+        assert_eq!(
+            t.key_id,
+            Some(Address::with_last_byte(0x03))
+        );
+        assert_eq!(
+            t.fee_token,
+            Some(Address::with_last_byte(0x04))
+        );
+        assert_eq!(
+            t.fee_payer,
+            Some(Address::with_last_byte(0x05))
+        );
         assert_eq!(t.valid_after, Some(1000));
         assert_eq!(t.valid_before, Some(2000));
         assert!(t.tempo_calls.is_some());
@@ -153,8 +159,14 @@ mod tests {
         let auth_list = t.tempo_authorization_list.as_ref().unwrap();
         assert_eq!(auth_list.len(), 1);
         assert!(auth_list[0].is_keychain);
-        assert_eq!(auth_list[0].authority, Some(Address::with_last_byte(0x06)));
-        assert_eq!(auth_list[0].address, Some(Address::with_last_byte(0x07)));
+        assert_eq!(
+            auth_list[0].authority,
+            Some(Address::with_last_byte(0x06))
+        );
+        assert_eq!(
+            auth_list[0].address,
+            Some(Address::with_last_byte(0x07))
+        );
         assert_eq!(auth_list[0].chain_id, Some(U256::from(1)));
     }
 
@@ -170,8 +182,7 @@ mod tests {
             "input": "0x"
         });
 
-        let req: CallRequest =
-            serde_json::from_value(json).expect("should deserialize standard request");
+        let req: CallRequest = serde_json::from_value(json).expect("should deserialize standard request");
         let t = req.tempo.unwrap_or_default();
         assert!(t.tempo_calls.is_none());
         assert!(t.nonce_key.is_none());
@@ -226,8 +237,7 @@ mod tests {
     fn test_tempo_key_auth_gas_info_defaults() {
         let json = serde_json::json!({});
 
-        let info: TempoKeyAuthGasInfo =
-            serde_json::from_value(json).expect("should deserialize empty");
+        let info: TempoKeyAuthGasInfo = serde_json::from_value(json).expect("should deserialize empty");
         assert!(info.sig_type.is_none());
         assert_eq!(info.num_limits, 0);
     }

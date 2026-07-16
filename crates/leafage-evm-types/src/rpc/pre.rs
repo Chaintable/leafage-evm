@@ -53,8 +53,7 @@ where
     fn from(exec_res: ExecutionResult<T>) -> Self {
         match exec_res {
             ExecutionResult::Revert { gas, output, .. } => {
-                let reason =
-                    decode_revert_reason(&output).unwrap_or("execution revert".to_string());
+                let reason = decode_revert_reason(&output).unwrap_or("execution revert".to_string());
                 let pre_error = PreError {
                     msg: reason,
                     code: PreErrorCode::Reverted as i64,
