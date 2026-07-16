@@ -2,7 +2,7 @@ use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, U256};
 use crate::rpc::{Block, Header};
 use alloy::primitives::keccak256;
 pub use alloy::serde::WithOtherFields;
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, Encodable};
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use serde::{Deserialize, Serialize};
@@ -167,27 +167,87 @@ impl From<NewAccount> for SlimAccount {
 
 /// Blast (chain 81457) wire account. blast-geth stores raw yield fields
 /// instead of a balance; the balance is derived at read time against the
-/// sharePrice of the same state view: flags 0 (Automatic) ->
-/// `shares * sharePrice + remainder`, any other flags -> `fixed`.
-/// Field order mirrors Chaintable/pipeline `types.BlastNewAccount` exactly.
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+/// sharePrice of the same state view.
+///
+/// The raw yield fields are the embedded [`BlastAccountExt`] — the same
+/// struct the internal [`StoredAccount`] extension carries, so the wire and
+/// internal representations share one definition. On the wire the ext's
+/// fields are **flattened in place**, mirroring Chaintable/pipeline
+/// `types.BlastNewAccount` exactly (7 items:
+/// `[address, nonce, flags, fixed, shares, remainder, code_hash]`); the RLP
+/// impls are hand-written below because a derived nested struct would encode
+/// as a nested list and change the bytes.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlastNewAccount {
     /// keccak256 of the account address
     pub address: H256,
     /// Account nonce
     pub nonce: u64,
-    /// Yield mode: 0 = Automatic, 1 = Disabled, 2 = Claimable. Passed through
-    /// as-is; unknown values are not rejected here (read side treats them
-    /// like blast-geth `Balance()`: anything non-zero returns `fixed`).
-    pub flags: u8,
-    /// Balance for non-Automatic accounts
-    pub fixed: U256,
-    /// Yield shares for Automatic accounts
-    pub shares: U256,
-    /// Sub-share remainder for Automatic accounts
-    pub remainder: U256,
+    /// Blast raw yield fields, flattened on the wire
+    pub ext: BlastAccountExt,
     /// code hash
     pub code_hash: H256,
+}
+
+impl BlastNewAccount {
+    fn rlp_payload_length(&self) -> usize {
+        self.address.length()
+            + self.nonce.length()
+            + self.ext.flags.length()
+            + self.ext.fixed.length()
+            + self.ext.shares.length()
+            + self.ext.remainder.length()
+            + self.code_hash.length()
+    }
+}
+
+impl Encodable for BlastNewAccount {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        alloy_rlp::Header {
+            list: true,
+            payload_length: self.rlp_payload_length(),
+        }
+        .encode(out);
+        self.address.encode(out);
+        self.nonce.encode(out);
+        self.ext.flags.encode(out);
+        self.ext.fixed.encode(out);
+        self.ext.shares.encode(out);
+        self.ext.remainder.encode(out);
+        self.code_hash.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_length = self.rlp_payload_length();
+        payload_length + alloy_rlp::length_of_length(payload_length)
+    }
+}
+
+impl Decodable for BlastNewAccount {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let payload = alloy_rlp::Header::decode_bytes(buf, true)?;
+        let mut b = payload;
+        let this = Self {
+            address: Decodable::decode(&mut b)?,
+            nonce: Decodable::decode(&mut b)?,
+            ext: BlastAccountExt {
+                flags: Decodable::decode(&mut b)?,
+                fixed: Decodable::decode(&mut b)?,
+                shares: Decodable::decode(&mut b)?,
+                remainder: Decodable::decode(&mut b)?,
+            },
+            code_hash: Decodable::decode(&mut b)?,
+        };
+        // Same strictness as the derive: the list payload must be exactly
+        // consumed — trailing items are an error, never ignored.
+        if !b.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: payload.len(),
+                got: payload.len() - b.len(),
+            });
+        }
+        Ok(this)
+    }
 }
 
 /// Blast wire state diff: the same [`BlockStorageDiff`] container carrying
@@ -229,8 +289,13 @@ pub enum AccountExt {
 
 /// Blast raw yield fields (the non-trie-root part of blast-geth's
 /// `StateAccount`). Plain data with no invariant of its own, so fields stay
-/// public. The balance is derived at read time: flags 0 (Automatic) ->
-/// `shares * sharePrice + remainder`, any other flags -> `fixed`.
+/// public. One definition shared by the wire account ([`BlastNewAccount`],
+/// where it is flattened into the 7-item RLP list) and the internal
+/// [`StoredAccount`] extension. The balance is derived at read time:
+/// flags 0 (Automatic) -> `shares * sharePrice + remainder`, any other
+/// flags -> `fixed`. Unknown flags are passed through, not rejected (the
+/// read side mirrors blast-geth `Balance()`: anything non-zero returns
+/// `fixed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlastAccountExt {
     /// Yield mode: 0 = Automatic, 1 = Disabled, 2 = Claimable (passed through)
@@ -314,12 +379,7 @@ impl From<BlastNewAccount> for StoredAccount {
         StoredAccount::with_ext(
             account.nonce,
             account.code_hash,
-            AccountExt::Blast(BlastAccountExt {
-                flags: account.flags,
-                fixed: account.fixed,
-                shares: account.shares,
-                remainder: account.remainder,
-            }),
+            AccountExt::Blast(account.ext),
         )
     }
 }
@@ -499,10 +559,12 @@ mod tests {
             new_accounts: vec![BlastNewAccount {
                 address: h256(3),
                 nonce: 7,
-                flags: 2,
-                fixed: U256::from(11),
-                shares: U256::from(13),
-                remainder: U256::from(17),
+                ext: BlastAccountExt {
+                    flags: 2,
+                    fixed: U256::from(11),
+                    shares: U256::from(13),
+                    remainder: U256::from(17),
+                },
                 code_hash: h256(4),
             }],
             deleted_accounts: vec![h256(5)],
