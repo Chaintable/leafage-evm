@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 pub type BlockInfo = WithOtherFields<Block<H256>>;
 pub type HeaderInfo = WithOtherFields<Header>;
 
-
 pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
     BlockEnv {
         number: U256::from(block.header.number),
@@ -187,54 +186,132 @@ pub struct BlastBlockStorageDiff {
     pub new_codes: Vec<NewCode>,
 }
 
-/// How an account's balance is represented internally.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BalanceState {
-    /// Materialized balance (all standard chains).
-    Standard { balance: U256 },
-    /// Blast raw yield fields; the balance is derived at read time against
-    /// the sharePrice of the same state view.
-    Blast {
-        flags: u8,
-        fixed: U256,
-        shares: U256,
-        remainder: U256,
-    },
-}
-
 /// Chain-agnostic internal account value. Wire account types only exist at
 /// decode boundaries and convert into this.
+///
+/// A generic core (same shape as [`NewAccount`]: balance, nonce, code_hash)
+/// with an embedded chain-specific extension. Standard chains carry no
+/// extension; chains with a rewritten account model (Blast) embed their raw
+/// fields in `ext` and the balance is derived at read time.
+///
+/// Fields are private on purpose: the invariant "`ext` is `Some` ⇒ `balance`
+/// is zero and must not be read" is established once by the constructors and
+/// upheld by the accessor API ([`Self::standard_balance`],
+/// [`Self::balance_view`]), instead of relying on every consumer to know the
+/// rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAccount {
-    pub nonce: u64,
-    pub code_hash: H256,
-    pub balance_state: BalanceState,
+    /// Materialized balance; only meaningful while `ext` is `None`.
+    balance: U256,
+    nonce: u64,
+    code_hash: H256,
+    /// Chain-specific account-model extension. `None` = standard account.
+    ext: Option<AccountExt>,
+}
+
+/// Chain-specific account-model extensions. New chains add a variant here.
+/// Deliberately NOT `#[non_exhaustive]`: adding a variant must force every
+/// match site to decide explicitly, never fall through a default arm that
+/// silently treats an unknown extension as a standard account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountExt {
+    Blast(BlastAccountExt),
+}
+
+/// Blast raw yield fields (the non-trie-root part of blast-geth's
+/// `StateAccount`). Plain data with no invariant of its own, so fields stay
+/// public. The balance is derived at read time: flags 0 (Automatic) ->
+/// `shares * sharePrice + remainder`, any other flags -> `fixed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlastAccountExt {
+    /// Yield mode: 0 = Automatic, 1 = Disabled, 2 = Claimable (passed through)
+    pub flags: u8,
+    pub fixed: U256,
+    pub shares: U256,
+    pub remainder: U256,
+}
+
+/// Borrowed balance view of a [`StoredAccount`], see
+/// [`StoredAccount::balance_view`]. A read API only — the storage layout
+/// stays the embedded struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceView<'a> {
+    /// Materialized balance of a standard account.
+    Standard(U256),
+    /// Blast raw yield fields; the balance must be derived against the
+    /// sharePrice of the same state view.
+    Blast(&'a BlastAccountExt),
+}
+
+impl StoredAccount {
+    /// Standard account (materialized balance, no extension).
+    pub fn standard(balance: U256, nonce: u64, code_hash: H256) -> Self {
+        Self {
+            balance,
+            nonce,
+            code_hash,
+            ext: None,
+        }
+    }
+
+    /// Account with a chain-specific extension. The materialized balance is
+    /// pinned to zero here — the extension is the balance's source of truth.
+    pub fn with_ext(nonce: u64, code_hash: H256, ext: AccountExt) -> Self {
+        Self {
+            balance: U256::ZERO,
+            nonce,
+            code_hash,
+            ext: Some(ext),
+        }
+    }
+
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub fn code_hash(&self) -> H256 {
+        self.code_hash
+    }
+
+    pub fn ext(&self) -> Option<&AccountExt> {
+        self.ext.as_ref()
+    }
+
+    /// Materialized balance of a standard account. `None` for extended
+    /// accounts, whose balance must be derived at read time.
+    pub fn standard_balance(&self) -> Option<U256> {
+        self.ext.is_none().then_some(self.balance)
+    }
+
+    /// The authoritative balance view: consumers match on this, so reading
+    /// "the materialized balance of an extended account" is structurally
+    /// impossible.
+    pub fn balance_view(&self) -> BalanceView<'_> {
+        match &self.ext {
+            None => BalanceView::Standard(self.balance),
+            Some(AccountExt::Blast(blast)) => BalanceView::Blast(blast),
+        }
+    }
 }
 
 impl From<NewAccount> for StoredAccount {
     fn from(account: NewAccount) -> Self {
-        StoredAccount {
-            nonce: account.nonce,
-            code_hash: account.code_hash,
-            balance_state: BalanceState::Standard {
-                balance: account.balance,
-            },
-        }
+        StoredAccount::standard(account.balance, account.nonce, account.code_hash)
     }
 }
 
 impl From<BlastNewAccount> for StoredAccount {
     fn from(account: BlastNewAccount) -> Self {
-        StoredAccount {
-            nonce: account.nonce,
-            code_hash: account.code_hash,
-            balance_state: BalanceState::Blast {
+        StoredAccount::with_ext(
+            account.nonce,
+            account.code_hash,
+            AccountExt::Blast(BlastAccountExt {
                 flags: account.flags,
                 fixed: account.fixed,
                 shares: account.shares,
                 remainder: account.remainder,
-            },
-        }
+            }),
+        )
     }
 }
 
@@ -513,13 +590,11 @@ mod tests {
         assert_eq!(update.new_accounts[0].address, h256(3));
         assert_eq!(
             update.new_accounts[0].account,
-            StoredAccount {
-                nonce: 7,
-                code_hash: h256(4),
-                balance_state: BalanceState::Standard {
-                    balance: U256::from(100)
-                },
-            }
+            StoredAccount::standard(U256::from(100), 7, h256(4))
+        );
+        assert_eq!(
+            update.new_accounts[0].account.standard_balance(),
+            Some(U256::from(100))
         );
         assert!(decode_state_diff(StateDiffCodec::BlastV1, &standard_bytes).is_err());
 
@@ -531,18 +606,22 @@ mod tests {
         assert_eq!(update.deleted_accounts, vec![h256(5)]);
         assert_eq!(update.storage_diffs.len(), 1);
         assert_eq!(update.new_codes.len(), 1);
+        let blast_ext = BlastAccountExt {
+            flags: 2,
+            fixed: U256::from(11),
+            shares: U256::from(13),
+            remainder: U256::from(17),
+        };
         assert_eq!(
             update.new_accounts[0].account,
-            StoredAccount {
-                nonce: 7,
-                code_hash: h256(4),
-                balance_state: BalanceState::Blast {
-                    flags: 2,
-                    fixed: U256::from(11),
-                    shares: U256::from(13),
-                    remainder: U256::from(17),
-                },
-            }
+            StoredAccount::with_ext(7, h256(4), AccountExt::Blast(blast_ext.clone()))
+        );
+        // The invariant in action: an extended account has no readable
+        // materialized balance; its balance view carries the raw fields.
+        assert_eq!(update.new_accounts[0].account.standard_balance(), None);
+        assert_eq!(
+            update.new_accounts[0].account.balance_view(),
+            BalanceView::Blast(&blast_ext)
         );
         assert!(decode_state_diff(StateDiffCodec::Standard, &blast_bytes).is_err());
     }
