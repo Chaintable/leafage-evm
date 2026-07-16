@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 pub type BlockInfo = WithOtherFields<Block<H256>>;
 pub type HeaderInfo = WithOtherFields<Header>;
 
-
 pub fn block_env_from_block<T>(block: &Block<T>) -> BlockEnv {
     BlockEnv {
         number: U256::from(block.header.number),
@@ -143,6 +142,25 @@ impl From<NewAccount> for SlimAccount {
     }
 }
 
+/// Blast on-disk account value (`BlastSlimAccountV1`): raw yield fields
+/// stored in place of a materialized balance. 6 RLP items, so a standard
+/// 3-item [`SlimAccount`] can never decode as one (and vice versa).
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct BlastSlimAccount {
+    /// Account nonce
+    pub nonce: u64,
+    /// Yield mode: 0 = Automatic, 1 = Disabled, 2 = Claimable
+    pub flags: u8,
+    /// Balance for non-Automatic accounts
+    pub fixed: U256,
+    /// Yield shares for Automatic accounts
+    pub shares: U256,
+    /// Sub-share remainder for Automatic accounts
+    pub remainder: U256,
+    /// code hash
+    pub code_hash: H256,
+}
+
 /// Blast (chain 81457) wire account. blast-geth stores raw yield fields
 /// instead of a balance; the balance is derived at read time against the
 /// sharePrice of the same state view: flags 0 (Automatic) ->
@@ -209,6 +227,17 @@ pub struct StoredAccount {
     pub nonce: u64,
     pub code_hash: H256,
     pub balance_state: BalanceState,
+}
+
+impl StoredAccount {
+    /// Materialized balance of a standard account. `None` for Blast accounts,
+    /// whose balance is derived at read time against the sharePrice.
+    pub fn standard_balance(&self) -> Option<U256> {
+        match self.balance_state {
+            BalanceState::Standard { balance } => Some(balance),
+            BalanceState::Blast { .. } => None,
+        }
+    }
 }
 
 impl From<NewAccount> for StoredAccount {

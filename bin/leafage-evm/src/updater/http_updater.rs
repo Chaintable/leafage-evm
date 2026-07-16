@@ -1,9 +1,10 @@
-use alloy_rlp::Decodable;
 use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, DebankOutPut, HeaderInfo};
+use leafage_evm_storage::{account_codec, BlockContext, EvmStorageRead, EvmStorageWrite};
+use leafage_evm_types::{
+    decode_state_diff, Block, BlockId, BlockInfo, BlockNumberOrTag, DebankOutPut, HeaderInfo,
+};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -90,18 +91,17 @@ where
         }
 
         while let Some(debank_output) = self.block_queue.pop_front() {
-            let block_storage_diff = if debank_output.state_diff.is_empty() {
-                BlockStorageDiff::default()
-            } else {
-                let mut bytes = debank_output.state_diff.as_ref();
-                BlockStorageDiff::decode(&mut bytes)?
-            };
+            let block_storage_diff =
+                decode_state_diff(account_codec(), debank_output.state_diff.as_ref())?;
             let block_hash = debank_output.header.hash;
             let block_num = debank_output.header.number;
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
-            let HeaderInfo { inner: header, other } = debank_output.header;
+            let HeaderInfo {
+                inner: header,
+                other,
+            } = debank_output.header;
             let block_info = BlockInfo {
                 inner: Block::empty(header),
                 other,
@@ -157,7 +157,11 @@ mod tests {
                 .debank_block(BlockId::Number(BlockNumberOrTag::Number(18022783 + i)))
                 .await
                 .unwrap();
-            let block_diff: BlockStorageDiff = Decodable::decode(&mut res.state_diff.as_ref()).unwrap();
+            let block_diff = decode_state_diff(
+                leafage_evm_types::StateDiffCodec::Standard,
+                res.state_diff.as_ref(),
+            )
+            .unwrap();
             println!("{:?}", block_diff.storage_diffs);
         }
     }

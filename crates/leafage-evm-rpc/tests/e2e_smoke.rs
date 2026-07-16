@@ -65,15 +65,22 @@ async fn rpc_smoke_over_layered_state() {
             .unwrap()
             .unwrap(),
     )
-    .update_block(genesis, genesis_diff)
+    .update_block(genesis, genesis_diff.into())
     .unwrap();
 
     // Two empty diff layers on top keep reads walking the in-memory chain.
-    let tree = Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
-    tree.update_block(block_info(1, h(0xbb), h(0xaa)), BlockStorageDiff::default())
-        .unwrap();
-    tree.update_block(block_info(2, h(0xcc), h(0xbb)), BlockStorageDiff::default())
-        .unwrap();
+    let tree =
+        Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
+    tree.update_block(
+        block_info(1, h(0xbb), h(0xaa)),
+        BlockStorageDiff::default().into(),
+    )
+    .unwrap();
+    tree.update_block(
+        block_info(2, h(0xcc), h(0xbb)),
+        BlockStorageDiff::default().into(),
+    )
+    .unwrap();
 
     let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
     cfg.disable_balance_check = true;
@@ -104,7 +111,10 @@ async fn rpc_smoke_over_layered_state() {
         .build(format!("http://{addr}"))
         .unwrap();
 
-    assert_eq!(EthApiClient::chain_id(&client).await.unwrap(), U256::from(1u64));
+    assert_eq!(
+        EthApiClient::chain_id(&client).await.unwrap(),
+        U256::from(1u64)
+    );
 
     let latest = DebankApiClient::get_latest_block(&client).await.unwrap();
     assert_eq!(latest.height, 2u64);

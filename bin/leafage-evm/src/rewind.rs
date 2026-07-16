@@ -5,7 +5,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
     EvmStorageWrite, MultiStorage, StateDBProvider, StateDBRead, StateDBWrapper, StorageKind,
 };
-use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
+use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStateUpdate, H256};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -14,7 +14,7 @@ use tracing::info;
 /// Rewind the database's committed-head pointer to an earlier block so the
 /// next `standalone` start resyncs `to_block + 1 ..= head` from S3.
 ///
-/// The state itself is left untouched: `BlockStorageDiff` carries absolute
+/// The state itself is left untouched: `BlockStateUpdate` carries absolute
 /// post-state values, so the forward replay converges to the exact head
 /// state.
 ///
@@ -122,10 +122,7 @@ impl Command {
             // index locally, so no S3/RPC lookup is needed.
             let target_hash = state.0.read_block_hash(self.to_block)?;
             if target_hash == H256::ZERO {
-                bail!(
-                    "block {} not found in the archive database",
-                    self.to_block
-                );
+                bail!("block {} not found in the archive database", self.to_block);
             }
             state.0.read_block_info(target_hash)?.ok_or_else(|| {
                 anyhow!("block info for {target_hash} not found in the archive database")
@@ -167,7 +164,7 @@ impl Command {
         // An empty diff makes update_block a pure pointer move: it re-inserts
         // the target's BlockInfo (snapshot mode prunes all but the newest)
         // and sets LatestBlockHash, without touching account/storage state.
-        state.update_block(target, BlockStorageDiff::default())?;
+        state.update_block(target, BlockStateUpdate::default())?;
         info!(
             target: "rewind",
             "rewound committed head to number {}, hash {}",

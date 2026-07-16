@@ -251,6 +251,18 @@ pub struct Command {
     #[arg(long, value_parser = parse_ovm_address, value_name = "OVM_ADDRESS")]
     ovm_address: Option<Address>,
 
+    /// Wire/disk codec for state diffs and account values.
+    /// Default: standard
+    ///
+    /// `standard` decodes the generic 4-field account wire format and 3-item
+    /// disk records; `blast-v1` decodes the Blast 7-field raw-account wire
+    /// format and 6-item disk records. Strict in both directions: a record of
+    /// the other shape is a read error, never silently reinterpreted — the
+    /// flag must match the database and the S3/Kafka feed (same operator
+    /// contract as `--inverted-block-encoding`).
+    #[arg(long, value_parser = crate::utils::parse_state_diff_codec, default_value = "standard")]
+    state_diff_codec: leafage_evm_types::StateDiffCodec,
+
     /// Historical RPC endpoint for forwarding pre-fork requests
     #[arg(long, value_name = "URL")]
     historical_rpc: Option<String>,
@@ -823,6 +835,15 @@ impl Command {
     pub async fn run(&mut self) -> Result<()> {
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        // Fix the account value codec before any DB or state-diff access.
+        leafage_evm_storage::set_account_codec(self.state_diff_codec);
+        if matches!(
+            self.state_diff_codec,
+            leafage_evm_types::StateDiffCodec::BlastV1
+        ) && self.ovm_address.is_some()
+        {
+            anyhow::bail!("--state-diff-codec=blast-v1 and --ovm-address are mutually exclusive");
+        }
         let (updater_handle, rpc_handle, resgitry_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {

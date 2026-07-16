@@ -8,8 +8,9 @@ mod mdbx_impl;
 mod error;
 
 pub use archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding, set_inverted_block_encoding, ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,
+    account_codec, decode_stored_account, decode_stored_account_with, encode_account_key,
+    encode_block_num, encode_storage_key, encode_stored_account, inverted_block_encoding,
+    set_account_codec, set_inverted_block_encoding, ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,
 };
 pub use error::Error as StorageError;
 pub use mdbx_impl::{
@@ -20,7 +21,7 @@ pub use rocksdb;
 pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, RocksDBStorage};
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
-use leafage_evm_types::{BlockId, BlockInfo, Bytes, NewAccount, H256, U256};
+use leafage_evm_types::{BlockId, BlockInfo, Bytes, StoredAccount, H256, U256};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -98,7 +99,7 @@ pub enum MultiStateDB {
 }
 
 impl LatestStateDBIterator for MultiStorage {
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), StorageError>> {
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), StorageError>> {
         match self {
             MultiStorage::RocksDBState(db) => {
                 Box::new(db.account_iter()) as Box<dyn Iterator<Item = _>>
@@ -206,7 +207,7 @@ impl StateDBProvider for MultiStorage {
 }
 
 impl StateDBRead for MultiStateDB {
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, StorageError> {
+    fn read_account(&self, address: H256) -> Result<Option<StoredAccount>, StorageError> {
         match self {
             MultiStateDB::RocksDBState(db) => db.read_account(address),
             MultiStateDB::RocksDBArchive(db) => db.read_account(address),
@@ -360,7 +361,7 @@ impl StateDBWrite for MultiStateDB {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), StorageError> {
         match (self, batch) {
             (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {

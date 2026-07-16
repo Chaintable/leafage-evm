@@ -32,6 +32,12 @@ pub struct Command {
     #[arg(long, default_value = "false")]
     inverted_block_encoding: bool,
 
+    /// Wire/disk codec for state diffs and account values (`standard` or
+    /// `blast-v1`). Must match the database and the S3 feed; a record of the
+    /// other shape is a read error. Default: standard.
+    #[arg(long, value_parser = crate::utils::parse_state_diff_codec, default_value = "standard")]
+    state_diff_codec: leafage_evm_types::StateDiffCodec,
+
     /// The path to the dir which state database generated
     ///
     #[arg(long, value_name = "PATH")]
@@ -73,6 +79,10 @@ pub struct Command {
 
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
+        // Fix the account value codec before any account decode/encode; must
+        // match the source database's account format.
+        leafage_evm_storage::set_account_codec(self.state_diff_codec);
+
         // Archive→archive re-encode mode: a raw byte-level rebuild that does not
         // go through the latest-state iterators (so it preserves every
         // historical version, not just the tip).

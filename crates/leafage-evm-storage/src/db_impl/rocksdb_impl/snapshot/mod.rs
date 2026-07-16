@@ -17,13 +17,10 @@
 //! All [`U256`] are big-endian encoded.
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::archive_encoding::{decode_stored_account, encode_stored_account};
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
-use alloy_rlp::{Decodable, Encodable};
-use leafage_evm_types::{
-    BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
-    U256,
-};
+use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag, Bytes, StoredAccount, H256, U256};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
     WriteBatch, DB,
@@ -168,7 +165,7 @@ impl StateDBRead for DataBase {
         Ok(block_hash)
     }
 
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+    fn read_account(&self, address: H256) -> Result<Option<StoredAccount>, Error> {
         let start = std::time::Instant::now();
         let address_to_account_cf = self
             .db
@@ -187,18 +184,7 @@ impl StateDBRead for DataBase {
             return Ok(None);
         }
         let raw_account_bytes = raw_account_bytes.unwrap();
-        let mut raw_account_slice = raw_account_bytes.as_ref();
-        let account = SlimAccount::decode(&mut raw_account_slice).unwrap();
-        let account = NewAccount {
-            address,
-            balance: account.balance,
-            nonce: account.nonce,
-            code_hash: if account.code_hash.is_zero() {
-                KECCAK256_EMPTY.0.into()
-            } else {
-                account.code_hash
-            },
-        };
+        let account = decode_stored_account(raw_account_bytes.as_ref())?;
         Ok(Some(account))
     }
 
@@ -299,7 +285,7 @@ impl StateDBWrite for DataBase {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         _block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), Error> {
         let address_to_account_cf = self
             .db
@@ -307,9 +293,7 @@ impl StateDBWrite for DataBase {
             .unwrap();
         let address_bytes = address.as_slice();
         if let Some(raw_account) = raw_account {
-            let raw_account: SlimAccount = raw_account.into();
-            let mut raw_account_bytes = Vec::new();
-            raw_account.encode(&mut raw_account_bytes);
+            let raw_account_bytes = encode_stored_account(raw_account);
             batch.put_cf(address_to_account_cf, address_bytes, raw_account_bytes);
         } else {
             batch.delete_cf(address_to_account_cf, address_bytes);
@@ -396,8 +380,8 @@ fn rocksdb_column_options(shared_cache: &Cache) -> Options {
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
-    // Disable TTL-based compaction to avoid unnecessary full rewrites of old
-    // SST files (default 30 days from optimize_level_style_compaction).
+                                                              // Disable TTL-based compaction to avoid unnecessary full rewrites of old
+                                                              // SST files (default 30 days from optimize_level_style_compaction).
     cf_opts.set_ttl(0);
     cf_opts
 }
@@ -563,7 +547,7 @@ impl StateDBProvider for Arc<DataBase> {
 
 impl LatestStateDBIterator for DataBase {
     /// account address -> raw account
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), Error>> {
         let address_to_account_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -576,19 +560,7 @@ impl LatestStateDBIterator for DataBase {
         iter.map(|item| {
             let (key, value) = item?;
             let address = H256::from_slice(key.as_ref());
-            let mut raw_account_slice = value.as_ref();
-            let account = SlimAccount::decode(&mut raw_account_slice)
-                .expect(format!("Invalid account data for address {:?}", address).as_str());
-            let account = NewAccount {
-                address,
-                balance: account.balance,
-                nonce: account.nonce,
-                code_hash: if account.code_hash.is_zero() {
-                    KECCAK256_EMPTY.0.into()
-                } else {
-                    account.code_hash
-                },
-            };
+            let account = decode_stored_account(value.as_ref())?;
             Ok((address, account))
         })
     }
@@ -676,7 +648,10 @@ mod tests {
     use super::*;
     use crate::db::StateDBWrapper;
     use crate::interface::EvmStorageWrite;
-    use leafage_evm_types::{AccountStorageDiff, Block, BlockStorageDiff, Header, IndexValuePair};
+    use leafage_evm_types::{
+        AccountStorageDiff, AccountUpdate, BalanceState, Block, BlockStateUpdate, Header,
+        IndexValuePair, KECCAK256_EMPTY,
+    };
 
     fn make_block_info(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
         let mut raw = leafage_evm_types::RawHeader::default();
@@ -695,13 +670,17 @@ mod tests {
         }
     }
 
-    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStorageDiff {
-        BlockStorageDiff {
-            new_accounts: vec![NewAccount {
+    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStateUpdate {
+        BlockStateUpdate {
+            new_accounts: vec![AccountUpdate {
                 address: addr,
-                balance: U256::from(balance),
-                nonce,
-                code_hash: KECCAK256_EMPTY.0.into(),
+                account: StoredAccount {
+                    nonce,
+                    code_hash: KECCAK256_EMPTY.0.into(),
+                    balance_state: BalanceState::Standard {
+                        balance: U256::from(balance),
+                    },
+                },
             }],
             storage_diffs: vec![AccountStorageDiff {
                 address: addr,
@@ -742,7 +721,7 @@ mod tests {
 
             // Rewind the head pointer to block 1 with an empty diff.
             state
-                .update_block(block1.clone(), BlockStorageDiff::default())
+                .update_block(block1.clone(), BlockStateUpdate::default())
                 .unwrap();
             let head = state.last_committed_block().unwrap().unwrap();
             assert_eq!(head.header.number, 1);
@@ -750,7 +729,7 @@ mod tests {
 
             // Flat state is untouched: still the block-2 values.
             let account = db.read_account(addr).unwrap().unwrap();
-            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(account.standard_balance().unwrap(), U256::from(200));
             assert_eq!(account.nonce, 2);
             assert_eq!(db.read_storage(addr, slot).unwrap(), U256::from(9));
 
@@ -760,7 +739,7 @@ mod tests {
             assert_eq!(head.header.number, 2);
             assert_eq!(head.header.hash, block2.header.hash);
             let account = db.read_account(addr).unwrap().unwrap();
-            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(account.standard_balance().unwrap(), U256::from(200));
             assert_eq!(db.read_storage(addr, slot).unwrap(), U256::from(9));
         }
         let _ = std::fs::remove_dir_all(&dir);

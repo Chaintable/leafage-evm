@@ -3,7 +3,7 @@ use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::metrics::STORAGE_METRICS;
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
+    BlockId, BlockInfo, BlockStateUpdate, Bytecode, Bytes, StoredAccount, H256, U256,
 };
 use std::fmt::Debug;
 use tracing::{debug, trace};
@@ -30,7 +30,7 @@ pub trait StateDBRead {
     fn read_block_hash(&self, block_num: u64) -> Result<H256, StorageError>;
 
     /// account address -> raw account
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, StorageError>;
+    fn read_account(&self, address: H256) -> Result<Option<StoredAccount>, StorageError>;
 
     /// code hash -> code
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, StorageError>;
@@ -42,7 +42,7 @@ pub trait StateDBRead {
 #[auto_impl(&, Box, Arc)]
 pub trait LatestStateDBIterator: Send + Sync + 'static {
     /// account address -> raw account
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), StorageError>>;
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), StorageError>>;
 
     /// code hash -> code
     fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), StorageError>>;
@@ -87,7 +87,7 @@ pub trait StateDBWrite: Send + Sync + 'static {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         block_num: u64, // only for archive db
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), StorageError>;
 
     /// code hash -> code
@@ -143,13 +143,8 @@ where
 {
     type Error = StorageError;
 
-    fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
-        let raw_account_info = self.0.read_account(address.into())?;
-        if let Some(raw_account_info) = raw_account_info {
-            Ok(Some(raw_account_info.into()))
-        } else {
-            Ok(None)
-        }
+    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
+        self.0.read_account(address.into())
     }
     /// Get account code by its hash
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
@@ -180,7 +175,7 @@ where
     fn update_block(
         &self,
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
     ) -> Result<(), Self::Error> {
         let start = std::time::Instant::now();
         let mut batch = self.0.prepare_write_batch()?;
@@ -211,10 +206,14 @@ where
         }
         for account in block_diff.new_accounts {
             trace!(target: "state_diff",
-                "commit account: block {}, address {}, balance {}, nonce {}, code_hash {}",
-                block_number, account.address, account.balance, account.nonce, account.code_hash);
-            self.0
-                .write_account(&mut batch, account.address, block_number, Some(account))?;
+                "commit account: block {}, address {}, nonce {}, code_hash {}",
+                block_number, account.address, account.account.nonce, account.account.code_hash);
+            self.0.write_account(
+                &mut batch,
+                account.address,
+                block_number,
+                Some(account.account),
+            )?;
         }
         for account_diff in block_diff.storage_diffs {
             for index_value_pair in account_diff.diffs {

@@ -1,6 +1,6 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::state_tree::error::Error;
-use leafage_evm_types::{AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, H256, U256};
+use leafage_evm_types::{BlockInfo, BlockStateUpdate, Bytecode, StoredAccount, H256, U256};
 use moka::ops::compute::Op;
 use moka::sync::Cache;
 use std::collections::{HashMap, VecDeque};
@@ -130,7 +130,7 @@ impl LinkedDiffLayer {
 /// the tag check and the write.
 #[derive(Debug)]
 pub struct CacheDiskLayer {
-    accounts: FastCache<H256, (u64, Option<AccountInfo>)>,
+    accounts: FastCache<H256, (u64, Option<StoredAccount>)>,
     storages: FastCache<(H256, H256), (u64, U256)>,
     contracts: FastCache<H256, (u64, Bytecode)>,
     block_hashes: FastCache<u64, (u64, H256)>,
@@ -258,23 +258,23 @@ impl CacheDiskLayer {
 #[derive(Debug)]
 pub struct DiffLayer {
     pub block_info: Arc<BlockInfo>,
-    pub block_diff: Arc<BlockStorageDiff>,
-    pub accounts: FastMap<H256, Option<AccountInfo>>,
+    pub block_diff: Arc<BlockStateUpdate>,
+    pub accounts: FastMap<H256, Option<StoredAccount>>,
     pub storage: FastMap<(H256, H256), U256>,
     pub contracts: FastMap<H256, Bytecode>,
     pub next: RwLock<Arc<LinkedDiffLayer>>,
 }
 
-impl From<(BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer>)> for DiffLayer {
+impl From<(BlockInfo, BlockStateUpdate, Arc<LinkedDiffLayer>)> for DiffLayer {
     fn from(
-        (block_info, block_diff, db): (BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer>),
+        (block_info, block_diff, db): (BlockInfo, BlockStateUpdate, Arc<LinkedDiffLayer>),
     ) -> Self {
         Self::new(block_info, block_diff, db)
     }
 }
 
-impl Into<(BlockInfo, BlockStorageDiff)> for &DiffLayer {
-    fn into(self) -> (BlockInfo, BlockStorageDiff) {
+impl Into<(BlockInfo, BlockStateUpdate)> for &DiffLayer {
+    fn into(self) -> (BlockInfo, BlockStateUpdate) {
         self.storage_diff()
     }
 }
@@ -282,7 +282,7 @@ impl Into<(BlockInfo, BlockStorageDiff)> for &DiffLayer {
 impl DiffLayer {
     pub fn new(
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
         next: Arc<LinkedDiffLayer>,
     ) -> Self {
         let mut accounts = FastMap::default();
@@ -292,9 +292,7 @@ impl DiffLayer {
             accounts.insert(del_account.clone(), None);
         }
         for new_account in block_diff.new_accounts.iter() {
-            let address = new_account.address;
-            let account_info: AccountInfo = new_account.clone().into();
-            accounts.insert(address, Some(account_info));
+            accounts.insert(new_account.address, Some(new_account.account.clone()));
         }
         for account_diff in block_diff.storage_diffs.iter() {
             let address = account_diff.address;
@@ -317,7 +315,7 @@ impl DiffLayer {
         }
     }
 
-    fn storage_diff(&self) -> (BlockInfo, BlockStorageDiff) {
+    fn storage_diff(&self) -> (BlockInfo, BlockStateUpdate) {
         (
             self.block_info.as_ref().clone(),
             self.block_diff.as_ref().clone(),
@@ -411,7 +409,7 @@ impl<DB> HybridStateDB<DB> {
 impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
-    fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
+    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
         for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().accounts.get(&address) {
                 return Ok(value.clone());
@@ -422,7 +420,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                 match cache.accounts.get(&address) {
                     Some((_, value)) => Ok(value),
                     None => {
-                        let res = self.statedb.basic(address)?;
+                        let res = self.statedb.raw_account(address)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res.clone());
                             cache
@@ -437,7 +435,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     }
                 }
             }
-            _ => Ok(self.statedb.basic(address)?),
+            _ => Ok(self.statedb.raw_account(address)?),
         }
     }
 
@@ -535,7 +533,9 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
 mod tests {
     use super::*;
     use crate::interface::BlockIndex;
-    use leafage_evm_types::{AccountStorageDiff, BlockId, IndexValuePair, NewAccount};
+    use leafage_evm_types::{
+        AccountStorageDiff, AccountUpdate, BalanceState, BlockId, IndexValuePair,
+    };
     use std::sync::Mutex as StdMutex;
 
     #[derive(Debug, thiserror::Error)]
@@ -552,13 +552,13 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockDBInner {
         storage: HashMap<(H256, H256), U256>,
-        accounts: HashMap<H256, Option<AccountInfo>>,
+        accounts: HashMap<H256, Option<StoredAccount>>,
         last_block: Option<Arc<BlockInfo>>,
     }
 
     impl StateDB for MockDB {
         type Error = MockErr;
-        fn basic(&self, address: H256) -> Result<Option<AccountInfo>, MockErr> {
+        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
             Ok(self
                 .inner
                 .lock()
@@ -597,8 +597,8 @@ mod tests {
                 .clone()
                 .unwrap_or_default())
         }
-        fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, MockErr> {
-            Ok(Arc::new(BlockStorageDiff::default()))
+        fn state_diff_arc(&self) -> Result<Arc<BlockStateUpdate>, MockErr> {
+            Ok(Arc::new(BlockStateUpdate::default()))
         }
     }
 
@@ -607,7 +607,7 @@ mod tests {
         fn update_block(
             &self,
             block_info: BlockInfo,
-            block_diff: BlockStorageDiff,
+            block_diff: BlockStateUpdate,
         ) -> Result<(), MockErr> {
             let mut inner = self.inner.lock().unwrap();
             for account_diff in block_diff.storage_diffs.iter() {
@@ -620,7 +620,7 @@ mod tests {
             for account in block_diff.new_accounts.iter() {
                 inner
                     .accounts
-                    .insert(account.address, Some(account.clone().into()));
+                    .insert(account.address, Some(account.account.clone()));
             }
             inner.last_block = Some(Arc::new(block_info));
             Ok(())
@@ -661,7 +661,7 @@ mod tests {
         )));
         let mut prev = cache;
         for n in 0..depth {
-            let mut diff = BlockStorageDiff::default();
+            let mut diff = BlockStateUpdate::default();
             diff.storage_diffs.push(AccountStorageDiff {
                 address: addr,
                 diffs: vec![IndexValuePair {
@@ -669,11 +669,15 @@ mod tests {
                     value: U256::from(n + 1),
                 }],
             });
-            diff.new_accounts.push(NewAccount {
+            diff.new_accounts.push(AccountUpdate {
                 address: key(2000 + n),
-                balance: U256::from(n + 1),
-                nonce: n + 1,
-                code_hash: H256::ZERO,
+                account: StoredAccount {
+                    nonce: n + 1,
+                    code_hash: H256::ZERO,
+                    balance_state: BalanceState::Standard {
+                        balance: U256::from(n + 1),
+                    },
+                },
             });
             let mut info = BlockInfo::default();
             info.inner.header.hash = key(3000 + n);
@@ -695,11 +699,11 @@ mod tests {
 
         for n in 0..4u64 {
             assert_eq!(db.storage(addr, key(1000 + n)).unwrap(), U256::from(n + 1));
-            assert_eq!(db.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
+            assert_eq!(db.raw_account(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
         }
         // Absent key falls through to the bottom DB (zero).
         assert_eq!(db.storage(addr, key(9999)).unwrap(), U256::ZERO);
-        assert!(db.basic(key(9999)).unwrap().is_none());
+        assert!(db.raw_account(key(9999)).unwrap().is_none());
         // Block hashes resolve from layer metadata.
         assert_eq!(db.block_hash(3).unwrap(), key(3000 + 2));
     }
@@ -750,7 +754,10 @@ mod tests {
                 before.storage(addr, key(1000 + n)).unwrap(),
                 U256::from(n + 1)
             );
-            assert_eq!(before.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
+            assert_eq!(
+                before.raw_account(key(2000 + n)).unwrap().unwrap().nonce,
+                n + 1
+            );
         }
 
         // A post-commit handle reads committed keys through the cache/db.
@@ -760,7 +767,10 @@ mod tests {
                 after.storage(addr, key(1000 + n)).unwrap(),
                 U256::from(n + 1)
             );
-            assert_eq!(after.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
+            assert_eq!(
+                after.raw_account(key(2000 + n)).unwrap().unwrap().nonce,
+                n + 1
+            );
         }
     }
 }
@@ -786,7 +796,7 @@ impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
         }
     }
 
-    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+    fn state_diff_arc(&self) -> Result<Arc<BlockStateUpdate>, Self::Error> {
         match self.flattened.head().as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_diff.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {

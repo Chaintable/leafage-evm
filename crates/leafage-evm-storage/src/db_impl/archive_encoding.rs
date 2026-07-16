@@ -87,8 +87,11 @@
 //! The `BlockNumToBlockHash` index is unaffected either way — it keeps
 //! ascending [`encode_block_num`], as its readers decode the raw block number.
 
-use alloy_rlp::Encodable;
-use leafage_evm_types::{NewAccount, SlimAccount, H256};
+use alloy_rlp::{Decodable, Encodable};
+use leafage_evm_types::{
+    BalanceState, BlastSlimAccount, SlimAccount, StateDiffCodec, StoredAccount, H256,
+    KECCAK256_EMPTY,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Length of the encoded `(address, block_num)` account key.
@@ -172,12 +175,225 @@ pub fn encode_storage_key(
     key
 }
 
-/// RLP-encode the slim form of an account (balance, nonce, code_hash) used
-/// as the value for `AddressToAccount`.
+/// Process-global account value codec, mirroring the `--state-diff-codec`
+/// CLI option (same operator contract as [`set_inverted_block_encoding`]:
+/// set once at startup, before any account read/write, and it must match the
+/// database). `false` (default) = standard 3-item [`SlimAccount`]; `true` =
+/// Blast 6-item [`BlastSlimAccount`]. Decoding is strict per this flag —
+/// opening a DB of the other format fails on every account read instead of
+/// silently returning wrong data.
+static BLAST_ACCOUNT_FORMAT: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide account value codec from the configured
+/// state-diff codec. Call once at startup, before opening any DB.
 #[inline]
-pub fn encode_slim_account(account: NewAccount) -> Vec<u8> {
-    let slim: SlimAccount = account.into();
+pub fn set_account_codec(codec: StateDiffCodec) {
+    BLAST_ACCOUNT_FORMAT.store(matches!(codec, StateDiffCodec::BlastV1), Ordering::Relaxed);
+}
+
+/// The process-wide account value codec.
+#[inline]
+pub fn account_codec() -> StateDiffCodec {
+    if BLAST_ACCOUNT_FORMAT.load(Ordering::Relaxed) {
+        StateDiffCodec::BlastV1
+    } else {
+        StateDiffCodec::Standard
+    }
+}
+
+/// RLP-encode an account for the `AddressToAccount` value: standard accounts
+/// keep the exact legacy 3-item [`SlimAccount`] bytes, Blast accounts use the
+/// 6-item [`BlastSlimAccount`] form. The variant is produced by the
+/// codec-gated state-diff decoder, so it always matches [`account_codec`].
+#[inline]
+pub fn encode_stored_account(account: StoredAccount) -> Vec<u8> {
     let mut buf = Vec::new();
-    slim.encode(&mut buf);
+    match account.balance_state {
+        BalanceState::Standard { balance } => {
+            SlimAccount {
+                balance,
+                nonce: account.nonce,
+                code_hash: account.code_hash,
+            }
+            .encode(&mut buf);
+        }
+        BalanceState::Blast {
+            flags,
+            fixed,
+            shares,
+            remainder,
+        } => {
+            BlastSlimAccount {
+                nonce: account.nonce,
+                flags,
+                fixed,
+                shares,
+                remainder,
+                code_hash: account.code_hash,
+            }
+            .encode(&mut buf);
+        }
+    }
     buf
+}
+
+/// Decode an `AddressToAccount` value, strictly in the configured
+/// [`account_codec`] format. See [`decode_stored_account_with`].
+#[inline]
+pub fn decode_stored_account(bytes: &[u8]) -> Result<StoredAccount, alloy_rlp::Error> {
+    decode_stored_account_with(account_codec(), bytes)
+}
+
+/// Decode an `AddressToAccount` value, strictly in the given format:
+/// `Standard` only accepts the 3-item form, `BlastV1` only the 6-item form —
+/// a record of the other shape is an error, never silently reinterpreted.
+/// Normalizes a zero `code_hash` (written by external producers for codeless
+/// accounts) to `KECCAK256_EMPTY`.
+#[inline]
+pub fn decode_stored_account_with(
+    codec: StateDiffCodec,
+    mut bytes: &[u8],
+) -> Result<StoredAccount, alloy_rlp::Error> {
+    let account = match codec {
+        StateDiffCodec::Standard => {
+            let slim = SlimAccount::decode(&mut bytes)?;
+            StoredAccount {
+                nonce: slim.nonce,
+                code_hash: slim.code_hash,
+                balance_state: BalanceState::Standard {
+                    balance: slim.balance,
+                },
+            }
+        }
+        StateDiffCodec::BlastV1 => {
+            let slim = BlastSlimAccount::decode(&mut bytes)?;
+            StoredAccount {
+                nonce: slim.nonce,
+                code_hash: slim.code_hash,
+                balance_state: BalanceState::Blast {
+                    flags: slim.flags,
+                    fixed: slim.fixed,
+                    shares: slim.shares,
+                    remainder: slim.remainder,
+                },
+            }
+        }
+    };
+    Ok(normalize_code_hash(account))
+}
+
+#[inline]
+fn normalize_code_hash(mut account: StoredAccount) -> StoredAccount {
+    if account.code_hash.is_zero() {
+        account.code_hash = KECCAK256_EMPTY.0.into();
+    }
+    account
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_types::U256;
+
+    #[test]
+    fn test_stored_account_roundtrip_and_strict_shape() {
+        let standard = StoredAccount {
+            nonce: 5,
+            code_hash: H256::repeat_byte(0x11),
+            balance_state: BalanceState::Standard {
+                balance: U256::from(100),
+            },
+        };
+        let bytes = encode_stored_account(standard.clone());
+        // Standard bytes are the exact legacy SlimAccount encoding (locked
+        // byte-for-byte by leafage-evm-types::test_slim_account_golden_bytes).
+        let mut slim = Vec::new();
+        SlimAccount {
+            balance: U256::from(100),
+            nonce: 5,
+            code_hash: H256::repeat_byte(0x11),
+        }
+        .encode(&mut slim);
+        assert_eq!(bytes, slim);
+        assert_eq!(
+            decode_stored_account_with(StateDiffCodec::Standard, &bytes).unwrap(),
+            standard
+        );
+        // Strict: a 3-item record under the Blast codec is an error.
+        assert!(decode_stored_account_with(StateDiffCodec::BlastV1, &bytes).is_err());
+
+        let blast = StoredAccount {
+            nonce: 7,
+            code_hash: H256::repeat_byte(0x22),
+            balance_state: BalanceState::Blast {
+                flags: 2,
+                fixed: U256::from(11),
+                shares: U256::from(13),
+                remainder: U256::from(17),
+            },
+        };
+        let bytes = encode_stored_account(blast.clone());
+        assert_eq!(
+            decode_stored_account_with(StateDiffCodec::BlastV1, &bytes).unwrap(),
+            blast
+        );
+        // Strict: a 6-item record under the standard codec is an error.
+        assert!(decode_stored_account_with(StateDiffCodec::Standard, &bytes).is_err());
+    }
+
+    #[test]
+    fn test_zero_code_hash_normalizes_to_keccak_empty() {
+        for account in [
+            StoredAccount {
+                nonce: 1,
+                code_hash: H256::ZERO,
+                balance_state: BalanceState::Standard {
+                    balance: U256::ZERO,
+                },
+            },
+            StoredAccount {
+                nonce: 1,
+                code_hash: H256::ZERO,
+                balance_state: BalanceState::Blast {
+                    flags: 0,
+                    fixed: U256::ZERO,
+                    shares: U256::ZERO,
+                    remainder: U256::ZERO,
+                },
+            },
+        ] {
+            let codec = match account.balance_state {
+                BalanceState::Standard { .. } => StateDiffCodec::Standard,
+                BalanceState::Blast { .. } => StateDiffCodec::BlastV1,
+            };
+            let bytes = encode_stored_account(account);
+            let decoded = decode_stored_account_with(codec, &bytes).unwrap();
+            assert_eq!(decoded.code_hash, H256::from(KECCAK256_EMPTY.0));
+        }
+    }
+
+    #[test]
+    fn test_deletion_sentinel_never_collides_with_real_encoding() {
+        // Archive backends store deletions as empty bytes; any real account
+        // encoding is a non-empty RLP list.
+        let blast = StoredAccount {
+            nonce: 0,
+            code_hash: H256::ZERO,
+            balance_state: BalanceState::Blast {
+                flags: 0,
+                fixed: U256::ZERO,
+                shares: U256::ZERO,
+                remainder: U256::ZERO,
+            },
+        };
+        assert!(!encode_stored_account(blast).is_empty());
+        let standard = StoredAccount {
+            nonce: 0,
+            code_hash: H256::ZERO,
+            balance_state: BalanceState::Standard {
+                balance: U256::ZERO,
+            },
+        };
+        assert!(!encode_stored_account(standard).is_empty());
+    }
 }

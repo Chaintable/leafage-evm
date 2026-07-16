@@ -1,7 +1,8 @@
-use alloy::primitives::keccak256;
+use alloy::primitives::{b256, keccak256};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Address, BlockId, BlockInfo, BlockStorageDiff, Bytecode, H256, U256,
+    AccountInfo, Address, BalanceState, BlockId, BlockInfo, BlockStateUpdate, Bytecode,
+    StoredAccount, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
 use revm::DatabaseRef;
@@ -12,8 +13,8 @@ use std::sync::Arc;
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
     type Error: std::error::Error + DBErrorMarker + Send + Sync + 'static;
-    /// Get basic account information.
-    fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error>;
+    /// Get the raw internal account (no balance materialization).
+    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error>;
     /// Get account code by its hash
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error>;
     /// Get storage value of address at index.
@@ -35,11 +36,11 @@ pub trait BlockContext {
         Ok(Arc::new(self.block_info()?))
     }
 
-    fn state_diff(&self) -> Result<BlockStorageDiff, Self::Error> {
+    fn state_diff(&self) -> Result<BlockStateUpdate, Self::Error> {
         Ok(self.state_diff_arc()?.as_ref().clone())
     }
 
-    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+    fn state_diff_arc(&self) -> Result<Arc<BlockStateUpdate>, Self::Error> {
         Ok(Arc::new(self.state_diff()?))
     }
 }
@@ -71,7 +72,30 @@ pub trait BlockIndex {
     }
 }
 
+/// Trie key of the Blast Shares predeploy: `keccak256(0x4300…0000)`.
+pub const BLAST_SHARES_HASH: H256 =
+    b256!("34ef019b82232cdd8dce3115c0c0787debeb839c4848a6e1df77393f6625ed82");
+/// Trie key of the Shares predeploy's storage slot 1 (sharePrice):
+/// `keccak256(uint256_be(1))`.
+pub const SHARE_PRICE_SLOT_HASH: H256 =
+    b256!("b10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6");
+
+/// Error of [`EvmStorageWrapper`]: a backend error, or a Blast balance
+/// derivation overflow (which must be an error, never wrapping arithmetic).
+#[derive(Debug, thiserror::Error)]
+pub enum EvmStorageError<E> {
+    #[error(transparent)]
+    Backend(#[from] E),
+    #[error("blast balance overflow: shares * sharePrice + remainder exceeds U256")]
+    BlastBalanceOverflow,
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> DBErrorMarker for EvmStorageError<E> {}
+
 /// [`EvmStorageWrapper`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
+/// This is the single place where a raw internal account is materialized into
+/// a revm [`AccountInfo`] — including deriving the balance of Blast accounts
+/// from the sharePrice of the same state view.
 #[derive(Clone, Debug)]
 pub struct EvmStorageWrapper<T> {
     pub db: T,
@@ -79,10 +103,53 @@ pub struct EvmStorageWrapper<T> {
     pub normalize_state_key: bool,
 }
 
+impl<T: StateDB> EvmStorageWrapper<T> {
+    /// Materialize a raw account. Blast balance semantics mirror blast-geth
+    /// `stateObject.Balance()` (state_object.go:650): only YieldAutomatic (0)
+    /// derives `shares * sharePrice + remainder`; every other flags value
+    /// (Disabled, Claimable, unknown) returns `fixed`.
+    fn materialize(
+        &self,
+        account: StoredAccount,
+    ) -> Result<AccountInfo, EvmStorageError<T::Error>> {
+        let balance = match account.balance_state {
+            BalanceState::Standard { balance } => balance,
+            BalanceState::Blast {
+                flags: 0,
+                shares,
+                remainder,
+                ..
+            } => {
+                let price = self.db.storage(BLAST_SHARES_HASH, SHARE_PRICE_SLOT_HASH)?;
+                shares
+                    .checked_mul(price)
+                    .and_then(|value| value.checked_add(remainder))
+                    .ok_or(EvmStorageError::BlastBalanceOverflow)?
+            }
+            BalanceState::Blast { flags, fixed, .. } => {
+                if flags > 2 {
+                    tracing::warn!(target: "storage", "unknown blast yield flags {flags}, using fixed balance");
+                }
+                fixed
+            }
+        };
+        Ok(AccountInfo {
+            balance,
+            nonce: account.nonce,
+            code_hash: account.code_hash.0.into(),
+            code: None,
+            account_id: Default::default(),
+        })
+    }
+}
+
 impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
-    type Error = T::Error;
+    type Error = EvmStorageError<T::Error>;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let account = self.db.basic(keccak256(address.as_slice()))?;
+        let account = match self.db.raw_account(keccak256(address.as_slice()))? {
+            Some(raw_account) => Some(self.materialize(raw_account)?),
+            None => None,
+        };
         if let Some(ovm_address) = self.ovm_address {
             let balance = self
                 .db
@@ -102,7 +169,7 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
         Ok(account)
     }
     fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
-        self.db.code_by_hash(code_hash.0.into())
+        Ok(self.db.code_by_hash(code_hash.0.into())?)
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let address = keccak256(address.as_slice());
@@ -112,12 +179,10 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
             index.to_be_bytes()
         });
 
-        self.db
-            .storage(address.into(), index.into())
-            .map(|n| n.into())
+        Ok(self.db.storage(address.into(), index.into())?)
     }
     fn block_hash_ref(&self, number: u64) -> Result<H256, Self::Error> {
-        self.db.block_hash(number).map(|h| h.0.into())
+        Ok(self.db.block_hash(number).map(|h| h.0.into())?)
     }
 }
 
@@ -187,7 +252,7 @@ pub trait EvmStorageWrite {
     fn update_block(
         &self,
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
     ) -> Result<(), Self::Error>;
 
     fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error>;
@@ -218,5 +283,123 @@ mod tests {
             H256::from_str("0xb43127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
                 .unwrap();
         assert_eq!(to_normalize_state_key(key.into()), key2);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("mock error")]
+    struct MockErr;
+    impl DBErrorMarker for MockErr {}
+
+    /// Mock keyed the same way the real backends are: accounts and storage by
+    /// trie key hash.
+    #[derive(Debug, Default, Clone)]
+    struct MockStateDB {
+        accounts: std::collections::HashMap<H256, StoredAccount>,
+        storage: std::collections::HashMap<(H256, H256), U256>,
+    }
+
+    impl StateDB for MockStateDB {
+        type Error = MockErr;
+        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
+            Ok(self.accounts.get(&address).cloned())
+        }
+        fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
+            Ok(Bytecode::default())
+        }
+        fn storage(&self, address: H256, index: H256) -> Result<U256, MockErr> {
+            Ok(self
+                .storage
+                .get(&(address, index))
+                .copied()
+                .unwrap_or_default())
+        }
+        fn block_hash(&self, _number: u64) -> Result<H256, MockErr> {
+            Ok(H256::ZERO)
+        }
+    }
+
+    fn blast_account(flags: u8, fixed: u64, shares: U256, remainder: u64) -> StoredAccount {
+        StoredAccount {
+            nonce: 9,
+            code_hash: H256::repeat_byte(0x33),
+            balance_state: BalanceState::Blast {
+                flags,
+                fixed: U256::from(fixed),
+                shares,
+                remainder: U256::from(remainder),
+            },
+        }
+    }
+
+    fn wrapper_with(account: StoredAccount, price: Option<U256>) -> EvmStorageWrapper<MockStateDB> {
+        let address = Address::from_str("0x455875815af7E846317D9E73e9Ea65d19EC58A82").unwrap();
+        let mut db = MockStateDB::default();
+        db.accounts.insert(keccak256(address.as_slice()), account);
+        if let Some(price) = price {
+            db.storage
+                .insert((BLAST_SHARES_HASH, SHARE_PRICE_SLOT_HASH), price);
+        }
+        EvmStorageWrapper {
+            db,
+            ovm_address: None,
+            normalize_state_key: false,
+        }
+    }
+
+    fn balance_of(
+        wrapper: &EvmStorageWrapper<MockStateDB>,
+    ) -> Result<U256, EvmStorageError<MockErr>> {
+        let address = Address::from_str("0x455875815af7E846317D9E73e9Ea65d19EC58A82").unwrap();
+        Ok(wrapper.basic_ref(address)?.unwrap().balance)
+    }
+
+    /// Mirrors blast-geth `stateObject.Balance()`: only flags == 0 derives
+    /// `shares * sharePrice + remainder`; 1, 2 and unknown values return fixed.
+    #[test]
+    fn test_blast_balance_derivation() {
+        // Automatic: shares * price + remainder.
+        let w = wrapper_with(
+            blast_account(0, 11, U256::from(13), 17),
+            Some(U256::from(1_019_184_352u64)),
+        );
+        assert_eq!(
+            balance_of(&w).unwrap(),
+            U256::from(13u64 * 1_019_184_352 + 17)
+        );
+
+        // price == 0 (slot missing / zero): balance == remainder.
+        let w = wrapper_with(blast_account(0, 11, U256::from(13), 17), None);
+        assert_eq!(balance_of(&w).unwrap(), U256::from(17));
+
+        // Disabled / Claimable / unknown flags: fixed.
+        for flags in [1u8, 2, 3, 255] {
+            let w = wrapper_with(
+                blast_account(flags, 11, U256::from(13), 17),
+                Some(U256::from(1_019_184_352u64)),
+            );
+            assert_eq!(balance_of(&w).unwrap(), U256::from(11), "flags {flags}");
+        }
+
+        // Overflow must be an error, never wrapping arithmetic.
+        let w = wrapper_with(blast_account(0, 0, U256::MAX, 0), Some(U256::from(2)));
+        assert!(matches!(
+            balance_of(&w),
+            Err(EvmStorageError::BlastBalanceOverflow)
+        ));
+
+        // Standard accounts pass their balance through unchanged.
+        let standard = StoredAccount {
+            nonce: 3,
+            code_hash: H256::repeat_byte(0x44),
+            balance_state: BalanceState::Standard {
+                balance: U256::from(12345),
+            },
+        };
+        let w = wrapper_with(standard, None);
+        let address = Address::from_str("0x455875815af7E846317D9E73e9Ea65d19EC58A82").unwrap();
+        let info = w.basic_ref(address).unwrap().unwrap();
+        assert_eq!(info.balance, U256::from(12345));
+        assert_eq!(info.nonce, 3);
+        assert_eq!(info.code_hash, H256::repeat_byte(0x44));
     }
 }

@@ -10,7 +10,7 @@ use leafage_evm_storage::{
     read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
 };
 use leafage_evm_types::{
-    BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, KafkaBlockChangeNotification,
+    BlockId, BlockInfo, BlockNumberOrTag, BlockStateUpdate, KafkaBlockChangeNotification,
     KafkaBlockContext, H256,
 };
 use rdkafka::{
@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
 struct BlockContextWithOffset {
-    block_diff: BlockStorageDiff,
+    block_diff: BlockStateUpdate,
     block_info: BlockInfo,
     offset: i64,
 }
@@ -221,7 +221,7 @@ where
 
                 let block_diff =
                     if parent_block_info.header.state_root == block_info.header.state_root {
-                        let mut diff = BlockStorageDiff::default();
+                        let mut diff = BlockStateUpdate::default();
                         diff.hash = block_info.header.state_root;
                         diff.parent_hash = parent_block_info.header.state_root;
                         diff

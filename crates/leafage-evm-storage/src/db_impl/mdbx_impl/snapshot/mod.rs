@@ -18,13 +18,10 @@
 
 use super::{default_page_size, DEFAULT_MAX_READERS, GIGABYTE, MEGABYTE, TERABYTE};
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
+use crate::db_impl::archive_encoding::{decode_stored_account, encode_stored_account};
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
-use alloy_rlp::{Decodable, Encodable};
-use leafage_evm_types::{
-    BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
-    U256,
-};
+use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag, Bytes, StoredAccount, H256, U256};
 use libmdbx::{
     Cursor, DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode,
     Transaction, WriteFlags, RO, RW,
@@ -244,25 +241,12 @@ impl DataBase {
 // Helper functions to convert cursor iterator results
 fn decode_account(
     result: libmdbx::Result<(Cow<'_, [u8]>, Cow<'_, [u8]>)>,
-) -> Result<(H256, NewAccount), Error> {
+) -> Result<(H256, StoredAccount), Error> {
     let (key, value) = result.map_err(|e| Error::UnSupported(format!("Iterator error: {}", e)))?;
     let address = H256::from_slice(&key);
-    let mut raw_account_slice: &[u8] = &value;
-    let account = SlimAccount::decode(&mut raw_account_slice)
+    let account = decode_stored_account(&value)
         .map_err(|e| Error::UnSupported(format!("Failed to decode account: {}", e)))?;
-    Ok((
-        address,
-        NewAccount {
-            address,
-            balance: account.balance,
-            nonce: account.nonce,
-            code_hash: if account.code_hash.is_zero() {
-                KECCAK256_EMPTY.0.into()
-            } else {
-                account.code_hash
-            },
-        },
-    ))
+    Ok((address, account))
 }
 
 fn decode_code(
@@ -317,7 +301,7 @@ fn create_cursor(env: &Environment, table: StorageTable) -> Result<Cursor<RO>, E
 }
 
 impl LatestStateDBIterator for DataBase {
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), Error>> {
         match create_cursor(&self.env, StorageTable::AddressToAccount) {
             Ok(cursor) => {
                 Box::new(cursor.iter_slices().map(decode_account)) as Box<dyn Iterator<Item = _>>
@@ -469,7 +453,7 @@ impl StateDBRead for StateDB {
         }
     }
 
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+    fn read_account(&self, address: H256) -> Result<Option<StoredAccount>, Error> {
         let start = std::time::Instant::now();
 
         let dbi = self
@@ -489,18 +473,7 @@ impl StateDBRead for StateDB {
 
         match raw_account_bytes {
             Some(bytes) => {
-                let mut raw_account_slice: &[u8] = &bytes;
-                let account = SlimAccount::decode(&mut raw_account_slice).unwrap();
-                let account = NewAccount {
-                    address,
-                    balance: account.balance,
-                    nonce: account.nonce,
-                    code_hash: if account.code_hash.is_zero() {
-                        KECCAK256_EMPTY.0.into()
-                    } else {
-                        account.code_hash
-                    },
-                };
+                let account = decode_stored_account(&bytes)?;
                 Ok(Some(account))
             }
             None => Ok(None),
@@ -638,7 +611,7 @@ impl StateDBWrite for StateDB {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         _block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), Error> {
         let dbi = self
             .dbis
@@ -646,9 +619,7 @@ impl StateDBWrite for StateDB {
             .ok_or_else(|| Error::UnSupported("AddressToAccount table not found".to_string()))?;
         let address_bytes = address.as_slice();
         if let Some(raw_account) = raw_account {
-            let raw_account: SlimAccount = raw_account.into();
-            let mut raw_account_bytes = Vec::new();
-            raw_account.encode(&mut raw_account_bytes);
+            let raw_account_bytes = encode_stored_account(raw_account);
             batch
                 .txn
                 .put(*dbi, address_bytes, &raw_account_bytes, WriteFlags::empty())

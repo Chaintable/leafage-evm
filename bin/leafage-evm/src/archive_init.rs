@@ -7,7 +7,7 @@ use clap::Parser;
 use futures::{stream, StreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
-    encode_account_key, encode_slim_account, encode_storage_key, ArchiveRocksDBStorage,
+    encode_account_key, encode_storage_key, encode_stored_account, ArchiveRocksDBStorage,
     MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXSyncMode, StateDBWrite,
     StorageKind,
 };
@@ -136,6 +136,12 @@ pub struct Command {
     /// unreadable.
     #[arg(long, default_value = "false")]
     inverted_block_encoding: bool,
+
+    /// Wire/disk codec for state diffs and account values (`standard` or
+    /// `blast-v1`). Must match the database and the S3 feed; a record of the
+    /// other shape is a read error. Default: standard.
+    #[arg(long, value_parser = crate::utils::parse_state_diff_codec, default_value = "standard")]
+    state_diff_codec: leafage_evm_types::StateDiffCodec,
 }
 
 /// Data fetched and pre-encoded for a single block, to be written by the
@@ -147,7 +153,7 @@ struct EncodedBlockData {
     block_num: u64,
     block_hash: H256,
     block_info: BlockInfo,
-    /// Pre-encoded account writes: `(address(32) || block_num(32), Some(rlp(SlimAccount)))`
+    /// Pre-encoded account writes: `(address(32) || block_num(32), Some(encode_stored_account(...)))`
     /// or `(.., None)` for deletions.
     accounts: Vec<([u8; 64], Option<Vec<u8>>)>,
     /// Pre-encoded storage writes: `(address(32) || key(32) || block_num(32), value_be_bytes(32))`.
@@ -503,13 +509,8 @@ fn spawn_rocksdb_batch_accumulator(
                 let bh = b.block_hash;
                 let bnum = b.block_num;
 
-                StateDBWrite::write_block_hash(
-                    &db,
-                    &mut small,
-                    b.block_info.header.number,
-                    bh,
-                )
-                .expect("write_block_hash");
+                StateDBWrite::write_block_hash(&db, &mut small, b.block_info.header.number, bh)
+                    .expect("write_block_hash");
                 StateDBWrite::write_block_info(&db, &mut small, b.block_info)
                     .expect("write_block_info");
                 acc_writes.extend(
@@ -664,8 +665,7 @@ fn spawn_rocksdb_ingest_dispatcher(
     worker_count: usize,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> =
-            tokio::task::JoinSet::new();
+        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -694,8 +694,7 @@ fn spawn_rocksdb_ingest_dispatcher(
             }
         }
         while let Some(res) = tasks.join_next().await {
-            let comp = res
-                .map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
+            let comp = res.map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
             if completion_tx.send(comp).await.is_err() {
                 return Err(anyhow::anyhow!(
                     "watermark advancer dropped completion channel"
@@ -854,6 +853,8 @@ impl Command {
         // Fix the versioned-key encoding before any key is encoded (fetchers
         // call encode_account_key / encode_storage_key off the writer thread).
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        // Fix the account value codec before any state-diff decode or account encode.
+        leafage_evm_storage::set_account_codec(self.state_diff_codec);
 
         // Validate checkpoint_interval
         if self.checkpoint_interval == 0 {
@@ -961,10 +962,8 @@ impl Command {
                 }
                 std::fs::create_dir_all(&tmp_dir)?;
 
-                let (block_tx, block_rx) =
-                    mpsc::channel::<EncodedBlockData>(self.max_tasks);
-                let (batch_tx, batch_rx) =
-                    mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
+                let (block_tx, block_rx) = mpsc::channel::<EncodedBlockData>(self.max_tasks);
+                let (batch_tx, batch_rx) = mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
                 let (completion_tx, completion_rx) =
                     mpsc::channel::<BatchCompletion>(INGEST_WORKER_COUNT + 1);
 
@@ -1367,7 +1366,7 @@ impl Command {
     /// Fetch block data from RPC/S3 and pre-encode it for the writer.
     ///
     /// Encoding (`encode_account_key`, `encode_storage_key`, RLP of
-    /// `SlimAccount`, `U256::to_be_bytes`) runs here so it scales with the
+    /// stored account, `U256::to_be_bytes`) runs here so it scales with the
     /// fetcher concurrency rather than serializing on the single writer
     /// thread.
     async fn fetch_block(
@@ -1406,23 +1405,18 @@ impl Command {
 
         let block_hash = block_info.header.hash;
 
-        let mut accounts = Vec::with_capacity(
-            block_diff.deleted_accounts.len() + block_diff.new_accounts.len(),
-        );
+        let mut accounts =
+            Vec::with_capacity(block_diff.deleted_accounts.len() + block_diff.new_accounts.len());
         for address in block_diff.deleted_accounts {
             accounts.push((encode_account_key(address, block_num), None));
         }
         for account in block_diff.new_accounts {
             let key = encode_account_key(account.address, block_num);
-            let value = encode_slim_account(account);
+            let value = encode_stored_account(account.account);
             accounts.push((key, Some(value)));
         }
 
-        let storage_count: usize = block_diff
-            .storage_diffs
-            .iter()
-            .map(|d| d.diffs.len())
-            .sum();
+        let storage_count: usize = block_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum();
         let mut storage = Vec::with_capacity(storage_count);
         for account_diff in block_diff.storage_diffs {
             for pair in account_diff.diffs {

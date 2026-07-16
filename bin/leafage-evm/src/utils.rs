@@ -1,10 +1,10 @@
-use alloy_rlp::Decodable;
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use flate2::read;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_rpc::EthApiClient;
-use leafage_evm_types::{BlockInfo, BlockStorageDiff, DebankTransaction, H256};
+use leafage_evm_storage::account_codec;
+use leafage_evm_types::{decode_state_diff, BlockInfo, BlockStateUpdate, DebankTransaction, H256};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +29,15 @@ pub struct KafkaS3Config {
     pub s3_chain_id: String,
     #[serde(default)]
     pub version: String,
+}
+
+/// Parse a `--state-diff-codec` CLI argument.
+pub fn parse_state_diff_codec(arg: &str) -> Result<leafage_evm_types::StateDiffCodec> {
+    match arg {
+        "standard" => Ok(leafage_evm_types::StateDiffCodec::Standard),
+        "blast-v1" => Ok(leafage_evm_types::StateDiffCodec::BlastV1),
+        _ => Err(anyhow::anyhow!("unsupported state-diff codec: {arg}")),
+    }
 }
 
 /// Parse a [`KafkaS3Config`] CLI argument: an absolute file path or inline JSON.
@@ -61,9 +70,7 @@ fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
             let mix_hash = obj
                 .get("prevRandao")
                 .cloned()
-                .unwrap_or_else(|| {
-                    serde_json::to_value(H256::ZERO).expect("zero hash serializes")
-                });
+                .unwrap_or_else(|| serde_json::to_value(H256::ZERO).expect("zero hash serializes"));
             obj.insert("mixHash".to_string(), mix_hash);
         }
     }
@@ -76,7 +83,7 @@ pub async fn s3_get_block_diff(
     s3_chain_id: &str,
     version: &str,
     block_root: H256,
-) -> Result<BlockStorageDiff> {
+) -> Result<BlockStateUpdate> {
     let s3_key = if version.is_empty() {
         format!("{}/{}/stateDiff", s3_chain_id, block_root)
     } else {
@@ -89,7 +96,7 @@ pub async fn s3_get_block_diff(
         .send()
         .await?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
-    let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
+    let block_storage_diff = decode_state_diff(account_codec(), bytes.as_ref())?;
     // Correlate with the commit-side logs in StateDBWrapper::update_block via
     // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
     // per-account / per-slot detail).
@@ -105,8 +112,8 @@ pub async fn s3_get_block_diff(
     );
     for account in &block_storage_diff.new_accounts {
         trace!(target: "state_diff",
-            "fetched account: root {}, address {}, balance {}, nonce {}, code_hash {}",
-            block_storage_diff.hash, account.address, account.balance, account.nonce, account.code_hash);
+            "fetched account: root {}, address {}, nonce {}, code_hash {}",
+            block_storage_diff.hash, account.address, account.account.nonce, account.account.code_hash);
     }
     for address in &block_storage_diff.deleted_accounts {
         trace!(target: "state_diff",
@@ -345,7 +352,7 @@ pub async fn s3_get_block_info_by_number(
     }
 }
 
-/// Compute the [`BlockStorageDiff`] for an already-resolved [`BlockInfo`] by
+/// Compute the [`BlockStateUpdate`] for an already-resolved [`BlockInfo`] by
 /// fetching its parent (by hash) and comparing state roots: an unchanged root
 /// yields an empty diff, otherwise the diff is read from S3.
 async fn s3_resolve_block_diff(
@@ -354,7 +361,7 @@ async fn s3_resolve_block_diff(
     s3_chain_id: &str,
     version: &str,
     block_info: &BlockInfo,
-) -> Result<BlockStorageDiff> {
+) -> Result<BlockStateUpdate> {
     let parent_block_info = s3_get_block_info(
         s3_client,
         bucket_name,
@@ -381,7 +388,7 @@ async fn s3_resolve_block_diff(
             block_info.header.state_root, block_info.header.number
         ))
     } else {
-        let mut diff = BlockStorageDiff::default();
+        let mut diff = BlockStateUpdate::default();
         diff.hash = block_info.header.state_root;
         diff.parent_hash = parent_block_info.header.state_root;
         Ok(diff)
@@ -396,7 +403,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
     s3_chain_id: &str,
     version: &str,
     number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
         s3_client,
@@ -413,7 +420,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
     Ok((block_info, block_diff))
 }
 
-/// Resolve a block to its [`BlockInfo`] and [`BlockStorageDiff`] strictly by
+/// Resolve a block to its [`BlockInfo`] and [`BlockStateUpdate`] strictly by
 /// hash, following the by-hash S3 layout instead of the by-number index. Used
 /// to backfill the chain tip along the exact parent-hash links carried by
 /// Kafka, so a reorg near the tip cannot make the by-number index resolve a
@@ -424,7 +431,7 @@ pub async fn s3_get_block_info_and_diff_by_hash(
     s3_chain_id: &str,
     version: &str,
     hash: H256,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, hash).await?;
     let block_diff =
         s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
@@ -439,7 +446,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     s3_chain_id: &str,
     version: &str,
     number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
         s3_client,
