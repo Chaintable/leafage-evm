@@ -505,6 +505,7 @@ impl Command {
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Base(chain_cfg))
             }
             "bsc" => {
