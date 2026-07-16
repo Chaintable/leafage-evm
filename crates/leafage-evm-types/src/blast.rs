@@ -10,6 +10,7 @@
 use crate::primitives::{H256, U256};
 use crate::storage::{AccountExt, AccountUpdate, BlockStorageDiff, StoredAccount};
 use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 
 /// Blast raw yield fields (the non-trie-root part of blast-geth's
 /// `StateAccount`). Plain data with no invariant of its own, so the fields
@@ -116,6 +117,24 @@ impl Decodable for BlastNewAccount {
 /// Blast wire accounts (7 RLP items instead of 4). Mirrors
 /// Chaintable/pipeline `types.BlastBlockStorageDiff` exactly.
 pub type BlastBlockStorageDiff = BlockStorageDiff<BlastNewAccount>;
+
+/// Blast on-disk account value (version 1): the flat 6-item RLP list
+/// `[nonce, flags, fixed, shares, remainder, code_hash]`. The disk
+/// counterpart of [`BlastNewAccount`] — same raw yield fields, and no
+/// balance either: it is derived at read time. All fields are scalars, so
+/// unlike the wire account the RLP derives cleanly.
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct BlastSlimAccountV1 {
+    /// Account nonce
+    pub nonce: u64,
+    /// Yield mode: 0 = Automatic, 1 = Disabled, 2 = Claimable (passed through)
+    pub flags: u8,
+    pub fixed: U256,
+    pub shares: U256,
+    pub remainder: U256,
+    /// code hash
+    pub code_hash: H256,
+}
 
 impl From<BlastNewAccount> for StoredAccount {
     fn from(account: BlastNewAccount) -> Self {
@@ -268,6 +287,34 @@ mod tests {
         let mut full = Vec::new();
         blast_diff_fixture_value().encode(&mut full);
         assert!(BlastBlockStorageDiff::decode(&mut &full[..full.len() - 1]).is_err());
+    }
+
+    /// Locks the Blast on-disk account encoding byte-for-byte: the flat
+    /// 6-item list `[nonce, flags, fixed, shares, remainder, code_hash]`,
+    /// no balance.
+    #[test]
+    fn test_blast_slim_account_v1_bytes() {
+        let account = BlastSlimAccountV1 {
+            nonce: 7,
+            flags: 2,
+            fixed: U256::from(11),
+            shares: U256::from(13),
+            remainder: U256::from(17),
+            code_hash: h256(4),
+        };
+        let mut buf = Vec::new();
+        account.encode(&mut buf);
+        let want = crate::primitives::hex::decode(concat!(
+            "e607020b0d11a0",
+            "00000000000000000000000000000000000000000000000000000000000000",
+            "04"
+        ))
+        .unwrap();
+        assert_eq!(buf, want);
+        assert_eq!(
+            BlastSlimAccountV1::decode(&mut buf.as_slice()).unwrap(),
+            account
+        );
     }
 
     /// The two wire formats reject each other as long as a diff carries at
