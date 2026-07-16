@@ -1,7 +1,9 @@
+use crate::blast::{BlastAccountExt, BlastBlockStorageDiff};
 use crate::primitives::{AccountInfo, Address, BlockEnv, Bytes, H256, U256};
 use crate::rpc::{Block, Header};
 use alloy::primitives::keccak256;
 pub use alloy::serde::WithOtherFields;
+use alloy_rlp::Decodable;
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use serde::{Deserialize, Serialize};
@@ -42,20 +44,44 @@ pub struct DebankOutPut {
     pub state_diff: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
-pub struct BlockStorageDiff {
+/// Wire state diff of one block. The container is generic over the account
+/// entry type: standard chains use the default [`NewAccount`] (4 RLP items
+/// per account); chains with a rewritten account model plug in their own
+/// wire account (e.g. [`BlastNewAccount`](crate::blast::BlastNewAccount),
+/// 7 items). The 6-item top-level layout and the standard-chain bytes are
+/// unchanged: `BlockStorageDiff` still means `BlockStorageDiff<NewAccount>`.
+///
+/// The internal, non-RLP representation of the same container is
+/// [`BlockStateUpdate`].
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct BlockStorageDiff<A = NewAccount> {
     /// Block root hash.
     pub hash: H256,
     /// Parent block root hash.
     pub parent_hash: H256,
     /// New accounts
-    pub new_accounts: Vec<NewAccount>,
+    pub new_accounts: Vec<A>,
     /// Deleted accounts
     pub deleted_accounts: Vec<H256>,
     /// Account storage diff
     pub storage_diffs: Vec<AccountStorageDiff>,
     /// New codes
     pub new_codes: Vec<NewCode>,
+}
+
+// Manual impl instead of derive: the derived one would demand `A: Default`,
+// which the account entry types neither have nor need for an empty diff.
+impl<A> Default for BlockStorageDiff<A> {
+    fn default() -> Self {
+        Self {
+            hash: H256::default(),
+            parent_hash: H256::default(),
+            new_accounts: Vec::new(),
+            deleted_accounts: Vec::new(),
+            storage_diffs: Vec::new(),
+            new_codes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
@@ -142,6 +168,178 @@ impl From<NewAccount> for SlimAccount {
     }
 }
 
+/// Chain-agnostic internal account value. Wire account types only exist at
+/// decode boundaries and convert into this.
+///
+/// A generic core (same shape as [`NewAccount`]: balance, nonce, code_hash)
+/// with an embedded chain-specific extension: standard chains carry no
+/// extension, chains with a rewritten account model (Blast) embed their raw
+/// fields in `ext` and the balance is derived at read time.
+///
+/// All fields are private on purpose: the invariant "`ext` is `Some` ⇒
+/// `balance` is zero and must not be read" is established once by the
+/// constructors and upheld by the accessor API ([`Self::standard_balance`],
+/// [`Self::balance_view`]), instead of relying on every consumer to know the
+/// rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAccount {
+    /// Materialized balance; only meaningful while `ext` is `None`.
+    balance: U256,
+    nonce: u64,
+    code_hash: H256,
+    /// Chain-specific account-model extension. `None` = standard account.
+    ext: Option<AccountExt>,
+}
+
+/// Chain-specific account-model extensions; new chains add a variant here.
+/// Deliberately NOT `#[non_exhaustive]`: adding a variant must force every
+/// match site to decide explicitly, never fall through a default arm that
+/// silently treats an unknown extension as a standard account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountExt {
+    Blast(BlastAccountExt),
+}
+
+/// Borrowed balance view of a [`StoredAccount`], see
+/// [`StoredAccount::balance_view`]. A read API only — the storage layout
+/// stays the embedded struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceView<'a> {
+    /// Materialized balance of a standard account.
+    Standard(U256),
+    /// Blast raw yield fields; the balance must be derived against the
+    /// sharePrice of the same state view.
+    Blast(&'a BlastAccountExt),
+}
+
+impl StoredAccount {
+    /// Standard account (materialized balance, no extension).
+    pub fn standard(balance: U256, nonce: u64, code_hash: H256) -> Self {
+        Self {
+            balance,
+            nonce,
+            code_hash,
+            ext: None,
+        }
+    }
+
+    /// Account with a chain-specific extension. The materialized balance is
+    /// pinned to zero here — the extension is the balance's source of truth.
+    pub fn with_ext(nonce: u64, code_hash: H256, ext: AccountExt) -> Self {
+        Self {
+            balance: U256::ZERO,
+            nonce,
+            code_hash,
+            ext: Some(ext),
+        }
+    }
+
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub fn code_hash(&self) -> H256 {
+        self.code_hash
+    }
+
+    pub fn ext(&self) -> Option<&AccountExt> {
+        self.ext.as_ref()
+    }
+
+    /// Materialized balance of a standard account. `None` for extended
+    /// accounts, whose balance must be derived at read time.
+    pub fn standard_balance(&self) -> Option<U256> {
+        self.ext.is_none().then_some(self.balance)
+    }
+
+    /// The authoritative balance view: consumers match on this, so reading
+    /// "the materialized balance of an extended account" is structurally
+    /// impossible.
+    pub fn balance_view(&self) -> BalanceView<'_> {
+        match &self.ext {
+            None => BalanceView::Standard(self.balance),
+            Some(AccountExt::Blast(blast)) => BalanceView::Blast(blast),
+        }
+    }
+}
+
+impl From<NewAccount> for StoredAccount {
+    fn from(account: NewAccount) -> Self {
+        StoredAccount::standard(account.balance, account.nonce, account.code_hash)
+    }
+}
+
+/// Internal account entry of a [`BlockStateUpdate`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountUpdate {
+    /// keccak256 of the account address
+    pub address: H256,
+    pub account: StoredAccount,
+}
+
+impl From<NewAccount> for AccountUpdate {
+    fn from(account: NewAccount) -> Self {
+        AccountUpdate {
+            address: account.address,
+            account: account.into(),
+        }
+    }
+}
+
+/// Internal, non-RLP representation of one block's state changes: the same
+/// generic container instantiated with the internal account entry. Wire
+/// instantiations convert into it right after decoding; everything past the
+/// decode boundary uses this type. [`AccountUpdate`] implements no RLP
+/// traits, so this instantiation structurally has no wire codec.
+pub type BlockStateUpdate = BlockStorageDiff<AccountUpdate>;
+
+impl<A> BlockStorageDiff<A> {
+    /// Convert a decoded wire diff into the internal representation.
+    ///
+    /// An inherent method rather than `From`: with [`BlockStateUpdate`] being
+    /// an instantiation of this same container, a generic `From` impl would
+    /// overlap the reflexive `impl From<T> for T` at `A = AccountUpdate`.
+    pub fn into_state_update(self) -> BlockStateUpdate
+    where
+        AccountUpdate: From<A>,
+    {
+        BlockStateUpdate {
+            hash: self.hash,
+            parent_hash: self.parent_hash,
+            new_accounts: self.new_accounts.into_iter().map(Into::into).collect(),
+            deleted_accounts: self.deleted_accounts,
+            storage_diffs: self.storage_diffs,
+            new_codes: self.new_codes,
+        }
+    }
+}
+
+/// Which wire format a deployment's state diffs use. Always explicit
+/// (configuration-driven) — never guessed by trying both formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateDiffCodec {
+    Standard,
+    BlastV1,
+}
+
+/// The single state-diff decode entry point. Empty bytes mean "no state
+/// change in this block" and decode to an empty [`BlockStateUpdate`].
+pub fn decode_state_diff(
+    codec: StateDiffCodec,
+    bytes: &[u8],
+) -> Result<BlockStateUpdate, alloy_rlp::Error> {
+    if bytes.is_empty() {
+        return Ok(BlockStateUpdate::default());
+    }
+    match codec {
+        StateDiffCodec::Standard => BlockStorageDiff::<NewAccount>::decode(&mut &*bytes)
+            .map(BlockStorageDiff::into_state_update),
+        StateDiffCodec::BlastV1 => {
+            BlastBlockStorageDiff::decode(&mut &*bytes).map(BlockStorageDiff::into_state_update)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +380,94 @@ mod tests {
         assert_eq!(output.header.timestamp, 0x6715ede6);
         assert_eq!(output.header.base_fee_per_gas, Some(0xf4240));
         assert!(output.state_diff.is_empty());
+    }
+
+    fn h256(n: u8) -> H256 {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        H256::from(bytes)
+    }
+
+    /// Locks the standard on-disk account encoding byte-for-byte. Existing
+    /// standard-chain DBs must keep decoding; any change to these bytes is a
+    /// breaking format change.
+    #[test]
+    fn test_slim_account_golden_bytes() {
+        let account = SlimAccount {
+            balance: U256::from(100),
+            nonce: 0,
+            code_hash: H256::ZERO,
+        };
+        let mut buf = Vec::new();
+        account.encode(&mut buf);
+        let want = crate::primitives::hex::decode(concat!(
+            "e36480a0",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ))
+        .unwrap();
+        assert_eq!(buf, want);
+        assert_eq!(SlimAccount::decode(&mut buf.as_slice()).unwrap(), account);
+
+        let account = SlimAccount {
+            balance: U256::from(1_000_000_000_000_000_000u64),
+            nonce: 5,
+            code_hash: crate::primitives::KECCAK256_EMPTY,
+        };
+        let mut buf = Vec::new();
+        account.encode(&mut buf);
+        let want = crate::primitives::hex::decode(
+            "eb880de0b6b3a764000005a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        )
+        .unwrap();
+        assert_eq!(buf, want);
+        assert_eq!(SlimAccount::decode(&mut buf.as_slice()).unwrap(), account);
+    }
+
+    #[test]
+    fn test_decode_state_diff() {
+        // Empty bytes mean "no state change" under both codecs.
+        assert_eq!(
+            decode_state_diff(StateDiffCodec::Standard, &[]).unwrap(),
+            BlockStateUpdate::default()
+        );
+        assert_eq!(
+            decode_state_diff(StateDiffCodec::BlastV1, &[]).unwrap(),
+            BlockStateUpdate::default()
+        );
+
+        let diff = BlockStorageDiff {
+            hash: h256(1),
+            parent_hash: h256(2),
+            new_accounts: vec![NewAccount {
+                address: h256(3),
+                balance: U256::from(100),
+                nonce: 7,
+                code_hash: h256(4),
+            }],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        diff.encode(&mut bytes);
+
+        let update = decode_state_diff(StateDiffCodec::Standard, &bytes).unwrap();
+        assert_eq!(update.hash, h256(1));
+        assert_eq!(update.parent_hash, h256(2));
+        assert_eq!(
+            update.new_accounts,
+            vec![AccountUpdate {
+                address: h256(3),
+                account: StoredAccount::standard(U256::from(100), 7, h256(4)),
+            }]
+        );
+        // A standard account exposes its materialized balance.
+        let account = &update.new_accounts[0].account;
+        assert_eq!(account.standard_balance(), Some(U256::from(100)));
+        assert_eq!(
+            account.balance_view(),
+            BalanceView::Standard(U256::from(100))
+        );
+
+        // A diff carrying a 4-field standard account is not Blast-decodable.
+        assert!(decode_state_diff(StateDiffCodec::BlastV1, &bytes).is_err());
     }
 }

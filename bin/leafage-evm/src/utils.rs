@@ -89,7 +89,7 @@ pub async fn s3_get_block_diff(
         .send()
         .await?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
-    let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
+    let block_storage_diff: BlockStorageDiff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
     // Correlate with the commit-side logs in StateDBWrapper::update_block via
     // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
     // per-account / per-slot detail).
