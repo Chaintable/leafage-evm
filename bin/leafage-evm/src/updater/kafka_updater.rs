@@ -136,16 +136,9 @@ where
         presist_block_num: u64,
         presist_block_hash: H256,
     ) -> Option<BlockContextWithOffset> {
-        let presist_block = self
-            .hash_to_blockctx
-            .lock()
-            .unwrap()
-            .remove(&presist_block_hash);
-
-        self.hash_to_blockctx
-            .lock()
-            .unwrap()
-            .retain(|_, block| block.block_info.header.number >= presist_block_num);
+        let mut blocks = self.hash_to_blockctx.lock().unwrap();
+        let presist_block = blocks.remove(&presist_block_hash);
+        blocks.retain(|_, block| block.block_info.header.number >= presist_block_num);
 
         presist_block
     }
@@ -213,6 +206,7 @@ where
             roothash_to_block_info.insert(block_diff.hash, block_diff);
         }
 
+        let mut block_contexts = Vec::new();
         for (offset, mut block_change_notification) in msgs.drain(..) {
             debug!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
             for new_block in block_change_notification.new_blocks.drain(..) {
@@ -235,14 +229,11 @@ where
                     offset,
                 };
 
-                self.hash_to_blockctx
-                    .lock()
-                    .unwrap()
-                    .insert(new_block.hash, block_ctx_with_offset);
-
+                block_contexts.push((new_block.hash, block_ctx_with_offset));
                 new_blocks.push(new_block);
             }
         }
+        self.hash_to_blockctx.lock().unwrap().extend(block_contexts);
         Ok(new_blocks)
     }
 
@@ -400,17 +391,13 @@ where
 
     async fn update_from_kafka(&self, messages: &Vec<BorrowedMessage<'_>>) -> Result<()> {
         let new_blocks = self.prepare_update(messages).await?;
-        let mut update_path = new_blocks
-            .iter()
-            .map(|new_block| {
-                self.hash_to_blockctx
-                    .lock()
-                    .unwrap()
-                    .get(&new_block.hash)
-                    .cloned()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let mut update_path = {
+            let blocks = self.hash_to_blockctx.lock().unwrap();
+            new_blocks
+                .iter()
+                .map(|new_block| blocks.get(&new_block.hash).cloned().unwrap())
+                .collect::<Vec<_>>()
+        };
         for block in update_path.drain(..) {
             let block_storage_diff = block.block_diff;
             let block_info = block.block_info;
