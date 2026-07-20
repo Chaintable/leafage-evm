@@ -122,6 +122,7 @@ rand = "0.10"
 criterion = "0.5"
 
 ahash = "0.8"
+arc-swap = "1.7"
 
 # for test
 metrics-util = "0.19"
