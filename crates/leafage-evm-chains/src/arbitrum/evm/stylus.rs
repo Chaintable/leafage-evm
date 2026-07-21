@@ -951,7 +951,10 @@ mod tests {
         )
     }
 
-    fn test_hostio(evm: &mut ArbitrumEvm<TestDb, ()>, is_static: bool) -> StylusHostio<'_, TestDb, ()> {
+    fn test_hostio(
+        evm: &mut ArbitrumEvm<TestDb, ()>,
+        is_static: bool,
+    ) -> StylusHostio<'_, TestDb, ()> {
         let gas_params = evm.inner.ctx.cfg().gas_params().clone();
         // revm expects an account to be journal-loaded before its storage is
         // touched, which in production the frame setup has already done.
@@ -1069,7 +1072,8 @@ mod tests {
         input.extend_from_slice(&100_000u64.to_be_bytes()); // gasReq
 
         let mut evm = test_evm();
-        let (response, _, cost) = test_hostio(&mut evm, true).contract_call(&input, CallScheme::Call);
+        let (response, _, cost) =
+            test_hostio(&mut evm, true).contract_call(&input, CallScheme::Call);
         assert_eq!(response, vec![CALL_STATUS_FAILURE]);
         assert_eq!(cost, 0);
     }
