@@ -11,8 +11,7 @@
 //! GasParams), init/cached cost, and the L1 block-number EvmData field.
 //! The hostio *response* encodings are aligned with nitro and unit-pinned.
 //! **Gas/trace parity is still NOT verified end to end** and the following stay
-//! approximate: subcall/create base cost, setTrieSlots' gas budget,
-//! capture-hostio (14), RecentWasms (strategy A only), and
+//! approximate: capture-hostio (14), RecentWasms (strategy A only), and
 //! enforceStylusPageLimit. All are TODO(Phase 4) and must be diffed against a
 //! writer / Arb One traced RPC before shipping.
 
@@ -57,11 +56,28 @@ pub(super) fn is_stylus_code(code: &[u8]) -> bool {
 /// are not interchangeable.
 const API_STATUS_SUCCESS: u8 = 0;
 const API_STATUS_FAILURE: u8 = 1;
+const API_STATUS_OUT_OF_GAS: u8 = 2;
 const API_STATUS_WRITE_PROTECTION: u8 = 3;
+
+/// ArbOS version from which `setTrieSlots` reports a spent budget as `OutOfGas`
+/// instead of `Failure` (`api.go:112-118`).
+const ARBOS_SET_TRIE_SLOTS_OUT_OF_GAS: u64 = 50;
+
+/// The call hostios instead answer with a `UserOutcomeKind` byte, of which nitro
+/// only ever produces these two (`api.go:409-411`).
+const CALL_STATUS_SUCCESS: u8 = 0;
+const CALL_STATUS_FAILURE: u8 = 2;
+
+/// `WasmAccountTouchCost(withCode: true)` bills a worst-case EXTCODESIZE on top
+/// of the 2929 access cost, scaled by the chain's code-size limit, because the
+/// code length is unknown before the load (`operations_acl_arbitrum.go:157`).
+const EXTCODE_SIZE_GAS_EIP150: u64 = 700;
+const DEFAULT_MAX_CODE_SIZE: u64 = 24_576;
 
 /// Error strings for the requests that answer with a Go `error.Error()` string
 /// (EmitLog, Create). `write protection` matches geth's `ErrWriteProtection`.
 const WRITE_PROTECTION_ERROR: &[u8] = b"write protection";
+const OUT_OF_GAS_ERROR: &[u8] = b"out of gas";
 const MALFORMED_REQUEST_ERROR: &[u8] = b"malformed request";
 
 /// nitro `Program::initGas`: `MinInitGas*128 + ceil(initCost*InitCostScalar*2/100)`.
@@ -93,6 +109,19 @@ const MEMORY_EXPONENTS: [u32; 129] = [
     4208502, 4816684, 5512756, 6309419, 7221210, 8264766, 9459129, 10826093, 12390601, 14181199,
     16230562, 18576084, 21260563, 24332984, 27849408, 31873999,
 ];
+
+/// ArbOS version from which return data is priced at EVM parity
+/// (`ArbosVersion_StylusFixes` = 31).
+const ARBOS_STYLUS_FIXES: u64 = 31;
+
+/// nitro `evmMemoryCost` (`programs.go:340`): what the EVM would charge to hold
+/// `size` bytes in memory — `MemoryGas` per word plus the quadratic term.
+fn evm_memory_cost(size: u64) -> u64 {
+    let words = size.div_ceil(32);
+    words
+        .saturating_mul(3)
+        .saturating_add(words.saturating_mul(words) / 512)
+}
 
 fn memory_exp(pages: u16) -> u64 {
     match MEMORY_EXPONENTS.get(pages as usize) {
@@ -268,6 +297,7 @@ where
     let supplied = gas.remaining();
     let mut call_gas = supplied;
     let gas_params = evm.inner.ctx.cfg().gas_params().clone();
+    let max_code_size = evm.inner.ctx.cfg().max_code_size() as u64;
     let mut hostio = StylusHostio {
         evm,
         contract,
@@ -277,6 +307,8 @@ where
         free_pages: prepared.free_pages,
         page_gas: prepared.page_gas,
         gas_params,
+        max_code_size,
+        arbos_version: prepared.arbos_version,
         refund: 0,
     };
     let result = StylusRuntime::call_from_env(&asm, &calldata, input, &mut hostio, &mut call_gas);
@@ -308,6 +340,21 @@ where
         | StylusOutcome::OutOfStack
         | StylusOutcome::NativeStackOverflow => (InstructionResult::Revert, Bytes::new()),
     };
+
+    // Return data must cost at least what it would in the EVM. nitro does this
+    // by capping the gas handed back — measured against the frame's gas *before*
+    // the pre-charge — rather than by charging again (`programs.go:289-302`).
+    if !output.is_empty() && prepared.arbos_version >= ARBOS_STYLUS_FIXES {
+        let evm_cost = evm_memory_cost(output.len() as u64);
+        if gas_limit < evm_cost {
+            gas.spend_all();
+            return finish_frame(evm, InstructionResult::OutOfGas, Bytes::new(), gas);
+        }
+        let excess = gas.remaining().saturating_sub(gas_limit - evm_cost);
+        if excess > 0 {
+            let _ = gas.record_cost(excess);
+        }
+    }
     finish_frame(evm, result, output, gas)
 }
 
@@ -407,6 +454,10 @@ struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
     page_gas: u16,
     /// revm gas schedule, for exact SLOAD/SSTORE/account-touch cost + refund.
     gas_params: GasParams,
+    /// Scales the EXTCODESIZE component of `AccountCode`.
+    max_code_size: u64,
+    /// Gates `setTrieSlots`' OutOfGas status.
+    arbos_version: u64,
     refund: i64,
 }
 
@@ -449,6 +500,50 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             }
     }
 
+    /// nitro `WasmCallCost` (`operations_acl_arbitrum.go:114`): the 2929 static
+    /// and cold-access costs plus the value-transfer surcharges, tallied against
+    /// the caller's budget. `None` means the tally exceeded it, which nitro
+    /// answers by burning the whole budget.
+    fn call_base_cost(&mut self, target: Address, value: U256, budget: u64) -> Option<u64> {
+        let transfers_value = value > U256::ZERO;
+        let mut total = self.gas_params.warm_storage_read_cost();
+        if total > budget {
+            return None;
+        }
+        // Loading the account also warms it, as nitro's AddAddressToAccessList does.
+        let (is_cold, is_empty) = match self.ctx().journal_mut().load_account(target) {
+            Ok(load) => (load.is_cold, load.data.is_empty()),
+            Err(_) => (false, false),
+        };
+        if is_cold {
+            total = total.saturating_add(self.gas_params.cold_account_additional_cost());
+            if total > budget {
+                return None;
+            }
+        }
+        if transfers_value && is_empty {
+            total = total.saturating_add(self.gas_params.new_account_cost(true, true));
+            if total > budget {
+                return None;
+            }
+        }
+        if transfers_value {
+            total = total.saturating_add(self.gas_params.transfer_value_cost());
+            if total > budget {
+                return None;
+            }
+        }
+        Some(total)
+    }
+
+    /// nitro `WasmAccountTouchCost(withCode: true)` — the access cost plus the
+    /// worst-case EXTCODESIZE charge.
+    fn account_code_cost(&self, is_cold: bool) -> u64 {
+        let ext_code_cost =
+            (self.max_code_size / DEFAULT_MAX_CODE_SIZE).saturating_mul(EXTCODE_SIZE_GAS_EIP150);
+        ext_code_cost.saturating_add(self.account_touch_cost(is_cold))
+    }
+
     /// EIP-2929 account-access cost (nitro `WasmAccountTouchCost`).
     fn account_touch_cost(&self, is_cold: bool) -> u64 {
         self.gas_params.warm_storage_read_cost()
@@ -473,21 +568,28 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), cost)
     }
 
-    /// TODO(Phase 4): nitro checks each slot's cost against the request's
-    /// gasLeft header *before* writing it and answers `OutOfGas` once the
-    /// budget is spent (`api.go:82-118`). Doing that here means computing the
-    /// SSTORE cost before `journal.sstore` commits the value, so it is left to
-    /// the gas-alignment pass rather than bolted on here.
+    /// SetTrieSlots: `gasLeft[8] ++ (key[32] ++ value[32])*N`. Each slot is
+    /// charged against the request's own budget and the write is skipped once it
+    /// runs out (`api.go:82-118`).
     fn set_trie_slots(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if self.is_static {
             return (vec![API_STATUS_WRITE_PROTECTION], Vec::new(), 0);
         }
+        if input.len() < 8 {
+            return (vec![API_STATUS_FAILURE], Vec::new(), 0);
+        }
+        let budget = u64::from_be_bytes(input[..8].try_into().unwrap());
         let contract = self.contract;
-        let mut cost = 0u64;
-        let mut offset = if input.len() >= 8 { 8 } else { input.len() };
+        let mut remaining = budget;
+        let mut out_of_gas = false;
+        let mut offset = 8;
         while input.len() >= offset + 64 {
             let key = U256::from_be_slice(&input[offset..offset + 32]);
             let value = U256::from_be_slice(&input[offset + 32..offset + 64]);
+            // nitro prices the slot before writing it. revm only reports the
+            // SStoreResult the price depends on *from* the write, so each write
+            // goes in a checkpoint that is rolled back when it is unaffordable.
+            let checkpoint = self.ctx().journal_mut().checkpoint();
             match self.ctx().journal_mut().sstore(contract, key, value) {
                 Ok(load) => {
                     // Exact revm SSTORE gas + refund (EIP-2929/2200/3529).
@@ -496,14 +598,38 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
                         + self
                             .gas_params
                             .sstore_dynamic_gas(true, &load.data, load.is_cold);
+                    if slot_cost > remaining {
+                        self.ctx().journal_mut().checkpoint_revert(checkpoint);
+                        remaining = 0;
+                        out_of_gas = true;
+                        break;
+                    }
+                    self.ctx().journal_mut().checkpoint_commit();
                     self.refund += self.gas_params.sstore_refund(true, &load.data);
-                    cost = cost.saturating_add(slot_cost);
+                    remaining -= slot_cost;
                 }
-                Err(_) => return (vec![API_STATUS_FAILURE], Vec::new(), cost),
+                Err(_) => {
+                    self.ctx().journal_mut().checkpoint_revert(checkpoint);
+                    return (
+                        vec![API_STATUS_FAILURE],
+                        Vec::new(),
+                        budget.saturating_sub(remaining),
+                    );
+                }
             }
             offset += 64;
         }
-        (vec![API_STATUS_SUCCESS], Vec::new(), cost)
+        // Spending the budget exactly also counts as out of gas.
+        let status = if out_of_gas || remaining == 0 {
+            if self.arbos_version < ARBOS_SET_TRIE_SLOTS_OUT_OF_GAS {
+                API_STATUS_FAILURE
+            } else {
+                API_STATUS_OUT_OF_GAS
+            }
+        } else {
+            API_STATUS_SUCCESS
+        };
+        (vec![status], Vec::new(), budget.saturating_sub(remaining))
     }
 
     fn get_transient(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
@@ -539,7 +665,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
     /// and status encoding — diff against writer.
     fn contract_call(&mut self, input: &[u8], scheme: CallScheme) -> (Vec<u8>, Vec<u8>, u64) {
         if input.len() < 68 {
-            return (vec![2], Vec::new(), 0);
+            return (vec![CALL_STATUS_FAILURE], Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
         let value = U256::from_be_slice(&input[20..52]);
@@ -548,14 +674,24 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         let calldata = Bytes::copy_from_slice(&input[68..]);
 
         let is_static = self.is_static || scheme == CallScheme::StaticCall;
-        let one_64th = gas_left / 64;
-        let forwarded = gas_req.min(gas_left.saturating_sub(one_64th));
-        let stipend = if value > U256::ZERO && scheme == CallScheme::Call {
-            2300
-        } else {
-            0
+        // Read-only calls are not payable (nitro `api.go:142`, geth `opCall`).
+        if self.is_static && value > U256::ZERO {
+            return (vec![CALL_STATUS_FAILURE], Vec::new(), 0);
+        }
+        let base_cost = match self.call_base_cost(addr, value, gas_left) {
+            Some(cost) => cost,
+            // The tally blew the caller's budget; nitro burns all of it.
+            None => return (vec![CALL_STATUS_FAILURE], Vec::new(), gas_left),
         };
-        let call_gas = forwarded.saturating_add(stipend);
+        // 63/64 of what survives the base cost, capped by the request. Written
+        // as nitro does — `x * 63 / 64`, which is not `x - x / 64`.
+        let start_gas = gas_left.saturating_sub(base_cost).saturating_mul(63) / 64;
+        let mut call_gas = gas_req.min(start_gas);
+        if value > U256::ZERO {
+            // The stipend rides on top of the 63/64 split, and unlike geth's
+            // opCall nitro bills whatever the callee spends of it.
+            call_gas = call_gas.saturating_add(self.gas_params.call_stipend());
+        }
 
         let (target_address, bytecode_address, caller, call_value) = match scheme {
             CallScheme::Call => (addr, addr, self.contract, CallValue::Transfer(value)),
@@ -586,17 +722,19 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             Some(FrameResult::Call(outcome)) => {
                 let returned = outcome.gas().remaining();
                 let status = if outcome.instruction_result().is_ok() {
-                    0u8
+                    CALL_STATUS_SUCCESS
                 } else {
-                    2u8
+                    CALL_STATUS_FAILURE
                 };
                 let output = outcome.output().to_vec();
-                // Program is charged the gas the subcall consumed. TODO(Phase 4):
-                // + nitro base call cost.
-                let cost = call_gas.saturating_sub(returned);
+                let cost = base_cost.saturating_add(call_gas.saturating_sub(returned));
                 (vec![status], output, cost)
             }
-            _ => (vec![2], Vec::new(), call_gas),
+            _ => (
+                vec![CALL_STATUS_FAILURE],
+                Vec::new(),
+                base_cost.saturating_add(call_gas),
+            ),
         }
     }
 
@@ -629,12 +767,27 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             CreateScheme::Create
         };
         let init_code = Bytes::copy_from_slice(&input[header..]);
-        let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, gas);
+        // nitro `api.go:217-233`: CreateGas, plus CREATE2's keccak word cost.
+        let base_cost = if is_create2 {
+            self.gas_params.create2_cost(init_code.len())
+        } else {
+            self.gas_params.create_cost()
+        };
+        if gas < base_cost {
+            return (create_error(OUT_OF_GAS_ERROR), Vec::new(), gas);
+        }
+        // EIP-150 keeps a 64th back for the caller — note nitro splits this as
+        // `gas -= gas / 64` *after* the base cost, unlike the call path.
+        let after_base = gas - base_cost;
+        let one_64th = after_base / 64;
+        let child_gas = after_base - one_64th;
+        let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, child_gas);
 
         match drive_subframe(self.evm, FrameInput::Create(Box::new(inputs))) {
             Some(FrameResult::Create(outcome)) => {
                 let returned = outcome.gas().remaining();
-                let cost = gas.saturating_sub(returned);
+                // The withheld 64th goes back to the caller (`api.go:260`).
+                let cost = gas.saturating_sub(returned.saturating_add(one_64th));
                 // A failed deploy still answers "success" carrying the zero
                 // address, exactly as the EVM's CREATE pushes 0 on failure.
                 let address = outcome.address.unwrap_or(Address::ZERO);
@@ -709,17 +862,26 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         (hash.0.to_vec(), Vec::new(), self.account_touch_cost(is_cold))
     }
 
-    /// AccountCode: `addr[20] ++ gas[8]`. Code goes on the `raw_data` channel.
+    /// AccountCode: `addr[20] ++ gasLeft[8]`. Code goes on the `raw_data`
+    /// channel; the response stays empty.
     fn account_code(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
-        if input.len() < 20 {
+        if input.len() < 28 {
             return (Vec::new(), Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
+        let gas_left = u64::from_be_bytes(input[20..28].try_into().unwrap());
         let (code, is_cold) = match self.ctx().journal_mut().code(addr) {
             Ok(load) => (load.data.to_vec(), load.is_cold),
             Err(_) => (Vec::new(), false),
         };
-        (Vec::new(), code, self.account_touch_cost(is_cold))
+        let cost = self.account_code_cost(is_cold);
+        // nitro still bills the full cost but hands back no code when the
+        // program cannot afford the load, which then runs it out of ink
+        // (`api.go:289-299`).
+        if gas_left < cost {
+            return (Vec::new(), Vec::new(), cost);
+        }
+        (Vec::new(), code, cost)
     }
 
     /// AddPages: `pages[2]` (u16). Charges nitro `MemoryModel.GasCost` and tracks
@@ -764,6 +926,9 @@ mod tests {
 
     fn test_hostio(evm: &mut ArbitrumEvm<TestDb, ()>, is_static: bool) -> StylusHostio<'_, TestDb, ()> {
         let gas_params = evm.inner.ctx.cfg().gas_params().clone();
+        // revm expects an account to be journal-loaded before its storage is
+        // touched, which in production the frame setup has already done.
+        let _ = evm.inner.ctx.journal_mut().load_account(Address::ZERO);
         StylusHostio {
             evm,
             contract: Address::ZERO,
@@ -773,6 +938,8 @@ mod tests {
             free_pages: 2,
             page_gas: 1000,
             gas_params,
+            max_code_size: DEFAULT_MAX_CODE_SIZE,
+            arbos_version: 61,
             refund: 0,
         }
     }
@@ -815,6 +982,68 @@ mod tests {
         let mut evm = test_evm();
         let (response, _, _) = test_hostio(&mut evm, false).emit_log(&[0u8; 2]);
         assert_eq!(response, MALFORMED_REQUEST_ERROR);
+    }
+
+    #[test]
+    fn return_data_is_priced_like_evm_memory() {
+        // nitro `evmMemoryCost`: words*MemoryGas + words^2/QuadCoeffDiv.
+        assert_eq!(evm_memory_cost(0), 0);
+        assert_eq!(evm_memory_cost(32), 3);
+        assert_eq!(evm_memory_cost(33), 6);
+        assert_eq!(evm_memory_cost(32 * 512), 512 * 3 + 512);
+    }
+
+    #[test]
+    fn account_code_bills_the_worst_case_extcodesize() {
+        let mut evm = test_evm();
+        let hostio = test_hostio(&mut evm, false);
+        // 700 for the unknown code length, plus the 2929 access cost.
+        assert_eq!(hostio.account_code_cost(true), 700 + 2600);
+        assert_eq!(hostio.account_code_cost(false), 700 + 100);
+    }
+
+    #[test]
+    fn set_trie_slots_stops_at_its_own_budget() {
+        let mut slot = 10u64.to_be_bytes().to_vec(); // budget far below an SSTORE
+        slot.extend_from_slice(&[1u8; 32]);
+        slot.extend_from_slice(&[2u8; 32]);
+
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, false).set_trie_slots(&slot);
+        assert_eq!(response, vec![API_STATUS_OUT_OF_GAS]);
+        assert_eq!(cost, 10, "an exhausted budget is burned whole");
+
+        let mut affordable = 1_000_000u64.to_be_bytes().to_vec();
+        affordable.extend_from_slice(&slot[8..]);
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, false).set_trie_slots(&affordable);
+        assert_eq!(response, vec![API_STATUS_SUCCESS]);
+        assert!(cost > 0 && cost < 1_000_000);
+    }
+
+    #[test]
+    fn payable_calls_are_refused_in_a_static_context() {
+        let mut input = Address::with_last_byte(9).to_vec();
+        input.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+        input.extend_from_slice(&100_000u64.to_be_bytes()); // gasLeft
+        input.extend_from_slice(&100_000u64.to_be_bytes()); // gasReq
+
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, true).contract_call(&input, CallScheme::Call);
+        assert_eq!(response, vec![CALL_STATUS_FAILURE]);
+        assert_eq!(cost, 0);
+    }
+
+    #[test]
+    fn create_below_its_base_cost_is_out_of_gas() {
+        let mut input = 1_000u64.to_be_bytes().to_vec(); // below CreateGas
+        input.extend_from_slice(&[0u8; 32]);
+
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, false).create(&input, false);
+        assert_eq!(response[0], 0);
+        assert_eq!(&response[1..], OUT_OF_GAS_ERROR);
+        assert_eq!(cost, 1_000);
     }
 
     #[test]
