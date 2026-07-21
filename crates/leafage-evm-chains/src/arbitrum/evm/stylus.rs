@@ -10,8 +10,10 @@
 //! keccak, subcalls (including the call tree), successful returns, program
 //! panics and pre-charge-only reverts.
 //!
-//! Not yet exercised against a writer: create, logs, and account access — Arb
-//! One has very few Stylus programs and none reached those paths.
+//! Not yet exercised against a writer, because Arb One's handful of Stylus
+//! programs never reach these paths: create, logs, account access, storage
+//! *writes* (and with them the SSTORE refund), and Stylus calling Stylus.
+//! See `docs/todo.md` for what would make those worth chasing.
 //!
 //! Two things are deliberately absent rather than pending:
 //! - `RecentWasms` cannot be mirrored here at all; see the pre-charge.
