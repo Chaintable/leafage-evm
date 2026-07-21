@@ -12,9 +12,9 @@
 //! The hostio *response* encodings are aligned with nitro and unit-pinned.
 //! **Gas/trace parity is still NOT verified end to end** and the following stay
 //! approximate: subcall/create base cost, setTrieSlots' gas budget,
-//! capture-hostio (14), reentrant flag, paid-gas-price EvmData field, RecentWasms
-//! (strategy A only), and enforceStylusPageLimit. All are TODO(Phase 4) and must
-//! be diffed against a writer / Arb One traced RPC before shipping.
+//! capture-hostio (14), RecentWasms (strategy A only), and
+//! enforceStylusPageLimit. All are TODO(Phase 4) and must be diffed against a
+//! writer / Arb One traced RPC before shipping.
 
 use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::ArbStateReader;
@@ -127,7 +127,7 @@ where
 {
     // 1. Gather frame inputs, then drop the frame borrow so the body can take
     //    `&mut ctx`/`&mut evm` (disjoint field of the same `Evm`).
-    let (code, code_hash, calldata, contract, caller, value, is_static, gas_limit) = {
+    let (code, code_hash, calldata, contract, caller, value, is_static, gas_limit, opens_span) = {
         let frame = evm.inner.frame_stack.get();
         let code = frame.interpreter.bytecode.original_byte_slice().to_vec();
         let code_hash = keccak256(&code);
@@ -137,8 +137,17 @@ where
         let value = frame.interpreter.input.call_value;
         let is_static = frame.interpreter.runtime_flag.is_static;
         let gas_limit = frame.interpreter.gas.remaining();
+        // DELEGATECALL/CALLCODE run foreign code inside the caller's own frame,
+        // so nitro opens no reentrancy span for them (`PushContract`).
+        let opens_span = match &frame.input {
+            FrameInput::Call(inputs) => !matches!(
+                inputs.scheme,
+                CallScheme::DelegateCall | CallScheme::CallCode
+            ),
+            _ => true,
+        };
         (
-            code, code_hash, calldata, contract, caller, value, is_static, gas_limit,
+            code, code_hash, calldata, contract, caller, value, is_static, gas_limit, opens_span,
         )
     };
 
@@ -205,6 +214,13 @@ where
         .chain_mut()
         .set_stylus_pages_open(open.saturating_add(prepared.footprint));
 
+    // A program is reentrant when it already has a frame open — asked before
+    // this frame is counted (nitro `tx_processor.go:139`).
+    let reentrant = opens_span && evm.inner.ctx.chain().stylus_frame_is_open(contract);
+    if opens_span {
+        evm.inner.ctx.chain_mut().enter_stylus_frame(contract);
+    }
+
     // EvmData.block_number is the ArbOS-recorded L1 block number (what the
     // NUMBER opcode returns on Arbitrum, per PR #184's BLOCKHASH work), falling
     // back to the L2 number on a read error.
@@ -228,10 +244,18 @@ where
         module_hash: prepared.module_hash,
         msg_sender: caller,
         msg_value: value,
-        // TODO(Phase 4): nitro's paid gas price (GasPriceOp), not the raw tx price.
-        tx_gas_price: U256::from(evm.inner.ctx.tx().gas_price()),
+        // nitro passes `evm.TxContext.GasPrice` (`programs.go:279`), which geth
+        // fills with the effective price — *not* the ArbOS paid price that the
+        // GASPRICE opcode reports. revm's `gas_price()` is the 1559 max fee, so
+        // the effective price has to be derived here.
+        tx_gas_price: U256::from(
+            evm.inner
+                .ctx
+                .tx()
+                .effective_gas_price(evm.inner.ctx.block().basefee() as u128),
+        ),
         tx_origin: evm.inner.ctx.tx().caller(),
-        reentrant: 0, // TODO(Phase 3): depth-based reentrancy flag.
+        reentrant: reentrant as u32,
         cached: prepared.cached,
         tracing: false, // TODO(Phase 3/4): wire inspector tracing.
         version: prepared.version,
@@ -260,6 +284,9 @@ where
     // Release the footprint page reservation (nitro's deferred SetStylusPagesOpen);
     // the high-water `ever` set during the call is retained.
     evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
+    if opens_span {
+        evm.inner.ctx.chain_mut().exit_stylus_frame(contract);
+    }
 
     let outcome = match result {
         Ok(outcome) => outcome,

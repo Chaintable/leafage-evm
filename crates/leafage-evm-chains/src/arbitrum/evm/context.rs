@@ -28,6 +28,7 @@ pub struct ArbitrumExecutionContext {
     compiled_asm: HashMap<B256, Bytes>,
     stylus_pages_open: u16,
     stylus_pages_ever: u16,
+    open_stylus_frames: HashMap<Address, u32>,
 }
 
 impl ArbitrumExecutionContext {
@@ -103,6 +104,30 @@ impl ArbitrumExecutionContext {
     pub fn remaining_stylus_page_limit(&self, page_limit: u16) -> u16 {
         page_limit.saturating_sub(self.stylus_pages_open)
     }
+
+    /// Open Stylus frames for `address`, mirroring nitro's `TxProcessor.Programs`
+    /// counter (`arbos/tx_processor.go:46`). nitro counts every non-delegate
+    /// frame, but only ever queries the acting program's own address, and an
+    /// address holds exactly one kind of code — so counting that address's
+    /// Stylus frames is equivalent.
+    pub fn enter_stylus_frame(&mut self, address: Address) {
+        *self.open_stylus_frames.entry(address).or_insert(0) += 1;
+    }
+
+    pub fn exit_stylus_frame(&mut self, address: Address) {
+        if let Some(open) = self.open_stylus_frames.get_mut(&address) {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                self.open_stylus_frames.remove(&address);
+            }
+        }
+    }
+
+    /// nitro `reentrant := p.Programs[acting] > 1` (`tx_processor.go:139`), asked
+    /// before the frame being entered is counted.
+    pub fn stylus_frame_is_open(&self, address: Address) -> bool {
+        self.open_stylus_frames.contains_key(&address)
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +155,30 @@ mod tests {
         assert_eq!(context.stylus_pages_open(), 5);
         assert_eq!(context.remaining_stylus_page_limit(8), 3);
         assert_eq!(context.remaining_stylus_page_limit(4), 0);
+    }
+
+    #[test]
+    fn open_stylus_frames_answer_the_reentrancy_question() {
+        let mut context = ArbitrumExecutionContext::default();
+        let program = Address::with_last_byte(7);
+
+        assert!(!context.stylus_frame_is_open(program));
+        context.enter_stylus_frame(program);
+        // Entering again while the first frame is open is what nitro reports as
+        // reentrant; the flag is read before the new frame is counted.
+        assert!(context.stylus_frame_is_open(program));
+        context.enter_stylus_frame(program);
+
+        context.exit_stylus_frame(program);
+        assert!(
+            context.stylus_frame_is_open(program),
+            "the outer frame is still open"
+        );
+        context.exit_stylus_frame(program);
+        assert!(!context.stylus_frame_is_open(program));
+
+        // An unbalanced exit must not underflow into a permanently-open frame.
+        context.exit_stylus_frame(program);
+        assert!(!context.stylus_frame_is_open(program));
     }
 }
