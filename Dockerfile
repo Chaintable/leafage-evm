@@ -2,6 +2,15 @@
 
 ARG RUST_VERSION=1.93.0
 
+# libstylus.so, built from Chaintable/nitro and published as a COPY-only image.
+# Pinned to a revision on purpose: moduleHash and the FFI ABI are tied to the
+# nitro commit the library came from, so a floating tag would silently drift
+# activation results away from the writer. Bump this deliberately, together
+# with a re-verified Stylus diff.
+ARG LIBSTYLUS_REV=f7c0ab5
+
+FROM public.ecr.aws/b2h7a5c4/chaintable/libstylus:${LIBSTYLUS_REV} AS libstylus
+
 FROM rust:${RUST_VERSION}-bookworm AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -59,6 +68,12 @@ WORKDIR /app
 
 COPY --from=builder /out/leafage-evm /usr/local/bin/leafage-evm
 
-ENV RUST_LOG=info
+# The native Stylus runtime, dlopened on the first Stylus call. Without it the
+# Arbitrum EVM still dispatches on the 0xEFF0 prefix but has no runtime to hand
+# the WASM to, so those calls come back as a revert instead of executing.
+COPY --from=libstylus /libstylus.so /usr/local/lib/libstylus.so
+
+ENV RUST_LOG=info \
+    LEAFAGE_ARB_STYLUS_LIB=/usr/local/lib/libstylus.so
 
 ENTRYPOINT ["/usr/local/bin/leafage-evm"]
