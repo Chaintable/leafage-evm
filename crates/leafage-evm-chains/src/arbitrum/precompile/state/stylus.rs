@@ -167,39 +167,62 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         &mut self,
         account: Address,
     ) -> Result<B256, PrecompileError> {
-        self.context
-            .journal_mut()
-            .load_account(account)
-            .map(|account| {
-                if account.data.is_selfdestructed() {
-                    KECCAK_EMPTY
-                } else {
-                    account.data.info.code_hash
-                }
-            })
-            .map_err(fatal_db_error)
+        // Nitro's StateDB.GetCodeHash does not add the account to the EIP-2929
+        // access list. Revert the journal entry created by revm's account load
+        // so activation does not make the following program call warm.
+        let checkpoint = self.context.journal_mut().checkpoint();
+        let result = {
+            self.context
+                .journal_mut()
+                .load_account(account)
+                .map(|account| {
+                    if account.data.is_selfdestructed() {
+                        KECCAK_EMPTY
+                    } else {
+                        account
+                            .data
+                            .info
+                            .code
+                            .as_ref()
+                            .map(|code| code.hash_slow())
+                            .unwrap_or(account.data.info.code_hash)
+                    }
+                })
+        };
+        self.context.journal_mut().checkpoint_revert(checkpoint);
+        result.map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn account_code_and_hash(
         &mut self,
         account: Address,
     ) -> Result<(Bytes, B256), PrecompileError> {
-        let loaded = self
-            .context
-            .journal_mut()
-            .load_account_with_code(account)
-            .map_err(fatal_db_error)?;
-        if loaded.data.is_selfdestructed() {
+        // Nitro's StateDB.GetCode/GetCodeHash reads do not warm the program
+        // account. Keep revm's loaded code, but roll back its access-list side
+        // effect before returning the owned values.
+        let checkpoint = self.context.journal_mut().checkpoint();
+        let result = {
+            self.context
+                .journal_mut()
+                .load_account_with_code(account)
+                .map(|loaded| {
+                    let is_selfdestructed = loaded.data.is_selfdestructed();
+                    let (code, code_hash) = loaded
+                        .data
+                        .info
+                        .code
+                        .as_ref()
+                        .map(|code| (code.original_bytes(), code.hash_slow()))
+                        .unwrap_or((Bytes::new(), loaded.data.info.code_hash));
+                    (code, code_hash, is_selfdestructed)
+                })
+        };
+        self.context.journal_mut().checkpoint_revert(checkpoint);
+
+        let (code, code_hash, is_selfdestructed) = result.map_err(fatal_db_error)?;
+        if is_selfdestructed {
             return Err(PrecompileError::other("self destructed"));
         }
-        let code_hash = loaded.data.info.code_hash;
-        let code = loaded
-            .data
-            .info
-            .code
-            .as_ref()
-            .map(|code| code.original_bytes())
-            .unwrap_or_default();
         Ok((code, code_hash))
     }
 

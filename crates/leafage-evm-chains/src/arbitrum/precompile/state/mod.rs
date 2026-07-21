@@ -536,9 +536,11 @@ mod tests {
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use leafage_evm_types::{BlockEnv, CfgEnv};
+    use revm::bytecode::Bytecode;
     use revm::context::JournalTr;
     use revm::database::EmptyDB;
     use revm::database::in_memory_db::CacheDB;
+    use revm::state::AccountInfo;
     use revm::{Context, MainContext};
 
     fn context_without_loaded_account(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
@@ -623,7 +625,12 @@ mod tests {
         let recipient = Address::with_last_byte(2);
 
         with_failing_storage(|storage| {
+            assert_db_failure_is_fatal(storage.account_code_hash(account));
+            assert_eq!(storage.context.journal().depth(), 0);
+        });
+        with_failing_storage(|storage| {
             assert_db_failure_is_fatal(storage.account_code_and_hash(account));
+            assert_eq!(storage.context.journal().depth(), 0);
         });
         with_failing_storage(|storage| {
             assert_db_failure_is_fatal(storage.read(&[], 0));
@@ -634,6 +641,58 @@ mod tests {
         with_failing_storage(|storage| {
             assert_db_failure_is_fatal(storage.transfer_balance(account, recipient, U256::ONE));
         });
+    }
+
+    #[test]
+    fn stylus_program_code_reads_preserve_account_warmth() {
+        let account = Address::with_last_byte(1);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x60, 0x00]));
+        let code_hash = code.hash_slow();
+        let stale_code_hash = B256::with_last_byte(0xff);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            account,
+            AccountInfo {
+                // State overrides can replace code while retaining the prior
+                // account hash. Nitro's SetCode keeps these values in sync.
+                code_hash: stale_code_hash,
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv::default())
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(db)
+            .with_chain(ArbitrumExecutionContext::default());
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+
+        assert!(!storage.account_is_warm(account));
+        assert_eq!(
+            storage.account_code_hash(account).expect("read code hash"),
+            code_hash
+        );
+        assert!(!storage.account_is_warm(account));
+        assert_eq!(
+            storage
+                .account_code_and_hash(account)
+                .expect("read code and hash"),
+            (Bytes::from_static(&[0x60, 0x00]), code_hash)
+        );
+        assert!(!storage.account_is_warm(account));
+
+        storage
+            .context
+            .journal_mut()
+            .load_account(account)
+            .expect("warm account");
+        assert!(storage.account_is_warm(account));
+        storage.account_code_hash(account).expect("read code hash");
+        storage
+            .account_code_and_hash(account)
+            .expect("read code and hash");
+        assert!(storage.account_is_warm(account));
     }
 
     #[test]
