@@ -5,15 +5,17 @@
 //! journal commit/revert, `CallOutcome` wrapping, and parent gas/return wiring
 //! stay identical to an EVM callee. See `docs/stylus-execution-impl-plan.md`.
 //!
-//! Verification status: dispatch, decode, compile, execute, the full hostio
-//! set, and subcall/create driving are wired. Exact gas is in place for the
-//! memory model (nitro table), storage/account access + SSTORE refund (revm
-//! GasParams), init/cached cost, and the L1 block-number EvmData field.
-//! The hostio *response* encodings are aligned with nitro and unit-pinned.
-//! **Gas/trace parity is still NOT verified end to end** and the following stay
-//! approximate: capture-hostio (14), RecentWasms (strategy A only), and
-//! enforceStylusPageLimit. All are TODO(Phase 4) and must be diffed against a
-//! writer / Arb One traced RPC before shipping.
+//! Verified gas-for-gas against the Arb One writer: dispatch, native-asm
+//! compile, the pre-charge, read_args, storage and transient-storage hostios,
+//! keccak, subcalls (including the call tree), successful returns, program
+//! panics and pre-charge-only reverts.
+//!
+//! Not yet exercised against a writer: create, logs, and account access — Arb
+//! One has very few Stylus programs and none reached those paths.
+//!
+//! Two things are deliberately absent rather than pending:
+//! - `RecentWasms` cannot be mirrored here at all; see the pre-charge.
+//! - `CaptureHostIO` (request 14) stays a no-op; see the hostio dispatch.
 
 use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::ArbStateReader;
@@ -319,7 +321,9 @@ where
         tx_origin: evm.inner.ctx.tx().caller(),
         reentrant: reentrant as u32,
         cached: prepared.cached,
-        tracing: false, // TODO(Phase 3/4): wire inspector tracing.
+        // Left false on purpose: it only makes the runtime emit CaptureHostIO,
+        // which nothing here consumes. See the hostio dispatch.
+        tracing: false,
         version: prepared.version,
         max_depth: prepared.max_stack_depth,
         ink_price: prepared.ink_price,
@@ -616,8 +620,15 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> HostioHandler
             11 => self.account_code(input),
             12 => self.account_code_hash(input),
             13 => self.add_pages(input),
-            // TODO(Phase 3/4): 7-8 create (needs CreateInputs driving), 14
-            //   capture-hostio (tracing).
+            // 14 is CaptureHostIO, which reports every hostio to an
+            // opcode-level tracer — nitro turns those into synthetic EVM
+            // opcodes for structLogger. leafage exposes no opcode-level trace
+            // (`debug_traceCall` and `trace_call` are not served; pre_traceMany
+            // and simulateTransactions are call-level, and their subcall frames
+            // come from the inspected frame driver, not from here), so nothing
+            // would read the output. `EvmData.tracing` is left false, which
+            // stops the runtime from ever sending this request — and also skips
+            // its ink sampling and calldata clones. This arm is just a guard.
             _ => (Vec::new(), Vec::new(), 0),
         }
     }
