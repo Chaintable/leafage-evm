@@ -9,11 +9,12 @@
 //! set, and subcall/create driving are wired. Exact gas is in place for the
 //! memory model (nitro table), storage/account access + SSTORE refund (revm
 //! GasParams), init/cached cost, and the L1 block-number EvmData field.
+//! The hostio *response* encodings are aligned with nitro and unit-pinned.
 //! **Gas/trace parity is still NOT verified end to end** and the following stay
-//! approximate: subcall/create base cost + status encoding, capture-hostio (14),
-//! reentrant flag, paid-gas-price EvmData field, RecentWasms (strategy A only),
-//! and enforceStylusPageLimit. All are TODO(Phase 4) and must be diffed against
-//! a writer / Arb One traced RPC before shipping.
+//! approximate: subcall/create base cost, setTrieSlots' gas budget,
+//! capture-hostio (14), reentrant flag, paid-gas-price EvmData field, RecentWasms
+//! (strategy A only), and enforceStylusPageLimit. All are TODO(Phase 4) and must
+//! be diffed against a writer / Arb One traced RPC before shipping.
 
 use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::ArbStateReader;
@@ -49,6 +50,19 @@ pub(super) fn is_stylus_code(code: &[u8]) -> bool {
             || code.starts_with(STYLUS_FRAGMENT_PREFIX)
             || code.starts_with(STYLUS_ROOT_PREFIX))
 }
+
+/// nitro `apiStatus` (`arbos/programs/api.go:48`). This encoding is used by
+/// SetTrieSlots(1) and SetTransientBytes32(3) only — `contract_call` answers
+/// with a `UserOutcomeKind` byte and `create` with a success flag, so the three
+/// are not interchangeable.
+const API_STATUS_SUCCESS: u8 = 0;
+const API_STATUS_FAILURE: u8 = 1;
+const API_STATUS_WRITE_PROTECTION: u8 = 3;
+
+/// Error strings for the requests that answer with a Go `error.Error()` string
+/// (EmitLog, Create). `write protection` matches geth's `ErrWriteProtection`.
+const WRITE_PROTECTION_ERROR: &[u8] = b"write protection";
+const MALFORMED_REQUEST_ERROR: &[u8] = b"malformed request";
 
 /// nitro `Program::initGas`: `MinInitGas*128 + ceil(initCost*InitCostScalar*2/100)`.
 fn init_gas(program: &PreparedStylusProgram) -> u64 {
@@ -343,6 +357,15 @@ where
     }
 }
 
+/// A `0x00`-led create response: the remaining bytes are an error string that
+/// aborts the calling program (`arbutil` `req.rs:88-96`).
+fn create_error(message: &[u8]) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(1 + message.len());
+    resp.push(0);
+    resp.extend_from_slice(message);
+    resp
+}
+
 /// Services a Stylus program's hostio requests against revm state. Holds
 /// `&mut ArbitrumEvm` so subcalls can drive child frames on the shared stack.
 struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
@@ -423,9 +446,14 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), cost)
     }
 
+    /// TODO(Phase 4): nitro checks each slot's cost against the request's
+    /// gasLeft header *before* writing it and answers `OutOfGas` once the
+    /// budget is spent (`api.go:82-118`). Doing that here means computing the
+    /// SSTORE cost before `journal.sstore` commits the value, so it is left to
+    /// the gas-alignment pass rather than bolted on here.
     fn set_trie_slots(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if self.is_static {
-            return (vec![3], Vec::new(), 0); // WriteProtection
+            return (vec![API_STATUS_WRITE_PROTECTION], Vec::new(), 0);
         }
         let contract = self.contract;
         let mut cost = 0u64;
@@ -444,11 +472,11 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
                     self.refund += self.gas_params.sstore_refund(true, &load.data);
                     cost = cost.saturating_add(slot_cost);
                 }
-                Err(_) => return (vec![1], Vec::new(), cost), // Failure
+                Err(_) => return (vec![API_STATUS_FAILURE], Vec::new(), cost),
             }
             offset += 64;
         }
-        (vec![0], Vec::new(), cost) // Success
+        (vec![API_STATUS_SUCCESS], Vec::new(), cost)
     }
 
     fn get_transient(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
@@ -461,15 +489,20 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), 0)
     }
 
+    /// Answers with an `apiStatus` byte; an empty response makes the Rust side
+    /// fail the whole program with "empty result!" (`arbutil` `req.rs:174`).
     fn set_transient(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
-        if self.is_static || input.len() < 64 {
-            return (Vec::new(), Vec::new(), 0);
+        if self.is_static {
+            return (vec![API_STATUS_WRITE_PROTECTION], Vec::new(), 0);
+        }
+        if input.len() < 64 {
+            return (vec![API_STATUS_FAILURE], Vec::new(), 0);
         }
         let key = U256::from_be_slice(&input[..32]);
         let value = U256::from_be_slice(&input[32..64]);
         let contract = self.contract;
         self.ctx().journal_mut().tstore(contract, key, value);
-        (Vec::new(), Vec::new(), 0)
+        (vec![API_STATUS_SUCCESS], Vec::new(), 0)
     }
 
     /// ContractCall / DelegateCall / StaticCall: `addr[20] ++ value[32] ++
@@ -546,14 +579,20 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
     /// TODO(Phase 4): exact create gas (CreateGas + keccak word cost for CREATE2)
     /// and the precise error-response encoding — diff against writer.
     fn create(&mut self, input: &[u8], is_create2: bool) -> (Vec<u8>, Vec<u8>, u64) {
-        if self.is_static {
-            return (vec![0u8], Vec::new(), 0);
-        }
         let header = if is_create2 { 72 } else { 40 };
-        if input.len() < header {
-            return (vec![0u8], Vec::new(), 0);
+        // The requested gas doubles as the cost charged on the refusal paths,
+        // where nitro burns the whole budget (`api.go:425`).
+        let gas = if input.len() >= 8 {
+            u64::from_be_bytes(input[0..8].try_into().unwrap())
+        } else {
+            0
+        };
+        if self.is_static {
+            return (create_error(WRITE_PROTECTION_ERROR), Vec::new(), gas);
         }
-        let gas = u64::from_be_bytes(input[0..8].try_into().unwrap());
+        if input.len() < header {
+            return (create_error(MALFORMED_REQUEST_ERROR), Vec::new(), gas);
+        }
         let endowment = U256::from_be_slice(&input[8..40]);
         let scheme = if is_create2 {
             CreateScheme::Create2 {
@@ -569,30 +608,40 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             Some(FrameResult::Create(outcome)) => {
                 let returned = outcome.gas().remaining();
                 let cost = gas.saturating_sub(returned);
-                match (outcome.instruction_result().is_ok(), outcome.address) {
-                    (true, Some(addr)) => {
-                        let mut resp = Vec::with_capacity(21);
-                        resp.push(1);
-                        resp.extend_from_slice(addr.as_slice());
-                        (resp, outcome.output().to_vec(), cost)
-                    }
-                    _ => (vec![0u8], outcome.output().to_vec(), cost),
-                }
+                // A failed deploy still answers "success" carrying the zero
+                // address, exactly as the EVM's CREATE pushes 0 on failure.
+                let address = outcome.address.unwrap_or(Address::ZERO);
+                let mut resp = Vec::with_capacity(21);
+                resp.push(1);
+                resp.extend_from_slice(address.as_slice());
+                // Return data survives a revert only (nitro `api.go:257-258`).
+                let output = if matches!(outcome.instruction_result(), InstructionResult::Revert) {
+                    outcome.output().to_vec()
+                } else {
+                    Vec::new()
+                };
+                (resp, output, cost)
             }
-            _ => (vec![0u8], Vec::new(), gas),
+            _ => (create_error(b"create frame failed"), Vec::new(), gas),
         }
     }
 
     /// EmitLog: `topics[4] ++ topic[32]*n ++ data`. Gas is charged Rust-side
     /// (`pay_for_evm_log`), so the wire cost is 0.
+    /// An *empty* response means success here; any non-empty response is read as
+    /// an error string and fails the program (`arbutil` `req.rs:266`) — the
+    /// inverse of the `apiStatus` convention.
     fn emit_log(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
-        if self.is_static || input.len() < 4 {
-            return (Vec::new(), Vec::new(), 0);
+        if self.is_static {
+            return (WRITE_PROTECTION_ERROR.to_vec(), Vec::new(), 0);
+        }
+        if input.len() < 4 {
+            return (MALFORMED_REQUEST_ERROR.to_vec(), Vec::new(), 0);
         }
         let num_topics = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let topics_end = 4 + num_topics * 32;
         if input.len() < topics_end {
-            return (Vec::new(), Vec::new(), 0);
+            return (MALFORMED_REQUEST_ERROR.to_vec(), Vec::new(), 0);
         }
         let topics = (0..num_topics)
             .map(|i| B256::from_slice(&input[4 + i * 32..4 + (i + 1) * 32]))
@@ -666,7 +715,101 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stylus_code, memory_exp, memory_gas_cost};
+    use super::*;
+    use crate::arbitrum::evm::ArbitrumExecutionContext;
+    use crate::arbitrum::hardforks::ArbitrumHardfork;
+    use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
+    use leafage_evm_types::{BlockEnv, CfgEnv};
+    use revm::database::{in_memory_db::CacheDB, EmptyDB};
+
+    type TestDb = CacheDB<EmptyDB>;
+
+    fn test_evm() -> ArbitrumEvm<TestDb, ()> {
+        ArbitrumEvm::new(
+            BlockEnv::default(),
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            CacheDB::new(EmptyDB::default()),
+            (),
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        )
+    }
+
+    fn test_hostio(evm: &mut ArbitrumEvm<TestDb, ()>, is_static: bool) -> StylusHostio<'_, TestDb, ()> {
+        let gas_params = evm.inner.ctx.cfg().gas_params().clone();
+        StylusHostio {
+            evm,
+            contract: Address::ZERO,
+            is_static,
+            delegate_caller: Address::ZERO,
+            delegate_value: U256::ZERO,
+            free_pages: 2,
+            page_gas: 1000,
+            gas_params,
+            refund: 0,
+        }
+    }
+
+    #[test]
+    fn transient_store_always_answers_with_a_status_byte() {
+        // An empty response makes the Stylus runtime abort the whole program
+        // with "empty result!" (`arbutil` req.rs:174), so every path answers.
+        let mut evm = test_evm();
+        let (response, raw, cost) = test_hostio(&mut evm, false).set_transient(&[7u8; 64]);
+        assert_eq!(response, vec![API_STATUS_SUCCESS]);
+        assert!(raw.is_empty());
+        assert_eq!(cost, 0);
+
+        let mut evm = test_evm();
+        let (response, _, _) = test_hostio(&mut evm, true).set_transient(&[7u8; 64]);
+        assert_eq!(response, vec![API_STATUS_WRITE_PROTECTION]);
+
+        let mut evm = test_evm();
+        let (response, _, _) = test_hostio(&mut evm, false).set_transient(&[0u8; 8]);
+        assert_eq!(response, vec![API_STATUS_FAILURE]);
+    }
+
+    #[test]
+    fn emit_log_answers_empty_on_success_and_an_error_string_otherwise() {
+        // Inverse of the status-byte convention: empty means success, and any
+        // non-empty response is read as an error string (`req.rs:266`).
+        let mut input = 0u32.to_be_bytes().to_vec(); // zero topics
+        input.extend_from_slice(b"payload");
+
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, false).emit_log(&input);
+        assert!(response.is_empty(), "success must answer empty");
+        assert_eq!(cost, 0, "log gas is charged runtime-side");
+
+        let mut evm = test_evm();
+        let (response, _, _) = test_hostio(&mut evm, true).emit_log(&input);
+        assert_eq!(response, WRITE_PROTECTION_ERROR);
+
+        let mut evm = test_evm();
+        let (response, _, _) = test_hostio(&mut evm, false).emit_log(&[0u8; 2]);
+        assert_eq!(response, MALFORMED_REQUEST_ERROR);
+    }
+
+    #[test]
+    fn create_refusals_are_error_strings_that_burn_the_budget() {
+        // Only the paths nitro refuses outright answer with a 0-led error
+        // string; a failed deploy instead reports the zero address so the
+        // program keeps running (covered by writer diffing, not here).
+        let mut input = 4_242u64.to_be_bytes().to_vec();
+        input.extend_from_slice(&[0u8; 32]); // endowment
+
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, true).create(&input, false);
+        assert_eq!(response[0], 0);
+        assert_eq!(&response[1..], WRITE_PROTECTION_ERROR);
+        assert_eq!(cost, 4_242, "nitro burns the requested gas on refusal");
+
+        let mut evm = test_evm();
+        let (response, _, cost) = test_hostio(&mut evm, false).create(&input, true);
+        assert_eq!(response[0], 0, "a create2 request is short of its salt");
+        assert_eq!(&response[1..], MALFORMED_REQUEST_ERROR);
+        assert_eq!(cost, 4_242);
+    }
 
     #[test]
     fn memory_model_matches_nitro() {
