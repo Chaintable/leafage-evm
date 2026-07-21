@@ -17,7 +17,7 @@
 //! ```
 
 use crate::arbitrum::arbos_state::ArbPricing;
-use alloy::primitives::{keccak256, U256};
+use alloy::primitives::{U256, keccak256};
 use alloy_rlp::Encodable;
 use once_cell::sync::Lazy;
 use revm::context::TxEnv;
@@ -396,7 +396,10 @@ mod tests {
         let padded_cost =
             p.pad_estimation_cost(p.price_per_unit * U256::from(estimate.calldata_units));
         let adjusted_price = paid * U256::from(7u64) / U256::from(8u64); // above the floor
-        assert_eq!(U256::from(estimate.poster_gas), padded_cost / adjusted_price);
+        assert_eq!(
+            U256::from(estimate.poster_gas),
+            padded_cost / adjusted_price
+        );
         assert!(estimate.poster_gas > call.poster_gas);
     }
 

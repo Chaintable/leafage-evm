@@ -4850,6 +4850,7 @@ dependencies = [
  "k256",
  "leafage-evm-types",
  "libloading",
+ "moka",
  "once_cell",
  "p256 0.13.2",
  "parity-bytes",
@@ -4861,6 +4862,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tendermint",
+ "tracing",
 ]
 
 [[package]]

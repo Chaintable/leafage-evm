@@ -1,16 +1,21 @@
 use super::abi::IArbWasm;
 use super::state::{ArbStorage, StylusParams, StylusProgramError, WasmActivation, WasmProgram};
-use super::stylus_dictionary::{program_dictionary_owned, PROGRAM_DICTIONARY_ID};
+use super::stylus_dictionary::{PROGRAM_DICTIONARY_ID, program_dictionary_owned};
 use super::stylus_runtime::{ActivatedWasm, StylusRuntime, StylusRuntimeError};
 use super::util::{dispatch, empty_revert, finish_call};
-use super::{ArbPrecompileInput, ArbitrumContext, ARB_WASM_ADDRESS};
+use super::{ARB_WASM_ADDRESS, ArbPrecompileInput, ArbitrumContext};
 use crate::arbitrum::arbos_state;
-use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
+use crate::arbitrum::stylus_prefix::{
+    ARBOS_VERSION_STYLUS, ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_FRAGMENT_PREFIX,
+    has_stylus_prefix, is_stylus_classic, is_stylus_fragment, is_stylus_root,
+};
+use alloy::primitives::{Address, B256, Bytes, Log, U256, keccak256};
 use alloy::sol_types::{SolError, SolValue};
-use revm::context::ContextTr;
+use revm::Database;
+use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::{Block, Cfg};
 use revm::precompile::{PrecompileError, PrecompileResult};
-use revm::Database;
+use revm::primitives::KECCAK_EMPTY;
 use std::io::{Cursor, Read};
 
 const PAGE_RAMP: u64 = 620_674_314;
@@ -25,27 +30,24 @@ const LOG_GAS: u64 = 375;
 const LOG_TOPIC_GAS: u64 = 375;
 const LOG_DATA_GAS: u64 = 8;
 const ACTIVATION_FIXED_GAS: u64 = 1_659_168;
-const ARBOS_VERSION_STYLUS: u64 = 30;
 const ARBOS_VERSION_STYLUS_CHARGING_FIXES: u64 = 32;
 const ARBOS_VERSION_WASM_ACTIVATION_GAS: u64 = 59;
-const ARBOS_VERSION_STYLUS_CONTRACT_LIMIT: u64 = 60;
-const STYLUS_CLASSIC_PREFIX: &[u8] = &[0xef, 0xf0, 0x00];
-const STYLUS_FRAGMENT_PREFIX: &[u8] = &[0xef, 0xf0, 0x01];
-const STYLUS_ROOT_PREFIX: &[u8] = &[0xef, 0xf0, 0x02];
 const STYLUS_HEADER_LEN: usize = 4;
 const STYLUS_EMPTY_DICTIONARY: u8 = 0;
 const STYLUS_PROGRAM_DICTIONARY: u8 = PROGRAM_DICTIONARY_ID;
 
-/// Consensus inputs for executing a Stylus program: on-chain wasm (decoded) +
-/// Programs metadata + StylusParams. Plain fields so the frame seam in `evm/`
-/// needs no visibility into the `pub(in precompile)` state types.
+/// Programs metadata and Stylus parameters needed before execution. The
+/// on-chain wasm is intentionally decoded later, only on a native-asm cache
+/// miss. Plain fields keep the frame seam in `evm/` independent of the
+/// `pub(in precompile)` state types.
 pub(crate) struct PreparedStylusProgram {
-    pub wasm: Vec<u8>,
     pub module_hash: B256,
     pub arbos_version: u64,
     pub version: u16,
+    pub max_wasm_size: u32,
     pub max_stack_depth: u32,
     pub ink_price: u32,
+    pub block_cache_size: u16,
     pub footprint: u16,
     pub free_pages: u16,
     pub page_gas: u16,
@@ -68,6 +70,12 @@ struct StylusRoot {
     fragments: Vec<Address>,
 }
 
+enum ExecutionCodeSource {
+    Ready(Bytes),
+    Hash(B256),
+    Unloaded,
+}
+
 #[derive(Debug)]
 enum ArbWasmError {
     Precompile(PrecompileError),
@@ -77,6 +85,21 @@ enum ArbWasmError {
     ProgramNotWasm,
     ProgramUpToDate,
     ProgramInsufficientValue { have: U256, want: U256 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationRuntimeDisposition {
+    ProgramActivation,
+    Revert,
+    Infrastructure,
+}
+
+fn activation_runtime_disposition(error: &StylusRuntimeError) -> ActivationRuntimeDisposition {
+    match error {
+        StylusRuntimeError::Activation { .. } => ActivationRuntimeDisposition::ProgramActivation,
+        StylusRuntimeError::OutOfStack => ActivationRuntimeDisposition::Revert,
+        _ => ActivationRuntimeDisposition::Infrastructure,
+    }
 }
 
 impl From<PrecompileError> for ArbWasmError {
@@ -290,7 +313,7 @@ impl ArbWasm {
             return Err(ArbWasmError::ProgramUpToDate);
         }
 
-        let wasm = Self::decode_stylus_wasm(storage, params, &code)?;
+        let wasm = Self::decode_stylus_wasm_for_activation(storage, params, &code)?;
 
         let activated = Self::activate_program_runtime(storage, program, code_hash, &wasm, params)?;
         let ret = Self::finish_activation(
@@ -497,9 +520,20 @@ impl ArbWasm {
             ArbWasmError::Precompile(error)
             | ArbWasmError::Program(StylusProgramError::Precompile(error)) => Err(error),
             ArbWasmError::ActivationRuntime(error) => {
-                let _ = error.message();
-                storage.burn_out();
-                Self::empty_revert(gas_limit, gas_limit)
+                let message = error.message();
+                match activation_runtime_disposition(&error) {
+                    ActivationRuntimeDisposition::ProgramActivation => {
+                        storage.burn_out();
+                        Err(PrecompileError::other(message))
+                    }
+                    ActivationRuntimeDisposition::Revert => {
+                        storage.burn_out();
+                        Self::empty_revert(gas_limit, gas_limit)
+                    }
+                    ActivationRuntimeDisposition::Infrastructure => {
+                        Err(PrecompileError::Fatal(message))
+                    }
+                }
             }
             ArbWasmError::NonSolidityError => Self::empty_revert(gas_limit, storage.gas_used),
             ArbWasmError::Program(StylusProgramError::ProgramNotActivated) => {
@@ -614,32 +648,44 @@ impl ArbWasm {
             .saturating_sub(activated_at)
     }
 
-    /// Reads Programs state + decodes on-chain wasm for a Stylus call. Returns
-    /// `None` when the program is not an up-to-date activated Stylus program
-    /// (the caller reverts). Consensus reads are unmetered here (`gas` = MAX);
-    /// the frame seam applies the real gas pre-charge separately.
-    ///
-    /// TODO(Phase 4): distinguish revert (not-activated / expired) from
-    /// out-of-gas and thread the exact read gas, matching nitro `getActiveProgram`.
+    /// Reads the current ArbOS version without erasing a database error.
+    pub(crate) fn arbos_version_for_execution<DB: Database>(
+        context: &mut ArbitrumContext<DB>,
+    ) -> Result<u64, DB::Error> {
+        ArbStorage::new_with_initial_gas(context, u64::MAX, 0).arbos_version_concrete()
+    }
+
+    /// Reads Programs metadata for a Stylus call. The on-chain wasm is decoded
+    /// only on a native-asm cache miss, matching nitro `getCompiledProgram`.
+    /// `Ok(None)` means inactive, stale, or expired; the execution layer maps
+    /// it to Nitro's exceptional child failure. Database failures retain their
+    /// concrete error type.
     pub(crate) fn prepare_stylus_program<DB: Database>(
         context: &mut ArbitrumContext<DB>,
         code_hash: B256,
-        code: &[u8],
         timestamp: u64,
-    ) -> Option<PreparedStylusProgram> {
+        arbos_version: u64,
+    ) -> Result<Option<PreparedStylusProgram>, DB::Error> {
         let mut storage = ArbStorage::new_with_initial_gas(context, u64::MAX, 0);
-        let arbos_version = storage.arbos_version().ok()?;
-        let params = storage.stylus_params().ok()?;
-        let program = storage.active_wasm_program(code_hash, timestamp, params).ok()?;
-        let module_hash = storage.wasm_module_hash(code_hash).ok()?;
-        let wasm = Self::decode_stylus_wasm(&mut storage, params, code).ok()?;
-        Some(PreparedStylusProgram {
-            wasm,
+        let params = storage.stylus_params_concrete(arbos_version)?;
+        let program = storage.wasm_program_concrete(code_hash)?;
+        let age = timestamp.saturating_sub(
+            ARBITRUM_START_TIME
+                .saturating_add(u64::from(program.activated_at).saturating_mul(3600)),
+        );
+        let expiry = u64::from(params.expiry_days).saturating_mul(24 * 60 * 60);
+        if program.version == 0 || program.version != params.version || age > expiry {
+            return Ok(None);
+        }
+        let module_hash = storage.wasm_module_hash_concrete(code_hash)?;
+        Ok(Some(PreparedStylusProgram {
             module_hash,
             arbos_version,
             version: params.version,
+            max_wasm_size: params.max_wasm_size,
             max_stack_depth: params.max_stack_depth,
             ink_price: params.ink_price,
+            block_cache_size: params.block_cache_size,
             footprint: program.footprint,
             free_pages: params.free_pages,
             page_gas: params.page_gas,
@@ -651,10 +697,10 @@ impl ArbWasm {
             min_cached_init_gas: params.min_cached_init_gas,
             init_cost_scalar: params.init_cost_scalar,
             cached_cost_scalar: params.cached_cost_scalar,
-        })
+        }))
     }
 
-    fn decode_stylus_wasm<DB: Database>(
+    fn decode_stylus_wasm_for_activation<DB: Database>(
         storage: &mut ArbStorage<'_, ArbitrumContext<DB>>,
         params: StylusParams,
         code: &[u8],
@@ -662,7 +708,7 @@ impl ArbWasm {
         if code.is_empty() {
             return Err(ArbWasmError::ProgramNotWasm);
         }
-        if Self::has_stylus_prefix(code, STYLUS_CLASSIC_PREFIX) {
+        if is_stylus_classic(code) {
             return Self::check_classic_stylus_code(code, params.max_wasm_size);
         }
 
@@ -671,17 +717,52 @@ impl ArbWasm {
             return Err(ArbWasmError::NonSolidityError);
         }
 
-        if Self::has_stylus_prefix(code, STYLUS_ROOT_PREFIX) {
+        if is_stylus_root(code) {
             return Self::check_stylus_root(storage, code, params);
         }
-        if Self::has_stylus_prefix(code, STYLUS_FRAGMENT_PREFIX) {
+        if is_stylus_fragment(code) {
             return Err(ArbWasmError::NonSolidityError);
         }
         Err(ArbWasmError::ProgramNotWasm)
     }
 
-    fn has_stylus_prefix(code: &[u8], prefix: &[u8]) -> bool {
-        code.len() > prefix.len() && code.starts_with(prefix)
+    /// Decodes wasm for active execution without charging or warming fragment
+    /// addresses. Root activation limits are intentionally omitted here:
+    /// nitro enforces them only when a fragment read charger is present.
+    pub(crate) fn decode_stylus_wasm_for_execution<DB: Database>(
+        context: &mut ArbitrumContext<DB>,
+        code: &[u8],
+        max_wasm_size: u32,
+        arbos_version: u64,
+    ) -> Result<Option<Vec<u8>>, DB::Error> {
+        if is_stylus_classic(code) {
+            return Ok(Self::check_classic_stylus_code(code, max_wasm_size).ok());
+        }
+        if arbos_version < ARBOS_VERSION_STYLUS_CONTRACT_LIMIT || !is_stylus_root(code) {
+            return Ok(None);
+        }
+
+        let root = match Self::parse_stylus_root_inner(code, None) {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
+        let compressed = match Self::read_stylus_fragments_for_execution(context, &root.fragments)?
+        {
+            Some(compressed) => compressed,
+            None => return Ok(None),
+        };
+        if Self::check_stylus_dictionary(root.dictionary).is_err() {
+            return Ok(None);
+        }
+        let wasm = match Self::decompress_stylus_payload(
+            &compressed,
+            root.dictionary,
+            root.decompressed_len,
+        ) {
+            Ok(wasm) => wasm,
+            Err(_) => return Ok(None),
+        };
+        Ok((wasm.len() == root.decompressed_len as usize).then_some(wasm))
     }
 
     fn check_stylus_root<DB: Database>(
@@ -702,6 +783,13 @@ impl ArbWasm {
     }
 
     fn parse_stylus_root(code: &[u8], params: StylusParams) -> Result<StylusRoot, ArbWasmError> {
+        Self::parse_stylus_root_inner(code, Some(params))
+    }
+
+    fn parse_stylus_root_inner(
+        code: &[u8],
+        activation_params: Option<StylusParams>,
+    ) -> Result<StylusRoot, ArbWasmError> {
         if code.len() < 8 {
             return Err(ArbWasmError::NonSolidityError);
         }
@@ -713,11 +801,13 @@ impl ArbWasm {
         }
 
         let fragment_count = address_bytes / 20;
-        if decompressed_len > params.max_wasm_size {
-            return Err(ArbWasmError::NonSolidityError);
-        }
-        if fragment_count > usize::from(params.max_fragment_count) {
-            return Err(ArbWasmError::NonSolidityError);
+        if let Some(params) = activation_params {
+            if decompressed_len > params.max_wasm_size {
+                return Err(ArbWasmError::NonSolidityError);
+            }
+            if fragment_count > usize::from(params.max_fragment_count) {
+                return Err(ArbWasmError::NonSolidityError);
+            }
         }
         if fragment_count == 0 {
             return Err(ArbWasmError::NonSolidityError);
@@ -751,6 +841,69 @@ impl ArbWasm {
         Ok(compressed)
     }
 
+    fn read_stylus_fragments_for_execution<DB: Database>(
+        context: &mut ArbitrumContext<DB>,
+        fragments: &[Address],
+    ) -> Result<Option<Vec<u8>>, DB::Error> {
+        let mut compressed = Vec::new();
+        for fragment in fragments {
+            let code = Self::account_code_without_warming(context, *fragment)?;
+            let Some(payload) = code.strip_prefix(STYLUS_FRAGMENT_PREFIX) else {
+                return Ok(None);
+            };
+            if payload.is_empty() {
+                return Ok(None);
+            }
+            compressed.extend_from_slice(payload);
+        }
+        Ok(Some(compressed))
+    }
+
+    fn account_code_without_warming<DB: Database>(
+        context: &mut ArbitrumContext<DB>,
+        address: Address,
+    ) -> Result<Bytes, DB::Error> {
+        let source = match context.journal().state.get(&address) {
+            Some(account) if account.is_selfdestructed() => {
+                ExecutionCodeSource::Ready(Bytes::new())
+            }
+            Some(account) => match &account.info.code {
+                Some(code) => ExecutionCodeSource::Ready(code.original_bytes()),
+                None => ExecutionCodeSource::Hash(account.info.code_hash),
+            },
+            None => ExecutionCodeSource::Unloaded,
+        };
+
+        match source {
+            ExecutionCodeSource::Ready(code) => Ok(code),
+            ExecutionCodeSource::Hash(code_hash) => {
+                Self::code_by_hash_without_warming(context, code_hash)
+            }
+            ExecutionCodeSource::Unloaded => {
+                let Some(info) = context.db_mut().basic(address)? else {
+                    return Ok(Bytes::new());
+                };
+                match info.code {
+                    Some(code) => Ok(code.original_bytes()),
+                    None => Self::code_by_hash_without_warming(context, info.code_hash),
+                }
+            }
+        }
+    }
+
+    fn code_by_hash_without_warming<DB: Database>(
+        context: &mut ArbitrumContext<DB>,
+        code_hash: B256,
+    ) -> Result<Bytes, DB::Error> {
+        if code_hash == B256::ZERO || code_hash == KECCAK_EMPTY {
+            return Ok(Bytes::new());
+        }
+        context
+            .db_mut()
+            .code_by_hash(code_hash)
+            .map(|code| code.original_bytes())
+    }
+
     fn ensure_can_read_max_fragment<DB: Database>(
         storage: &mut ArbStorage<'_, ArbitrumContext<DB>>,
         is_cold: bool,
@@ -764,7 +917,7 @@ impl ArbWasm {
     }
 
     fn stylus_fragment_payload(code: &[u8]) -> Result<&[u8], ArbWasmError> {
-        if Self::has_stylus_prefix(code, STYLUS_FRAGMENT_PREFIX) {
+        if has_stylus_prefix(code, STYLUS_FRAGMENT_PREFIX) {
             return Ok(&code[STYLUS_FRAGMENT_PREFIX.len()..]);
         }
         Err(ArbWasmError::NonSolidityError)
@@ -832,33 +985,102 @@ mod tests {
     use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::stylus_dictionary::PROGRAM_DICTIONARY_BYTES;
+    use crate::arbitrum::precompile::stylus_runtime::{NativeAsmCacheKey, StylusCompiler};
+    use crate::arbitrum::stylus_prefix::STYLUS_CLASSIC_PREFIX;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::sol_types::SolCall;
     use brotli::enc::BrotliEncoderParams;
     use leafage_evm_types::{BlockEnv, CfgEnv};
     use revm::bytecode::Bytecode;
     use revm::context::JournalTr;
-    use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
+    use revm::database::in_memory_db::CacheDB;
     use revm::state::AccountInfo;
     use revm::{Context, MainContext};
+    use std::sync::Arc;
+
+    #[test]
+    fn activation_runtime_dispositions_match_nitro_error_surfaces() {
+        for status in [1, 2, 9] {
+            let error = StylusRuntimeError::Activation {
+                status,
+                message: "guest activation failed".to_owned(),
+            };
+            assert_eq!(
+                activation_runtime_disposition(&error),
+                ActivationRuntimeDisposition::ProgramActivation
+            );
+        }
+        assert_eq!(
+            activation_runtime_disposition(&StylusRuntimeError::OutOfStack),
+            ActivationRuntimeDisposition::Revert
+        );
+        assert_eq!(
+            activation_runtime_disposition(&StylusRuntimeError::NativeStackOverflow),
+            ActivationRuntimeDisposition::Infrastructure
+        );
+    }
+
+    #[test]
+    fn activation_program_errors_burn_all_gas_and_remain_precompile_errors() {
+        let gas_limit = 12_345;
+        for status in [1, 2, 9] {
+            with_storage(gas_limit, 24_576, &[], |storage| {
+                let result = ArbWasm::handle_error(
+                    storage,
+                    gas_limit,
+                    ArbWasmError::ActivationRuntime(StylusRuntimeError::Activation {
+                        status,
+                        message: "guest activation failed".to_owned(),
+                    }),
+                );
+
+                assert_eq!(storage.gas_used, gas_limit);
+                assert!(matches!(
+                    result,
+                    Err(PrecompileError::Other(message))
+                        if message == format!(
+                            "stylus activation failed with status {status}: guest activation failed"
+                        )
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn activation_out_of_stack_burns_all_gas_and_reverts() {
+        let gas_limit = 12_345;
+        with_storage(gas_limit, 24_576, &[], |storage| {
+            let output = ArbWasm::handle_error(
+                storage,
+                gas_limit,
+                ArbWasmError::ActivationRuntime(StylusRuntimeError::OutOfStack),
+            )
+            .expect("OutOfStack is an EVM revert, not a precompile error");
+
+            assert!(output.reverted);
+            assert_eq!(output.gas_used, gas_limit);
+            assert!(output.bytes.is_empty());
+            assert_eq!(storage.gas_used, gas_limit);
+        });
+    }
 
     /// Phase 0 gate (design doc §5): leafage's `stylus_activate` binding must
     /// reproduce the consensus module hash of a real, already-activated Stylus
     /// program. Fixture is Arb One `0xe6fc94f78cfec8bdf090ccb854e9b4382870aa7e`
     /// (classic `0xeff000` prefix, Stylus version 2). The expected module hash
     /// was read from the ArbOS Programs `{2}` subspace on Arb One at ArbOS 51.
-    /// Gated on `LEAFAGE_ARB_STYLUS_LIB` (needs the real libstylus dylib); skips
-    /// otherwise so the suite stays green without the native lib.
+    /// Requires `LEAFAGE_ARB_STYLUS_LIB` and runs in the dedicated ignored-test
+    /// job that supplies the real libstylus dylib.
     #[test]
+    #[ignore = "requires libstylus"]
     fn reproduces_arb_one_module_hash() {
-        if std::env::var_os("LEAFAGE_ARB_STYLUS_LIB").is_none() {
-            eprintln!("skipping reproduces_arb_one_module_hash: LEAFAGE_ARB_STYLUS_LIB not set");
-            return;
-        }
+        std::env::var_os("LEAFAGE_ARB_STYLUS_LIB")
+            .expect("LEAFAGE_ARB_STYLUS_LIB must point to libstylus");
 
-        let code = alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
-            .expect("decode fixture hex");
+        let code =
+            alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
+                .expect("decode fixture hex");
         let code_hash = keccak256(&code);
         assert_eq!(
             code_hash,
@@ -878,8 +1100,9 @@ mod tests {
         // and asserts equality with the stored hash, so the hash is a function of
         // (wasm, stylus_version) only. Pass 0 to match that path.
         let mut gas = u64::MAX;
-        let activated = StylusRuntime::activate_from_env(&wasm, code_hash, params, 128, 0, &mut gas)
-            .expect("activate");
+        let activated =
+            StylusRuntime::activate_from_env(&wasm, code_hash, params, 128, 0, &mut gas)
+                .expect("activate");
         assert_eq!(
             activated.activation.module_hash,
             "0xa7c2ce01cea0880198cfc8a35bb3b772babc7ab007a8ebf4f9df1e35f8c6b098"
@@ -895,20 +1118,31 @@ mod tests {
     /// (empty target => `Target::default()`) without needing a hostio bridge.
     /// Gated on `LEAFAGE_ARB_STYLUS_LIB`.
     #[test]
+    #[ignore = "requires libstylus"]
     fn compiles_arb_one_program_to_native_asm() {
-        if std::env::var_os("LEAFAGE_ARB_STYLUS_LIB").is_none() {
-            eprintln!("skipping compiles_arb_one_program_to_native_asm: LEAFAGE_ARB_STYLUS_LIB not set");
-            return;
-        }
+        std::env::var_os("LEAFAGE_ARB_STYLUS_LIB")
+            .expect("LEAFAGE_ARB_STYLUS_LIB must point to libstylus");
 
-        let code = alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
-            .expect("decode fixture hex");
+        let code =
+            alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
+                .expect("decode fixture hex");
         let mut params = test_stylus_params(16 * 1024 * 1024, 0);
         params.version = 2;
         let wasm = ArbWasm::check_classic_stylus_code(&code, params.max_wasm_size)
             .expect("decode classic stylus code");
 
-        let asm = StylusRuntime::compile_from_env(&wasm, params.version).expect("compile");
+        let key = NativeAsmCacheKey::native(
+            keccak256(&wasm),
+            params.version,
+            StylusCompiler::Singlepass,
+            false,
+        );
+        let asm = StylusRuntime::compile_cached_from_env(key.clone(), &wasm).expect("compile");
+        let cached = StylusRuntime::compile_cached_from_env(key, &wasm).expect("cached compile");
+        assert!(
+            Arc::ptr_eq(&asm, &cached),
+            "second compile must hit process cache"
+        );
         assert!(!asm.is_empty(), "native asm must be non-empty");
         assert!(
             asm.len() > wasm.len() / 4,
@@ -925,15 +1159,14 @@ mod tests {
     /// program takes the no-selector revert path. We assert the call *returns*
     /// (ABI intact) and consumes gas. Gated on `LEAFAGE_ARB_STYLUS_LIB`.
     #[test]
+    #[ignore = "requires libstylus"]
     fn calls_arb_one_program_via_ffi() {
         use crate::arbitrum::precompile::stylus_runtime::{
             HostioHandler, StylusExecInput, StylusOutcome, StylusRuntime,
         };
 
-        if std::env::var_os("LEAFAGE_ARB_STYLUS_LIB").is_none() {
-            eprintln!("skipping calls_arb_one_program_via_ffi: LEAFAGE_ARB_STYLUS_LIB not set");
-            return;
-        }
+        std::env::var_os("LEAFAGE_ARB_STYLUS_LIB")
+            .expect("LEAFAGE_ARB_STYLUS_LIB must point to libstylus");
 
         struct ZeroHostio;
         impl HostioHandler for ZeroHostio {
@@ -944,8 +1177,9 @@ mod tests {
             }
         }
 
-        let code = alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
-            .expect("decode fixture hex");
+        let code =
+            alloy::primitives::hex::decode(include_str!("fixtures/arb1_stylus_code.hex").trim())
+                .expect("decode fixture hex");
         let mut params = test_stylus_params(16 * 1024 * 1024, 0);
         params.version = 2;
         let wasm = ArbWasm::check_classic_stylus_code(&code, params.max_wasm_size)
@@ -985,7 +1219,10 @@ mod tests {
             .expect("call returns without ABI corruption");
         // Empty calldata to an erc20-style program: a clean outcome, never a crash.
         assert!(
-            matches!(result.outcome, StylusOutcome::Success | StylusOutcome::Revert),
+            matches!(
+                result.outcome,
+                StylusOutcome::Success | StylusOutcome::Revert
+            ),
             "unexpected outcome: {:?}",
             result.outcome,
         );
@@ -1213,12 +1450,14 @@ mod tests {
         let wasm = &PROGRAM_DICTIONARY_BYTES[1024..1152];
         let compressed = brotli_compress_with_dictionary(wasm, PROGRAM_DICTIONARY_BYTES);
 
-        assert!(ArbWasm::decompress_stylus_payload(
-            &compressed,
-            STYLUS_EMPTY_DICTIONARY,
-            wasm.len() as u32,
-        )
-        .is_err());
+        assert!(
+            ArbWasm::decompress_stylus_payload(
+                &compressed,
+                STYLUS_EMPTY_DICTIONARY,
+                wasm.len() as u32,
+            )
+            .is_err()
+        );
 
         let decompressed = ArbWasm::decompress_stylus_payload(
             &compressed,
@@ -1633,6 +1872,103 @@ mod tests {
                     + ArbWasm::fragment_read_gas(false, code.len())
             );
         });
+    }
+
+    #[test]
+    fn execution_fragment_reads_are_unmetered_and_do_not_warm_addresses() {
+        let wasm = b"\0asm\x01\0\0\0";
+        let compressed = brotli_compress(wasm);
+        let fragment = Address::from([0x11; 20]);
+        let root = stylus_root(STYLUS_EMPTY_DICTIONARY, wasm.len() as u32, &[fragment]);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            fragment,
+            account_info_with_code(stylus_fragment(&compressed)),
+        );
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv::default())
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(db)
+            .with_chain(ArbitrumExecutionContext::default());
+
+        let decoded = ArbWasm::decode_stylus_wasm_for_execution(
+            &mut context,
+            &root,
+            1, // activation would reject this decompressed length
+            ARBOS_VERSION_STYLUS_CONTRACT_LIMIT,
+        )
+        .expect("read execution fragments")
+        .expect("decode execution root");
+
+        assert_eq!(decoded, wasm);
+        let storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+        assert!(!storage.account_is_warm(fragment));
+        assert!(
+            !storage.context.journal().state.contains_key(&fragment),
+            "execution reads must not journal-load the fragment"
+        );
+        assert_eq!(storage.gas_used, 0);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    struct FailingDb;
+
+    impl Database for FailingDb {
+        type Error = ExpectedDbError;
+
+        fn basic(&mut self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn code_by_hash(&mut self, _: B256) -> Result<Bytecode, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn storage(&mut self, _: Address, _: U256) -> Result<U256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+    }
+
+    #[test]
+    fn execution_reads_preserve_database_errors() {
+        let fragment = Address::from([0x11; 20]);
+        let root = stylus_root(STYLUS_EMPTY_DICTIONARY, 1, &[fragment]);
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv::default())
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(FailingDb)
+            .with_chain(ArbitrumExecutionContext::default());
+
+        assert_eq!(
+            ArbWasm::arbos_version_for_execution(&mut context),
+            Err(ExpectedDbError)
+        );
+        assert_eq!(
+            ArbWasm::decode_stylus_wasm_for_execution(
+                &mut context,
+                &root,
+                1,
+                ARBOS_VERSION_STYLUS_CONTRACT_LIMIT,
+            ),
+            Err(ExpectedDbError)
+        );
     }
 
     #[test]

@@ -15,46 +15,59 @@
 //! *writes* (and with them the SSTORE refund), and Stylus calling Stylus.
 //! See `docs/todo.md` for what would make those worth chasing.
 //!
-//! Two things are deliberately absent rather than pending:
-//! - `RecentWasms` cannot be mirrored here at all; see the pre-charge.
-//! - `CaptureHostIO` (request 14) stays a no-op; see the hostio dispatch.
+//! Full `CaptureHostIO` opcode tracing remains deliberately absent: request 14
+//! stays a no-op because the registered API only consumes logs and SSTOREs.
 
 use super::ArbitrumEvm;
-use crate::arbitrum::arbos_state::ArbStateReader;
+use crate::arbitrum::arbos_state::read_blockhashes_l1_block_number;
 use crate::arbitrum::precompile::{
-    ArbWasm, ArbitrumContext, HostioHandler, PreparedStylusProgram, StylusExecInput, StylusOutcome,
-    StylusRuntime,
+    ArbWasm, ArbitrumContext, HostioHandler, NativeAsmCacheKey, PreparedStylusProgram,
+    StylusCompiler, StylusExecInput, StylusOutcome, StylusRuntime,
 };
-use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
+use crate::arbitrum::stylus_prefix::{
+    is_stylus_classic, is_stylus_component, is_stylus_deployable, is_stylus_fragment,
+    is_stylus_root,
+};
+use alloy::primitives::{Address, B256, Bytes, Log, U256, keccak256};
 use core::marker::PhantomData;
+use revm::bytecode::{Bytecode, opcode};
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::cfg::gas_params::GasParams;
+use revm::context_interface::context::{ContextError, take_error};
 use revm::context_interface::{Block, Cfg, CreateScheme, Transaction};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
-use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult};
+use revm::handler::{EthFrame, EvmTr, FrameData, FrameInitOrResult, FrameResult, ItemOrResult};
 use revm::inspector::{Inspector, InspectorEvmTr};
-use revm::interpreter::interpreter::EthInterpreter;
+use revm::interpreter::interpreter::{EthInterpreter, ExtBytecode, Interpreter};
 use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{
-    CallInput, CallInputs, CallScheme, CallValue, CreateInputs, FrameInput, Gas, InstructionResult,
-    InterpreterAction, InterpreterResult,
+    CallInput, CallInputs, CallScheme, CallValue, CreateInputs, FrameInput, Gas, InputsImpl,
+    InstructionResult, InterpreterAction, InterpreterResult, SharedMemory,
 };
 use revm::{Database, DatabaseRef};
 
-/// Stylus program prefixes (nitro `IsStylusProgramPrefix`): classic / fragment
-/// / root. EIP-3541 forbids deploying `0xEF`-leading code via CREATE, so on an
-/// Arbitrum chain the only `0xEFF0xx` account code is an activated Stylus
-/// program — the prefix alone has no false positives.
-const STYLUS_CLASSIC_PREFIX: &[u8] = &[0xef, 0xf0, 0x00];
-const STYLUS_FRAGMENT_PREFIX: &[u8] = &[0xef, 0xf0, 0x01];
-const STYLUS_ROOT_PREFIX: &[u8] = &[0xef, 0xf0, 0x02];
-
-/// True if `code` is an activated Stylus program blob (prefix-based dispatch).
-pub(super) fn is_stylus_code(code: &[u8]) -> bool {
-    code.len() > STYLUS_CLASSIC_PREFIX.len()
-        && (code.starts_with(STYLUS_CLASSIC_PREFIX)
-            || code.starts_with(STYLUS_FRAGMENT_PREFIX)
-            || code.starts_with(STYLUS_ROOT_PREFIX))
+/// Returns the ArbOS version when the current call frame contains a directly
+/// executable Stylus program. CREATE initcode and fragment components always
+/// stay on the EVM path.
+pub(super) fn frame_stylus_version<DB, I>(
+    evm: &mut ArbitrumEvm<DB, I>,
+) -> Result<Option<u64>, ContextDbError<ArbitrumContext<DB>>>
+where
+    DB: Database + DatabaseRef,
+{
+    let code = {
+        let frame = evm.inner.frame_stack.get();
+        if !matches!(frame.data, FrameData::Call(_)) {
+            return Ok(None);
+        }
+        let code = frame.interpreter.bytecode.original_byte_slice();
+        if !(is_stylus_classic(code) || is_stylus_fragment(code) || is_stylus_root(code)) {
+            return Ok(None);
+        }
+        code.to_vec()
+    };
+    let arbos_version = ArbWasm::arbos_version_for_execution(&mut evm.inner.ctx)?;
+    Ok(is_stylus_deployable(&code, arbos_version).then_some(arbos_version))
 }
 
 /// nitro `apiStatus` (`arbos/programs/api.go:48`). This encoding is used by
@@ -124,6 +137,52 @@ const ARBOS_STYLUS_FIXES: u64 = 31;
 /// ArbOS version from which `StylusParams.PageLimit` is a consensus cap on the
 /// open-page total (`api.go:507-512`).
 const ARBOS_PAGE_LIMIT: u64 = 59;
+const ARBOS_RECENT_WASMS: u64 = 60;
+
+#[derive(Debug, Eq, PartialEq)]
+enum StylusFrameDisposition {
+    Complete {
+        result: InstructionResult,
+        output: Bytes,
+        spend_all: bool,
+    },
+    Infrastructure(&'static str),
+}
+
+fn stylus_frame_disposition(outcome: StylusOutcome, output: Vec<u8>) -> StylusFrameDisposition {
+    match outcome {
+        StylusOutcome::Success => StylusFrameDisposition::Complete {
+            result: InstructionResult::Return,
+            output: Bytes::from(output),
+            spend_all: false,
+        },
+        StylusOutcome::Revert => StylusFrameDisposition::Complete {
+            result: InstructionResult::Revert,
+            output: Bytes::from(output),
+            spend_all: false,
+        },
+        StylusOutcome::Failure => StylusFrameDisposition::Complete {
+            result: InstructionResult::Revert,
+            output: Bytes::new(),
+            spend_all: false,
+        },
+        StylusOutcome::OutOfInk => StylusFrameDisposition::Complete {
+            result: InstructionResult::OutOfGas,
+            output: Bytes::new(),
+            spend_all: true,
+        },
+        // Nitro maps userOutOfStack to vm.ErrDepth. In revm that frame result
+        // is CallTooDeep; it is not an EVM operand-stack overflow.
+        StylusOutcome::OutOfStack => StylusFrameDisposition::Complete {
+            result: InstructionResult::CallTooDeep,
+            output: Bytes::new(),
+            spend_all: true,
+        },
+        StylusOutcome::NativeStackOverflow => StylusFrameDisposition::Infrastructure(
+            "Stylus native stack overflow during off-chain execution",
+        ),
+    }
+}
 
 /// nitro `evmMemoryCost` (`programs.go:340`): what the EVM would charge to hold
 /// `size` bytes in memory — `MemoryGas` per word plus the quadratic term.
@@ -161,6 +220,7 @@ fn memory_gas_cost(new: u16, open: u16, ever: u16, free_pages: u16, page_gas: u1
 /// a Stylus blob.
 pub(super) fn run_stylus_frame<D, DB, I>(
     evm: &mut ArbitrumEvm<DB, I>,
+    arbos_version: u64,
 ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>>
 where
     D: FrameDriver<DB, I>,
@@ -168,7 +228,7 @@ where
 {
     // 1. Gather frame inputs, then drop the frame borrow so the body can take
     //    `&mut ctx`/`&mut evm` (disjoint field of the same `Evm`).
-    let (code, code_hash, calldata, contract, caller, value, is_static, gas_limit, opens_span) = {
+    let (code, code_hash, calldata, contract, caller, value, is_static, gas_limit) = {
         let frame = evm.inner.frame_stack.get();
         let code = frame.interpreter.bytecode.original_byte_slice().to_vec();
         let code_hash = keccak256(&code);
@@ -178,70 +238,48 @@ where
         let value = frame.interpreter.input.call_value;
         let is_static = frame.interpreter.runtime_flag.is_static;
         let gas_limit = frame.interpreter.gas.remaining();
-        // DELEGATECALL/CALLCODE run foreign code inside the caller's own frame,
-        // so nitro opens no reentrancy span for them (`PushContract`).
-        let opens_span = match &frame.input {
-            FrameInput::Call(inputs) => !matches!(
-                inputs.scheme,
-                CallScheme::DelegateCall | CallScheme::CallCode
-            ),
-            _ => true,
-        };
         (
-            code, code_hash, calldata, contract, caller, value, is_static, gas_limit, opens_span,
+            code, code_hash, calldata, contract, caller, value, is_static, gas_limit,
         )
     };
 
-    // 2. Read Programs state + decode wasm. `None` = not an up-to-date active
-    //    Stylus program -> revert (nitro `getActiveProgram` error paths).
+    // 2. Read Programs state. An inactive, stale, or expired program is an
+    //    exceptional child failure in Nitro: it rolls back and consumes all
+    //    forwarded gas. Concrete database errors propagate to the handler.
     let timestamp = evm.inner.ctx.block().timestamp().saturating_to::<u64>();
-    let prepared =
-        match ArbWasm::prepare_stylus_program(&mut evm.inner.ctx, code_hash, &code, timestamp) {
-            Some(prepared) => prepared,
-            None => {
-                return finish_frame(
-                    evm,
-                    InstructionResult::Revert,
-                    Bytes::new(),
-                    Gas::new(gas_limit),
-                )
-            }
-        };
-
-    // 3. Native asm: cache hit, else compile the on-chain wasm for the host.
-    let asm = match evm.inner.ctx.chain().compiled_asm(prepared.module_hash) {
-        Some(asm) => asm.clone(),
-        None => match StylusRuntime::compile_from_env(&prepared.wasm, prepared.version) {
-            Ok(asm) => {
-                let asm = Bytes::from(asm);
-                evm.inner
-                    .ctx
-                    .chain_mut()
-                    .insert_compiled_asm(prepared.module_hash, asm.clone());
-                asm
-            }
-            Err(_) => {
-                return finish_frame(
-                    evm,
-                    InstructionResult::Revert,
-                    Bytes::new(),
-                    Gas::new(gas_limit),
-                )
-            }
-        },
+    let prepared = match ArbWasm::prepare_stylus_program(
+        &mut evm.inner.ctx,
+        code_hash,
+        timestamp,
+        arbos_version,
+    )? {
+        Some(prepared) => prepared,
+        None => {
+            let mut gas = Gas::new(gas_limit);
+            gas.spend_all();
+            return finish_frame(evm, InstructionResult::NotActivated, Bytes::new(), gas);
+        }
     };
+    if prepared.module_hash == B256::ZERO {
+        return Err(ContextError::Custom(
+            "active Stylus program has no module hash".to_owned(),
+        ));
+    }
 
-    // 4. Gas pre-charge, mirroring nitro `CallProgram` order: memory-init cost
+    // 3. Gas pre-charge, mirroring nitro `CallProgram` order: memory-init cost
     //    for the program footprint, then program init/cached cost.
     //
-    //    `cached` is the on-chain flag alone. From ArbOS 60 nitro also treats a
-    //    program warmed earlier *in the same block* as cached (`RecentWasms`, a
-    //    32-entry LRU living on the StateDB). leafage builds an execution
-    //    context per simulated tx, so there is no block-scoped state to hold
-    //    that LRU: a repeat call is billed the full initGas (~8832 + initCost)
-    //    where the writer would bill only the cached cost. The error is
-    //    one-directional — leafage never under-charges — and closing it needs
-    //    block-ordered replay rather than a change here.
+    //    From ArbOS 60 every active call inserts its code hash into RecentWasms
+    //    before the gas gate. The LRU is not journaled, so even an OOG/reverted
+    //    call warms a later call in the same transaction. Cross-transaction
+    //    block replay requires a request-level seed and remains separate.
+    let recent_hit = prepared.arbos_version >= ARBOS_RECENT_WASMS
+        && evm
+            .inner
+            .ctx
+            .chain_mut()
+            .insert_recent_wasm(code_hash, prepared.block_cache_size);
+    let cached_for_gas = prepared.cached || recent_hit;
     let mut gas = Gas::new(gas_limit);
     let (open, ever) = {
         let chain = evm.inner.ctx.chain();
@@ -254,10 +292,10 @@ where
         prepared.free_pages,
         prepared.page_gas,
     );
-    if prepared.cached || prepared.version > 1 {
+    if cached_for_gas || prepared.version > 1 {
         precharge = precharge.saturating_add(cached_gas(&prepared));
     }
-    if !prepared.cached {
+    if !cached_for_gas {
         precharge = precharge.saturating_add(init_gas(&prepared));
     }
     // Consensus page cap: nitro saturates callCost so the burn below fails,
@@ -280,22 +318,60 @@ where
         .chain_mut()
         .set_stylus_pages_open(open.saturating_add(prepared.footprint));
 
-    // A program is reentrant when it already has a frame open — asked before
-    // this frame is counted (nitro `tx_processor.go:139`).
-    let reentrant = opens_span && evm.inner.ctx.chain().stylus_frame_is_open(contract);
-    if opens_span {
-        evm.inner.ctx.chain_mut().enter_stylus_frame(contract);
-    }
+    // 4. Native asm: lookup happens only after the consensus pre-charge and
+    // page-limit gate. A hit avoids decoding root fragments altogether; a miss
+    // decodes without charging or warming addresses, then enters the cache's
+    // singleflight compile path.
+    let cache_key = NativeAsmCacheKey::native(
+        prepared.module_hash,
+        prepared.version,
+        StylusCompiler::Singlepass,
+        false,
+    );
+    let asm = match StylusRuntime::cached_asm_from_env(&cache_key) {
+        Ok(Some(asm)) => asm,
+        Ok(None) => {
+            let wasm = match ArbWasm::decode_stylus_wasm_for_execution(
+                &mut evm.inner.ctx,
+                &code,
+                prepared.max_wasm_size,
+                prepared.arbos_version,
+            ) {
+                Ok(Some(wasm)) => wasm,
+                Ok(None) => {
+                    evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
+                    return Err(ContextError::Custom(
+                        "active Stylus program has invalid execution code".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
+                    return Err(error.into());
+                }
+            };
+            match StylusRuntime::compile_cached_from_env(cache_key, &wasm) {
+                Ok(asm) => asm,
+                Err(error) => {
+                    evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
+                    return Err(ContextError::Custom(error.message()));
+                }
+            }
+        }
+        Err(error) => {
+            evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
+            return Err(ContextError::Custom(error.message()));
+        }
+    };
+
+    // `frame_init` has already counted this non-delegate frame. Nitro reports
+    // reentrancy when the same acting address has more than one open span.
+    let reentrant = evm.inner.ctx.chain().contract_is_reentrant(contract);
 
     // EvmData.block_number is the ArbOS-recorded L1 block number (what the
-    // NUMBER opcode returns on Arbitrum, per PR #184's BLOCKHASH work), falling
-    // back to the L2 number on a read error.
-    let l1_block_number = evm
-        .inner
-        .ctx
-        .db()
-        .blockhashes_l1_block_number()
-        .unwrap_or_else(|| evm.inner.ctx.block().number().saturating_to::<u64>());
+    // NUMBER opcode returns on Arbitrum, per PR #184's BLOCKHASH work). A
+    // database failure aborts execution instead of substituting the L2 number.
+    let l1_block_number =
+        read_blockhashes_l1_block_number(evm.inner.ctx.db_mut()).map_err(ContextError::Db)?;
 
     // 5. Assemble EvmData inputs.
     let input = StylusExecInput {
@@ -351,34 +427,41 @@ where
         max_code_size,
         arbos_version: prepared.arbos_version,
         refund: 0,
+        fatal_error: None,
     };
-    let result = StylusRuntime::call_from_env(&asm, &calldata, input, &mut hostio, &mut call_gas);
+    let result =
+        StylusRuntime::call_from_env(asm.as_ref(), &calldata, input, &mut hostio, &mut call_gas);
     let refund = hostio.refund;
+    let fatal_error = hostio.fatal_error.take();
     // Release the footprint page reservation (nitro's deferred SetStylusPagesOpen);
     // the high-water `ever` set during the call is retained.
     evm.inner.ctx.chain_mut().set_stylus_pages_open(open);
-    if opens_span {
-        evm.inner.ctx.chain_mut().exit_stylus_frame(contract);
+    if let Some(error) = fatal_error {
+        return Err(error);
     }
 
     let outcome = match result {
         Ok(outcome) => outcome,
-        Err(_) => return finish_frame(evm, InstructionResult::Revert, Bytes::new(), gas),
+        Err(error) => return Err(ContextError::Custom(error.message())),
     };
 
     // 7. Thread gas + refund back onto the frame result.
     let wasm_used = supplied.saturating_sub(call_gas);
     let _ = gas.record_cost(wasm_used);
     gas.record_refund(refund);
-    let (result, output) = match outcome.outcome {
-        StylusOutcome::Success => (InstructionResult::Return, Bytes::from(outcome.output)),
-        StylusOutcome::Revert => (InstructionResult::Revert, Bytes::from(outcome.output)),
-        StylusOutcome::OutOfInk => {
-            gas.spend_all();
-            (InstructionResult::OutOfGas, Bytes::new())
+    let (result, output) = match stylus_frame_disposition(outcome.outcome, outcome.output) {
+        StylusFrameDisposition::Complete {
+            result,
+            output,
+            spend_all,
+        } => {
+            if spend_all {
+                gas.spend_all();
+            }
+            (result, output)
         }
-        StylusOutcome::Failure | StylusOutcome::OutOfStack | StylusOutcome::NativeStackOverflow => {
-            (InstructionResult::Revert, Bytes::new())
+        StylusFrameDisposition::Infrastructure(message) => {
+            return Err(ContextError::Custom(message.to_owned()));
         }
     };
 
@@ -413,11 +496,40 @@ where
     let frame = evm.inner.frame_stack.get();
     let action = InterpreterAction::Return(InterpreterResult::new(result, output, gas));
     let context = &mut evm.inner.ctx;
-    frame.process_next_action(context, action).inspect(|item| {
+    process_next_action(context, frame, action).inspect(|item| {
         if item.is_result() {
             frame.set_finished(true);
         }
     })
+}
+
+/// Processes a frame action with Nitro's CREATE exception to EIP-3541. The
+/// stock revm path remains responsible for size checks, code-deposit gas,
+/// checkpoint handling, and result construction; only its optional EIP-3541
+/// flag is changed for the duration of this call.
+pub(super) fn process_next_action<DB: Database>(
+    context: &mut ArbitrumContext<DB>,
+    frame: &mut EthFrame,
+    action: InterpreterAction,
+) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+    let create_output = match (&frame.data, &action) {
+        (FrameData::Create(_), InterpreterAction::Return(result))
+            if result.result.is_ok() && result.output.first() == Some(&0xef) =>
+        {
+            Some(result.output.as_ref())
+        }
+        _ => None,
+    };
+    let Some(output) = create_output else {
+        return frame.process_next_action(context, action);
+    };
+
+    let arbos_version = ArbWasm::arbos_version_for_execution(context)?;
+    let previous = context.cfg.disable_eip3541;
+    context.cfg.disable_eip3541 = is_stylus_component(output, arbos_version);
+    let result = frame.process_next_action(context, action);
+    context.cfg.disable_eip3541 = previous;
+    result
 }
 
 /// Which pair of revm entry points a Stylus frame uses to drive its children.
@@ -432,7 +544,7 @@ where
 ///
 /// The `Inspector` bound lives on the `Traced` impl instead of the trait, so the
 /// untraced path never acquires it and `ArbitrumEvm`'s own bounds are untouched.
-trait FrameDriver<DB: Database + DatabaseRef, I> {
+pub(super) trait FrameDriver<DB: Database + DatabaseRef, I> {
     fn init(
         evm: &mut ArbitrumEvm<DB, I>,
         frame_init: FrameInit,
@@ -441,6 +553,23 @@ trait FrameDriver<DB: Database + DatabaseRef, I> {
     fn run(
         evm: &mut ArbitrumEvm<DB, I>,
     ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>>;
+
+    fn record_log(_evm: &mut ArbitrumEvm<DB, I>, _log: Log) {}
+
+    fn start_sstore_step(
+        _evm: &mut ArbitrumEvm<DB, I>,
+        _contract: Address,
+        _key: U256,
+        _value: U256,
+    ) -> Option<Interpreter<EthInterpreter>> {
+        None
+    }
+
+    fn end_sstore_step(
+        _evm: &mut ArbitrumEvm<DB, I>,
+        _interpreter: &mut Option<Interpreter<EthInterpreter>>,
+    ) {
+    }
 }
 
 /// Untraced execution.
@@ -485,6 +614,50 @@ where
     ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
         evm.inspect_frame_run()
     }
+
+    fn record_log(evm: &mut ArbitrumEvm<DB, I>, log: Log) {
+        evm.inner.inspector.log(&mut evm.inner.ctx, log);
+    }
+
+    fn start_sstore_step(
+        evm: &mut ArbitrumEvm<DB, I>,
+        contract: Address,
+        key: U256,
+        value: U256,
+    ) -> Option<Interpreter<EthInterpreter>> {
+        let bytecode = Bytecode::new_raw(Bytes::from(vec![opcode::SSTORE, opcode::STOP]));
+        let input = InputsImpl {
+            target_address: contract,
+            bytecode_address: Some(contract),
+            ..Default::default()
+        };
+        let mut interpreter = Interpreter::new(
+            SharedMemory::new(),
+            ExtBytecode::new(bytecode),
+            input,
+            false,
+            (*evm.inner.ctx.cfg().spec()).into(),
+            u64::MAX,
+        );
+        // SSTORE pops key first and value second, so key is the stack top.
+        let _ = interpreter.stack.push(value);
+        let _ = interpreter.stack.push(key);
+        evm.inner
+            .inspector
+            .step(&mut interpreter, &mut evm.inner.ctx);
+        Some(interpreter)
+    }
+
+    fn end_sstore_step(
+        evm: &mut ArbitrumEvm<DB, I>,
+        interpreter: &mut Option<Interpreter<EthInterpreter>>,
+    ) {
+        if let Some(interpreter) = interpreter {
+            evm.inner
+                .inspector
+                .step_end(interpreter, &mut evm.inner.ctx);
+        }
+    }
 }
 
 /// Drives a Stylus subcall's child frame subtree to completion synchronously
@@ -496,12 +669,14 @@ where
 fn drive_subframe<D, DB, I>(
     evm: &mut ArbitrumEvm<DB, I>,
     frame_input: FrameInput,
-) -> Option<FrameResult>
+) -> Result<FrameResult, ContextDbError<ArbitrumContext<DB>>>
 where
     D: FrameDriver<DB, I>,
     DB: Database + DatabaseRef,
 {
-    let parent_index = evm.inner.frame_stack.index();
+    let parent_index = evm.inner.frame_stack.index().ok_or_else(|| {
+        ContextError::Custom("Stylus subframe started without a parent frame".to_owned())
+    })?;
     // Build the child FrameInit from the current (Stylus parent) frame. This
     // reserves a child context on the parent's shared memory.
     let child_init = {
@@ -513,7 +688,7 @@ where
         }
     };
     // The Stylus parent's index; the direct child lands one above it.
-    let child_index = parent_index.map(|i| i + 1);
+    let child_index = parent_index + 1;
 
     let outcome = run_subframe::<D, _, _>(evm, child_init, child_index);
 
@@ -523,7 +698,7 @@ where
     // freeing child context` and panics. Guarded on the stack having unwound
     // back to the parent, so an error path that left a frame behind does not
     // free the wrong frame's memory.
-    if evm.inner.frame_stack.index() == parent_index {
+    if evm.inner.frame_stack.index() == Some(parent_index) {
         evm.inner
             .frame_stack
             .get()
@@ -537,35 +712,64 @@ where
 fn run_subframe<D, DB, I>(
     evm: &mut ArbitrumEvm<DB, I>,
     child_init: FrameInit,
-    child_index: Option<usize>,
-) -> Option<FrameResult>
+    child_index: usize,
+) -> Result<FrameResult, ContextDbError<ArbitrumContext<DB>>>
 where
     D: FrameDriver<DB, I>,
     DB: Database + DatabaseRef,
 {
-    match D::init(evm, child_init).ok()? {
+    match D::init(evm, child_init)? {
         // Resolved without pushing a frame (precompile / empty code).
-        ItemOrResult::Result(frame_result) => return Some(frame_result),
+        ItemOrResult::Result(frame_result) => return Ok(frame_result),
         ItemOrResult::Item(_frame) => {}
     }
 
     loop {
-        let result = match D::run(evm).ok()? {
-            ItemOrResult::Item(init) => match D::init(evm, init).ok()? {
+        match D::run(evm)? {
+            ItemOrResult::Item(init) => match D::init(evm, init)? {
                 ItemOrResult::Item(_frame) => continue,
-                ItemOrResult::Result(frame_result) => frame_result,
+                // This result belongs to the newly requested grandchild, not
+                // to the frame currently at `child_index`.
+                ItemOrResult::Result(frame_result) => {
+                    if evm.frame_return_result(frame_result)?.is_some() {
+                        return Err(ContextError::Custom(
+                            "Stylus immediate subframe result escaped its parent".to_owned(),
+                        ));
+                    }
+                }
             },
-            ItemOrResult::Result(frame_result) => frame_result,
-        };
-        // If the finished frame is the direct child, capture + pop manually.
-        if evm.inner.frame_stack.index() == child_index {
-            evm.inner.frame_stack.pop();
-            return Some(result);
-        }
-        // Deeper frame: return to its (non-Stylus) parent, which resumes.
-        match evm.frame_return_result(result) {
-            Ok(Some(_)) | Err(_) => return None,
-            Ok(None) => continue,
+            ItemOrResult::Result(frame_result) => {
+                let current_index = evm.inner.frame_stack.index().ok_or_else(|| {
+                    ContextError::Custom("Stylus subframe stack became empty".to_owned())
+                })?;
+                if current_index < child_index {
+                    return Err(ContextError::Custom(
+                        "Stylus subframe unwound past its direct child".to_owned(),
+                    ));
+                }
+
+                // Capture the direct child's result without inserting it into
+                // the Stylus parent's EVM interpreter.
+                if current_index == child_index {
+                    if !evm.inner.frame_stack.get().is_finished() {
+                        return Err(ContextError::Custom(
+                            "Stylus direct child returned before finishing".to_owned(),
+                        ));
+                    }
+                    evm.pop_frame();
+                    // `EthFrame::return_result` normally drains errors after a
+                    // pop; direct-child capture deliberately bypasses it.
+                    take_error::<ContextDbError<ArbitrumContext<DB>>, _>(evm.inner.ctx.error())?;
+                    return Ok(frame_result);
+                }
+
+                // Deeper frame: pop it and resume its EVM parent.
+                if evm.frame_return_result(frame_result)?.is_some() {
+                    return Err(ContextError::Custom(
+                        "Stylus nested subframe escaped the direct child".to_owned(),
+                    ));
+                }
+            }
         }
     }
 }
@@ -577,6 +781,17 @@ fn create_error(message: &[u8]) -> Vec<u8> {
     resp.push(0);
     resp.extend_from_slice(message);
     resp
+}
+
+/// revm returns unused child gas only for success and revert. Exceptional
+/// halts consume the entire child allowance even if `Gas` still carries a
+/// non-zero remainder.
+fn returnable_gas(result: InstructionResult, gas: &Gas) -> u64 {
+    if result.is_ok_or_revert() {
+        gas.remaining()
+    } else {
+        0
+    }
 }
 
 /// Services a Stylus program's hostio requests against revm state. Holds
@@ -601,12 +816,19 @@ struct StylusHostio<'a, D, DB: Database + DatabaseRef, I> {
     /// Gates `setTrieSlots`' OutOfGas status.
     arbos_version: u64,
     refund: i64,
+    /// First execution error raised while synchronously driving an EVM child.
+    /// The native ABI cannot return Rust errors, so hostio latches it until the
+    /// native call unwinds.
+    fatal_error: Option<ContextDbError<ArbitrumContext<DB>>>,
 }
 
 impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> HostioHandler
     for StylusHostio<'_, D, DB, I>
 {
     fn handle(&mut self, req_type: u32, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+        if self.fatal_error.is_some() {
+            return (Vec::new(), Vec::new(), 0);
+        }
         match req_type {
             0 => self.get_bytes32(input),
             1 => self.set_trie_slots(input),
@@ -637,6 +859,12 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> HostioHandler
 }
 
 impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, DB, I> {
+    fn latch_fatal_error(&mut self, error: ContextDbError<ArbitrumContext<DB>>) {
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(error);
+        }
+    }
+
     fn ctx(&mut self) -> &mut ArbitrumContext<DB> {
         &mut self.evm.inner.ctx
     }
@@ -662,9 +890,17 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             return None;
         }
         // Loading the account also warms it, as nitro's AddAddressToAccessList does.
-        let (is_cold, is_empty) = match self.ctx().journal_mut().load_account(target) {
-            Ok(load) => (load.is_cold, load.data.is_empty()),
-            Err(_) => (false, false),
+        let account = self
+            .ctx()
+            .journal_mut()
+            .load_account(target)
+            .map(|load| (load.is_cold, load.data.is_empty()));
+        let (is_cold, is_empty) = match account {
+            Ok(account) => account,
+            Err(error) => {
+                self.latch_fatal_error(ContextError::Db(error));
+                return None;
+            }
         };
         if is_cold {
             total = total.saturating_add(self.gas_params.cold_account_additional_cost());
@@ -711,9 +947,18 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         }
         let key = U256::from_be_slice(&input[..32]);
         let contract = self.contract;
-        let (value, is_cold) = match self.ctx().journal_mut().sload(contract, key) {
-            Ok(load) => (load.data, load.is_cold),
-            Err(_) => (U256::ZERO, false),
+        let slot = self
+            .ctx()
+            .journal_mut()
+            .sload(contract, key)
+            .map(|load| (load.data, load.is_cold));
+        let (value, is_cold) = match slot {
+            Ok(slot) => slot,
+            Err(error) => {
+                let cost = self.storage_load_cost(false);
+                self.latch_fatal_error(ContextError::Db(error));
+                return (vec![0u8; 32], Vec::new(), cost);
+            }
         };
         let cost = self.storage_load_cost(is_cold);
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), cost)
@@ -737,6 +982,7 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         while input.len() >= offset + 64 {
             let key = U256::from_be_slice(&input[offset..offset + 32]);
             let value = U256::from_be_slice(&input[offset + 32..offset + 64]);
+            let mut trace_step = D::start_sstore_step(self.evm, contract, key, value);
             // nitro prices the slot before writing it. revm only reports the
             // SStoreResult the price depends on *from* the write, so each write
             // goes in a checkpoint that is rolled back when it is unaffordable.
@@ -751,6 +997,7 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
                             .sstore_dynamic_gas(true, &load.data, load.is_cold);
                     if slot_cost > remaining {
                         self.ctx().journal_mut().checkpoint_revert(checkpoint);
+                        D::end_sstore_step(self.evm, &mut trace_step);
                         remaining = 0;
                         out_of_gas = true;
                         break;
@@ -758,9 +1005,12 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
                     self.ctx().journal_mut().checkpoint_commit();
                     self.refund += self.gas_params.sstore_refund(true, &load.data);
                     remaining -= slot_cost;
+                    D::end_sstore_step(self.evm, &mut trace_step);
                 }
-                Err(_) => {
+                Err(error) => {
                     self.ctx().journal_mut().checkpoint_revert(checkpoint);
+                    D::end_sstore_step(self.evm, &mut trace_step);
+                    self.latch_fatal_error(ContextError::Db(error));
                     return (
                         vec![API_STATUS_FAILURE],
                         Vec::new(),
@@ -812,8 +1062,8 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
     /// ContractCall / DelegateCall / StaticCall: `addr[20] ++ value[32] ++
     /// gasLeft[8] ++ gasReq[8] ++ calldata`. Response: `status[1]`, returndata
     /// on `raw_data`.
-    /// TODO(Phase 4): exact base cost (nitro `WasmCallCost`), stipend, 63/64,
-    /// and status encoding — diff against writer.
+    /// Base cost, stipend, 63/64 split, child gas, and status follow Nitro's
+    /// `doCall` implementation.
     fn contract_call(&mut self, input: &[u8], scheme: CallScheme) -> (Vec<u8>, Vec<u8>, u64) {
         if input.len() < 68 {
             return (vec![CALL_STATUS_FAILURE], Vec::new(), 0);
@@ -875,9 +1125,14 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         };
 
         match drive_subframe::<D, _, _>(self.evm, FrameInput::Call(Box::new(inputs))) {
-            Some(FrameResult::Call(outcome)) => {
-                let returned = outcome.gas().remaining();
-                let status = if outcome.instruction_result().is_ok() {
+            Ok(FrameResult::Call(outcome)) => {
+                let instruction_result = *outcome.instruction_result();
+                let outcome_gas = outcome.gas();
+                let returned = returnable_gas(instruction_result, &outcome_gas);
+                if instruction_result.is_ok() {
+                    self.refund = self.refund.saturating_add(outcome_gas.refunded());
+                }
+                let status = if instruction_result.is_ok() {
                     CALL_STATUS_SUCCESS
                 } else {
                     CALL_STATUS_FAILURE
@@ -886,19 +1141,31 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
                 let cost = base_cost.saturating_add(call_gas.saturating_sub(returned));
                 (vec![status], output, cost)
             }
-            _ => (
-                vec![CALL_STATUS_FAILURE],
-                Vec::new(),
-                base_cost.saturating_add(call_gas),
-            ),
+            Ok(_) => {
+                self.latch_fatal_error(ContextError::Custom(
+                    "CALL hostio received a non-call frame result".to_owned(),
+                ));
+                (
+                    vec![CALL_STATUS_FAILURE],
+                    Vec::new(),
+                    base_cost.saturating_add(call_gas),
+                )
+            }
+            Err(error) => {
+                self.latch_fatal_error(error);
+                (
+                    vec![CALL_STATUS_FAILURE],
+                    Vec::new(),
+                    base_cost.saturating_add(call_gas),
+                )
+            }
         }
     }
 
     /// Create1 (`gas[8] ++ endowment[32] ++ code`) / Create2 (`... ++ salt[32]
     /// ++ code`). Response: `1 ++ addr[20]` on success (returndata on raw_data),
     /// else `0` with the revert data on raw_data.
-    /// TODO(Phase 4): exact create gas (CreateGas + keccak word cost for CREATE2)
-    /// and the precise error-response encoding — diff against writer.
+    /// Gas and response encoding follow Nitro's `create` implementation.
     fn create(&mut self, input: &[u8], is_create2: bool) -> (Vec<u8>, Vec<u8>, u64) {
         let header = if is_create2 { 72 } else { 40 };
         // The requested gas doubles as the cost charged on the refusal paths,
@@ -940,25 +1207,42 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, child_gas);
 
         match drive_subframe::<D, _, _>(self.evm, FrameInput::Create(Box::new(inputs))) {
-            Some(FrameResult::Create(outcome)) => {
-                let returned = outcome.gas().remaining();
+            Ok(FrameResult::Create(outcome)) => {
+                let instruction_result = *outcome.instruction_result();
+                let returned = returnable_gas(instruction_result, outcome.gas());
+                if instruction_result.is_ok() {
+                    self.refund = self.refund.saturating_add(outcome.gas().refunded());
+                }
                 // The withheld 64th goes back to the caller (`api.go:260`).
                 let cost = gas.saturating_sub(returned.saturating_add(one_64th));
                 // A failed deploy still answers "success" carrying the zero
                 // address, exactly as the EVM's CREATE pushes 0 on failure.
-                let address = outcome.address.unwrap_or(Address::ZERO);
+                let address = if instruction_result.is_ok() {
+                    outcome.address.unwrap_or(Address::ZERO)
+                } else {
+                    Address::ZERO
+                };
                 let mut resp = Vec::with_capacity(21);
                 resp.push(1);
                 resp.extend_from_slice(address.as_slice());
                 // Return data survives a revert only (nitro `api.go:257-258`).
-                let output = if matches!(outcome.instruction_result(), InstructionResult::Revert) {
+                let output = if instruction_result == InstructionResult::Revert {
                     outcome.output().to_vec()
                 } else {
                     Vec::new()
                 };
                 (resp, output, cost)
             }
-            _ => (create_error(b"create frame failed"), Vec::new(), gas),
+            Ok(_) => {
+                self.latch_fatal_error(ContextError::Custom(
+                    "CREATE hostio received a non-create frame result".to_owned(),
+                ));
+                (create_error(b"create frame failed"), Vec::new(), gas)
+            }
+            Err(error) => {
+                self.latch_fatal_error(error);
+                (create_error(b"create frame failed"), Vec::new(), gas)
+            }
         }
     }
 
@@ -984,9 +1268,9 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             .collect::<Vec<_>>();
         let data = Bytes::copy_from_slice(&input[topics_end..]);
         let contract = self.contract;
-        self.ctx()
-            .journal_mut()
-            .log(Log::new_unchecked(contract, topics, data));
+        let log = Log::new_unchecked(contract, topics, data);
+        self.ctx().journal_mut().log(log.clone());
+        D::record_log(self.evm, log);
         (Vec::new(), Vec::new(), 0)
     }
 
@@ -995,9 +1279,18 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             return (vec![0u8; 32], Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
-        let (balance, is_cold) = match self.ctx().journal_mut().load_account(addr) {
-            Ok(load) => (load.data.info.balance, load.is_cold),
-            Err(_) => (U256::ZERO, false),
+        let account = self
+            .ctx()
+            .journal_mut()
+            .load_account(addr)
+            .map(|load| (load.data.info.balance, load.is_cold));
+        let (balance, is_cold) = match account {
+            Ok(account) => account,
+            Err(error) => {
+                let cost = self.account_touch_cost(false);
+                self.latch_fatal_error(ContextError::Db(error));
+                return (vec![0u8; 32], Vec::new(), cost);
+            }
         };
         (
             balance.to_be_bytes::<32>().to_vec(),
@@ -1011,9 +1304,18 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             return (vec![0u8; 32], Vec::new(), 0);
         }
         let addr = Address::from_slice(&input[..20]);
-        let (hash, is_cold) = match self.ctx().journal_mut().code_hash(addr) {
-            Ok(load) => (load.data, load.is_cold),
-            Err(_) => (B256::ZERO, false),
+        let code_hash = self
+            .ctx()
+            .journal_mut()
+            .code_hash(addr)
+            .map(|load| (load.data, load.is_cold));
+        let (hash, is_cold) = match code_hash {
+            Ok(code_hash) => code_hash,
+            Err(error) => {
+                let cost = self.account_touch_cost(false);
+                self.latch_fatal_error(ContextError::Db(error));
+                return (vec![0u8; 32], Vec::new(), cost);
+            }
         };
         (
             hash.0.to_vec(),
@@ -1030,9 +1332,18 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         }
         let addr = Address::from_slice(&input[..20]);
         let gas_left = u64::from_be_bytes(input[20..28].try_into().unwrap());
-        let (code, is_cold) = match self.ctx().journal_mut().code(addr) {
-            Ok(load) => (load.data.to_vec(), load.is_cold),
-            Err(_) => (Vec::new(), false),
+        let account_code = self
+            .ctx()
+            .journal_mut()
+            .code(addr)
+            .map(|load| (load.data.to_vec(), load.is_cold));
+        let (code, is_cold) = match account_code {
+            Ok(account_code) => account_code,
+            Err(error) => {
+                let cost = self.account_code_cost(false);
+                self.latch_fatal_error(ContextError::Db(error));
+                return (Vec::new(), Vec::new(), cost);
+            }
         };
         let cost = self.account_code_cost(is_cold);
         // nitro still bills the full cost but hands back no code when the
@@ -1075,25 +1386,179 @@ mod tests {
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
     use leafage_evm_types::{BlockEnv, CfgEnv};
-    use revm::database::{in_memory_db::CacheDB, EmptyDB};
+    use revm::database::{EmptyDB, in_memory_db::CacheDB};
+    use revm::interpreter::interpreter_types::Jumps;
+    use revm::interpreter::{CallOutcome, CreateOutcome};
 
     type TestDb = CacheDB<EmptyDB>;
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    struct FailingStorageDb;
+
+    impl Database for FailingStorageDb {
+        type Error = ExpectedDbError;
+
+        fn basic(&mut self, _: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Ok(Some(revm::state::AccountInfo::default()))
+        }
+
+        fn code_by_hash(&mut self, _: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage(&mut self, _: Address, _: U256) -> Result<U256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    impl DatabaseRef for FailingStorageDb {
+        type Error = ExpectedDbError;
+
+        fn basic_ref(&self, _: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Ok(Some(revm::state::AccountInfo::default()))
+        }
+
+        fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
     fn test_evm() -> ArbitrumEvm<TestDb, ()> {
+        test_evm_with_inspector(())
+    }
+
+    #[test]
+    fn stylus_outcomes_preserve_nitro_error_semantics() {
+        let data = vec![0xaa, 0xbb];
+        assert_eq!(
+            stylus_frame_disposition(StylusOutcome::Success, data.clone()),
+            StylusFrameDisposition::Complete {
+                result: InstructionResult::Return,
+                output: Bytes::from(data.clone()),
+                spend_all: false,
+            }
+        );
+        assert_eq!(
+            stylus_frame_disposition(StylusOutcome::Revert, data.clone()),
+            StylusFrameDisposition::Complete {
+                result: InstructionResult::Revert,
+                output: Bytes::from(data),
+                spend_all: false,
+            }
+        );
+        assert_eq!(
+            stylus_frame_disposition(StylusOutcome::Failure, vec![0xff]),
+            StylusFrameDisposition::Complete {
+                result: InstructionResult::Revert,
+                output: Bytes::new(),
+                spend_all: false,
+            }
+        );
+        assert_eq!(
+            stylus_frame_disposition(StylusOutcome::OutOfInk, Vec::new()),
+            StylusFrameDisposition::Complete {
+                result: InstructionResult::OutOfGas,
+                output: Bytes::new(),
+                spend_all: true,
+            }
+        );
+        assert_eq!(
+            stylus_frame_disposition(StylusOutcome::OutOfStack, Vec::new()),
+            StylusFrameDisposition::Complete {
+                result: InstructionResult::CallTooDeep,
+                output: Bytes::new(),
+                spend_all: true,
+            }
+        );
+        assert!(matches!(
+            stylus_frame_disposition(StylusOutcome::NativeStackOverflow, Vec::new()),
+            StylusFrameDisposition::Infrastructure(_)
+        ));
+    }
+
+    fn test_evm_with_inspector<I>(inspector: I) -> ArbitrumEvm<TestDb, I> {
         ArbitrumEvm::new(
             BlockEnv::default(),
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             CacheDB::new(EmptyDB::default()),
+            inspector,
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        )
+    }
+
+    fn failing_storage_evm() -> ArbitrumEvm<FailingStorageDb, ()> {
+        ArbitrumEvm::new(
+            BlockEnv::default(),
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            FailingStorageDb,
             (),
             ArbitrumPrecompileEnv::default(),
             ArbitrumExecutionContext::default(),
         )
     }
 
+    fn failing_storage_hostio(
+        evm: &mut ArbitrumEvm<FailingStorageDb, ()>,
+    ) -> StylusHostio<'_, Plain, FailingStorageDb, ()> {
+        let gas_params = evm.inner.ctx.cfg().gas_params().clone();
+        evm.inner
+            .ctx
+            .journal_mut()
+            .load_account(Address::ZERO)
+            .expect("load contract account");
+        StylusHostio {
+            evm,
+            driver: PhantomData,
+            contract: Address::ZERO,
+            is_static: false,
+            delegate_caller: Address::ZERO,
+            delegate_value: U256::ZERO,
+            free_pages: 2,
+            page_gas: 1000,
+            page_limit: 128,
+            gas_params,
+            max_code_size: DEFAULT_MAX_CODE_SIZE,
+            arbos_version: 61,
+            refund: 0,
+            fatal_error: None,
+        }
+    }
+
     fn test_hostio(
         evm: &mut ArbitrumEvm<TestDb, ()>,
         is_static: bool,
     ) -> StylusHostio<'_, Plain, TestDb, ()> {
+        test_hostio_with_driver(evm, is_static)
+    }
+
+    fn test_hostio_with_driver<D, I>(
+        evm: &mut ArbitrumEvm<TestDb, I>,
+        is_static: bool,
+    ) -> StylusHostio<'_, D, TestDb, I> {
         let gas_params = evm.inner.ctx.cfg().gas_params().clone();
         // revm expects an account to be journal-loaded before its storage is
         // touched, which in production the frame setup has already done.
@@ -1112,7 +1577,208 @@ mod tests {
             max_code_size: DEFAULT_MAX_CODE_SIZE,
             arbos_version: 61,
             refund: 0,
+            fatal_error: None,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingInspector {
+        steps: Vec<(u8, Address, Vec<U256>)>,
+        step_ends: usize,
+        logs: Vec<Log>,
+    }
+
+    impl Inspector<ArbitrumContext<TestDb>, EthInterpreter> for RecordingInspector {
+        fn step(
+            &mut self,
+            interpreter: &mut Interpreter<EthInterpreter>,
+            _context: &mut ArbitrumContext<TestDb>,
+        ) {
+            self.steps.push((
+                interpreter.bytecode.opcode(),
+                interpreter.input.target_address,
+                interpreter.stack.data().clone(),
+            ));
+        }
+
+        fn step_end(
+            &mut self,
+            _interpreter: &mut Interpreter<EthInterpreter>,
+            _context: &mut ArbitrumContext<TestDb>,
+        ) {
+            self.step_ends += 1;
+        }
+
+        fn log(&mut self, _context: &mut ArbitrumContext<TestDb>, log: Log) {
+            self.logs.push(log);
+        }
+    }
+
+    fn push_parent(evm: &mut ArbitrumEvm<TestDb, ()>, address: Address) {
+        let caller = Address::with_last_byte(1);
+        evm.inner
+            .ctx
+            .journal_mut()
+            .load_account(caller)
+            .expect("load parent caller");
+        evm.inner
+            .ctx
+            .journal_mut()
+            .load_account(address)
+            .expect("load parent target");
+        let bytecode = Bytecode::new_raw(Bytes::from_static(&[0x00]));
+        let code_hash = bytecode.hash_slow();
+        let inputs = CallInputs {
+            input: CallInput::Bytes(Bytes::new()),
+            return_memory_offset: 0..0,
+            gas_limit: 1_000_000,
+            bytecode_address: address,
+            known_bytecode: Some((code_hash, bytecode)),
+            target_address: address,
+            caller,
+            value: CallValue::Apparent(U256::ZERO),
+            scheme: CallScheme::Call,
+            is_static: false,
+        };
+        assert!(matches!(
+            evm.frame_init(FrameInit {
+                depth: 0,
+                memory: SharedMemory::new(),
+                frame_input: FrameInput::Call(Box::new(inputs)),
+            })
+            .expect("initialize parent frame"),
+            ItemOrResult::Item(_)
+        ));
+    }
+
+    fn known_call_inputs(
+        target: Address,
+        bytecode_address: Address,
+        scheme: CallScheme,
+        code: Bytes,
+    ) -> CallInputs {
+        let bytecode = Bytecode::new_raw(code);
+        CallInputs {
+            input: CallInput::Bytes(Bytes::new()),
+            return_memory_offset: 0..0,
+            gas_limit: 100_000,
+            bytecode_address,
+            known_bytecode: Some((bytecode.hash_slow(), bytecode)),
+            target_address: target,
+            caller: Address::with_last_byte(1),
+            value: CallValue::Apparent(U256::ZERO),
+            scheme,
+            is_static: false,
+        }
+    }
+
+    fn child_frame_init(evm: &mut ArbitrumEvm<TestDb, ()>, frame_input: FrameInput) -> FrameInit {
+        let parent = evm.inner.frame_stack.get();
+        FrameInit {
+            depth: parent.depth + 1,
+            memory: parent.interpreter.memory.new_child_context(),
+            frame_input,
+        }
+    }
+
+    struct ImmediateDriver;
+
+    impl<DB, I> FrameDriver<DB, I> for ImmediateDriver
+    where
+        DB: Database + DatabaseRef,
+    {
+        fn init(
+            evm: &mut ArbitrumEvm<DB, I>,
+            frame_init: FrameInit,
+        ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+            let frame_result = match frame_init.frame_input {
+                FrameInput::Call(inputs) => {
+                    let marker = inputs
+                        .input
+                        .bytes(&evm.inner.ctx)
+                        .first()
+                        .copied()
+                        .unwrap_or_default();
+                    if marker == 0xff {
+                        return Err(ContextError::Custom("synthetic child failure".to_owned()));
+                    }
+                    let mut gas = Gas::new(inputs.gas_limit);
+                    let (result, output) = match marker {
+                        0 => {
+                            assert!(gas.record_cost(1_234));
+                            gas.record_refund(77);
+                            (InstructionResult::Return, Bytes::from_static(b"ok"))
+                        }
+                        1 => {
+                            assert!(gas.record_cost(1_234));
+                            gas.record_refund(88);
+                            (InstructionResult::Revert, Bytes::from_static(b"revert"))
+                        }
+                        2 => {
+                            gas.record_refund(99);
+                            (InstructionResult::OutOfGas, Bytes::new())
+                        }
+                        _ => unreachable!("unknown call marker"),
+                    };
+                    FrameResult::Call(CallOutcome::new(
+                        InterpreterResult::new(result, output, gas),
+                        0..0,
+                    ))
+                }
+                FrameInput::Create(inputs) => {
+                    let marker = inputs.init_code().first().copied().unwrap_or_default();
+                    if marker == 0xff {
+                        return Err(ContextError::Custom("synthetic child failure".to_owned()));
+                    }
+                    let mut gas = Gas::new(inputs.gas_limit());
+                    let (result, output) = match marker {
+                        0 => {
+                            assert!(gas.record_cost(1_234));
+                            gas.record_refund(77);
+                            (InstructionResult::Return, Bytes::new())
+                        }
+                        1 => {
+                            assert!(gas.record_cost(1_234));
+                            gas.record_refund(88);
+                            (InstructionResult::Revert, Bytes::from_static(b"revert"))
+                        }
+                        2 => {
+                            gas.record_refund(99);
+                            (InstructionResult::OutOfGas, Bytes::new())
+                        }
+                        _ => unreachable!("unknown create marker"),
+                    };
+                    FrameResult::Create(CreateOutcome::new(
+                        InterpreterResult::new(result, output, gas),
+                        Some(Address::with_last_byte(0x42)),
+                    ))
+                }
+                FrameInput::Empty => unreachable!("empty test frame"),
+            };
+            Ok(ItemOrResult::Result(frame_result))
+        }
+
+        fn run(
+            _evm: &mut ArbitrumEvm<DB, I>,
+        ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+            unreachable!("immediate frames never run")
+        }
+    }
+
+    fn call_request(marker: u8) -> Vec<u8> {
+        let mut input = Address::with_last_byte(0x99).to_vec();
+        input.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        input.extend_from_slice(&100_000u64.to_be_bytes());
+        input.extend_from_slice(&50_000u64.to_be_bytes());
+        input.push(marker);
+        input
+    }
+
+    fn create_request(marker: u8) -> Vec<u8> {
+        let mut input = 100_000u64.to_be_bytes().to_vec();
+        input.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        input.push(marker);
+        input
     }
 
     #[test]
@@ -1153,6 +1819,60 @@ mod tests {
         let mut evm = test_evm();
         let (response, _, _) = test_hostio(&mut evm, false).emit_log(&[0u8; 2]);
         assert_eq!(response, MALFORMED_REQUEST_ERROR);
+    }
+
+    #[test]
+    fn traced_hostio_reports_each_log_and_sstore_once() {
+        let topic = B256::from([0x11; 32]);
+        let mut log_input = 1u32.to_be_bytes().to_vec();
+        log_input.extend_from_slice(topic.as_slice());
+        log_input.extend_from_slice(b"payload");
+
+        let key = U256::from(7);
+        let value = U256::from(9);
+        let mut slot_input = 1_000_000u64.to_be_bytes().to_vec();
+        slot_input.extend_from_slice(&key.to_be_bytes::<32>());
+        slot_input.extend_from_slice(&value.to_be_bytes::<32>());
+
+        let mut evm = test_evm_with_inspector(RecordingInspector::default());
+        {
+            let mut hostio = test_hostio_with_driver::<Traced, _>(&mut evm, false);
+            assert!(hostio.emit_log(&log_input).0.is_empty());
+            assert_eq!(
+                hostio.set_trie_slots(&slot_input).0,
+                vec![API_STATUS_SUCCESS]
+            );
+        }
+
+        assert_eq!(evm.inner.ctx.journal().logs().len(), 1);
+        assert_eq!(evm.inner.inspector.logs.len(), 1);
+        assert_eq!(evm.inner.inspector.logs[0].address, Address::ZERO);
+        assert_eq!(evm.inner.inspector.logs[0].topics(), &[topic]);
+        assert_eq!(evm.inner.inspector.logs[0].data.data.as_ref(), b"payload");
+        assert_eq!(
+            evm.inner.inspector.steps,
+            vec![(opcode::SSTORE, Address::ZERO, vec![value, key])]
+        );
+        assert_eq!(evm.inner.inspector.step_ends, 1);
+    }
+
+    #[test]
+    fn traced_unaffordable_sstore_still_balances_step_hooks() {
+        let mut slot_input = 10u64.to_be_bytes().to_vec();
+        slot_input.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+        slot_input.extend_from_slice(&U256::from(2).to_be_bytes::<32>());
+        // This second slot is not processed after the first exhausts the budget.
+        slot_input.extend_from_slice(&U256::from(3).to_be_bytes::<32>());
+        slot_input.extend_from_slice(&U256::from(4).to_be_bytes::<32>());
+
+        let mut evm = test_evm_with_inspector(RecordingInspector::default());
+        let response = test_hostio_with_driver::<Traced, _>(&mut evm, false)
+            .set_trie_slots(&slot_input)
+            .0;
+
+        assert_eq!(response, vec![API_STATUS_OUT_OF_GAS]);
+        assert_eq!(evm.inner.inspector.steps.len(), 1);
+        assert_eq!(evm.inner.inspector.step_ends, 1);
     }
 
     #[test]
@@ -1219,6 +1939,256 @@ mod tests {
     }
 
     #[test]
+    fn immediate_grandchild_result_resumes_the_direct_child() {
+        let parent = Address::with_last_byte(0x10);
+        let child = Address::with_last_byte(0x20);
+        let empty_target = Address::with_last_byte(0xee);
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+
+        // CALL an empty account (resolved by `frame_init` without a pushed
+        // frame), then return 0x2a. The direct child must resume after the
+        // immediate grandchild result instead of returning that result itself.
+        let mut code = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73];
+        code.extend_from_slice(empty_target.as_slice());
+        code.extend_from_slice(&[
+            0x61, 0x27, 0x10, 0xf1, 0x50, 0x60, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+        ]);
+
+        for _ in 0..2 {
+            let inputs = known_call_inputs(
+                child,
+                child,
+                CallScheme::Call,
+                Bytes::copy_from_slice(&code),
+            );
+            let result =
+                drive_subframe::<Plain, _, _>(&mut evm, FrameInput::Call(Box::new(inputs)))
+                    .expect("drive child frame");
+            let FrameResult::Call(outcome) = result else {
+                panic!("expected call outcome")
+            };
+            assert_eq!(*outcome.instruction_result(), InstructionResult::Return);
+            assert_eq!(outcome.output().len(), 32);
+            assert_eq!(outcome.output()[31], 0x2a);
+            assert_eq!(evm.inner.frame_stack.index(), Some(0));
+            assert_eq!(evm.ctx().chain().open_contract_frame_count(child), 0);
+        }
+    }
+
+    #[test]
+    fn call_gas_and_refunds_follow_revm_return_rules() {
+        let parent = Address::with_last_byte(0x10);
+
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+        let (response, output, cost) = hostio.contract_call(&call_request(0), CallScheme::Call);
+        assert_eq!(response, vec![CALL_STATUS_SUCCESS]);
+        assert_eq!(output, b"ok");
+        assert_eq!(cost, 2_600 + 1_234);
+        assert_eq!(hostio.refund, 77);
+
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+        let (response, output, cost) = hostio.contract_call(&call_request(1), CallScheme::Call);
+        assert_eq!(response, vec![CALL_STATUS_FAILURE]);
+        assert_eq!(output, b"revert");
+        assert_eq!(cost, 2_600 + 1_234);
+        assert_eq!(hostio.refund, 0, "revert must not propagate refunds");
+
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+        let (response, output, cost) = hostio.contract_call(&call_request(2), CallScheme::Call);
+        assert_eq!(response, vec![CALL_STATUS_FAILURE]);
+        assert!(output.is_empty());
+        assert_eq!(cost, 2_600 + 50_000, "exceptional halt burns child gas");
+        assert_eq!(hostio.refund, 0, "exceptional halt must not refund");
+    }
+
+    #[test]
+    fn create_gas_refund_and_failed_address_follow_revm_rules() {
+        let parent = Address::with_last_byte(0x10);
+
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+        let (response, output, cost) = hostio.create(&create_request(0), false);
+        assert_eq!(response[0], 1);
+        assert_eq!(&response[1..], Address::with_last_byte(0x42).as_slice());
+        assert!(output.is_empty());
+        assert_eq!(cost, 32_000 + 1_234);
+        assert_eq!(hostio.refund, 77);
+
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+        let (response, output, cost) = hostio.create(&create_request(1), false);
+        assert_eq!(response[0], 1);
+        assert_eq!(&response[1..], Address::ZERO.as_slice());
+        assert_eq!(output, b"revert");
+        assert_eq!(cost, 32_000 + 1_234);
+        assert_eq!(hostio.refund, 0, "revert must not propagate refunds");
+
+        let mut evm = test_evm();
+        push_parent(&mut evm, parent);
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+        let (response, output, cost) = hostio.create(&create_request(2), false);
+        assert_eq!(response[0], 1);
+        assert_eq!(&response[1..], Address::ZERO.as_slice());
+        assert!(output.is_empty());
+        assert_eq!(
+            cost, 98_938,
+            "exceptional halt only returns EIP-150 reserve"
+        );
+        assert_eq!(hostio.refund, 0, "exceptional halt must not refund");
+    }
+
+    #[test]
+    fn subframe_error_is_latched_and_blocks_later_hostio_mutations() {
+        let mut evm = test_evm();
+        push_parent(&mut evm, Address::with_last_byte(0x10));
+        let mut hostio = test_hostio_with_driver::<ImmediateDriver, _>(&mut evm, false);
+
+        let (response, _, _) = hostio.contract_call(&call_request(0xff), CallScheme::Call);
+        assert_eq!(response, vec![CALL_STATUS_FAILURE]);
+        assert!(matches!(
+            hostio.fatal_error,
+            Some(ContextError::Custom(ref message)) if message == "synthetic child failure"
+        ));
+
+        let key = U256::from(7);
+        let value = U256::from(9);
+        let mut mutation = key.to_be_bytes::<32>().to_vec();
+        mutation.extend_from_slice(&value.to_be_bytes::<32>());
+        let response = hostio.handle(3, &mutation);
+        assert_eq!(response, (Vec::new(), Vec::new(), 0));
+        assert_eq!(
+            hostio.evm.ctx_mut().journal_mut().tload(Address::ZERO, key),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn hostio_storage_errors_keep_database_error_provenance() {
+        let mut evm = failing_storage_evm();
+        let mut hostio = failing_storage_hostio(&mut evm);
+        let placeholder_cost = hostio.storage_load_cost(false);
+        assert_eq!(
+            hostio.get_bytes32(&U256::from(1).to_be_bytes::<32>()),
+            (vec![0u8; 32], Vec::new(), placeholder_cost)
+        );
+        assert_eq!(hostio.fatal_error, Some(ContextError::Db(ExpectedDbError)));
+
+        let mut input = 1_000_000u64.to_be_bytes().to_vec();
+        input.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+        input.extend_from_slice(&U256::from(2).to_be_bytes::<32>());
+        let mut evm = failing_storage_evm();
+        let mut hostio = failing_storage_hostio(&mut evm);
+        assert_eq!(
+            hostio.set_trie_slots(&input),
+            (vec![API_STATUS_FAILURE], Vec::new(), 0)
+        );
+        assert_eq!(hostio.fatal_error, Some(ContextError::Db(ExpectedDbError)));
+    }
+
+    #[test]
+    fn frame_counts_cover_calls_and_creates_but_not_delegate_frames() {
+        let acting = Address::with_last_byte(0x10);
+        let implementation = Address::with_last_byte(0x11);
+        let mut evm = test_evm();
+        push_parent(&mut evm, acting);
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(acting), 1);
+
+        let call = known_call_inputs(
+            acting,
+            acting,
+            CallScheme::Call,
+            Bytes::from_static(&[0x00]),
+        );
+        let init = child_frame_init(&mut evm, FrameInput::Call(Box::new(call)));
+        assert!(matches!(
+            evm.frame_init(init).expect("initialize recursive call"),
+            ItemOrResult::Item(_)
+        ));
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(acting), 2);
+        assert!(evm.ctx().chain().contract_is_reentrant(acting));
+        let ItemOrResult::Result(result) = evm.frame_run().expect("run recursive call") else {
+            panic!("STOP should finish the frame")
+        };
+        assert!(
+            evm.frame_return_result(result)
+                .expect("return recursive call")
+                .is_none()
+        );
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(acting), 1);
+
+        let delegate = known_call_inputs(
+            acting,
+            implementation,
+            CallScheme::DelegateCall,
+            Bytes::from_static(&[0x00]),
+        );
+        let init = child_frame_init(&mut evm, FrameInput::Call(Box::new(delegate)));
+        assert!(matches!(
+            evm.frame_init(init).expect("initialize delegate call"),
+            ItemOrResult::Item(_)
+        ));
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(acting), 1);
+        let ItemOrResult::Result(result) = evm.frame_run().expect("run delegate call") else {
+            panic!("STOP should finish the frame")
+        };
+        assert!(
+            evm.frame_return_result(result)
+                .expect("return delegate call")
+                .is_none()
+        );
+
+        let create = CreateInputs::new(
+            acting,
+            CreateScheme::Create,
+            U256::ZERO,
+            Bytes::from_static(&[0x00]),
+            100_000,
+        );
+        let init = child_frame_init(&mut evm, FrameInput::Create(Box::new(create)));
+        assert!(matches!(
+            evm.frame_init(init).expect("initialize create"),
+            ItemOrResult::Item(_)
+        ));
+        let created = evm
+            .inner
+            .frame_stack
+            .get()
+            .data
+            .created_address()
+            .expect("create address");
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(created), 1);
+        let ItemOrResult::Result(result) = evm.frame_run().expect("run create") else {
+            panic!("STOP should finish init code")
+        };
+        assert!(
+            evm.frame_return_result(result)
+                .expect("return create")
+                .is_none()
+        );
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(created), 0);
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(acting), 1);
+
+        let ItemOrResult::Result(result) = evm.frame_run().expect("run parent") else {
+            panic!("STOP should finish parent")
+        };
+        assert!(
+            evm.frame_return_result(result)
+                .expect("return parent")
+                .is_some()
+        );
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(acting), 0);
+    }
+
+    #[test]
     fn create_below_its_base_cost_is_out_of_gas() {
         let mut input = 1_000u64.to_be_bytes().to_vec(); // below CreateGas
         input.extend_from_slice(&[0u8; 32]);
@@ -1267,25 +2237,5 @@ mod tests {
         assert_eq!(memory_gas_cost(10, 0, 0, 2, 1000), 8002);
         // Re-growing already-open pages is linear only (exp keyed on high-water).
         assert_eq!(memory_gas_cost(0, 10, 10, 2, 1000), 0);
-    }
-
-    #[test]
-    fn dispatches_only_on_stylus_prefixes() {
-        // The three activated-program prefixes (with a non-empty body) dispatch.
-        assert!(is_stylus_code(&[0xef, 0xf0, 0x00, 0x01]));
-        assert!(is_stylus_code(&[0xef, 0xf0, 0x01, 0x2a]));
-        assert!(is_stylus_code(&[0xef, 0xf0, 0x02, 0xff, 0x00]));
-    }
-
-    #[test]
-    fn does_not_dispatch_on_non_stylus_code() {
-        // Ordinary EVM bytecode, empty code, and near-miss prefixes must not
-        // dispatch (no false positives — see design §8.2.1).
-        assert!(!is_stylus_code(&[]));
-        assert!(!is_stylus_code(&[0x60, 0x80, 0x60, 0x40])); // PUSH1 0x80 ...
-        assert!(!is_stylus_code(&[0xef])); // bare 0xEF
-        assert!(!is_stylus_code(&[0xef, 0x00, 0x01, 0x02])); // EOF magic 0xEF00
-        assert!(!is_stylus_code(&[0xef, 0xf0, 0x03, 0x00])); // unknown 4th prefix byte
-        assert!(!is_stylus_code(&[0xef, 0xf0, 0x00])); // prefix only, no body
     }
 }

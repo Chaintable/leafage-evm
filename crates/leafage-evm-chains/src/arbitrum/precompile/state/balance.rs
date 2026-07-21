@@ -12,7 +12,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         self.context
             .journal_mut()
             .transfer(precompile, Address::ZERO, value)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?
+            .map_err(fatal_db_error)?
             .map_or(Ok(()), |err| {
                 Err(PrecompileError::other(format!("{err:?}")))
             })
@@ -30,7 +30,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         self.context
             .journal_mut()
             .transfer(from, to, value)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?
+            .map_err(fatal_db_error)?
             .map_or(Ok(()), |err| {
                 Err(PrecompileError::other(format!("{err:?}")))
             })
@@ -45,7 +45,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .context
             .journal_mut()
             .load_account_mut_skip_cold_load(account, false)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+            .map_err(fatal_db_error)?;
         if !account.data.incr_balance(amount) {
             return Err(PrecompileError::other("balance overflow"));
         }
@@ -61,7 +61,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .context
             .journal_mut()
             .load_account_mut_skip_cold_load(account, false)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+            .map_err(fatal_db_error)?;
         if !account.data.decr_balance(amount) {
             return Err(PrecompileError::other("burn amount exceeds balance"));
         }

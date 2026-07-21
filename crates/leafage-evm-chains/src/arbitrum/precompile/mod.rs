@@ -27,23 +27,25 @@ mod wasm_cache;
 
 use self::env::ArbPrecompileInput;
 pub use self::env::ArbitrumPrecompileEnv;
-pub(crate) use self::stylus_runtime::{HostioHandler, StylusExecInput, StylusOutcome, StylusRuntime};
-pub(crate) use self::wasm::{ArbWasm, PreparedStylusProgram};
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
+pub(crate) use self::stylus_runtime::{
+    HostioHandler, NativeAsmCacheKey, StylusCompiler, StylusExecInput, StylusOutcome, StylusRuntime,
+};
 use self::util::{
     charge_precompile_context_gas, decode_revert, empty_revert, to_interpreter_result,
 };
+pub(crate) use self::wasm::{ArbWasm, PreparedStylusProgram};
 use crate::arbitrum::evm::ArbitrumExecutionContext;
 use crate::arbitrum::hardforks::ArbitrumHardfork;
 use crate::arbitrum::tx::ArbitrumTxEnv;
-use alloy::primitives::{address, Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, U256, address};
 use leafage_evm_types::{BlockEnv, CfgEnv};
 use once_cell::race::OnceBox;
 use revm::context::{ContextTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, CallScheme, InterpreterResult};
-use revm::precompile::{secp256r1, PrecompileResult, Precompiles};
+use revm::precompile::{PrecompileResult, Precompiles, secp256r1};
 use revm::primitives::Address as RevmAddress;
 use revm::{Context, Journal};
 use revm::{Database, DatabaseRef};
@@ -328,8 +330,8 @@ mod tests {
     use crate::arbitrum::evm::ArbPosterCharge;
     use alloy::sol_types::SolCall;
     use revm::context::JournalTr;
-    use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
+    use revm::database::in_memory_db::CacheDB;
     use revm::handler::PrecompileProvider;
     use revm::interpreter::{CallValue, InstructionResult};
     use revm::precompile::u64_to_address;

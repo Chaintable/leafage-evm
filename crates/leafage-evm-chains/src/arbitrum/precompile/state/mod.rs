@@ -9,16 +9,16 @@ mod stylus;
 
 use super::util::{address_from_word, address_key, signed_diff};
 use super::{
-    ArbitrumContext, ASSUMED_SIMPLE_TX_SIZE, GAS_CONSTRAINTS_KEY, L1_PRICER_FUNDS_POOL_ADDRESS,
+    ASSUMED_SIMPLE_TX_SIZE, ArbitrumContext, GAS_CONSTRAINTS_KEY, L1_PRICER_FUNDS_POOL_ADDRESS,
     MAX_GET_ALL_MEMBERS, MULTI_GAS_CONSTRAINTS_KEY, NUM_RESOURCE_KIND, RESOURCE_KIND_SINGLE_DIM,
     RETRYABLE_LIFETIME_SECONDS, STORAGE_READ_GAS, STORAGE_WRITE_COST, STORAGE_WRITE_ZERO_COST,
     TX_DATA_NON_ZERO_GAS,
 };
 use crate::arbitrum::arbos_state;
-use alloy::primitives::{keccak256, Address, Bytes, B256, I256, U256};
+use alloy::primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable, Header};
 use revm::context::{ContextTr, JournalTr};
-use revm::context_interface::{journaled_state::account::JournaledAccountTr, Block};
+use revm::context_interface::{Block, journaled_state::account::JournaledAccountTr};
 use revm::precompile::PrecompileError;
 use revm::primitives::KECCAK_EMPTY;
 use revm::{Database, DatabaseRef};
@@ -28,6 +28,10 @@ const ARBOS_VERSION_60: u64 = 60;
 const ARBITRUM_START_TIME: u64 = 1_421_388_000;
 const MAX_UINT24: u32 = 0x00ff_ffff;
 const WARM_STORAGE_READ_GAS: u64 = 100;
+
+fn fatal_db_error(error: impl core::fmt::Debug) -> PrecompileError {
+    PrecompileError::Fatal(format!("{error:?}"))
+}
 
 pub(super) struct ArbStorage<'a, CTX> {
     pub(super) context: &'a mut CTX,
@@ -168,12 +172,33 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .unwrap_or_else(|| self.context.block().basefee())
     }
 
+    fn load_account_concrete(&mut self, account: Address) -> Result<(), DB::Error> {
+        self.context.journal_mut().load_account(account).map(|_| ())
+    }
+
     fn load_account(&mut self, account: Address) -> Result<(), PrecompileError> {
+        self.load_account_concrete(account).map_err(fatal_db_error)
+    }
+
+    pub(in crate::arbitrum::precompile) fn read_key_concrete(
+        &mut self,
+        storage_key: &[u8],
+        key: [u8; 32],
+    ) -> Result<U256, DB::Error> {
+        self.read_account_key_concrete(arbos_state::ARBOS_STATE_ADDRESS, storage_key, key)
+    }
+
+    fn read_account_key_concrete(
+        &mut self,
+        account: Address,
+        storage_key: &[u8],
+        key: [u8; 32],
+    ) -> Result<U256, DB::Error> {
+        self.load_account_concrete(account)?;
         self.context
             .journal_mut()
-            .load_account(account)
-            .map(|_| ())
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .sload(account, arbos_state::slot_for_key(storage_key, key))
+            .map(|slot| slot.data)
     }
 
     pub(super) fn read_key(
@@ -191,12 +216,8 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         key: [u8; 32],
     ) -> Result<U256, PrecompileError> {
         self.burn(STORAGE_READ_GAS)?;
-        self.load_account(account)?;
-        self.context
-            .journal_mut()
-            .sload(account, arbos_state::slot_for_key(storage_key, key))
-            .map(|slot| slot.data)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+        self.read_account_key_concrete(account, storage_key, key)
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile::state) fn read_account_key_unmetered(
@@ -205,12 +226,8 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         storage_key: &[u8],
         key: [u8; 32],
     ) -> Result<U256, PrecompileError> {
-        self.load_account(account)?;
-        self.context
-            .journal_mut()
-            .sload(account, arbos_state::slot_for_key(storage_key, key))
-            .map(|slot| slot.data)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+        self.read_account_key_concrete(account, storage_key, key)
+            .map_err(fatal_db_error)
     }
 
     pub(super) fn read(
@@ -247,7 +264,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .sstore(account, arbos_state::slot_for_key(storage_key, key), value)
             .map(|_| ())
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile::state) fn write_account_key_unmetered(
@@ -262,7 +279,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .sstore(account, arbos_state::slot_for_key(storage_key, key), value)
             .map(|_| ())
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(super) fn write(
@@ -355,16 +372,17 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     }
 
     fn arbos_version_unmetered(&mut self) -> Result<u64, PrecompileError> {
-        let slot = arbos_state::slot_for_key(
+        self.arbos_version_concrete().map_err(fatal_db_error)
+    }
+
+    pub(in crate::arbitrum::precompile) fn arbos_version_concrete(
+        &mut self,
+    ) -> Result<u64, DB::Error> {
+        self.read_key_concrete(
             &[],
             U256::from(arbos_state::ARBOS_VERSION_OFFSET).to_be_bytes(),
-        );
-        self.load_account(arbos_state::ARBOS_STATE_ADDRESS)?;
-        self.context
-            .journal_mut()
-            .sload(arbos_state::ARBOS_STATE_ADDRESS, slot)
-            .map(|slot| slot.data.to::<u64>())
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+        )
+        .map(|value| value.to::<u64>())
     }
 
     pub(super) fn l1_key(&self) -> [u8; 32] {
@@ -519,8 +537,8 @@ mod tests {
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use leafage_evm_types::{BlockEnv, CfgEnv};
     use revm::context::JournalTr;
-    use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
+    use revm::database::in_memory_db::CacheDB;
     use revm::{Context, MainContext};
 
     fn context_without_loaded_account(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
@@ -542,6 +560,95 @@ mod tests {
             .load_account(arbos_state::ARBOS_STATE_ADDRESS)
             .expect("load ArbOS state account");
         context
+    }
+
+    #[derive(Debug)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    struct FailingDb;
+
+    impl Database for FailingDb {
+        type Error = ExpectedDbError;
+
+        fn basic(&mut self, _: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn code_by_hash(&mut self, _: B256) -> Result<revm::bytecode::Bytecode, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn storage(&mut self, _: Address, _: U256) -> Result<U256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+    }
+
+    fn with_failing_storage<T>(
+        test: impl FnOnce(&mut ArbStorage<'_, ArbitrumContext<FailingDb>>) -> T,
+    ) -> T {
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv::default())
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(FailingDb)
+            .with_chain(ArbitrumExecutionContext::default());
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+        test(&mut storage)
+    }
+
+    fn assert_db_failure_is_fatal<T>(result: Result<T, PrecompileError>) {
+        match result {
+            Err(PrecompileError::Fatal(message)) => assert_eq!(message, "ExpectedDbError"),
+            Err(error) => panic!("database failure was not fatal: {error:?}"),
+            Ok(_) => panic!("database operation unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
+    fn db_failures_are_fatal_for_activation_read_write_and_transfer() {
+        let account = Address::with_last_byte(1);
+        let recipient = Address::with_last_byte(2);
+
+        with_failing_storage(|storage| {
+            assert_db_failure_is_fatal(storage.account_code_and_hash(account));
+        });
+        with_failing_storage(|storage| {
+            assert_db_failure_is_fatal(storage.read(&[], 0));
+        });
+        with_failing_storage(|storage| {
+            assert_db_failure_is_fatal(storage.write(&[], 0, U256::ONE));
+        });
+        with_failing_storage(|storage| {
+            assert_db_failure_is_fatal(storage.transfer_balance(account, recipient, U256::ONE));
+        });
+    }
+
+    #[test]
+    fn transfer_balance_state_errors_remain_non_fatal() {
+        let mut context = context_without_loaded_account(0);
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+        let error = storage
+            .transfer_balance(
+                Address::with_last_byte(1),
+                Address::with_last_byte(2),
+                U256::ONE,
+            )
+            .expect_err("an empty account cannot transfer value");
+
+        assert!(matches!(error, PrecompileError::Other(_)));
     }
 
     #[test]

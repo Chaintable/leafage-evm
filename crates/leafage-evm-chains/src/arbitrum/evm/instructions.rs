@@ -14,7 +14,7 @@ use revm::context_interface::transaction::TransactionType;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::StackTr;
-use revm::interpreter::{push, Instruction, InstructionContext};
+use revm::interpreter::{Instruction, InstructionContext, push};
 use revm::primitives::U256;
 use revm::{Database, DatabaseRef};
 
@@ -122,14 +122,14 @@ mod tests {
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
     use crate::arbitrum::tx::ArbitrumTxEnv;
-    use alloy::primitives::{address, Address, Bytes, B256};
+    use alloy::primitives::{Address, B256, Bytes, address};
     use leafage_evm_types::{BlockEnv, CfgEnv};
-    use revm::context::result::{ExecutionResult, Output};
+    use revm::ExecuteEvm;
     use revm::context::TxEnv;
-    use revm::database::{in_memory_db::CacheDB, EmptyDB};
+    use revm::context::result::{ExecutionResult, Output};
+    use revm::database::{EmptyDB, in_memory_db::CacheDB};
     use revm::primitives::TxKind;
     use revm::state::{AccountInfo, Bytecode};
-    use revm::ExecuteEvm;
 
     type TestDb = CacheDB<EmptyDB>;
 

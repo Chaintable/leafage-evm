@@ -36,6 +36,19 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                 U256::ZERO.to_be_bytes(),
             )?
             .to_be_bytes::<32>();
+        Ok(Self::decode_stylus_params(bytes, arbos_version))
+    }
+
+    pub(in crate::arbitrum::precompile) fn stylus_params_concrete(
+        &mut self,
+        arbos_version: u64,
+    ) -> Result<StylusParams, DB::Error> {
+        let params_key = self.stylus_params_key();
+        self.read_key_concrete(&params_key, U256::ZERO.to_be_bytes())
+            .map(|value| Self::decode_stylus_params(value.to_be_bytes(), arbos_version))
+    }
+
+    fn decode_stylus_params(bytes: [u8; 32], arbos_version: u64) -> StylusParams {
         let mut cursor = 0usize;
 
         let take_u8 = |cursor: &mut usize| {
@@ -89,7 +102,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             0
         };
 
-        Ok(StylusParams {
+        StylusParams {
             version,
             ink_price,
             max_stack_depth,
@@ -105,7 +118,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             block_cache_size,
             max_wasm_size,
             max_fragment_count,
-        })
+        }
     }
 
     pub(in crate::arbitrum::precompile) fn save_stylus_params(
@@ -164,7 +177,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                     account.data.info.code_hash
                 }
             })
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn account_code_and_hash(
@@ -175,7 +188,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .context
             .journal_mut()
             .load_account_with_code(account)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+            .map_err(fatal_db_error)?;
         if loaded.data.is_selfdestructed() {
             return Err(PrecompileError::other("self destructed"));
         }
@@ -198,7 +211,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .code(account)
             .map(|load| (load.data, load.is_cold))
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn code_by_hash(
@@ -223,7 +236,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .db()
             .code_by_hash_ref(code_hash)
             .map(|code| code.original_bytes())
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn account_is_warm(&self, account: Address) -> bool {
@@ -243,7 +256,20 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         let bytes = self
             .read_key(&programs_key, code_hash.0)?
             .to_be_bytes::<32>();
-        Ok(WasmProgram {
+        Ok(Self::decode_wasm_program(bytes))
+    }
+
+    pub(in crate::arbitrum::precompile) fn wasm_program_concrete(
+        &mut self,
+        code_hash: B256,
+    ) -> Result<WasmProgram, DB::Error> {
+        let programs_key = self.wasm_programs_key();
+        self.read_key_concrete(&programs_key, code_hash.0)
+            .map(|value| Self::decode_wasm_program(value.to_be_bytes()))
+    }
+
+    fn decode_wasm_program(bytes: [u8; 32]) -> WasmProgram {
+        WasmProgram {
             version: u16::from_be_bytes([bytes[0], bytes[1]]),
             init_cost: u16::from_be_bytes([bytes[2], bytes[3]]),
             cached_cost: u16::from_be_bytes([bytes[4], bytes[5]]),
@@ -251,7 +277,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             activated_at: u32::from_be_bytes([0, bytes[8], bytes[9], bytes[10]]),
             asm_estimate_kb: u32::from_be_bytes([0, bytes[11], bytes[12], bytes[13]]),
             cached: bytes[14] != 0,
-        })
+        }
     }
 
     pub(in crate::arbitrum::precompile) fn active_wasm_program(
@@ -319,16 +345,13 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         )
     }
 
-    /// Reads the consensus `codeHash -> moduleHash` mapping from the Programs
-    /// `{2}` subspace (the inverse of `save_wasm_module_hash`). The moduleHash
-    /// keys the node-local native-asm cache for execution.
-    pub(in crate::arbitrum::precompile) fn wasm_module_hash(
+    pub(in crate::arbitrum::precompile) fn wasm_module_hash_concrete(
         &mut self,
         code_hash: B256,
-    ) -> Result<B256, PrecompileError> {
+    ) -> Result<B256, DB::Error> {
         let module_hashes_key = self.wasm_module_hashes_key();
-        let value = self.read_key(&module_hashes_key, code_hash.0)?;
-        Ok(B256::from(value.to_be_bytes::<32>()))
+        self.read_key_concrete(&module_hashes_key, code_hash.0)
+            .map(|value| B256::from(value.to_be_bytes::<32>()))
     }
 
     pub(in crate::arbitrum::precompile) fn save_activated_wasm_program(
