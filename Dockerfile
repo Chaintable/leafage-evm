@@ -58,6 +58,16 @@ RUN cargo build --release -p leafage-evm \
     && cp /app/target/release/leafage-evm /out/leafage-evm \
     && strip --strip-debug /out/leafage-evm
 
+FROM builder AS stylus-tests
+
+COPY --from=libstylus /libstylus.so /usr/local/lib/libstylus.so
+
+ENV LEAFAGE_ARB_STYLUS_LIB=/usr/local/lib/libstylus.so
+
+RUN cargo test --release -p leafage-evm-chains --lib \
+    && cargo test --release -p leafage-evm-chains --lib -- \
+        --ignored --test-threads=1
+
 FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -68,9 +78,8 @@ WORKDIR /app
 
 COPY --from=builder /out/leafage-evm /usr/local/bin/leafage-evm
 
-# The native Stylus runtime, dlopened on the first Stylus call. Without it the
-# Arbitrum EVM still dispatches on the 0xEFF0 prefix but has no runtime to hand
-# the WASM to, so those calls come back as a revert instead of executing.
+# The native Stylus runtime, dlopened on the first Stylus call. If it is missing
+# or cannot be loaded, only Arbitrum Stylus execution fails with a node error.
 COPY --from=libstylus /libstylus.so /usr/local/lib/libstylus.so
 
 ENV RUST_LOG=info \
