@@ -114,6 +114,10 @@ const MEMORY_EXPONENTS: [u32; 129] = [
 /// (`ArbosVersion_StylusFixes` = 31).
 const ARBOS_STYLUS_FIXES: u64 = 31;
 
+/// ArbOS version from which `StylusParams.PageLimit` is a consensus cap on the
+/// open-page total (`api.go:507-512`).
+const ARBOS_PAGE_LIMIT: u64 = 59;
+
 /// nitro `evmMemoryCost` (`programs.go:340`): what the EVM would charge to hold
 /// `size` bytes in memory — `MemoryGas` per word plus the quadratic term.
 fn evm_memory_cost(size: u64) -> u64 {
@@ -210,9 +214,16 @@ where
     };
 
     // 4. Gas pre-charge, mirroring nitro `CallProgram` order: memory-init cost
-    //    for the program footprint, then program init/cached cost. Strategy A
-    //    for `cached` (on-chain flag only, no block RecentWasms LRU).
-    //    TODO(Phase 4): RecentWasms (strategy B), enforceStylusPageLimit penalty.
+    //    for the program footprint, then program init/cached cost.
+    //
+    //    `cached` is the on-chain flag alone. From ArbOS 60 nitro also treats a
+    //    program warmed earlier *in the same block* as cached (`RecentWasms`, a
+    //    32-entry LRU living on the StateDB). leafage builds an execution
+    //    context per simulated tx, so there is no block-scoped state to hold
+    //    that LRU: a repeat call is billed the full initGas (~8832 + initCost)
+    //    where the writer would bill only the cached cost. The error is
+    //    one-directional — leafage never under-charges — and closing it needs
+    //    block-ordered replay rather than a change here.
     let mut gas = Gas::new(gas_limit);
     let (open, ever) = {
         let chain = evm.inner.ctx.chain();
@@ -231,7 +242,15 @@ where
     if !prepared.cached {
         precharge = precharge.saturating_add(init_gas(&prepared));
     }
-    if !gas.record_cost(precharge) {
+    // Consensus page cap: nitro saturates callCost so the burn below fails,
+    // which surfaces as out-of-gas rather than a revert (`api.go:507-512`). The
+    // node-level MaxOpenPages cap is deliberately not mirrored — it is policy,
+    // not consensus, and its default equals PageLimit anyway.
+    let new_open = open.saturating_add(prepared.footprint);
+    let over_page_limit = prepared.arbos_version >= ARBOS_PAGE_LIMIT
+        && prepared.page_limit > 0
+        && new_open > prepared.page_limit;
+    if over_page_limit || !gas.record_cost(precharge) {
         gas.spend_all();
         return finish_frame(evm, InstructionResult::OutOfGas, Bytes::new(), gas);
     }
@@ -306,6 +325,7 @@ where
         delegate_value: value,
         free_pages: prepared.free_pages,
         page_gas: prepared.page_gas,
+        page_limit: prepared.page_limit,
         gas_params,
         max_code_size,
         arbos_version: prepared.arbos_version,
@@ -452,6 +472,7 @@ struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
     /// StylusParams memory model inputs, for AddPages.
     free_pages: u16,
     page_gas: u16,
+    page_limit: u16,
     /// revm gas schedule, for exact SLOAD/SSTORE/account-touch cost + refund.
     gas_params: GasParams,
     /// Scales the EXTCODESIZE component of `AccountCode`.
@@ -886,7 +907,6 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
 
     /// AddPages: `pages[2]` (u16). Charges nitro `MemoryModel.GasCost` and tracks
     /// open pages on the execution context.
-    /// TODO(Phase 4): enforceStylusPageLimit penalty (breach -> OOG).
     fn add_pages(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if input.len() < 2 {
             return (Vec::new(), Vec::new(), 0);
@@ -894,10 +914,17 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         let new_pages = u16::from_be_bytes([input[0], input[1]]);
         let open = self.ctx().chain().stylus_pages_open();
         let ever = self.ctx().chain().stylus_pages_ever();
+        // nitro opens the pages before testing the cap (`api.go:305-315`).
+        let new_open = open.saturating_add(new_pages);
+        self.ctx().chain_mut().set_stylus_pages_open(new_open);
+        if self.arbos_version >= ARBOS_PAGE_LIMIT
+            && self.page_limit > 0
+            && new_open > self.page_limit
+        {
+            // Priced at MaxUint64 so the runtime runs out of ink.
+            return (Vec::new(), Vec::new(), u64::MAX);
+        }
         let cost = memory_gas_cost(new_pages, open, ever, self.free_pages, self.page_gas);
-        self.ctx()
-            .chain_mut()
-            .set_stylus_pages_open(open.saturating_add(new_pages));
         (Vec::new(), Vec::new(), cost)
     }
 }
@@ -937,6 +964,7 @@ mod tests {
             delegate_value: U256::ZERO,
             free_pages: 2,
             page_gas: 1000,
+            page_limit: 128,
             gas_params,
             max_code_size: DEFAULT_MAX_CODE_SIZE,
             arbos_version: 61,
@@ -1019,6 +1047,18 @@ mod tests {
         let (response, _, cost) = test_hostio(&mut evm, false).set_trie_slots(&affordable);
         assert_eq!(response, vec![API_STATUS_SUCCESS]);
         assert!(cost > 0 && cost < 1_000_000);
+    }
+
+    #[test]
+    fn add_pages_prices_a_cap_breach_as_unaffordable() {
+        // The harness carries the default 128-page consensus cap.
+        let mut evm = test_evm();
+        let (_, _, cost) = test_hostio(&mut evm, false).add_pages(&129u16.to_be_bytes());
+        assert_eq!(cost, u64::MAX, "a breach has to be unaffordable");
+
+        let mut evm = test_evm();
+        let (_, _, cost) = test_hostio(&mut evm, false).add_pages(&10u16.to_be_bytes());
+        assert_eq!(cost, memory_gas_cost(10, 0, 0, 2, 1000));
     }
 
     #[test]
