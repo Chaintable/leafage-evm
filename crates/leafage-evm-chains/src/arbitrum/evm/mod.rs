@@ -164,7 +164,7 @@ where
             stylus::is_stylus_code(frame.interpreter.bytecode.original_byte_slice())
         };
         if is_stylus {
-            stylus::run_stylus_frame(self)
+            stylus::run_stylus_frame::<stylus::Plain, _, _>(self)
         } else {
             self.inner.frame_run()
         }
@@ -288,7 +288,7 @@ where
         // inspector's call_end so the trace records the frame exit; the `call`
         // hook already fired in inspect_frame_init, so skipping the end would
         // corrupt the inspector's call stack.
-        let mut result = stylus::run_stylus_frame(self);
+        let mut result = stylus::run_stylus_frame::<stylus::Traced, _, _>(self);
         if let Ok(ItemOrResult::Result(frame_result)) = &mut result {
             let (ctx, inspector, frame) = self.inner.ctx_inspector_frame();
             let input = frame.input.clone();

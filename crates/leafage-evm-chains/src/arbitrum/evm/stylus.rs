@@ -22,11 +22,14 @@ use crate::arbitrum::precompile::{
     StylusRuntime,
 };
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
+use core::marker::PhantomData;
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::cfg::gas_params::GasParams;
 use revm::context_interface::{Block, Cfg, CreateScheme, Transaction};
-use revm::handler::evm::ContextDbError;
+use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::{EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult};
+use revm::inspector::{Inspector, InspectorEvmTr};
+use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{
     CallInput, CallInputs, CallScheme, CallValue, CreateInputs, FrameInput, Gas, InstructionResult,
@@ -152,10 +155,11 @@ fn memory_gas_cost(new: u16, open: u16, ever: u16, free_pages: u16, page_gas: u1
 /// Runs the current (top-of-stack) frame as a Stylus program and produces its
 /// frame result. The caller (`frame_run`) has confirmed the callee bytecode is
 /// a Stylus blob.
-pub(super) fn run_stylus_frame<DB, I>(
+pub(super) fn run_stylus_frame<D, DB, I>(
     evm: &mut ArbitrumEvm<DB, I>,
 ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>>
 where
+    D: FrameDriver<DB, I>,
     DB: Database + DatabaseRef,
 {
     // 1. Gather frame inputs, then drop the frame borrow so the body can take
@@ -191,7 +195,12 @@ where
         match ArbWasm::prepare_stylus_program(&mut evm.inner.ctx, code_hash, &code, timestamp) {
             Some(prepared) => prepared,
             None => {
-                return finish_frame(evm, InstructionResult::Revert, Bytes::new(), Gas::new(gas_limit))
+                return finish_frame(
+                    evm,
+                    InstructionResult::Revert,
+                    Bytes::new(),
+                    Gas::new(gas_limit),
+                )
             }
         };
 
@@ -208,7 +217,12 @@ where
                 asm
             }
             Err(_) => {
-                return finish_frame(evm, InstructionResult::Revert, Bytes::new(), Gas::new(gas_limit))
+                return finish_frame(
+                    evm,
+                    InstructionResult::Revert,
+                    Bytes::new(),
+                    Gas::new(gas_limit),
+                )
             }
         },
     };
@@ -317,8 +331,9 @@ where
     let mut call_gas = supplied;
     let gas_params = evm.inner.ctx.cfg().gas_params().clone();
     let max_code_size = evm.inner.ctx.cfg().max_code_size() as u64;
-    let mut hostio = StylusHostio {
+    let mut hostio = StylusHostio::<D, _, _> {
         evm,
+        driver: PhantomData,
         contract,
         is_static,
         delegate_caller: caller,
@@ -356,9 +371,9 @@ where
             gas.spend_all();
             (InstructionResult::OutOfGas, Bytes::new())
         }
-        StylusOutcome::Failure
-        | StylusOutcome::OutOfStack
-        | StylusOutcome::NativeStackOverflow => (InstructionResult::Revert, Bytes::new()),
+        StylusOutcome::Failure | StylusOutcome::OutOfStack | StylusOutcome::NativeStackOverflow => {
+            (InstructionResult::Revert, Bytes::new())
+        }
     };
 
     // Return data must cost at least what it would in the EVM. nitro does this
@@ -399,17 +414,85 @@ where
     })
 }
 
+/// Which pair of revm entry points a Stylus frame uses to drive its children.
+///
+/// revm runs traced and untraced execution through different calls —
+/// `inspect_frame_init`/`inspect_frame_run` versus `frame_init`/`frame_run`,
+/// with `frame_return_result` shared — and a Stylus frame drives its subtree by
+/// hand rather than yielding to the run loop, so it has to pick the matching
+/// pair itself. Going through the plain pair while traced is what made a Stylus
+/// program's subcalls vanish from the trace: nitro reports the full tree, we
+/// reported only the top frame.
+///
+/// The `Inspector` bound lives on the `Traced` impl instead of the trait, so the
+/// untraced path never acquires it and `ArbitrumEvm`'s own bounds are untouched.
+trait FrameDriver<DB: Database + DatabaseRef, I> {
+    fn init(
+        evm: &mut ArbitrumEvm<DB, I>,
+        frame_init: FrameInit,
+    ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<ArbitrumContext<DB>>>;
+
+    fn run(
+        evm: &mut ArbitrumEvm<DB, I>,
+    ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>>;
+}
+
+/// Untraced execution.
+pub(super) struct Plain;
+
+impl<DB, I> FrameDriver<DB, I> for Plain
+where
+    DB: Database + DatabaseRef,
+{
+    fn init(
+        evm: &mut ArbitrumEvm<DB, I>,
+        frame_init: FrameInit,
+    ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+        evm.frame_init(frame_init)
+    }
+
+    fn run(
+        evm: &mut ArbitrumEvm<DB, I>,
+    ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+        evm.frame_run()
+    }
+}
+
+/// Traced execution — children run through the inspected loop so they show up
+/// in the trace.
+pub(super) struct Traced;
+
+impl<DB, I> FrameDriver<DB, I> for Traced
+where
+    DB: Database + DatabaseRef,
+    I: Inspector<ArbitrumContext<DB>, EthInterpreter>,
+{
+    fn init(
+        evm: &mut ArbitrumEvm<DB, I>,
+        frame_init: FrameInit,
+    ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+        evm.inspect_frame_init(frame_init)
+    }
+
+    fn run(
+        evm: &mut ArbitrumEvm<DB, I>,
+    ) -> Result<FrameInitOrResult<EthFrame>, ContextDbError<ArbitrumContext<DB>>> {
+        evm.inspect_frame_run()
+    }
+}
+
 /// Drives a Stylus subcall's child frame subtree to completion synchronously
 /// (WASM can't yield to revm's run loop — the G1 problem), returning the direct
 /// child's `CallOutcome`. The child is pushed above the Stylus parent; grandchild
 /// frames resolve via the stock `frame_return_result`, but the DIRECT child's
 /// result is captured + popped manually so it never reaches the Stylus parent's
 /// `return_result` (which would corrupt the parent's interpreter gas/stack).
-fn drive_subframe<DB, I>(
+fn drive_subframe<D, DB, I>(
     evm: &mut ArbitrumEvm<DB, I>,
     frame_input: FrameInput,
 ) -> Option<FrameResult>
 where
+    D: FrameDriver<DB, I>,
     DB: Database + DatabaseRef,
 {
     let parent_index = evm.inner.frame_stack.index();
@@ -426,7 +509,7 @@ where
     // The Stylus parent's index; the direct child lands one above it.
     let child_index = parent_index.map(|i| i + 1);
 
-    let outcome = run_subframe(evm, child_init, child_index);
+    let outcome = run_subframe::<D, _, _>(evm, child_init, child_index);
 
     // revm releases the child context on its normal return path, which popping
     // the child by hand bypasses. Without this the *second* subcall from the
@@ -445,23 +528,24 @@ where
     outcome
 }
 
-fn run_subframe<DB, I>(
+fn run_subframe<D, DB, I>(
     evm: &mut ArbitrumEvm<DB, I>,
     child_init: FrameInit,
     child_index: Option<usize>,
 ) -> Option<FrameResult>
 where
+    D: FrameDriver<DB, I>,
     DB: Database + DatabaseRef,
 {
-    match evm.frame_init(child_init).ok()? {
+    match D::init(evm, child_init).ok()? {
         // Resolved without pushing a frame (precompile / empty code).
         ItemOrResult::Result(frame_result) => return Some(frame_result),
         ItemOrResult::Item(_frame) => {}
     }
 
     loop {
-        let result = match evm.frame_run().ok()? {
-            ItemOrResult::Item(init) => match evm.frame_init(init).ok()? {
+        let result = match D::run(evm).ok()? {
+            ItemOrResult::Item(init) => match D::init(evm, init).ok()? {
                 ItemOrResult::Item(_frame) => continue,
                 ItemOrResult::Result(frame_result) => frame_result,
             },
@@ -491,8 +575,10 @@ fn create_error(message: &[u8]) -> Vec<u8> {
 
 /// Services a Stylus program's hostio requests against revm state. Holds
 /// `&mut ArbitrumEvm` so subcalls can drive child frames on the shared stack.
-struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
+struct StylusHostio<'a, D, DB: Database + DatabaseRef, I> {
     evm: &'a mut ArbitrumEvm<DB, I>,
+    /// Selects the frame entry points subcalls drive children through.
+    driver: PhantomData<D>,
     contract: Address,
     is_static: bool,
     /// The Stylus frame's caller/value, used for DELEGATECALL context.
@@ -511,7 +597,9 @@ struct StylusHostio<'a, DB: Database + DatabaseRef, I> {
     refund: i64,
 }
 
-impl<DB: Database + DatabaseRef, I> HostioHandler for StylusHostio<'_, DB, I> {
+impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> HostioHandler
+    for StylusHostio<'_, D, DB, I>
+{
     fn handle(&mut self, req_type: u32, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         match req_type {
             0 => self.get_bytes32(input),
@@ -535,7 +623,7 @@ impl<DB: Database + DatabaseRef, I> HostioHandler for StylusHostio<'_, DB, I> {
     }
 }
 
-impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
+impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, DB, I> {
     fn ctx(&mut self) -> &mut ArbitrumContext<DB> {
         &mut self.evm.inner.ctx
     }
@@ -752,7 +840,12 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
                 self.delegate_caller,
                 CallValue::Apparent(self.delegate_value),
             ),
-            CallScheme::CallCode => (self.contract, addr, self.contract, CallValue::Transfer(value)),
+            CallScheme::CallCode => (
+                self.contract,
+                addr,
+                self.contract,
+                CallValue::Transfer(value),
+            ),
         };
 
         let inputs = CallInputs {
@@ -768,7 +861,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             is_static,
         };
 
-        match drive_subframe(self.evm, FrameInput::Call(Box::new(inputs))) {
+        match drive_subframe::<D, _, _>(self.evm, FrameInput::Call(Box::new(inputs))) {
             Some(FrameResult::Call(outcome)) => {
                 let returned = outcome.gas().remaining();
                 let status = if outcome.instruction_result().is_ok() {
@@ -833,7 +926,7 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
         let child_gas = after_base - one_64th;
         let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, child_gas);
 
-        match drive_subframe(self.evm, FrameInput::Create(Box::new(inputs))) {
+        match drive_subframe::<D, _, _>(self.evm, FrameInput::Create(Box::new(inputs))) {
             Some(FrameResult::Create(outcome)) => {
                 let returned = outcome.gas().remaining();
                 // The withheld 64th goes back to the caller (`api.go:260`).
@@ -909,7 +1002,11 @@ impl<DB: Database + DatabaseRef, I> StylusHostio<'_, DB, I> {
             Ok(load) => (load.data, load.is_cold),
             Err(_) => (B256::ZERO, false),
         };
-        (hash.0.to_vec(), Vec::new(), self.account_touch_cost(is_cold))
+        (
+            hash.0.to_vec(),
+            Vec::new(),
+            self.account_touch_cost(is_cold),
+        )
     }
 
     /// AccountCode: `addr[20] ++ gasLeft[8]`. Code goes on the `raw_data`
@@ -983,13 +1080,14 @@ mod tests {
     fn test_hostio(
         evm: &mut ArbitrumEvm<TestDb, ()>,
         is_static: bool,
-    ) -> StylusHostio<'_, TestDb, ()> {
+    ) -> StylusHostio<'_, Plain, TestDb, ()> {
         let gas_params = evm.inner.ctx.cfg().gas_params().clone();
         // revm expects an account to be journal-loaded before its storage is
         // touched, which in production the frame setup has already done.
         let _ = evm.inner.ctx.journal_mut().load_account(Address::ZERO);
         StylusHostio {
             evm,
+            driver: PhantomData,
             contract: Address::ZERO,
             is_static,
             delegate_caller: Address::ZERO,
