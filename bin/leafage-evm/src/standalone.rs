@@ -110,6 +110,28 @@ pub struct Command {
     #[arg(long, default_value = "5000")]
     max_connections: u32,
 
+    /// Maximum number of concurrently executing EVM requests
+    /// (eth_call / multicall / estimateGas / simulate / trace).
+    /// Default: 0 (unbounded, same as before)
+    ///
+    /// EVM execution is CPU-bound; without a cap a load spike can put
+    /// hundreds of executions on the blocking pool at once and inflate
+    /// tail latency through CPU oversubscription. A value around 2-4x
+    /// the core count keeps excess requests queued on the async side
+    /// (cheap and cancellable) instead.
+    #[arg(long, default_value = "0")]
+    evm_exec_concurrency: usize,
+
+    /// The TCP accept-queue backlog for the HTTP-RPC listener.
+    /// Default: 4096
+    ///
+    /// The kernel caps the effective queue at `min(this, net.core.somaxconn)`.
+    /// A too-small backlog drops completing handshakes under connection bursts
+    /// (kernel `ListenOverflows`), which upstream proxies observe as
+    /// `dial ...: i/o timeout`. Keep this <= the pod's `net.core.somaxconn`.
+    #[arg(long, default_value = "4096")]
+    listen_backlog: u32,
+
     /// The depth limit of the diff tree.
     /// Default: 64 for eth mainnet
     ///
@@ -307,6 +329,14 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     iterator_timeout_secs: u64,
 
+    /// Size (MB) of the in-memory content-addressed code cache
+    /// (code_hash → code) for archive reads. Serves debank_getAddressCode /
+    /// eth_getCode / multicall code loads at any block height without
+    /// touching the HashToCode CF. 0 disables.
+    /// Archive-only (RocksDB archive mode).
+    #[arg(long, env = "ARCHIVE_CODE_CACHE_MB", default_value = "256")]
+    archive_code_cache_mb: u64,
+
     /// Gas estimation buffer percentage (100 = no buffer, 120 = +20% buffer)
     /// Default: 100
     ///
@@ -476,7 +506,6 @@ impl Command {
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
-                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Base(chain_cfg))
             }
             "bsc" => {
@@ -594,9 +623,22 @@ impl Command {
         info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
         if !self.prometheus_addr.is_empty() {
+            // Latency buckets (seconds) so `leafage_rpc_call_time` exports as a
+            // Prometheus `_bucket`/`_count`/`_sum` histogram (queryable via
+            // `histogram_quantile(... by (method_name, le))`) instead of the
+            // exporter's default summary rendering. This replaces the previous
+            // `{quantile=...}` series; `_count`/`_sum` are unchanged.
+            const LATENCY_BUCKETS: &[f64] = &[
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                10.0,
+            ];
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
                 .add_global_label("chain_id", format!("{}", chain_cfg.chain_id()))
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full("leafage_rpc_call_time".to_string()),
+                    LATENCY_BUCKETS,
+                )?
                 .install()?;
             let labels = [("role", "replica".to_string())];
             let gauge = gauge!("pipeline_node_info", &labels);
@@ -663,6 +705,10 @@ impl Command {
                 "ROCKSDB_ITERATOR_TIMEOUT_SECS",
                 self.iterator_timeout_secs.to_string(),
             );
+            std::env::set_var(
+                "ARCHIVE_CODE_CACHE_MB",
+                self.archive_code_cache_mb.to_string(),
+            );
         }
 
         let db = MultiStorage::open(
@@ -702,7 +748,8 @@ impl Command {
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
-            .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+            .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+            .with_evm_exec_concurrency(self.evm_exec_concurrency);
 
         #[cfg(target_os = "linux")]
         {
@@ -744,6 +791,7 @@ impl Command {
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
                 self.estimate_gas_buffer,
+                self.listen_backlog,
             )
             .await?;
 

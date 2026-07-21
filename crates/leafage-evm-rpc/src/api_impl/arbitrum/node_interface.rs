@@ -1334,6 +1334,7 @@ mod tests {
             "test".to_string(),
             100,
             None,
+            None,
         )
     }
 

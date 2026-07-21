@@ -29,6 +29,9 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
+    /// Per-server limiter for CPU-bound EVM execution (call / multicall /
+    /// estimateGas / simulate / trace). `None` keeps execution unbounded.
+    pub exec_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 pub(crate) trait ApiCore:
@@ -38,7 +41,7 @@ pub(crate) trait ApiCore:
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
     type DB;
-    type SpecId;
+    type SpecId: Into<revm::primitives::hardfork::SpecId> + Clone;
     type CustomCfg;
 
     fn db(&self) -> &Self::DB;
