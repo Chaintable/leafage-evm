@@ -412,7 +412,9 @@ fn drive_subframe<DB, I>(
 where
     DB: Database + DatabaseRef,
 {
-    // Build the child FrameInit from the current (Stylus parent) frame.
+    let parent_index = evm.inner.frame_stack.index();
+    // Build the child FrameInit from the current (Stylus parent) frame. This
+    // reserves a child context on the parent's shared memory.
     let child_init = {
         let parent = evm.inner.frame_stack.get();
         FrameInit {
@@ -422,8 +424,35 @@ where
         }
     };
     // The Stylus parent's index; the direct child lands one above it.
-    let child_index = evm.inner.frame_stack.index().map(|i| i + 1);
+    let child_index = parent_index.map(|i| i + 1);
 
+    let outcome = run_subframe(evm, child_init, child_index);
+
+    // revm releases the child context on its normal return path, which popping
+    // the child by hand bypasses. Without this the *second* subcall from the
+    // same Stylus frame hits `new_child_context was already called without
+    // freeing child context` and panics. Guarded on the stack having unwound
+    // back to the parent, so an error path that left a frame behind does not
+    // free the wrong frame's memory.
+    if evm.inner.frame_stack.index() == parent_index {
+        evm.inner
+            .frame_stack
+            .get()
+            .interpreter
+            .memory
+            .free_child_context();
+    }
+    outcome
+}
+
+fn run_subframe<DB, I>(
+    evm: &mut ArbitrumEvm<DB, I>,
+    child_init: FrameInit,
+    child_index: Option<usize>,
+) -> Option<FrameResult>
+where
+    DB: Database + DatabaseRef,
+{
     match evm.frame_init(child_init).ok()? {
         // Resolved without pushing a frame (precompile / empty code).
         ItemOrResult::Result(frame_result) => return Some(frame_result),
