@@ -3,7 +3,7 @@ use crate::state_tree::error::Error;
 use leafage_evm_types::{AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, H256, U256};
 use moka::ops::compute::Op;
 use moka::sync::Cache;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
 use tracing::info;
@@ -11,6 +11,7 @@ use tracing::info;
 /// Keys are already uniformly distributed (keccak-derived), and these
 /// maps sit on the per-read hot path — use ahash instead of SipHash.
 type FastMap<K, V> = HashMap<K, V, ahash::RandomState>;
+type FastSet<K> = HashSet<K, ahash::RandomState>;
 type FastCache<K, V> = Cache<K, V, ahash::RandomState>;
 
 /// [`LinkedDiffLayer`] is a single linked list that stores the state of the EVM.
@@ -132,6 +133,7 @@ impl LinkedDiffLayer {
 pub struct CacheDiskLayer {
     accounts: FastCache<H256, (u64, Option<AccountInfo>)>,
     storages: FastCache<(H256, H256), (u64, U256)>,
+    storage_wipes: FastCache<H256, u64>,
     contracts: FastCache<H256, (u64, Bytecode)>,
     block_hashes: FastCache<u64, (u64, H256)>,
     old_diff_layer: Mutex<Option<Arc<LinkedDiffLayer>>>,
@@ -170,6 +172,9 @@ impl CacheDiskLayer {
                 .build_with_hasher(ahash::RandomState::default()),
             storages: Cache::builder()
                 .max_capacity(s)
+                .build_with_hasher(ahash::RandomState::default()),
+            storage_wipes: Cache::builder()
+                .max_capacity(a)
                 .build_with_hasher(ahash::RandomState::default()),
             contracts: Cache::builder()
                 .max_capacity(c)
@@ -238,6 +243,9 @@ impl CacheDiskLayer {
             for (key, value) in diff.storage.iter() {
                 self.storages.insert(*key, (block_num, *value));
             }
+            for address in &diff.storage_wipes {
+                self.storage_wipes.insert(*address, block_num);
+            }
             for (key, value) in diff.contracts.iter() {
                 self.contracts.insert(*key, (block_num, value.clone()));
             }
@@ -261,6 +269,8 @@ pub struct DiffLayer {
     pub block_diff: Arc<BlockStorageDiff>,
     pub accounts: FastMap<H256, Option<AccountInfo>>,
     pub storage: FastMap<(H256, H256), U256>,
+    /// Addresses whose complete parent storage is hidden by this diff.
+    pub storage_wipes: FastSet<H256>,
     pub contracts: FastMap<H256, Bytecode>,
     pub next: RwLock<Arc<LinkedDiffLayer>>,
 }
@@ -287,6 +297,7 @@ impl DiffLayer {
     ) -> Self {
         let mut accounts = FastMap::default();
         let mut storage = FastMap::default();
+        let storage_wipes = block_diff.deleted_accounts.iter().copied().collect();
         let mut contracts = FastMap::default();
         for del_account in block_diff.deleted_accounts.iter() {
             accounts.insert(del_account.clone(), None);
@@ -312,6 +323,7 @@ impl DiffLayer {
             block_diff: Arc::new(block_diff),
             accounts,
             storage,
+            storage_wipes,
             contracts,
             next: RwLock::new(next),
         }
@@ -443,15 +455,32 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
 
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error> {
         for layer in self.flattened.layers.iter() {
-            if let Some(value) = layer.unwrap_diff_layer().storage.get(&(address, index)) {
+            let diff = layer.unwrap_diff_layer();
+            if let Some(value) = diff.storage.get(&(address, index)) {
                 return Ok(*value);
+            }
+            if diff.storage_wipes.contains(&address) {
+                return Ok(U256::ZERO);
             }
         }
         match self.flattened.terminal.as_ref() {
             LinkedDiffLayer::CacheDiskLayer(cache) if cache.enabled => {
                 match cache.storages.get(&(address, index)) {
-                    Some((_, value)) => Ok(value),
+                    Some((slot_height, value)) => {
+                        if cache
+                            .storage_wipes
+                            .get(&address)
+                            .is_some_and(|wipe_height| wipe_height > slot_height)
+                        {
+                            Ok(U256::ZERO)
+                        } else {
+                            Ok(value)
+                        }
+                    }
                     None => {
+                        if cache.storage_wipes.contains_key(&address) {
+                            return Ok(U256::ZERO);
+                        }
                         let res = self.statedb.storage(address, index)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res);
@@ -702,6 +731,48 @@ mod tests {
         assert!(db.basic(key(9999)).unwrap().is_none());
         // Block hashes resolve from layer metadata.
         assert_eq!(db.block_hash(3).unwrap(), key(3000 + 2));
+    }
+
+    #[test]
+    fn deleted_then_recreated_account_hides_parent_storage() {
+        let addr = key(0xabcd);
+        let old_slot = key(1);
+        let final_slot = key(2);
+        let bottom = MockDB::default();
+        {
+            let mut inner = bottom.inner.lock().unwrap();
+            inner.storage.insert((addr, old_slot), U256::from(7));
+            inner.storage.insert((addr, final_slot), U256::from(8));
+        }
+
+        let terminal = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(
+            10, 10, 10, 0, true,
+        )));
+        let mut diff = BlockStorageDiff::default();
+        diff.deleted_accounts.push(addr);
+        diff.new_accounts.push(NewAccount {
+            address: addr,
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: H256::ZERO,
+        });
+        diff.storage_diffs.push(AccountStorageDiff {
+            address: addr,
+            diffs: vec![IndexValuePair {
+                index: final_slot,
+                value: U256::from(9),
+            }],
+        });
+        let top = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
+            BlockInfo::default(),
+            diff,
+            terminal,
+        )));
+        let db = HybridStateDB::new(top, bottom, Some(0));
+
+        assert_eq!(db.storage(addr, old_slot).unwrap(), U256::ZERO);
+        assert_eq!(db.storage(addr, final_slot).unwrap(), U256::from(9));
+        assert_eq!(db.basic(addr).unwrap().unwrap().nonce, 1);
     }
 
     #[test]

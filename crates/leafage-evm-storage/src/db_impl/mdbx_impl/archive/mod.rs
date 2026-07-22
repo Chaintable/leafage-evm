@@ -7,6 +7,8 @@
 //! +-------------------------+-------------------------+-------------------------+
 //! |  AddressToAccount       |  AddressToStorage       |  HashToCode             |
 //! +-------------------------+-------------------------+-------------------------+
+//! |  AddressToStorageWipe   |                         |                         |
+//! +-------------------------+-------------------------+-------------------------+
 //! ```
 //!
 //! Key formats:
@@ -16,14 +18,15 @@
 //! - `AddressToAccount`: address(32) || block_num(32) -> SlimAccount (RLP)
 //! - `AddressToStorage`: address(32) || key(32) || block_num(32) -> value(32)
 //! - `HashToCode`: code_hash(32) -> code_bytes
+//! - `AddressToStorageWipe`: address(32) || block_num(32) -> empty marker
 //!
 //! All block numbers use 32-byte big-endian encoding (U256) for compatibility with RocksDB.
 
 use super::{default_page_size, DEFAULT_MAX_READERS, GIGABYTE, MEGABYTE, TERABYTE};
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding,
+    decode_version_tail, encode_account_key, encode_block_num, encode_slim_account,
+    encode_storage_key, inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
@@ -56,6 +59,7 @@ enum StorageTable {
     AddressToAccount = 4,
     AddressToStorage = 5,
     HashToCode = 6,
+    AddressToStorageWipe = 7,
 }
 
 impl StorageTable {
@@ -67,6 +71,7 @@ impl StorageTable {
             StorageTable::AddressToAccount => "AddressToAccount",
             StorageTable::AddressToStorage => "AddressToStorage",
             StorageTable::HashToCode => "HashToCode",
+            StorageTable::AddressToStorageWipe => "AddressToStorageWipe",
         }
     }
 }
@@ -138,6 +143,29 @@ impl Debug for StateDB {
             .field("block_num", &self.block_num)
             .field("cached_block_info", &self.cached_block_info)
             .finish()
+    }
+}
+
+impl StateDB {
+    fn storage_wipe_height(&self, address: H256) -> Result<Option<u64>, Error> {
+        let txn =
+            self.db.env.begin_ro_txn().map_err(|e| {
+                Error::UnSupported(format!("Failed to begin read transaction: {e}"))
+            })?;
+        let db = txn
+            .open_db(Some(StorageTable::AddressToStorageWipe.to_str()))
+            .map_err(|e| Error::UnSupported(format!("Failed to open storage wipe table: {e}")))?;
+        let mut cursor = txn.cursor(&db).map_err(|e| {
+            Error::UnSupported(format!("Failed to create storage wipe cursor: {e}"))
+        })?;
+        let target = encode_account_key(address, self.block_num);
+        let Some((key, _)) = seek_version(&mut cursor, &target)? else {
+            return Ok(None);
+        };
+        if key.len() != 64 || &key[..32] != address.as_slice() {
+            return Ok(None);
+        }
+        Ok(Some(decode_version_tail(&key[32..64])))
     }
 }
 
@@ -286,6 +314,14 @@ impl DataBase {
             )
             .expect("Failed to create HashToCode table");
         dbis.insert(StorageTable::HashToCode.to_str(), t.dbi());
+
+        let t = txn
+            .create_db(
+                Some(StorageTable::AddressToStorageWipe.to_str()),
+                DatabaseFlags::empty(),
+            )
+            .expect("Failed to create AddressToStorageWipe table");
+        dbis.insert(StorageTable::AddressToStorageWipe.to_str(), t.dbi());
 
         txn.commit().expect("Failed to commit transaction");
 
@@ -862,10 +898,16 @@ impl StateDBRead for StateDB {
         let result = match seek_version(&mut cursor, &target_key)? {
             Some((found_key, value)) => {
                 // Verify the address and storage key prefix match
-                if found_key.len() < 64
+                let unavailable = found_key.len() < 96
                     || &found_key[..32] != address.as_slice()
-                    || &found_key[32..64] != key.as_slice()
-                {
+                    || &found_key[32..64] != key.as_slice();
+                let wiped = !unavailable
+                    && self
+                        .storage_wipe_height(address)?
+                        .is_some_and(|wipe_height| {
+                            wipe_height > decode_version_tail(&found_key[64..96])
+                        });
+                if unavailable || wiped {
                     U256::ZERO
                 } else if value.is_empty() {
                     // Empty value means deleted storage slot
@@ -982,6 +1024,15 @@ impl StateDBWrite for StateDB {
         self.db.write_storage(batch, address, key, block_num, value)
     }
 
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), Error> {
+        self.db.write_storage_wipe(batch, address, block_num)
+    }
+
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), Error> {
         self.db.commit(batch)
     }
@@ -1006,6 +1057,7 @@ impl StateDBWrite for Arc<DataBase> {
             StorageTable::BlockHashToBlockInfo,
             StorageTable::BlockNumToBlockHash,
             StorageTable::HashToCode,
+            StorageTable::AddressToStorageWipe,
         ] {
             let db = txn
                 .open_db(Some(table.to_str()))
@@ -1146,6 +1198,28 @@ impl StateDBWrite for Arc<DataBase> {
         Ok(())
     }
 
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), Error> {
+        let cursor = batch
+            .cursors
+            .get_mut(StorageTable::AddressToStorageWipe.to_str())
+            .ok_or_else(|| {
+                Error::UnSupported("AddressToStorageWipe cursor not found".to_string())
+            })?;
+        cursor
+            .put(
+                &encode_account_key(address, block_num),
+                &[],
+                WriteFlags::UPSERT,
+            )
+            .map_err(|e| Error::UnSupported(format!("Failed to write storage wipe: {e}")))?;
+        Ok(())
+    }
+
     fn commit(&self, mut batch: Self::DBWriteBatch) -> Result<(), Error> {
         // 1. Sort and write cached account data
         if !batch.account_cache.is_empty() {
@@ -1229,5 +1303,118 @@ impl StateDBWrite for Arc<DataBase> {
             .commit()
             .map_err(|e| Error::UnSupported(format!("Failed to commit transaction: {}", e)))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::StateDBWrapper;
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{
+        AccountStorageDiff, Block, BlockStorageDiff, Header, IndexValuePair, RawHeader,
+    };
+
+    fn block_info(number: u64) -> BlockInfo {
+        BlockInfo::new(Block {
+            header: Header {
+                hash: H256::with_last_byte(number as u8),
+                inner: RawHeader {
+                    number,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn destroy_recreate_wipes_old_storage_at_new_height() {
+        let _guard = crate::db_impl::rocksdb_impl::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        let dir =
+            std::env::temp_dir().join(format!("leafage-mdbx-archive-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBase::open(&dir));
+            let addr = H256::repeat_byte(0xab);
+            let old_slot = H256::repeat_byte(0x01);
+            let final_slot = H256::repeat_byte(0x02);
+
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            state
+                .update_block(
+                    block_info(1),
+                    BlockStorageDiff {
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(100),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: vec![
+                                IndexValuePair {
+                                    index: old_slot,
+                                    value: U256::from(7),
+                                },
+                                IndexValuePair {
+                                    index: final_slot,
+                                    value: U256::from(8),
+                                },
+                            ],
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            state
+                .update_block(
+                    block_info(2),
+                    BlockStorageDiff {
+                        deleted_accounts: vec![addr],
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(200),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: vec![IndexValuePair {
+                                index: final_slot,
+                                value: U256::from(9),
+                            }],
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            let at = |number| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(number)))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(at(1).read_storage(addr, old_slot).unwrap(), U256::from(7));
+            assert_eq!(at(1).read_storage(addr, final_slot).unwrap(), U256::from(8));
+            assert_eq!(at(2).read_storage(addr, old_slot).unwrap(), U256::ZERO);
+            assert_eq!(at(2).read_storage(addr, final_slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

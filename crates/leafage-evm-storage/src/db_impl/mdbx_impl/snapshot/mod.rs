@@ -687,6 +687,35 @@ impl StateDBWrite for StateDB {
         Ok(())
     }
 
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        _block_num: u64,
+    ) -> Result<(), Error> {
+        let db = batch
+            .txn
+            .open_db(Some(StorageTable::AddressToStorage.to_str()))
+            .map_err(|e| Error::UnSupported(format!("AddressToStorage table not found: {e}")))?;
+        let mut cursor = batch
+            .txn
+            .cursor(&db)
+            .map_err(|e| Error::UnSupported(format!("Failed to create storage cursor: {e}")))?;
+        loop {
+            let next = cursor
+                .set_range::<Cow<'_, [u8]>, Cow<'_, [u8]>>(address.as_slice())
+                .map_err(|e| Error::UnSupported(format!("Storage wipe seek failed: {e}")))?;
+            let Some((key, _)) = next else { break };
+            if !key.starts_with(address.as_slice()) {
+                break;
+            }
+            cursor
+                .del(WriteFlags::empty())
+                .map_err(|e| Error::UnSupported(format!("Storage wipe delete failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     fn write_code(
         &self,
         batch: &mut Self::DBWriteBatch,
