@@ -23,8 +23,8 @@
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding, set_inverted_block_encoding,
+    decode_version_tail, encode_account_key, encode_block_num, encode_slim_account,
+    encode_storage_key, inverted_block_encoding, set_inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
@@ -93,6 +93,8 @@ enum StorageTypeColumn {
     AddressToStorage = 5,
     // code hash -> code
     HashToCode = 6,
+    // address || block num -> storage-wide wipe marker
+    AddressToStorageWipe = 7,
 }
 
 #[inline]
@@ -214,6 +216,7 @@ impl StorageTypeColumn {
             StorageTypeColumn::AddressToAccount => "4",
             StorageTypeColumn::AddressToStorage => "5",
             StorageTypeColumn::HashToCode => "6",
+            StorageTypeColumn::AddressToStorageWipe => "7",
         }
     }
 
@@ -225,6 +228,7 @@ impl StorageTypeColumn {
             StorageTypeColumn::AddressToAccount => "AddressToAccount",
             StorageTypeColumn::AddressToStorage => "AddressToStorage",
             StorageTypeColumn::HashToCode => "HashToCode",
+            StorageTypeColumn::AddressToStorageWipe => "AddressToStorageWipe",
         }
     }
 }
@@ -619,6 +623,17 @@ fn archive_cf_descriptors(
                 archive_zstd_compression,
             ),
         ),
+        ColumnFamilyDescriptor::new(
+            StorageTypeColumn::AddressToStorageWipe.to_str(),
+            rocksdb_column_options(
+                shared_cache,
+                32,
+                disable_auto_compactions,
+                CfCompression::None,
+                bulk_load,
+                archive_zstd_compression,
+            ),
+        ),
         // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
         ColumnFamilyDescriptor::new(
             StorageTypeColumn::HashToCode.to_str(),
@@ -839,8 +854,7 @@ fn reencode_versioned_cf(
                         if since_report >= 50_000 {
                             processed.fetch_add(since_report, Ordering::Relaxed);
                             since_report = 0;
-                            let key_w =
-                                u32::from_be_bytes(key[0..4].try_into().unwrap()) as u64;
+                            let key_w = u32::from_be_bytes(key[0..4].try_into().unwrap()) as u64;
                             let pos = key_w.saturating_sub(lo_w) as f64 / range_w as f64;
                             progress_bps[i]
                                 .store((pos.clamp(0.0, 1.0) * 10_000.0) as u32, Ordering::Relaxed);
@@ -1021,6 +1035,14 @@ impl DataBaseRef {
                 .unwrap(),
             ),
             (
+                StorageTypeColumn::AddressToStorageWipe,
+                NonNull::new(
+                    db.cf_handle(StorageTypeColumn::AddressToStorageWipe.to_str())
+                        .unwrap() as *const _ as *mut _,
+                )
+                .unwrap(),
+            ),
+            (
                 StorageTypeColumn::HashToCode,
                 NonNull::new(
                     db.cf_handle(StorageTypeColumn::HashToCode.to_str())
@@ -1134,7 +1156,11 @@ impl DataBaseRef {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(512),
         );
-        let cf_names = [
+        let existing_cf_names = DB::list_cf(&src_opts, &src_path).map_err(Error::RocksDB)?;
+        let source_has_storage_wipes = existing_cf_names
+            .iter()
+            .any(|name| name == StorageTypeColumn::AddressToStorageWipe.to_str());
+        let mut cf_names = vec![
             StorageTypeColumn::LatestBlockHash.to_str(),
             StorageTypeColumn::BlockHashToBlockInfo.to_str(),
             StorageTypeColumn::BlockNumToBlockHash.to_str(),
@@ -1142,6 +1168,9 @@ impl DataBaseRef {
             StorageTypeColumn::AddressToStorage.to_str(),
             StorageTypeColumn::HashToCode.to_str(),
         ];
+        if source_has_storage_wipes {
+            cf_names.push(StorageTypeColumn::AddressToStorageWipe.to_str());
+        }
         let src = DB::open_cf_for_read_only(&src_opts, &src_path, cf_names, false)
             .map_err(Error::RocksDB)?;
 
@@ -1248,6 +1277,21 @@ impl DataBaseRef {
         info!(target: "migrate",
             "reencode: rewrote {} AddressToStorage records ({} u64::MAX sentinels dropped)",
             sto_kept, sto_dropped);
+        if source_has_storage_wipes {
+            let (wipe_kept, wipe_dropped) = reencode_versioned_cf(
+                &src,
+                &dst,
+                StorageTypeColumn::AddressToStorageWipe,
+                32,
+                jobs,
+                &sst_opts,
+                &tmp_dir,
+                ROLL_BYTES,
+            )?;
+            info!(target: "migrate",
+                "reencode: rewrote {} AddressToStorageWipe records ({} u64::MAX sentinels dropped)",
+                wipe_kept, wipe_dropped);
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -1552,6 +1596,7 @@ impl DataBaseRef {
             StorageTypeColumn::BlockNumToBlockHash,
             StorageTypeColumn::AddressToAccount,
             StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::AddressToStorageWipe,
             StorageTypeColumn::HashToCode,
             StorageTypeColumn::LatestBlockHash,
         ] {
@@ -1569,6 +1614,7 @@ impl DataBaseRef {
             StorageTypeColumn::BlockNumToBlockHash,
             StorageTypeColumn::AddressToAccount,
             StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::AddressToStorageWipe,
             StorageTypeColumn::HashToCode,
         ];
 
@@ -1610,6 +1656,10 @@ impl DataBaseRef {
                 StorageTypeColumn::AddressToStorage => {
                     // Key structure: address (32) || slot (32) || block_num (32) = 96 bytes.
                     self.compact_cf_by_prefix::<96>(cf, &compact_opts);
+                }
+                StorageTypeColumn::AddressToStorageWipe => {
+                    // Key structure: address (32) || block_num (32) = 64 bytes.
+                    self.compact_cf_by_prefix::<64>(cf, &compact_opts);
                 }
                 _ => {
                     // Small column families can be compacted in one go
@@ -1681,6 +1731,7 @@ impl DataBaseRef {
         let versioned = [
             StorageTypeColumn::AddressToAccount,
             StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::AddressToStorageWipe,
         ];
         let files = self.db.live_files()?;
 
@@ -2197,6 +2248,24 @@ impl StateDB {
         }
         Ok(())
     }
+
+    /// Latest storage-wide wipe for `address` visible at this handle's height.
+    fn storage_wipe_height(&self, address: H256) -> Option<u64> {
+        let cf = self
+            .db
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorageWipe.to_str())?;
+        let mut iter = self.db.db.raw_iterator_cf_opt(cf, rocksdb_read_options());
+        let target = encode_account_key(address, self.block_num);
+        if inverted_block_encoding() {
+            iter.seek(target);
+        } else {
+            iter.seek_for_prev(target);
+        }
+        let key = iter.key()?;
+        (key.len() == 64 && key[..32] == address.as_slice()[..])
+            .then(|| decode_version_tail(&key[32..64]))
+    }
 }
 
 impl StateDBRead for StateDB {
@@ -2273,6 +2342,13 @@ impl StateDBRead for StateDB {
                 return Ok(U256::ZERO);
             }
             if key_bytes != raw_key_bytes[32..64] {
+                return Ok(U256::ZERO);
+            }
+            let slot_height = decode_version_tail(&raw_key_bytes[64..96]);
+            if self
+                .storage_wipe_height(address)
+                .is_some_and(|wipe_height| wipe_height > slot_height)
+            {
                 return Ok(U256::ZERO);
             }
             let raw_val_bytes = storage_iter.value().unwrap();
@@ -2359,6 +2435,15 @@ impl StateDBWrite for StateDB {
         value: U256,
     ) -> Result<(), Error> {
         self.db.write_storage(batch, address, key, block_num, value)
+    }
+
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), Error> {
+        self.db.write_storage_wipe(batch, address, block_num)
     }
 
     fn write_code(
@@ -2464,6 +2549,22 @@ impl StateDBWrite for Arc<DataBaseRef> {
         let value_bytes: [u8; 32] = value.to_be_bytes();
 
         batch.storage_writes.push((storage_key, value_bytes));
+        Ok(())
+    }
+
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorageWipe.to_str())
+            .ok_or_else(|| Error::UnSupported("AddressToStorageWipe CF not found".to_string()))?;
+        batch
+            .inner
+            .put_cf(cf, encode_account_key(address, block_num), []);
         Ok(())
     }
 
@@ -3052,7 +3153,7 @@ mod inverted_encoding_tests {
     }
 
     /// End-to-end versioned read/write round-trip, parameterized by encoding
-    /// mode. Writing a slot at blocks 5/10/20 and reading at arbitrary heights
+    /// mode. Writing a slot at blocks 5/10/20, wiping it at block 15, and reading at arbitrary heights
     /// must return the greatest version <= H, absence below the first write,
     /// and the latest-state iterators must surface the newest version — under
     /// BOTH the legacy ascending and the inverted descending encodings.
@@ -3077,6 +3178,20 @@ mod inverted_encoding_tests {
                 let diff = match n {
                     5 => slot_diff(addr, slot, 100, 7),
                     10 => slot_diff(addr, slot, 200, 9),
+                    15 => BlockStorageDiff {
+                        deleted_accounts: vec![addr],
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(250),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: Vec::new(),
+                        }],
+                        ..Default::default()
+                    },
                     20 => slot_diff(addr, slot, 300, 11),
                     _ => BlockStorageDiff::default(),
                 };
@@ -3104,8 +3219,8 @@ mod inverted_encoding_tests {
                 (7, 7, 100),
                 (9, 7, 100),
                 (10, 9, 200),
-                (15, 9, 200),
-                (19, 9, 200),
+                (15, 0, 250),
+                (19, 0, 250),
                 (20, 11, 300),
             ] {
                 assert_eq!(
@@ -3141,6 +3256,108 @@ mod inverted_encoding_tests {
     #[test]
     fn test_versioned_read_greatest_leq_height_legacy() {
         run_versioned_roundtrip(false);
+    }
+
+    fn run_storage_wipe_roundtrip(inverted: bool) {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(inverted);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-wipe-{}-{}",
+            inverted,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let addr = H256::repeat_byte(0xab);
+            let old_slot = H256::repeat_byte(0x01);
+            let final_slot = H256::repeat_byte(0x02);
+
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            state
+                .update_block(
+                    block_info(1),
+                    BlockStorageDiff {
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(100),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: vec![
+                                IndexValuePair {
+                                    index: old_slot,
+                                    value: U256::from(7),
+                                },
+                                IndexValuePair {
+                                    index: final_slot,
+                                    value: U256::from(8),
+                                },
+                            ],
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            state
+                .update_block(
+                    block_info(2),
+                    BlockStorageDiff {
+                        deleted_accounts: vec![addr],
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(200),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: vec![IndexValuePair {
+                                index: final_slot,
+                                value: U256::from(9),
+                            }],
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(at(1).read_storage(addr, old_slot).unwrap(), U256::from(7));
+            assert_eq!(at(1).read_storage(addr, final_slot).unwrap(), U256::from(8));
+            assert_eq!(at(2).read_storage(addr, old_slot).unwrap(), U256::ZERO);
+            assert_eq!(at(2).read_storage(addr, final_slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    #[test]
+    fn test_storage_wipe_roundtrip_inverted() {
+        run_storage_wipe_roundtrip(true);
+    }
+
+    #[test]
+    fn test_storage_wipe_roundtrip_legacy() {
+        run_storage_wipe_roundtrip(false);
     }
 
     /// Legacy DBs built before #104 carry orphaned dual-write "latest" pointers
@@ -3252,7 +3469,8 @@ mod inverted_encoding_tests {
         let addr = H256::repeat_byte(0xab);
         let slot = H256::repeat_byte(0x01);
 
-        // 1) Build the LEGACY source.
+        // 1) Build the LEGACY source, including a storage wipe that must be
+        // re-encoded together with the account and slot histories.
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
         {
             let db = Arc::new(DataBaseRef::open(&src_dir, 64, false, false));
@@ -3260,6 +3478,20 @@ mod inverted_encoding_tests {
                 let diff = match n {
                     5 => slot_diff(addr, slot, 100, 7),
                     10 => slot_diff(addr, slot, 200, 9),
+                    15 => BlockStorageDiff {
+                        deleted_accounts: vec![addr],
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(250),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: Vec::new(),
+                        }],
+                        ..Default::default()
+                    },
                     20 => slot_diff(addr, slot, 300, 11),
                     _ => BlockStorageDiff::default(),
                 };
@@ -3330,7 +3562,9 @@ mod inverted_encoding_tests {
                 (5u64, 7u64, 100u64),
                 (9, 7, 100),
                 (10, 9, 200),
-                (19, 9, 200),
+                (14, 9, 200),
+                (15, 0, 250),
+                (19, 0, 250),
                 (20, 11, 300),
             ] {
                 assert_eq!(

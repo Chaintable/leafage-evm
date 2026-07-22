@@ -152,6 +152,8 @@ struct EncodedBlockData {
     accounts: Vec<([u8; 64], Option<Vec<u8>>)>,
     /// Pre-encoded storage writes: `(address(32) || key(32) || block_num(32), value_be_bytes(32))`.
     storage: Vec<([u8; 96], [u8; 32])>,
+    /// Accounts whose complete pre-block storage must be hidden at this height.
+    storage_wipes: Vec<H256>,
     /// New code blobs to write under `HashToCode`.
     codes: Vec<NewCode>,
 }
@@ -283,6 +285,23 @@ impl ArchiveStorage {
             }
             (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
                 Ok(db.write_code(b, code_hash, code)?)
+            }
+            _ => Err(anyhow::anyhow!("Batch type mismatch")),
+        }
+    }
+
+    fn write_storage_wipe(
+        &self,
+        batch: &mut ArchiveWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), anyhow::Error> {
+        match (self, batch) {
+            (ArchiveStorage::RocksDB(db), ArchiveWriteBatch::RocksDB(b)) => {
+                Ok(db.write_storage_wipe(b, address, block_num)?)
+            }
+            (ArchiveStorage::MDBX(db), ArchiveWriteBatch::MDBX(b)) => {
+                Ok(db.write_storage_wipe(b, address, block_num)?)
             }
             _ => Err(anyhow::anyhow!("Batch type mismatch")),
         }
@@ -503,15 +522,14 @@ fn spawn_rocksdb_batch_accumulator(
                 let bh = b.block_hash;
                 let bnum = b.block_num;
 
-                StateDBWrite::write_block_hash(
-                    &db,
-                    &mut small,
-                    b.block_info.header.number,
-                    bh,
-                )
-                .expect("write_block_hash");
+                StateDBWrite::write_block_hash(&db, &mut small, b.block_info.header.number, bh)
+                    .expect("write_block_hash");
                 StateDBWrite::write_block_info(&db, &mut small, b.block_info)
                     .expect("write_block_info");
+                for address in b.storage_wipes {
+                    StateDBWrite::write_storage_wipe(&db, &mut small, address, bnum)
+                        .expect("write_storage_wipe");
+                }
                 acc_writes.extend(
                     b.accounts
                         .into_iter()
@@ -664,8 +682,7 @@ fn spawn_rocksdb_ingest_dispatcher(
     worker_count: usize,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> =
-            tokio::task::JoinSet::new();
+        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -694,8 +711,7 @@ fn spawn_rocksdb_ingest_dispatcher(
             }
         }
         while let Some(res) = tasks.join_next().await {
-            let comp = res
-                .map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
+            let comp = res.map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
             if completion_tx.send(comp).await.is_err() {
                 return Err(anyhow::anyhow!(
                     "watermark advancer dropped completion channel"
@@ -961,10 +977,8 @@ impl Command {
                 }
                 std::fs::create_dir_all(&tmp_dir)?;
 
-                let (block_tx, block_rx) =
-                    mpsc::channel::<EncodedBlockData>(self.max_tasks);
-                let (batch_tx, batch_rx) =
-                    mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
+                let (block_tx, block_rx) = mpsc::channel::<EncodedBlockData>(self.max_tasks);
+                let (batch_tx, batch_rx) = mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
                 let (completion_tx, completion_rx) =
                     mpsc::channel::<BatchCompletion>(INGEST_WORKER_COUNT + 1);
 
@@ -1272,16 +1286,21 @@ impl Command {
         block: EncodedBlockData,
     ) -> Result<()> {
         let EncodedBlockData {
-            block_num: _,
+            block_num,
             block_hash,
             block_info,
             accounts,
             storage,
+            storage_wipes,
             codes,
         } = block;
 
         db.write_block_hash(batch, block_info.header.number, block_hash)?;
         db.write_block_info(batch, block_info)?;
+
+        for address in storage_wipes {
+            db.write_storage_wipe(batch, address, block_num)?;
+        }
 
         db.extend_account_writes(batch, accounts)?;
         db.extend_storage_writes(batch, storage)?;
@@ -1405,10 +1424,10 @@ impl Command {
         };
 
         let block_hash = block_info.header.hash;
+        let storage_wipes = block_diff.deleted_accounts.clone();
 
-        let mut accounts = Vec::with_capacity(
-            block_diff.deleted_accounts.len() + block_diff.new_accounts.len(),
-        );
+        let mut accounts =
+            Vec::with_capacity(block_diff.deleted_accounts.len() + block_diff.new_accounts.len());
         for address in block_diff.deleted_accounts {
             accounts.push((encode_account_key(address, block_num), None));
         }
@@ -1418,11 +1437,7 @@ impl Command {
             accounts.push((key, Some(value)));
         }
 
-        let storage_count: usize = block_diff
-            .storage_diffs
-            .iter()
-            .map(|d| d.diffs.len())
-            .sum();
+        let storage_count: usize = block_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum();
         let mut storage = Vec::with_capacity(storage_count);
         for account_diff in block_diff.storage_diffs {
             for pair in account_diff.diffs {
@@ -1438,6 +1453,7 @@ impl Command {
             block_info,
             accounts,
             storage,
+            storage_wipes,
             codes: block_diff.new_codes,
         })
     }

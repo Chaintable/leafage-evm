@@ -427,6 +427,29 @@ impl StateDBWrite for MultiStateDB {
         }
     }
 
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), StorageError> {
+        match (self, batch) {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
+                db.write_storage_wipe(b, address, block_num)
+            }
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
+                db.write_storage_wipe(b, address, block_num)
+            }
+            (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
+                db.write_storage_wipe(b, address, block_num)
+            }
+            (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => {
+                db.write_storage_wipe(b, address, block_num)
+            }
+            _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
+        }
+    }
+
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError> {
         match (self, batch) {
             (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => db.commit(b),

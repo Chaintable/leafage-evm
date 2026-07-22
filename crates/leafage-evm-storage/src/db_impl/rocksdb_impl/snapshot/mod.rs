@@ -345,6 +345,26 @@ impl StateDBWrite for DataBase {
         Ok(())
     }
 
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        _block_num: u64,
+    ) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let mut begin = Vec::with_capacity(64);
+        begin.extend_from_slice(address.as_slice());
+        begin.extend_from_slice(&[0u8; 32]);
+        let mut end = Vec::with_capacity(65);
+        end.extend_from_slice(address.as_slice());
+        end.extend_from_slice(&[0xff; 33]);
+        batch.delete_range_cf(cf, begin, end);
+        Ok(())
+    }
+
     fn write_code(
         &self,
         batch: &mut Self::DBWriteBatch,
@@ -396,8 +416,8 @@ fn rocksdb_column_options(shared_cache: &Cache) -> Options {
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
-    // Disable TTL-based compaction to avoid unnecessary full rewrites of old
-    // SST files (default 30 days from optimize_level_style_compaction).
+                                                              // Disable TTL-based compaction to avoid unnecessary full rewrites of old
+                                                              // SST files (default 30 days from optimize_level_style_compaction).
     cf_opts.set_ttl(0);
     cf_opts
 }
@@ -762,6 +782,81 @@ mod tests {
             let account = db.read_account(addr).unwrap().unwrap();
             assert_eq!(account.balance, U256::from(200));
             assert_eq!(db.read_storage(addr, slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_destroy_recreate_wipes_old_storage() {
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-snapshot-storage-wipe-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBase::open(&dir, 64, false));
+            let state = StateDBWrapper(db.clone());
+            let addr = H256::repeat_byte(0xaa);
+            let old_slot = H256::repeat_byte(0x01);
+            let final_slot = H256::repeat_byte(0x02);
+
+            state
+                .update_block(
+                    make_block_info(1, H256::repeat_byte(0x11), H256::ZERO),
+                    BlockStorageDiff {
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(100),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: vec![
+                                IndexValuePair {
+                                    index: old_slot,
+                                    value: U256::from(7),
+                                },
+                                IndexValuePair {
+                                    index: final_slot,
+                                    value: U256::from(8),
+                                },
+                            ],
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            state
+                .update_block(
+                    make_block_info(2, H256::repeat_byte(0x22), H256::repeat_byte(0x11)),
+                    BlockStorageDiff {
+                        deleted_accounts: vec![addr],
+                        new_accounts: vec![NewAccount {
+                            address: addr,
+                            balance: U256::from(200),
+                            nonce: 1,
+                            code_hash: KECCAK256_EMPTY.0.into(),
+                        }],
+                        storage_diffs: vec![AccountStorageDiff {
+                            address: addr,
+                            diffs: vec![IndexValuePair {
+                                index: final_slot,
+                                value: U256::from(9),
+                            }],
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(db.read_storage(addr, old_slot).unwrap(), U256::ZERO);
+            assert_eq!(db.read_storage(addr, final_slot).unwrap(), U256::from(9));
+            assert_eq!(
+                db.read_account(addr).unwrap().unwrap().balance,
+                U256::from(200)
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

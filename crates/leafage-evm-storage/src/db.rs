@@ -108,6 +108,17 @@ pub trait StateDBWrite: Send + Sync + 'static {
         value: U256,
     ) -> Result<(), StorageError>;
 
+    /// Remove every storage slot belonging to `address` at this block.
+    ///
+    /// Archive implementations persist a versioned wipe marker; snapshot
+    /// implementations may physically delete the address prefix.
+    fn write_storage_wipe(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), StorageError>;
+
     /// commit write batch
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError>;
 }
@@ -203,6 +214,12 @@ where
             .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
         let hash = block_info.header.hash;
         self.0.write_block_info(&mut batch, block_info)?;
+        for &address in &block_diff.deleted_accounts {
+            trace!(target: "state_diff",
+                "commit storage wipe: block {}, address {}", block_number, address);
+            self.0
+                .write_storage_wipe(&mut batch, address, block_number)?;
+        }
         for account in block_diff.deleted_accounts {
             trace!(target: "state_diff",
                 "commit delete account: block {}, address {}", block_number, account);

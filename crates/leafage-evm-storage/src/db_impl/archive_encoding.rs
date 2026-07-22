@@ -145,6 +145,17 @@ pub fn encode_block_num_desc(block_num: u64) -> [u8; 32] {
     encode_block_num(u64::MAX - block_num)
 }
 
+/// Decode an archive version tail according to the process encoding mode.
+#[inline]
+pub fn decode_version_tail(tail: &[u8]) -> u64 {
+    let raw = u64::from_be_bytes(tail[24..32].try_into().expect("32-byte version tail"));
+    if inverted_block_encoding() {
+        u64::MAX - raw
+    } else {
+        raw
+    }
+}
+
 /// Encode account key: `address(32) || version_tail(32 BE)`, where the tail is
 /// ascending or descending per [`inverted_block_encoding`]. In inverted mode a
 /// forward `Seek(address || (MAX - H))` lands on the greatest version `≤ H`; in
