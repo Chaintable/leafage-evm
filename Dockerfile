@@ -3,11 +3,7 @@
 ARG RUST_VERSION=1.93.0
 
 # libstylus.so, built from Chaintable/nitro and published as a COPY-only image.
-# Pinned to a revision on purpose: moduleHash and the FFI ABI are tied to the
-# nitro commit the library came from, so a floating tag would silently drift
-# activation results away from the writer. Bump this deliberately, together
-# with a re-verified Stylus diff.
-ARG LIBSTYLUS_REV=f7c0ab5
+ARG LIBSTYLUS_REV=latest
 
 FROM public.ecr.aws/b2h7a5c4/chaintable/libstylus:${LIBSTYLUS_REV} AS libstylus
 
