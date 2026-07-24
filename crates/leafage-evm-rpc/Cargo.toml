@@ -37,3 +37,6 @@ anyhow.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true
+
+[dev-dependencies]
+metrics-util.workspace = true

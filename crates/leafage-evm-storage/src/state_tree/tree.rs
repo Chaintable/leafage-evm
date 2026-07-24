@@ -6,10 +6,11 @@ use crate::state_tree::error::Error;
 use crate::state_tree::layer::{
     CacheDiskLayer, DiffLayer, FlattenedLayerView, HybridStateDB, LinkedDiffLayer,
 };
+use arc_swap::ArcSwap;
 use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 #[derive(Clone, Debug)]
@@ -56,21 +57,44 @@ impl Default for StateTreeConfig {
     }
 }
 
-/// [`StateTree`] is a tree structure that stores the state of the EVM.
-pub struct StateTree<DB> {
+#[derive(Clone, Debug)]
+struct StateIndex {
     /// Pre-built read view for the current head. The linked head inside the
     /// view remains available for extending the topology with a child block.
-    latest: RwLock<Arc<FlattenedLayerView>>,
-    /// Bottom CacheDiskLayer held directly so state_at() can read
-    /// `committed_height` in O(1) instead of walking the diff chain.
-    cache_layer: Arc<LinkedDiffLayer>,
+    latest: Arc<FlattenedLayerView>,
     /// blockhash -> immutable read view for every in-memory block head.
     /// Each view owns O(depth) Arc pointers, so retaining a canonical window
     /// of `depth` heads costs O(depth^2) pointers; recent forks add O(depth)
     /// each until clear_diff_map prunes their height.
-    hash_diff_map: RwLock<HashMap<H256, Arc<FlattenedLayerView>>>,
+    hash_diff_map: HashMap<H256, Arc<FlattenedLayerView>>,
     /// blocknum -> immutable read view for every in-memory block head.
-    num_diff_map: RwLock<HashMap<u64, Arc<FlattenedLayerView>>>,
+    num_diff_map: HashMap<u64, Arc<FlattenedLayerView>>,
+}
+
+impl StateIndex {
+    /// Remove diff heads lower than bottom_height from the next published
+    /// snapshot. Readers continue using the previous immutable snapshot until
+    /// the complete update is atomically published.
+    fn clear_diff_map(&mut self, bottom_height: u64) {
+        if bottom_height == 0 {
+            return;
+        }
+        self.hash_diff_map
+            .retain(|_, v| v.head().unwrap_diff_layer().block_info.header.number >= bottom_height);
+        self.num_diff_map.retain(|num, _| *num >= bottom_height);
+    }
+}
+
+/// [`StateTree`] is a tree structure that stores the state of the EVM.
+pub struct StateTree<DB> {
+    /// One immutable, atomically-published snapshot keeps latest/by-hash/
+    /// by-number mutually consistent and makes the RPC read side lock-free.
+    index: ArcSwap<StateIndex>,
+    /// Serialize the copy-on-write publisher. Reads never acquire this lock.
+    update_lock: Mutex<()>,
+    /// Bottom CacheDiskLayer held directly so state_at() can read
+    /// `committed_height` in O(1) instead of walking the diff chain.
+    cache_layer: Arc<LinkedDiffLayer>,
     /// config stores the config of the StateTree.
     config: StateTreeConfig,
     /// db is the underlying database.
@@ -78,21 +102,6 @@ pub struct StateTree<DB> {
 }
 
 impl<DB> StateTree<DB> {
-    /// clear_diff_map removes the diff layer that is lower than bottom_height.
-    fn clear_diff_map(&self, bottom_height: u64) {
-        if bottom_height == 0 {
-            return;
-        }
-        self.hash_diff_map
-            .write()
-            .unwrap()
-            .retain(|_, v| v.head().unwrap_diff_layer().block_info.header.number >= bottom_height);
-        self.num_diff_map
-            .write()
-            .unwrap()
-            .retain(|num, _| *num >= bottom_height);
-    }
-
     pub fn get_config(&self) -> StateTreeConfig {
         self.config.clone()
     }
@@ -127,10 +136,13 @@ where
         hash_diffs.insert(info.header.hash, bottom_view.clone());
         num_diffs.insert(info.header.number, bottom_view);
         Ok(Self {
-            latest: RwLock::new(latest_view),
+            index: ArcSwap::from_pointee(StateIndex {
+                latest: latest_view,
+                hash_diff_map: hash_diffs,
+                num_diff_map: num_diffs,
+            }),
+            update_lock: Mutex::new(()),
             cache_layer,
-            hash_diff_map: RwLock::new(hash_diffs),
-            num_diff_map: RwLock::new(num_diffs),
             config,
             db,
         })
@@ -148,19 +160,17 @@ where
         block_info: BlockInfo,
         block_diff: BlockStorageDiff,
     ) -> Result<(), Self::Error> {
-        if self
+        let _update_guard = self.update_lock.lock().unwrap();
+        let current_index = self.index.load_full();
+        if current_index
             .hash_diff_map
-            .read()
-            .unwrap()
             .contains_key(&block_info.header.hash)
         {
             info!(target:"storage", "block {:?} already exists", block_info.header.hash);
             return Ok(());
         }
-        let res = self
+        let res = current_index
             .hash_diff_map
-            .read()
-            .unwrap()
             .get(&block_info.header.parent_hash)
             .cloned();
 
@@ -177,7 +187,7 @@ where
             )));
 
             // Metadata-only; None disables refill.
-            let latest_view = self.latest.read().unwrap().clone();
+            let latest_view = current_index.latest.clone();
             let latest_block_info =
                 HybridStateDB::from_flattened(latest_view, &latest_statedb, None).block_info()?;
             let should_publish_as_latest =
@@ -185,14 +195,14 @@ where
 
             if !should_publish_as_latest {
                 let new_view = FlattenedLayerView::build(new_diff_layer);
-                self.hash_diff_map
-                    .write()
-                    .unwrap()
+                let mut next_index = (*current_index).clone();
+                next_index
+                    .hash_diff_map
                     .insert(block_info.header.hash, new_view.clone());
-                self.num_diff_map
-                    .write()
-                    .unwrap()
+                next_index
+                    .num_diff_map
                     .insert(block_info.header.number, new_view);
+                self.index.store(Arc::new(next_index));
                 info!(target:"storage", "import reorg block {:?} -> {:?}", block_info.header.number, latest_block_info.header.number);
                 return Ok(());
             }
@@ -209,17 +219,17 @@ where
             // cap_diff_to_db may retarget the linked chain. Build the view
             // afterwards so indexes and latest publish the final topology.
             let new_view = FlattenedLayerView::build(new_diff_layer);
-            self.hash_diff_map
-                .write()
-                .unwrap()
+            let mut next_index = (*current_index).clone();
+            next_index
+                .hash_diff_map
                 .insert(block_info.header.hash, new_view.clone());
-            self.num_diff_map
-                .write()
-                .unwrap()
+            next_index
+                .num_diff_map
                 .insert(block_info.header.number, new_view.clone());
-            *self.latest.write().unwrap() = new_view;
+            next_index.latest = new_view;
             debug!(target:"storage", "clear diff map bottom_height: {:?}", bottom_height);
-            self.clear_diff_map(bottom_height);
+            next_index.clear_diff_map(bottom_height);
+            self.index.store(Arc::new(next_index));
             Ok(())
         } else {
             Err(Error::ParentBlockHashNotFound(
@@ -252,15 +262,10 @@ where
         &self,
         block_id: BlockId,
     ) -> Result<Option<Arc<BlockInfo>>, Self::Error> {
+        let index = self.index.load();
         let view = match block_id {
             BlockId::Hash(hash) => {
-                if let Some(view) = self
-                    .hash_diff_map
-                    .read()
-                    .unwrap()
-                    .get(&hash.block_hash)
-                    .cloned()
-                {
+                if let Some(view) = index.hash_diff_map.get(&hash.block_hash).cloned() {
                     Ok(Some(view))
                 } else {
                     Ok(None)
@@ -268,10 +273,10 @@ where
             }
             BlockId::Number(number) => match number {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    Ok(Some(self.latest.read().unwrap().clone()))
+                    Ok(Some(index.latest.clone()))
                 }
                 BlockNumberOrTag::Number(num) => {
-                    if let Some(view) = self.num_diff_map.read().unwrap().get(&num).cloned() {
+                    if let Some(view) = index.num_diff_map.get(&num).cloned() {
                         Ok(Some(view))
                     } else {
                         Ok(None)
@@ -313,15 +318,10 @@ where
     type StateDB = HybridStateDB<StateDBWrapper<<DB as StateDBProvider>::StateDBReadWrite>>;
 
     fn state_at(&self, block_arg: BlockId) -> Result<Option<Self::StateDB>, Self::Error> {
+        let index = self.index.load();
         let view = match block_arg {
             BlockId::Hash(hash) => {
-                if let Some(view) = self
-                    .hash_diff_map
-                    .read()
-                    .unwrap()
-                    .get(&hash.block_hash)
-                    .cloned()
-                {
+                if let Some(view) = index.hash_diff_map.get(&hash.block_hash).cloned() {
                     Ok(Some(view))
                 } else {
                     Ok(None)
@@ -329,10 +329,10 @@ where
             }
             BlockId::Number(number) => match number {
                 BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => {
-                    Ok(Some(self.latest.read().unwrap().clone()))
+                    Ok(Some(index.latest.clone()))
                 }
                 BlockNumberOrTag::Number(num) => {
-                    if let Some(view) = self.num_diff_map.read().unwrap().get(&num).cloned() {
+                    if let Some(view) = index.num_diff_map.get(&num).cloned() {
                         Ok(Some(view))
                     } else {
                         Ok(None)
@@ -431,15 +431,10 @@ mod tests {
         )
         .unwrap();
 
-        let latest = tree.latest.read().unwrap().clone();
-        let by_hash = tree
-            .hash_diff_map
-            .read()
-            .unwrap()
-            .get(&hash(0xa3))
-            .unwrap()
-            .clone();
-        let by_number = tree.num_diff_map.read().unwrap().get(&3).unwrap().clone();
+        let index = tree.index.load();
+        let latest = index.latest.clone();
+        let by_hash = index.hash_diff_map.get(&hash(0xa3)).unwrap().clone();
+        let by_number = index.num_diff_map.get(&3).unwrap().clone();
         assert!(Arc::ptr_eq(&latest, &by_hash));
         assert!(Arc::ptr_eq(&latest, &by_number));
         assert_eq!(latest.diff_layer_count(), 2);
@@ -462,16 +457,11 @@ mod tests {
             BlockStorageDiff::default(),
         )
         .unwrap();
-        let fork = tree
-            .hash_diff_map
-            .read()
-            .unwrap()
-            .get(&hash(0xb2))
-            .unwrap()
-            .clone();
+        let index = tree.index.load();
+        let fork = index.hash_diff_map.get(&hash(0xb2)).unwrap().clone();
         assert!(!Arc::ptr_eq(&fork, &latest));
         assert_eq!(fork.diff_layer_count(), 2);
-        assert!(Arc::ptr_eq(&tree.latest.read().unwrap(), &latest));
+        assert!(Arc::ptr_eq(&index.latest, &latest));
 
         drop(numbered_handle);
         drop(latest_handle);

@@ -9,7 +9,7 @@ use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
     ToJsonRpcError,
 };
-use crate::metrics::RpcMetric;
+use crate::metrics::{HttpMetricLayer, RpcMetric};
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
@@ -153,7 +153,9 @@ where
             std::sync::Arc::new(tokio::sync::Semaphore::new(self.evm_exec_concurrency))
         });
 
-        let http_middleware = tower::ServiceBuilder::new().timeout(rpc_timeout);
+        let http_middleware = tower::ServiceBuilder::new()
+            .layer(HttpMetricLayer)
+            .timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
         let http_middleware = http_middleware.layer(InterceptorLayer::new(
             &self.interceptor_cfg.unwrap_or_default(),
