@@ -3,7 +3,7 @@
 //! the native runtime instead of the EVM opcode loop, then feeds a synthetic
 //! `InterpreterAction::Return` back through the stock `process_next_action` so
 //! journal commit/revert, `CallOutcome` wrapping, and parent gas/return wiring
-//! stay identical to an EVM callee. See `docs/stylus-execution-impl-plan.md`.
+//! stay identical to an EVM callee.
 //!
 //! Verified gas-for-gas against the Arb One writer: dispatch, native-asm
 //! compile, the pre-charge, read_args, storage and transient-storage hostios,
@@ -13,7 +13,6 @@
 //! Not yet exercised against a writer, because Arb One's handful of Stylus
 //! programs never reach these paths: create, logs, account access, storage
 //! *writes* (and with them the SSTORE refund), and Stylus calling Stylus.
-//! See `docs/todo.md` for what would make those worth chasing.
 //!
 //! Full `CaptureHostIO` opcode tracing remains deliberately absent: request 14
 //! stays a no-op because the registered API only consumes logs and SSTOREs.
