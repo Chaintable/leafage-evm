@@ -4,7 +4,7 @@ use crate::api_impl::mantle::evm::{create_mantle_evm_from_state, create_mantle_t
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::mantle::{MantleHardfork, GAS_ORACLE_ADDR, TOKEN_RATIO_SLOT};
-use leafage_evm_types::CallRequest;
+use leafage_evm_types::{BlockInfo, CallRequest};
 use op_revm::transaction::OpTxTr;
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::{EVMError, ResultGas};
@@ -51,6 +51,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,

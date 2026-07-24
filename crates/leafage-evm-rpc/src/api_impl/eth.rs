@@ -25,6 +25,7 @@ where
     C::DB: EvmStorageRead + BlockIndex,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<C::EvmHaltReason>,
 {
     fn base_fee_inner(&self, block_id: BlockId) -> RpcResult<u64> {
         let state = self
@@ -119,6 +120,7 @@ where
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
         let tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request,
             &db,
@@ -365,6 +367,7 @@ where
                 }
             }
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 request,
                 state.clone(),
@@ -649,6 +652,7 @@ where
     C::DB: EvmStorageRead + BlockIndex,
     C::TransactionError: ToJsonRpcError + GetTransactionError,
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
+    DebankErrorCode: From<C::EvmHaltReason>,
 {
     async fn call(
         &self,

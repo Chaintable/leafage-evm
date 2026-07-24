@@ -7,6 +7,7 @@ use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, Nod
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
+use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 #[cfg(target_os = "linux")]
@@ -468,8 +469,8 @@ impl Command {
                 // *under*-estimates the floor — if a chain enables 7623 PRAGUE is exact,
                 // if it's off the floor only over-estimates rare calldata-heavy txs (the
                 // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
-                // chains. The L1 cost is added separately in estimate_l1_overhead.
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::PRAGUE, "arbitrum")?;
+                // chains. The Arbitrum EVM handler accounts for Nitro's L1 poster gas.
+                let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;

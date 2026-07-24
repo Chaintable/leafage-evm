@@ -4,7 +4,7 @@ use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::base::BaseHardfork;
-use leafage_evm_types::CallRequest;
+use leafage_evm_types::{BlockInfo, CallRequest};
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::EVMError;
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
@@ -40,6 +40,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,
@@ -53,8 +54,10 @@ where
         block_env: &BlockEnv,
         state: StateDB,
         tx: Self::Tx,
-    ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<StateDB::Error, Self::TransactionError>>
-    {
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    > {
         let mut evm = create_base_evm_from_state(
             block_env.clone(),
             self.evm_cfg.cfg.clone(),

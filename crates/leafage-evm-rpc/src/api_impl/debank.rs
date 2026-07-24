@@ -18,12 +18,12 @@ use leafage_evm_types::{
     H256, KECCAK256_EMPTY, U256,
 };
 use revm::bytecode::OpCode;
-use revm::context_interface::Cfg;
-use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
+use revm::context_interface::Cfg;
 use revm::database::{CacheDB, DatabaseRef};
+use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -526,6 +526,7 @@ where
             }
         }
         let tx = self.inner.create_txn_env(
+            block,
             block_env,
             request,
             db,
@@ -595,11 +596,7 @@ where
                 continue;
             }
             let res = self.debank_single_call_from_state_impl_inner(
-                &state,
-                &block,
-                &block_env,
-                &db,
-                request,
+                &state, &block, &block_env, &db, request,
             )?;
             if res.code != 0 {
                 stats.success = false;
@@ -719,6 +716,7 @@ where
                 .set_steps(true);
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 tx,
                 &memory_db,
@@ -805,11 +803,13 @@ where
             })
             .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request.clone(),
             &memory_db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
+        tx.set_gas_estimation();
         // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
