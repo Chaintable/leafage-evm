@@ -36,6 +36,19 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                 U256::ZERO.to_be_bytes(),
             )?
             .to_be_bytes::<32>();
+        Ok(Self::decode_stylus_params(bytes, arbos_version))
+    }
+
+    pub(in crate::arbitrum::precompile) fn stylus_params_concrete(
+        &mut self,
+        arbos_version: u64,
+    ) -> Result<StylusParams, DB::Error> {
+        let params_key = self.stylus_params_key();
+        self.read_key_concrete(&params_key, U256::ZERO.to_be_bytes())
+            .map(|value| Self::decode_stylus_params(value.to_be_bytes(), arbos_version))
+    }
+
+    fn decode_stylus_params(bytes: [u8; 32], arbos_version: u64) -> StylusParams {
         let mut cursor = 0usize;
 
         let take_u8 = |cursor: &mut usize| {
@@ -89,7 +102,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             0
         };
 
-        Ok(StylusParams {
+        StylusParams {
             version,
             ink_price,
             max_stack_depth,
@@ -105,7 +118,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             block_cache_size,
             max_wasm_size,
             max_fragment_count,
-        })
+        }
     }
 
     pub(in crate::arbitrum::precompile) fn save_stylus_params(
@@ -154,39 +167,62 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         &mut self,
         account: Address,
     ) -> Result<B256, PrecompileError> {
-        self.context
-            .journal_mut()
-            .load_account(account)
-            .map(|account| {
-                if account.data.is_selfdestructed() {
-                    KECCAK_EMPTY
-                } else {
-                    account.data.info.code_hash
-                }
-            })
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+        // Nitro's StateDB.GetCodeHash does not add the account to the EIP-2929
+        // access list. Revert the journal entry created by revm's account load
+        // so activation does not make the following program call warm.
+        let checkpoint = self.context.journal_mut().checkpoint();
+        let result = {
+            self.context
+                .journal_mut()
+                .load_account(account)
+                .map(|account| {
+                    if account.data.is_selfdestructed() {
+                        KECCAK_EMPTY
+                    } else {
+                        account
+                            .data
+                            .info
+                            .code
+                            .as_ref()
+                            .map(|code| code.hash_slow())
+                            .unwrap_or(account.data.info.code_hash)
+                    }
+                })
+        };
+        self.context.journal_mut().checkpoint_revert(checkpoint);
+        result.map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn account_code_and_hash(
         &mut self,
         account: Address,
     ) -> Result<(Bytes, B256), PrecompileError> {
-        let loaded = self
-            .context
-            .journal_mut()
-            .load_account_with_code(account)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
-        if loaded.data.is_selfdestructed() {
+        // Nitro's StateDB.GetCode/GetCodeHash reads do not warm the program
+        // account. Keep revm's loaded code, but roll back its access-list side
+        // effect before returning the owned values.
+        let checkpoint = self.context.journal_mut().checkpoint();
+        let result = {
+            self.context
+                .journal_mut()
+                .load_account_with_code(account)
+                .map(|loaded| {
+                    let is_selfdestructed = loaded.data.is_selfdestructed();
+                    let (code, code_hash) = loaded
+                        .data
+                        .info
+                        .code
+                        .as_ref()
+                        .map(|code| (code.original_bytes(), code.hash_slow()))
+                        .unwrap_or((Bytes::new(), loaded.data.info.code_hash));
+                    (code, code_hash, is_selfdestructed)
+                })
+        };
+        self.context.journal_mut().checkpoint_revert(checkpoint);
+
+        let (code, code_hash, is_selfdestructed) = result.map_err(fatal_db_error)?;
+        if is_selfdestructed {
             return Err(PrecompileError::other("self destructed"));
         }
-        let code_hash = loaded.data.info.code_hash;
-        let code = loaded
-            .data
-            .info
-            .code
-            .as_ref()
-            .map(|code| code.original_bytes())
-            .unwrap_or_default();
         Ok((code, code_hash))
     }
 
@@ -198,7 +234,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .code(account)
             .map(|load| (load.data, load.is_cold))
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn code_by_hash(
@@ -223,7 +259,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .db()
             .code_by_hash_ref(code_hash)
             .map(|code| code.original_bytes())
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))
+            .map_err(fatal_db_error)
     }
 
     pub(in crate::arbitrum::precompile) fn account_is_warm(&self, account: Address) -> bool {
@@ -243,7 +279,20 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         let bytes = self
             .read_key(&programs_key, code_hash.0)?
             .to_be_bytes::<32>();
-        Ok(WasmProgram {
+        Ok(Self::decode_wasm_program(bytes))
+    }
+
+    pub(in crate::arbitrum::precompile) fn wasm_program_concrete(
+        &mut self,
+        code_hash: B256,
+    ) -> Result<WasmProgram, DB::Error> {
+        let programs_key = self.wasm_programs_key();
+        self.read_key_concrete(&programs_key, code_hash.0)
+            .map(|value| Self::decode_wasm_program(value.to_be_bytes()))
+    }
+
+    fn decode_wasm_program(bytes: [u8; 32]) -> WasmProgram {
+        WasmProgram {
             version: u16::from_be_bytes([bytes[0], bytes[1]]),
             init_cost: u16::from_be_bytes([bytes[2], bytes[3]]),
             cached_cost: u16::from_be_bytes([bytes[4], bytes[5]]),
@@ -251,7 +300,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             activated_at: u32::from_be_bytes([0, bytes[8], bytes[9], bytes[10]]),
             asm_estimate_kb: u32::from_be_bytes([0, bytes[11], bytes[12], bytes[13]]),
             cached: bytes[14] != 0,
-        })
+        }
     }
 
     pub(in crate::arbitrum::precompile) fn active_wasm_program(
@@ -317,6 +366,15 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             code_hash.0,
             U256::from_be_bytes(module_hash.0),
         )
+    }
+
+    pub(in crate::arbitrum::precompile) fn wasm_module_hash_concrete(
+        &mut self,
+        code_hash: B256,
+    ) -> Result<B256, DB::Error> {
+        let module_hashes_key = self.wasm_module_hashes_key();
+        self.read_key_concrete(&module_hashes_key, code_hash.0)
+            .map(|value| B256::from(value.to_be_bytes::<32>()))
     }
 
     pub(in crate::arbitrum::precompile) fn save_activated_wasm_program(

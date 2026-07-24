@@ -34,6 +34,8 @@ k256.workspace = true
 brotli.workspace = true # Stylus payload decompression (wasm.rs)
 brotlic.workspace = true # L1 poster-gas fake-tx compression, byte-identical to Nitro's libbrotli
 libloading.workspace = true
+moka.workspace = true
+tracing.workspace = true
 
 #only use in bsc precompile
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }

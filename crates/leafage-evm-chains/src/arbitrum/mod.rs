@@ -10,6 +10,7 @@ pub mod config;
 pub mod evm;
 pub mod hardforks;
 pub mod precompile;
+mod stylus_prefix;
 pub mod tx;
 
 pub use config::ArbitrumEvmConfig;

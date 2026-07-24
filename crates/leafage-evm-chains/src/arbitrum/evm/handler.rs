@@ -1,24 +1,24 @@
 //! EVM handler hooks for Arbitrum Nitro transaction processing.
 
-use super::poster_gas::ArbPosterCharge;
 use super::ArbitrumEvm;
+use super::poster_gas::ArbPosterCharge;
 use crate::arbitrum::arbos_state::{self, ArbStateReader};
 use crate::arbitrum::precompile::{ArbitrumContext, L1_PRICER_FUNDS_POOL_ADDRESS};
 use alloy::primitives::U256;
 use revm::{
+    Database, DatabaseRef,
     context::{
-        result::{EVMError, HaltReason},
-        Block, ContextTr, Transaction,
+        Block, ContextTr, LocalContextTr, Transaction,
+        result::{EVMError, ExecutionResult, HaltReason},
     },
     context_interface::{
-        journaled_state::account::JournaledAccountTr, result::InvalidTransaction,
-        transaction::TransactionType, Cfg, JournalTr,
+        Cfg, JournalTr, journaled_state::account::JournaledAccountTr, result::InvalidTransaction,
+        transaction::TransactionType,
     },
-    handler::{pre_execution, validation, EvmTr, FrameResult, FrameTr, Handler},
+    handler::{EvmTr, FrameResult, FrameTr, Handler, pre_execution, validation},
     inspector::{Inspector, InspectorHandler},
-    interpreter::{interpreter::EthInterpreter, Gas, InitialAndFloorGas},
+    interpreter::{Gas, InitialAndFloorGas, interpreter::EthInterpreter},
     primitives::hardfork::SpecId,
-    Database, DatabaseRef,
 };
 
 const ARBOS_VERSION_L1_PRICER_FUNDS_POOL: u64 = 2;
@@ -273,6 +273,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
+        evm.ctx_mut().chain_mut().clear_open_contract_frames();
         evm.ctx_mut().chain_mut().clear_current_poster_charge();
 
         let mut gas_limit = evm
@@ -407,21 +408,33 @@ where
         }
         Ok(())
     }
+
+    fn catch_error(
+        &self,
+        evm: &mut Self::Evm,
+        error: Self::Error,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        evm.ctx_mut().chain_mut().clear_open_contract_frames();
+        evm.ctx_mut().local_mut().clear();
+        evm.ctx_mut().journal_mut().discard_tx();
+        evm.frame_stack().clear();
+        Err(error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arbitrum::evm::ArbitrumExecutionContext;
-    use crate::arbitrum::precompile::BATCH_POSTER_ADDRESS;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
+    use crate::arbitrum::precompile::BATCH_POSTER_ADDRESS;
     use crate::arbitrum::tx::ArbitrumTxEnv;
-    use alloy::primitives::{Address, Bytes, B256};
+    use alloy::primitives::{Address, B256, Bytes};
     use leafage_evm_types::{BlockEnv, CfgEnv};
-    use revm::context::{Context, TxEnv};
-    use revm::database::{in_memory_db::CacheDB, EmptyDB};
     use revm::MainContext;
+    use revm::context::{Context, TxEnv};
+    use revm::database::{EmptyDB, in_memory_db::CacheDB};
 
     type TestDb = CacheDB<EmptyDB>;
 
@@ -752,6 +765,23 @@ mod tests {
         assert_eq!(inspect_poster, transact_poster);
         assert_eq!(inspect_result.gas_used(), transact_result.result.gas_used());
     }
+
+    #[test]
+    fn catch_error_clears_open_contract_frame_counts() {
+        let address = Address::with_last_byte(0x42);
+        let mut evm = evm_with_tx(ArbitrumTxEnv::default());
+        evm.ctx_mut().chain_mut().enter_contract_frame(address);
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(address), 1);
+
+        let error: EVMError<<TestDb as Database>::Error> =
+            EVMError::Custom("synthetic execution error".to_owned());
+        let result = ArbitrumHandler::<TestDb, ()>::new().catch_error(&mut evm, error);
+
+        assert!(
+            matches!(result, Err(EVMError::Custom(message)) if message == "synthetic execution error")
+        );
+        assert_eq!(evm.ctx().chain().open_contract_frame_count(address), 0);
+    }
 }
 
 impl<DB, INSP> InspectorHandler for ArbitrumHandler<DB, INSP>
@@ -771,6 +801,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
+        evm.ctx_mut().chain_mut().clear_open_contract_frames();
         evm.ctx_mut().chain_mut().clear_current_poster_charge();
 
         let mut gas_limit = evm

@@ -20,8 +20,8 @@
 use once_cell::sync::Lazy;
 use revm::context::TxEnv;
 use revm::context_interface::transaction::Transaction;
-use revm::primitives::{address, keccak256, Address, Bytes, B256, U256};
-use revm::DatabaseRef;
+use revm::primitives::{Address, B256, Bytes, U256, address, keccak256};
+use revm::{Database, DatabaseRef};
 use std::fmt::Debug;
 
 /// `types.ArbosStateAddress`: the account whose storage holds all ArbOS state.
@@ -147,11 +147,20 @@ static ARBOS_VERSION_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], ARBOS_VERSION_
 static COLLECT_TIPS_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], COLLECT_TIPS_OFFSET));
 static FEATURES_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&subspace_key(&[], FEATURES_SUBSPACE), 0));
 static BLOCKHASHES_KEY: Lazy<[u8; 32]> = Lazy::new(|| subspace_key(&[], BLOCKHASHES_SUBSPACE));
-static BLOCKHASHES_L1_BLOCK_NUMBER_SLOT: Lazy<U256> =
-    Lazy::new(|| slot_at(&*BLOCKHASHES_KEY, 0));
+static BLOCKHASHES_L1_BLOCK_NUMBER_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&*BLOCKHASHES_KEY, 0));
 static GENESIS_BLOCK_NUM_SLOT: Lazy<U256> = Lazy::new(|| slot_at(&[], GENESIS_BLOCK_NUM_OFFSET));
 static NETWORK_FEE_ACCOUNT_SLOT: Lazy<U256> =
     Lazy::new(|| slot_at(&[], NETWORK_FEE_ACCOUNT_OFFSET));
+
+/// Reads the next L1 block number recorded in ArbOS `Blockhashes` state while
+/// preserving the concrete database error for execution callers.
+pub(crate) fn read_blockhashes_l1_block_number<DB: Database>(
+    db: &mut DB,
+) -> Result<u64, DB::Error> {
+    db.storage(ARBOS_STATE_ADDRESS, *BLOCKHASHES_L1_BLOCK_NUMBER_SLOT)
+        .map(|value| value.saturating_to::<u64>())
+}
+
 /// The three ArbOS pricing values posterGas estimation needs.
 #[derive(Debug, Clone)]
 pub struct ArbPricing {
@@ -446,6 +455,42 @@ fn address_from_word(word: U256) -> Address {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    struct FailingStorageDb;
+
+    impl Database for FailingStorageDb {
+        type Error = ExpectedDbError;
+
+        fn basic(&mut self, _: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            unreachable!("block number helper must only read storage")
+        }
+
+        fn code_by_hash(&mut self, _: B256) -> Result<revm::bytecode::Bytecode, Self::Error> {
+            unreachable!("block number helper must only read storage")
+        }
+
+        fn storage(&mut self, address: Address, slot: U256) -> Result<U256, Self::Error> {
+            assert_eq!(address, ARBOS_STATE_ADDRESS);
+            assert_eq!(slot, *BLOCKHASHES_L1_BLOCK_NUMBER_SLOT);
+            Err(ExpectedDbError)
+        }
+
+        fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+            unreachable!("block number helper must only read storage")
+        }
+    }
+
     /// Slots derived here must equal the values read live off the writer
     /// (kava-1, 2026-05-29; see design-doc appendix). These vectors also pin the
     /// subspace ids / offsets for Robinhood's ArbOS version.
@@ -493,8 +538,16 @@ mod tests {
     }
 
     #[test]
+    fn blockhashes_l1_block_number_preserves_database_error() {
+        assert_eq!(
+            read_blockhashes_l1_block_number(&mut FailingStorageDb),
+            Err(ExpectedDbError)
+        );
+    }
+
+    #[test]
     fn reads_blockhashes_and_calldata_price_feature() {
-        use revm::database::{in_memory_db::CacheDB, EmptyDB};
+        use revm::database::{EmptyDB, in_memory_db::CacheDB};
 
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_storage(
@@ -521,13 +574,14 @@ mod tests {
 
         assert!(db.is_calldata_price_increase_enabled());
         assert_eq!(db.blockhashes_l1_block_number(), Some(1_000));
+        assert_eq!(read_blockhashes_l1_block_number(&mut db), Ok(1_000));
         assert_eq!(db.l1_block_hash(999), Some(hash));
     }
 
     /// Nitro gates the feature on ArbOS 40 as well as the flag bit.
     #[test]
     fn calldata_price_feature_requires_version_and_flag() {
-        use revm::database::{in_memory_db::CacheDB, EmptyDB};
+        use revm::database::{EmptyDB, in_memory_db::CacheDB};
 
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_storage(ARBOS_STATE_ADDRESS, *FEATURES_SLOT, U256::ONE)

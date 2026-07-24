@@ -63,6 +63,7 @@ revm = { version = "36.0.0", features = [
     "secp256k1",
     "blst",
     "serde",
+    "optional_eip3541",
     "optional_eip3607",
     "optional_eip7623",
     "optional_no_base_fee",
