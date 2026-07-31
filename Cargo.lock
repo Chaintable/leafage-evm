@@ -4867,6 +4867,7 @@ dependencies = [
  "libloading",
  "moka",
  "once_cell",
+ "op-revm",
  "p256 0.13.2",
  "parity-bytes",
  "prost 0.12.6",
