@@ -98,7 +98,9 @@ where
 
         // Extract gas_used and return_value from execution result
         let (gas_used, return_value) = match &exec_res {
-            ExecutionResult::Success { gas, output, .. } => (gas.used(), output.data().clone()),
+            ExecutionResult::Success {
+                gas, output, ..
+            } => (gas.used(), output.data().clone()),
             ExecutionResult::Revert { gas, output, .. } => (gas.used(), output.clone()),
             ExecutionResult::Halt { gas, .. } => (gas.used(), Bytes::new()),
         };

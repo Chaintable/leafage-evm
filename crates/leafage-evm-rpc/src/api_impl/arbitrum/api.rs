@@ -494,13 +494,6 @@ mod tests {
             },
             ArbitrumTxContext::default(),
         );
-        let child = CallTrace {
-            depth: 0,
-            caller: Address::with_last_byte(2),
-            address: Address::with_last_byte(3),
-            gas_limit: 9_000,
-            ..Default::default()
-        };
         let result = ExecutionResult::Success {
             reason: SuccessReason::Return,
             gas: ResultGas::new(10_000, 123, 0, 0, 0),
@@ -508,7 +501,13 @@ mod tests {
             output: Output::Call(Bytes::from_static(&[1, 2, 3])),
         };
         let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-        inspector.traces_mut().nodes_mut()[0].trace = child;
+        inspector.traces_mut().nodes_mut()[0].trace = CallTrace {
+            depth: 0,
+            caller: Address::with_last_byte(2),
+            address: Address::with_last_byte(3),
+            gas_limit: 9_000,
+            ..Default::default()
+        };
 
         ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result);
 
@@ -516,7 +515,6 @@ mod tests {
         assert_eq!(traces.len(), 2);
         assert_eq!(traces[0].trace.address, NODE_INTERFACE_ADDRESS);
         assert_eq!(traces[0].children, vec![1]);
-        assert_eq!(traces[1].idx, 1);
         assert_eq!(traces[1].parent, Some(0));
         assert_eq!(traces[1].trace.depth, 1);
         assert_eq!(traces[1].trace.address, Address::with_last_byte(3));

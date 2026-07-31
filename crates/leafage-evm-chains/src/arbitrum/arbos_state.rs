@@ -415,37 +415,6 @@ where
     Ok(bytes.into())
 }
 
-pub fn read_pricing<S: ArbStateReader + ?Sized>(state: &S) -> Option<ArbPricing> {
-    state.read_pricing()
-}
-
-pub fn current_tx_l1_gas_fee<S: ArbStateReader + ?Sized>(
-    state: &S,
-    tx: &TxEnv,
-    block_base_fee: u64,
-) -> U256 {
-    state.current_tx_l1_gas_fee(tx, block_base_fee)
-}
-
-pub fn genesis_block_num<S: ArbStateReader + ?Sized>(state: &S) -> U256 {
-    state.genesis_block_num()
-}
-
-pub fn arbos_version<S: ArbStateReader + ?Sized>(state: &S) -> u64 {
-    state.arbos_version()
-}
-
-pub fn read_retryable_info<S>(
-    state: &S,
-    ticket_id: B256,
-) -> Result<Option<ArbRetryableInfo>, String>
-where
-    S: ArbStateReader + ?Sized,
-    S::Error: Debug,
-{
-    state.read_retryable_info(ticket_id)
-}
-
 fn address_from_word(word: U256) -> Address {
     let bytes = word.to_be_bytes::<32>();
     Address::from_slice(&bytes[12..])

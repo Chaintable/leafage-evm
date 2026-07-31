@@ -31,8 +31,6 @@ const UNITS_PADDING_BIPS: u128 = 10_100;
 /// `GasEstimationL1PricePadding` (`tx_processor.go:33`): ×1.10.
 const PRICE_PADDING_BIPS: u64 = 11_000;
 const ONE_IN_BIPS: u64 = 10_000;
-const LEGACY_TX_TYPE: u8 = 0;
-const ACCESS_LIST_TX_TYPE: u8 = 1;
 
 // Fixed fields for the gas-estimation fake tx (`l1pricing.go:560-566`). The tx is
 // intentionally invalid; only its compressed byte count matters, so these merely
@@ -311,7 +309,7 @@ mod tests {
     fn brotli_len_is_flat_like_libbrotli() {
         let fake = |n: usize| {
             let mut v = vec![0x02u8, 0xf8, 0x00, 0x80, 0x84, 0x11, 0x22, 0x33, 0x44];
-            v.extend(std::iter::repeat(0xab).take(n));
+            v.extend(std::iter::repeat_n(0xab, n));
             v
         };
         let small = brotli_len(&fake(4096), 1).unwrap();
@@ -373,10 +371,11 @@ mod tests {
     }
 
     fn sample_tx(data: Vec<u8>) -> TxEnv {
-        let mut tx = TxEnv::default();
-        tx.kind = TxKind::Call(revm::primitives::Address::repeat_byte(0x11));
-        tx.data = Bytes::from(data);
-        tx
+        TxEnv {
+            kind: TxKind::Call(revm::primitives::Address::repeat_byte(0x11)),
+            data: Bytes::from(data),
+            ..Default::default()
+        }
     }
 
     /// Nitro's `GetPosterGas` pads only under `IsGasEstimation`: call-mode
@@ -440,7 +439,7 @@ mod tests {
                 .count()
         }
 
-        for tx_type in [LEGACY_TX_TYPE, ACCESS_LIST_TX_TYPE, 2] {
+        for tx_type in [0, 1, 2] {
             assert_eq!(
                 encoded_gas_price_count(tx_type),
                 1,

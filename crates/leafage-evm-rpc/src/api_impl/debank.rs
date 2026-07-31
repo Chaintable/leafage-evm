@@ -18,12 +18,12 @@ use leafage_evm_types::{
     H256, KECCAK256_EMPTY, U256,
 };
 use revm::bytecode::OpCode;
+use revm::context_interface::Cfg;
+use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
-use revm::context_interface::Cfg;
 use revm::database::{CacheDB, DatabaseRef};
-use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -596,7 +596,11 @@ where
                 continue;
             }
             let res = self.debank_single_call_from_state_impl_inner(
-                &state, &block, &block_env, &db, request,
+                &state,
+                &block,
+                &block_env,
+                &db,
+                request,
             )?;
             if res.code != 0 {
                 stats.success = false;

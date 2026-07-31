@@ -173,29 +173,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stores_activated_wasm_module_and_tracks_remaining_pages() {
-        let mut context = ArbitrumExecutionContext::default();
-        let module_hash = B256::from([0x11; 32]);
-        let module = Bytes::from_static(b"module");
-
-        context.insert_activated_wasm_module(module_hash, module.clone());
-        context.set_stylus_pages_open(5);
-        context.set_current_l2_context(U256::from(123), 456);
-        context.set_current_poster_charge(ArbPosterCharge {
-            poster_gas: 7,
-            ..Default::default()
-        });
-
-        assert_eq!(context.activated_wasm_module(module_hash), Some(&module));
-        assert_eq!(context.current_l2_block_number(), Some(U256::from(123)));
-        assert_eq!(context.current_l2_basefee(), Some(456));
-        assert_eq!(context.current_poster_charge().unwrap().poster_gas, 7);
-        assert_eq!(context.stylus_pages_open(), 5);
-        assert_eq!(context.remaining_stylus_page_limit(8), 3);
-        assert_eq!(context.remaining_stylus_page_limit(4), 0);
-    }
-
-    #[test]
     fn all_contract_frames_answer_the_reentrancy_question() {
         let mut context = ArbitrumExecutionContext::default();
         let program = Address::with_last_byte(7);

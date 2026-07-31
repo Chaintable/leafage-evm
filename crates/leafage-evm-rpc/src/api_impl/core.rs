@@ -1,6 +1,7 @@
 use crate::api_impl::token_collector::TokenCollector;
 use alloy::consensus::BlockHeader;
-use jsonrpsee::{core::RpcResult, http_client::HttpClient};
+use jsonrpsee::core::RpcResult;
+use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::bsc::BscHardfork;
@@ -92,7 +93,7 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
             .unwrap())
     }
 
-    fn estimate_l1_overhead<StateDB: DatabaseRef>(
+    fn estimate_l1_overhead<StateDB>(
         &self,
         _block: &BlockInfo,
         _block_env: &BlockEnv,
@@ -100,8 +101,8 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
         _state: &StateDB,
     ) -> u64
     where
+        StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
-        StateDB: Debug,
     {
         0
     }

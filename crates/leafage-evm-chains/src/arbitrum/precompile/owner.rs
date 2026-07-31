@@ -1118,7 +1118,7 @@ impl ArbOwner {
         let mut resources = [0u64; NUM_RESOURCE_KIND];
         for weighted in &constraint.resources {
             let resource = usize::from(weighted.resource);
-            if resource <= RESOURCE_KIND_UNKNOWN || resource >= NUM_RESOURCE_KIND {
+            if resource == RESOURCE_KIND_UNKNOWN || resource >= NUM_RESOURCE_KIND {
                 return Err(PrecompileError::other(format!(
                     "invalid resource id: {}",
                     weighted.resource

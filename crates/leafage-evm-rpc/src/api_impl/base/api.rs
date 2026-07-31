@@ -54,10 +54,8 @@ where
         block_env: &BlockEnv,
         state: StateDB,
         tx: Self::Tx,
-    ) -> Result<
-        ExecutionResult<Self::EvmHaltReason>,
-        EVMError<StateDB::Error, Self::TransactionError>,
-    > {
+    ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<StateDB::Error, Self::TransactionError>>
+    {
         let mut evm = create_base_evm_from_state(
             block_env.clone(),
             self.evm_cfg.cfg.clone(),

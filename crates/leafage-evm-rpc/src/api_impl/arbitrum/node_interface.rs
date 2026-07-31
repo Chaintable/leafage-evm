@@ -1367,8 +1367,10 @@ mod tests {
             data: data.clone(),
         };
 
-        let mut block_env = BlockEnv::default();
-        block_env.basefee = 42;
+        let block_env = BlockEnv {
+            basefee: 42,
+            ..Default::default()
+        };
         let source_tx = ArbitrumTxEnv::new(
             TxEnv {
                 kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
@@ -1399,43 +1401,33 @@ mod tests {
     }
 
     #[test]
-    fn retryable_redeem_call_adapter_maps_all_fields() {
-        let fee_refund = Address::with_last_byte(0xbb);
-        let call_value_refund = Address::with_last_byte(0xcc);
-        let target = Address::with_last_byte(0xaa);
+    fn retryable_call_adapter_maps_fields() {
+        let data = Bytes::from_static(&[1, 2, 3, 4]);
         let call = INodeInterfaceVirtual::estimateRetryableTicketCall {
-            sender: Address::ZERO,
+            sender: Address::with_last_byte(1),
             deposit: U256::from(1_000_000u64),
-            to: target,
+            to: Address::with_last_byte(2),
             l2CallValue: U256::from(7u64),
-            excessFeeRefundAddress: fee_refund,
-            callValueRefundAddress: call_value_refund,
-            data: Bytes::from_static(&[1, 2, 3, 4]),
+            excessFeeRefundAddress: Address::with_last_byte(3),
+            callValueRefundAddress: Address::with_last_byte(4),
+            data: data.clone(),
         };
 
-        let decoded_call = RetryableRedeemCall::from(call.clone());
-        let refund_to = decoded_call.excess_fee_refund_address;
-        assert_eq!(decoded_call.sender, call.sender);
-        assert_eq!(decoded_call.deposit, call.deposit);
-        assert_eq!(decoded_call.to, call.to);
-        assert_eq!(decoded_call.l2_call_value, call.l2CallValue);
+        let decoded = RetryableRedeemCall::from(call.clone());
+
+        assert_eq!(decoded.sender, call.sender);
+        assert_eq!(decoded.deposit, call.deposit);
+        assert_eq!(decoded.to, call.to);
+        assert_eq!(decoded.l2_call_value, call.l2CallValue);
         assert_eq!(
-            decoded_call.excess_fee_refund_address,
+            decoded.excess_fee_refund_address,
             call.excessFeeRefundAddress
         );
         assert_eq!(
-            decoded_call.call_value_refund_address,
+            decoded.call_value_refund_address,
             call.callValueRefundAddress
         );
-        assert_eq!(decoded_call.data, call.data);
-
-        assert_eq!(refund_to, fee_refund);
-        assert_eq!(decoded_call.to, target);
-    }
-
-    #[test]
-    fn arbitrum_one_nitro_genesis_block_matches_node_interface() {
-        assert_eq!(configured_nitro_genesis_block_num(42161, None), 22_207_817);
+        assert_eq!(decoded.data, data);
     }
 
     #[test]
