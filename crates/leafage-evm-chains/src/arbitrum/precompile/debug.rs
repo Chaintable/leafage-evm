@@ -113,7 +113,7 @@ impl ArbDebug {
                 .context
                 .journal_mut()
                 .load_account_with_code(target)
-                .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+                .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?;
             loaded
                 .data
                 .info

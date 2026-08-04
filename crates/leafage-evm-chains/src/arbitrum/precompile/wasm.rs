@@ -375,7 +375,7 @@ impl ArbWasm {
         cached: bool,
         activation: WasmActivation,
     ) -> Result<(u16, U256), ArbWasmError> {
-        let timestamp = storage.context.block().timestamp().to::<u64>();
+        let timestamp = storage.context.block().timestamp().wrapping_to::<u64>();
         let module_hash = activation.module_hash;
         let data_fee = storage
             .save_activated_wasm_program(code_hash, params, activation, timestamp, cached)?;
@@ -404,7 +404,7 @@ impl ArbWasm {
         code_hash: B256,
         params: StylusParams,
     ) -> Result<WasmProgram, ArbWasmError> {
-        let timestamp = storage.context.block().timestamp().to::<u64>();
+        let timestamp = storage.context.block().timestamp().wrapping_to::<u64>();
         storage
             .active_wasm_program(code_hash, timestamp, params)
             .map_err(Into::into)
@@ -429,7 +429,7 @@ impl ArbWasm {
         code_hash: B256,
     ) -> Result<(), ArbWasmError> {
         let params = storage.stylus_params()?;
-        let timestamp = storage.context.block().timestamp().to::<u64>();
+        let timestamp = storage.context.block().timestamp().wrapping_to::<u64>();
         let data_fee = storage.keepalive_wasm_program(code_hash, timestamp, params)?;
         Self::pay_activation_data_fee(storage, caller, value, data_fee)?;
         Self::emit_program_lifetime_extended(storage, code_hash, data_fee)?;
@@ -644,7 +644,7 @@ impl ArbWasm {
             .context
             .block()
             .timestamp()
-            .to::<u64>()
+            .wrapping_to::<u64>()
             .saturating_sub(activated_at)
     }
 

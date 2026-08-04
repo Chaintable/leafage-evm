@@ -2,7 +2,7 @@ name: stylus-test
 
 on:
   pull_request:
-    branches: [arb-evm]
+    branches: [main]
     paths:
       - .github/workflows/stylus-test.yml
       - Cargo.lock

@@ -238,7 +238,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                 .journal_mut()
                 .load_account(L1_PRICER_FUNDS_POOL_ADDRESS)
                 .map(|account| account.data.info.balance)
-                .map_err(|e| PrecompileError::other(format!("{e:?}")))?
+                .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?
         } else {
             self.read(&l1_key, arbos_state::L1_FEES_AVAILABLE_OFFSET)?
         };
@@ -256,7 +256,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .load_account(L1_PRICER_FUNDS_POOL_ADDRESS)
             .map(|account| account.data.info.balance)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?;
         let recognized = self.read(&l1_key, arbos_state::L1_FEES_AVAILABLE_OFFSET)?;
         let released = balance.saturating_sub(recognized).min(max_wei_to_release);
         self.write(

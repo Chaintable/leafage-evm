@@ -190,7 +190,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                 })
         };
         self.context.journal_mut().checkpoint_revert(checkpoint);
-        result.map_err(fatal_db_error)
+        result.map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile) fn account_code_and_hash(
@@ -219,7 +219,8 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         };
         self.context.journal_mut().checkpoint_revert(checkpoint);
 
-        let (code, code_hash, is_selfdestructed) = result.map_err(fatal_db_error)?;
+        let (code, code_hash, is_selfdestructed) =
+            result.map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?;
         if is_selfdestructed {
             return Err(PrecompileError::other("self destructed"));
         }
@@ -234,7 +235,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .code(account)
             .map(|load| (load.data, load.is_cold))
-            .map_err(fatal_db_error)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile) fn code_by_hash(
@@ -259,7 +260,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .db()
             .code_by_hash_ref(code_hash)
             .map(|code| code.original_bytes())
-            .map_err(fatal_db_error)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile) fn account_is_warm(&self, account: Address) -> bool {

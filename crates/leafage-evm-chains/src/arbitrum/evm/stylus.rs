@@ -21,7 +21,7 @@ use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::read_blockhashes_l1_block_number;
 use crate::arbitrum::precompile::{
     ArbWasm, ArbitrumContext, HostioHandler, NativeAsmCacheKey, PreparedStylusProgram,
-    StylusCompiler, StylusExecInput, StylusOutcome, StylusRuntime,
+    StylusCompiler, StylusExecInput, StylusOutcome, StylusRuntime, failed_hostio_response,
 };
 use crate::arbitrum::stylus_prefix::{
     is_stylus_classic, is_stylus_component, is_stylus_deployable, is_stylus_fragment,
@@ -826,7 +826,7 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> HostioHandler
 {
     fn handle(&mut self, req_type: u32, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
         if self.fatal_error.is_some() {
-            return (Vec::new(), Vec::new(), 0);
+            return failed_hostio_response(req_type);
         }
         match req_type {
             0 => self.get_bytes32(input),
@@ -2063,7 +2063,7 @@ mod tests {
         let mut mutation = key.to_be_bytes::<32>().to_vec();
         mutation.extend_from_slice(&value.to_be_bytes::<32>());
         let response = hostio.handle(3, &mutation);
-        assert_eq!(response, (Vec::new(), Vec::new(), 0));
+        assert_eq!(response, (vec![API_STATUS_FAILURE], Vec::new(), 0));
         assert_eq!(
             hostio.evm.ctx_mut().journal_mut().tload(Address::ZERO, key),
             U256::ZERO

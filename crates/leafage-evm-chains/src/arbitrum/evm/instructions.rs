@@ -8,9 +8,9 @@
 
 use crate::arbitrum::arbos_state::ArbStateReader;
 use crate::arbitrum::precompile::{ArbitrumContext, BATCH_POSTER_ADDRESS};
+use crate::arbitrum::tx::nitro_message_gas_price;
 use revm::bytecode::opcode;
-use revm::context::{Block, ContextTr, Transaction};
-use revm::context_interface::transaction::TransactionType;
+use revm::context::{Block, ContextTr};
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::StackTr;
@@ -59,33 +59,14 @@ where
     let basefee = host.block().basefee() as u128;
     let price = if host.db().arbos_version() >= ARBOS_VERSION_PAID_GAS_PRICE {
         if collects_tips(host) {
-            message_gas_price(host, basefee)
+            nitro_message_gas_price(host.tx(), basefee)
         } else {
             basefee
         }
     } else {
-        message_gas_price(host, basefee).min(basefee)
+        nitro_message_gas_price(host.tx(), basefee).min(basefee)
     };
     push!(context.interpreter, U256::from(price));
-}
-
-/// Nitro `msg.GasPrice`: geth's `ToMessage` defaults an absent
-/// `maxPriorityFeePerGas` to 0 — `min(feeCap, basefee)` — while revm's
-/// `effective_gas_price` returns the raw fee cap in that case. Legacy and
-/// EIP-2930 prices are used verbatim on both sides.
-fn message_gas_price<DB>(host: &ArbitrumContext<DB>, basefee: u128) -> u128
-where
-    DB: Database + DatabaseRef,
-{
-    let tx = host.tx();
-    let effective = tx.effective_gas_price(basefee);
-    let fixed_price = tx.tx_type() == TransactionType::Legacy as u8
-        || tx.tx_type() == TransactionType::Eip2930 as u8;
-    if !fixed_price && tx.max_priority_fee_per_gas().is_none() {
-        effective.min(basefee)
-    } else {
-        effective
-    }
 }
 
 /// Nitro `opBlockhash`: the 256-block window is anchored at the ArbOS-recorded
@@ -127,6 +108,7 @@ mod tests {
     use revm::ExecuteEvm;
     use revm::context::TxEnv;
     use revm::context::result::{ExecutionResult, Output};
+    use revm::context_interface::transaction::TransactionType;
     use revm::database::{EmptyDB, in_memory_db::CacheDB};
     use revm::primitives::TxKind;
     use revm::state::{AccountInfo, Bytecode};

@@ -29,10 +29,6 @@ const ARBITRUM_START_TIME: u64 = 1_421_388_000;
 const MAX_UINT24: u32 = 0x00ff_ffff;
 const WARM_STORAGE_READ_GAS: u64 = 100;
 
-fn fatal_db_error(error: impl core::fmt::Debug) -> PrecompileError {
-    PrecompileError::Fatal(format!("{error:?}"))
-}
-
 pub(super) struct ArbStorage<'a, CTX> {
     pub(super) context: &'a mut CTX,
     gas_limit: u64,
@@ -177,7 +173,8 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     }
 
     fn load_account(&mut self, account: Address) -> Result<(), PrecompileError> {
-        self.load_account_concrete(account).map_err(fatal_db_error)
+        self.load_account_concrete(account)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile) fn read_key_concrete(
@@ -217,7 +214,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     ) -> Result<U256, PrecompileError> {
         self.burn(STORAGE_READ_GAS)?;
         self.read_account_key_concrete(account, storage_key, key)
-            .map_err(fatal_db_error)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile::state) fn read_account_key_unmetered(
@@ -227,7 +224,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         key: [u8; 32],
     ) -> Result<U256, PrecompileError> {
         self.read_account_key_concrete(account, storage_key, key)
-            .map_err(fatal_db_error)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(super) fn read(
@@ -264,7 +261,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .sstore(account, arbos_state::slot_for_key(storage_key, key), value)
             .map(|_| ())
-            .map_err(fatal_db_error)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile::state) fn write_account_key_unmetered(
@@ -279,7 +276,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .sstore(account, arbos_state::slot_for_key(storage_key, key), value)
             .map(|_| ())
-            .map_err(fatal_db_error)
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(super) fn write(
@@ -324,7 +321,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         } else {
             self.read_account_key_unmetered(arbos_state::ARBOS_STATE_ADDRESS, storage_key, key)?
         };
-        Ok(value.to::<u64>())
+        Ok(value.wrapping_to::<u64>())
     }
 
     pub(in crate::arbitrum::precompile::state) fn write_with_metering(
@@ -372,7 +369,8 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     }
 
     fn arbos_version_unmetered(&mut self) -> Result<u64, PrecompileError> {
-        self.arbos_version_concrete().map_err(fatal_db_error)
+        self.arbos_version_concrete()
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
 
     pub(in crate::arbitrum::precompile) fn arbos_version_concrete(
@@ -382,7 +380,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             &[],
             U256::from(arbos_state::ARBOS_VERSION_OFFSET).to_be_bytes(),
         )
-        .map(|value| value.to::<u64>())
+        .map(|value| value.wrapping_to::<u64>())
     }
 
     pub(super) fn l1_key(&self) -> [u8; 32] {
@@ -742,6 +740,26 @@ mod tests {
 
         assert_eq!(storage.arbos_version().expect("read ArbOS version"), 60);
         assert_eq!(storage.gas_used, 123);
+    }
+
+    #[test]
+    fn u64_state_reads_wrap_high_bits_instead_of_panicking() {
+        let mut context = context(0);
+        let high_value = (U256::ONE << 200) | U256::from(42);
+        {
+            let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+            storage
+                .write(&[], arbos_state::ARBOS_VERSION_OFFSET, high_value)
+                .expect("write ArbOS version");
+            storage
+                .write(&[], 99, high_value)
+                .expect("write generic u64 slot");
+        }
+
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+
+        assert_eq!(storage.arbos_version().expect("read ArbOS version"), 42);
+        assert_eq!(storage.read_u64(&[], 99).expect("read generic u64"), 42);
     }
 
     #[test]

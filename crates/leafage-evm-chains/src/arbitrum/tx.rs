@@ -1,7 +1,7 @@
 use alloy_rlp::{BufMut, Encodable, Header, EMPTY_STRING_CODE};
 use revm::{
     context::TxEnv,
-    context_interface::transaction::Transaction,
+    context_interface::transaction::{Transaction, TransactionType},
     primitives::{keccak256, Address, Bytes, TxKind, B256, U256},
 };
 
@@ -9,6 +9,21 @@ pub const ARBITRUM_RETRY_TX_TYPE: u8 = 0x68;
 pub const ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE: u8 = 0x69;
 pub const ARBITRUM_UNSIGNED_TX_TYPE: u8 = 0x65;
 pub const ARBITRUM_CONTRACT_TX_TYPE: u8 = 0x66;
+
+/// Nitro `msg.GasPrice`: geth's `ToMessage` defaults an absent
+/// `maxPriorityFeePerGas` to 0 — `min(feeCap, basefee)` — while revm's
+/// `effective_gas_price` returns the raw fee cap in that case. Legacy and
+/// EIP-2930 prices are used verbatim on both sides.
+pub fn nitro_message_gas_price(tx: &impl Transaction, basefee: u128) -> u128 {
+    let effective = tx.effective_gas_price(basefee);
+    let fixed_price = tx.tx_type() == TransactionType::Legacy as u8
+        || tx.tx_type() == TransactionType::Eip2930 as u8;
+    if !fixed_price && tx.max_priority_fee_per_gas().is_none() {
+        effective.min(basefee)
+    } else {
+        effective
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ArbitrumTxEnv {
@@ -230,6 +245,31 @@ impl Transaction for ArbitrumTxEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nitro_message_gas_price_matches_geth_default_tip_semantics() {
+        let missing_tip = TxEnv {
+            tx_type: TransactionType::Eip1559 as u8,
+            gas_price: 250,
+            gas_priority_fee: None,
+            ..Default::default()
+        };
+        assert_eq!(nitro_message_gas_price(&missing_tip, 100), 100);
+
+        let explicit_tip = TxEnv {
+            tx_type: TransactionType::Eip1559 as u8,
+            gas_price: 250,
+            gas_priority_fee: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(nitro_message_gas_price(&explicit_tip, 100), 150);
+
+        let legacy = TxEnv {
+            gas_price: 250,
+            ..Default::default()
+        };
+        assert_eq!(nitro_message_gas_price(&legacy, 100), 250);
+    }
 
     #[test]
     fn retryable_redeem_marks_custom_tx_type() {

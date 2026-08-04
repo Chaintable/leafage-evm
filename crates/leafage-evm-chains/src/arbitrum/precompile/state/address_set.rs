@@ -48,7 +48,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         let by_address_key = arbos_state::child_key(set_key, &[0]);
         let slot = self
             .read_key(&by_address_key, address_key(addr))?
-            .to::<u64>();
+            .wrapping_to::<u64>();
         if slot == 0 {
             return Ok(());
         }
@@ -81,7 +81,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         let by_address_key = arbos_state::child_key(set_key, &[0]);
         let slot = self
             .read_key(&by_address_key, address_key(addr))?
-            .to::<u64>();
+            .wrapping_to::<u64>();
         let at_slot = self.read(set_key, slot)?;
         let size = self.read_u64(set_key, 0)?;
         let addr_word = U256::from_be_slice(addr.as_slice());

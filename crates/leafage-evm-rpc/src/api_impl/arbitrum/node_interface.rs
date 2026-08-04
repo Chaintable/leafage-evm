@@ -7,7 +7,9 @@ use leafage_evm_chains::arbitrum::arbos_state::{ArbStateReader, ARBOS_STATE_ADDR
 use leafage_evm_chains::arbitrum::precompile::{
     NODE_INTERFACE_ADDRESS, NODE_INTERFACE_DEBUG_ADDRESS,
 };
-use leafage_evm_chains::arbitrum::tx::{ArbitrumSubmitRetryableTx, ArbitrumTxEnv};
+use leafage_evm_chains::arbitrum::tx::{
+    nitro_message_gas_price, ArbitrumSubmitRetryableTx, ArbitrumTxEnv,
+};
 use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockId, BlockInfo, BlockNumberOrTag};
@@ -464,7 +466,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         11u64.saturating_add((data_len as u64) / 32)
     }
 
-    fn l2_basefee_from_state<StateDB>(state: &StateDB) -> u64
+    fn l2_basefee_from_state<StateDB>(state: &StateDB) -> Result<u64, StateDB::Error>
     where
         StateDB: DatabaseRef,
     {
@@ -474,9 +476,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 ARBOS_STATE_ADDRESS,
                 arbos_slot_at(&l2_pricing_key, L2_BASE_FEE_WEI_OFFSET),
             )
-            .ok()
-            .and_then(|basefee| u64::try_from(basefee).ok())
-            .unwrap_or_default()
+            .map(|basefee| basefee.wrapping_to::<u64>())
     }
 
     fn retryable_effective_basefee(submit_tx: &ArbitrumSubmitRetryableTx, l2_basefee: u64) -> u64 {
@@ -492,20 +492,21 @@ impl<DB> ArbitrumApiImpl<DB> {
         block_env: &BlockEnv,
         state: &StateDB,
         call: &RetryableRedeemCall,
-    ) -> ArbitrumSubmitRetryableTx
+    ) -> Result<ArbitrumSubmitRetryableTx, StateDB::Error>
     where
         StateDB: DatabaseRef,
     {
-        let source_message_gas_price = source_tx.effective_gas_price(block_env.basefee as u128);
+        let source_message_gas_price =
+            nitro_message_gas_price(source_tx, block_env.basefee as u128);
         let l1_base_fee = state
-            .read_pricing()
+            .try_read_pricing()?
             .map(|pricing| pricing.price_per_unit)
             .unwrap_or_default();
         let max_submission_fee =
             ArbitrumSubmitRetryableTx::submission_fee(call.data.len(), l1_base_fee);
         let retry_to = (call.to != Address::ZERO).then_some(call.to);
 
-        ArbitrumSubmitRetryableTx {
+        Ok(ArbitrumSubmitRetryableTx {
             chain_id: U256::ZERO,
             request_id: B256::ZERO,
             from: Self::remap_l1_address(call.sender),
@@ -519,7 +520,7 @@ impl<DB> ArbitrumApiImpl<DB> {
             max_submission_fee,
             fee_refund_addr: call.excess_fee_refund_address,
             retry_data: call.data.clone(),
-        }
+        })
     }
 
     fn gas_estimate_target_tx(
@@ -665,7 +666,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         let retryable_key = arbos_child_key(&retryables_key, ticket_id.as_slice());
         let timeout = block_env
             .timestamp
-            .to::<u64>()
+            .wrapping_to::<u64>()
             .saturating_add(RETRYABLE_LIFETIME_SECONDS);
 
         Self::insert_arbos_storage(db, &retryable_key, 0, U256::ZERO)?;
@@ -917,14 +918,14 @@ impl<DB> ArbitrumApiImpl<DB> {
                     call.contractCreation,
                     call.data.clone(),
                 );
-                let l2_basefee = Self::l2_basefee_from_state(state);
+                let l2_basefee = Self::l2_basefee_from_state(state).map_err(EVMError::Database)?;
                 let execution_gas = self.estimate_node_interface_execution_gas(
                     block_env,
                     state,
                     target_tx.clone(),
                 )?;
                 target_tx.base.gas_limit = execution_gas;
-                let pricing = state.read_pricing();
+                let pricing = state.try_read_pricing().map_err(EVMError::Database)?;
                 let l1_gas = pricing
                     .as_ref()
                     .filter(|_| l2_basefee != 0)
@@ -952,8 +953,8 @@ impl<DB> ArbitrumApiImpl<DB> {
                     call.data.clone(),
                 );
                 target_tx.base.gas_limit = random_gas_for_l1_component();
-                let l2_basefee = Self::l2_basefee_from_state(state);
-                let pricing = state.read_pricing();
+                let l2_basefee = Self::l2_basefee_from_state(state).map_err(EVMError::Database)?;
+                let pricing = state.try_read_pricing().map_err(EVMError::Database)?;
                 let l1_gas = pricing
                     .as_ref()
                     .filter(|_| l2_basefee != 0)
@@ -994,7 +995,8 @@ impl<DB> ArbitrumApiImpl<DB> {
                 call,
             )) => {
                 let call = RetryableRedeemCall::from(call);
-                let submit_tx = Self::retryable_submission(tx, block_env, state, &call);
+                let submit_tx = Self::retryable_submission(tx, block_env, state, &call)
+                    .map_err(EVMError::Database)?;
                 let ticket_id = submit_tx.ticket_id();
                 let result = self.execute_retryable_submission(
                     block_env, state, tx, submit_tx, ticket_id, inspector,
@@ -1212,7 +1214,7 @@ impl<DB> ArbitrumApiImpl<DB> {
     {
         let output = Bytes::copy_from_slice(ticket_id.as_slice());
         let mut overlay = CacheDB::new(BorrowedState(state));
-        let l2_basefee = Self::l2_basefee_from_state(state);
+        let l2_basefee = Self::l2_basefee_from_state(state).map_err(EVMError::Database)?;
         let retryable_basefee = Self::retryable_effective_basefee(&submit_tx, l2_basefee);
         let should_schedule = Self::apply_retryable_submission_overlay(
             &mut overlay,
@@ -1317,6 +1319,7 @@ mod tests {
     use leafage_evm_chains::arbitrum::ArbitrumHardfork;
     use leafage_evm_types::CfgEnv;
     use revm::context::TxEnv;
+    use revm::context_interface::transaction::TransactionType;
     use revm::database::EmptyDB;
 
     fn test_api() -> ArbitrumApiImpl<()> {
@@ -1339,8 +1342,23 @@ mod tests {
     }
 
     fn state_with_l2_basefee(basefee: u64) -> CacheDB<EmptyDB> {
+        const ARBOS_VERSION_OFFSET: u64 = 0;
+        const L2_PER_TX_GAS_LIMIT_OFFSET: u64 = 7;
+
         let mut db = CacheDB::new(EmptyDB::default());
         let l2_pricing_key = arbos_child_key(&[], L2_PRICING_SUBSPACE);
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            arbos_slot_at(&[], ARBOS_VERSION_OFFSET),
+            U256::from(51),
+        )
+        .expect("write ArbOS version");
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            arbos_slot_at(&l2_pricing_key, L2_PER_TX_GAS_LIMIT_OFFSET),
+            U256::from(32_000_000u64),
+        )
+        .expect("write per-transaction gas limit");
         db.insert_account_storage(
             ARBOS_STATE_ADDRESS,
             arbos_slot_at(&l2_pricing_key, L2_BASE_FEE_WEI_OFFSET),
@@ -1385,7 +1403,8 @@ mod tests {
             &block_env,
             &EmptyDB::default(),
             &call,
-        );
+        )
+        .expect("retryable submission");
 
         assert_eq!(
             submit_tx.from,
@@ -1398,6 +1417,44 @@ mod tests {
         assert_eq!(submit_tx.gas_fee_cap, U256::from(999u64));
         assert_eq!(submit_tx.fee_refund_addr, fee_refund);
         assert_eq!(submit_tx.beneficiary, call_value_refund);
+    }
+
+    #[test]
+    fn retryable_submission_defaults_missing_eip1559_tip_to_zero() {
+        let call = RetryableRedeemCall {
+            sender: Address::ZERO,
+            deposit: U256::from(1_000_000u64),
+            to: Address::with_last_byte(0xaa),
+            l2_call_value: U256::ZERO,
+            excess_fee_refund_address: Address::with_last_byte(0xbb),
+            call_value_refund_address: Address::with_last_byte(0xcc),
+            data: Bytes::new(),
+        };
+        let block_env = BlockEnv {
+            basefee: 42,
+            ..Default::default()
+        };
+        let source_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                tx_type: TransactionType::Eip1559 as u8,
+                gas_limit: 777_000,
+                gas_price: 999,
+                gas_priority_fee: None,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+
+        let submit_tx = ArbitrumApiImpl::<()>::retryable_submission(
+            &source_tx,
+            &block_env,
+            &EmptyDB::default(),
+            &call,
+        )
+        .expect("retryable submission");
+
+        assert_eq!(submit_tx.gas_fee_cap, U256::from(block_env.basefee));
     }
 
     #[test]
@@ -1449,8 +1506,9 @@ mod tests {
             ArbitrumTxContext::default(),
         );
 
+        let state = state_with_l2_basefee(0);
         let gas = api
-            .estimate_node_interface_execution_gas(&block_env, &EmptyDB::default(), tx)
+            .estimate_node_interface_execution_gas(&block_env, &state, tx)
             .expect("target gas estimation should not inherit source gas limit");
 
         assert!(gas > MIN_TRANSACTION_GAS);
@@ -1535,8 +1593,9 @@ mod tests {
             ArbitrumTxContext::default(),
         );
 
+        let state = state_with_l2_basefee(0);
         let gas = api
-            .estimate_node_interface_execution_gas(&block_env, &EmptyDB::default(), tx)
+            .estimate_node_interface_execution_gas(&block_env, &state, tx)
             .expect("source gas above cap should not break target gas estimation");
 
         assert!(gas > MIN_TRANSACTION_GAS);
@@ -1564,8 +1623,9 @@ mod tests {
             ArbitrumTxContext::default(),
         );
 
+        let state = state_with_l2_basefee(0);
         let gas = api
-            .estimate_node_interface_execution_gas(&block_env, &EmptyDB::default(), tx)
+            .estimate_node_interface_execution_gas(&block_env, &state, tx)
             .expect("buffered estimate should still obey the cap");
 
         assert!(gas <= api.evm_cfg.cfg.tx_gas_limit_cap.unwrap());

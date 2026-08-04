@@ -1039,7 +1039,7 @@ impl ArbOwner {
             old_config.check_compatible(
                 &new_config,
                 storage.current_l2_block_number_u64(),
-                storage.context.block().timestamp().to::<u64>(),
+                storage.context.block().timestamp().wrapping_to::<u64>(),
             )?;
         }
         let current_chain_config = current_chain_config
@@ -1048,7 +1048,7 @@ impl ArbOwner {
         current_config.check_compatible(
             &new_config,
             storage.current_l2_block_number_u64(),
-            storage.context.block().timestamp().to::<u64>(),
+            storage.context.block().timestamp().wrapping_to::<u64>(),
         )?;
 
         Ok(())
@@ -1188,8 +1188,8 @@ impl ArbOwner {
             return storage.write(&[], offset, U256::ZERO);
         }
 
-        let now = storage.context.block().timestamp().to::<u64>();
-        let stored = storage.root(offset)?.to::<u64>();
+        let now = storage.context.block().timestamp().wrapping_to::<u64>();
+        let stored = storage.root(offset)?.wrapping_to::<u64>();
         let earliest = now.saturating_add(FEATURE_ENABLE_DELAY);
         if (stored == 0 && timestamp < earliest) || (stored > earliest && timestamp < earliest) {
             return Err(PrecompileError::other(
@@ -1210,8 +1210,8 @@ impl ArbOwner {
         offset: u64,
         reason: &'static str,
     ) -> Result<(), PrecompileError> {
-        let enabled_time = storage.root(offset)?.to::<u64>();
-        let now = storage.context.block().timestamp().to::<u64>();
+        let enabled_time = storage.root(offset)?.wrapping_to::<u64>();
+        let now = storage.context.block().timestamp().wrapping_to::<u64>();
         if enabled_time == 0 || enabled_time > now {
             return Err(PrecompileError::other(reason));
         }

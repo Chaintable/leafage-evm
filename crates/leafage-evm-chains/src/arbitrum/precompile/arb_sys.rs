@@ -55,12 +55,12 @@ impl ArbSys {
                             current,
                         );
                     }
-                    let block = requested.to::<u64>();
+                    let block = requested.wrapping_to::<u64>();
                     let hash = storage
                         .context
                         .db_mut()
                         .block_hash(block)
-                        .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+                        .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?;
                     finish_call::<IArbSys::arbBlockHashCall>(
                         gas_limit,
                         storage.gas_used,

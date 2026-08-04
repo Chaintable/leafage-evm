@@ -30,7 +30,8 @@ pub use self::env::ArbitrumPrecompileEnv;
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
 pub(crate) use self::stylus_runtime::{
-    HostioHandler, NativeAsmCacheKey, StylusCompiler, StylusExecInput, StylusOutcome, StylusRuntime,
+    HostioHandler, NativeAsmCacheKey, StylusCompiler, StylusExecInput, StylusOutcome,
+    StylusRuntime, failed_hostio_response,
 };
 use self::util::{
     charge_precompile_context_gas, decode_revert, empty_revert, to_interpreter_result,
@@ -45,7 +46,7 @@ use once_cell::race::OnceBox;
 use revm::context::{ContextTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, CallScheme, InterpreterResult};
-use revm::precompile::{PrecompileResult, Precompiles, secp256r1};
+use revm::precompile::{PrecompileError, PrecompileResult, Precompiles, secp256r1};
 use revm::primitives::Address as RevmAddress;
 use revm::{Context, Journal};
 use revm::{Database, DatabaseRef};
@@ -278,6 +279,7 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
                         wrapper_gas_used,
                     )
                 }
+                Err(PrecompileError::Fatal(err)) => Err(PrecompileError::Fatal(err)),
                 Err(_) => empty_revert(inputs.gas_limit, inputs.gas_limit),
             }
         } else {

@@ -576,6 +576,35 @@ mod tests {
         .expect("getBeneficiary")
     }
 
+    fn get_timeout(
+        context: &mut ArbitrumContext<CacheDB<EmptyDB>>,
+        arbos_version: u64,
+        ticket_id: B256,
+    ) -> PrecompileOutput {
+        let data = IArbRetryableTx::getTimeoutCall {
+            ticketId: ticket_id,
+        }
+        .abi_encode();
+        ArbRetryableTx::run(ArbPrecompileInput {
+            data: &data,
+            gas: 10_000_000,
+            caller: Address::ZERO,
+            value: U256::ZERO,
+            is_static: false,
+            is_valid_call_context: true,
+            current_arbos_version: arbos_version,
+            current_tx_l1_gas_fees: U256::ZERO,
+            current_tx_l1_gas_units: 0,
+            current_l1_block_number: 0,
+            current_retryable_ticket: None,
+            current_refund_to: None,
+            allow_debug_precompiles: false,
+            current_chain_config: None,
+            context,
+        })
+        .expect("getTimeout")
+    }
+
     fn keepalive(
         context: &mut ArbitrumContext<CacheDB<EmptyDB>>,
         ticket_id: B256,
@@ -703,6 +732,35 @@ mod tests {
         let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
         let retryable_key = storage.retryable_key(ticket_id);
         assert_eq!(storage.read(&retryable_key, 6).unwrap(), U256::from(1));
+    }
+
+    #[test]
+    fn get_beneficiary_rejects_pre_v60_retryable_after_raw_timeout() {
+        let ticket_id = B256::from([0x88; 32]);
+        let now = RETRYABLE_LIFETIME_SECONDS + 10;
+        let mut context = context_at(now);
+        initialize_retryable_with(&mut context, ticket_id, 40, RETRYABLE_LIFETIME_SECONDS, 1);
+
+        let output = get_beneficiary(&mut context, 40, ticket_id);
+
+        assert!(output.reverted);
+        IArbRetryableTx::NoTicketWithID::abi_decode(output.bytes.as_ref())
+            .expect("decode NoTicketWithID");
+    }
+
+    #[test]
+    fn get_timeout_uses_timeout_windows_after_live_check() {
+        let ticket_id = B256::from([0x99; 32]);
+        let now = RETRYABLE_LIFETIME_SECONDS - 10;
+        let mut context = context_at(now);
+        initialize_retryable_with(&mut context, ticket_id, 40, RETRYABLE_LIFETIME_SECONDS, 1);
+
+        let output = get_timeout(&mut context, 40, ticket_id);
+
+        assert!(!output.reverted);
+        let timeout = IArbRetryableTx::getTimeoutCall::abi_decode_returns(output.bytes.as_ref())
+            .expect("decode getTimeout return");
+        assert_eq!(timeout, U256::from(RETRYABLE_LIFETIME_SECONDS * 2));
     }
 
     #[test]

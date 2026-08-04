@@ -170,7 +170,7 @@ impl ArbWasmCache {
             });
         }
 
-        let timestamp = storage.context.block().timestamp().to::<u64>();
+        let timestamp = storage.context.block().timestamp().wrapping_to::<u64>();
         let age = storage.wasm_program_age(timestamp, program);
         let expiry = u64::from(params.expiry_days) * 24 * 60 * 60;
         if age > expiry {

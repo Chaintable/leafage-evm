@@ -142,7 +142,7 @@ pub(super) fn topic_u256(value: U256) -> B256 {
 }
 
 pub(super) fn low_u64_as_i64(word: U256) -> i64 {
-    word.to::<u64>() as i64
+    word.wrapping_to::<u64>() as i64
 }
 
 pub(super) fn signed_word(word: U256) -> I256 {

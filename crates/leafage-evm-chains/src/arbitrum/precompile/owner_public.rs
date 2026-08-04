@@ -56,7 +56,7 @@ impl ArbOwnerPublic {
                 IArbOwnerPublic::IArbOwnerPublicCalls::getNativeTokenManagementFrom(_) => {
                     let ret = storage
                         .root(arbos_state::NATIVE_TOKEN_ENABLED_FROM_TIME_OFFSET)?
-                        .to::<u64>();
+                        .wrapping_to::<u64>();
                     finish_call::<IArbOwnerPublic::getNativeTokenManagementFromCall>(
                         gas_limit,
                         storage.gas_used,
@@ -84,7 +84,7 @@ impl ArbOwnerPublic {
                 IArbOwnerPublic::IArbOwnerPublicCalls::getTransactionFilteringFrom(_) => {
                     let ret = storage
                         .root(arbos_state::TRANSACTION_FILTERING_ENABLED_FROM_TIME_OFFSET)?
-                        .to::<u64>();
+                        .wrapping_to::<u64>();
                     finish_call::<IArbOwnerPublic::getTransactionFilteringFromCall>(
                         gas_limit,
                         storage.gas_used,
@@ -142,7 +142,7 @@ impl ArbOwnerPublic {
                 IArbOwnerPublic::IArbOwnerPublicCalls::getBrotliCompressionLevel(_) => {
                     let ret = storage
                         .root(arbos_state::BROTLI_COMPRESSION_LEVEL_OFFSET)?
-                        .to::<u64>();
+                        .wrapping_to::<u64>();
                     finish_call::<IArbOwnerPublic::getBrotliCompressionLevelCall>(
                         gas_limit,
                         storage.gas_used,
@@ -153,7 +153,7 @@ impl ArbOwnerPublic {
                     let l1_key = storage.l1_key();
                     let ret = storage
                         .read(&l1_key, arbos_state::L1_GAS_FLOOR_PER_TOKEN_OFFSET)?
-                        .to::<u64>();
+                        .wrapping_to::<u64>();
                     finish_call::<IArbOwnerPublic::getParentGasFloorPerTokenCall>(
                         gas_limit,
                         storage.gas_used,
@@ -164,10 +164,10 @@ impl ArbOwnerPublic {
                     let current = storage.arbos_version()?;
                     let version = storage
                         .root(arbos_state::UPGRADE_VERSION_OFFSET)?
-                        .to::<u64>();
+                        .wrapping_to::<u64>();
                     let timestamp = storage
                         .root(arbos_state::UPGRADE_TIMESTAMP_OFFSET)?
-                        .to::<u64>();
+                        .wrapping_to::<u64>();
                     let ret = if version <= current {
                         (0, 0)
                     } else {

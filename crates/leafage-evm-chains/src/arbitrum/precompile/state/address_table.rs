@@ -18,7 +18,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         if value.is_zero() {
             Ok(None)
         } else {
-            Ok(Some(value.to::<u64>().saturating_sub(1)))
+            Ok(Some(value.wrapping_to::<u64>().saturating_sub(1)))
         }
     }
 
@@ -56,7 +56,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         let by_address_key = arbos_state::child_key(&table_key, &[]);
         let value = self.read_key(&by_address_key, address_key(addr))?;
         if !value.is_zero() {
-            return Ok(value.to::<u64>().saturating_sub(1));
+            return Ok(value.wrapping_to::<u64>().saturating_sub(1));
         }
 
         let new_size = self.read_u64(&table_key, 0)?.saturating_add(1);

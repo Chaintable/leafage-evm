@@ -3,7 +3,7 @@
 ARG RUST_VERSION=1.93.0
 
 # libstylus.so, built from Chaintable/nitro and published as a COPY-only image.
-ARG LIBSTYLUS_REV=latest
+ARG LIBSTYLUS_REV=v3.11.1-ct.5
 
 FROM public.ecr.aws/b2h7a5c4/chaintable/libstylus:${LIBSTYLUS_REV} AS libstylus
 

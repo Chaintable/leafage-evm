@@ -43,9 +43,9 @@ fn precompile_env<StateDB: DatabaseRef>(
     state: &StateDB,
     tx: &ArbitrumTxEnv,
     custom_cfg: Option<&ArbitrumEvmConfig>,
-) -> ArbitrumPrecompileEnv {
-    ArbitrumPrecompileEnv {
-        current_arbos_version: state.arbos_version(),
+) -> Result<ArbitrumPrecompileEnv, StateDB::Error> {
+    Ok(ArbitrumPrecompileEnv {
+        current_arbos_version: state.try_arbos_version()?,
         current_tx_l1_gas_fees: U256::ZERO,
         current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,
@@ -55,7 +55,7 @@ fn precompile_env<StateDB: DatabaseRef>(
         current_chain_config: custom_cfg
             .and_then(|cfg| cfg.chain_config.as_ref())
             .map(|chain_config| Bytes::copy_from_slice(chain_config.get().as_bytes())),
-    }
+    })
 }
 
 impl<DB> ArbitrumApiImpl<DB> {
@@ -114,7 +114,8 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB::Error: Sync + Send + 'static,
     {
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref());
+        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref())
+            .map_err(EVMError::Database)?;
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -138,7 +139,8 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB::Error: Sync + Send + 'static,
     {
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref());
+        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref())
+            .map_err(EVMError::Database)?;
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -299,7 +301,8 @@ where
         }
 
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref());
+        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref())
+            .map_err(EVMError::Database)?;
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),

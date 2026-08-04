@@ -17,9 +17,9 @@
 //! every Orbit chain. Offsets can only change across an ArbOS *major* version;
 //! the layout-check test in the design doc guards that before enabling a chain.
 
+use crate::arbitrum::tx::nitro_message_gas_price;
 use once_cell::sync::Lazy;
 use revm::context::TxEnv;
-use revm::context_interface::transaction::Transaction;
 use revm::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use revm::{Database, DatabaseRef};
 use std::fmt::Debug;
@@ -172,34 +172,66 @@ pub struct ArbPricing {
     pub brotli_level: u64,
 }
 
-pub trait ArbStateReader: DatabaseRef {
-    fn read_root(&self, slot: U256) -> Option<U256> {
-        self.storage_ref(ARBOS_STATE_ADDRESS, slot).ok()
-    }
-
-    /// Read the pricing values from replica state. Returns `None` — meaning no
-    /// L1 overhead, a safe degrade — if any slot read fails or `price_per_unit`
-    /// is zero (pre-L1-pricing blocks, matching Nitro's early-block semantics).
-    fn read_pricing(&self) -> Option<ArbPricing> {
-        let price_per_unit = self.read_root(*PRICE_PER_UNIT_SLOT)?;
+impl ArbPricing {
+    fn from_values(price_per_unit: U256, min_base_fee: U256, brotli_raw: U256) -> Option<Self> {
         if price_per_unit.is_zero() {
             return None;
         }
-        let min_base_fee = self.read_root(*MIN_BASE_FEE_SLOT)?;
-        let brotli_raw = self.read_root(*BROTLI_LEVEL_SLOT)?;
-        // Brotli quality is 0..=11; clamp defensively against an unexpected slot value.
-        let brotli_level = u64::try_from(brotli_raw).unwrap_or(0).min(11);
-        Some(ArbPricing {
+        Some(Self {
             price_per_unit,
             min_base_fee,
-            brotli_level,
+            brotli_level: brotli_raw.wrapping_to::<u64>().min(11),
         })
     }
 
+    pub(crate) fn read_from_db<DB: Database>(db: &mut DB) -> Result<Option<Self>, DB::Error> {
+        let price_per_unit = db.storage(ARBOS_STATE_ADDRESS, *PRICE_PER_UNIT_SLOT)?;
+        if price_per_unit.is_zero() {
+            return Ok(None);
+        }
+        let min_base_fee = db.storage(ARBOS_STATE_ADDRESS, *MIN_BASE_FEE_SLOT)?;
+        let brotli_raw = db.storage(ARBOS_STATE_ADDRESS, *BROTLI_LEVEL_SLOT)?;
+        Ok(Self::from_values(price_per_unit, min_base_fee, brotli_raw))
+    }
+}
+
+pub trait ArbStateReader: DatabaseRef {
+    fn try_read_root(&self, slot: U256) -> Result<U256, Self::Error> {
+        self.storage_ref(ARBOS_STATE_ADDRESS, slot)
+    }
+
+    fn read_root(&self, slot: U256) -> Option<U256> {
+        self.try_read_root(slot).ok()
+    }
+
+    fn try_read_pricing(&self) -> Result<Option<ArbPricing>, Self::Error> {
+        let price_per_unit = self.try_read_root(*PRICE_PER_UNIT_SLOT)?;
+        if price_per_unit.is_zero() {
+            return Ok(None);
+        }
+        let min_base_fee = self.try_read_root(*MIN_BASE_FEE_SLOT)?;
+        let brotli_raw = self.try_read_root(*BROTLI_LEVEL_SLOT)?;
+        Ok(ArbPricing::from_values(
+            price_per_unit,
+            min_base_fee,
+            brotli_raw,
+        ))
+    }
+
+    /// Optional pricing is retained for callers where an absent pre-L1-pricing
+    /// state is expected. Execution paths use `try_read_pricing` so a database
+    /// failure cannot be mistaken for a zero L1 charge.
+    fn read_pricing(&self) -> Option<ArbPricing> {
+        self.try_read_pricing().ok().flatten()
+    }
+
     fn arbos_version(&self) -> u64 {
-        self.read_root(*ARBOS_VERSION_SLOT)
-            .map(|value| value.to::<u64>())
-            .unwrap_or_default()
+        self.try_arbos_version().unwrap_or_default()
+    }
+
+    fn try_arbos_version(&self) -> Result<u64, Self::Error> {
+        self.try_read_root(*ARBOS_VERSION_SLOT)
+            .map(|value| value.wrapping_to::<u64>())
     }
 
     fn genesis_block_num(&self) -> U256 {
@@ -242,7 +274,7 @@ pub trait ArbStateReader: DatabaseRef {
 
     fn paid_l1_gas_price(&self, tx: &TxEnv, block_base_fee: u64) -> U256 {
         if self.collect_tips() {
-            let price = tx.effective_gas_price(block_base_fee as u128);
+            let price = nitro_message_gas_price(tx, block_base_fee as u128);
             if price != 0 {
                 return U256::from(price);
             }
@@ -361,7 +393,7 @@ fn read_u64<S: DatabaseRef + ?Sized>(
 where
     S::Error: Debug,
 {
-    Ok(read_storage(state, storage_key, offset)?.to::<u64>())
+    Ok(read_storage(state, storage_key, offset)?.wrapping_to::<u64>())
 }
 
 fn read_address<S: DatabaseRef + ?Sized>(
@@ -545,6 +577,29 @@ mod tests {
         assert_eq!(db.blockhashes_l1_block_number(), Some(1_000));
         assert_eq!(read_blockhashes_l1_block_number(&mut db), Ok(1_000));
         assert_eq!(db.l1_block_hash(999), Some(hash));
+    }
+
+    #[test]
+    fn read_only_u64_slots_wrap_high_bits_instead_of_panicking() {
+        use revm::database::{EmptyDB, in_memory_db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let high_value = (U256::ONE << 200) | U256::from(42);
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&[], ARBOS_VERSION_OFFSET),
+            high_value,
+        )
+        .unwrap();
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&*BLOCKHASHES_KEY, 6),
+            high_value,
+        )
+        .unwrap();
+
+        assert_eq!(db.arbos_version(), 42);
+        assert_eq!(read_u64(&db, &*BLOCKHASHES_KEY, 6), Ok(42));
     }
 
     /// Nitro gates the feature on ArbOS 40 as well as the flag bit.

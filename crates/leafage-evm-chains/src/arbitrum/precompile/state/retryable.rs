@@ -5,23 +5,10 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         &mut self,
         ticket_id: B256,
     ) -> Result<u64, PrecompileError> {
-        let retryable_key = self.retryable_key(ticket_id);
+        let retryable_key = self.live_retryable_key(ticket_id)?;
         let timeout = self.read_u64(&retryable_key, 5)?;
-        let now = self.context.block().timestamp().to::<u64>();
-        if timeout == 0 {
-            return Err(PrecompileError::other("NoTicketWithID"));
-        }
-        let windows_left = if self.arbos_version()? >= 60 {
-            self.read_u64(&retryable_key, 6)?
-        } else {
-            0
-        };
-        let effective_timeout =
-            timeout.saturating_add(windows_left.saturating_mul(RETRYABLE_LIFETIME_SECONDS));
-        if effective_timeout < now {
-            return Err(PrecompileError::other("NoTicketWithID"));
-        }
-        Ok(effective_timeout)
+        let windows_left = self.read_u64(&retryable_key, 6)?;
+        Ok(timeout.saturating_add(windows_left.saturating_mul(RETRYABLE_LIFETIME_SECONDS)))
     }
 
     pub(in crate::arbitrum::precompile) fn retryable_beneficiary(
@@ -56,12 +43,12 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .journal_mut()
             .load_account(escrow)
             .map(|account| account.data.info.balance)
-            .map_err(|e| PrecompileError::other(format!("{e:?}")))?;
+            .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?;
         if !balance.is_zero() {
             self.context
                 .journal_mut()
                 .transfer(escrow, beneficiary, balance)
-                .map_err(|e| PrecompileError::other(format!("{e:?}")))?
+                .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?
                 .map_or(Ok(()), |err| {
                     Err(PrecompileError::other(format!("{err:?}")))
                 })?;
@@ -82,7 +69,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .context
             .block()
             .timestamp()
-            .to::<u64>()
+            .wrapping_to::<u64>()
             .saturating_add(RETRYABLE_LIFETIME_SECONDS);
         if timeout > limit_before_add {
             return Err(PrecompileError::other("timeout too far into the future"));
@@ -165,7 +152,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             return Err(PrecompileError::other("NoTicketWithID"));
         }
 
-        let now = self.context.block().timestamp().to::<u64>();
+        let now = self.context.block().timestamp().wrapping_to::<u64>();
         if timeout < now {
             let mut effective_timeout = timeout;
             if self.arbos_version_unmetered()? >= ARBOS_VERSION_60 {

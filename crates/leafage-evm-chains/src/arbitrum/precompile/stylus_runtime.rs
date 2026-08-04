@@ -5,6 +5,7 @@ use moka::sync::Cache;
 use once_cell::sync::OnceCell;
 use std::env;
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
@@ -68,6 +69,9 @@ pub(crate) enum StylusRuntimeError {
     },
     Compile {
         status: u8,
+        message: String,
+    },
+    HostioPanic {
         message: String,
     },
     OutOfInk,
@@ -413,6 +417,27 @@ pub(crate) trait HostioHandler {
     fn handle(&mut self, req_type: u32, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64);
 }
 
+pub(crate) fn failed_hostio_response(req_type: u32) -> (Vec<u8>, Vec<u8>, u64) {
+    const API_STATUS_FAILURE: u8 = 1;
+    const CALL_STATUS_FAILURE: u8 = 2;
+    const HOSTIO_ERROR: &[u8] = b"hostio error";
+
+    match req_type {
+        0 | 2 | 10 | 12 => (vec![0u8; 32], Vec::new(), 0),
+        1 | 3 => (vec![API_STATUS_FAILURE], Vec::new(), 0),
+        4..=6 => (vec![CALL_STATUS_FAILURE], Vec::new(), 0),
+        7 | 8 => {
+            let mut response = Vec::with_capacity(1 + HOSTIO_ERROR.len());
+            response.push(0);
+            response.extend_from_slice(HOSTIO_ERROR);
+            (response, Vec::new(), 0)
+        }
+        9 => (HOSTIO_ERROR.to_vec(), Vec::new(), 0),
+        13 => (Vec::new(), Vec::new(), u64::MAX),
+        _ => (Vec::new(), Vec::new(), 0),
+    }
+}
+
 /// Semantic inputs for a Stylus call; `call_from_env` marshals these into the
 /// `#[repr(C)]` `EvmData`/`StylusConfig` so callers never touch the FFI layout.
 pub(crate) struct StylusExecInput {
@@ -473,26 +498,52 @@ pub(crate) struct StylusCallResult {
     pub output: Vec<u8>,
 }
 
-/// Bridges the C hostio callback to a Rust `HostioHandler`. `arena` keeps the
-/// response/raw buffers alive for the whole `stylus_call` (the native lib holds
-/// `raw_data` lazily via a `GoSliceData` view).
+/// Bridges the C hostio callback to a Rust `HostioHandler`. The native lib
+/// receives `GoSliceData` views, so buffers stay owned here until the call
+/// returns; raw-data slots are replaced when Nitro's requestor would replace
+/// its corresponding `last_return_data` / `last_code` reader.
 struct HostioBridge<'a> {
     handler: &'a mut dyn HostioHandler,
-    arena: Vec<Vec<u8>>,
+    response: Option<Vec<u8>>,
+    last_return_data: Option<Vec<u8>>,
+    last_account_code: Option<Vec<u8>>,
+    scratch_raw: Option<Vec<u8>>,
+    trampoline_error: Option<String>,
 }
 
 impl HostioBridge<'_> {
-    fn stash(&mut self, bytes: Vec<u8>) -> GoSliceData {
+    fn stash_slot(slot: &mut Option<Vec<u8>>, bytes: Vec<u8>) -> GoSliceData {
         if bytes.is_empty() {
+            *slot = None;
             return GoSliceData {
                 ptr: ptr::null(),
                 len: 0,
             };
         }
-        let ptr = bytes.as_ptr();
-        let len = bytes.len();
-        self.arena.push(bytes);
-        GoSliceData { ptr, len }
+        *slot = Some(bytes);
+        let bytes = slot.as_ref().expect("slot just populated");
+        GoSliceData {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    fn stash_response(&mut self, bytes: Vec<u8>) -> GoSliceData {
+        Self::stash_slot(&mut self.response, bytes)
+    }
+
+    fn stash_raw(&mut self, req_type: u32, bytes: Vec<u8>) -> GoSliceData {
+        match req_type {
+            4..=8 => Self::stash_slot(&mut self.last_return_data, bytes),
+            11 => Self::stash_slot(&mut self.last_account_code, bytes),
+            _ => Self::stash_slot(&mut self.scratch_raw, bytes),
+        }
+    }
+
+    fn latch_trampoline_error(&mut self, error: String) {
+        if self.trampoline_error.is_none() {
+            self.trampoline_error = Some(error);
+        }
     }
 }
 
@@ -505,14 +556,50 @@ unsafe extern "C" fn hostio_trampoline(
     raw_data: *mut GoSliceData,
 ) {
     let bridge = unsafe { &mut *(id as *mut HostioBridge<'_>) };
-    let input = unsafe { (*data).as_slice() };
     let method = req_type.wrapping_sub(EVM_API_METHOD_REQ_OFFSET);
-    let (response, raw, cost) = bridge.handler.handle(method, input);
+    let (response, raw, cost) = if bridge.trampoline_error.is_some() {
+        failed_hostio_response(method)
+    } else {
+        let handled = catch_unwind(AssertUnwindSafe(|| {
+            let input = if data.is_null() {
+                &[]
+            } else {
+                unsafe { (*data).as_slice() }
+            };
+            bridge.handler.handle(method, input)
+        }));
+        match handled {
+            Ok(response) => response,
+            Err(error) => {
+                bridge.latch_trampoline_error(format!(
+                    "Stylus hostio callback panicked: {}",
+                    panic_payload_message(error)
+                ));
+                failed_hostio_response(method)
+            }
+        }
+    };
     unsafe {
-        *gas_cost = cost;
-        *result = bridge.stash(response);
-        *raw_data = bridge.stash(raw);
+        if !gas_cost.is_null() {
+            *gas_cost = cost;
+        }
+        if !result.is_null() {
+            *result = bridge.stash_response(response);
+        }
+        if !raw_data.is_null() {
+            *raw_data = bridge.stash_raw(method, raw);
+        }
     }
+}
+
+fn panic_payload_message(error: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = error.downcast_ref::<&'static str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = error.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_owned()
 }
 
 impl StylusRuntime {
@@ -830,7 +917,11 @@ impl StylusRuntime {
 
         let mut bridge = HostioBridge {
             handler,
-            arena: Vec::new(),
+            response: None,
+            last_return_data: None,
+            last_account_code: None,
+            scratch_raw: None,
+            trampoline_error: None,
         };
         let req_handler = NativeRequestHandler {
             handle_request_fptr: hostio_trampoline,
@@ -872,9 +963,13 @@ impl StylusRuntime {
                 0,
             )
         };
-        // `bridge` (and its arena) must stay alive until stylus_call returns.
+        // `bridge` owns every GoSliceData backing buffer until stylus_call returns.
+        let trampoline_error = bridge.trampoline_error.take();
         drop(bridge);
         let out_bytes = unsafe { rust_bytes_to_vec(self.free_output_fn, output) };
+        if let Some(message) = trampoline_error {
+            return Err(StylusRuntimeError::HostioPanic { message });
+        }
         let outcome = call_outcome_from_status(status, &out_bytes);
         Ok(StylusCallResult {
             outcome,
@@ -965,6 +1060,7 @@ impl StylusRuntimeError {
             Self::Compile { status, message } => {
                 format!("stylus compile failed with status {status}: {message}")
             }
+            Self::HostioPanic { message } => message.clone(),
             Self::OutOfInk => "stylus activation ran out of ink".to_owned(),
             Self::OutOfStack => "stylus activation ran out of stack".to_owned(),
             Self::NativeStackOverflow => "stylus activation hit native stack overflow".to_owned(),
@@ -1007,6 +1103,124 @@ mod tests {
             call_outcome_from_status(u8::MAX, b"internal detail"),
             StylusOutcome::Failure
         );
+    }
+
+    #[test]
+    fn failed_hostio_responses_have_parseable_shapes() {
+        assert_eq!(failed_hostio_response(0).0, vec![0u8; 32]);
+        assert_eq!(failed_hostio_response(1).0, vec![1]);
+        assert_eq!(failed_hostio_response(3).0, vec![1]);
+        assert_eq!(failed_hostio_response(4).0, vec![2]);
+        assert_eq!(failed_hostio_response(6).0, vec![2]);
+        assert_eq!(failed_hostio_response(7).0.first(), Some(&0));
+        assert_eq!(failed_hostio_response(10).0, vec![0u8; 32]);
+        assert!(failed_hostio_response(11).0.is_empty());
+        assert_eq!(failed_hostio_response(12).0, vec![0u8; 32]);
+        assert_eq!(failed_hostio_response(13).2, u64::MAX);
+    }
+
+    struct PanicHostio {
+        calls: usize,
+    }
+
+    impl HostioHandler for PanicHostio {
+        fn handle(&mut self, _: u32, _: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+            self.calls += 1;
+            panic!("synthetic hostio panic")
+        }
+    }
+
+    #[test]
+    fn hostio_trampoline_catches_handler_panics() {
+        let mut handler = PanicHostio { calls: 0 };
+        let mut bridge = HostioBridge {
+            handler: &mut handler,
+            response: None,
+            last_return_data: None,
+            last_account_code: None,
+            scratch_raw: None,
+            trampoline_error: None,
+        };
+        let mut data = RustSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let mut gas = u64::MAX;
+        let mut result = GoSliceData {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let mut raw = GoSliceData {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+
+        unsafe {
+            hostio_trampoline(
+                &mut bridge as *mut HostioBridge<'_> as usize,
+                EVM_API_METHOD_REQ_OFFSET + 1,
+                &mut data,
+                &mut gas,
+                &mut result,
+                &mut raw,
+            );
+        }
+
+        let response = unsafe { std::slice::from_raw_parts(result.ptr, result.len) };
+        assert_eq!(response, &[1]);
+        assert_eq!(gas, 0);
+        assert!(raw.ptr.is_null());
+        assert!(
+            bridge
+                .trampoline_error
+                .as_deref()
+                .is_some_and(|message| message.contains("synthetic hostio panic"))
+        );
+
+        unsafe {
+            hostio_trampoline(
+                &mut bridge as *mut HostioBridge<'_> as usize,
+                EVM_API_METHOD_REQ_OFFSET + 3,
+                &mut data,
+                &mut gas,
+                &mut result,
+                &mut raw,
+            );
+        }
+        drop(bridge);
+        assert_eq!(handler.calls, 1, "panic must latch the trampoline");
+    }
+
+    struct EmptyHostio;
+
+    impl HostioHandler for EmptyHostio {
+        fn handle(&mut self, _: u32, _: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
+            (Vec::new(), Vec::new(), 0)
+        }
+    }
+
+    #[test]
+    fn hostio_bridge_replaces_raw_slots_by_reader_kind() {
+        let mut handler = EmptyHostio;
+        let mut bridge = HostioBridge {
+            handler: &mut handler,
+            response: None,
+            last_return_data: None,
+            last_account_code: None,
+            scratch_raw: None,
+            trampoline_error: None,
+        };
+
+        let _ = bridge.stash_raw(11, vec![1; 10]);
+        assert_eq!(bridge.last_account_code.as_ref().unwrap().len(), 10);
+        let _ = bridge.stash_raw(11, vec![2; 20]);
+        assert_eq!(bridge.last_account_code.as_ref().unwrap().len(), 20);
+
+        let _ = bridge.stash_raw(4, vec![3; 30]);
+        assert_eq!(bridge.last_return_data.as_ref().unwrap().len(), 30);
+        assert_eq!(bridge.last_account_code.as_ref().unwrap().len(), 20);
+        let _ = bridge.stash_raw(5, vec![4; 40]);
+        assert_eq!(bridge.last_return_data.as_ref().unwrap().len(), 40);
     }
 
     #[test]
