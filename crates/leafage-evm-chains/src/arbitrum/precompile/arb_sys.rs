@@ -5,7 +5,7 @@ use super::util::{
     log_gas,
 };
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_SYS_ADDRESS};
-use crate::arbitrum::evm::ArbitrumCallContext;
+use crate::arbitrum::evm::{ArbResourceKind, ArbitrumCallContext};
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolError, SolEvent};
 use revm::context::{Cfg, ContextTr, Transaction};
@@ -365,7 +365,7 @@ impl ArbSys {
             hash,
             position,
         };
-        storage.burn(log_gas(3, 0))?;
+        storage.burn_resource(ArbResourceKind::HistoryGrowth, log_gas(3, 0))?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_SYS_ADDRESS,
             event.encode_topics().into_iter().map(Into::into).collect(),
@@ -399,7 +399,10 @@ impl ArbSys {
             data: calldata_for_l1,
         };
         let data = Bytes::from(event.encode_data());
-        storage.burn(log_gas(3, data.len()))?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            log_gas(3, data.len()),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_SYS_ADDRESS,
             event.encode_topics().into_iter().map(Into::into).collect(),

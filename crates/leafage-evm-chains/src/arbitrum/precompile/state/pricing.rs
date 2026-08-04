@@ -109,7 +109,11 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     ) -> Result<Vec<U256>, PrecompileError> {
         let fees_key = self.multi_gas_base_fees_key();
         let l2_key = self.l2_key();
-        let base_fee = self.read(&l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET)?;
+        let base_fee = if self.arbos_version_unmetered()? >= 61 {
+            U256::from(self.current_l2_basefee())
+        } else {
+            self.read(&l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET)?
+        };
         let mut out = Vec::with_capacity(NUM_RESOURCE_KIND);
         for resource in 0..NUM_RESOURCE_KIND {
             let fee = self.read(&fees_key, NUM_RESOURCE_KIND as u64 + resource as u64)?;
@@ -233,7 +237,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             self.read(&l1_key, arbos_state::L1_FUNDS_DUE_FOR_REWARDS_OFFSET)?;
         let need_funds = funds_due_for_refunds.saturating_add(funds_due_for_rewards);
         let have_funds = if self.arbos_version()? < 10 {
-            self.burn(STORAGE_READ_GAS)?;
+            self.burn_resource(ArbResourceKind::StorageAccessRead, STORAGE_READ_GAS)?;
             self.context
                 .journal_mut()
                 .load_account(L1_PRICER_FUNDS_POOL_ADDRESS)

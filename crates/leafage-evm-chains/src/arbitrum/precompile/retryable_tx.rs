@@ -4,6 +4,7 @@ use super::util::{log_gas, sol_error_revert};
 use super::{
     ArbPrecompileInput, ArbitrumContext, ARB_RETRYABLE_TX_ADDRESS, RETRYABLE_LIFETIME_SECONDS,
 };
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolCall, SolInterface, SolValue};
 use alloy_rlp::{BufMut, Encodable, Header, EMPTY_STRING_CODE};
@@ -168,7 +169,8 @@ impl ArbRetryableTx {
         if byte_count == 0 {
             return Err(PrecompileError::other("NoTicketWithID"));
         }
-        storage.burn(
+        storage.burn_resource(
+            ArbResourceKind::StorageAccessWrite,
             RETRYABLE_KEEPALIVE_STORAGE_BURN_PER_WORD.saturating_mul(byte_count.div_ceil(32)),
         )?;
         let timeout = storage.keepalive_retryable(ticket_id)?;
@@ -187,7 +189,10 @@ impl ArbRetryableTx {
         }
 
         let byte_count = storage.retryable_size_bytes(ticket_id)?;
-        storage.burn(RETRYABLE_STORAGE_BURN_PER_WORD.saturating_mul(byte_count.div_ceil(32)))?;
+        storage.burn_resource(
+            ArbResourceKind::StorageAccessWrite,
+            RETRYABLE_STORAGE_BURN_PER_WORD.saturating_mul(byte_count.div_ceil(32)),
+        )?;
 
         let info = storage.retryable_redeem_info(ticket_id)?;
         let backlog_update_cost = storage.backlog_update_cost()?;
@@ -218,7 +223,7 @@ impl ArbRetryableTx {
             gas_to_donate,
             caller,
         )?;
-        storage.burn(gas_to_donate)?;
+        storage.burn_resource(ArbResourceKind::SingleDim, gas_to_donate)?;
         if uses_fixed_backlog_update_cost {
             storage.burn(backlog_update_cost)?;
         }
@@ -349,7 +354,10 @@ impl ArbRetryableTx {
         storage: &mut ArbStorage<'_, ArbitrumContext<DB>>,
         ticket_id: B256,
     ) -> Result<(), PrecompileError> {
-        storage.burn(Self::canceled_event_gas_cost())?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            Self::canceled_event_gas_cost(),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_RETRYABLE_TX_ADDRESS,
             vec![keccak256("Canceled(bytes32)"), ticket_id],
@@ -364,7 +372,10 @@ impl ArbRetryableTx {
         new_timeout: u64,
     ) -> Result<(), PrecompileError> {
         let data = Bytes::from(U256::from(new_timeout).abi_encode());
-        storage.burn(Self::lifetime_extended_event_gas_cost())?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            Self::lifetime_extended_event_gas_cost(),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_RETRYABLE_TX_ADDRESS,
             vec![keccak256("LifetimeExtended(bytes32,uint256)"), ticket_id],
@@ -381,7 +392,10 @@ impl ArbRetryableTx {
         gas_donated: u64,
         gas_donor: Address,
     ) -> Result<(), PrecompileError> {
-        storage.burn(Self::redeem_scheduled_event_gas_cost())?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            Self::redeem_scheduled_event_gas_cost(),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_RETRYABLE_TX_ADDRESS,
             vec![

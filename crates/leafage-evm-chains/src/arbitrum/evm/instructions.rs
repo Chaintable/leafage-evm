@@ -33,6 +33,7 @@ where
     let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
     instructions.insert_instruction(opcode::GASPRICE, Instruction::new(gasprice, 2));
     instructions.insert_instruction(opcode::BLOCKHASH, Instruction::new(blockhash, 20));
+    super::multigas::install_instruction_metering(&mut instructions);
     instructions
 }
 

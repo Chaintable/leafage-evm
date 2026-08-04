@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, B256, Bytes, U256};
 use std::collections::{HashMap, VecDeque};
 
+use super::multigas::{ArbMultiGas, ArbResourceKind};
 use super::poster_gas::ArbPosterCharge;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +58,9 @@ pub struct ArbitrumExecutionContext {
     current_l2_block_number: Option<U256>,
     current_l2_basefee: Option<u64>,
     current_poster_charge: Option<ArbPosterCharge>,
+    multi_gas_arbos_version: Option<u64>,
+    multi_gas: ArbMultiGas,
+    multi_gas_unattributed: u64,
     activated_wasm_modules: HashMap<B256, Bytes>,
     recent_wasms: RecentWasms,
     stylus_pages_open: u16,
@@ -88,6 +92,83 @@ impl ArbitrumExecutionContext {
 
     pub fn clear_current_poster_charge(&mut self) {
         self.current_poster_charge = None;
+    }
+
+    pub(crate) fn begin_multi_gas(&mut self, arbos_version: u64, intrinsic: ArbMultiGas) {
+        self.multi_gas_arbos_version = (arbos_version >= 60).then_some(arbos_version);
+        self.multi_gas = if self.multi_gas_arbos_version.is_some() {
+            intrinsic
+        } else {
+            ArbMultiGas::default()
+        };
+        self.multi_gas_unattributed = 0;
+    }
+
+    pub(crate) fn clear_multi_gas(&mut self) {
+        self.multi_gas_arbos_version = None;
+        self.multi_gas = ArbMultiGas::default();
+        self.multi_gas_unattributed = 0;
+    }
+
+    pub(crate) fn multi_gas_arbos_version(&self) -> Option<u64> {
+        self.multi_gas_arbos_version
+    }
+
+    pub(crate) fn multi_gas(&self) -> ArbMultiGas {
+        self.multi_gas
+    }
+
+    pub(crate) fn restore_multi_gas(&mut self, multi_gas: ArbMultiGas) {
+        self.multi_gas = multi_gas;
+    }
+
+    pub(crate) fn multi_gas_total(&self) -> u64 {
+        self.multi_gas.total()
+    }
+
+    pub(crate) fn record_multi_gas(&mut self, resource: ArbResourceKind, amount: u64) {
+        if self.multi_gas_arbos_version.is_some() {
+            self.multi_gas.record(resource, amount);
+        }
+    }
+
+    pub(crate) fn record_multi_gas_cost(&mut self, cost: ArbMultiGas) {
+        if self.multi_gas_arbos_version.is_some() {
+            self.multi_gas.add(cost);
+        }
+    }
+
+    pub(crate) fn leave_multi_gas_unattributed(&mut self, amount: u64) {
+        if self.multi_gas_arbos_version.is_some() {
+            self.multi_gas_unattributed = self.multi_gas_unattributed.saturating_add(amount);
+        }
+    }
+
+    pub(crate) fn attribute_wasm_computation(
+        &mut self,
+        starting_multi_gas: u64,
+        starting_gas: u64,
+        remaining_gas: u64,
+    ) {
+        if self.multi_gas_arbos_version.is_none() {
+            return;
+        }
+        let used_gas = starting_gas.saturating_sub(remaining_gas);
+        let accounted_gas = self.multi_gas.total().saturating_sub(starting_multi_gas);
+        self.multi_gas.record(
+            ArbResourceKind::WasmComputation,
+            used_gas.saturating_sub(accounted_gas),
+        );
+    }
+
+    pub(crate) fn finalize_multi_gas(&mut self, gross_gas_used: u64) {
+        if self.multi_gas_arbos_version.is_none() {
+            return;
+        }
+        let accounted_gas = gross_gas_used.saturating_sub(self.multi_gas_unattributed);
+        let residual = accounted_gas.saturating_sub(self.multi_gas.total());
+        self.multi_gas
+            .record(ArbResourceKind::Computation, residual);
     }
 
     pub fn set_current_call(&mut self, depth: usize, callers_caller: Address) {

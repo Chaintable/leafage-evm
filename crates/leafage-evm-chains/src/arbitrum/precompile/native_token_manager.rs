@@ -2,6 +2,7 @@ use super::abi::IArbNativeTokenManager;
 use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call, log_gas, topic_address};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_NATIVE_TOKEN_MANAGER_ADDRESS};
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log, U256};
 use alloy::sol_types::SolValue;
 use revm::context::{ContextTr, JournalTr};
@@ -35,7 +36,10 @@ impl ArbNativeTokenManager {
 
                 match call {
                     IArbNativeTokenManager::IArbNativeTokenManagerCalls::mintNativeToken(call) => {
-                        storage.burn(MINT_BURN_GAS_COST)?;
+                        storage.burn_resource(
+                            ArbResourceKind::StorageAccessWrite,
+                            MINT_BURN_GAS_COST,
+                        )?;
                         storage.mint_balance(caller, call.amount)?;
                         Self::emit(
                             &mut storage,
@@ -50,7 +54,10 @@ impl ArbNativeTokenManager {
                         )
                     }
                     IArbNativeTokenManager::IArbNativeTokenManagerCalls::burnNativeToken(call) => {
-                        storage.burn(MINT_BURN_GAS_COST)?;
+                        storage.burn_resource(
+                            ArbResourceKind::StorageAccessWrite,
+                            MINT_BURN_GAS_COST,
+                        )?;
                         match storage.burn_balance(caller, call.amount) {
                             Ok(()) => {
                                 Self::emit(
@@ -91,7 +98,10 @@ impl ArbNativeTokenManager {
         amount: U256,
     ) -> Result<(), PrecompileError> {
         let data = Bytes::from((amount,).abi_encode());
-        storage.burn(log_gas(1, data.len()))?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            log_gas(1, data.len()),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_NATIVE_TOKEN_MANAGER_ADDRESS,
             vec![keccak256(event), topic_address(account)],

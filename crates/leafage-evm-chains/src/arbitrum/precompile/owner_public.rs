@@ -3,6 +3,7 @@ use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call, log_gas};
 use super::{ArbPrecompileInput, ArbitrumContext};
 use crate::arbitrum::arbos_state;
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log};
 use alloy::sol_types::SolValue;
 use revm::context::{ContextTr, JournalTr};
@@ -257,7 +258,10 @@ impl ArbOwnerPublic {
         owner: Address,
     ) -> Result<(), PrecompileError> {
         let data = Bytes::from((owner,).abi_encode());
-        storage.burn(log_gas(0, data.len()))?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            log_gas(0, data.len()),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             super::ARB_OWNER_PUBLIC_ADDRESS,
             vec![keccak256("ChainOwnerRectified(address)")],

@@ -3,6 +3,7 @@ use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call, log_gas};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_FILTERED_TRANSACTIONS_MANAGER_ADDRESS};
 use crate::arbitrum::arbos_state;
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256};
 use revm::context::{ContextTr, JournalTr};
 use revm::precompile::{PrecompileError, PrecompileResult};
@@ -126,7 +127,7 @@ impl ArbFilteredTransactionsManager {
         event: &'static str,
         tx_hash: B256,
     ) -> Result<(), PrecompileError> {
-        storage.burn(log_gas(1, 0))?;
+        storage.burn_resource(ArbResourceKind::HistoryGrowth, log_gas(1, 0))?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_FILTERED_TRANSACTIONS_MANAGER_ADDRESS,
             vec![keccak256(event), tx_hash],

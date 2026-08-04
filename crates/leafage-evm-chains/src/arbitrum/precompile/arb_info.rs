@@ -1,6 +1,7 @@
 use super::abi::IArbInfo;
 use super::util::{copy_gas, dispatch, finish_call};
 use super::{ArbPrecompileInput, ArbitrumContext};
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use revm::Database;
 use revm::context::ContextTr;
@@ -34,12 +35,20 @@ impl ArbInfo {
                 if gas_used > gas_limit {
                     return Err(PrecompileError::OutOfGas);
                 }
+                context.chain_mut().record_multi_gas(
+                    ArbResourceKind::StorageAccessRead,
+                    CODE_STORAGE_READ_GAS,
+                );
                 let code = Self::account_code_without_warming(context, call.account)
                     .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))?;
-                let gas_used = gas_used.saturating_add(copy_gas(code.len()));
+                let code_copy_gas = copy_gas(code.len());
+                let gas_used = gas_used.saturating_add(code_copy_gas);
                 if gas_used > gas_limit {
                     return Err(PrecompileError::OutOfGas);
                 }
+                context
+                    .chain_mut()
+                    .record_multi_gas(ArbResourceKind::StorageAccessRead, code_copy_gas);
                 finish_call::<IArbInfo::getCodeCall>(gas_limit, gas_used, code)
             }
         })

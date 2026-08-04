@@ -2,6 +2,7 @@ use super::abi::{IArbWasm, IArbWasmCache};
 use super::state::{ArbStorage, StylusProgramError, WasmProgram};
 use super::util::{dispatch, empty_revert, finish_call, topic_address};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_WASM_CACHE_ADDRESS};
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256};
 use alloy::sol_types::{SolError, SolValue};
 use revm::context::{ContextTr, JournalTr};
@@ -123,7 +124,10 @@ impl ArbWasmCache {
         };
         if program.cached != cached {
             Self::emit(storage, caller, code_hash, cached)?;
-            storage.burn(u64::from(program.init_cost))?;
+            storage.burn_resource(
+                ArbResourceKind::StorageAccessRead,
+                u64::from(program.init_cost),
+            )?;
             if cached {
                 match Self::ensure_cacheable_code(storage, code_hash) {
                     Ok(()) => {}
@@ -276,7 +280,10 @@ impl ArbWasmCache {
         code_hash: B256,
         cached: bool,
     ) -> Result<(), PrecompileError> {
-        storage.burn(Self::update_program_cache_event_gas())?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            Self::update_program_cache_event_gas(),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_WASM_CACHE_ADDRESS,
             vec![

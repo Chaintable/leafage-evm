@@ -15,6 +15,7 @@ use super::{
     TX_DATA_NON_ZERO_GAS,
 };
 use crate::arbitrum::arbos_state;
+use crate::arbitrum::evm::{ArbMultiGas, ArbResourceKind};
 use alloy::primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable, Header};
 use revm::context::{ContextTr, JournalTr};
@@ -140,6 +141,22 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         Ok(())
     }
 
+    pub(super) fn burn_resource(
+        &mut self,
+        resource: ArbResourceKind,
+        gas: u64,
+    ) -> Result<(), PrecompileError> {
+        self.burn(gas)?;
+        self.context.chain_mut().record_multi_gas(resource, gas);
+        Ok(())
+    }
+
+    pub(super) fn burn_multi_gas(&mut self, gas: ArbMultiGas) -> Result<(), PrecompileError> {
+        self.burn(gas.total())?;
+        self.context.chain_mut().record_multi_gas_cost(gas);
+        Ok(())
+    }
+
     pub(super) fn burn_out(&mut self) {
         self.gas_used = self.gas_limit;
     }
@@ -212,7 +229,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         storage_key: &[u8],
         key: [u8; 32],
     ) -> Result<U256, PrecompileError> {
-        self.burn(STORAGE_READ_GAS)?;
+        self.burn_resource(ArbResourceKind::StorageAccessRead, STORAGE_READ_GAS)?;
         self.read_account_key_concrete(account, storage_key, key)
             .map_err(|e| PrecompileError::Fatal(format!("{e:?}")))
     }
@@ -251,11 +268,12 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         key: [u8; 32],
         value: U256,
     ) -> Result<(), PrecompileError> {
-        self.burn(if value.is_zero() {
+        let gas = if value.is_zero() {
             STORAGE_WRITE_ZERO_COST
         } else {
             STORAGE_WRITE_COST
-        })?;
+        };
+        self.burn_resource(ArbResourceKind::StorageAccessWrite, gas)?;
         self.load_account(account)?;
         self.context
             .journal_mut()

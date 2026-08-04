@@ -1,6 +1,7 @@
 mod context;
 mod handler;
 mod instructions;
+mod multigas;
 mod poster_gas;
 mod stylus;
 
@@ -26,7 +27,7 @@ use revm::state::EvmState;
 use revm::{
     Database, DatabaseCommit, DatabaseRef, Journal,
     context_interface::{
-        ContextTr,
+        Cfg, ContextTr,
         result::{EVMError, ExecutionResult, HaltReason, ResultAndState},
     },
 };
@@ -34,6 +35,7 @@ use std::ops::{Deref, DerefMut};
 
 pub use self::context::{ArbitrumCallContext, ArbitrumExecutionContext};
 use self::handler::ArbitrumHandler;
+pub(crate) use self::multigas::{ArbMultiGas, ArbResourceKind};
 pub use self::poster_gas::ArbPosterCharge;
 
 pub struct ArbitrumEvm<DB: Database + DatabaseRef, I> {
@@ -237,6 +239,20 @@ where
         &mut self,
         result: FrameResult,
     ) -> Result<Option<FrameResult>, ContextDbError<Self::Context>> {
+        if let FrameResult::Create(outcome) = &result {
+            if outcome.instruction_result().is_ok() {
+                let code_deposit_gas = self
+                    .inner
+                    .ctx
+                    .cfg()
+                    .gas_params()
+                    .code_deposit_cost(outcome.output().len());
+                self.inner.ctx.chain_mut().record_multi_gas(
+                    ArbResourceKind::StorageGrowth,
+                    code_deposit_gas,
+                );
+            }
+        }
         if self.inner.frame_stack.get().is_finished() {
             self.pop_frame();
         }

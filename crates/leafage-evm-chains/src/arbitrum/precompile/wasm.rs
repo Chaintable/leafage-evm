@@ -5,6 +5,7 @@ use super::stylus_runtime::{ActivatedWasm, StylusRuntime, StylusRuntimeError};
 use super::util::{dispatch, empty_revert, finish_call};
 use super::{ARB_WASM_ADDRESS, ArbPrecompileInput, ArbitrumContext};
 use crate::arbitrum::arbos_state;
+use crate::arbitrum::evm::{ArbMultiGas, ArbResourceKind};
 use crate::arbitrum::stylus_prefix::{
     ARBOS_VERSION_STYLUS, ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_FRAGMENT_PREFIX,
     has_stylus_prefix, is_stylus_classic, is_stylus_fragment, is_stylus_root,
@@ -303,7 +304,7 @@ impl ArbWasm {
         program: Address,
     ) -> Result<(u16, U256), ArbWasmError> {
         let activation_gas = storage.wasm_activation_gas()?;
-        storage.burn(activation_gas)?;
+        storage.burn_resource(ArbResourceKind::SingleDim, activation_gas)?;
         storage.burn(ACTIVATION_FIXED_GAS)?;
 
         let params = storage.stylus_params()?;
@@ -460,7 +461,10 @@ impl ArbWasm {
         code_hash: B256,
         data_fee: U256,
     ) -> Result<(), PrecompileError> {
-        storage.burn(Self::program_lifetime_extended_event_gas())?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            Self::program_lifetime_extended_event_gas(),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_WASM_ADDRESS,
             vec![
@@ -480,7 +484,10 @@ impl ArbWasm {
         data_fee: U256,
         version: u16,
     ) -> Result<(), PrecompileError> {
-        storage.burn(Self::program_activated_event_gas())?;
+        storage.burn_resource(
+            ArbResourceKind::HistoryGrowth,
+            Self::program_activated_event_gas(),
+        )?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_WASM_ADDRESS,
             vec![
@@ -835,7 +842,18 @@ impl ArbWasm {
             let is_cold = !storage.account_is_warm(*fragment);
             Self::ensure_can_read_max_fragment(storage, is_cold, max_code_size)?;
             let (code, _) = storage.account_code(*fragment)?;
-            storage.burn(Self::fragment_read_gas(is_cold, code.len()))?;
+            let copy_gas = Self::copy_gas(code.len());
+            let mut gas = ArbMultiGas::default();
+            if is_cold {
+                gas.record(
+                    ArbResourceKind::StorageAccessRead,
+                    COLD_ACCOUNT_ACCESS_GAS.saturating_add(copy_gas),
+                );
+            } else {
+                gas.record(ArbResourceKind::Computation, WARM_STORAGE_READ_GAS);
+                gas.record(ArbResourceKind::StorageAccessRead, copy_gas);
+            }
+            storage.burn_multi_gas(gas)?;
             compressed.extend_from_slice(Self::stylus_fragment_payload(&code)?);
         }
         Ok(compressed)

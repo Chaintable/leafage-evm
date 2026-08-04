@@ -34,10 +34,10 @@ pub(crate) use self::stylus_runtime::{
     StylusRuntime, failed_hostio_response,
 };
 use self::util::{
-    charge_precompile_context_gas, decode_revert, empty_revert, to_interpreter_result,
+    charge_precompile_context_gas, copy_gas, decode_revert, empty_revert, to_interpreter_result,
 };
 pub(crate) use self::wasm::{ArbWasm, PreparedStylusProgram};
-use crate::arbitrum::evm::ArbitrumExecutionContext;
+use crate::arbitrum::evm::{ArbResourceKind, ArbitrumExecutionContext};
 use crate::arbitrum::hardforks::ArbitrumHardfork;
 use crate::arbitrum::tx::ArbitrumTxEnv;
 use alloy::primitives::{Address, Bytes, U256, address};
@@ -205,6 +205,18 @@ impl ArbitrumPrecompiles {
             context,
         });
 
+        let args_copy_gas = copy_gas(data.len().saturating_sub(4));
+        let args_copy_oog = args_copy_gas > precompile_gas_limit;
+        if !args_copy_oog && !matches!(precompile, ArbitrumPrecompile::ArbOwner) {
+            context.chain_mut().record_multi_gas(
+                ArbResourceKind::StorageAccessRead,
+                context_gas,
+            );
+            context
+                .chain_mut()
+                .record_multi_gas(ArbResourceKind::L2Calldata, args_copy_gas);
+        }
+
         charge_precompile_context_gas(context_gas, inputs.gas_limit, result)
     }
 }
@@ -259,12 +271,14 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
             precompile,
             ArbitrumPrecompile::ArbFilteredTransactionsManager
         ) {
+            let multi_gas_before = context.chain().multi_gas();
             match ArbFilteredTransactionsManager::wrapper_access(
                 context,
                 inputs.gas_limit,
                 inputs.caller,
             ) {
                 Ok((caller_is_filterer, wrapper_gas_used)) => {
+                    let multi_gas_after_wrapper = context.chain().multi_gas();
                     let result = self.run_checked_precompile(
                         precompile,
                         context,
@@ -272,16 +286,35 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
                         data.as_ref(),
                         is_valid_call_context,
                     );
-                    ArbFilteredTransactionsManager::finish_free_access_call(
+                    let result = ArbFilteredTransactionsManager::finish_free_access_call(
                         inputs.gas_limit,
                         result,
                         caller_is_filterer,
                         wrapper_gas_used,
-                    )
+                    );
+                    context.chain_mut().restore_multi_gas(if caller_is_filterer {
+                        multi_gas_before
+                    } else {
+                        multi_gas_after_wrapper
+                    });
+                    result
                 }
                 Err(PrecompileError::Fatal(err)) => Err(PrecompileError::Fatal(err)),
                 Err(_) => empty_revert(inputs.gas_limit, inputs.gas_limit),
             }
+        } else if matches!(precompile, ArbitrumPrecompile::ArbOwner) {
+            let multi_gas_before = context.chain().multi_gas();
+            let result = self.run_checked_precompile(
+                precompile,
+                context,
+                inputs,
+                data.as_ref(),
+                is_valid_call_context,
+            );
+            if matches!(&result, Ok(output) if output.gas_used == 0) {
+                context.chain_mut().restore_multi_gas(multi_gas_before);
+            }
+            result
         } else {
             self.run_checked_precompile(
                 precompile,
@@ -602,6 +635,157 @@ mod tests {
 
         assert_eq!(result.result, InstructionResult::Return);
         assert_eq!(result.gas.spent(), STORAGE_READ_GAS + copy_gas(32));
+    }
+
+    #[test]
+    fn precompile_multigas_distinguishes_argument_and_result_copy_oog() {
+        let caller = Address::from([1; 20]);
+        let gas_limit = STORAGE_READ_GAS + copy_gas(32) - 1;
+        let inputs = |address, data| CallInputs {
+            input: CallInput::Bytes(Bytes::from(data)),
+            return_memory_offset: 0..0,
+            gas_limit,
+            bytecode_address: address,
+            known_bytecode: None,
+            target_address: address,
+            caller,
+            value: CallValue::default(),
+            scheme: CallScheme::StaticCall,
+            is_static: true,
+        };
+        let mut precompiles = ArbitrumPrecompiles::new_with_env(
+            ArbitrumHardfork::Prague,
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 60,
+                ..Default::default()
+            },
+        );
+
+        let mut args_oog_context = context();
+        args_oog_context
+            .chain_mut()
+            .begin_multi_gas(60, Default::default());
+        let args_oog = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
+            &mut precompiles,
+            &mut args_oog_context,
+            &inputs(
+                ARB_INFO_ADDRESS,
+                abi::IArbInfo::getBalanceCall {
+                    account: Address::ZERO,
+                }
+                .abi_encode(),
+            ),
+        )
+        .expect("provider run should not fail")
+        .expect("ArbInfo should be handled");
+        assert_eq!(args_oog.result, InstructionResult::Revert);
+        assert_eq!(
+            args_oog_context
+                .chain()
+                .multi_gas()
+                .get(ArbResourceKind::StorageAccessRead),
+            0
+        );
+        assert_eq!(
+            args_oog_context
+                .chain()
+                .multi_gas()
+                .get(ArbResourceKind::L2Calldata),
+            0
+        );
+
+        let mut result_oog_context = context();
+        result_oog_context
+            .chain_mut()
+            .begin_multi_gas(60, Default::default());
+        let result_oog = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
+            &mut precompiles,
+            &mut result_oog_context,
+            &inputs(
+                ARB_SYS_ADDRESS,
+                abi::IArbSys::arbBlockNumberCall {}.abi_encode(),
+            ),
+        )
+        .expect("provider run should not fail")
+        .expect("ArbSys should be handled");
+        assert_eq!(result_oog.result, InstructionResult::PrecompileOOG);
+        assert_eq!(
+            result_oog_context
+                .chain()
+                .multi_gas()
+                .get(ArbResourceKind::StorageAccessRead),
+            STORAGE_READ_GAS
+        );
+    }
+
+    #[test]
+    fn arb_owner_multigas_is_free_only_for_authorized_calls() {
+        let caller = Address::from([7; 20]);
+        let data = abi::IArbOwner::isChainOwnerCall { addr: caller }.abi_encode();
+        let inputs = CallInputs {
+            input: CallInput::Bytes(Bytes::from(data)),
+            return_memory_offset: 0..0,
+            gas_limit: 100_000,
+            bytecode_address: ARB_OWNER_ADDRESS,
+            known_bytecode: None,
+            target_address: ARB_OWNER_ADDRESS,
+            caller,
+            value: CallValue::default(),
+            scheme: CallScheme::StaticCall,
+            is_static: true,
+        };
+        let mut precompiles = ArbitrumPrecompiles::new_with_env(
+            ArbitrumHardfork::Prague,
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 60,
+                ..Default::default()
+            },
+        );
+
+        let mut unauthorized_context = context();
+        unauthorized_context
+            .chain_mut()
+            .begin_multi_gas(60, Default::default());
+        let unauthorized = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
+            &mut precompiles,
+            &mut unauthorized_context,
+            &inputs,
+        )
+        .expect("provider run should not fail")
+        .expect("ArbOwner should be handled");
+        assert_eq!(unauthorized.result, InstructionResult::Revert);
+        assert!(
+            unauthorized_context
+                .chain()
+                .multi_gas()
+                .get(ArbResourceKind::StorageAccessRead)
+                > 0
+        );
+
+        let mut authorized_context = context();
+        {
+            let mut storage = state::ArbStorage::new_with_initial_gas(
+                &mut authorized_context,
+                u64::MAX,
+                0,
+            );
+            let owners_key = storage.chain_owner_key();
+            storage
+                .address_set_add(&owners_key, caller)
+                .expect("add chain owner");
+        }
+        authorized_context
+            .chain_mut()
+            .begin_multi_gas(60, Default::default());
+        let authorized = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
+            &mut precompiles,
+            &mut authorized_context,
+            &inputs,
+        )
+        .expect("provider run should not fail")
+        .expect("ArbOwner should be handled");
+        assert_eq!(authorized.result, InstructionResult::Return);
+        assert_eq!(authorized_context.chain().multi_gas().total(), 0);
     }
 
     #[test]

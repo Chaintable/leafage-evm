@@ -1,6 +1,7 @@
 //! EVM handler hooks for Arbitrum Nitro transaction processing.
 
 use super::ArbitrumEvm;
+use super::multigas::{ArbMultiGas, ArbResourceKind, NUM_RESOURCE_KIND};
 use super::poster_gas::ArbPosterCharge;
 use crate::arbitrum::arbos_state::{self, ArbPricing, ArbStateReader};
 use crate::arbitrum::precompile::{ArbitrumContext, L1_PRICER_FUNDS_POOL_ADDRESS};
@@ -16,7 +17,9 @@ use revm::{
         Cfg, JournalTr, journaled_state::account::JournaledAccountTr, result::InvalidTransaction,
         transaction::TransactionType,
     },
-    handler::{EvmTr, FrameResult, FrameTr, Handler, pre_execution, validation},
+    handler::{
+        EvmTr, FrameResult, FrameTr, Handler, post_execution, pre_execution, validation,
+    },
     inspector::{Inspector, InspectorHandler},
     interpreter::{Gas, InitialAndFloorGas, interpreter::EthInterpreter},
     primitives::hardfork::SpecId,
@@ -25,6 +28,8 @@ use revm::{
 const ARBOS_VERSION_L1_PRICER_FUNDS_POOL: u64 = 2;
 const ARBOS_VERSION_L1_FEES_AVAILABLE: u64 = 10;
 const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
+const ARBOS_VERSION_MULTI_GAS: u64 = 60;
+const ARBOS_VERSION_MULTI_GAS_REFUND_FIX: u64 = 61;
 
 pub struct ArbitrumHandler<DB: Database + DatabaseRef, INSP>(core::marker::PhantomData<(DB, INSP)>);
 
@@ -178,6 +183,7 @@ where
         evm: &mut ArbitrumEvm<DB, INSP>,
         gas_remaining: &mut u64,
         intrinsic_gas: u64,
+        arbos_version: u64,
     ) -> Result<u64, EVMError<<DB as Database>::Error>> {
         let (l2_basefee, is_retryable_redeem, gas_estimation) = {
             let ctx = evm.ctx();
@@ -206,6 +212,9 @@ where
         };
 
         evm.ctx_mut().chain_mut().set_current_poster_charge(charge);
+        evm.ctx_mut()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::SingleDim, charge.poster_gas);
         Self::add_to_l1_pricing_slot(
             evm.ctx_mut(),
             arbos_state::L1_UNITS_SINCE_UPDATE_OFFSET,
@@ -227,14 +236,6 @@ where
         }
 
         let l2_pricing_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
-        let arbos_version = evm
-            .ctx_mut()
-            .db_mut()
-            .storage(
-                arbos_state::ARBOS_STATE_ADDRESS,
-                arbos_state::slot_at(&[], arbos_state::ARBOS_VERSION_OFFSET),
-            )?
-            .wrapping_to::<u64>();
         let limit_offset = if arbos_version < ARBOS_VERSION_PER_TX_GAS_LIMIT {
             arbos_state::L2_PER_BLOCK_GAS_LIMIT_OFFSET
         } else {
@@ -257,6 +258,105 @@ where
         Ok(held_gas)
     }
 
+    fn read_arbos_value(
+        ctx: &mut ArbitrumContext<DB>,
+        storage_key: &[u8],
+        offset: u64,
+    ) -> Result<U256, EVMError<<DB as Database>::Error>> {
+        ctx.journal_mut()
+            .load_account(arbos_state::ARBOS_STATE_ADDRESS)?;
+        ctx.journal_mut()
+            .sload(
+                arbos_state::ARBOS_STATE_ADDRESS,
+                arbos_state::slot_at(storage_key, offset),
+            )
+            .map(|value| value.data)
+            .map_err(Into::into)
+    }
+
+    fn multi_gas_price(
+        ctx: &mut ArbitrumContext<DB>,
+    ) -> Result<Option<U256>, EVMError<<DB as Database>::Error>> {
+        let Some(arbos_version) = ctx.chain().multi_gas_arbos_version() else {
+            return Ok(None);
+        };
+        if arbos_version < ARBOS_VERSION_MULTI_GAS {
+            return Ok(None);
+        }
+
+        let l2_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
+        if arbos_version >= ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
+            let constraints_key = arbos_state::child_key(&l2_key, &[1]);
+            if Self::read_arbos_value(ctx, &constraints_key, 0)?.is_zero() {
+                return Ok(None);
+            }
+        }
+
+        let block_basefee = if arbos_version >= ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
+            U256::from(Self::l2_basefee(ctx))
+        } else {
+            Self::read_arbos_value(ctx, &l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET)?
+        };
+        let fees_key = arbos_state::child_key(&l2_key, &[2]);
+        let resources = *ctx.chain().multi_gas().resources();
+        let mut total = U256::ZERO;
+        for (resource, amount) in resources.into_iter().enumerate() {
+            if amount == 0 {
+                continue;
+            }
+            let resource_fee = Self::read_arbos_value(
+                ctx,
+                &fees_key,
+                NUM_RESOURCE_KIND as u64 + resource as u64,
+            )?;
+            let fee = if resource == ArbResourceKind::SingleDim as usize
+                || resource_fee.is_zero()
+            {
+                block_basefee
+            } else {
+                resource_fee
+            };
+            total = total.saturating_add(fee.saturating_mul(U256::from(amount)));
+        }
+        Ok(Some(total))
+    }
+
+    fn apply_multi_gas_refund(
+        evm: &mut ArbitrumEvm<DB, INSP>,
+        exec_result: &FrameResult,
+        network_fee_account: alloy::primitives::Address,
+    ) -> Result<(), EVMError<<DB as Database>::Error>> {
+        // Retryable redeems route refunds through their L1 deposit accounting.
+        // ArbitrumTxEnv intentionally does not carry MaxRefund, so applying the
+        // normal sender refund here would be observably wrong.
+        if evm.ctx().tx().is_retryable_redeem() {
+            return Ok(());
+        }
+        let Some(multi_gas_cost) = Self::multi_gas_price(evm.ctx_mut())? else {
+            return Ok(());
+        };
+        let basefee = U256::from(Self::l2_basefee(evm.ctx()));
+        let single_gas_cost = basefee.saturating_mul(U256::from(exec_result.gas().used()));
+        if single_gas_cost <= multi_gas_cost {
+            return Ok(());
+        }
+        let refund = single_gas_cost - multi_gas_cost;
+        let caller = evm.ctx().tx().caller();
+        if !evm
+            .ctx_mut()
+            .journal_mut()
+            .load_account_mut(network_fee_account)?
+            .decr_balance(refund)
+        {
+            return Ok(());
+        }
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account_mut(caller)?
+            .incr_balance(refund);
+        Ok(())
+    }
+
     fn finish_frame_result(
         evm: &mut ArbitrumEvm<DB, INSP>,
         frame_result: &mut FrameResult,
@@ -277,6 +377,28 @@ where
         if instruction_result.is_ok() {
             gas.record_refund(refunded);
         }
+    }
+
+    fn start_tx_hook(
+        evm: &mut ArbitrumEvm<DB, INSP>,
+        intrinsic_gas: u64,
+    ) -> Result<u64, EVMError<<DB as Database>::Error>> {
+        evm.ctx_mut().chain_mut().clear_open_contract_frames();
+        evm.ctx_mut().chain_mut().clear_current_poster_charge();
+
+        let arbos_version = evm
+            .ctx_mut()
+            .db_mut()
+            .storage(
+                arbos_state::ARBOS_STATE_ADDRESS,
+                arbos_state::slot_at(&[], arbos_state::ARBOS_VERSION_OFFSET),
+            )?
+            .wrapping_to::<u64>();
+        let intrinsic = ArbMultiGas::intrinsic(evm.ctx().tx(), intrinsic_gas);
+        evm.ctx_mut()
+            .chain_mut()
+            .begin_multi_gas(arbos_version, intrinsic);
+        Ok(arbos_version)
     }
 }
 
@@ -329,16 +451,19 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
-        evm.ctx_mut().chain_mut().clear_open_contract_frames();
-        evm.ctx_mut().chain_mut().clear_current_poster_charge();
+        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas)?;
 
         let mut gas_limit = evm
             .ctx()
             .tx()
             .gas_limit()
             .saturating_sub(init_and_floor_gas.initial_gas);
-        let held_gas =
-            self.gas_charging_hook(evm, &mut gas_limit, init_and_floor_gas.initial_gas)?;
+        let held_gas = self.gas_charging_hook(
+            evm,
+            &mut gas_limit,
+            init_and_floor_gas.initial_gas,
+            arbos_version,
+        )?;
 
         let first_frame_input = self.first_frame_input(evm, gas_limit)?;
         let mut frame_result = self.run_exec_loop(evm, first_frame_input)?;
@@ -374,6 +499,29 @@ where
         let max_refund = refundable_spent / max_refund_quotient;
         let refund = (gas.refunded() as u64).min(max_refund);
         gas.set_refund(refund as i64);
+    }
+
+    fn eip7623_check_gas_floor(
+        &self,
+        evm: &mut Self::Evm,
+        exec_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
+        init_and_floor_gas: InitialAndFloorGas,
+    ) {
+        let gas = exec_result.gas();
+        let gross_gas_used = gas.spent();
+        let net_gas_used = gas.spent_sub_refunded();
+        let refund = gas.refunded() as u64;
+        evm.ctx_mut()
+            .chain_mut()
+            .finalize_multi_gas(gross_gas_used);
+        let used_multi_gas = evm.ctx().chain().multi_gas().single_gas(refund);
+        if net_gas_used < init_and_floor_gas.floor_gas {
+            evm.ctx_mut().chain_mut().record_multi_gas(
+                ArbResourceKind::L2Calldata,
+                init_and_floor_gas.floor_gas - used_multi_gas,
+            );
+        }
+        post_execution::eip7623_check_gas_floor(exec_result.gas_mut(), init_and_floor_gas);
     }
 
     fn reimburse_caller(
@@ -450,6 +598,7 @@ where
                 poster_fee,
             )?;
         }
+        Self::apply_multi_gas_refund(evm, exec_result, beneficiary)?;
         Ok(())
     }
 
@@ -459,6 +608,7 @@ where
         error: Self::Error,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         evm.ctx_mut().chain_mut().clear_open_contract_frames();
+        evm.ctx_mut().chain_mut().clear_multi_gas();
         evm.ctx_mut().local_mut().clear();
         evm.ctx_mut().journal_mut().discard_tx();
         evm.frame_stack().clear();
@@ -679,7 +829,7 @@ mod tests {
         let mut normal_gas_remaining = 900_000;
 
         handler
-            .gas_charging_hook(&mut normal_evm, &mut normal_gas_remaining, 21_000)
+            .gas_charging_hook(&mut normal_evm, &mut normal_gas_remaining, 21_000, 51)
             .expect("normal transaction poster gas should be chargeable");
         assert!(
             normal_evm
@@ -706,7 +856,7 @@ mod tests {
         let mut retryable_gas_remaining = 900_000;
 
         handler
-            .gas_charging_hook(&mut retryable_evm, &mut retryable_gas_remaining, 21_000)
+            .gas_charging_hook(&mut retryable_evm, &mut retryable_gas_remaining, 21_000, 51)
             .expect("retryable redeem should not charge L1 poster gas");
         assert_eq!(
             retryable_evm
@@ -745,7 +895,7 @@ mod tests {
             let mut evm = evm_with_tx(tx);
             let mut gas_remaining = 900_000;
             handler
-                .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000)
+                .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000, 51)
                 .expect("poster gas should be chargeable");
             evm.ctx()
                 .chain()
@@ -811,7 +961,7 @@ mod tests {
 
             let mut gas_remaining = 479_000;
             let held = handler
-                .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000)
+                .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000, version)
                 .expect("gas charging hook");
             let poster = ArbitrumHandler::<TestDb, ()>::poster_gas(&evm);
 
@@ -830,12 +980,66 @@ mod tests {
         let mut evm = evm_with_tx(tx);
         let mut gas_remaining = 479_000;
         let held = handler
-            .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000)
+            .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000, 51)
             .expect("call-mode gas charging hook");
         assert_eq!(held, 0);
         assert_eq!(
             gas_remaining + ArbitrumHandler::<TestDb, ()>::poster_gas(&evm),
             479_000
+        );
+    }
+
+    #[test]
+    fn multi_gas_price_applies_arbos_60_and_61_fork_rules() {
+        let l2_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
+        let constraints_key = arbos_state::child_key(&l2_key, &[1]);
+        let make_context = |arbos_version, constraints_len| {
+            let mut ctx = context();
+            ctx.chain_mut().set_current_l2_context(U256::ZERO, 11);
+            ctx.db_mut()
+                .insert_account_storage(
+                    arbos_state::ARBOS_STATE_ADDRESS,
+                    arbos_state::slot_at(&l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET),
+                    U256::from(7),
+                )
+                .expect("write stored L2 base fee");
+            ctx.db_mut()
+                .insert_account_storage(
+                    arbos_state::ARBOS_STATE_ADDRESS,
+                    arbos_state::slot_at(&constraints_key, 0),
+                    U256::from(constraints_len),
+                )
+                .expect("write constraint count");
+            ctx.chain_mut()
+                .begin_multi_gas(arbos_version, Default::default());
+            ctx.chain_mut()
+                .record_multi_gas(ArbResourceKind::Computation, 2);
+            ctx
+        };
+
+        let mut arbos_60 = make_context(60, 0);
+        assert_eq!(
+            ArbitrumHandler::<TestDb, ()>::multi_gas_price(&mut arbos_60)
+                .expect("price ArbOS 60 resources"),
+            Some(U256::from(14))
+        );
+
+        let mut arbos_61_without_constraints = make_context(61, 0);
+        assert_eq!(
+            ArbitrumHandler::<TestDb, ()>::multi_gas_price(
+                &mut arbos_61_without_constraints,
+            )
+            .expect("price unconstrained ArbOS 61 resources"),
+            None
+        );
+
+        let mut arbos_61_with_constraints = make_context(61, 1);
+        assert_eq!(
+            ArbitrumHandler::<TestDb, ()>::multi_gas_price(
+                &mut arbos_61_with_constraints,
+            )
+            .expect("price constrained ArbOS 61 resources"),
+            Some(U256::from(22))
         );
     }
 
@@ -897,10 +1101,10 @@ mod tests {
         assert_eq!(result.result.gas_used(), 21_000 + poster);
     }
 
-    /// Pins the `inspect_execution` override: the traced path must charge the
-    /// same L1 poster gas as the untraced path for an identical transaction.
+    /// Pins the `inspect_execution` override: both execution paths must run the
+    /// same Arbitrum transaction hooks for an identical transaction.
     #[test]
-    fn inspected_execution_charges_poster_gas_like_transact() {
+    fn inspected_execution_runs_arbitrum_tx_hooks_like_transact() {
         use revm::inspector::NoOpInspector;
         use revm::primitives::TxKind;
         use revm::state::AccountInfo;
@@ -922,6 +1126,19 @@ mod tests {
         };
         let funded_db = || {
             let mut db = db_with_pricing();
+            let l2_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
+            db.insert_account_storage(
+                arbos_state::ARBOS_STATE_ADDRESS,
+                arbos_state::slot_at(&[], arbos_state::ARBOS_VERSION_OFFSET),
+                U256::from(60),
+            )
+            .expect("write ArbOS version");
+            db.insert_account_storage(
+                arbos_state::ARBOS_STATE_ADDRESS,
+                arbos_state::slot_at(&l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET),
+                U256::from(100),
+            )
+            .expect("write L2 base fee");
             db.insert_account_info(
                 caller,
                 AccountInfo {
@@ -957,7 +1174,12 @@ mod tests {
             .current_poster_charge()
             .expect("transact path records the poster charge")
             .poster_gas;
+        let transact_multi_gas = transact_evm.ctx().chain().multi_gas();
         assert!(transact_poster > 0);
+        assert_eq!(
+            transact_evm.ctx().chain().multi_gas_arbos_version(),
+            Some(60)
+        );
 
         let mut inspect_evm = ArbitrumEvm::new(
             block_env(),
@@ -974,9 +1196,79 @@ mod tests {
             .current_poster_charge()
             .expect("inspected path records the poster charge")
             .poster_gas;
+        let inspect_multi_gas = inspect_evm.ctx().chain().multi_gas();
 
         assert_eq!(inspect_poster, transact_poster);
+        assert_eq!(inspect_multi_gas, transact_multi_gas);
         assert_eq!(inspect_result.gas_used(), transact_result.result.gas_used());
+    }
+
+    #[test]
+    fn calldata_floor_uses_classified_multi_gas_after_refund() {
+        use revm::interpreter::{CallOutcome, InstructionResult, InterpreterResult};
+
+        let mut evm = evm_with_tx(ArbitrumTxEnv::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .begin_multi_gas(60, ArbMultiGas::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::Computation, 80);
+        evm.ctx_mut()
+            .chain_mut()
+            .leave_multi_gas_unattributed(10);
+
+        let mut gas = Gas::new(100);
+        assert!(gas.record_cost(100));
+        gas.record_refund(20);
+        let mut result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
+            0..0,
+        ));
+
+        ArbitrumHandler::<TestDb, ()>::new().eip7623_check_gas_floor(
+            &mut evm,
+            &mut result,
+            InitialAndFloorGas::new(0, 100),
+        );
+
+        let multi_gas = evm.ctx().chain().multi_gas();
+        assert_eq!(multi_gas.get(ArbResourceKind::Computation), 90);
+        assert_eq!(multi_gas.get(ArbResourceKind::L2Calldata), 30);
+        assert_eq!(multi_gas.single_gas(20), 100);
+    }
+
+    #[test]
+    fn calldata_floor_condition_uses_transaction_net_gas() {
+        use revm::interpreter::{CallOutcome, InstructionResult, InterpreterResult};
+
+        let mut evm = evm_with_tx(ArbitrumTxEnv::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .begin_multi_gas(60, ArbMultiGas::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::Computation, 80);
+        evm.ctx_mut()
+            .chain_mut()
+            .leave_multi_gas_unattributed(10);
+
+        let mut gas = Gas::new(100);
+        assert!(gas.record_cost(100));
+        let mut result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
+            0..0,
+        ));
+
+        ArbitrumHandler::<TestDb, ()>::new().eip7623_check_gas_floor(
+            &mut evm,
+            &mut result,
+            InitialAndFloorGas::new(0, 100),
+        );
+
+        let multi_gas = evm.ctx().chain().multi_gas();
+        assert_eq!(multi_gas.get(ArbResourceKind::Computation), 90);
+        assert_eq!(multi_gas.get(ArbResourceKind::L2Calldata), 0);
     }
 
     #[test]
@@ -984,6 +1276,12 @@ mod tests {
         let address = Address::with_last_byte(0x42);
         let mut evm = evm_with_tx(ArbitrumTxEnv::default());
         evm.ctx_mut().chain_mut().enter_contract_frame(address);
+        evm.ctx_mut()
+            .chain_mut()
+            .begin_multi_gas(60, Default::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::Computation, 1);
         assert_eq!(evm.ctx().chain().open_contract_frame_count(address), 1);
 
         let error: EVMError<<TestDb as Database>::Error> =
@@ -994,6 +1292,8 @@ mod tests {
             matches!(result, Err(EVMError::Custom(message)) if message == "synthetic execution error")
         );
         assert_eq!(evm.ctx().chain().open_contract_frame_count(address), 0);
+        assert_eq!(evm.ctx().chain().multi_gas_arbos_version(), None);
+        assert_eq!(evm.ctx().chain().multi_gas().total(), 0);
     }
 }
 
@@ -1014,16 +1314,19 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
-        evm.ctx_mut().chain_mut().clear_open_contract_frames();
-        evm.ctx_mut().chain_mut().clear_current_poster_charge();
+        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas)?;
 
         let mut gas_limit = evm
             .ctx()
             .tx()
             .gas_limit()
             .saturating_sub(init_and_floor_gas.initial_gas);
-        let held_gas =
-            self.gas_charging_hook(evm, &mut gas_limit, init_and_floor_gas.initial_gas)?;
+        let held_gas = self.gas_charging_hook(
+            evm,
+            &mut gas_limit,
+            init_and_floor_gas.initial_gas,
+            arbos_version,
+        )?;
 
         let first_frame_input = self.first_frame_input(evm, gas_limit)?;
         let mut frame_result = self.inspect_run_exec_loop(evm, first_frame_input)?;

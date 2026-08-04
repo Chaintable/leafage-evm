@@ -17,6 +17,7 @@
 //! Full `CaptureHostIO` opcode tracing remains deliberately absent: request 14
 //! stays a no-op because the registered API only consumes logs and SSTOREs.
 
+use super::multigas::{ArbMultiGas, ArbResourceKind};
 use super::ArbitrumEvm;
 use crate::arbitrum::arbos_state::read_blockhashes_l1_block_number;
 use crate::arbitrum::precompile::{
@@ -137,6 +138,7 @@ const ARBOS_STYLUS_FIXES: u64 = 31;
 /// open-page total (`api.go:507-512`).
 const ARBOS_PAGE_LIMIT: u64 = 59;
 const ARBOS_RECENT_WASMS: u64 = 60;
+const ARBOS_MULTI_GAS_REFUND_FIX: u64 = 61;
 
 #[derive(Debug, Eq, PartialEq)]
 enum StylusFrameDisposition {
@@ -241,6 +243,7 @@ where
             code, code_hash, calldata, contract, caller, value, is_static, gas_limit,
         )
     };
+    let starting_multi_gas = evm.inner.ctx.chain().multi_gas_total();
 
     // 2. Read Programs state. An inactive, stale, or expired program is an
     //    exceptional child failure in Nitro: it rolls back and consumes all
@@ -307,6 +310,18 @@ where
         && new_open > prepared.page_limit;
     if over_page_limit || !gas.record_cost(precharge) {
         gas.spend_all();
+        if arbos_version >= ARBOS_MULTI_GAS_REFUND_FIX {
+            evm.inner.ctx.chain_mut().attribute_wasm_computation(
+                starting_multi_gas,
+                gas_limit,
+                gas.remaining(),
+            );
+        } else {
+            evm.inner
+                .ctx
+                .chain_mut()
+                .leave_multi_gas_unattributed(gas_limit);
+        }
         return finish_frame(evm, InstructionResult::OutOfGas, Bytes::new(), gas);
     }
     // Reserve the footprint pages for the call (nitro `AddStylusPages`); restored
@@ -471,6 +486,11 @@ where
         let evm_cost = evm_memory_cost(output.len() as u64);
         if gas_limit < evm_cost {
             gas.spend_all();
+            evm.inner.ctx.chain_mut().attribute_wasm_computation(
+                starting_multi_gas,
+                gas_limit,
+                gas.remaining(),
+            );
             return finish_frame(evm, InstructionResult::OutOfGas, Bytes::new(), gas);
         }
         let excess = gas.remaining().saturating_sub(gas_limit - evm_cost);
@@ -478,6 +498,11 @@ where
             let _ = gas.record_cost(excess);
         }
     }
+    evm.inner.ctx.chain_mut().attribute_wasm_computation(
+        starting_multi_gas,
+        gas_limit,
+        gas.remaining(),
+    );
     finish_frame(evm, result, output, gas)
 }
 
@@ -884,7 +909,8 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
     /// answers by burning the whole budget.
     fn call_base_cost(&mut self, target: Address, value: U256, budget: u64) -> Option<u64> {
         let transfers_value = value > U256::ZERO;
-        let mut total = self.gas_params.warm_storage_read_cost();
+        let warm_read = self.gas_params.warm_storage_read_cost();
+        let mut total = warm_read;
         if total > budget {
             return None;
         }
@@ -919,6 +945,27 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
                 return None;
             }
         }
+        let mut multi_gas = ArbMultiGas::default();
+        multi_gas.record(ArbResourceKind::Computation, warm_read);
+        if is_cold {
+            multi_gas.record(
+                ArbResourceKind::StorageAccessRead,
+                self.gas_params.cold_account_additional_cost(),
+            );
+        }
+        if transfers_value && is_empty {
+            multi_gas.record(
+                ArbResourceKind::StorageGrowth,
+                self.gas_params.new_account_cost(true, true),
+            );
+        }
+        if transfers_value {
+            multi_gas.record(
+                ArbResourceKind::Computation,
+                self.gas_params.transfer_value_cost(),
+            );
+        }
+        self.ctx().chain_mut().record_multi_gas_cost(multi_gas);
         Some(total)
     }
 
@@ -938,6 +985,20 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             } else {
                 0
             }
+    }
+
+    fn record_account_touch(&mut self, is_cold: bool, with_code: bool) -> u64 {
+        let cost = if with_code {
+            self.account_code_cost(is_cold)
+        } else {
+            self.account_touch_cost(is_cold)
+        };
+        let computation = self.gas_params.warm_storage_read_cost();
+        let storage_read = cost.saturating_sub(computation);
+        let chain = self.ctx().chain_mut();
+        chain.record_multi_gas(ArbResourceKind::Computation, computation);
+        chain.record_multi_gas(ArbResourceKind::StorageAccessRead, storage_read);
+        cost
     }
 
     fn get_bytes32(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, u64) {
@@ -960,6 +1021,16 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             }
         };
         let cost = self.storage_load_cost(is_cold);
+        let computation = self.gas_params.warm_storage_read_cost();
+        self.ctx()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::Computation, computation);
+        if is_cold {
+            let storage_read = self.gas_params.cold_storage_additional_cost();
+            self.ctx()
+                .chain_mut()
+                .record_multi_gas(ArbResourceKind::StorageAccessRead, storage_read);
+        }
         (value.to_be_bytes::<32>().to_vec(), Vec::new(), cost)
     }
 
@@ -976,6 +1047,7 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         let budget = u64::from_be_bytes(input[..8].try_into().unwrap());
         let contract = self.contract;
         let mut remaining = budget;
+        let mut multi_gas = ArbMultiGas::default();
         let mut out_of_gas = false;
         let mut offset = 8;
         while input.len() >= offset + 64 {
@@ -1002,6 +1074,13 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
                         break;
                     }
                     self.ctx().journal_mut().checkpoint_commit();
+                    multi_gas.add(ArbMultiGas::sstore_cost(
+                        &self.gas_params,
+                        load.data.original_value,
+                        load.data.present_value,
+                        load.data.new_value,
+                        load.is_cold,
+                    ));
                     self.refund += self.gas_params.sstore_refund(true, &load.data);
                     remaining -= slot_cost;
                     D::end_sstore_step(self.evm, &mut trace_step);
@@ -1029,6 +1108,9 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         } else {
             API_STATUS_SUCCESS
         };
+        if status == API_STATUS_SUCCESS {
+            self.ctx().chain_mut().record_multi_gas_cost(multi_gas);
+        }
         (vec![status], Vec::new(), budget.saturating_sub(remaining))
     }
 
@@ -1198,6 +1280,9 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         if gas < base_cost {
             return (create_error(OUT_OF_GAS_ERROR), Vec::new(), gas);
         }
+        self.ctx()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::Computation, base_cost);
         // EIP-150 keeps a 64th back for the caller — note nitro splits this as
         // `gas -= gas / 64` *after* the base cost, unlike the call path.
         let after_base = gas - base_cost;
@@ -1266,6 +1351,14 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             .map(|i| B256::from_slice(&input[4 + i * 32..4 + (i + 1) * 32]))
             .collect::<Vec<_>>();
         let data = Bytes::copy_from_slice(&input[topics_end..]);
+        const LOG_TOPIC_HISTORY_GAS: u64 = 32 * 8;
+        const LOG_DATA_GAS: u64 = 8;
+        self.ctx().chain_mut().record_multi_gas(
+            ArbResourceKind::HistoryGrowth,
+            (num_topics as u64)
+                .saturating_mul(LOG_TOPIC_HISTORY_GAS)
+                .saturating_add((data.len() as u64).saturating_mul(LOG_DATA_GAS)),
+        );
         let contract = self.contract;
         let log = Log::new_unchecked(contract, topics, data);
         self.ctx().journal_mut().log(log.clone());
@@ -1286,15 +1379,16 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         let (balance, is_cold) = match account {
             Ok(account) => account,
             Err(error) => {
-                let cost = self.account_touch_cost(false);
+                let cost = self.record_account_touch(false, false);
                 self.latch_fatal_error(ContextError::Db(error));
                 return (vec![0u8; 32], Vec::new(), cost);
             }
         };
+        let cost = self.record_account_touch(is_cold, false);
         (
             balance.to_be_bytes::<32>().to_vec(),
             Vec::new(),
-            self.account_touch_cost(is_cold),
+            cost,
         )
     }
 
@@ -1311,15 +1405,16 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         let (hash, is_cold) = match code_hash {
             Ok(code_hash) => code_hash,
             Err(error) => {
-                let cost = self.account_touch_cost(false);
+                let cost = self.record_account_touch(false, false);
                 self.latch_fatal_error(ContextError::Db(error));
                 return (vec![0u8; 32], Vec::new(), cost);
             }
         };
+        let cost = self.record_account_touch(is_cold, false);
         (
             hash.0.to_vec(),
             Vec::new(),
-            self.account_touch_cost(is_cold),
+            cost,
         )
     }
 
@@ -1339,12 +1434,12 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         let (code, is_cold) = match account_code {
             Ok(account_code) => account_code,
             Err(error) => {
-                let cost = self.account_code_cost(false);
+                let cost = self.record_account_touch(false, true);
                 self.latch_fatal_error(ContextError::Db(error));
                 return (Vec::new(), Vec::new(), cost);
             }
         };
-        let cost = self.account_code_cost(is_cold);
+        let cost = self.record_account_touch(is_cold, true);
         // nitro still bills the full cost but hands back no code when the
         // program cannot afford the load, which then runs it out of ink
         // (`api.go:289-299`).

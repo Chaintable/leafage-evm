@@ -2,6 +2,7 @@ use super::abi::IArbDebug;
 use super::state::ArbStorage;
 use super::util::{copy_gas, dispatch, empty_revert, finish_call, topic_address, topic_u256};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_DEBUG_ADDRESS};
+use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::SolValue;
 use revm::context::{ContextTr, JournalTr};
@@ -136,14 +137,14 @@ impl ArbDebug {
         flag: bool,
         value: B256,
     ) -> Result<(), PrecompileError> {
-        storage.burn(Self::log_gas(2, 32))?;
+        storage.burn_resource(ArbResourceKind::HistoryGrowth, Self::log_gas(2, 32))?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_DEBUG_ADDRESS,
             vec![keccak256("Basic(bool,bytes32)"), value],
             Bytes::from((!flag,).abi_encode()),
         ));
 
-        storage.burn(Self::log_gas(4, 64))?;
+        storage.burn_resource(ArbResourceKind::HistoryGrowth, Self::log_gas(4, 64))?;
         storage.context.journal_mut().log(Log::new_unchecked(
             ARB_DEBUG_ADDRESS,
             vec![
