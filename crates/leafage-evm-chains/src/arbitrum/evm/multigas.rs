@@ -227,6 +227,9 @@ fn meter_account_load<DB>(
 ) where
     DB: Database + DatabaseRef,
 {
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, instruction);
+    }
     let start = journal_len(context.host);
     run_stock(&mut context, instruction);
     if failed(context.interpreter) {
@@ -270,6 +273,9 @@ where
     DB: Database + DatabaseRef,
 {
     let mut context = context;
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, host::extcodecopy);
+    }
     let len = context
         .interpreter
         .stack
@@ -305,6 +311,9 @@ fn sload<DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpr
 where
     DB: Database + DatabaseRef,
 {
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, host::sload);
+    }
     let start = journal_len(context.host);
     run_stock(&mut context, host::sload);
     if failed(context.interpreter) {
@@ -329,6 +338,9 @@ fn sstore<DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterp
 where
     DB: Database + DatabaseRef,
 {
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, host::sstore);
+    }
     let stack = context.interpreter.stack.data();
     let Some((&key, &new_value)) = stack
         .len()
@@ -386,6 +398,9 @@ fn log<const N: usize, DB>(mut context: InstructionContext<'_, ArbitrumContext<D
 where
     DB: Database + DatabaseRef,
 {
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, host::log::<N, _>);
+    }
     let len = context
         .interpreter
         .stack
@@ -445,6 +460,9 @@ fn meter_call<DB>(
 ) where
     DB: Database + DatabaseRef,
 {
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, instruction);
+    }
     let stack = context.interpreter.stack.data();
     let target = stack.iter().rev().nth(1).copied().map(word_to_address);
     let value = charges_new_account
@@ -482,10 +500,13 @@ fn meter_call<DB>(
     chain.record_multi_gas(ArbResourceKind::StorageGrowth, storage_growth);
 }
 
-fn selfdestruct<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn selfdestruct<DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
 where
     DB: Database + DatabaseRef,
 {
+    if context.host.chain().multi_gas_arbos_version().is_none() {
+        return run_stock(&mut context, host::selfdestruct);
+    }
     if context.interpreter.runtime_flag.is_static() {
         context
             .interpreter

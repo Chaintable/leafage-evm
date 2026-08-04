@@ -3,10 +3,10 @@
 use super::ArbitrumEvm;
 use super::multigas::{ArbMultiGas, ArbResourceKind, NUM_RESOURCE_KIND};
 use super::poster_gas::ArbPosterCharge;
-use crate::arbitrum::arbos_state::{self, ArbPricing, ArbStateReader};
+use crate::arbitrum::arbos_state::{self, ArbPricing};
 use crate::arbitrum::precompile::{ArbitrumContext, L1_PRICER_FUNDS_POOL_ADDRESS};
 use crate::arbitrum::tx::nitro_message_gas_price;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use revm::{
     Database, DatabaseRef,
     context::{
@@ -63,27 +63,34 @@ where
             .unwrap_or_else(|| ctx.block().basefee()) as u128
     }
 
-    fn collect_tips(ctx: &ArbitrumContext<DB>) -> bool {
-        super::instructions::collects_tips(ctx)
+    fn collect_tips(
+        ctx: &mut ArbitrumContext<DB>,
+    ) -> Result<bool, EVMError<<DB as Database>::Error>> {
+        super::instructions::collects_tips(ctx).map_err(EVMError::Database)
     }
 
-    fn effective_gas_price(ctx: &ArbitrumContext<DB>) -> u128 {
+    fn effective_gas_price(
+        ctx: &mut ArbitrumContext<DB>,
+    ) -> Result<u128, EVMError<<DB as Database>::Error>> {
         let basefee = Self::l2_basefee(ctx);
-        if Self::collect_tips(ctx) {
-            nitro_message_gas_price(ctx.tx(), basefee)
+        if Self::collect_tips(ctx)? {
+            Ok(nitro_message_gas_price(ctx.tx(), basefee))
         } else {
-            nitro_message_gas_price(ctx.tx(), basefee).min(basefee)
+            Ok(nitro_message_gas_price(ctx.tx(), basefee).min(basefee))
         }
     }
 
-    fn paid_l1_gas_price(ctx: &ArbitrumContext<DB>, block_base_fee: u64) -> U256 {
-        if Self::collect_tips(ctx) {
+    fn paid_l1_gas_price(
+        ctx: &mut ArbitrumContext<DB>,
+        block_base_fee: u64,
+    ) -> Result<U256, EVMError<<DB as Database>::Error>> {
+        if Self::collect_tips(ctx)? {
             let price = nitro_message_gas_price(ctx.tx(), block_base_fee as u128);
             if price != 0 {
-                return U256::from(price);
+                return Ok(U256::from(price));
             }
         }
-        U256::from(block_base_fee)
+        Ok(U256::from(block_base_fee))
     }
 
     fn effective_balance_spending(
@@ -201,10 +208,11 @@ where
             ArbPricing::read_from_db(evm.ctx_mut().db_mut())?
         };
         let charge = if let Some(pricing) = pricing {
+            let paid_l1_gas_price = Self::paid_l1_gas_price(evm.ctx_mut(), l2_basefee)?;
             let ctx = evm.ctx();
             pricing.gas_charging_charge(
                 &ctx.tx().base,
-                Self::paid_l1_gas_price(ctx, l2_basefee),
+                paid_l1_gas_price,
                 gas_estimation,
             )
         } else {
@@ -265,6 +273,14 @@ where
     ) -> Result<U256, EVMError<<DB as Database>::Error>> {
         ctx.journal_mut()
             .load_account(arbos_state::ARBOS_STATE_ADDRESS)?;
+        Self::read_loaded_arbos_value(ctx, storage_key, offset)
+    }
+
+    fn read_loaded_arbos_value(
+        ctx: &mut ArbitrumContext<DB>,
+        storage_key: &[u8],
+        offset: u64,
+    ) -> Result<U256, EVMError<<DB as Database>::Error>> {
         ctx.journal_mut()
             .sload(
                 arbos_state::ARBOS_STATE_ADDRESS,
@@ -272,6 +288,14 @@ where
             )
             .map(|value| value.data)
             .map_err(Into::into)
+    }
+
+    fn network_fee_account(
+        ctx: &mut ArbitrumContext<DB>,
+    ) -> Result<Address, EVMError<<DB as Database>::Error>> {
+        let value = Self::read_arbos_value(ctx, &[], arbos_state::NETWORK_FEE_ACCOUNT_OFFSET)?;
+        let bytes = value.to_be_bytes::<32>();
+        Ok(Address::from_slice(&bytes[12..]))
     }
 
     fn multi_gas_price(
@@ -283,11 +307,13 @@ where
         if arbos_version < ARBOS_VERSION_MULTI_GAS {
             return Ok(None);
         }
+        ctx.journal_mut()
+            .load_account(arbos_state::ARBOS_STATE_ADDRESS)?;
 
         let l2_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
         if arbos_version >= ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
             let constraints_key = arbos_state::child_key(&l2_key, &[1]);
-            if Self::read_arbos_value(ctx, &constraints_key, 0)?.is_zero() {
+            if Self::read_loaded_arbos_value(ctx, &constraints_key, 0)?.is_zero() {
                 return Ok(None);
             }
         }
@@ -295,7 +321,7 @@ where
         let block_basefee = if arbos_version >= ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
             U256::from(Self::l2_basefee(ctx))
         } else {
-            Self::read_arbos_value(ctx, &l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET)?
+            Self::read_loaded_arbos_value(ctx, &l2_key, arbos_state::L2_BASE_FEE_WEI_OFFSET)?
         };
         let fees_key = arbos_state::child_key(&l2_key, &[2]);
         let resources = *ctx.chain().multi_gas().resources();
@@ -304,7 +330,7 @@ where
             if amount == 0 {
                 continue;
             }
-            let resource_fee = Self::read_arbos_value(
+            let resource_fee = Self::read_loaded_arbos_value(
                 ctx,
                 &fees_key,
                 NUM_RESOURCE_KIND as u64 + resource as u64,
@@ -379,26 +405,16 @@ where
         }
     }
 
-    fn start_tx_hook(
-        evm: &mut ArbitrumEvm<DB, INSP>,
-        intrinsic_gas: u64,
-    ) -> Result<u64, EVMError<<DB as Database>::Error>> {
+    fn start_tx_hook(evm: &mut ArbitrumEvm<DB, INSP>, intrinsic_gas: u64) -> u64 {
         evm.ctx_mut().chain_mut().clear_open_contract_frames();
         evm.ctx_mut().chain_mut().clear_current_poster_charge();
 
-        let arbos_version = evm
-            .ctx_mut()
-            .db_mut()
-            .storage(
-                arbos_state::ARBOS_STATE_ADDRESS,
-                arbos_state::slot_at(&[], arbos_state::ARBOS_VERSION_OFFSET),
-            )?
-            .wrapping_to::<u64>();
+        let arbos_version = evm.ctx().chain().current_arbos_version();
         let intrinsic = ArbMultiGas::intrinsic(evm.ctx().tx(), intrinsic_gas);
         evm.ctx_mut()
             .chain_mut()
             .begin_multi_gas(arbos_version, intrinsic);
-        Ok(arbos_version)
+        arbos_version
     }
 }
 
@@ -420,7 +436,7 @@ where
         &self,
         evm: &mut Self::Evm,
     ) -> Result<(), Self::Error> {
-        let effective_gas_price = Self::effective_gas_price(evm.ctx());
+        let effective_gas_price = Self::effective_gas_price(evm.ctx_mut())?;
         let blob_price = evm.ctx().block().blob_gasprice().unwrap_or_default();
         let (block, tx, cfg, journal, _, _) = evm.ctx_mut().all_mut();
 
@@ -451,7 +467,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
-        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas)?;
+        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas);
 
         let mut gas_limit = evm
             .ctx()
@@ -518,7 +534,7 @@ where
         if net_gas_used < init_and_floor_gas.floor_gas {
             evm.ctx_mut().chain_mut().record_multi_gas(
                 ArbResourceKind::L2Calldata,
-                init_and_floor_gas.floor_gas - used_multi_gas,
+                init_and_floor_gas.floor_gas.saturating_sub(used_multi_gas),
             );
         }
         post_execution::eip7623_check_gas_floor(exec_result.gas_mut(), init_and_floor_gas);
@@ -533,7 +549,7 @@ where
             return Ok(());
         }
 
-        let effective_gas_price = Self::effective_gas_price(evm.ctx());
+        let effective_gas_price = Self::effective_gas_price(evm.ctx_mut())?;
         let gas = exec_result.gas();
         let refund_gas = gas.remaining().saturating_add(gas.refunded() as u64);
         let refund = U256::from(effective_gas_price.saturating_mul(refund_gas as u128));
@@ -555,8 +571,8 @@ where
             return Ok(());
         }
 
-        let effective_gas_price = Self::effective_gas_price(evm.ctx());
-        let arbos_version = evm.ctx().db().arbos_version();
+        let effective_gas_price = Self::effective_gas_price(evm.ctx_mut())?;
+        let arbos_version = evm.ctx().chain().current_arbos_version();
         let poster_gas = Self::poster_gas(evm);
         let compute_gas = exec_result.gas().used().saturating_sub(poster_gas);
         let compute_fee = U256::from(effective_gas_price.saturating_mul(compute_gas as u128));
@@ -570,11 +586,7 @@ where
                 .unwrap_or_default()
         };
 
-        let beneficiary = evm
-            .ctx()
-            .db()
-            .network_fee_account()
-            .unwrap_or_else(|| evm.ctx().block().beneficiary());
+        let beneficiary = Self::network_fee_account(evm.ctx_mut())?;
         evm.ctx_mut()
             .journal_mut()
             .load_account_mut(beneficiary)?
@@ -632,6 +644,49 @@ mod tests {
 
     type TestDb = CacheDB<EmptyDB>;
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    #[derive(Clone)]
+    struct FailingArbosStorage {
+        slot: U256,
+    }
+
+    impl DatabaseRef for FailingArbosStorage {
+        type Error = ExpectedDbError;
+
+        fn basic_ref(
+            &self,
+            address: Address,
+        ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Ok((address == arbos_state::ARBOS_STATE_ADDRESS).then(Default::default))
+        }
+
+        fn code_by_hash_ref(&self, _: B256) -> Result<revm::bytecode::Bytecode, Self::Error> {
+            Ok(Default::default())
+        }
+
+        fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            if address == arbos_state::ARBOS_STATE_ADDRESS && index == self.slot {
+                return Err(ExpectedDbError);
+            }
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
     fn context() -> ArbitrumContext<TestDb> {
         Context::mainnet()
             .with_tx(ArbitrumTxEnv::default())
@@ -656,6 +711,8 @@ mod tests {
         )
         .expect("write collectTips");
 
+        let mut execution_context = ArbitrumExecutionContext::default();
+        execution_context.set_current_arbos_version(60);
         Context::mainnet()
             .with_tx(ArbitrumTxEnv::new(
                 TxEnv {
@@ -671,7 +728,7 @@ mod tests {
             })
             .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
             .with_db(db)
-            .with_chain(ArbitrumExecutionContext::default())
+            .with_chain(execution_context)
     }
 
     fn db_with_pricing() -> TestDb {
@@ -723,7 +780,10 @@ mod tests {
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             db_with_pricing(),
             (),
-            ArbitrumPrecompileEnv::default(),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 51,
+                ..Default::default()
+            },
             execution_context,
         );
         evm.inner.ctx.tx = tx;
@@ -766,25 +826,25 @@ mod tests {
 
     #[test]
     fn delayed_message_blocks_do_not_collect_tips() {
-        let batch_poster = context_with_collect_tips(BATCH_POSTER_ADDRESS);
-        assert!(ArbitrumHandler::<TestDb, ()>::collect_tips(&batch_poster));
+        let mut batch_poster = context_with_collect_tips(BATCH_POSTER_ADDRESS);
+        assert!(ArbitrumHandler::<TestDb, ()>::collect_tips(&mut batch_poster).unwrap());
         assert_eq!(
-            ArbitrumHandler::<TestDb, ()>::effective_gas_price(&batch_poster),
+            ArbitrumHandler::<TestDb, ()>::effective_gas_price(&mut batch_poster).unwrap(),
             200
         );
         assert_eq!(
-            ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&batch_poster, 100),
+            ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&mut batch_poster, 100).unwrap(),
             U256::from(200)
         );
 
-        let delayed = context_with_collect_tips(Address::with_last_byte(0x01));
-        assert!(!ArbitrumHandler::<TestDb, ()>::collect_tips(&delayed));
+        let mut delayed = context_with_collect_tips(Address::with_last_byte(0x01));
+        assert!(!ArbitrumHandler::<TestDb, ()>::collect_tips(&mut delayed).unwrap());
         assert_eq!(
-            ArbitrumHandler::<TestDb, ()>::effective_gas_price(&delayed),
+            ArbitrumHandler::<TestDb, ()>::effective_gas_price(&mut delayed).unwrap(),
             100
         );
         assert_eq!(
-            ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&delayed, 100),
+            ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&mut delayed, 100).unwrap(),
             U256::from(100)
         );
     }
@@ -803,13 +863,104 @@ mod tests {
         );
 
         assert_eq!(
-            ArbitrumHandler::<TestDb, ()>::effective_gas_price(&batch_poster),
+            ArbitrumHandler::<TestDb, ()>::effective_gas_price(&mut batch_poster).unwrap(),
             100
         );
         assert_eq!(
-            ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&batch_poster, 100),
+            ArbitrumHandler::<TestDb, ()>::paid_l1_gas_price(&mut batch_poster, 100).unwrap(),
             U256::from(100)
         );
+    }
+
+    #[test]
+    fn collect_tips_error_aborts_transaction() {
+        use revm::ExecuteEvm;
+        use revm::state::AccountInfo;
+
+        let caller = Address::with_last_byte(0xc0);
+        let mut db = CacheDB::new(FailingArbosStorage {
+            slot: arbos_state::slot_at(&[], arbos_state::COLLECT_TIPS_OFFSET),
+        });
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                ..Default::default()
+            },
+        );
+        let mut evm = ArbitrumEvm::new(
+            BlockEnv {
+                beneficiary: BATCH_POSTER_ADDRESS,
+                gas_limit: 1_000_000,
+                ..Default::default()
+            },
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            db,
+            (),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 60,
+                ..Default::default()
+            },
+            ArbitrumExecutionContext::default(),
+        );
+
+        let error = evm
+            .transact(ArbitrumTxEnv::new(
+                TxEnv {
+                    caller,
+                    gas_limit: 100_000,
+                    kind: revm::primitives::TxKind::Call(Address::with_last_byte(0xee)),
+                    ..Default::default()
+                },
+                Default::default(),
+            ))
+            .expect_err("collectTips failure must abort execution");
+        assert!(matches!(error, EVMError::Database(ExpectedDbError)));
+    }
+
+    #[test]
+    fn network_fee_account_error_aborts_transaction() {
+        use revm::ExecuteEvm;
+        use revm::state::AccountInfo;
+
+        let caller = Address::with_last_byte(0xc1);
+        let mut db = CacheDB::new(FailingArbosStorage {
+            slot: arbos_state::slot_at(&[], arbos_state::NETWORK_FEE_ACCOUNT_OFFSET),
+        });
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                ..Default::default()
+            },
+        );
+        let mut evm = ArbitrumEvm::new(
+            BlockEnv {
+                gas_limit: 1_000_000,
+                ..Default::default()
+            },
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            db,
+            (),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 40,
+                ..Default::default()
+            },
+            ArbitrumExecutionContext::default(),
+        );
+
+        let error = evm
+            .transact(ArbitrumTxEnv::new(
+                TxEnv {
+                    caller,
+                    gas_limit: 100_000,
+                    kind: revm::primitives::TxKind::Call(Address::with_last_byte(0xee)),
+                    ..Default::default()
+                },
+                Default::default(),
+            ))
+            .expect_err("network fee account failure must abort execution");
+        assert!(matches!(error, EVMError::Database(ExpectedDbError)));
     }
 
     #[test]
@@ -1077,7 +1228,10 @@ mod tests {
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             db,
             (),
-            ArbitrumPrecompileEnv::default(),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 51,
+                ..Default::default()
+            },
             execution_context,
         );
         let result = evm
@@ -1164,7 +1318,10 @@ mod tests {
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             funded_db(),
             NoOpInspector {},
-            ArbitrumPrecompileEnv::default(),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 60,
+                ..Default::default()
+            },
             execution_context(),
         );
         let transact_result = transact_evm.transact(make_tx()).expect("transact");
@@ -1186,7 +1343,10 @@ mod tests {
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             funded_db(),
             NoOpInspector {},
-            ArbitrumPrecompileEnv::default(),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 60,
+                ..Default::default()
+            },
             execution_context(),
         );
         let inspect_result = inspect_evm.inspect_one_tx(make_tx()).expect("inspect");
@@ -1272,6 +1432,40 @@ mod tests {
     }
 
     #[test]
+    fn calldata_floor_does_not_underflow_when_classification_is_over_attributed() {
+        use revm::interpreter::{CallOutcome, InstructionResult, InterpreterResult};
+
+        let mut evm = evm_with_tx(ArbitrumTxEnv::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .begin_multi_gas(60, ArbMultiGas::default());
+        evm.ctx_mut()
+            .chain_mut()
+            .record_multi_gas(ArbResourceKind::Computation, 120);
+
+        let mut gas = Gas::new(100);
+        assert!(gas.record_cost(100));
+        let mut result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
+            0..0,
+        ));
+
+        ArbitrumHandler::<TestDb, ()>::new().eip7623_check_gas_floor(
+            &mut evm,
+            &mut result,
+            InitialAndFloorGas::new(0, 110),
+        );
+
+        assert_eq!(
+            evm.ctx()
+                .chain()
+                .multi_gas()
+                .get(ArbResourceKind::L2Calldata),
+            0
+        );
+    }
+
+    #[test]
     fn catch_error_clears_open_contract_frame_counts() {
         let address = Address::with_last_byte(0x42);
         let mut evm = evm_with_tx(ArbitrumTxEnv::default());
@@ -1314,7 +1508,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
-        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas)?;
+        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas);
 
         let mut gas_limit = evm
             .ctx()

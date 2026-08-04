@@ -11,25 +11,28 @@ pub(crate) fn create_arbitrum_evm_from_state<StateDB, INSP>(
     mut cfg: CfgEnv<ArbitrumHardfork>,
     state: StateDB,
     inspector: INSP,
-    precompile_env: ArbitrumPrecompileEnv,
+    mut precompile_env: ArbitrumPrecompileEnv,
     execution_context: ArbitrumExecutionContext,
-) -> ArbitrumEvm<WrapDatabaseRef<StateDB>, INSP>
+) -> Result<ArbitrumEvm<WrapDatabaseRef<StateDB>, INSP>, StateDB::Error>
 where
     StateDB: DatabaseRef,
 {
+    let arbos_version = state.try_arbos_version()?;
+    precompile_env.current_arbos_version = arbos_version;
+
     // Nitro applies the EIP-7623 calldata gas floor only from ArbOS 40 with
     // the chain-owner feature flag set (`state_transition.go`,
     // `TxProcessor.IsCalldataPricingIncreaseEnabled`); revm would otherwise
     // always apply it from Prague.
-    cfg.disable_eip7623 = !state.is_calldata_price_increase_enabled();
-    ArbitrumEvm::new(
+    cfg.disable_eip7623 = !state.try_is_calldata_price_increase_enabled(arbos_version)?;
+    Ok(ArbitrumEvm::new(
         block_env,
         cfg,
         WrapDatabaseRef(state),
         inspector,
         precompile_env,
         execution_context,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -41,6 +44,64 @@ mod tests {
     use revm::inspector::NoOpInspector;
     use revm::primitives::{address, keccak256, Bytes, TxKind, U256};
     use revm::ExecuteEvm;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    struct FailingArbosState {
+        version: Result<u64, ExpectedDbError>,
+        fail_features: bool,
+    }
+
+    impl DatabaseRef for FailingArbosState {
+        type Error = ExpectedDbError;
+
+        fn basic_ref(
+            &self,
+            _: revm::primitives::Address,
+        ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn code_by_hash_ref(
+            &self,
+            _: revm::primitives::B256,
+        ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+            Ok(Default::default())
+        }
+
+        fn storage_ref(
+            &self,
+            _: revm::primitives::Address,
+            index: U256,
+        ) -> Result<U256, Self::Error> {
+            if index == slot(&[], 0) {
+                return self
+                    .version
+                    .as_ref()
+                    .map(|version| U256::from(*version))
+                    .map_err(Clone::clone);
+            }
+            let features_key = keccak256([&[] as &[u8], &[9u8][..]].concat());
+            if self.fail_features && index == slot(features_key.as_slice(), 0) {
+                return Err(ExpectedDbError);
+            }
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash_ref(&self, _: u64) -> Result<revm::primitives::B256, Self::Error> {
+            Ok(revm::primitives::B256::ZERO)
+        }
+    }
 
     /// Independent re-derivation of the ArbOS slot scheme
     /// (`keccak(storageKey ++ key[:31])[:31] ++ key[31]`).
@@ -75,7 +136,8 @@ mod tests {
             NoOpInspector {},
             ArbitrumPrecompileEnv::default(),
             ArbitrumExecutionContext::default(),
-        );
+        )
+        .expect("create Arbitrum EVM");
         let tx = ArbitrumTxEnv::new(
             TxEnv {
                 caller: address!("0000000000000000000000000000000000ca11e4"),
@@ -98,5 +160,39 @@ mod tests {
     fn eip7623_floor_follows_arbos_feature_flag() {
         assert_eq!(calldata_heavy_gas(U256::ZERO), 37_000);
         assert_eq!(calldata_heavy_gas(U256::ONE), 61_000);
+    }
+
+    #[test]
+    fn evm_factory_preserves_arbos_version_database_error() {
+        let result = create_arbitrum_evm_from_state(
+            BlockEnv::default(),
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            FailingArbosState {
+                version: Err(ExpectedDbError),
+                fail_features: false,
+            },
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        );
+
+        assert!(matches!(result, Err(ExpectedDbError)));
+    }
+
+    #[test]
+    fn evm_factory_preserves_calldata_feature_database_error() {
+        let result = create_arbitrum_evm_from_state(
+            BlockEnv::default(),
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            FailingArbosState {
+                version: Ok(40),
+                fail_features: true,
+            },
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        );
+
+        assert!(matches!(result, Err(ExpectedDbError)));
     }
 }

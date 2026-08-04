@@ -348,6 +348,9 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     ) -> Result<(), PrecompileError> {
         for i in 0..len {
             let constraint_key = self.gas_constraint_key(vector_key, i);
+            if !metered {
+                self.validate_materialized_constraint(&constraint_key, i, "gas constraint")?;
+            }
             let backlog = self.read_u64_with_metering(&constraint_key, 2, metered)?;
             self.write_with_metering(
                 &constraint_key,
@@ -368,6 +371,9 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     ) -> Result<(), PrecompileError> {
         for i in 0..len {
             let constraint_key = self.multi_gas_constraint_key(vector_key, i);
+            if !metered {
+                self.validate_materialized_constraint(&constraint_key, i, "multi-gas constraint")?;
+            }
             let mut backlog = self.read_u64_with_metering(&constraint_key, 2, metered)?;
             for resource in 0..NUM_RESOURCE_KIND {
                 let weight =
@@ -383,6 +389,22 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                 backlog = backlog.saturating_sub(amount.saturating_mul(weight));
             }
             self.write_with_metering(&constraint_key, 2, U256::from(backlog), metered)?;
+        }
+        Ok(())
+    }
+
+    fn validate_materialized_constraint(
+        &mut self,
+        constraint_key: &[u8],
+        index: u64,
+        kind: &str,
+    ) -> Result<(), PrecompileError> {
+        let target = self.read_u64_with_metering(constraint_key, 0, false)?;
+        let adjustment_window = self.read_u64_with_metering(constraint_key, 1, false)?;
+        if target == 0 || adjustment_window == 0 {
+            return Err(PrecompileError::other(format!(
+                "invalid {kind} at index {index}: target={target} adjustmentWindow={adjustment_window}"
+            )));
         }
         Ok(())
     }

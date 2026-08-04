@@ -55,10 +55,11 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
         db: DB,
         inspector: I,
         precompile_env: ArbitrumPrecompileEnv,
-        execution_context: ArbitrumExecutionContext,
+        mut execution_context: ArbitrumExecutionContext,
     ) -> Self {
         let hardfork = cfg.spec;
         let spec = hardfork.into();
+        execution_context.set_current_arbos_version(precompile_env.current_arbos_version);
         Self {
             inner: Evm {
                 ctx: Context {
@@ -239,18 +240,20 @@ where
         &mut self,
         result: FrameResult,
     ) -> Result<Option<FrameResult>, ContextDbError<Self::Context>> {
-        if let FrameResult::Create(outcome) = &result {
-            if outcome.instruction_result().is_ok() {
-                let code_deposit_gas = self
-                    .inner
-                    .ctx
-                    .cfg()
-                    .gas_params()
-                    .code_deposit_cost(outcome.output().len());
-                self.inner.ctx.chain_mut().record_multi_gas(
-                    ArbResourceKind::StorageGrowth,
-                    code_deposit_gas,
-                );
+        if self.inner.ctx.chain.multi_gas_arbos_version().is_some() {
+            if let FrameResult::Create(outcome) = &result {
+                if outcome.instruction_result().is_ok() {
+                    let code_deposit_gas = self
+                        .inner
+                        .ctx
+                        .cfg()
+                        .gas_params()
+                        .code_deposit_cost(outcome.output().len());
+                    self.inner.ctx.chain_mut().record_multi_gas(
+                        ArbResourceKind::StorageGrowth,
+                        code_deposit_gas,
+                    );
+                }
             }
         }
         if self.inner.frame_stack.get().is_finished() {
@@ -439,7 +442,10 @@ mod tests {
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             test_db(arbos_version),
             inspector,
-            ArbitrumPrecompileEnv::default(),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: arbos_version,
+                ..Default::default()
+            },
             ArbitrumExecutionContext::default(),
         )
     }

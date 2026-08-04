@@ -725,9 +725,7 @@ impl<DB> ArbitrumApiImpl<DB> {
     where
         StateDB: DatabaseRef,
     {
-        let network_fee_account = db
-            .network_fee_account()
-            .unwrap_or_else(|| block_env.beneficiary);
+        let network_fee_account = db.try_network_fee_account().map_err(EVMError::Database)?;
         let escrow = retryable_escrow_address(ticket_id);
         let basefee = U256::from(l2_basefee);
 
@@ -851,7 +849,10 @@ impl<DB> ArbitrumApiImpl<DB> {
         let TxKind::Call(to) = tx.kind() else {
             return Ok(None);
         };
-        if state.arbos_version() == 0 {
+        if to != NODE_INTERFACE_ADDRESS && to != NODE_INTERFACE_DEBUG_ADDRESS {
+            return Ok(None);
+        }
+        if state.try_arbos_version().map_err(EVMError::Database)? == 0 {
             return Ok(None);
         }
         if to == NODE_INTERFACE_DEBUG_ADDRESS {
@@ -894,10 +895,6 @@ impl<DB> ArbitrumApiImpl<DB> {
                     "invalid NodeInterfaceDebug calldata: {err}",
                 ))),
             };
-        }
-
-        if to != NODE_INTERFACE_ADDRESS {
-            return Ok(None);
         }
 
         let data = tx.input().as_ref();
@@ -1322,11 +1319,57 @@ mod tests {
     use revm::context_interface::transaction::TransactionType;
     use revm::database::EmptyDB;
 
-    fn test_api() -> ArbitrumApiImpl<()> {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ExpectedDbError;
+
+    impl core::fmt::Display for ExpectedDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("expected database error")
+        }
+    }
+
+    impl std::error::Error for ExpectedDbError {}
+    impl revm::database_interface::DBErrorMarker for ExpectedDbError {}
+
+    #[derive(Debug)]
+    struct FailingState;
+
+    impl DatabaseRef for FailingState {
+        type Error = ExpectedDbError;
+
+        fn basic_ref(&self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+
+        fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {
+            Err(ExpectedDbError)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestBlockIndex;
+
+    impl BlockIndex for TestBlockIndex {
+        type Error = core::convert::Infallible;
+
+        fn get_block_by_id(&self, _: BlockId) -> Result<Option<BlockInfo>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn test_api() -> ArbitrumApiImpl<TestBlockIndex> {
         let mut cfg = CfgEnv::new_with_spec(ArbitrumHardfork::Prague);
         cfg.chain_id = 42161;
         ArbitrumApiImpl::new(
-            (),
+            TestBlockIndex,
             cfg,
             None,
             None,
@@ -1366,6 +1409,68 @@ mod tests {
         )
         .expect("write L2 base fee");
         db
+    }
+
+    #[test]
+    fn node_interface_version_read_preserves_database_error() {
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+
+        let error = test_api()
+            .try_execute_node_interface(&BlockEnv::default(), &FailingState, &tx, None)
+            .expect_err("NodeInterface version failure must be returned");
+        assert!(matches!(error, EVMError::Database(ExpectedDbError)));
+    }
+
+    #[test]
+    fn ordinary_call_does_not_read_node_interface_version() {
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                kind: TxKind::Call(Address::with_last_byte(0x42)),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+
+        let result = test_api()
+            .try_execute_node_interface(&BlockEnv::default(), &FailingState, &tx, None)
+            .expect("ordinary calls must bypass NodeInterface probing");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn retryable_overlay_preserves_network_fee_account_database_error() {
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(1),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 0,
+            retry_to: None,
+            retry_value: U256::ZERO,
+            beneficiary: Address::with_last_byte(2),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(3),
+            retry_data: Bytes::new(),
+        };
+        let mut overlay = CacheDB::new(BorrowedState(&FailingState));
+
+        let error = ArbitrumApiImpl::<TestBlockIndex>::apply_retryable_submission_overlay(
+            &mut overlay,
+            &BlockEnv::default(),
+            &submit_tx,
+            B256::ZERO,
+            0,
+        )
+        .expect_err("network fee account failure must abort the overlay");
+        assert!(matches!(error, EVMError::Database(ExpectedDbError)));
     }
 
     #[test]

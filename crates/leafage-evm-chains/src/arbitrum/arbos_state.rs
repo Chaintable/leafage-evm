@@ -87,6 +87,8 @@ pub(crate) const L2_PRICING_INERTIA_OFFSET: u64 = 5;
 pub(crate) const L2_BACKLOG_TOLERANCE_OFFSET: u64 = 6;
 pub(crate) const L2_PER_TX_GAS_LIMIT_OFFSET: u64 = 7;
 const RETRYABLE_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Nitro `arbostypes.MaxL2MessageSize`; submit-retryable parsing rejects larger calldata.
+const MAX_RETRYABLE_CALLDATA_SIZE: u64 = 256 * 1024;
 /// Nitro `ArbosVersion_40`: first version where the EIP-7623 calldata price
 /// increase feature can be enabled (`arbos/tx_processor.go`).
 const ARBOS_VERSION_INCREASED_CALLDATA_PRICE: u64 = 40;
@@ -239,17 +241,39 @@ pub trait ArbStateReader: DatabaseRef {
     }
 
     fn collect_tips(&self) -> bool {
-        collect_tips(self)
+        self.try_arbos_version()
+            .and_then(|version| self.try_collect_tips(version))
+            .unwrap_or_default()
+    }
+
+    fn try_collect_tips(&self, arbos_version: u64) -> Result<bool, Self::Error> {
+        if arbos_version == 9 {
+            return Ok(true);
+        }
+        if arbos_version < 60 {
+            return Ok(false);
+        }
+        self.try_read_root(*COLLECT_TIPS_SLOT)
+            .map(|value| !value.is_zero())
     }
 
     /// Nitro `TxProcessor.IsCalldataPricingIncreaseEnabled`: the EIP-7623
     /// calldata gas floor applies only from ArbOS 40 with the chain-owner
     /// feature flag set (features subspace bit 0, `arbos/features/features.go`).
     fn is_calldata_price_increase_enabled(&self) -> bool {
-        self.arbos_version() >= ARBOS_VERSION_INCREASED_CALLDATA_PRICE
-            && self
-                .read_root(*FEATURES_SLOT)
-                .is_some_and(|value| value.bit(0))
+        self.try_arbos_version()
+            .and_then(|version| self.try_is_calldata_price_increase_enabled(version))
+            .unwrap_or_default()
+    }
+
+    fn try_is_calldata_price_increase_enabled(
+        &self,
+        arbos_version: u64,
+    ) -> Result<bool, Self::Error> {
+        if arbos_version < ARBOS_VERSION_INCREASED_CALLDATA_PRICE {
+            return Ok(false);
+        }
+        self.try_read_root(*FEATURES_SLOT).map(|value| value.bit(0))
     }
 
     /// Next L1 block number recorded in ArbOS `Blockhashes` state
@@ -268,7 +292,11 @@ pub trait ArbStateReader: DatabaseRef {
     }
 
     fn network_fee_account(&self) -> Option<Address> {
-        self.read_root(*NETWORK_FEE_ACCOUNT_SLOT)
+        self.try_network_fee_account().ok()
+    }
+
+    fn try_network_fee_account(&self) -> Result<Address, Self::Error> {
+        self.try_read_root(*NETWORK_FEE_ACCOUNT_SLOT)
             .map(address_from_word)
     }
 
@@ -315,15 +343,6 @@ pub trait ArbStateReader: DatabaseRef {
 }
 
 impl<T: DatabaseRef + ?Sized> ArbStateReader for T {}
-
-fn collect_tips<S: ArbStateReader + ?Sized>(state: &S) -> bool {
-    let version = state.arbos_version();
-    version == 9
-        || (version >= 60
-            && state
-                .read_root(*COLLECT_TIPS_SLOT)
-                .is_some_and(|value| !value.is_zero()))
-}
 
 fn read_retryable_info_from_state<S>(
     state: &S,
@@ -427,7 +446,12 @@ where
     S::Error: Debug,
 {
     let size = read_u64(state, storage_key, 0)?;
-    let mut bytes = Vec::new();
+    if size > MAX_RETRYABLE_CALLDATA_SIZE {
+        return Err(format!(
+            "retryable calldata size {size} exceeds maximum {MAX_RETRYABLE_CALLDATA_SIZE}"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
     let mut bytes_left = size;
     let mut offset = 1;
 
@@ -630,5 +654,22 @@ mod tests {
             !db.is_calldata_price_increase_enabled(),
             "bit 0 is the increasedCalldata feature; other bits must not enable it"
         );
+    }
+
+    #[test]
+    fn oversized_retryable_calldata_is_rejected_before_loading_words() {
+        use revm::database::{EmptyDB, in_memory_db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let calldata_key = child_key(&[], &[0x42]);
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            slot_at(&calldata_key, 0),
+            U256::from(MAX_RETRYABLE_CALLDATA_SIZE + 1),
+        )
+        .unwrap();
+
+        let error = read_bytes(&db, &calldata_key).expect_err("oversized calldata must fail");
+        assert!(error.contains("exceeds maximum"));
     }
 }

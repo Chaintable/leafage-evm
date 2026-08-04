@@ -6,11 +6,12 @@
 //! against the L1 block hashes recorded in ArbOS `Blockhashes` state instead
 //! of the L2 header chain.
 
-use crate::arbitrum::arbos_state::ArbStateReader;
+use crate::arbitrum::arbos_state::{self, ArbStateReader};
 use crate::arbitrum::precompile::{ArbitrumContext, BATCH_POSTER_ADDRESS};
 use crate::arbitrum::tx::nitro_message_gas_price;
 use revm::bytecode::opcode;
 use revm::context::{Block, ContextTr};
+use revm::context_interface::context::ContextError;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::StackTr;
@@ -39,11 +40,34 @@ where
 
 /// Nitro `TxProcessor.CollectTips`: the ArbOS state flag (v9, or v60+ with the
 /// collectTips setting) plus the sequenced-block coinbase check.
-pub(super) fn collects_tips<DB>(ctx: &ArbitrumContext<DB>) -> bool
+pub(super) fn collects_tips<DB>(
+    ctx: &mut ArbitrumContext<DB>,
+) -> Result<bool, <DB as Database>::Error>
 where
     DB: Database + DatabaseRef,
 {
-    ctx.db().collect_tips() && ctx.block().beneficiary() == BATCH_POSTER_ADDRESS
+    let arbos_version = ctx.chain().current_arbos_version();
+    let enabled = if arbos_version == 9 {
+        true
+    } else if arbos_version < 60 {
+        false
+    } else {
+        let slot = arbos_state::slot_at(&[], arbos_state::COLLECT_TIPS_OFFSET);
+        let journaled = ctx
+            .journal()
+            .state
+            .get(&arbos_state::ARBOS_STATE_ADDRESS)
+            .and_then(|account| account.storage.get(&slot))
+            .map(|value| value.present_value());
+        let value = match journaled {
+            Some(value) => value,
+            None => ctx
+                .db_mut()
+                .storage(arbos_state::ARBOS_STATE_ADDRESS, slot)?,
+        };
+        !value.is_zero()
+    };
+    Ok(enabled && ctx.block().beneficiary() == BATCH_POSTER_ADDRESS)
 }
 
 /// Nitro `opGasprice` -> `GasPriceOp` (`arbos/tx_processor.go`): from ArbOS 3,
@@ -56,10 +80,17 @@ fn gasprice<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpre
 where
     DB: Database + DatabaseRef,
 {
-    let host = &*context.host;
+    let host = &mut *context.host;
     let basefee = host.block().basefee() as u128;
-    let price = if host.db().arbos_version() >= ARBOS_VERSION_PAID_GAS_PRICE {
-        if collects_tips(host) {
+    let price = if host.chain().current_arbos_version() >= ARBOS_VERSION_PAID_GAS_PRICE {
+        let collect_tips = match collects_tips(host) {
+            Ok(collect_tips) => collect_tips,
+            Err(error) => {
+                *host.error() = Err(ContextError::Db(error));
+                return context.interpreter.halt_fatal();
+            }
+        };
+        if collect_tips {
             nitro_message_gas_price(host.tx(), basefee)
         } else {
             basefee
@@ -106,7 +137,7 @@ mod tests {
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::primitives::{Address, B256, Bytes, address};
     use leafage_evm_types::{BlockEnv, CfgEnv};
-    use revm::ExecuteEvm;
+    use revm::{Context, ExecuteEvm, MainContext};
     use revm::context::TxEnv;
     use revm::context::result::{ExecutionResult, Output};
     use revm::context_interface::transaction::TransactionType;
@@ -162,6 +193,7 @@ mod tests {
     }
 
     fn call_contract(db: TestDb, beneficiary: Address, tx_env: TxEnv) -> Bytes {
+        let arbos_version = db.try_arbos_version().expect("read ArbOS version");
         let block_env = BlockEnv {
             basefee: 100,
             gas_limit: 30_000_000,
@@ -175,7 +207,10 @@ mod tests {
             CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
             db,
             (),
-            ArbitrumPrecompileEnv::default(),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: arbos_version,
+                ..Default::default()
+            },
             execution_context,
         );
         let tx = ArbitrumTxEnv::new(tx_env, Default::default());
@@ -235,6 +270,28 @@ mod tests {
         };
         let output = call_contract(collect_tips_db(), BATCH_POSTER_ADDRESS, tx);
         assert_eq!(U256::from_be_slice(&output), U256::from(100));
+    }
+
+    #[test]
+    fn collect_tips_read_does_not_warm_arbos_state() {
+        let mut execution_context = ArbitrumExecutionContext::default();
+        execution_context.set_current_arbos_version(60);
+        let mut context = Context::mainnet()
+            .with_tx(ArbitrumTxEnv::default())
+            .with_block(BlockEnv {
+                beneficiary: BATCH_POSTER_ADDRESS,
+                ..Default::default()
+            })
+            .with_cfg(CfgEnv::new_with_spec(ArbitrumHardfork::Prague))
+            .with_db(collect_tips_db())
+            .with_chain(execution_context);
+
+        assert!(collects_tips(&mut context).expect("read collectTips"));
+        assert!(!context
+            .journal()
+            .state
+            .contains_key(&arbos_state::ARBOS_STATE_ADDRESS));
+        assert!(context.journal().journal.is_empty());
     }
 
     #[test]

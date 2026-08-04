@@ -903,4 +903,67 @@ mod tests {
         assert_eq!(fees[1], U256::from(123));
         assert_eq!(fees[RESOURCE_KIND_SINGLE_DIM], U256::from(123));
     }
+
+    #[test]
+    fn fixed_cost_backlog_update_rejects_sparse_constraint_vectors() {
+        let mut context = context(0);
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+        storage
+            .write(&[], arbos_state::ARBOS_VERSION_OFFSET, U256::from(60))
+            .expect("write ArbOS version");
+
+        let multi_key = storage.multi_gas_constraints_key();
+        storage
+            .write(&multi_key, 0, U256::MAX)
+            .expect("write multi-gas constraints length");
+        let error = storage
+            .shrink_l2_backlog(1)
+            .expect_err("sparse multi-gas constraints must fail");
+        assert!(
+            matches!(error, PrecompileError::Other(message) if message.contains("invalid multi-gas constraint at index 0"))
+        );
+
+        storage
+            .write(&multi_key, 0, U256::ZERO)
+            .expect("clear multi-gas constraints length");
+        let single_key = storage.gas_constraints_key();
+        storage
+            .write(&single_key, 0, U256::MAX)
+            .expect("write gas constraints length");
+        let error = storage
+            .shrink_l2_backlog(1)
+            .expect_err("sparse gas constraints must fail");
+        assert!(
+            matches!(error, PrecompileError::Other(message) if message.contains("invalid gas constraint at index 0"))
+        );
+    }
+
+    #[test]
+    fn fixed_cost_backlog_update_accepts_more_than_1024_constraints() {
+        const CONSTRAINTS: u64 = 1025;
+
+        let mut context = context(0);
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 0);
+        storage
+            .write(&[], arbos_state::ARBOS_VERSION_OFFSET, U256::from(60))
+            .expect("write ArbOS version");
+
+        let vector_key = storage.gas_constraints_key();
+        for i in 0..CONSTRAINTS {
+            let constraint_key = storage.gas_constraint_key(&vector_key, i);
+            storage
+                .write(&constraint_key, 0, U256::ONE)
+                .expect("write constraint target");
+            storage
+                .write(&constraint_key, 1, U256::ONE)
+                .expect("write constraint adjustment window");
+        }
+        storage
+            .write(&vector_key, 0, U256::from(CONSTRAINTS))
+            .expect("write constraints length");
+
+        storage
+            .shrink_l2_backlog(1)
+            .expect("materialized constraints remain Nitro-compatible");
+    }
 }

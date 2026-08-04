@@ -58,6 +58,7 @@ pub struct ArbitrumExecutionContext {
     current_l2_block_number: Option<U256>,
     current_l2_basefee: Option<u64>,
     current_poster_charge: Option<ArbPosterCharge>,
+    current_arbos_version: u64,
     multi_gas_arbos_version: Option<u64>,
     multi_gas: ArbMultiGas,
     multi_gas_unattributed: u64,
@@ -92,6 +93,14 @@ impl ArbitrumExecutionContext {
 
     pub fn clear_current_poster_charge(&mut self) {
         self.current_poster_charge = None;
+    }
+
+    pub(crate) fn set_current_arbos_version(&mut self, arbos_version: u64) {
+        self.current_arbos_version = arbos_version;
+    }
+
+    pub(crate) fn current_arbos_version(&self) -> u64 {
+        self.current_arbos_version
     }
 
     pub(crate) fn begin_multi_gas(&mut self, arbos_version: u64, intrinsic: ArbMultiGas) {

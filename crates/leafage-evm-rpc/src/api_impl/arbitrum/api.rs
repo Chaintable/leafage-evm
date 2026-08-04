@@ -20,7 +20,6 @@ use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
 use alloy::primitives::{Bytes, B256, U256};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
 use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
 use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv};
@@ -39,13 +38,11 @@ use std::fmt::Debug;
 
 pub(super) type ArbitrumApiImpl<DB> = ApiImpl<DB, ArbitrumHardfork, ArbitrumEvmConfig>;
 
-fn precompile_env<StateDB: DatabaseRef>(
-    state: &StateDB,
+fn precompile_env(
     tx: &ArbitrumTxEnv,
     custom_cfg: Option<&ArbitrumEvmConfig>,
-) -> Result<ArbitrumPrecompileEnv, StateDB::Error> {
-    Ok(ArbitrumPrecompileEnv {
-        current_arbos_version: state.try_arbos_version()?,
+) -> ArbitrumPrecompileEnv {
+    ArbitrumPrecompileEnv {
         current_tx_l1_gas_fees: U256::ZERO,
         current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,
@@ -55,7 +52,8 @@ fn precompile_env<StateDB: DatabaseRef>(
         current_chain_config: custom_cfg
             .and_then(|cfg| cfg.chain_config.as_ref())
             .map(|chain_config| Bytes::copy_from_slice(chain_config.get().as_bytes())),
-    })
+        ..Default::default()
+    }
 }
 
 impl<DB> ArbitrumApiImpl<DB> {
@@ -114,8 +112,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB::Error: Sync + Send + 'static,
     {
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref())
-            .map_err(EVMError::Database)?;
+        let precompile_env = precompile_env(&tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -123,7 +120,8 @@ impl<DB> ArbitrumApiImpl<DB> {
             NoOpInspector {},
             precompile_env,
             execution_context,
-        );
+        )
+        .map_err(EVMError::Database)?;
 
         evm.transact(tx).map(|res| res.result.into())
     }
@@ -139,8 +137,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB::Error: Sync + Send + 'static,
     {
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref())
-            .map_err(EVMError::Database)?;
+        let precompile_env = precompile_env(&tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -148,7 +145,8 @@ impl<DB> ArbitrumApiImpl<DB> {
             inspector,
             precompile_env,
             execution_context,
-        );
+        )
+        .map_err(EVMError::Database)?;
 
         evm.inspect_tx_commit(tx).map(Into::into)
     }
@@ -301,8 +299,7 @@ where
         }
 
         let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&state, &tx, self.evm_cfg.custom_cfg.as_ref())
-            .map_err(EVMError::Database)?;
+        let precompile_env = precompile_env(&tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
@@ -310,7 +307,8 @@ where
             &mut inspector,
             precompile_env,
             execution_context,
-        );
+        )
+        .map_err(EVMError::Database)?;
 
         evm.inspect_tx_commit(tx)
             .map(|res| (res.into(), inspector_collect(inspector)))

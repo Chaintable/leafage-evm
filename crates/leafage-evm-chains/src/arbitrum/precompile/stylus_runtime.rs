@@ -532,9 +532,17 @@ impl HostioBridge<'_> {
         Self::stash_slot(&mut self.response, bytes)
     }
 
-    fn stash_raw(&mut self, req_type: u32, bytes: Vec<u8>) -> GoSliceData {
+    fn stash_raw(&mut self, req_type: u32, response: &[u8], bytes: Vec<u8>) -> GoSliceData {
         match req_type {
-            4..=8 => Self::stash_slot(&mut self.last_return_data, bytes),
+            4..=6 => Self::stash_slot(&mut self.last_return_data, bytes),
+            7..=8 if response.len() == 21 && response[0] != 0 => {
+                Self::stash_slot(&mut self.last_return_data, bytes)
+            }
+            7..=8 => Self::stash_slot(&mut self.scratch_raw, bytes),
+            11 if bytes.is_empty() => GoSliceData {
+                ptr: ptr::null(),
+                len: 0,
+            },
             11 => Self::stash_slot(&mut self.last_account_code, bytes),
             _ => Self::stash_slot(&mut self.scratch_raw, bytes),
         }
@@ -580,14 +588,16 @@ unsafe extern "C" fn hostio_trampoline(
         }
     };
     unsafe {
+        let raw = bridge.stash_raw(method, &response, raw);
+        let response = bridge.stash_response(response);
         if !gas_cost.is_null() {
             *gas_cost = cost;
         }
         if !result.is_null() {
-            *result = bridge.stash_response(response);
+            *result = response;
         }
         if !raw_data.is_null() {
-            *raw_data = bridge.stash_raw(method, raw);
+            *raw_data = raw;
         }
     }
 }
@@ -1211,16 +1221,59 @@ mod tests {
             trampoline_error: None,
         };
 
-        let _ = bridge.stash_raw(11, vec![1; 10]);
+        let _ = bridge.stash_raw(11, &[], vec![1; 10]);
         assert_eq!(bridge.last_account_code.as_ref().unwrap().len(), 10);
-        let _ = bridge.stash_raw(11, vec![2; 20]);
+        let _ = bridge.stash_raw(11, &[], vec![2; 20]);
         assert_eq!(bridge.last_account_code.as_ref().unwrap().len(), 20);
 
-        let _ = bridge.stash_raw(4, vec![3; 30]);
+        let _ = bridge.stash_raw(4, &[0], vec![3; 30]);
         assert_eq!(bridge.last_return_data.as_ref().unwrap().len(), 30);
         assert_eq!(bridge.last_account_code.as_ref().unwrap().len(), 20);
-        let _ = bridge.stash_raw(5, vec![4; 40]);
+        let _ = bridge.stash_raw(5, &[0], vec![4; 40]);
         assert_eq!(bridge.last_return_data.as_ref().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn hostio_bridge_keeps_cached_code_alive_after_empty_response() {
+        let mut handler = EmptyHostio;
+        let mut bridge = HostioBridge {
+            handler: &mut handler,
+            response: None,
+            last_return_data: None,
+            last_account_code: None,
+            scratch_raw: None,
+            trampoline_error: None,
+        };
+
+        let cached = bridge.stash_raw(11, &[], vec![0xab; 32]);
+        let empty = bridge.stash_raw(11, &[], Vec::new());
+
+        assert!(empty.ptr.is_null());
+        assert_eq!(empty.len, 0);
+        assert_eq!(bridge.last_account_code.as_deref(), Some(&[0xab; 32][..]));
+        assert_eq!(
+            cached.ptr,
+            bridge.last_account_code.as_ref().unwrap().as_ptr()
+        );
+    }
+
+    #[test]
+    fn failed_create_does_not_replace_last_return_data() {
+        let mut handler = EmptyHostio;
+        let mut bridge = HostioBridge {
+            handler: &mut handler,
+            response: None,
+            last_return_data: None,
+            last_account_code: None,
+            scratch_raw: None,
+            trampoline_error: None,
+        };
+
+        let _ = bridge.stash_raw(4, &[0], vec![0xaa; 16]);
+        let _ = bridge.stash_raw(7, &[0], vec![0xbb; 8]);
+
+        assert_eq!(bridge.last_return_data.as_deref(), Some(&[0xaa; 16][..]));
+        assert_eq!(bridge.scratch_raw.as_deref(), Some(&[0xbb; 8][..]));
     }
 
     #[test]
