@@ -8,4 +8,7 @@ mod rpc;
 pub use rpc::*;
 
 mod kafka;
+mod bundle;
+mod error;
+
 pub use kafka::*;
