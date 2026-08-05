@@ -19,6 +19,39 @@ impl Default for ArbitrumCallContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArbitrumTxFeeContext {
+    settlement_gas_price: u128,
+    poster_pricing_gas_price: u128,
+    tip_recipient: Option<Address>,
+}
+
+impl ArbitrumTxFeeContext {
+    pub(crate) fn new(settlement_gas_price: u128, poster_pricing_gas_price: u128) -> Self {
+        Self {
+            settlement_gas_price,
+            poster_pricing_gas_price,
+            tip_recipient: None,
+        }
+    }
+
+    pub(crate) fn settlement_gas_price(self) -> u128 {
+        self.settlement_gas_price
+    }
+
+    pub(crate) fn poster_pricing_gas_price(self) -> u128 {
+        self.poster_pricing_gas_price
+    }
+
+    pub(crate) fn tip_recipient(self) -> Option<Address> {
+        self.tip_recipient
+    }
+
+    fn set_tip_recipient(&mut self, recipient: Address) {
+        self.tip_recipient = Some(recipient);
+    }
+}
+
 /// Nitro's `RecentWasms` LRU carried by this execution context. The first
 /// insertion fixes capacity for the context lifetime, and get-on-hit updates
 /// recency. A configured size of zero still retains one entry because geth's
@@ -57,6 +90,7 @@ pub struct ArbitrumExecutionContext {
     current_call: ArbitrumCallContext,
     current_l2_block_number: Option<U256>,
     current_l2_basefee: Option<u64>,
+    tx_fee_context: Option<ArbitrumTxFeeContext>,
     current_poster_charge: Option<ArbPosterCharge>,
     current_arbos_version: u64,
     multi_gas_arbos_version: Option<u64>,
@@ -81,6 +115,33 @@ impl ArbitrumExecutionContext {
 
     pub fn current_l2_basefee(&self) -> Option<u64> {
         self.current_l2_basefee
+    }
+
+    pub(crate) fn begin_tx_fee_context(
+        &mut self,
+        settlement_gas_price: u128,
+        poster_pricing_gas_price: u128,
+    ) {
+        self.tx_fee_context = Some(ArbitrumTxFeeContext::new(
+            settlement_gas_price,
+            poster_pricing_gas_price,
+        ));
+    }
+
+    pub(crate) fn tx_fee_context(&self) -> Option<ArbitrumTxFeeContext> {
+        self.tx_fee_context
+    }
+
+    pub(crate) fn set_tx_tip_recipient(&mut self, recipient: Address) -> bool {
+        let Some(context) = self.tx_fee_context.as_mut() else {
+            return false;
+        };
+        context.set_tip_recipient(recipient);
+        true
+    }
+
+    pub(crate) fn clear_tx_fee_context(&mut self) {
+        self.tx_fee_context = None;
     }
 
     pub fn set_current_poster_charge(&mut self, charge: ArbPosterCharge) {
