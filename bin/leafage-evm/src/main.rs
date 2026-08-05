@@ -1,6 +1,7 @@
 // cache-verify round 2: validating Plan C (layer-cache via cargo-chef, no cache mounts)
 mod archive_init;
 mod archive_scan;
+mod bundle;
 mod compact;
 mod db_migrate;
 mod force_compact;

@@ -1,12 +1,12 @@
 use crate::error::{BundleStorageDiffError, BundleStorageDiffResult};
 use crate::BlockStorageDiff;
-use alloy_rlp::{decode_exact, Encodable};
+use alloy_rlp::{Decodable, Encodable};
 
-const STATE_DIFF_ENTRY_CAPACITY: usize = 1_000;
+pub const STATE_DIFF_ENTRY_CAPACITY: usize = 1_000;
 const STATE_DIFF_BITMAP_BYTES: usize = 125;
 const STATE_DIFF_OFFSET_COUNT: usize = STATE_DIFF_ENTRY_CAPACITY + 1;
 const STATE_DIFF_OFFSET_BYTES: usize = 8;
-const STATE_DIFF_INDEX_BYTES: usize =
+pub const STATE_DIFF_INDEX_BYTES: usize =
     STATE_DIFF_BITMAP_BYTES + STATE_DIFF_OFFSET_COUNT * STATE_DIFF_OFFSET_BYTES;
 
 pub struct BundleStorageDiff {
@@ -43,13 +43,19 @@ impl BundleStorageDiff {
             });
         }
 
-        let payload = &bytes[STATE_DIFF_INDEX_BYTES..];
         let mut entries = Vec::with_capacity(STATE_DIFF_ENTRY_CAPACITY);
         for position in 0..STATE_DIFF_ENTRY_CAPACITY {
-            let start = index.offset_as_usize(position)?;
-            let end = index.offset_as_usize(position + 1)?;
-            let entry = decode_exact(&payload[start..end])
+            let start = STATE_DIFF_INDEX_BYTES + index.offset_as_usize(position)?;
+            let end = STATE_DIFF_INDEX_BYTES + index.offset_as_usize(position + 1)?;
+            let mut entry_bytes = &bytes[start..end];
+            let entry = BlockStorageDiff::decode(&mut entry_bytes)
                 .map_err(|source| BundleStorageDiffError::Rlp { position, source })?;
+            if !entry_bytes.is_empty() {
+                return Err(BundleStorageDiffError::Rlp {
+                    position,
+                    source: alloy_rlp::Error::UnexpectedLength,
+                });
+            }
             entries.push(entry);
         }
 
@@ -62,6 +68,7 @@ impl BundleStorageDiff {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct BundleStorageDiffIndex {
     bitmap: [u8; STATE_DIFF_BITMAP_BYTES],
     offset: [u64; STATE_DIFF_OFFSET_COUNT],
@@ -69,11 +76,28 @@ pub struct BundleStorageDiffIndex {
 
 impl BundleStorageDiffIndex {
     pub fn payload_size(&self) -> BundleStorageDiffResult<usize> {
-        self.offset_as_usize(STATE_DIFF_ENTRY_CAPACITY)
+        let last_used_offset = self
+            .offset
+            .iter()
+            .rposition(|offset| *offset != 0)
+            .unwrap_or_default();
+        self.offset_as_usize(last_used_offset)
     }
 
     pub fn encode(&self) -> BundleStorageDiffResult<Vec<u8>> {
-        self.validate()?;
+        self.encode_for_bundle(1)
+    }
+
+    /// Encode the fixed index using the entry count implied by a bundle ID.
+    /// Bundle 0 contains only genesis; every other bundle contains 1,000
+    /// entries.
+    pub fn encode_for_bundle(&self, bundle_id: u64) -> BundleStorageDiffResult<Vec<u8>> {
+        let entry_count = if bundle_id == 0 {
+            1
+        } else {
+            STATE_DIFF_ENTRY_CAPACITY
+        };
+        self.validate(entry_count)?;
 
         let mut encoded = Vec::with_capacity(STATE_DIFF_INDEX_BYTES);
         encoded.extend_from_slice(&self.bitmap);
@@ -84,6 +108,12 @@ impl BundleStorageDiffIndex {
     }
 
     pub fn decode(bytes: &[u8]) -> BundleStorageDiffResult<Self> {
+        Self::decode_for_bundle(1, bytes)
+    }
+
+    /// Decode the fixed index using pipeline-compactor's bundle-0 rules.
+    /// Bundle 0 has one entry; every other bundle has 1,000 entries.
+    pub fn decode_for_bundle(bundle_id: u64, bytes: &[u8]) -> BundleStorageDiffResult<Self> {
         if bytes.len() != STATE_DIFF_INDEX_BYTES {
             return Err(BundleStorageDiffError::InvalidIndexLength {
                 expected: STATE_DIFF_INDEX_BYTES,
@@ -107,20 +137,45 @@ impl BundleStorageDiffIndex {
         }
 
         let index = Self { bitmap, offset };
-        index.validate()?;
+        let entry_count = if bundle_id == 0 {
+            1
+        } else {
+            STATE_DIFF_ENTRY_CAPACITY
+        };
+        index.validate(entry_count)?;
         Ok(index)
     }
 
-    fn validate(&self) -> BundleStorageDiffResult<()> {
+    /// Return an entry's half-open range relative to the StateDiff payload.
+    pub fn payload_range(&self, position: usize) -> BundleStorageDiffResult<(u64, u64)> {
+        if position >= STATE_DIFF_ENTRY_CAPACITY {
+            return Err(BundleStorageDiffError::PositionOutOfRange {
+                position,
+                capacity: STATE_DIFF_ENTRY_CAPACITY,
+            });
+        }
+        let start = self.offset[position];
+        let end = self.offset[position + 1];
+        if end <= start {
+            return Err(BundleStorageDiffError::NonIncreasingOffset {
+                position,
+                current: start,
+                next: end,
+            });
+        }
+        Ok((start, end))
+    }
+
+    fn validate(&self, entry_count: usize) -> BundleStorageDiffResult<()> {
         if self.offset[0] != 0 {
             return Err(BundleStorageDiffError::NonZeroFirstOffset {
                 actual: self.offset[0],
             });
         }
 
-        for (position, window) in self.offset.windows(2).enumerate() {
-            let current = window[0];
-            let next = window[1];
+        for position in 0..entry_count {
+            let current = self.offset[position];
+            let next = self.offset[position + 1];
             if next <= current {
                 return Err(BundleStorageDiffError::NonIncreasingOffset {
                     position,
@@ -130,9 +185,24 @@ impl BundleStorageDiffIndex {
             }
         }
 
+        for position in entry_count + 1..STATE_DIFF_OFFSET_COUNT {
+            if self.offset[position] != 0 {
+                return Err(BundleStorageDiffError::NonZeroUnusedOffset {
+                    position,
+                    actual: self.offset[position],
+                });
+            }
+        }
+
+        for position in entry_count..STATE_DIFF_ENTRY_CAPACITY {
+            if self.bitmap[position / 8] & (1 << (position % 8)) != 0 {
+                return Err(BundleStorageDiffError::NonZeroUnusedBitmap { position });
+            }
+        }
+
         // The bitmap marks real versus synthesized StateDiffs. Both have an RLP
         // payload, so bitmap bits do not change offset validation.
-        self.payload_size()?;
+        self.offset_as_usize(entry_count)?;
         Ok(())
     }
 
@@ -211,6 +281,47 @@ mod tests {
                 current: 100,
                 next: 100
             })
+        ));
+    }
+
+    #[test]
+    fn genesis_index_uses_only_position_zero() {
+        let mut bytes = vec![0; STATE_DIFF_INDEX_BYTES];
+        bytes[0] = 1;
+        write_offset(&mut bytes, 1, 100);
+
+        let index = BundleStorageDiffIndex::decode_for_bundle(0, &bytes).unwrap();
+        assert_eq!(index.payload_range(0).unwrap(), (0, 100));
+        assert_eq!(index.payload_size().unwrap(), 100);
+        assert_eq!(index.encode_for_bundle(0).unwrap(), bytes);
+
+        write_offset(&mut bytes, 2, 200);
+        assert!(matches!(
+            BundleStorageDiffIndex::decode_for_bundle(0, &bytes),
+            Err(BundleStorageDiffError::NonZeroUnusedOffset {
+                position: 2,
+                actual: 200
+            })
+        ));
+    }
+
+    #[test]
+    fn genesis_index_rejects_unused_bitmap_bits() {
+        let mut bytes = vec![0; STATE_DIFF_INDEX_BYTES];
+        bytes[0] = 0b10;
+        write_offset(&mut bytes, 1, 100);
+
+        assert!(matches!(
+            BundleStorageDiffIndex::decode_for_bundle(0, &bytes),
+            Err(BundleStorageDiffError::NonZeroUnusedBitmap { position: 1 })
+        ));
+    }
+
+    #[test]
+    fn payload_range_rejects_position_outside_capacity() {
+        assert!(matches!(
+            index().payload_range(STATE_DIFF_ENTRY_CAPACITY),
+            Err(BundleStorageDiffError::PositionOutOfRange { .. })
         ));
     }
 

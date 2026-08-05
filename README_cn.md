@@ -164,12 +164,15 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
   "version": "v1"
 }
 ```
+
+`bundle_bucket_name` 为可选项；省略或留空时继续使用原有的逐块 S3 读取逻辑。
 
 ### 数据迁移
 

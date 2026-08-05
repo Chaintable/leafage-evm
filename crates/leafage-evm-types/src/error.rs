@@ -24,6 +24,15 @@ pub enum BundleStorageDiffError {
     #[error("StateDiff offset {offset} at position {position} does not fit usize")]
     OffsetOverflow { position: usize, offset: u64 },
 
+    #[error("unused StateDiff offset {position} must be 0, got {actual}")]
+    NonZeroUnusedOffset { position: usize, actual: u64 },
+
+    #[error("unused StateDiff bitmap bit {position} must be 0")]
+    NonZeroUnusedBitmap { position: usize },
+
+    #[error("StateDiff position {position} is outside bundle capacity {capacity}")]
+    PositionOutOfRange { position: usize, capacity: usize },
+
     #[error("decode StateDiff entry {position}: {source}")]
     Rlp {
         position: usize,

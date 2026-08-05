@@ -7,8 +7,10 @@ pub use storage::*;
 mod rpc;
 pub use rpc::*;
 
-mod kafka;
 mod bundle;
 mod error;
+mod kafka;
 
+pub use bundle::*;
+pub use error::*;
 pub use kafka::*;

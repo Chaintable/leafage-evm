@@ -164,12 +164,15 @@ When using Kafka + S3 mode, provide a JSON config file:
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
   "version": "v1"
 }
 ```
+
+`bundle_bucket_name` is optional; omit it or leave it empty to keep the legacy per-block S3 path.
 
 ### Data Migration
 
