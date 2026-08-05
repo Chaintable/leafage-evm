@@ -4,7 +4,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
     pub(in crate::arbitrum::precompile) fn send_merkle_append(
         &mut self,
         item_hash: B256,
-    ) -> Result<(u64, Vec<MerkleUpdate>), PrecompileError> {
+    ) -> Result<Vec<MerkleUpdate>, PrecompileError> {
         let merkle_key = self.send_merkle_key();
         let size = self.read_u64(&merkle_key, 0)?.saturating_add(1);
         self.write(&merkle_key, 0, U256::from(size))?;
@@ -25,7 +25,10 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
                 break;
             }
 
-            so_far = Self::hash_pair(this_level, so_far);
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(this_level.as_slice());
+            pair[32..].copy_from_slice(so_far.as_slice());
+            so_far = self.keccak(&pair)?;
             self.write_b256(&merkle_key, 2 + level, B256::ZERO)?;
             level = level.saturating_add(1);
             events.push(MerkleUpdate {
@@ -35,7 +38,14 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             });
         }
 
-        Ok((size, events))
+        Ok(events)
+    }
+
+    pub(in crate::arbitrum::precompile) fn send_merkle_size(
+        &mut self,
+    ) -> Result<u64, PrecompileError> {
+        let merkle_key = self.send_merkle_key();
+        self.read_u64(&merkle_key, 0)
     }
 
     pub(in crate::arbitrum::precompile) fn send_merkle_state(

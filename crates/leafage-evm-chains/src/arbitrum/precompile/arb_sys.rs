@@ -6,7 +6,7 @@ use super::util::{
 };
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_SYS_ADDRESS};
 use crate::arbitrum::evm::{ArbResourceKind, ArbitrumCallContext};
-use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
+use alloy::primitives::{Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolError, SolEvent};
 use revm::context::{Cfg, ContextTr, Transaction};
 use revm::context_interface::Block;
@@ -292,7 +292,7 @@ impl ArbSys {
         let arb_block_num = storage.current_l2_block_number();
         let eth_block_num = U256::from(current_l1_block_number);
         let timestamp = storage.context.block().timestamp();
-        let send_hash = Self::l2_to_l1_hash(
+        let send_hash_data = Self::l2_to_l1_hash_data(
             caller,
             destination,
             arb_block_num,
@@ -301,7 +301,9 @@ impl ArbSys {
             value,
             calldata_for_l1.as_ref(),
         );
-        let (size, updates) = storage.send_merkle_append(send_hash)?;
+        let send_hash = storage.keccak(&send_hash_data)?;
+        let updates = storage.send_merkle_append(send_hash)?;
+        let size = storage.send_merkle_size()?;
         let leaf = size.saturating_sub(1);
 
         storage.burn_precompile_balance(ARB_SYS_ADDRESS, value)?;
@@ -333,7 +335,7 @@ impl ArbSys {
         }
     }
 
-    fn l2_to_l1_hash(
+    fn l2_to_l1_hash_data(
         caller: Address,
         destination: Address,
         arb_block_num: U256,
@@ -341,7 +343,7 @@ impl ArbSys {
         timestamp: U256,
         value: U256,
         calldata_for_l1: &[u8],
-    ) -> B256 {
+    ) -> Vec<u8> {
         let mut data = Vec::with_capacity(20 + 20 + 32 * 4 + calldata_for_l1.len());
         data.extend_from_slice(caller.as_slice());
         data.extend_from_slice(destination.as_slice());
@@ -350,7 +352,7 @@ impl ArbSys {
         data.extend_from_slice(&timestamp.to_be_bytes::<32>());
         data.extend_from_slice(&value.to_be_bytes::<32>());
         data.extend_from_slice(calldata_for_l1);
-        keccak256(data)
+        data
     }
 
     fn emit_send_merkle_update<DB: Database>(
@@ -426,6 +428,7 @@ mod tests {
     use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::tx::ArbitrumTxEnv;
+    use alloy::primitives::keccak256;
     use alloy::sol_types::{SolCall, SolError, SolEvent};
     use leafage_evm_types::{BlockEnv, CfgEnv};
     use revm::context::{JournalTr, TxEnv};
@@ -874,7 +877,7 @@ mod tests {
         let timestamp = U256::from(20);
         let value = U256::from(30);
         let calldata = Bytes::from_static(b"payload");
-        let expected_send_hash = ArbSys::l2_to_l1_hash(
+        let expected_send_hash = keccak256(ArbSys::l2_to_l1_hash_data(
             caller,
             destination,
             arb_block_num,
@@ -882,7 +885,7 @@ mod tests {
             timestamp,
             value,
             calldata.as_ref(),
-        );
+        ));
 
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_info(
@@ -1003,7 +1006,7 @@ mod tests {
         let timestamp = U256::from(21);
         let value = U256::from(31);
         let calldata = Bytes::new();
-        let expected_send_hash = ArbSys::l2_to_l1_hash(
+        let expected_send_hash = keccak256(ArbSys::l2_to_l1_hash_data(
             caller,
             destination,
             arb_block_num,
@@ -1011,7 +1014,7 @@ mod tests {
             timestamp,
             value,
             calldata.as_ref(),
-        );
+        ));
 
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_info(

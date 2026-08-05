@@ -32,8 +32,9 @@ const CALL_STIPEND_GAS: u64 = 2_300;
 const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
 const COPY_GAS: u64 = 3;
 const STORAGE_READ_GAS: u64 = 800;
-const NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS: u64 = 5;
-const NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_READS: u64 = 5;
+const NODE_INTERFACE_CONTEXT_STORAGE_READS: u64 = 1;
+const NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_STORAGE_READS: u64 = 5;
+const NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_STORAGE_READS: u64 = 5;
 const RETRYABLE_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 const RETRYABLE_SUBSPACE: &[u8] = &[2];
 const L2_PRICING_SUBSPACE: &[u8] = &[1];
@@ -455,15 +456,18 @@ impl<DB> ArbitrumApiImpl<DB> {
         })
     }
 
-    fn virtual_call_gas(data: &[u8], output: &[u8], context_storage_reads: u64) -> u64 {
+    fn virtual_call_gas(data: &[u8], output: &[u8], method_storage_reads: u64) -> u64 {
+        let storage_reads = NODE_INTERFACE_CONTEXT_STORAGE_READS
+            .saturating_add(method_storage_reads);
         copy_gas(data.len().saturating_sub(4))
             .saturating_add(copy_gas(output.len()))
-            .saturating_add(STORAGE_READ_GAS.saturating_mul(context_storage_reads))
+            .saturating_add(STORAGE_READ_GAS.saturating_mul(storage_reads))
     }
 
     fn retryable_info_storage_reads(data_len: usize) -> u64 {
-        // OpenArbosState, retryable scalar fields, calldata length, and calldata words.
-        11u64.saturating_add((data_len as u64) / 32)
+        // Retryable scalar fields, calldata length, and calldata words. The
+        // OpenArbosState read is added by virtual_call_gas.
+        10u64.saturating_add((data_len as u64) / 32)
     }
 
     fn l2_basefee_from_state<StateDB>(state: &StateDB) -> Result<u64, StateDB::Error>
@@ -938,7 +942,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 let gas_used = Self::virtual_call_gas(
                     data,
                     output.as_ref(),
-                    NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS,
+                    NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_STORAGE_READS,
                 );
                 (output, gas_used)
             }
@@ -967,7 +971,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 let gas_used = Self::virtual_call_gas(
                     data,
                     output.as_ref(),
-                    NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_READS,
+                    NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_STORAGE_READS,
                 );
                 (output, gas_used)
             }
@@ -978,7 +982,8 @@ impl<DB> ArbitrumApiImpl<DB> {
                 )
                 .abi_encode()
                 .into();
-                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 0);
+                let gas_used = copy_gas(data.len().saturating_sub(4))
+                    .saturating_add(copy_gas(output.len()));
                 (output, gas_used)
             }
             Ok(
@@ -1008,7 +1013,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 ))?
                 .abi_encode()
                 .into();
-                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 1);
+                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 0);
                 (output, gas_used)
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::l2BlockRangeForL1(call)) => {
@@ -1029,7 +1034,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                         legacy_zero_base_fee_until,
                     ))?;
                 let output: Bytes = (first_block, last_block).abi_encode().into();
-                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 1);
+                let gas_used = Self::virtual_call_gas(data, output.as_ref(), 0);
                 (output, gas_used)
             }
             Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::getL1Confirmations(_)) => {
@@ -1220,9 +1225,9 @@ impl<DB> ArbitrumApiImpl<DB> {
             ticket_id,
             retryable_basefee,
         )?;
-        if !should_schedule {
-            let gas_used = Self::virtual_call_gas(source_tx.input(), output.as_ref(), 2);
-            return Self::virtual_success::<StateDB>(source_tx, output, gas_used);
+        let submission_gas_used = if should_schedule { submit_tx.gas } else { 0 };
+        if !should_schedule || !source_tx.context.gas_estimation {
+            return Self::virtual_success::<StateDB>(source_tx, output, submission_gas_used);
         }
 
         Self::prepare_scheduled_redeem_overlay(
@@ -1255,8 +1260,8 @@ impl<DB> ArbitrumApiImpl<DB> {
         };
 
         match redeem_result {
-            ExecutionResult::Success { gas, .. } => {
-                Self::virtual_success::<StateDB>(source_tx, output, gas.spent())
+            ExecutionResult::Success { .. } => {
+                Self::virtual_success::<StateDB>(source_tx, output, submission_gas_used)
             }
             failed => Ok(failed),
         }
@@ -1389,6 +1394,7 @@ mod tests {
         const L2_PER_TX_GAS_LIMIT_OFFSET: u64 = 7;
 
         let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(ARBOS_STATE_ADDRESS, AccountInfo::default());
         let l2_pricing_key = arbos_child_key(&[], L2_PRICING_SUBSPACE);
         db.insert_account_storage(
             ARBOS_STATE_ADDRESS,
@@ -1621,7 +1627,69 @@ mod tests {
     }
 
     #[test]
-    fn retryable_submission_runs_scheduled_redeem_and_returns_ticket_id() {
+    fn retryable_estimation_runs_scheduled_redeem_and_returns_ticket_id() {
+        let api = test_api();
+        let block_env = BlockEnv {
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let source_tx = ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                chain_id: Some(42161),
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 100_000,
+                ..Default::default()
+            },
+            ArbitrumTxContext {
+                gas_estimation: true,
+                ..Default::default()
+            },
+        );
+        let submit_tx = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(3),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(4)),
+            retry_value: U256::ZERO,
+            beneficiary: Address::with_last_byte(5),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(6),
+            retry_data: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let ticket_id = submit_tx.ticket_id();
+        let state = state_with_l2_basefee(0);
+
+        let result = api
+            .execute_retryable_submission(
+                &block_env,
+                &state,
+                &source_tx,
+                submit_tx,
+                ticket_id,
+                None,
+            )
+            .expect("scheduled redeem should execute against empty target");
+
+        match result {
+            ExecutionResult::Success {
+                output: Output::Call(output),
+                gas,
+                ..
+            } => {
+                assert_eq!(output.as_ref(), ticket_id.as_slice());
+                assert_eq!(gas.spent(), 100_000);
+            }
+            other => panic!("unexpected retryable submission result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retryable_call_returns_after_submission_without_scheduled_redeem() {
         let api = test_api();
         let block_env = BlockEnv {
             gas_limit: 1_000_000,
@@ -1663,7 +1731,7 @@ mod tests {
                 ticket_id,
                 None,
             )
-            .expect("scheduled redeem should execute against empty target");
+            .expect("ordinary call should return after retryable submission");
 
         match result {
             ExecutionResult::Success {
@@ -1672,7 +1740,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(output.as_ref(), ticket_id.as_slice());
-                assert!(gas.spent() >= MIN_TRANSACTION_GAS);
+                assert_eq!(gas.spent(), 100_000);
             }
             other => panic!("unexpected retryable submission result: {other:?}"),
         }
@@ -1901,7 +1969,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(output.as_ref(), ticket_id.as_slice());
-                assert!(gas.spent() < MIN_TRANSACTION_GAS);
+                assert_eq!(gas.spent(), 0);
             }
             other => panic!("unexpected retryable submission result: {other:?}"),
         }
@@ -1923,7 +1991,10 @@ mod tests {
                 gas_price: 0,
                 ..Default::default()
             },
-            ArbitrumTxContext::default(),
+            ArbitrumTxContext {
+                gas_estimation: true,
+                ..Default::default()
+            },
         );
         let submit_tx = ArbitrumSubmitRetryableTx {
             chain_id: U256::ZERO,
@@ -1956,7 +2027,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(output.as_ref(), ticket_id.as_slice());
-                assert!(gas.spent() >= MIN_TRANSACTION_GAS);
+                assert_eq!(gas.spent(), 100_000);
             }
             other => panic!("unexpected retryable submission result: {other:?}"),
         }
@@ -2043,11 +2114,13 @@ mod tests {
             ArbitrumApiImpl::<()>::virtual_call_gas(
                 &data,
                 &output,
-                NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS,
+                NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_STORAGE_READS,
             ),
             copy_gas(data.len() - 4)
                 + copy_gas(output.len())
-                + STORAGE_READ_GAS * NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_READS
+                + STORAGE_READ_GAS
+                    * (NODE_INTERFACE_CONTEXT_STORAGE_READS
+                        + NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_STORAGE_READS)
         );
     }
 

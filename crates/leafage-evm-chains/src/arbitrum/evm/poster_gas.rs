@@ -21,6 +21,7 @@ use alloy::primitives::{U256, keccak256};
 use alloy_rlp::Encodable;
 use once_cell::sync::Lazy;
 use revm::context::TxEnv;
+use revm::context_interface::transaction::TransactionType;
 
 /// EIP-2028 non-zero calldata byte gas; Nitro charges this per compressed byte.
 const TX_DATA_NON_ZERO_GAS: u64 = 16;
@@ -75,22 +76,27 @@ enum PosterDataMode {
 fn fake_tx_bytes(tx: &TxEnv, mode: PosterDataMode) -> Vec<u8> {
     // Nitro leaves the fake tx's ChainID unset (encodes as 0).
     let chain_id: u64 = 0;
-    // Estimation messages carry nonce 0 in Nitro's CallDefaults path, which is
-    // then replaced with randomNonce. Leafage's TxEnv may already be filled
-    // with the sender's state nonce, so the estimation path must ignore it.
+    // Nitro's RPC ToMessage path always sets nonce 0, then the fake transaction
+    // replaces it with randomNonce. Leafage fills TxEnv with the state nonce,
+    // which must not leak into either call or estimation poster pricing.
     let use_estimation_defaults = matches!(mode, PosterDataMode::Estimate);
-    let nonce: u64 = if use_estimation_defaults || tx.nonce == 0 {
-        *RANDOM_NONCE
+    let nonce: u64 = *RANDOM_NONCE;
+    // Legacy and EIP-2930 ToMessage map gasPrice to both fee cap and tip cap.
+    // Dynamic-fee messages preserve a non-zero priority fee; a zero or absent
+    // tip is replaced by Nitro's randomGasTipCap.
+    let fixed_price = tx.tx_type == TransactionType::Legacy as u8
+        || tx.tx_type == TransactionType::Eip2930 as u8;
+    let tip: u128 = if fixed_price {
+        if tx.gas_price == 0 {
+            *RANDOM_GAS_TIP_CAP
+        } else {
+            tx.gas_price
+        }
     } else {
-        tx.nonce
+        tx.gas_priority_fee
+            .filter(|tip| *tip != 0)
+            .unwrap_or(*RANDOM_GAS_TIP_CAP)
     };
-    // Nitro ignores the message's priority fee when pricing RPC calldata: every
-    // eth_call / estimate / simulate builds the fake tx with the fixed
-    // `randomGasTipCap` (the executed RPC message carries GasTipCap 0, so
-    // `makeFakeTxForMessage` falls back to the random cap). Mirroring the request
-    // tip here made the fake tx's tip vary in RLP byte length — changing the
-    // brotli size and thus the L1 poster fee — while Nitro's stayed constant.
-    let tip: u128 = *RANDOM_GAS_TIP_CAP;
     let fee: u128 = if tx.gas_price == 0 {
         *RANDOM_GAS_FEE_CAP
     } else {
@@ -421,10 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn gas_price_populates_only_the_fake_tx_fee_cap() {
-        // Nitro prices RPC calldata with a fixed randomGasTipCap, so gasPrice
-        // must appear exactly once — as the fee cap, never as the tip cap —
-        // regardless of tx type.
+    fn fixed_price_types_use_gas_price_for_fake_fee_and_tip_caps() {
         fn encoded_gas_price_count(tx_type: u8) -> usize {
             let mut tx = sample_tx(vec![0u8; 4]);
             tx.tx_type = tx_type;
@@ -439,32 +442,39 @@ mod tests {
                 .count()
         }
 
-        for tx_type in [0, 1, 2] {
+        for tx_type in [
+            TransactionType::Legacy as u8,
+            TransactionType::Eip2930 as u8,
+        ] {
             assert_eq!(
                 encoded_gas_price_count(tx_type),
-                1,
-                "gasPrice is the fee cap only, not the tip cap"
+                2,
+                "legacy gasPrice must populate both fake fee and tip caps"
             );
         }
+        assert_eq!(
+            encoded_gas_price_count(TransactionType::Eip1559 as u8),
+            1,
+            "EIP-1559 maxFeePerGas must not populate the tip cap"
+        );
     }
 
     #[test]
-    fn priority_fee_does_not_change_the_fake_tx() {
-        // P1-A: Nitro ignores the message tip when pricing RPC calldata, so a
-        // priority fee must not change the fake tx (and thus the poster gas). A
-        // 2-byte tip like 0x1234 previously shrank the fake tx and undercounted.
+    fn eip1559_priority_fee_populates_the_fake_tip_cap() {
         let base = |prio: Option<u128>| {
             let mut tx = sample_tx(vec![0xabu8; 100]);
-            tx.tx_type = 2;
+            tx.tx_type = TransactionType::Eip1559 as u8;
             tx.gas_price = 0x5e6156bc;
             tx.gas_priority_fee = prio;
             fake_tx_bytes(&tx, PosterDataMode::CurrentTx)
         };
-        assert_eq!(
-            base(Some(0x1234)),
-            base(None),
-            "priority fee must not change the fake tx (Nitro uses randomGasTipCap)"
+        let explicit = base(Some(0x1234));
+        assert_ne!(explicit, base(None));
+        assert!(
+            explicit.windows(3).any(|window| window == [0x82, 0x12, 0x34]),
+            "explicit priority fee must be encoded as the fake tip cap"
         );
+        assert_eq!(base(Some(0)), base(None));
     }
 
     #[test]
@@ -483,18 +493,18 @@ mod tests {
         assert_eq!(count, 1, "EIP-1559 maxFeePerGas is not GasTipCap");
     }
 
-    /// The state-filled TxEnv nonce must not leak into the gas-estimation fake
-    /// tx: Nitro's estimation message carries nonce 0 and therefore encodes
-    /// randomNonce. A real small nonce would shrink the fake tx and undercount
-    /// posterGas for senders with nonce > 0.
+    /// The state-filled TxEnv nonce must not leak into an RPC fake tx: Nitro's
+    /// call message carries nonce 0 and therefore encodes randomNonce.
     #[test]
-    fn fake_tx_ignores_state_nonce_during_estimation() {
+    fn fake_tx_ignores_state_nonce_for_call_and_estimation() {
         let mut with_nonce = sample_tx(vec![0xabu8; 100]);
         with_nonce.nonce = 7;
-        assert_eq!(
-            fake_tx_bytes(&with_nonce, PosterDataMode::Estimate),
-            fake_tx_bytes(&sample_tx(vec![0xabu8; 100]), PosterDataMode::Estimate),
-        );
+        for mode in [PosterDataMode::CurrentTx, PosterDataMode::Estimate] {
+            assert_eq!(
+                fake_tx_bytes(&with_nonce, mode),
+                fake_tx_bytes(&sample_tx(vec![0xabu8; 100]), mode),
+            );
+        }
     }
 
     /// posterGas is non-zero end-to-end for a realistic call and scales up with

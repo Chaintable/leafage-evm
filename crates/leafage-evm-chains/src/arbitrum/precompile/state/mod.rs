@@ -29,6 +29,8 @@ const ARBOS_VERSION_60: u64 = 60;
 const ARBITRUM_START_TIME: u64 = 1_421_388_000;
 const MAX_UINT24: u32 = 0x00ff_ffff;
 const WARM_STORAGE_READ_GAS: u64 = 100;
+const KECCAK_BASE_GAS: u64 = 30;
+const KECCAK_WORD_GAS: u64 = 6;
 
 pub(super) struct ArbStorage<'a, CTX> {
     pub(super) context: &'a mut CTX,
@@ -155,6 +157,15 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
         self.burn(gas.total())?;
         self.context.chain_mut().record_multi_gas_cost(gas);
         Ok(())
+    }
+
+    pub(super) fn keccak(&mut self, data: &[u8]) -> Result<B256, PrecompileError> {
+        let words = u64::try_from(data.len())
+            .unwrap_or(u64::MAX)
+            .div_ceil(32);
+        let gas = KECCAK_BASE_GAS.saturating_add(KECCAK_WORD_GAS.saturating_mul(words));
+        self.burn_resource(ArbResourceKind::Computation, gas)?;
+        Ok(keccak256(data))
     }
 
     pub(super) fn burn_out(&mut self) {
@@ -724,6 +735,16 @@ mod tests {
             .expect_err("an empty account cannot transfer value");
 
         assert!(matches!(error, PrecompileError::Other(_)));
+    }
+
+    #[test]
+    fn keccak_charges_base_and_word_gas() {
+        let mut context = context(0);
+        let mut storage = ArbStorage::new_with_initial_gas(&mut context, u64::MAX, 7);
+        let data = [0xabu8; 33];
+
+        assert_eq!(storage.keccak(&data).expect("metered keccak"), keccak256(data));
+        assert_eq!(storage.gas_used, 7 + KECCAK_BASE_GAS + 2 * KECCAK_WORD_GAS);
     }
 
     #[test]
