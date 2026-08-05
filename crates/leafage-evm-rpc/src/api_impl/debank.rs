@@ -900,7 +900,8 @@ where
             ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
         );
 
-        while (highest_gas_limit - lowest_gas_limit) > 1 {
+        // https://github.com/paradigmxyz/reth/pull/16413
+        while (lowest_gas_limit + 1) < highest_gas_limit {
             if cancel_token.is_cancelled() {
                 return Err(internal_rpc_err(
                     "estimate gas cancelled by caller".to_string(),
