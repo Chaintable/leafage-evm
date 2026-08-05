@@ -14,7 +14,8 @@ use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockId, BlockInfo, BlockNumberOrTag};
 use revm::context::result::{
-    EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output, ResultGas, SuccessReason,
+    EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError, Output, ResultGas,
+    SuccessReason,
 };
 use revm::context::Transaction as _;
 use revm::database::CacheDB;
@@ -34,7 +35,7 @@ const COPY_GAS: u64 = 3;
 const STORAGE_READ_GAS: u64 = 800;
 const NODE_INTERFACE_CONTEXT_STORAGE_READS: u64 = 1;
 const NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_STORAGE_READS: u64 = 5;
-const NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_STORAGE_READS: u64 = 5;
+const NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_STORAGE_READS: u64 = 4;
 const RETRYABLE_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 const RETRYABLE_SUBSPACE: &[u8] = &[2];
 const L2_PRICING_SUBSPACE: &[u8] = &[1];
@@ -1225,9 +1226,16 @@ impl<DB> ArbitrumApiImpl<DB> {
             ticket_id,
             retryable_basefee,
         )?;
-        let submission_gas_used = if should_schedule { submit_tx.gas } else { 0 };
-        if !should_schedule || !source_tx.context.gas_estimation {
+        if !source_tx.context.gas_estimation {
+            let submission_gas_used = if should_schedule { submit_tx.gas } else { 0 };
             return Self::virtual_success::<StateDB>(source_tx, output, submission_gas_used);
+        }
+
+        // Nitro's estimator ignores the submit transaction's candidate-wide gas usage and
+        // searches using the scheduled redeem's success or failure. Leafage seeds its search
+        // from gas_used, so expose a useful lower bound instead of the submitted gas limit.
+        if !should_schedule {
+            return Self::virtual_success::<StateDB>(source_tx, output, MIN_TRANSACTION_GAS);
         }
 
         Self::prepare_scheduled_redeem_overlay(
@@ -1254,14 +1262,32 @@ impl<DB> ArbitrumApiImpl<DB> {
             source_tx.context.clone(),
         );
         let redeem_result = if let Some(inspector) = inspector {
-            self.inspect_evm(block_env, overlay, redeem_tx, inspector)?
+            self.inspect_evm(block_env, overlay, redeem_tx, inspector)
         } else {
-            self.transact_evm(block_env, overlay, redeem_tx)?
+            self.transact_evm(block_env, overlay, redeem_tx)
+        };
+        let redeem_result = match redeem_result {
+            Ok(result) => result,
+            Err(EVMError::Transaction(
+                InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+                | InvalidTransaction::GasFloorMoreThanGasLimit { .. },
+            )) => ExecutionResult::Halt {
+                reason: HaltReason::OutOfGas(OutOfGasError::Basic),
+                gas: ResultGas::new(
+                    source_tx.gas_limit(),
+                    source_tx.gas_limit(),
+                    0,
+                    0,
+                    0,
+                ),
+                logs: Vec::new(),
+            },
+            Err(err) => return Err(err),
         };
 
         match redeem_result {
             ExecutionResult::Success { .. } => {
-                Self::virtual_success::<StateDB>(source_tx, output, submission_gas_used)
+                Self::virtual_success::<StateDB>(source_tx, output, MIN_TRANSACTION_GAS)
             }
             failed => Ok(failed),
         }
@@ -1669,7 +1695,7 @@ mod tests {
                 &block_env,
                 &state,
                 &source_tx,
-                submit_tx,
+                submit_tx.clone(),
                 ticket_id,
                 None,
             )
@@ -1682,10 +1708,33 @@ mod tests {
                 ..
             } => {
                 assert_eq!(output.as_ref(), ticket_id.as_slice());
-                assert_eq!(gas.spent(), 100_000);
+                assert_eq!(gas.spent(), MIN_TRANSACTION_GAS);
             }
             other => panic!("unexpected retryable submission result: {other:?}"),
         }
+
+        let mut low_gas_source_tx = source_tx;
+        low_gas_source_tx.base.gas_limit = MIN_TRANSACTION_GAS;
+        let mut low_gas_submit_tx = submit_tx;
+        low_gas_submit_tx.gas = MIN_TRANSACTION_GAS;
+        let low_gas_ticket_id = low_gas_submit_tx.ticket_id();
+        let result = api
+            .execute_retryable_submission(
+                &block_env,
+                &state,
+                &low_gas_source_tx,
+                low_gas_submit_tx,
+                low_gas_ticket_id,
+                None,
+            )
+            .expect("insufficient redeem gas should remain searchable");
+        assert!(matches!(
+            result,
+            ExecutionResult::Halt {
+                reason: HaltReason::OutOfGas(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1922,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_submission_without_enough_fee_cap_does_not_schedule_redeem() {
+    fn retryable_submission_without_enough_fee_cap_uses_mode_specific_gas() {
         let api = test_api();
         let block_env = BlockEnv {
             gas_limit: 1_000_000,
@@ -1958,7 +2007,12 @@ mod tests {
 
         let result = api
             .execute_retryable_submission(
-                &block_env, &state, &source_tx, submit_tx, ticket_id, None,
+                &block_env,
+                &state,
+                &source_tx,
+                submit_tx.clone(),
+                ticket_id,
+                None,
             )
             .expect("retryable submission should create ticket without auto-redeem");
 
@@ -1972,6 +2026,31 @@ mod tests {
                 assert_eq!(gas.spent(), 0);
             }
             other => panic!("unexpected retryable submission result: {other:?}"),
+        }
+
+        let mut estimation_tx = source_tx;
+        estimation_tx.context.gas_estimation = true;
+        let result = api
+            .execute_retryable_submission(
+                &block_env,
+                &state,
+                &estimation_tx,
+                submit_tx,
+                ticket_id,
+                None,
+            )
+            .expect("retryable estimation should retain the transaction gas floor");
+
+        match result {
+            ExecutionResult::Success {
+                output: Output::Call(output),
+                gas,
+                ..
+            } => {
+                assert_eq!(output.as_ref(), ticket_id.as_slice());
+                assert_eq!(gas.spent(), MIN_TRANSACTION_GAS);
+            }
+            other => panic!("unexpected retryable estimation result: {other:?}"),
         }
     }
 
@@ -2027,7 +2106,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(output.as_ref(), ticket_id.as_slice());
-                assert_eq!(gas.spent(), 100_000);
+                assert_eq!(gas.spent(), MIN_TRANSACTION_GAS);
             }
             other => panic!("unexpected retryable submission result: {other:?}"),
         }
@@ -2121,6 +2200,26 @@ mod tests {
                 + STORAGE_READ_GAS
                     * (NODE_INTERFACE_CONTEXT_STORAGE_READS
                         + NODE_INTERFACE_GAS_ESTIMATE_COMPONENTS_STORAGE_READS)
+        );
+    }
+
+    #[test]
+    fn gas_estimate_l1_component_charges_five_storage_reads() {
+        let call = INodeInterfaceVirtual::gasEstimateL1ComponentCall {
+            to: Address::with_last_byte(0xaa),
+            contractCreation: false,
+            data: Bytes::from_static(&[0x95, 0xd8, 0x9b, 0x41]),
+        };
+        let data = call.abi_encode();
+        let output = (1u64, U256::from(2), U256::from(3)).abi_encode();
+
+        assert_eq!(
+            ArbitrumApiImpl::<()>::virtual_call_gas(
+                &data,
+                &output,
+                NODE_INTERFACE_GAS_ESTIMATE_L1_COMPONENT_STORAGE_READS,
+            ),
+            copy_gas(data.len() - 4) + copy_gas(output.len()) + STORAGE_READ_GAS * 5
         );
     }
 
