@@ -1,10 +1,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::arbitrum::hardforks::ArbitrumHardfork;
+
 /// Per-chain configuration for Arbitrum Orbit (Nitro) replicas, parsed from
 /// `--evm-custom-config`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ArbitrumEvmConfig {
+    /// Explicit `--spec-id` override. `None` selects the spec from the target
+    /// block's Nitro `ArbOSFormatVersion`.
+    #[serde(skip)]
+    pub hardfork_override: Option<ArbitrumHardfork>,
+
     /// Mirrors Nitro's
     /// `ChainConfig.ArbitrumChainParams.AllowDebugPrecompiles`.
     ///

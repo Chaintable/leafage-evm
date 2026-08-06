@@ -38,6 +38,12 @@ fn block_info(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
     info.inner.header.inner.number = number;
     info.inner.header.inner.parent_hash = parent_hash;
     info.inner.header.inner.gas_limit = 30_000_000;
+    info.inner.header.inner.base_fee_per_gas = Some(1);
+    info.inner.header.inner.difficulty = U256::ONE;
+    info.inner.header.inner.extra_data = Bytes::from(vec![0; 32]);
+    let mut mix_hash = [0u8; 32];
+    mix_hash[16..24].copy_from_slice(&51u64.to_be_bytes());
+    info.inner.header.inner.mix_hash = H256::from(mix_hash);
     info
 }
 

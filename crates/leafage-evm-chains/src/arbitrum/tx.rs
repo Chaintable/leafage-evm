@@ -35,6 +35,8 @@ pub struct ArbitrumTxEnv {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArbitrumTxContext {
     pub current_l1_block_number: u64,
+    /// Nitro `HeaderInfo.ArbOSFormatVersion` decoded from the target block.
+    pub current_arbos_version: u64,
     /// Nitro run-context analog (`runCtx.IsGasEstimation()`): gas-estimation
     /// runs apply the L1 poster padding (×1.10 cost, 7/8 price adjustment)
     /// that eth_call-style runs must not.
