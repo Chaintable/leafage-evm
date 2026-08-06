@@ -42,7 +42,7 @@ impl ArbOwnerPublic {
                     finish_call::<IArbOwnerPublic::isChainOwnerCall>(
                         gas_limit,
                         storage.gas_used,
-                        ret.into(),
+                        ret,
                     )
                 }
                 IArbOwnerPublic::IArbOwnerPublicCalls::getAllChainOwners(_) => {
@@ -51,7 +51,7 @@ impl ArbOwnerPublic {
                     finish_call::<IArbOwnerPublic::getAllChainOwnersCall>(
                         gas_limit,
                         storage.gas_used,
-                        ret.into(),
+                        ret,
                     )
                 }
                 IArbOwnerPublic::IArbOwnerPublicCalls::getNativeTokenManagementFrom(_) => {

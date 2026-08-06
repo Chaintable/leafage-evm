@@ -6,7 +6,7 @@ use once_cell::sync::OnceCell;
 use std::env;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 use std::sync::{Arc, Condvar, Mutex};
@@ -997,13 +997,13 @@ fn canonicalize_library_path(path: PathBuf) -> Result<PathBuf, StylusRuntimeErro
 
 fn load_symbol<T: Copy>(
     library: &Library,
-    path: &PathBuf,
+    path: &Path,
     name: &'static str,
 ) -> Result<T, StylusRuntimeError> {
     unsafe { library.get::<T>(name.as_bytes()) }
         .map(|symbol| *symbol)
         .map_err(|error| StylusRuntimeError::Symbol {
-            path: path.clone(),
+            path: path.to_path_buf(),
             symbol: name,
             error: error.to_string(),
         })

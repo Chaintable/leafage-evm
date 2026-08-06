@@ -81,7 +81,7 @@ mod tests {
         }
         .abi_encode();
 
-        let output = ArbFunctionTable::run(ArbPrecompileInput {
+        ArbFunctionTable::run(ArbPrecompileInput {
             data: &data,
             gas: gas_limit,
             caller: Address::ZERO,
@@ -98,9 +98,7 @@ mod tests {
             current_chain_config: None,
             context: &mut context,
         })
-        .expect("get should revert");
-
-        output
+        .expect("get should revert")
     }
 
     #[test]

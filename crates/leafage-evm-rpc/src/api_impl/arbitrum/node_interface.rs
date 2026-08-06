@@ -267,7 +267,7 @@ where
 fn configured_nitro_genesis_block_num(chain_id: u64, config: Option<&ArbitrumEvmConfig>) -> u64 {
     config
         .and_then(|config| config.genesis_block_num)
-        .unwrap_or_else(|| match chain_id {
+        .unwrap_or(match chain_id {
             // Nitro chain info: Arbitrum One's first Nitro block after classic.
             42161 => ARBITRUM_ONE_NITRO_GENESIS_BLOCK,
             _ => 0,

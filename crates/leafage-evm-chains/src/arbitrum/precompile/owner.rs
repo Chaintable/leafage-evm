@@ -565,8 +565,8 @@ impl ArbOwner {
             }
             IArbOwner::IArbOwnerCalls::setGasPricingConstraints(call) => {
                 storage.clear_gas_pricing_constraints()?;
-                if current_arbos_version >= ARBOS_VERSION_MULTI_CONSTRAINT_FIX
-                    && current_arbos_version < ARBOS_VERSION_MULTI_GAS_CONSTRAINTS
+                if (ARBOS_VERSION_MULTI_CONSTRAINT_FIX..ARBOS_VERSION_MULTI_GAS_CONSTRAINTS)
+                    .contains(&current_arbos_version)
                     && call.constraints.len() > MAX_GAS_PRICING_CONSTRAINTS
                 {
                     return Err(PrecompileError::other(format!(
@@ -822,14 +822,10 @@ impl ArbOwner {
             }
             IArbOwner::IArbOwnerCalls::setWasmMinInitGas(call) => {
                 let mut params = storage.stylus_params()?;
-                params.min_init_gas = Self::saturating_u8(Self::div_ceil_u64(
-                    u64::from(call.gas),
-                    MIN_INIT_GAS_UNITS,
-                ));
-                params.min_cached_init_gas = Self::saturating_u8(Self::div_ceil_u64(
-                    u64::from(call.cached),
-                    MIN_CACHED_GAS_UNITS,
-                ));
+                params.min_init_gas =
+                    Self::saturating_u8(u64::from(call.gas).div_ceil(MIN_INIT_GAS_UNITS));
+                params.min_cached_init_gas =
+                    Self::saturating_u8(u64::from(call.cached).div_ceil(MIN_CACHED_GAS_UNITS));
                 storage.save_stylus_params(params)?;
                 Self::finish_write::<IArbOwner::setWasmMinInitGasCall, DB>(
                     storage,
@@ -842,7 +838,7 @@ impl ArbOwner {
             IArbOwner::IArbOwnerCalls::setWasmInitCostScalar(call) => {
                 let mut params = storage.stylus_params()?;
                 params.init_cost_scalar =
-                    Self::saturating_u8(Self::div_ceil_u64(call.percent, COST_SCALAR_PERCENT));
+                    Self::saturating_u8(call.percent.div_ceil(COST_SCALAR_PERCENT));
                 storage.save_stylus_params(params)?;
                 Self::finish_write::<IArbOwner::setWasmInitCostScalarCall, DB>(
                     storage,
@@ -1149,10 +1145,10 @@ impl ArbOwner {
                 continue;
             }
 
-            let divisor = Self::saturating_i64_from_u64(Self::saturating_u64_mul(
-                u64::from(constraint.adjustment_window_secs),
-                Self::saturating_u64_mul(constraint.target_per_sec, max_weight),
-            ));
+            let weighted_target = constraint.target_per_sec.saturating_mul(max_weight);
+            let divisor = Self::saturating_i64_from_u64(
+                u64::from(constraint.adjustment_window_secs).saturating_mul(weighted_target),
+            );
             if divisor == 0 {
                 continue;
             }
@@ -1162,8 +1158,7 @@ impl ArbOwner {
                     continue;
                 }
 
-                let dividend =
-                    Self::natural_to_bips(Self::saturating_u64_mul(constraint.backlog, weight));
+                let dividend = Self::natural_to_bips(constraint.backlog.saturating_mul(weight));
                 let exponent = dividend / divisor;
                 exponents[resource] = exponents[resource].saturating_add(exponent);
             }
@@ -1257,16 +1252,8 @@ impl ArbOwner {
         }
     }
 
-    fn div_ceil_u64(lhs: u64, rhs: u64) -> u64 {
-        lhs / rhs + u64::from(lhs % rhs != 0)
-    }
-
     fn saturating_u8(value: u64) -> u8 {
         u8::try_from(value).unwrap_or(u8::MAX)
-    }
-
-    fn saturating_u64_mul(lhs: u64, rhs: u64) -> u64 {
-        lhs.checked_mul(rhs).unwrap_or(u64::MAX)
     }
 
     fn saturating_i64_from_u64(value: u64) -> i64 {

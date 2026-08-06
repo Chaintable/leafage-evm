@@ -624,17 +624,13 @@ impl ArbWasm {
 
     fn program_init_gas(program: WasmProgram, params: StylusParams) -> (u64, u64) {
         let cached = u64::from(params.min_cached_init_gas) * MIN_CACHED_GAS_UNITS
-            + div_ceil_u64(
-                u64::from(program.cached_cost)
-                    .saturating_mul(u64::from(params.cached_cost_scalar) * COST_SCALAR_PERCENT),
-                100,
-            );
+            + u64::from(program.cached_cost)
+                .saturating_mul(u64::from(params.cached_cost_scalar) * COST_SCALAR_PERCENT)
+                .div_ceil(100);
         let mut init = u64::from(params.min_init_gas) * MIN_INIT_GAS_UNITS
-            + div_ceil_u64(
-                u64::from(program.init_cost)
-                    .saturating_mul(u64::from(params.init_cost_scalar) * COST_SCALAR_PERCENT),
-                100,
-            );
+            + u64::from(program.init_cost)
+                .saturating_mul(u64::from(params.init_cost_scalar) * COST_SCALAR_PERCENT)
+                .div_ceil(100);
         if params.version > 1 {
             init = init.saturating_add(cached);
         }
@@ -803,7 +799,7 @@ impl ArbWasm {
 
         let decompressed_len = u32::from_be_bytes([code[4], code[5], code[6], code[7]]);
         let address_bytes = code.len() - 8;
-        if address_bytes % 20 != 0 {
+        if !address_bytes.is_multiple_of(20) {
             return Err(ArbWasmError::NonSolidityError);
         }
 
@@ -991,10 +987,6 @@ impl ArbWasm {
 
         Ok(output)
     }
-}
-
-fn div_ceil_u64(lhs: u64, rhs: u64) -> u64 {
-    lhs / rhs + u64::from(lhs % rhs != 0)
 }
 
 #[cfg(test)]
