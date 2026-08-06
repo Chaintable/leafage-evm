@@ -46,6 +46,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,
@@ -108,7 +109,7 @@ where
 {
     type Tx = TxEnv;
 
-    fn estimate_l1_overhead<StateDB: DatabaseRef>(
+    fn estimate_l1_overhead<StateDB>(
         &self,
         block: &BlockInfo,
         block_env: &BlockEnv,
@@ -116,8 +117,8 @@ where
         state: &StateDB,
     ) -> u64
     where
+        StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
-        StateDB: Debug,
     {
         if tx.caller == SYSTEM_SIGNER {
             return 0;

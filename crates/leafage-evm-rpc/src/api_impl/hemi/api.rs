@@ -4,7 +4,7 @@ use crate::api_impl::hemi::evm::{create_hemi_evm_from_state, create_hemi_txn_env
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::hemi::HemiHardfork;
-use leafage_evm_types::{BlockEnv, CallRequest};
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::{EVMError, ExecutionResult};
 use revm::context::TxEnv;
@@ -32,6 +32,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,

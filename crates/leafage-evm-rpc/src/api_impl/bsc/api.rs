@@ -5,7 +5,7 @@ use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::bsc::{BscEvm, BscHardfork, BscTxEnv};
-use leafage_evm_types::{BlockEnv, CallRequest};
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
@@ -27,6 +27,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,

@@ -78,6 +78,7 @@ where
         // Use geth config to enable step recording for struct logs
         let trace_cfg = TracingInspectorConfig::default_geth();
         let tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request,
             &memory_db,
@@ -187,6 +188,7 @@ where
             }
             let trace_cfg = TracingInspectorConfig::default_parity();
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 tx,
                 &memory_db,
