@@ -28,7 +28,7 @@ pub fn nitro_message_gas_price(tx: &impl Transaction, basefee: u128) -> u128 {
 #[derive(Clone, Debug, Default)]
 pub struct ArbitrumTxEnv {
     pub base: TxEnv,
-    pub retryable: Option<ArbitrumRetryableRedeemContext>,
+    pub variant: ArbitrumTxVariant,
     pub context: ArbitrumTxContext,
 }
 
@@ -41,14 +41,15 @@ pub struct ArbitrumTxContext {
     pub gas_estimation: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArbitrumRetryableRedeemContext {
-    pub ticket_id: Option<B256>,
-    pub refund_to: Address,
-    pub zero_gas_price: bool,
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ArbitrumTxVariant {
+    #[default]
+    Ethereum,
+    SubmitRetryable(ArbitrumSubmitRetryableTx),
+    RetryableRedeem(ArbitrumRetryTx),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArbitrumSubmitRetryableTx {
     pub chain_id: U256,
     pub request_id: B256,
@@ -63,6 +64,22 @@ pub struct ArbitrumSubmitRetryableTx {
     pub max_submission_fee: U256,
     pub fee_refund_addr: Address,
     pub retry_data: Bytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitrumRetryTx {
+    pub chain_id: U256,
+    pub nonce: u64,
+    pub from: Address,
+    pub gas_fee_cap: U256,
+    pub gas: u64,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub data: Bytes,
+    pub ticket_id: B256,
+    pub refund_to: Address,
+    pub max_refund: U256,
+    pub submission_fee_refund: U256,
 }
 
 impl ArbitrumSubmitRetryableTx {
@@ -111,6 +128,30 @@ impl ArbitrumSubmitRetryableTx {
         keccak256(out)
     }
 
+    pub fn retry_tx(
+        &self,
+        ticket_id: B256,
+        sequence_num: u64,
+        gas_fee_cap: U256,
+        max_refund: U256,
+        submission_fee_refund: U256,
+    ) -> ArbitrumRetryTx {
+        ArbitrumRetryTx {
+            chain_id: self.chain_id,
+            nonce: sequence_num,
+            from: self.from,
+            gas_fee_cap,
+            gas: self.gas,
+            to: self.retry_to,
+            value: self.retry_value,
+            data: self.retry_data.clone(),
+            ticket_id,
+            refund_to: self.fee_refund_addr,
+            max_refund,
+            submission_fee_refund,
+        }
+    }
+
     fn optional_address_rlp_len(address: &Option<Address>) -> usize {
         address.as_ref().map_or(1, |address| address.length())
     }
@@ -123,13 +164,67 @@ impl ArbitrumSubmitRetryableTx {
     }
 }
 
+impl ArbitrumRetryTx {
+    pub fn hash(&self) -> B256 {
+        let payload_len = self.chain_id.length()
+            + self.nonce.length()
+            + self.from.length()
+            + self.gas_fee_cap.length()
+            + self.gas.length()
+            + ArbitrumSubmitRetryableTx::optional_address_rlp_len(&self.to)
+            + self.value.length()
+            + self.data.length()
+            + self.ticket_id.length()
+            + self.refund_to.length()
+            + self.max_refund.length()
+            + self.submission_fee_refund.length();
+
+        let mut out = Vec::with_capacity(payload_len + 8);
+        out.push(ARBITRUM_RETRY_TX_TYPE);
+        Header {
+            list: true,
+            payload_length: payload_len,
+        }
+        .encode(&mut out);
+        self.chain_id.encode(&mut out);
+        self.nonce.encode(&mut out);
+        self.from.encode(&mut out);
+        self.gas_fee_cap.encode(&mut out);
+        self.gas.encode(&mut out);
+        ArbitrumSubmitRetryableTx::encode_optional_address(&self.to, &mut out);
+        self.value.encode(&mut out);
+        self.data.encode(&mut out);
+        self.ticket_id.encode(&mut out);
+        self.refund_to.encode(&mut out);
+        self.max_refund.encode(&mut out);
+        self.submission_fee_refund.encode(&mut out);
+        keccak256(out)
+    }
+}
+
 impl ArbitrumTxEnv {
     pub fn new(base: TxEnv, context: ArbitrumTxContext) -> Self {
         Self {
             base,
-            retryable: None,
+            variant: ArbitrumTxVariant::Ethereum,
             context,
         }
+    }
+
+    pub fn submit_retryable(mut source: Self, submit_retryable: ArbitrumSubmitRetryableTx) -> Self {
+        source.base.tx_type = ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE;
+        source.base.caller = submit_retryable.from;
+        source.base.gas_limit = submit_retryable.gas;
+        source.base.gas_price = submit_retryable.gas_fee_cap.try_into().unwrap_or(u128::MAX);
+        source.base.gas_priority_fee = Some(0);
+        source.base.kind = submit_retryable
+            .retry_to
+            .map_or(TxKind::Create, TxKind::Call);
+        source.base.value = submit_retryable.retry_value;
+        source.base.data = submit_retryable.retry_data.clone();
+        source.base.nonce = 0;
+        source.variant = ArbitrumTxVariant::SubmitRetryable(submit_retryable);
+        source
     }
 
     pub fn retryable_redeem(
@@ -138,27 +233,78 @@ impl ArbitrumTxEnv {
         refund_to: Address,
         context: ArbitrumTxContext,
     ) -> Self {
-        let zero_gas_price = base.gas_price == 0;
         base.tx_type = ARBITRUM_RETRY_TX_TYPE;
+        let retryable = ArbitrumRetryTx {
+            chain_id: base.chain_id.map(U256::from).unwrap_or_default(),
+            nonce: base.nonce,
+            from: base.caller,
+            gas_fee_cap: U256::from(base.gas_price),
+            gas: base.gas_limit,
+            to: base.kind.to().copied(),
+            value: base.value,
+            data: base.data.clone(),
+            ticket_id: ticket_id.unwrap_or_default(),
+            refund_to,
+            max_refund: U256::MAX,
+            submission_fee_refund: U256::ZERO,
+        };
         Self {
             base,
-            retryable: Some(ArbitrumRetryableRedeemContext {
-                ticket_id,
-                refund_to,
-                zero_gas_price,
-            }),
+            variant: ArbitrumTxVariant::RetryableRedeem(retryable),
             context,
         }
     }
 
+    pub fn from_retryable(retryable: ArbitrumRetryTx, context: ArbitrumTxContext) -> Self {
+        let base = TxEnv {
+            tx_type: ARBITRUM_RETRY_TX_TYPE,
+            caller: retryable.from,
+            gas_limit: retryable.gas,
+            gas_price: retryable.gas_fee_cap.try_into().unwrap_or(u128::MAX),
+            gas_priority_fee: Some(0),
+            kind: retryable.to.map_or(TxKind::Create, TxKind::Call),
+            value: retryable.value,
+            data: retryable.data.clone(),
+            nonce: retryable.nonce,
+            chain_id: if retryable.chain_id.is_zero() {
+                None
+            } else {
+                retryable.chain_id.try_into().ok()
+            },
+            ..Default::default()
+        };
+        Self {
+            base,
+            variant: ArbitrumTxVariant::RetryableRedeem(retryable),
+            context,
+        }
+    }
+
+    pub fn submit_retryable_tx(&self) -> Option<&ArbitrumSubmitRetryableTx> {
+        match &self.variant {
+            ArbitrumTxVariant::SubmitRetryable(tx) => Some(tx),
+            _ => None,
+        }
+    }
+
+    pub fn retryable_redeem_tx(&self) -> Option<&ArbitrumRetryTx> {
+        match &self.variant {
+            ArbitrumTxVariant::RetryableRedeem(tx) => Some(tx),
+            _ => None,
+        }
+    }
+
+    pub fn is_submit_retryable(&self) -> bool {
+        self.submit_retryable_tx().is_some()
+    }
+
     pub fn is_retryable_redeem(&self) -> bool {
-        self.retryable.is_some()
+        self.retryable_redeem_tx().is_some()
     }
 
     pub fn is_zero_gas_price_retryable(&self) -> bool {
-        self.retryable
-            .as_ref()
-            .is_some_and(|retryable| retryable.zero_gas_price)
+        self.retryable_redeem_tx()
+            .is_some_and(|retryable| retryable.gas_fee_cap.is_zero())
     }
 
     pub fn aliases_caller(&self) -> bool {
@@ -245,6 +391,7 @@ impl Transaction for ArbitrumTxEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leafage_evm_types::hex;
 
     #[test]
     fn nitro_message_gas_price_matches_geth_default_tip_semantics() {
@@ -305,6 +452,37 @@ mod tests {
     }
 
     #[test]
+    fn retryable_nil_chain_id_stays_unset_in_tx_env() {
+        let submit = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(1),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::ZERO,
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(2)),
+            retry_value: U256::ZERO,
+            beneficiary: Address::with_last_byte(3),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(4),
+            retry_data: Bytes::new(),
+        };
+        let retryable = submit.retry_tx(
+            B256::with_last_byte(5),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        );
+
+        let tx = ArbitrumTxEnv::from_retryable(retryable, ArbitrumTxContext::default());
+
+        assert_eq!(tx.chain_id(), None);
+        assert_eq!(tx.tx_type(), ARBITRUM_RETRY_TX_TYPE);
+    }
+
+    #[test]
     fn aliases_caller_matches_nitro_tx_types() {
         for tx_type in [
             ARBITRUM_UNSIGNED_TX_TYPE,
@@ -337,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_retryable_ticket_id_is_typed_hash() {
+    fn arbitrum_transaction_hashes_match_nitro_vectors() {
         let submit = ArbitrumSubmitRetryableTx {
             chain_id: U256::ZERO,
             request_id: B256::ZERO,
@@ -353,31 +531,33 @@ mod tests {
             fee_refund_addr: Address::with_last_byte(10),
             retry_data: Bytes::from_static(&[11, 12]),
         };
+        assert_eq!(
+            submit.ticket_id(),
+            B256::from(hex!(
+                "b5cc7f02d7439838cbee893675f3fdddba261626a579726892a434e9bb3e2190"
+            ))
+        );
 
-        let mut payload = Vec::new();
-        submit.chain_id.encode(&mut payload);
-        submit.request_id.encode(&mut payload);
-        submit.from.encode(&mut payload);
-        submit.l1_base_fee.encode(&mut payload);
-        submit.deposit_value.encode(&mut payload);
-        submit.gas_fee_cap.encode(&mut payload);
-        submit.gas.encode(&mut payload);
-        submit.retry_to.unwrap().encode(&mut payload);
-        submit.retry_value.encode(&mut payload);
-        submit.beneficiary.encode(&mut payload);
-        submit.max_submission_fee.encode(&mut payload);
-        submit.fee_refund_addr.encode(&mut payload);
-        submit.retry_data.encode(&mut payload);
-
-        let mut encoded = vec![ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE];
-        Header {
-            list: true,
-            payload_length: payload.len(),
-        }
-        .encode(&mut encoded);
-        encoded.extend_from_slice(&payload);
-
-        assert_eq!(submit.ticket_id(), keccak256(encoded));
+        let retryable = ArbitrumRetryTx {
+            chain_id: U256::ZERO,
+            nonce: 9,
+            from: Address::with_last_byte(1),
+            gas_fee_cap: U256::from(4),
+            gas: 50_000,
+            to: Some(Address::with_last_byte(6)),
+            value: U256::from(7),
+            data: Bytes::from_static(&[11, 12]),
+            ticket_id: B256::with_last_byte(5),
+            refund_to: Address::with_last_byte(10),
+            max_refund: U256::from(123),
+            submission_fee_refund: U256::from(456),
+        };
+        assert_eq!(
+            retryable.hash(),
+            B256::from(hex!(
+                "1da44f94407051bf4eb3eafabdc5cd2c7b45700d7997da04ffc14fb3f198fbd3"
+            ))
+        );
     }
 
     #[test]

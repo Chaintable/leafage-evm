@@ -12,7 +12,7 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{
     AccountStorageDiff, Address, Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff,
-    Bytes, CallRequest, CfgEnv, IndexValuePair, NewAccount, H256, U256,
+    Bytes, CallRequest, CfgEnv, IndexValuePair, NewAccount, NewCode, H256, U256,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,14 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
 
     let sender = Address::repeat_byte(0x11);
     let target = Address::repeat_byte(0x22);
+    let reverting_target = Address::repeat_byte(0x33);
+    let target_code = Bytes::from_static(&[
+        0x36, 0x15, 0x60, 0x12, 0x57, 0x60, 0x2a, 0x5f, 0x55, 0x60, 0x01, 0x5f, 0x53, 0x60, 0x01,
+        0x5f, 0xa0, 0x00, 0x5b, 0x5f, 0x54, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+    ]);
+    let reverting_code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+    let target_code_hash = keccak256(target_code.as_ref());
+    let reverting_code_hash = keccak256(reverting_code.as_ref());
     let arbos_address_hash = keccak256(ARBOS_STATE_ADDRESS.as_slice());
     let l2_pricing_key = keccak256([1u8]);
 
@@ -88,6 +96,18 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
                 nonce: 0,
                 code_hash: H256::ZERO,
             },
+            NewAccount {
+                address: keccak256(target.as_slice()),
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: target_code_hash,
+            },
+            NewAccount {
+                address: keccak256(reverting_target.as_slice()),
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: reverting_code_hash,
+            },
         ],
         storage_diffs: vec![AccountStorageDiff {
             address: arbos_address_hash,
@@ -106,6 +126,16 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
                 },
             ],
         }],
+        new_codes: vec![
+            NewCode {
+                code_hash: target_code_hash,
+                code: target_code,
+            },
+            NewCode {
+                code_hash: reverting_code_hash,
+                code: reverting_code,
+            },
+        ],
         ..Default::default()
     };
     StateDBWrapper(
@@ -169,7 +199,7 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
     };
     let ticket_id = EthApiClient::call(
         &client,
-        call_request,
+        call_request.clone(),
         BlockId::Number(BlockNumberOrTag::Latest),
         None,
         None,
@@ -177,6 +207,41 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
     .await
     .unwrap();
     assert_eq!(ticket_id.len(), 32);
+
+    let read_request = CallRequest {
+        inner: TransactionRequest::default().from(sender).to(target),
+        tempo: None,
+    };
+    let simulation = DebankApiClient::simulate_transactions(
+        &client,
+        vec![call_request, read_request],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(simulation.stats.success);
+    assert_eq!(simulation.results.len(), 2);
+    assert_eq!(simulation.results[0].code, 0);
+    assert_eq!(simulation.results[1].code, 0);
+    assert!(simulation.results[0].gas_used > 21_000);
+    assert!(simulation.results[0].gas_used < 100_000);
+    assert!(simulation.results[0]
+        .traces
+        .iter()
+        .any(|trace| trace.to_addr == NODE_INTERFACE_ADDRESS));
+    assert!(simulation.results[0]
+        .traces
+        .iter()
+        .any(|trace| trace.to_addr == target));
+    assert_eq!(simulation.results[0].events.len(), 3);
+    let read_trace = simulation.results[1]
+        .traces
+        .iter()
+        .find(|trace| trace.to_addr == target)
+        .expect("second simulation should execute the target contract");
+    assert_eq!(read_trace.output.len(), 32);
+    assert_eq!(read_trace.output[31], 0x2a);
 
     let mut estimates = Vec::new();
     for requested_gas in [None, Some(100_000), Some(1_000_000), Some(5_000_000)] {
@@ -202,8 +267,69 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
     }
 
     assert!(estimates.iter().all(|estimate| *estimate == estimates[0]));
-    assert!(estimates[0] >= U256::from(21_000u64));
+    assert!(estimates[0] > U256::from(21_000u64), "{estimates:?}");
     assert!(estimates[0] < U256::from(100_000u64));
+
+    let low_gas_request = CallRequest {
+        inner: TransactionRequest::default()
+            .from(sender)
+            .to(NODE_INTERFACE_ADDRESS)
+            .gas_limit(21_000)
+            .input(TransactionInput::new(Bytes::from(calldata.clone()))),
+        tempo: None,
+    };
+    assert!(EthApiClient::call(
+        &client,
+        low_gas_request,
+        BlockId::Number(BlockNumberOrTag::Latest),
+        None,
+        None,
+    )
+    .await
+    .is_err());
+
+    let reverting_calldata = estimateRetryableTicketCall {
+        sender,
+        deposit: U256::ZERO,
+        to: reverting_target,
+        l2CallValue: U256::ZERO,
+        excessFeeRefundAddress: sender,
+        callValueRefundAddress: sender,
+        data: Bytes::new(),
+    }
+    .abi_encode();
+    let reverting_request = CallRequest {
+        inner: TransactionRequest::default()
+            .from(sender)
+            .to(NODE_INTERFACE_ADDRESS)
+            .input(TransactionInput::new(Bytes::from(reverting_calldata))),
+        tempo: None,
+    };
+    assert!(EthApiClient::call(
+        &client,
+        reverting_request.clone(),
+        BlockId::Number(BlockNumberOrTag::Latest),
+        None,
+        None,
+    )
+    .await
+    .is_err());
+    assert!(
+        DebankApiClient::estimate_gas(&client, reverting_request.clone(), None, None,)
+            .await
+            .is_err()
+    );
+
+    let reverting_simulation =
+        DebankApiClient::simulate_transactions(&client, vec![reverting_request], None, None)
+            .await
+            .unwrap();
+    assert!(!reverting_simulation.stats.success);
+    assert_ne!(reverting_simulation.results[0].code, 0);
+    assert!(reverting_simulation.results[0]
+        .traces
+        .iter()
+        .any(|trace| trace.to_addr == NODE_INTERFACE_ADDRESS));
 
     handle.stop().unwrap();
     let _ = std::fs::remove_dir_all(&db_path);

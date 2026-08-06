@@ -5,16 +5,15 @@ use super::{
     ArbPrecompileInput, ArbitrumContext, ARB_RETRYABLE_TX_ADDRESS, RETRYABLE_LIFETIME_SECONDS,
 };
 use crate::arbitrum::evm::ArbResourceKind;
+use crate::arbitrum::tx::ArbitrumRetryTx;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolCall, SolInterface, SolValue};
-use alloy_rlp::{BufMut, Encodable, Header, EMPTY_STRING_CODE};
 use revm::context::{Cfg, ContextTr, JournalTr};
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use revm::Database;
 
 pub(super) struct ArbRetryableTx;
 
-const ARBITRUM_RETRY_TX_TYPE: u8 = 0x68;
 const RETRYABLE_STORAGE_BURN_PER_WORD: u64 = 50;
 const RETRYABLE_KEEPALIVE_STORAGE_BURN_PER_WORD: u64 = 200;
 const RETRYABLE_REAP_PRICE: u64 = 58_000;
@@ -22,6 +21,43 @@ const TX_GAS: u64 = 21_000;
 const COPY_GAS: u64 = 3;
 const ARBOS_VERSION_3: u64 = 3;
 const ARBOS_VERSION_11: u64 = 11;
+
+pub fn retryable_ticket_created_log(ticket_id: B256) -> Log {
+    Log::new_unchecked(
+        ARB_RETRYABLE_TX_ADDRESS,
+        vec![keccak256("TicketCreated(bytes32)"), ticket_id],
+        Bytes::new(),
+    )
+}
+
+pub fn retryable_redeem_scheduled_log(
+    ticket_id: B256,
+    retry_tx_hash: B256,
+    sequence_num: u64,
+    gas_donated: u64,
+    gas_donor: Address,
+    max_refund: U256,
+    submission_fee_refund: U256,
+) -> Log {
+    Log::new_unchecked(
+        ARB_RETRYABLE_TX_ADDRESS,
+        vec![
+            keccak256("RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)"),
+            ticket_id,
+            retry_tx_hash,
+            B256::from(U256::from(sequence_num).to_be_bytes::<32>()),
+        ],
+        Bytes::from(
+            (
+                U256::from(gas_donated),
+                gas_donor,
+                max_refund,
+                submission_fee_refund,
+            )
+                .abi_encode(),
+        ),
+    )
+}
 
 impl ArbRetryableTx {
     pub(super) fn run<DB: Database>(
@@ -396,16 +432,18 @@ impl ArbRetryableTx {
             ArbResourceKind::HistoryGrowth,
             Self::redeem_scheduled_event_gas_cost(),
         )?;
-        storage.context.journal_mut().log(Log::new_unchecked(
-            ARB_RETRYABLE_TX_ADDRESS,
-            vec![
-                keccak256("RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)"),
+        storage
+            .context
+            .journal_mut()
+            .log(retryable_redeem_scheduled_log(
                 ticket_id,
                 retry_tx_hash,
-                B256::from(U256::from(sequence_num).to_be_bytes::<32>()),
-            ],
-            Bytes::from((U256::from(gas_donated), gas_donor, U256::MAX, U256::ZERO).abi_encode()),
-        ));
+                sequence_num,
+                gas_donated,
+                gas_donor,
+                U256::MAX,
+                U256::ZERO,
+            ));
         Ok(())
     }
 
@@ -416,43 +454,21 @@ impl ArbRetryableTx {
         refund_to: Address,
         gas: u64,
     ) -> B256 {
-        let chain_id = storage.context.cfg().chain_id();
-        let gas_fee_cap = U256::from(storage.current_l2_basefee());
-        let max_refund = U256::MAX;
-        let submission_fee_refund = U256::ZERO;
-        let payload_len = chain_id.length()
-            + info.nonce.length()
-            + info.from.length()
-            + gas_fee_cap.length()
-            + gas.length()
-            + Self::optional_address_rlp_len(&info.to)
-            + info.value.length()
-            + info.data.length()
-            + ticket_id.length()
-            + refund_to.length()
-            + max_refund.length()
-            + submission_fee_refund.length();
-
-        let mut out = Vec::with_capacity(payload_len + 8);
-        out.push(ARBITRUM_RETRY_TX_TYPE);
-        Header {
-            list: true,
-            payload_length: payload_len,
+        ArbitrumRetryTx {
+            chain_id: U256::from(storage.context.cfg().chain_id()),
+            nonce: info.nonce,
+            from: info.from,
+            gas_fee_cap: U256::from(storage.current_l2_basefee()),
+            gas,
+            to: info.to,
+            value: info.value,
+            data: info.data.clone(),
+            ticket_id,
+            refund_to,
+            max_refund: U256::MAX,
+            submission_fee_refund: U256::ZERO,
         }
-        .encode(&mut out);
-        chain_id.encode(&mut out);
-        info.nonce.encode(&mut out);
-        info.from.encode(&mut out);
-        gas_fee_cap.encode(&mut out);
-        gas.encode(&mut out);
-        Self::encode_optional_address(&info.to, &mut out);
-        info.value.encode(&mut out);
-        info.data.encode(&mut out);
-        ticket_id.encode(&mut out);
-        refund_to.encode(&mut out);
-        max_refund.encode(&mut out);
-        submission_fee_refund.encode(&mut out);
-        keccak256(out)
+        .hash()
     }
 
     fn redeem_scheduled_event_gas_cost() -> u64 {
@@ -473,17 +489,6 @@ impl ArbRetryableTx {
 
     fn copy_gas(byte_count: usize) -> u64 {
         COPY_GAS.saturating_mul((byte_count as u64).div_ceil(32))
-    }
-
-    fn optional_address_rlp_len(address: &Option<Address>) -> usize {
-        address.as_ref().map_or(1, |address| address.length())
-    }
-
-    fn encode_optional_address(address: &Option<Address>, out: &mut dyn BufMut) {
-        match address {
-            Some(address) => address.encode(out),
-            None => out.put_u8(EMPTY_STRING_CODE),
-        }
     }
 }
 

@@ -29,6 +29,7 @@ use self::env::ArbPrecompileInput;
 pub use self::env::ArbitrumPrecompileEnv;
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
+pub use self::retryable_tx::{retryable_redeem_scheduled_log, retryable_ticket_created_log};
 pub(crate) use self::stylus_runtime::{
     HostioHandler, NativeAsmCacheKey, StylusCompiler, StylusExecInput, StylusOutcome,
     StylusRuntime, failed_hostio_response,

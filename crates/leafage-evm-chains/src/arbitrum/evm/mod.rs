@@ -3,6 +3,7 @@ mod handler;
 mod instructions;
 mod multigas;
 mod poster_gas;
+mod retryable;
 mod stylus;
 
 use crate::arbitrum::hardforks::ArbitrumHardfork;

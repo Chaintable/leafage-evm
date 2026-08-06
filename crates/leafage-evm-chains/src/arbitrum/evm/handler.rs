@@ -4,15 +4,16 @@ use super::ArbitrumEvm;
 use super::context::ArbitrumTxFeeContext;
 use super::multigas::{ArbMultiGas, ArbResourceKind, NUM_RESOURCE_KIND};
 use super::poster_gas::ArbPosterCharge;
+use super::retryable::{ArbRetryableState, SubmitRetryableOutcome};
 use crate::arbitrum::arbos_state::{self, ArbPricing};
 use crate::arbitrum::precompile::{ArbitrumContext, L1_PRICER_FUNDS_POOL_ADDRESS};
 use crate::arbitrum::tx::nitro_message_gas_price;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use revm::{
     Database, DatabaseRef,
     context::{
         Block, ContextTr, LocalContextTr, Transaction,
-        result::{EVMError, ExecutionResult, HaltReason, ResultGas},
+        result::{EVMError, ExecutionResult, HaltReason, Output, ResultGas, SuccessReason},
     },
     context_interface::{
         Cfg, JournalTr, journaled_state::account::JournaledAccountTr, result::InvalidTransaction,
@@ -405,12 +406,6 @@ where
         exec_result: &FrameResult,
         network_fee_account: alloy::primitives::Address,
     ) -> Result<(), EVMError<<DB as Database>::Error>> {
-        // Retryable redeems route refunds through their L1 deposit accounting.
-        // ArbitrumTxEnv intentionally does not carry MaxRefund, so applying the
-        // normal sender refund here would be observably wrong.
-        if evm.ctx().tx().is_retryable_redeem() {
-            return Ok(());
-        }
         let Some(multi_gas_cost) = Self::multi_gas_price(evm.ctx_mut())? else {
             return Ok(());
         };
@@ -434,6 +429,21 @@ where
             .load_account_mut(caller)?
             .incr_balance(refund);
         Ok(())
+    }
+
+    fn retryable_multi_gas_refund(
+        ctx: &mut ArbitrumContext<DB>,
+        retryable: &crate::arbitrum::tx::ArbitrumRetryTx,
+        gas_used: u64,
+    ) -> Result<U256, EVMError<<DB as Database>::Error>> {
+        if retryable.gas_fee_cap != U256::from(ctx.block().basefee()) {
+            return Ok(U256::ZERO);
+        }
+        let Some(multi_gas_cost) = Self::multi_gas_price(ctx)? else {
+            return Ok(U256::ZERO);
+        };
+        let single_gas_cost = retryable.gas_fee_cap.saturating_mul(U256::from(gas_used));
+        Ok(single_gas_cost.saturating_sub(multi_gas_cost))
     }
 
     fn finish_frame_result(
@@ -469,6 +479,56 @@ where
             .begin_multi_gas(arbos_version, intrinsic);
         arbos_version
     }
+
+    fn prepare_retryable_redeem(
+        evm: &mut ArbitrumEvm<DB, INSP>,
+    ) -> Result<(), EVMError<<DB as Database>::Error>> {
+        let retryable = evm.ctx().tx().retryable_redeem_tx().cloned();
+        if let Some(retryable) = retryable {
+            ArbRetryableState::new(evm.ctx_mut()).prepare_redeem(&retryable)?;
+        }
+        Ok(())
+    }
+
+    fn run_submit_retryable(
+        evm: &mut ArbitrumEvm<DB, INSP>,
+    ) -> Result<ExecutionResult<HaltReason>, EVMError<<DB as Database>::Error>> {
+        let submit = evm
+            .ctx()
+            .tx()
+            .submit_retryable_tx()
+            .cloned()
+            .ok_or_else(|| EVMError::Custom("missing submit-retryable transaction".to_owned()))?;
+        let gas_limit = submit.gas;
+        let outcome = ArbRetryableState::new(evm.ctx_mut()).submit_retryable(&submit)?;
+        let logs = evm.ctx_mut().journal_mut().take_logs();
+        evm.ctx_mut().journal_mut().commit_tx();
+        evm.ctx_mut().chain_mut().clear_tx_fee_context();
+        evm.ctx_mut().local_mut().clear();
+        evm.frame_stack().clear();
+        match outcome {
+            SubmitRetryableOutcome::Success {
+                ticket_id,
+                gas_used,
+                scheduled,
+            } => {
+                if let Some(scheduled) = scheduled {
+                    evm.ctx_mut().chain_mut().schedule_retryable(scheduled);
+                }
+                Ok(ExecutionResult::Success {
+                    reason: SuccessReason::Return,
+                    gas: ResultGas::new(gas_limit, gas_used, 0, 0, 0),
+                    logs,
+                    output: Output::Call(Bytes::copy_from_slice(ticket_id.as_slice())),
+                })
+            }
+            SubmitRetryableOutcome::Halt { reason } => Ok(ExecutionResult::Halt {
+                reason,
+                gas: ResultGas::new(gas_limit, 0, 0, 0, 0),
+                logs,
+            }),
+        }
+    }
 }
 
 impl<DB, INSP> Handler for ArbitrumHandler<DB, INSP>
@@ -478,6 +538,24 @@ where
     type Evm = ArbitrumEvm<DB, INSP>;
     type Error = EVMError<<DB as Database>::Error>;
     type HaltReason = HaltReason;
+
+    fn run_without_catch_error(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        evm.ctx_mut().chain_mut().clear_scheduled_retryables();
+        if evm.ctx().tx().is_submit_retryable() {
+            return Self::run_submit_retryable(evm);
+        }
+        Self::prepare_retryable_redeem(evm)?;
+
+        let init_and_floor_gas = self.validate(evm)?;
+        let eip7702_refund = self.pre_execution(evm)? as i64;
+        let mut exec_result = self.execution(evm, &init_and_floor_gas)?;
+        let result_gas =
+            self.post_execution(evm, &mut exec_result, init_and_floor_gas, eip7702_refund)?;
+        self.execution_result(evm, exec_result, result_gas)
+    }
 
     fn validate_env(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
         validation::validate_env::<_, Self::Error>(evm.ctx())?;
@@ -625,6 +703,11 @@ where
         if evm.ctx().cfg().is_fee_charge_disabled() {
             return Ok(());
         }
+        // SubmitRetryable prepaid the retry attempt. Nitro's retry EndTxHook
+        // refunds the unused portion instead of crediting fees a second time.
+        if evm.ctx().tx().is_retryable_redeem() {
+            return Ok(());
+        }
 
         let fee_context = Self::tx_fee_context(evm.ctx())?;
         let effective_gas_price = fee_context.settlement_gas_price();
@@ -699,7 +782,27 @@ where
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         revm::context_interface::context::take_error::<Self::Error, _>(evm.ctx().error())?;
 
+        let retryable = evm.ctx().tx().retryable_redeem_tx().cloned();
+        if let Some(retryable) = retryable {
+            let gas_left = result_gas
+                .remaining()
+                .saturating_add(result_gas.inner_refunded());
+            let multi_gas_refund =
+                Self::retryable_multi_gas_refund(evm.ctx_mut(), &retryable, result_gas.used())?;
+            ArbRetryableState::new(evm.ctx_mut()).finish_redeem(
+                &retryable,
+                result.interpreter_result().result.is_ok(),
+                gas_left,
+                multi_gas_refund,
+            )?;
+        }
         let exec_result = post_execution::output(evm.ctx(), result, result_gas);
+        let logs = exec_result.logs().to_vec();
+        let scheduled =
+            ArbRetryableState::new(evm.ctx_mut()).scheduled_retryables_from_logs(&logs)?;
+        for retryable in scheduled {
+            evm.ctx_mut().chain_mut().schedule_retryable(retryable);
+        }
         evm.ctx_mut().journal_mut().commit_tx();
         evm.ctx_mut().chain_mut().clear_tx_fee_context();
         evm.ctx_mut().local_mut().clear();
@@ -715,6 +818,7 @@ where
         evm.ctx_mut().chain_mut().clear_open_contract_frames();
         evm.ctx_mut().chain_mut().clear_multi_gas();
         evm.ctx_mut().chain_mut().clear_tx_fee_context();
+        evm.ctx_mut().chain_mut().clear_scheduled_retryables();
         evm.ctx_mut().local_mut().clear();
         evm.ctx_mut().journal_mut().discard_tx();
         evm.frame_stack().clear();
@@ -729,7 +833,7 @@ mod tests {
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
     use crate::arbitrum::precompile::BATCH_POSTER_ADDRESS;
-    use crate::arbitrum::tx::ArbitrumTxEnv;
+    use crate::arbitrum::tx::{ArbitrumSubmitRetryableTx, ArbitrumTxEnv};
     use alloy::primitives::{Address, B256, Bytes};
     use leafage_evm_types::{BlockEnv, CfgEnv};
     use revm::MainContext;
@@ -884,6 +988,36 @@ mod tests {
         evm
     }
 
+    fn submit_retryable_tx(gas_fee_cap: u64) -> ArbitrumTxEnv {
+        let gas = 100_000;
+        let submit = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from: Address::with_last_byte(0x11),
+            l1_base_fee: U256::ZERO,
+            deposit_value: U256::from(gas_fee_cap.saturating_mul(gas)),
+            gas_fee_cap: U256::from(gas_fee_cap),
+            gas,
+            retry_to: Some(Address::with_last_byte(0x22)),
+            retry_value: U256::ZERO,
+            beneficiary: Address::with_last_byte(0x33),
+            max_submission_fee: U256::ZERO,
+            fee_refund_addr: Address::with_last_byte(0x44),
+            retry_data: Bytes::new(),
+        };
+        ArbitrumTxEnv::submit_retryable(
+            ArbitrumTxEnv::new(
+                TxEnv {
+                    chain_id: Some(999),
+                    nonce: 99,
+                    ..Default::default()
+                },
+                Default::default(),
+            ),
+            submit,
+        )
+    }
+
     fn read_l1_pricing_slot(ctx: &mut ArbitrumContext<TestDb>, offset: u64) -> U256 {
         let slot = ArbitrumHandler::<TestDb, ()>::l1_pricing_slot(offset);
         ctx.journal_mut()
@@ -893,6 +1027,155 @@ mod tests {
             .sload(arbos_state::ARBOS_STATE_ADDRESS, slot)
             .expect("read ArbOS L1 pricing slot")
             .data
+    }
+
+    #[test]
+    fn submit_retryable_hook_runs_before_normal_transaction_validation() {
+        let tx = submit_retryable_tx(100);
+        let ticket_id = tx.submit_retryable_tx().unwrap().ticket_id();
+        let mut evm = evm_with_tx(tx);
+
+        let result = ArbitrumHandler::<TestDb, ()>::new()
+            .run(&mut evm)
+            .expect("submit-retryable hook should bypass normal validation");
+
+        let ExecutionResult::Success {
+            output, logs, gas, ..
+        } = result
+        else {
+            panic!("submit-retryable hook must return success");
+        };
+        assert_eq!(output.data().as_ref(), ticket_id.as_slice());
+        assert_eq!(gas.spent(), 100_000);
+        assert_eq!(logs.len(), 2);
+        assert_eq!(
+            evm.ctx_mut().chain_mut().take_scheduled_retryables().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn submit_retryable_without_sufficient_fee_cap_does_not_schedule_redeem() {
+        let tx = submit_retryable_tx(99);
+        let mut evm = evm_with_tx(tx);
+
+        let result = ArbitrumHandler::<TestDb, ()>::new()
+            .run(&mut evm)
+            .expect("ticket creation should still succeed");
+
+        let ExecutionResult::Success { logs, gas, .. } = result else {
+            panic!("submit-retryable hook must return success");
+        };
+        assert_eq!(gas.spent(), 0);
+        assert_eq!(logs.len(), 1);
+        assert!(evm
+            .ctx_mut()
+            .chain_mut()
+            .take_scheduled_retryables()
+            .is_empty());
+    }
+
+    #[test]
+    fn submit_retryable_callvalue_failure_commits_nitro_refunds() {
+        let from = Address::with_last_byte(0x11);
+        let fee_refund_addr = Address::with_last_byte(0x44);
+        let submit = ArbitrumSubmitRetryableTx {
+            chain_id: U256::ZERO,
+            request_id: B256::ZERO,
+            from,
+            l1_base_fee: U256::ONE,
+            deposit_value: U256::from(2_000),
+            gas_fee_cap: U256::ZERO,
+            gas: 100_000,
+            retry_to: Some(Address::with_last_byte(0x22)),
+            retry_value: U256::from(1_000),
+            beneficiary: Address::with_last_byte(0x33),
+            max_submission_fee: U256::from(1_400),
+            fee_refund_addr,
+            retry_data: Bytes::new(),
+        };
+        let tx = ArbitrumTxEnv::submit_retryable(
+            ArbitrumTxEnv::new(TxEnv::default(), Default::default()),
+            submit,
+        );
+        let mut evm = evm_with_tx(tx);
+
+        let result = ArbitrumHandler::<TestDb, ()>::new()
+            .run(&mut evm)
+            .expect("callvalue failure is an execution result, not a handler error");
+
+        let ExecutionResult::Halt { reason, gas, logs } = result else {
+            panic!("callvalue failure must halt the submit-retryable transaction");
+        };
+        assert_eq!(reason, HaltReason::OutOfFunds);
+        assert_eq!(gas.spent(), 0);
+        assert!(logs.is_empty());
+        assert!(evm
+            .ctx_mut()
+            .chain_mut()
+            .take_scheduled_retryables()
+            .is_empty());
+
+        let journal = evm.ctx_mut().journal_mut();
+        assert_eq!(
+            journal.load_account(from).unwrap().data.info.balance,
+            U256::from(1_000)
+        );
+        assert_eq!(
+            journal
+                .load_account(fee_refund_addr)
+                .unwrap()
+                .data
+                .info
+                .balance,
+            U256::from(1_000)
+        );
+        assert_eq!(
+            journal
+                .load_account(Address::ZERO)
+                .unwrap()
+                .data
+                .info
+                .balance,
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn retryable_redeem_refunds_unused_prepaid_gas() {
+        let tx = submit_retryable_tx(100);
+        let from = tx.submit_retryable_tx().unwrap().from;
+        let refund_to = tx.submit_retryable_tx().unwrap().fee_refund_addr;
+        let mut evm = evm_with_tx(tx);
+        ArbitrumHandler::<TestDb, ()>::new()
+            .run(&mut evm)
+            .expect("submit retryable");
+        let retryable = evm
+            .ctx_mut()
+            .chain_mut()
+            .take_scheduled_retryables()
+            .pop_front()
+            .expect("scheduled redeem");
+        evm.inner.ctx.tx = ArbitrumTxEnv::from_retryable(retryable, Default::default());
+
+        let result = ArbitrumHandler::<TestDb, ()>::new()
+            .run(&mut evm)
+            .expect("execute scheduled redeem");
+
+        assert!(result.is_success());
+        assert_eq!(result.gas_used(), 21_000);
+        let journal = evm.ctx_mut().journal_mut();
+        let from_balance = journal.load_account(from).unwrap().data.info.balance;
+        let refund_balance = journal.load_account(refund_to).unwrap().data.info.balance;
+        let network_balance = journal
+            .load_account(Address::ZERO)
+            .unwrap()
+            .data
+            .info
+            .balance;
+        assert_eq!(from_balance, U256::ZERO);
+        assert_eq!(refund_balance, U256::from(7_900_000u64));
+        assert_eq!(network_balance, U256::from(2_100_000u64));
     }
 
     #[test]
@@ -1717,6 +2000,24 @@ where
     INSP: Inspector<ArbitrumContext<DB>, EthInterpreter>,
 {
     type IT = EthInterpreter;
+
+    fn inspect_run_without_catch_error(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        evm.ctx_mut().chain_mut().clear_scheduled_retryables();
+        if evm.ctx().tx().is_submit_retryable() {
+            return Self::run_submit_retryable(evm);
+        }
+        Self::prepare_retryable_redeem(evm)?;
+
+        let init_and_floor_gas = self.validate(evm)?;
+        let eip7702_refund = self.pre_execution(evm)? as i64;
+        let mut frame_result = self.inspect_execution(evm, &init_and_floor_gas)?;
+        let result_gas =
+            self.post_execution(evm, &mut frame_result, init_and_floor_gas, eip7702_refund)?;
+        self.execution_result(evm, frame_result, result_gas)
+    }
 
     /// Mirrors this handler's `execution` override on the inspected path.
     /// `inspect_run` calls `inspect_execution`, not `Handler::execution`, so

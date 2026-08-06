@@ -12,28 +12,31 @@
 
 use crate::api_impl::arbitrum::evm::create_arbitrum_evm_from_state;
 use crate::api_impl::arbitrum::node_interface::{
-    configured_legacy_zero_base_fee_until, header_l1_block_num,
+    configured_legacy_zero_base_fee_until, header_l1_block_num, NodeInterfaceAction,
 };
 use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
-use alloy::primitives::{Bytes, B256, U256};
+use alloy::primitives::{Bytes, B256, Log, U256};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
-use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv};
+use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv, ArbitrumRetryTx};
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, DebankErrorCode};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output};
+use revm::context::ContextTr;
 use revm::context::Transaction as _;
+use revm::database::CacheDB;
 use revm::inspector::NoOpInspector;
 use revm::interpreter::InstructionResult;
 use revm::primitives::{Address, TxKind};
-use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm};
-use revm_inspectors::tracing::types::{CallKind, CallTrace, TraceMemberOrder};
+use revm::{DatabaseCommit, DatabaseRef, ExecuteCommitEvm, InspectCommitEvm};
+use revm_inspectors::tracing::types::{CallKind, CallLog, CallTrace, TraceMemberOrder};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 
 pub(super) type ArbitrumApiImpl<DB> = ApiImpl<DB, ArbitrumHardfork, ArbitrumEvmConfig>;
@@ -42,12 +45,15 @@ fn precompile_env(
     tx: &ArbitrumTxEnv,
     custom_cfg: Option<&ArbitrumEvmConfig>,
 ) -> ArbitrumPrecompileEnv {
+    let retryable = tx.retryable_redeem_tx();
     ArbitrumPrecompileEnv {
         current_tx_l1_gas_fees: U256::ZERO,
         current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,
-        current_retryable_ticket: tx.retryable.as_ref().and_then(|ctx| ctx.ticket_id),
-        current_refund_to: tx.retryable.as_ref().map(|ctx| ctx.refund_to),
+        current_retryable_ticket: retryable
+            .map(|retryable| retryable.ticket_id)
+            .filter(|ticket_id| *ticket_id != B256::ZERO),
+        current_refund_to: retryable.map(|retryable| retryable.refund_to),
         allow_debug_precompiles: custom_cfg.is_some_and(|cfg| cfg.allow_debug_precompiles),
         current_chain_config: custom_cfg
             .and_then(|cfg| cfg.chain_config.as_ref())
@@ -102,12 +108,15 @@ impl<DB> ArbitrumApiImpl<DB> {
         }
     }
 
-    pub(super) fn transact_evm<StateDB: DatabaseRef>(
+    fn transact_evm_commit<StateDB: DatabaseRef + DatabaseCommit>(
         &self,
         block_env: &BlockEnv,
-        state: StateDB,
+        state: &mut StateDB,
         tx: ArbitrumTxEnv,
-    ) -> Result<ExecutionResult<HaltReason>, EVMError<StateDB::Error, InvalidTransaction>>
+    ) -> Result<
+        (ExecutionResult<HaltReason>, VecDeque<ArbitrumRetryTx>),
+        EVMError<StateDB::Error, InvalidTransaction>,
+    >
     where
         StateDB::Error: Sync + Send + 'static,
     {
@@ -116,23 +125,28 @@ impl<DB> ArbitrumApiImpl<DB> {
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
-            state,
+            &mut *state,
             NoOpInspector {},
             precompile_env,
             execution_context,
         )
         .map_err(EVMError::Database)?;
 
-        evm.transact(tx).map(|res| res.result.into())
+        let result = evm.transact_commit(tx)?;
+        let scheduled = evm.ctx_mut().chain_mut().take_scheduled_retryables();
+        Ok((result, scheduled))
     }
 
-    pub(super) fn inspect_evm<StateDB: DatabaseRef + DatabaseCommit>(
+    fn inspect_evm_commit<StateDB: DatabaseRef + DatabaseCommit>(
         &self,
         block_env: &BlockEnv,
-        state: StateDB,
+        state: &mut StateDB,
         tx: ArbitrumTxEnv,
         inspector: &mut TracingInspector,
-    ) -> Result<ExecutionResult<HaltReason>, EVMError<StateDB::Error, InvalidTransaction>>
+    ) -> Result<
+        (ExecutionResult<HaltReason>, VecDeque<ArbitrumRetryTx>),
+        EVMError<StateDB::Error, InvalidTransaction>,
+    >
     where
         StateDB::Error: Sync + Send + 'static,
     {
@@ -141,20 +155,124 @@ impl<DB> ArbitrumApiImpl<DB> {
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
             self.cfg_for_tx(&tx),
-            state,
+            &mut *state,
             inspector,
             precompile_env,
             execution_context,
         )
         .map_err(EVMError::Database)?;
 
-        evm.inspect_tx_commit(tx).map(Into::into)
+        let result = evm.inspect_tx_commit(tx)?;
+        let scheduled = evm.ctx_mut().chain_mut().take_scheduled_retryables();
+        Ok((result, scheduled))
+    }
+
+    fn run_scheduled_retryables<E>(
+        context: &ArbitrumTxContext,
+        root_result: ExecutionResult<HaltReason>,
+        mut scheduled: VecDeque<ArbitrumRetryTx>,
+        mut execute: impl FnMut(
+            ArbitrumTxEnv,
+        )
+            -> Result<(ExecutionResult<HaltReason>, VecDeque<ArbitrumRetryTx>), E>,
+    ) -> Result<(ExecutionResult<HaltReason>, Vec<Log>), E> {
+        let (reason, mut gas, mut logs, output) = match root_result {
+            ExecutionResult::Success {
+                reason,
+                gas,
+                logs,
+                output,
+            } => (reason, gas, logs, output),
+            result => return Ok((result, Vec::new())),
+        };
+        let root_logs = logs.clone();
+
+        while let Some(retryable) = scheduled.pop_front() {
+            let mut retryable_context = context.clone();
+            retryable_context.gas_estimation = true;
+            let (result, mut newly_scheduled) =
+                execute(ArbitrumTxEnv::from_retryable(retryable, retryable_context))?;
+            scheduled.append(&mut newly_scheduled);
+
+            match result {
+                ExecutionResult::Success {
+                    gas: child_gas,
+                    logs: child_logs,
+                    ..
+                } => {
+                    gas = child_gas;
+                    logs.extend(child_logs);
+                }
+                ExecutionResult::Revert {
+                    gas,
+                    logs: child_logs,
+                    output,
+                } => {
+                    logs.extend(child_logs);
+                    return Ok((ExecutionResult::Revert { gas, logs, output }, root_logs));
+                }
+                ExecutionResult::Halt {
+                    reason,
+                    gas,
+                    logs: child_logs,
+                } => {
+                    logs.extend(child_logs);
+                    return Ok((ExecutionResult::Halt { reason, gas, logs }, root_logs));
+                }
+            }
+        }
+
+        Ok((
+            ExecutionResult::Success {
+                reason,
+                gas,
+                logs,
+                output,
+            },
+            root_logs,
+        ))
+    }
+
+    pub(super) fn transact_arbitrum<StateDB: DatabaseRef>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        submit: ArbitrumTxEnv,
+    ) -> Result<(ExecutionResult<HaltReason>, Vec<Log>), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let context = submit.context.clone();
+        let mut state = CacheDB::new(state);
+        let (root_result, scheduled) = self.transact_evm_commit(block_env, &mut state, submit)?;
+        Self::run_scheduled_retryables(&context, root_result, scheduled, |retryable| {
+            self.transact_evm_commit(block_env, &mut state, retryable)
+        })
+    }
+
+    fn inspect_arbitrum<StateDB: DatabaseRef + DatabaseCommit>(
+        &self,
+        block_env: &BlockEnv,
+        state: &mut StateDB,
+        submit: ArbitrumTxEnv,
+        inspector: &mut TracingInspector,
+    ) -> Result<(ExecutionResult<HaltReason>, Vec<Log>), EVMError<StateDB::Error, InvalidTransaction>>
+    where
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let context = submit.context.clone();
+        let (root_result, scheduled) =
+            self.inspect_evm_commit(block_env, state, submit, inspector)?;
+        Self::run_scheduled_retryables(&context, root_result, scheduled, |retryable| {
+            self.inspect_evm_commit(block_env, state, retryable, inspector)
+        })
     }
 
     fn record_virtual_trace(
         inspector: &mut TracingInspector,
         tx: &ArbitrumTxEnv,
         result: &ExecutionResult<HaltReason>,
+        root_logs: &[Log],
     ) {
         let (success, status, output, gas_used) = match result {
             ExecutionResult::Success { output, gas, .. } => {
@@ -202,6 +320,11 @@ impl<DB> ArbitrumApiImpl<DB> {
             },
             ..Default::default()
         };
+        for (index, log) in root_logs.iter().cloned().enumerate() {
+            root.logs
+                .push(CallLog::from(log).with_position(0).with_index(index as u64));
+            root.ordering.push(TraceMemberOrder::Log(index));
+        }
 
         let has_recorded_child = nodes.iter().any(|node| {
             node.trace.gas_limit != 0
@@ -223,14 +346,21 @@ impl<DB> ArbitrumApiImpl<DB> {
             return;
         }
 
+        let child_roots = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| node.parent.is_none().then_some(index + 1))
+            .collect::<Vec<_>>();
         for node in nodes.iter_mut() {
             node.idx += 1;
             node.parent = node.parent.map(|parent| parent + 1).or(Some(0));
             node.children.iter_mut().for_each(|child| *child += 1);
             node.trace.depth += 1;
         }
-        root.children.push(1);
-        root.ordering.push(TraceMemberOrder::Call(0));
+        root.children.extend(child_roots.iter().copied());
+        for index in 0..child_roots.len() {
+            root.ordering.push(TraceMemberOrder::Call(index));
+        }
         nodes.insert(0, root);
     }
 }
@@ -268,11 +398,15 @@ where
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
-        if let Some(result) = self.try_execute_node_interface(&block_env, &state, &tx, None)? {
-            return Ok(result);
+        match self.node_interface_action(block_env, &state, &tx)? {
+            Some(NodeInterfaceAction::Return(result)) => Ok(result),
+            Some(NodeInterfaceAction::Replace(submit)) => self
+                .transact_arbitrum(block_env, state, submit)
+                .map(|(result, _)| result),
+            None => self
+                .transact_arbitrum(block_env, state, tx)
+                .map(|(result, _)| result),
         }
-
-        self.transact_evm(&block_env, state, tx)
     }
 
     fn inspect_tx_commit<
@@ -282,7 +416,7 @@ where
     >(
         &self,
         block_env: &BlockEnv,
-        state: StateDB,
+        mut state: StateDB,
         inspector_cfg: TracingInspectorConfig,
         inspector_collect: F,
         tx: Self::Tx,
@@ -291,27 +425,18 @@ where
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
         let mut inspector = TracingInspector::new(inspector_cfg);
-        if let Some(result) =
-            self.try_execute_node_interface(&block_env, &state, &tx, Some(&mut inspector))?
-        {
-            Self::record_virtual_trace(&mut inspector, &tx, &result);
+        if let Some(action) = self.node_interface_action(block_env, &state, &tx)? {
+            let (result, root_logs) = match action {
+                NodeInterfaceAction::Return(result) => (result, Vec::new()),
+                NodeInterfaceAction::Replace(submit) => {
+                    self.inspect_arbitrum(block_env, &mut state, submit, &mut inspector)?
+                }
+            };
+            Self::record_virtual_trace(&mut inspector, &tx, &result, &root_logs);
             return Ok((result, inspector_collect(inspector)));
         }
-
-        let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
-        let precompile_env = precompile_env(&tx, self.evm_cfg.custom_cfg.as_ref());
-        let mut evm = create_arbitrum_evm_from_state(
-            evm_block_env,
-            self.cfg_for_tx(&tx),
-            state,
-            &mut inspector,
-            precompile_env,
-            execution_context,
-        )
-        .map_err(EVMError::Database)?;
-
-        evm.inspect_tx_commit(tx)
-            .map(|res| (res.into(), inspector_collect(inspector)))
+        let (result, _) = self.inspect_arbitrum(block_env, &mut state, tx, &mut inspector)?;
+        Ok((result, inspector_collect(inspector)))
     }
 }
 
@@ -471,7 +596,7 @@ mod tests {
         };
         let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
 
-        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result);
+        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result, &[]);
 
         let traces = inspector.into_traces().into_nodes();
         assert_eq!(traces.len(), 1);
@@ -510,7 +635,7 @@ mod tests {
             ..Default::default()
         };
 
-        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result);
+        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result, &[]);
 
         let traces = inspector.into_traces().into_nodes();
         assert_eq!(traces.len(), 2);
@@ -519,5 +644,53 @@ mod tests {
         assert_eq!(traces[1].parent, Some(0));
         assert_eq!(traces[1].trace.depth, 1);
         assert_eq!(traces[1].trace.address, Address::with_last_byte(3));
+    }
+
+    #[test]
+    fn virtual_node_interface_trace_wraps_each_scheduled_transaction() {
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                kind: TxKind::Call(NODE_INTERFACE_ADDRESS),
+                gas_limit: 10_000,
+                ..Default::default()
+            },
+            ArbitrumTxContext::default(),
+        );
+        let result = ExecutionResult::Success {
+            reason: SuccessReason::Return,
+            gas: ResultGas::new(10_000, 123, 0, 0, 0),
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        };
+        let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
+        let nodes = inspector.traces_mut().nodes_mut();
+        nodes[0].trace.gas_limit = 1;
+        nodes.push(revm_inspectors::tracing::types::CallTraceNode {
+            idx: 1,
+            parent: Some(0),
+            trace: CallTrace {
+                depth: 1,
+                gas_limit: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        nodes[0].children.push(1);
+        nodes.push(revm_inspectors::tracing::types::CallTraceNode {
+            idx: 2,
+            trace: CallTrace {
+                gas_limit: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        ArbitrumApiImpl::<()>::record_virtual_trace(&mut inspector, &tx, &result, &[]);
+
+        let traces = inspector.into_traces().into_nodes();
+        assert_eq!(traces[0].children, vec![1, 3]);
+        assert_eq!(traces[1].parent, Some(0));
+        assert_eq!(traces[2].parent, Some(1));
+        assert_eq!(traces[3].parent, Some(0));
     }
 }

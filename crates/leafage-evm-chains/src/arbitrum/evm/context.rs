@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 
 use super::multigas::{ArbMultiGas, ArbResourceKind};
 use super::poster_gas::ArbPosterCharge;
+use crate::arbitrum::tx::ArbitrumRetryTx;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArbitrumCallContext {
@@ -101,6 +102,7 @@ pub struct ArbitrumExecutionContext {
     stylus_pages_open: u16,
     stylus_pages_ever: u16,
     open_contract_frames: HashMap<Address, u32>,
+    scheduled_retryables: VecDeque<ArbitrumRetryTx>,
 }
 
 impl ArbitrumExecutionContext {
@@ -316,6 +318,18 @@ impl ArbitrumExecutionContext {
 
     pub fn clear_open_contract_frames(&mut self) {
         self.open_contract_frames.clear();
+    }
+
+    pub(crate) fn schedule_retryable(&mut self, retryable: ArbitrumRetryTx) {
+        self.scheduled_retryables.push_back(retryable);
+    }
+
+    pub fn take_scheduled_retryables(&mut self) -> VecDeque<ArbitrumRetryTx> {
+        core::mem::take(&mut self.scheduled_retryables)
+    }
+
+    pub(crate) fn clear_scheduled_retryables(&mut self) {
+        self.scheduled_retryables.clear();
     }
 }
 
