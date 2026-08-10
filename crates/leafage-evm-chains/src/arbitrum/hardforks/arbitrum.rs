@@ -1,5 +1,5 @@
 use alloy_hardforks::hardfork;
-use leafage_evm_types::MainnetSpecId;
+use leafage_evm_types::{CfgEnv, MainnetSpecId};
 use revm::primitives::hardfork::SpecId;
 
 hardfork!(
@@ -52,6 +52,11 @@ impl ArbitrumHardfork {
             11..=19 => Self::Shanghai,
             _ => Self::London,
         }
+    }
+
+    /// Updates the active EVM spec and all fork-dependent gas parameters.
+    pub fn apply_cfg(self, cfg: &mut CfgEnv<Self>) {
+        cfg.set_spec_and_mainnet_gas_params(self);
     }
 }
 
