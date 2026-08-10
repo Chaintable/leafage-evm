@@ -355,8 +355,8 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
         inner: TransactionRequest::default()
             .from(sender)
             .to(target)
-            // Hood tx 0x2f21d99a...aaa3325 was included successfully with this
-            // declared gas limit and replays successfully against Nitro at its parent block.
+            // A real Nitro transaction with this declared gas limit was included
+            // successfully and also replays successfully at its parent block.
             .gas_limit(20_000_000),
         tempo: None,
     };
