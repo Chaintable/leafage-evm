@@ -7,7 +7,7 @@ use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, Nod
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
+use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
@@ -465,15 +465,9 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
             "arbitrum" => {
-                // RPC execution normally replaces this fallback with the target block's
-                // ArbOS-derived hardfork. An explicit --spec-id pins all blocks instead.
-                let hardfork_override = (self.spec_id != u8::MAX)
-                    .then(|| ArbitrumHardfork::try_from(self.spec_id))
-                    .transpose()
-                    .map_err(|_| {
-                        anyhow!("invalid --spec-id {} for arbitrum evm-type", self.spec_id)
-                    })?;
-                let spec = hardfork_override.unwrap_or(ArbitrumHardfork::Prague);
+                // RPC execution replaces this fallback with the target block's
+                // ArbOS-derived hardfork whenever Nitro header metadata is available.
+                let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -481,18 +475,13 @@ impl Command {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
-                let mut custom_evm_cfg: Option<ArbitrumEvmConfig> = custom_evm_cfg
+                let custom_evm_cfg = custom_evm_cfg
                     .map(|str| {
                         serde_json::from_str(&str).map_err(|err| {
                             anyhow!("cannot parse arbitrum custom evm config: {}", err)
                         })
                     })
                     .transpose()?;
-                if let Some(hardfork_override) = hardfork_override {
-                    custom_evm_cfg
-                        .get_or_insert_with(ArbitrumEvmConfig::default)
-                        .hardfork_override = Some(hardfork_override);
-                }
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {

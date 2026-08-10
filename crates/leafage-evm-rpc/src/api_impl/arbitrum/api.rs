@@ -18,11 +18,11 @@ use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
-use alloy::primitives::{Bytes, B256, Log, U256};
+use alloy::primitives::{Bytes, Log, B256, U256};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
-use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv, ArbitrumRetryTx};
+use leafage_evm_chains::arbitrum::tx::{ArbitrumRetryTx, ArbitrumTxContext, ArbitrumTxEnv};
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, DebankErrorCode};
@@ -65,14 +65,9 @@ fn precompile_env(
 impl<DB> ArbitrumApiImpl<DB> {
     fn cfg_for_tx(&self, tx: &ArbitrumTxEnv) -> CfgEnv<ArbitrumHardfork> {
         let mut cfg = self.evm_cfg.cfg.clone();
-        cfg.spec = self
-            .evm_cfg
-            .custom_cfg
-            .as_ref()
-            .and_then(|custom_cfg| custom_cfg.hardfork_override)
-            .unwrap_or_else(|| {
-                ArbitrumHardfork::from_arbos_version(tx.context.current_arbos_version)
-            });
+        if tx.context.current_arbos_version != 0 {
+            cfg.spec = ArbitrumHardfork::from_arbos_version(tx.context.current_arbos_version);
+        }
         if tx.is_retryable_redeem() {
             cfg.disable_balance_check = true;
             cfg.disable_nonce_check = true;
@@ -513,15 +508,11 @@ mod tests {
     use revm::state::AccountInfo;
     use revm::ExecuteEvm;
 
-    fn test_api(hardfork_override: Option<ArbitrumHardfork>) -> ArbitrumApiImpl<()> {
-        let custom_cfg = hardfork_override.map(|hardfork_override| ArbitrumEvmConfig {
-            hardfork_override: Some(hardfork_override),
-            ..Default::default()
-        });
+    fn test_api(default_hardfork: ArbitrumHardfork) -> ArbitrumApiImpl<()> {
         ArbitrumApiImpl::new(
             (),
-            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
-            custom_cfg,
+            CfgEnv::new_with_spec(default_hardfork),
+            None,
             None,
             None,
             None,
@@ -546,7 +537,7 @@ mod tests {
 
     #[test]
     fn cfg_for_tx_selects_hardfork_from_arbos_version() {
-        let api = test_api(None);
+        let api = test_api(ArbitrumHardfork::Prague);
         for (version, expected) in [
             (10, ArbitrumHardfork::London),
             (11, ArbitrumHardfork::Shanghai),
@@ -560,10 +551,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hardfork_override_wins_over_arbos_version() {
-        let api = test_api(Some(ArbitrumHardfork::Prague));
+    fn configured_hardfork_is_only_fallback_without_arbos_version() {
+        let api = test_api(ArbitrumHardfork::Osaka);
         assert_eq!(
-            api.cfg_for_tx(&tx_at_arbos_version(61)).spec,
+            api.cfg_for_tx(&tx_at_arbos_version(0)).spec,
+            ArbitrumHardfork::Osaka
+        );
+        assert_eq!(
+            api.cfg_for_tx(&tx_at_arbos_version(10)).spec,
+            ArbitrumHardfork::London
+        );
+        assert_eq!(
+            api.cfg_for_tx(&tx_at_arbos_version(40)).spec,
             ArbitrumHardfork::Prague
         );
     }
@@ -579,6 +578,7 @@ mod tests {
     fn execute_clz(
         header_arbos_version: u64,
         state_arbos_version: u64,
+        default_hardfork: ArbitrumHardfork,
     ) -> ExecutionResult<HaltReason> {
         let target = Address::with_last_byte(0x22);
         let mut db = CacheDB::new(EmptyDB::default());
@@ -600,7 +600,7 @@ mod tests {
         let mut tx = tx_at_arbos_version(header_arbos_version);
         tx.base.kind = TxKind::Call(target);
         tx.base.gas_limit = 2_000_000;
-        let cfg = test_api(None).cfg_for_tx(&tx);
+        let cfg = test_api(default_hardfork).cfg_for_tx(&tx);
         let mut evm = create_arbitrum_evm_from_state(
             BlockEnv {
                 gas_limit: 30_000_000,
@@ -618,8 +618,11 @@ mod tests {
 
     #[test]
     fn clz_activates_at_arbos_50() {
-        assert!(matches!(execute_clz(49, 49), ExecutionResult::Halt { .. }));
-        match execute_clz(50, 50) {
+        assert!(matches!(
+            execute_clz(49, 49, ArbitrumHardfork::Prague),
+            ExecutionResult::Halt { .. }
+        ));
+        match execute_clz(50, 50, ArbitrumHardfork::Prague) {
             ExecutionResult::Success {
                 output: Output::Call(output),
                 ..
@@ -634,9 +637,24 @@ mod tests {
 
     #[test]
     fn state_arbos_override_does_not_change_header_selected_hardfork() {
-        assert!(matches!(execute_clz(49, 50), ExecutionResult::Halt { .. }));
         assert!(matches!(
-            execute_clz(50, 49),
+            execute_clz(49, 50, ArbitrumHardfork::Prague),
+            ExecutionResult::Halt { .. }
+        ));
+        assert!(matches!(
+            execute_clz(50, 49, ArbitrumHardfork::Prague),
+            ExecutionResult::Success { .. }
+        ));
+    }
+
+    #[test]
+    fn configured_hardfork_does_not_override_header_selected_hardfork() {
+        assert!(matches!(
+            execute_clz(49, 49, ArbitrumHardfork::Osaka),
+            ExecutionResult::Halt { .. }
+        ));
+        assert!(matches!(
+            execute_clz(50, 50, ArbitrumHardfork::London),
             ExecutionResult::Success { .. }
         ));
     }
