@@ -69,10 +69,13 @@ impl<DB> ArbitrumApiImpl<DB> {
             ArbitrumHardfork::from_arbos_version(tx.context.current_arbos_version)
                 .apply_cfg(&mut cfg);
         }
-        // Nitro exempts Arbitrum from Ethereum's fixed EIP-7825 cap. The raw
-        // RPC cap was already applied when constructing TxEnv; the Arbitrum
-        // handler enforces the state-derived compute limit for estimate mode.
-        cfg.tx_gas_limit_cap = Some(u64::MAX);
+        // Nitro exempts Arbitrum from Ethereum's implicit EIP-7825 cap. Keep an
+        // explicitly configured RPC cap; zero means unlimited.
+        cfg.tx_gas_limit_cap = Some(
+            cfg.tx_gas_limit_cap
+                .filter(|&cap| cap != 0)
+                .unwrap_or(u64::MAX),
+        );
         if tx.is_retryable_redeem() {
             cfg.disable_balance_check = true;
             cfg.disable_nonce_check = true;
@@ -519,9 +522,23 @@ mod tests {
     use revm::state::AccountInfo;
     use revm::ExecuteEvm;
 
-    fn test_api(default_hardfork: ArbitrumHardfork) -> ArbitrumApiImpl<()> {
+    #[derive(Clone, Copy, Debug)]
+    struct TestBlockIndex;
+
+    impl BlockIndex for TestBlockIndex {
+        type Error = core::convert::Infallible;
+
+        fn get_block_by_id(
+            &self,
+            _: leafage_evm_types::BlockId,
+        ) -> Result<Option<BlockInfo>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn test_api(default_hardfork: ArbitrumHardfork) -> ArbitrumApiImpl<TestBlockIndex> {
         ArbitrumApiImpl::new(
-            (),
+            TestBlockIndex,
             CfgEnv::new_with_spec(default_hardfork),
             None,
             None,
@@ -612,15 +629,27 @@ mod tests {
             (Some(25_000_000), Some(25_000_001), 25_000_000),
             (Some(0), None, 30_000_000),
         ] {
-            let mut cfg = CfgEnv::new_with_spec(ArbitrumHardfork::Osaka);
-            cfg.tx_gas_limit_cap = configured_cap;
+            let mut api = test_api(ArbitrumHardfork::Osaka);
+            api.evm_cfg.cfg.tx_gas_limit_cap = configured_cap;
             let mut request = CallRequest::default();
             request.gas = requested_gas;
-            let tx = create_mainnet_txn_env(&block_env, cfg, request, EmptyDB::default(), 1)
-                .expect("create transaction environment");
+            let tx = api
+                .create_txn_env(
+                    &BlockInfo::default(),
+                    &block_env,
+                    request,
+                    EmptyDB::default(),
+                    1,
+                )
+                .expect("create Arbitrum transaction environment");
             assert_eq!(
-                tx.gas_limit, expected_gas,
+                tx.base.gas_limit, expected_gas,
                 "wrong gas limit for configured cap {configured_cap:?} and request {requested_gas:?}",
+            );
+            assert_eq!(
+                api.cfg_for_tx(&tx).tx_gas_limit_cap,
+                Some(configured_cap.filter(|&cap| cap != 0).unwrap_or(u64::MAX)),
+                "wrong execution cap for configured cap {configured_cap:?}",
             );
         }
     }
@@ -823,6 +852,49 @@ mod tests {
                 "Arbitrum must accept a call with gas limit {gas_limit}, got {result:?}",
             );
         }
+    }
+
+    #[test]
+    fn arbitrum_osaka_preserves_explicit_rpc_gas_cap() {
+        let rpc_cap = 100_000_000;
+        let mut api = test_api(ArbitrumHardfork::Prague);
+        api.evm_cfg.cfg.tx_gas_limit_cap = Some(rpc_cap);
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                gas_limit: rpc_cap + 1,
+                kind: TxKind::Call(Address::with_last_byte(0x22)),
+                ..Default::default()
+            },
+            ArbitrumTxContext {
+                current_arbos_version: 50,
+                ..Default::default()
+            },
+        );
+        let cfg = api.cfg_for_tx(&tx);
+        assert_eq!(cfg.tx_gas_limit_cap, Some(rpc_cap));
+
+        let mut evm = create_arbitrum_evm_from_state(
+            BlockEnv {
+                gas_limit: rpc_cap + 1,
+                ..Default::default()
+            },
+            cfg,
+            CacheDB::new(EmptyDB::default()),
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        )
+        .expect("create Arbitrum EVM");
+
+        assert_eq!(
+            evm.transact(tx),
+            Err(EVMError::Transaction(
+                InvalidTransaction::TxGasLimitGreaterThanCap {
+                    gas_limit: rpc_cap + 1,
+                    cap: rpc_cap,
+                }
+            )),
+        );
     }
 
     #[test]
