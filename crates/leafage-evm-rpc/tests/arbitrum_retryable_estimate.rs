@@ -38,6 +38,12 @@ fn block_info(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
     info.inner.header.inner.number = number;
     info.inner.header.inner.parent_hash = parent_hash;
     info.inner.header.inner.gas_limit = 30_000_000;
+    info.inner.header.inner.base_fee_per_gas = Some(1);
+    info.inner.header.inner.difficulty = U256::ONE;
+    info.inner.header.inner.extra_data = Bytes::from(vec![0; 32]);
+    let mut mix_hash = [0u8; 32];
+    mix_hash[16..24].copy_from_slice(&51u64.to_be_bytes());
+    info.inner.header.inner.mix_hash = H256::from(mix_hash);
     info
 }
 
@@ -58,7 +64,7 @@ fn storage_index(slot: U256) -> H256 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn retryable_estimate_does_not_follow_requested_gas_cap() {
+async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     let db_path = std::env::temp_dir().join(format!(
         "leafage-arbitrum-retryable-estimate-{}-{:?}",
         std::process::id(),
@@ -70,13 +76,17 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
     let sender = Address::repeat_byte(0x11);
     let target = Address::repeat_byte(0x22);
     let reverting_target = Address::repeat_byte(0x33);
+    let high_gas_target = Address::repeat_byte(0x44);
     let target_code = Bytes::from_static(&[
         0x36, 0x15, 0x60, 0x12, 0x57, 0x60, 0x2a, 0x5f, 0x55, 0x60, 0x01, 0x5f, 0x53, 0x60, 0x01,
         0x5f, 0xa0, 0x00, 0x5b, 0x5f, 0x54, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
     ]);
     let reverting_code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+    // Expand memory to 96,000 words: 18,288,000 execution gas plus intrinsic gas.
+    let high_gas_code = Bytes::from_static(&[0x5f, 0x62, 0x2e, 0xdf, 0xe0, 0x52, 0x00]);
     let target_code_hash = keccak256(target_code.as_ref());
     let reverting_code_hash = keccak256(reverting_code.as_ref());
+    let high_gas_code_hash = keccak256(high_gas_code.as_ref());
     let arbos_address_hash = keccak256(ARBOS_STATE_ADDRESS.as_slice());
     let l2_pricing_key = keccak256([1u8]);
 
@@ -108,6 +118,12 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
                 nonce: 1,
                 code_hash: reverting_code_hash,
             },
+            NewAccount {
+                address: keccak256(high_gas_target.as_slice()),
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: high_gas_code_hash,
+            },
         ],
         storage_diffs: vec![AccountStorageDiff {
             address: arbos_address_hash,
@@ -134,6 +150,10 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
             NewCode {
                 code_hash: reverting_code_hash,
                 code: reverting_code,
+            },
+            NewCode {
+                code_hash: high_gas_code_hash,
+                code: high_gas_code,
             },
         ],
         ..Default::default()
@@ -162,7 +182,7 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
     cfg.chain_id = 42161;
     cfg.tx_gas_limit_cap = Some(100_000_000);
 
-    let handle = ApiBuilder::new(tree, MultiChainCfgEnv::Arbitrum((cfg, None)))
+    let handle = ApiBuilder::new(tree.clone(), MultiChainCfgEnv::Arbitrum((cfg, None)))
         .build_and_run(
             "127.0.0.1:18550",
             100,
@@ -331,6 +351,83 @@ async fn retryable_estimate_does_not_follow_requested_gas_cap() {
         .iter()
         .any(|trace| trace.to_addr == NODE_INTERFACE_ADDRESS));
 
+    let above_eip7825_cap = CallRequest {
+        inner: TransactionRequest::default()
+            .from(sender)
+            .to(target)
+            // A real Nitro transaction with this declared gas limit was included
+            // successfully and also replays successfully at its parent block.
+            .gas_limit(20_000_000),
+        tempo: None,
+    };
+    EthApiClient::call(
+        &client,
+        above_eip7825_cap.clone(),
+        BlockId::Number(BlockNumberOrTag::Latest),
+        None,
+        None,
+    )
+    .await
+    .expect("an explicit RPC cap above EIP-7825 must allow this Arbitrum call");
+
     handle.stop().unwrap();
+
+    let mut osaka_cfg = CfgEnv::new_with_spec(ArbitrumHardfork::Osaka);
+    osaka_cfg.disable_balance_check = true;
+    osaka_cfg.disable_eip3607 = true;
+    osaka_cfg.disable_block_gas_limit = true;
+    osaka_cfg.disable_base_fee = true;
+    osaka_cfg.chain_id = 42161;
+    osaka_cfg.tx_gas_limit_cap = None;
+
+    let osaka_handle = ApiBuilder::new(tree, MultiChainCfgEnv::Arbitrum((osaka_cfg, None)))
+        .build_and_run(
+            "127.0.0.1:18551",
+            100,
+            Duration::from_secs(10),
+            false,
+            false,
+            "arbitrum-osaka-gas-cap-test".to_string(),
+            100,
+            1024,
+        )
+        .await
+        .unwrap();
+    let osaka_client = HttpClientBuilder::default()
+        .build("http://127.0.0.1:18551")
+        .unwrap();
+    EthApiClient::call(
+        &osaka_client,
+        above_eip7825_cap,
+        BlockId::Number(BlockNumberOrTag::Latest),
+        None,
+        None,
+    )
+    .await
+    .expect("Arbitrum eth_call must not apply Ethereum's fixed EIP-7825 gas cap");
+
+    let high_gas_estimate = DebankApiClient::estimate_gas(
+        &osaka_client,
+        CallRequest {
+            inner: TransactionRequest::default()
+                .from(sender)
+                .to(high_gas_target),
+            tempo: None,
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("Arbitrum estimateGas must use the ArbOS compute limit");
+    assert!(
+        high_gas_estimate > U256::from(revm::primitives::eip7825::TX_GAS_LIMIT_CAP),
+        "estimate must not be capped at Ethereum's EIP-7825 boundary: {high_gas_estimate}",
+    );
+    assert!(
+        high_gas_estimate < U256::from(32_000_000u64),
+        "estimate must remain below the ArbOS per-transaction limit: {high_gas_estimate}",
+    );
+
+    osaka_handle.stop().unwrap();
     let _ = std::fs::remove_dir_all(&db_path);
 }

@@ -200,15 +200,15 @@ impl From<INodeInterfaceVirtual::estimateRetryableTicketCall> for RetryableRedee
     }
 }
 
-pub(in crate::api_impl::arbitrum) fn header_l1_block_num(
+pub(in crate::api_impl::arbitrum) fn header_l1_and_arbos_version(
     block: &BlockInfo,
     legacy_zero_base_fee_until: u64,
-) -> u64 {
+) -> (u64, u64) {
     if block.header.base_fee_per_gas.is_none()
         || block.header.extra_data.len() != 32
         || block.header.difficulty != U256::from(1)
     {
-        return 0;
+        return (0, 0);
     }
 
     let mix = block.header.mix_hash.as_slice();
@@ -218,16 +218,23 @@ pub(in crate::api_impl::arbitrum) fn header_l1_block_num(
             .map(u64::from_be_bytes)
     };
     let Some(arbos_format_version) = read_u64(16..24) else {
-        return 0;
+        return (0, 0);
     };
     if arbos_format_version <= ARBOS_VERSION_40
         && block.header.base_fee_per_gas == Some(0)
         && block.header.timestamp < legacy_zero_base_fee_until
     {
-        return 0;
+        return (0, 0);
     }
 
-    read_u64(8..16).unwrap_or_default()
+    (read_u64(8..16).unwrap_or_default(), arbos_format_version)
+}
+
+pub(in crate::api_impl::arbitrum) fn header_l1_block_num(
+    block: &BlockInfo,
+    legacy_zero_base_fee_until: u64,
+) -> u64 {
+    header_l1_and_arbos_version(block, legacy_zero_base_fee_until).0
 }
 
 fn block_by_l2_num<DB>(db: &DB, l2_block_num: u64) -> RpcResult<BlockInfo>
@@ -993,6 +1000,34 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn nitro_block(l1_block_number: u64, arbos_version: u64) -> BlockInfo {
+        let mut block = BlockInfo::default();
+        block.header.base_fee_per_gas = Some(1);
+        block.header.difficulty = U256::ONE;
+        block.header.extra_data = Bytes::from(vec![0; 32]);
+        let mut mix_hash = [0u8; 32];
+        mix_hash[8..16].copy_from_slice(&l1_block_number.to_be_bytes());
+        mix_hash[16..24].copy_from_slice(&arbos_version.to_be_bytes());
+        block.header.mix_hash = B256::from(mix_hash);
+        block
+    }
+
+    #[test]
+    fn decodes_l1_and_arbos_versions_from_nitro_header() {
+        assert_eq!(
+            header_l1_and_arbos_version(&nitro_block(25_694_457, 61), 0),
+            (25_694_457, 61)
+        );
+    }
+
+    #[test]
+    fn legacy_zero_base_fee_header_has_no_nitro_metadata() {
+        let mut block = nitro_block(25_694_457, 40);
+        block.header.base_fee_per_gas = Some(0);
+        block.header.timestamp = 99;
+        assert_eq!(header_l1_and_arbos_version(&block, 100), (0, 0));
     }
 
     fn state_with_l2_basefee(basefee: u64) -> CacheDB<EmptyDB> {

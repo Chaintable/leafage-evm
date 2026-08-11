@@ -12,7 +12,7 @@
 
 use crate::api_impl::arbitrum::evm::create_arbitrum_evm_from_state;
 use crate::api_impl::arbitrum::node_interface::{
-    configured_legacy_zero_base_fee_until, header_l1_block_num, NodeInterfaceAction,
+    configured_legacy_zero_base_fee_until, header_l1_and_arbos_version, NodeInterfaceAction,
 };
 use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
@@ -65,6 +65,17 @@ fn precompile_env(
 impl<DB> ArbitrumApiImpl<DB> {
     fn cfg_for_tx(&self, tx: &ArbitrumTxEnv) -> CfgEnv<ArbitrumHardfork> {
         let mut cfg = self.evm_cfg.cfg.clone();
+        if tx.context.current_arbos_version != 0 {
+            ArbitrumHardfork::from_arbos_version(tx.context.current_arbos_version)
+                .apply_cfg(&mut cfg);
+        }
+        // Nitro exempts Arbitrum from Ethereum's implicit EIP-7825 cap. Keep an
+        // explicitly configured RPC cap; zero means unlimited.
+        cfg.tx_gas_limit_cap = Some(
+            cfg.tx_gas_limit_cap
+                .filter(|&cap| cap != 0)
+                .unwrap_or(u64::MAX),
+        );
         if tx.is_retryable_redeem() {
             cfg.disable_balance_check = true;
             cfg.disable_nonce_check = true;
@@ -99,11 +110,13 @@ impl<DB> ArbitrumApiImpl<DB> {
     }
 
     fn tx_context_for_block(&self, block: &BlockInfo) -> ArbitrumTxContext {
+        let legacy_zero_base_fee_until =
+            configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref());
+        let (current_l1_block_number, current_arbos_version) =
+            header_l1_and_arbos_version(block, legacy_zero_base_fee_until);
         ArbitrumTxContext {
-            current_l1_block_number: header_l1_block_num(
-                block,
-                configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref()),
-            ),
+            current_l1_block_number,
+            current_arbos_version,
             ..Default::default()
         }
     }
@@ -458,6 +471,10 @@ where
 {
     type Tx = ArbitrumTxEnv;
 
+    fn consensus_tx_gas_limit_cap(&self, _spec: revm::primitives::hardfork::SpecId) -> u64 {
+        u64::MAX
+    }
+
     fn gas_allowance<StateDB: DatabaseRef>(
         &self,
         _request: &CallRequest,
@@ -493,9 +510,473 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leafage_evm_chains::arbitrum::arbos_state::ARBOS_STATE_ADDRESS;
     use leafage_evm_chains::arbitrum::precompile::NODE_INTERFACE_ADDRESS;
+    use revm::bytecode::Bytecode;
+    use revm::context::either::Either;
     use revm::context::result::{ResultGas, SuccessReason};
+    use revm::context::transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization};
     use revm::context::TxEnv;
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::primitives::keccak256;
+    use revm::state::AccountInfo;
+    use revm::ExecuteEvm;
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestBlockIndex;
+
+    impl BlockIndex for TestBlockIndex {
+        type Error = core::convert::Infallible;
+
+        fn get_block_by_id(
+            &self,
+            _: leafage_evm_types::BlockId,
+        ) -> Result<Option<BlockInfo>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn test_api(default_hardfork: ArbitrumHardfork) -> ArbitrumApiImpl<TestBlockIndex> {
+        ArbitrumApiImpl::new(
+            TestBlockIndex,
+            CfgEnv::new_with_spec(default_hardfork),
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            "test".to_string(),
+            100,
+            None,
+            None,
+        )
+    }
+
+    fn tx_at_arbos_version(version: u64) -> ArbitrumTxEnv {
+        ArbitrumTxEnv::new(
+            TxEnv::default(),
+            ArbitrumTxContext {
+                current_arbos_version: version,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn cfg_for_tx_selects_hardfork_from_arbos_version() {
+        let api = test_api(ArbitrumHardfork::Prague);
+        for (version, expected) in [
+            (1, ArbitrumHardfork::London),
+            (10, ArbitrumHardfork::London),
+            (11, ArbitrumHardfork::Shanghai),
+            (19, ArbitrumHardfork::Shanghai),
+            (20, ArbitrumHardfork::Cancun),
+            (39, ArbitrumHardfork::Cancun),
+            (40, ArbitrumHardfork::Prague),
+            (49, ArbitrumHardfork::Prague),
+            (50, ArbitrumHardfork::Osaka),
+            (61, ArbitrumHardfork::Osaka),
+            (u64::MAX, ArbitrumHardfork::Osaka),
+        ] {
+            assert_eq!(api.cfg_for_tx(&tx_at_arbos_version(version)).spec, expected);
+        }
+    }
+
+    #[test]
+    fn cfg_for_tx_updates_fork_dependent_gas_params_at_boundaries() {
+        let api = test_api(ArbitrumHardfork::London);
+        for (version, initcode_cost, auth_refund, floor_cost_per_token) in [
+            (10, 0, 0, 0),
+            (11, 4, 0, 0),
+            (19, 4, 0, 0),
+            (20, 4, 0, 0),
+            (39, 4, 0, 0),
+            (40, 4, 12_500, 10),
+            (49, 4, 12_500, 10),
+            (50, 4, 12_500, 10),
+        ] {
+            let cfg = api.cfg_for_tx(&tx_at_arbos_version(version));
+            assert_eq!(
+                cfg.gas_params.tx_initcode_cost(33),
+                initcode_cost,
+                "wrong initcode cost at ArbOS {version}",
+            );
+            assert_eq!(
+                cfg.gas_params.tx_eip7702_auth_refund(),
+                auth_refund,
+                "wrong EIP-7702 refund at ArbOS {version}",
+            );
+            assert_eq!(
+                cfg.gas_params.tx_floor_cost_per_token(),
+                floor_cost_per_token,
+                "wrong calldata floor cost at ArbOS {version}",
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_gas_cap_clamps_request_before_arbitrum_execution() {
+        let block_env = BlockEnv {
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        for (configured_cap, requested_gas, expected_gas) in [
+            (None, None, 30_000_000),
+            (None, Some(30_000_001), 30_000_000),
+            (Some(25_000_000), None, 25_000_000),
+            (Some(25_000_000), Some(25_000_000), 25_000_000),
+            (Some(25_000_000), Some(25_000_001), 25_000_000),
+            (Some(0), None, 30_000_000),
+        ] {
+            let mut api = test_api(ArbitrumHardfork::Osaka);
+            api.evm_cfg.cfg.tx_gas_limit_cap = configured_cap;
+            let mut request = CallRequest::default();
+            request.gas = requested_gas;
+            let tx = api
+                .create_txn_env(
+                    &BlockInfo::default(),
+                    &block_env,
+                    request,
+                    EmptyDB::default(),
+                    1,
+                )
+                .expect("create Arbitrum transaction environment");
+            assert_eq!(
+                tx.base.gas_limit, expected_gas,
+                "wrong gas limit for configured cap {configured_cap:?} and request {requested_gas:?}",
+            );
+            assert_eq!(
+                api.cfg_for_tx(&tx).tx_gas_limit_cap,
+                Some(configured_cap.filter(|&cap| cap != 0).unwrap_or(u64::MAX)),
+                "wrong execution cap for configured cap {configured_cap:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn configured_hardfork_is_only_fallback_without_arbos_version() {
+        let api = test_api(ArbitrumHardfork::Osaka);
+        assert_eq!(
+            api.cfg_for_tx(&tx_at_arbos_version(0)).spec,
+            ArbitrumHardfork::Osaka
+        );
+        assert_eq!(
+            api.cfg_for_tx(&tx_at_arbos_version(10)).spec,
+            ArbitrumHardfork::London
+        );
+        assert_eq!(
+            api.cfg_for_tx(&tx_at_arbos_version(40)).spec,
+            ArbitrumHardfork::Prague
+        );
+    }
+
+    fn arbos_version_slot() -> U256 {
+        let key = [0u8; 32];
+        let hashed = keccak256(&key[..31]);
+        let mut slot = [0u8; 32];
+        slot[..31].copy_from_slice(&hashed[..31]);
+        U256::from_be_bytes(slot)
+    }
+
+    fn execute_probe(
+        header_arbos_version: u64,
+        state_arbos_version: u64,
+        default_hardfork: ArbitrumHardfork,
+        code: &'static [u8],
+    ) -> ExecutionResult<HaltReason> {
+        let target = Address::with_last_byte(0x22);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            arbos_version_slot(),
+            U256::from(state_arbos_version),
+        )
+        .expect("write ArbOS version");
+        db.insert_account_info(
+            target,
+            AccountInfo {
+                code: Some(Bytecode::new_legacy(Bytes::from_static(code))),
+                ..Default::default()
+            },
+        );
+        let mut tx = tx_at_arbos_version(header_arbos_version);
+        tx.base.kind = TxKind::Call(target);
+        tx.base.gas_limit = 2_000_000;
+        let cfg = test_api(default_hardfork).cfg_for_tx(&tx);
+        let mut evm = create_arbitrum_evm_from_state(
+            BlockEnv {
+                gas_limit: 30_000_000,
+                ..Default::default()
+            },
+            cfg,
+            db,
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        )
+        .expect("create Arbitrum EVM");
+        evm.transact(tx).expect("execute opcode probe").result
+    }
+
+    fn execute_clz(
+        header_arbos_version: u64,
+        state_arbos_version: u64,
+        default_hardfork: ArbitrumHardfork,
+    ) -> ExecutionResult<HaltReason> {
+        execute_probe(
+            header_arbos_version,
+            state_arbos_version,
+            default_hardfork,
+            &[0x60, 0x01, 0x1e, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3],
+        )
+    }
+
+    fn execute_tx_at_arbos_version(
+        version: u64,
+        base: TxEnv,
+    ) -> Result<ExecutionResult<HaltReason>, InvalidTransaction> {
+        execute_tx_with_db_at_arbos_version(
+            version,
+            base,
+            CacheDB::new(EmptyDB::default()),
+            ArbitrumHardfork::Prague,
+        )
+    }
+
+    fn execute_tx_with_db_at_arbos_version(
+        version: u64,
+        base: TxEnv,
+        mut db: CacheDB<EmptyDB>,
+        default_hardfork: ArbitrumHardfork,
+    ) -> Result<ExecutionResult<HaltReason>, InvalidTransaction> {
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            arbos_version_slot(),
+            U256::from(version),
+        )
+        .expect("write ArbOS version");
+        let tx = ArbitrumTxEnv::new(
+            base,
+            ArbitrumTxContext {
+                current_arbos_version: version,
+                ..Default::default()
+            },
+        );
+        let cfg = test_api(default_hardfork).cfg_for_tx(&tx);
+        let mut evm = create_arbitrum_evm_from_state(
+            BlockEnv {
+                gas_limit: 100_000_000,
+                ..Default::default()
+            },
+            cfg,
+            db,
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        )
+        .expect("create Arbitrum EVM");
+        match evm.transact(tx) {
+            Ok(result) => Ok(result.result),
+            Err(EVMError::Transaction(err)) => Err(err),
+            Err(err) => panic!("unexpected execution error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn eip7702_transaction_type_activates_at_arbos_40() {
+        let tx = || TxEnv {
+            tx_type: 4,
+            chain_id: Some(1),
+            gas_limit: 100_000,
+            kind: TxKind::Call(Address::with_last_byte(0x22)),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            execute_tx_at_arbos_version(39, tx()),
+            Err(InvalidTransaction::Eip7702NotSupported),
+        );
+        assert_eq!(
+            execute_tx_at_arbos_version(40, tx()),
+            Err(InvalidTransaction::EmptyAuthorizationList),
+        );
+    }
+
+    #[test]
+    fn eip7702_existing_authority_refund_uses_arbos_40_gas_table() {
+        let authority = Address::with_last_byte(0x11);
+        let delegate = Address::with_last_byte(0x22);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(authority, AccountInfo::default());
+        let authorization = RecoveredAuthorization::new_unchecked(
+            Authorization {
+                chain_id: U256::from(1),
+                address: delegate,
+                nonce: 0,
+            },
+            RecoveredAuthority::Valid(authority),
+        );
+        let result = execute_tx_with_db_at_arbos_version(
+            40,
+            TxEnv {
+                tx_type: 4,
+                chain_id: Some(1),
+                gas_limit: 100_000,
+                kind: TxKind::Call(delegate),
+                authorization_list: vec![Either::Right(authorization)],
+                ..Default::default()
+            },
+            db,
+            ArbitrumHardfork::London,
+        )
+        .expect("execute EIP-7702 transaction");
+
+        assert_eq!(result.gas_used(), 36_800);
+    }
+
+    #[test]
+    fn arbitrum_osaka_does_not_reject_mainnet_eip7825_plus_one() {
+        let cap = revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+        for gas_limit in [cap, cap + 1] {
+            let result = execute_tx_at_arbos_version(
+                50,
+                TxEnv {
+                    gas_limit,
+                    kind: TxKind::Call(Address::with_last_byte(0x22)),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                matches!(result, Ok(ExecutionResult::Success { .. })),
+                "Arbitrum must accept a call with gas limit {gas_limit}, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrum_osaka_preserves_explicit_rpc_gas_cap() {
+        let rpc_cap = 100_000_000;
+        let mut api = test_api(ArbitrumHardfork::Prague);
+        api.evm_cfg.cfg.tx_gas_limit_cap = Some(rpc_cap);
+        let tx = ArbitrumTxEnv::new(
+            TxEnv {
+                gas_limit: rpc_cap + 1,
+                kind: TxKind::Call(Address::with_last_byte(0x22)),
+                ..Default::default()
+            },
+            ArbitrumTxContext {
+                current_arbos_version: 50,
+                ..Default::default()
+            },
+        );
+        let cfg = api.cfg_for_tx(&tx);
+        assert_eq!(cfg.tx_gas_limit_cap, Some(rpc_cap));
+
+        let mut evm = create_arbitrum_evm_from_state(
+            BlockEnv {
+                gas_limit: rpc_cap + 1,
+                ..Default::default()
+            },
+            cfg,
+            CacheDB::new(EmptyDB::default()),
+            NoOpInspector {},
+            ArbitrumPrecompileEnv::default(),
+            ArbitrumExecutionContext::default(),
+        )
+        .expect("create Arbitrum EVM");
+
+        assert_eq!(
+            evm.transact(tx),
+            Err(EVMError::Transaction(
+                InvalidTransaction::TxGasLimitGreaterThanCap {
+                    gas_limit: rpc_cap + 1,
+                    cap: rpc_cap,
+                }
+            )),
+        );
+    }
+
+    #[test]
+    fn opcode_activation_matches_each_arbos_boundary() {
+        let cases: [(u64, u64, &'static [u8]); 3] = [
+            // PUSH0; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+            (
+                10,
+                11,
+                &[0x5f, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3],
+            ),
+            // TSTORE(0, 1); TLOAD(0); MSTORE(0); RETURN(0, 32)
+            (
+                19,
+                20,
+                &[
+                    0x60, 0x01, 0x60, 0x00, 0x5d, 0x60, 0x00, 0x5c, 0x60, 0x00, 0x52, 0x60, 0x20,
+                    0x60, 0x00, 0xf3,
+                ],
+            ),
+            // CLZ(1); MSTORE(0); RETURN(0, 32)
+            (
+                49,
+                50,
+                &[0x60, 0x01, 0x1e, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3],
+            ),
+        ];
+
+        for (before, activation, code) in cases {
+            assert!(matches!(
+                execute_probe(before, before, ArbitrumHardfork::Prague, code),
+                ExecutionResult::Halt { .. }
+            ));
+            assert!(matches!(
+                execute_probe(activation, activation, ArbitrumHardfork::Prague, code),
+                ExecutionResult::Success { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn clz_activates_at_arbos_50() {
+        assert!(matches!(
+            execute_clz(49, 49, ArbitrumHardfork::Prague),
+            ExecutionResult::Halt { .. }
+        ));
+        match execute_clz(50, 50, ArbitrumHardfork::Prague) {
+            ExecutionResult::Success {
+                output: Output::Call(output),
+                ..
+            } => {
+                let mut expected = [0u8; 32];
+                expected[31] = 255;
+                assert_eq!(output.as_ref(), expected);
+            }
+            result => panic!("expected CLZ success, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn state_arbos_override_does_not_change_header_selected_hardfork() {
+        assert!(matches!(
+            execute_clz(49, 50, ArbitrumHardfork::Prague),
+            ExecutionResult::Halt { .. }
+        ));
+        assert!(matches!(
+            execute_clz(50, 49, ArbitrumHardfork::Prague),
+            ExecutionResult::Success { .. }
+        ));
+    }
+
+    #[test]
+    fn configured_hardfork_does_not_override_header_selected_hardfork() {
+        assert!(matches!(
+            execute_clz(49, 49, ArbitrumHardfork::Osaka),
+            ExecutionResult::Halt { .. }
+        ));
+        assert!(matches!(
+            execute_clz(50, 50, ArbitrumHardfork::London),
+            ExecutionResult::Success { .. }
+        ));
+    }
 
     #[test]
     fn execution_env_for_tx_matches_arbitrum_contexts() {

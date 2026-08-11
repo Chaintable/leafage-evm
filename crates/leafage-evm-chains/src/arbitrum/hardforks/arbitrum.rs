@@ -1,5 +1,5 @@
 use alloy_hardforks::hardfork;
-use leafage_evm_types::MainnetSpecId;
+use leafage_evm_types::{CfgEnv, MainnetSpecId};
 use revm::primitives::hardfork::SpecId;
 
 hardfork!(
@@ -39,6 +39,24 @@ impl From<ArbitrumHardfork> for SpecId {
             ArbitrumHardfork::Osaka => SpecId::OSAKA,
             ArbitrumHardfork::Amsterdam => SpecId::AMSTERDAM,
         }
+    }
+}
+
+impl ArbitrumHardfork {
+    /// Returns the Ethereum execution spec Nitro activates for an ArbOS version.
+    pub const fn from_arbos_version(version: u64) -> Self {
+        match version {
+            50.. => Self::Osaka,
+            40..=49 => Self::Prague,
+            20..=39 => Self::Cancun,
+            11..=19 => Self::Shanghai,
+            _ => Self::London,
+        }
+    }
+
+    /// Updates the active EVM spec and all fork-dependent gas parameters.
+    pub fn apply_cfg(self, cfg: &mut CfgEnv<Self>) {
+        cfg.set_spec_and_mainnet_gas_params(self);
     }
 }
 
@@ -133,5 +151,23 @@ mod tests {
             ArbitrumHardfork::try_from(MainnetSpecId::AMSTERDAM as u8),
             Ok(ArbitrumHardfork::Amsterdam)
         );
+    }
+
+    #[test]
+    fn maps_arbos_versions_to_nitro_evm_hardforks() {
+        for (version, expected) in [
+            (0, ArbitrumHardfork::London),
+            (10, ArbitrumHardfork::London),
+            (11, ArbitrumHardfork::Shanghai),
+            (19, ArbitrumHardfork::Shanghai),
+            (20, ArbitrumHardfork::Cancun),
+            (39, ArbitrumHardfork::Cancun),
+            (40, ArbitrumHardfork::Prague),
+            (49, ArbitrumHardfork::Prague),
+            (50, ArbitrumHardfork::Osaka),
+            (61, ArbitrumHardfork::Osaka),
+        ] {
+            assert_eq!(ArbitrumHardfork::from_arbos_version(version), expected);
+        }
     }
 }

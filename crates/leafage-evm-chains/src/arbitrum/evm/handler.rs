@@ -1615,6 +1615,64 @@ mod tests {
     }
 
     #[test]
+    fn gas_estimation_compute_limit_handles_equal_and_plus_one_boundaries() {
+        use crate::arbitrum::tx::ArbitrumTxContext;
+
+        let handler = ArbitrumHandler::<TestDb, ()>::new();
+        let l2_pricing_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
+        for (version, offset, stored_limit, execution_limit) in [
+            (49, arbos_state::L2_PER_BLOCK_GAS_LIMIT_OFFSET, 100_000, 100_000),
+            (50, arbos_state::L2_PER_TX_GAS_LIMIT_OFFSET, 100_000, 79_000),
+        ] {
+            for (available, expected_remaining, expected_held) in [
+                (execution_limit - 1, execution_limit - 1, 0),
+                (execution_limit, execution_limit, 0),
+                (execution_limit + 1, execution_limit, 1),
+            ] {
+                let tx = ArbitrumTxEnv::new(
+                    TxEnv {
+                        gas_limit: 500_000,
+                        ..Default::default()
+                    },
+                    ArbitrumTxContext {
+                        gas_estimation: true,
+                        ..Default::default()
+                    },
+                );
+                let mut evm = evm_with_tx(tx);
+                evm.ctx_mut()
+                    .chain_mut()
+                    .set_current_l2_context(U256::ZERO, 0);
+                evm.ctx_mut()
+                    .db_mut()
+                    .insert_account_storage(
+                        arbos_state::ARBOS_STATE_ADDRESS,
+                        arbos_state::slot_at(&[], arbos_state::ARBOS_VERSION_OFFSET),
+                        U256::from(version),
+                    )
+                    .expect("write ArbOS version");
+                evm.ctx_mut()
+                    .db_mut()
+                    .insert_account_storage(
+                        arbos_state::ARBOS_STATE_ADDRESS,
+                        arbos_state::slot_at(&l2_pricing_key, offset),
+                        U256::from(stored_limit),
+                    )
+                    .expect("write computation gas limit");
+
+                let mut gas_remaining = available;
+                let held = handler
+                    .gas_charging_hook(&mut evm, &mut gas_remaining, 21_000, version)
+                    .expect("gas charging hook");
+
+                assert_eq!(gas_remaining, expected_remaining);
+                assert_eq!(held, expected_held);
+                assert_eq!(ArbitrumHandler::<TestDb, ()>::poster_gas(&evm), 0);
+            }
+        }
+    }
+
+    #[test]
     fn multi_gas_price_applies_arbos_60_and_61_fork_rules() {
         let l2_key = arbos_state::child_key(&[], arbos_state::L2_PRICING_SUBSPACE);
         let constraints_key = arbos_state::child_key(&l2_key, &[1]);

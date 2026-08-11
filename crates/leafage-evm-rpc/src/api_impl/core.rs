@@ -17,6 +17,7 @@ use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId,
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
+use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
@@ -59,6 +60,15 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
+
+    fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
+        if spec.is_enabled_in(EthSpecId::OSAKA) {
+            eip7825::TX_GAS_LIMIT_CAP
+        } else {
+            u64::MAX
+        }
+    }
+
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         None
     }
@@ -234,5 +244,30 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context::TxEnv;
+
+    struct DefaultGasFeeHandler;
+
+    impl GasFeeHandler for DefaultGasFeeHandler {
+        type Tx = TxEnv;
+    }
+
+    #[test]
+    fn default_consensus_cap_keeps_mainnet_eip7825_boundary() {
+        let handler = DefaultGasFeeHandler;
+        assert_eq!(
+            handler.consensus_tx_gas_limit_cap(EthSpecId::PRAGUE),
+            u64::MAX
+        );
+        assert_eq!(
+            handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA),
+            eip7825::TX_GAS_LIMIT_CAP
+        );
     }
 }

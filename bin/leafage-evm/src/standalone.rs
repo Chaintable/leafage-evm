@@ -465,13 +465,8 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
             "arbitrum" => {
-                // Arbitrum Orbit (Nitro) on ArbOS >= 40 is Prague-level. Its EIP-7623
-                // calldata floor is a runtime feature flag (default off, e.g. Robinhood),
-                // so default to PRAGUE: it matches the chain's Prague EVM and never
-                // *under*-estimates the floor — if a chain enables 7623 PRAGUE is exact,
-                // if it's off the floor only over-estimates rare calldata-heavy txs (the
-                // safe direction). Override with --spec-id for pre-Prague (ArbOS < 40)
-                // chains. The Arbitrum EVM handler accounts for Nitro's L1 poster gas.
+                // RPC execution replaces this fallback with the target block's
+                // ArbOS-derived hardfork whenever Nitro header metadata is available.
                 let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
