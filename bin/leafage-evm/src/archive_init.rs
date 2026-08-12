@@ -1,4 +1,4 @@
-use crate::bundle::{bundle_end, s3_read_bundle};
+use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
     s3_get_block_info_and_diff_by_number_with_parent_state_root,
@@ -78,6 +78,9 @@ pub struct Command {
     /// disables bundle reads and preserves the legacy per-block path.
     #[arg(long, default_value = "")]
     s3_bundle_bucket: String,
+
+    #[command(flatten)]
+    bundle_read: BundleReadArgs,
 
     /// S3 outer bucket name
     #[arg(long)]
@@ -946,6 +949,7 @@ impl Command {
         let rpc_client = Some(rpc_client);
         let bucket = self.s3_bucket.clone();
         let bundle_bucket = self.s3_bundle_bucket.clone();
+        let bundle_range_size_mib = self.bundle_read.bundle_range_size_mib;
         let outer_bucket = self.s3_outer_bucket.clone();
         let chain_id = self.s3_chain_id.clone();
         let version = self.s3_version.clone();
@@ -1003,6 +1007,7 @@ impl Command {
                     s3_client.clone(),
                     bucket.clone(),
                     bundle_bucket.clone(),
+                    bundle_range_size_mib,
                     outer_bucket.clone(),
                     chain_id.clone(),
                     version.clone(),
@@ -1046,6 +1051,7 @@ impl Command {
                     s3_client.clone(),
                     bucket.clone(),
                     bundle_bucket.clone(),
+                    bundle_range_size_mib,
                     outer_bucket.clone(),
                     chain_id.clone(),
                     version.clone(),
@@ -1311,6 +1317,7 @@ impl Command {
         s3_client: Client,
         bucket: String,
         bundle_bucket: String,
+        bundle_range_size_mib: u32,
         outer_bucket: String,
         chain_id: String,
         version: String,
@@ -1331,6 +1338,7 @@ impl Command {
                 &version,
                 next_block,
                 current_bundle_end,
+                bundle_range_size_mib,
                 |block_info, block_diff| {
                     let tx = tx.clone();
                     async move {

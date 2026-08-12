@@ -105,7 +105,7 @@ When startup catch-up is required, KafkaUpdater synchronizes from S3:
 │                                                             │
 │  1. Read compacted bundles in block order                   │
 │     ├── Header: read the complete gzip JSON array           │
-│     └── StateDiff: Range reads, at most 32 MiB per body      │
+│     └── StateDiff: grouped Range reads (32 MiB by default)   │
 │  2. On the first missing bundle, stop bundle probes         │
 │  3. Read that height and all newer blocks from source S3    │
 │  4. Apply every block to StateTree                          │
@@ -115,7 +115,9 @@ When startup catch-up is required, KafkaUpdater synchronizes from S3:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The 32 MiB StateDiff body limit is currently fixed rather than configurable.
+Use `--bundle-range-size <MIB>` to tune the grouped Range request size. The
+limit applies only to requests containing multiple entries; an oversized
+single entry is still read by itself.
 After the first missing bundle, retries resume from the in-memory latest block
 and use only per-block source reads for the rest of the process.
 
@@ -231,6 +233,7 @@ Detection:
 | `--update-interval` | HTTP polling interval (ms) |
 | `--diff-depth-limit` | Max block diffs in memory / reorg depth |
 | `--init-task-queue-size` | Batch size for S3 catch-up (default: 256) |
+| `--bundle-range-size <MIB>` | Target size for grouping multiple compacted StateDiff entries into one S3 Range request (default: 32 MiB); oversized single entries are read alone |
 
 ## Related Documentation
 

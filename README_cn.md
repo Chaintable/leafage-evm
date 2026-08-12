@@ -145,6 +145,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-cache` | 2048 | 数据库缓存大小（MB） |
 | `--diff-depth-limit` | 64 | 内存中保留的区块差异深度 |
 | `--catchup-safe-depth` | 0 | S3 catch-up 的 reorg 缓冲深度：靠近 Kafka 链头的这些区块改为沿精确的 parent-hash 链回补，而非按块号索引，避免 reorg 时选错分叉支。0 表示禁用（与旧逻辑完全一致）；应设为大于该链的最大 reorg 深度（如 Moonriver 设 64） |
+| `--bundle-range-size` | 32 MiB | 多个 StateDiff entry 合并为一次 S3 Range 请求时的目标大小。单个 entry 超过该值时仍会单独读取；`archive-init` 也支持此参数 |
 | `--archive` | false | 启用归档模式 |
 | `--prometheus-addr` | - | Prometheus 监控地址 |
 | `--kafka-s3-config` | - | Kafka + S3 配置文件路径 |
@@ -173,6 +174,8 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 ```
 
 `bundle_bucket_name` 为可选项；省略或留空时继续使用原有的逐块 S3 读取逻辑。
+
+`standalone` 和 `archive-init` 均可通过 `--bundle-range-size <MIB>` 调整 compacted StateDiff 的请求大小。该限制只作用于多个 entry 的合并读取；单个 entry 超过配置值时会独立获取。
 
 ### 数据迁移
 

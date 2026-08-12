@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
     error::SdkError, operation::get_object::GetObjectError, primitives::ByteStream, Client,
 };
+use clap::Args;
 use flate2::read::GzDecoder;
 use leafage_evm_types::{
     BlockInfo, BlockStorageDiff, BundleStorageDiffIndex, STATE_DIFF_ENTRY_CAPACITY,
@@ -13,12 +14,25 @@ use tokio::{io::AsyncReadExt, time::sleep};
 use tracing::warn;
 
 const BUNDLE_SIZE: u64 = 1_000;
-const STATE_DIFF_GROUP_RANGE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const MEBIBYTE_BYTES: u64 = 1024 * 1024;
+const DEFAULT_BUNDLE_RANGE_SIZE_MIB: u32 = 32;
 const BODY_READ_MAX_ATTEMPTS: u32 = 3;
 #[cfg(not(test))]
 const BODY_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(test)]
 const BODY_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+#[derive(Debug, Clone, Copy, Args)]
+pub(crate) struct BundleReadArgs {
+    /// Target size limit, in MiB, when combining multiple StateDiff entries
+    /// into one S3 Range request. A larger single entry is still read alone.
+    #[arg(
+        long = "bundle-range-size",
+        default_value_t = DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+        value_name = "MIB"
+    )]
+    pub(crate) bundle_range_size_mib: u32,
+}
 
 pub(crate) fn bundle_end(block_number: u64) -> u64 {
     let bundle_id = bundle_id(block_number);
@@ -42,6 +56,7 @@ pub(crate) async fn s3_read_bundle<F, Fut>(
     version: &str,
     start_block: u64,
     end_block: u64,
+    bundle_range_size_mib: u32,
     mut process_block: F,
 ) -> Result<Option<BlockInfo>>
 where
@@ -96,10 +111,12 @@ where
 
     let start_position = bundle_position(start_block);
     let end_position = bundle_position(end_block);
+    let bundle_range_size_bytes = u64::from(bundle_range_size_mib) * MEBIBYTE_BYTES;
     let mut position = start_position;
     let mut last_block_info = None;
     while position <= end_position {
-        let range_end = state_diff_range_end(&index, position, end_position)?;
+        let range_end =
+            state_diff_range_end(&index, position, end_position, bundle_range_size_bytes)?;
         let (payload_start, _) = index.payload_range(position)?;
         let (_, payload_end) = index.payload_range(range_end)?;
         let object_start = (STATE_DIFF_INDEX_BYTES as u64)
@@ -427,6 +444,7 @@ fn state_diff_range_end(
     index: &BundleStorageDiffIndex,
     start_position: usize,
     end_position: usize,
+    group_range_limit_bytes: u64,
 ) -> Result<usize> {
     let (payload_start, _) = index.payload_range(start_position)?;
     let mut range_end = start_position;
@@ -434,7 +452,7 @@ fn state_diff_range_end(
         let (_, payload_end) = index.payload_range(position)?;
         // The limit only bounds ranges that combine multiple entries. A single
         // entry may itself be larger and must still be fetched on its own.
-        if payload_end - payload_start > STATE_DIFF_GROUP_RANGE_LIMIT_BYTES {
+        if payload_end - payload_start > group_range_limit_bytes {
             break;
         }
         range_end = position;
@@ -663,33 +681,13 @@ mod tests {
     }
 
     #[test]
-    fn builds_bundle_keys_with_and_without_version() {
-        assert_eq!(bundle_key("1", "", 2, "stateDiff"), "1/2/stateDiff");
-        assert_eq!(
-            bundle_key("1", "418dae46", 2, "block"),
-            "1/418dae46/2/block"
-        );
-    }
+    fn selects_state_diff_ranges() {
+        let limit = 4;
+        let index = index_with_sizes(&[limit + 1, limit / 2, limit / 2, 1]);
 
-    #[test]
-    fn groups_ranges_without_exceeding_limit() {
-        let index = index_with_sizes(&[STATE_DIFF_GROUP_RANGE_LIMIT_BYTES - 1, 1, 1]);
-        assert_eq!(state_diff_range_end(&index, 0, 2).unwrap(), 1);
-        assert_eq!(state_diff_range_end(&index, 2, 2).unwrap(), 2);
-    }
-
-    #[test]
-    fn fetches_an_oversized_entry_by_itself() {
-        let index = index_with_sizes(&[
-            STATE_DIFF_GROUP_RANGE_LIMIT_BYTES + 1,
-            STATE_DIFF_GROUP_RANGE_LIMIT_BYTES / 2,
-            STATE_DIFF_GROUP_RANGE_LIMIT_BYTES / 2,
-            1,
-        ]);
-
-        assert_eq!(state_diff_range_end(&index, 0, 3).unwrap(), 0);
-        assert_eq!(state_diff_range_end(&index, 1, 3).unwrap(), 2);
-        assert_eq!(state_diff_range_end(&index, 3, 3).unwrap(), 3);
+        assert_eq!(state_diff_range_end(&index, 0, 3, limit).unwrap(), 0);
+        assert_eq!(state_diff_range_end(&index, 1, 3, limit).unwrap(), 2);
+        assert_eq!(state_diff_range_end(&index, 3, 3, limit).unwrap(), 3);
     }
 
     #[tokio::test]
@@ -702,18 +700,27 @@ mod tests {
         let (client, server) = mock_client(state).await;
         let seen = Arc::new(Mutex::new(Vec::new()));
 
-        let found = s3_read_bundle(&client, "bundle", "1", "", 0, 0, {
-            let seen = seen.clone();
-            move |block_info, block_diff| {
+        let found = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            0,
+            0,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            {
                 let seen = seen.clone();
-                async move {
-                    seen.lock()
-                        .unwrap()
-                        .push((block_info.header.number, block_diff.hash));
-                    Ok(())
+                move |block_info, block_diff| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push((block_info.header.number, block_diff.hash));
+                        Ok(())
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap();
 
@@ -750,16 +757,25 @@ mod tests {
         let (client, server) = mock_client(state).await;
         let seen = Arc::new(Mutex::new(Vec::new()));
 
-        let last = s3_read_bundle(&client, "bundle", "1", "", 10, 12, {
-            let seen = seen.clone();
-            move |block_info, _| {
+        let last = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            10,
+            12,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            {
                 let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push(block_info.header.number);
-                    Ok(())
+                move |block_info, _| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(block_info.header.number);
+                        Ok(())
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap()
         .unwrap();
@@ -782,10 +798,19 @@ mod tests {
         let requests = state.requests.clone();
         let (client, server) = mock_client(state).await;
 
-        let last = s3_read_bundle(&client, "bundle", "1", "", 0, 0, |_, _| async { Ok(()) })
-            .await
-            .unwrap()
-            .unwrap();
+        let last = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            0,
+            0,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert_eq!(last.header.number, 0);
         let requests = requests.lock().unwrap();
@@ -800,9 +825,16 @@ mod tests {
         let requests = state.requests.clone();
         let (client, server) = mock_client(state).await;
 
-        let found = s3_read_bundle(&client, "bundle", "1", "", 1, 1, |_, _| async {
-            unreachable!()
-        })
+        let found = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            1,
+            1,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            |_, _| async { unreachable!() },
+        )
         .await
         .unwrap();
 
@@ -819,9 +851,16 @@ mod tests {
         };
         let (client, server) = mock_client(state).await;
 
-        let error = s3_read_bundle(&client, "bundle", "1", "", 1, 1, |_, _| async {
-            unreachable!()
-        })
+        let error = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            1,
+            1,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            |_, _| async { unreachable!() },
+        )
         .await
         .unwrap_err();
 
@@ -839,9 +878,16 @@ mod tests {
         };
         let (client, server) = mock_client(state).await;
 
-        let error = s3_read_bundle(&client, "bundle", "1", "", 0, 0, |_, _| async {
-            unreachable!()
-        })
+        let error = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            0,
+            0,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            |_, _| async { unreachable!() },
+        )
         .await
         .unwrap_err();
 

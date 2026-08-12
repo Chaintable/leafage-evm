@@ -52,6 +52,7 @@ pub struct Updater<Tree> {
     /// Kafka head that are backfilled by following the exact parent-hash chain
     /// instead of the by-number index. 0 disables it (legacy behavior).
     catchup_safe_depth: usize,
+    bundle_range_size_mib: u32,
     /// Bundle reads stop permanently after the first definitive miss in this
     /// process. Retries continue from the in-memory latest block, so they do
     /// not need to reread the already-applied bundle prefix.
@@ -73,6 +74,7 @@ where
         max_diff_depth: usize,
         init_task_queue_size: usize,
         catchup_safe_depth: usize,
+        bundle_range_size_mib: u32,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -105,6 +107,7 @@ where
             read_from_kafka: true,
             init_task_queue_size,
             catchup_safe_depth,
+            bundle_range_size_mib,
             read_from_bundle: AtomicBool::new(read_from_bundle),
         })
     }
@@ -316,6 +319,7 @@ where
                 &self.kafka_s3_cfg.version,
                 next_block_number,
                 current_bundle_end,
+                self.bundle_range_size_mib,
                 |block_info, block_diff| async move {
                     info!(target:"updater", "update bundle block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
                     self.tree.update_block(block_info, block_diff)?;

@@ -1,3 +1,4 @@
+use crate::bundle::BundleReadArgs;
 use crate::initializer::initialize_check;
 use crate::pprof::PProf;
 use crate::register::register_build;
@@ -209,6 +210,9 @@ pub struct Command {
     /// This config is used to set the kafka s3 config.
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
+
+    #[command(flatten)]
+    bundle_read: BundleReadArgs,
 
     /// The etcd register config path
     /// Default: None
@@ -821,6 +825,7 @@ impl Command {
             self.diff_depth_limit,
             self.init_task_queue_size,
             self.catchup_safe_depth,
+            self.bundle_read.bundle_range_size_mib,
         )
         .await?;
 

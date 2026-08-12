@@ -249,31 +249,22 @@ mod tests {
     }
 
     #[test]
-    fn index_rejects_wrong_length() {
+    fn index_rejects_invalid_data() {
         let encoded = index().encode().unwrap();
-
         assert!(matches!(
             BundleStorageDiffIndex::decode(&encoded[..encoded.len() - 1]),
             Err(BundleStorageDiffError::InvalidIndexLength { .. })
         ));
-    }
 
-    #[test]
-    fn index_rejects_nonzero_first_offset() {
         let mut encoded = index().encode().unwrap();
         write_offset(&mut encoded, 0, 1);
-
         assert!(matches!(
             BundleStorageDiffIndex::decode(&encoded),
             Err(BundleStorageDiffError::NonZeroFirstOffset { actual: 1 })
         ));
-    }
 
-    #[test]
-    fn index_rejects_non_increasing_offsets() {
         let mut encoded = index().encode().unwrap();
         write_offset(&mut encoded, 2, 100);
-
         assert!(matches!(
             BundleStorageDiffIndex::decode(&encoded),
             Err(BundleStorageDiffError::NonIncreasingOffset {
@@ -281,6 +272,10 @@ mod tests {
                 current: 100,
                 next: 100
             })
+        ));
+        assert!(matches!(
+            index().payload_range(STATE_DIFF_ENTRY_CAPACITY),
+            Err(BundleStorageDiffError::PositionOutOfRange { .. })
         ));
     }
 
@@ -303,25 +298,13 @@ mod tests {
                 actual: 200
             })
         ));
-    }
 
-    #[test]
-    fn genesis_index_rejects_unused_bitmap_bits() {
         let mut bytes = vec![0; STATE_DIFF_INDEX_BYTES];
         bytes[0] = 0b10;
         write_offset(&mut bytes, 1, 100);
-
         assert!(matches!(
             BundleStorageDiffIndex::decode_for_bundle(0, &bytes),
             Err(BundleStorageDiffError::NonZeroUnusedBitmap { position: 1 })
-        ));
-    }
-
-    #[test]
-    fn payload_range_rejects_position_outside_capacity() {
-        assert!(matches!(
-            index().payload_range(STATE_DIFF_ENTRY_CAPACITY),
-            Err(BundleStorageDiffError::PositionOutOfRange { .. })
         ));
     }
 

@@ -24,6 +24,7 @@ pub async fn updater_build<
     max_diff_depth: usize,
     init_task_queue_size: usize,
     catchup_safe_depth: usize,
+    bundle_range_size_mib: u32,
 ) -> Result<watch::Sender<()>> {
     match (rpc_url, kafka_s3_cfg) {
         (Some(rpc_url), None) => {
@@ -38,6 +39,7 @@ pub async fn updater_build<
                 max_diff_depth,
                 init_task_queue_size,
                 catchup_safe_depth,
+                bundle_range_size_mib,
             )
             .await?;
             Ok(updater.start())
