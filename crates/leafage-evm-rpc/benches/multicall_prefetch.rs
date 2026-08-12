@@ -4,15 +4,17 @@
 //! a real RocksDB-backed StateTree behind a jsonrpsee HTTP server.
 //!
 //! Two servers isolate the two regimes:
-//! - `cold_cache_disabled`: the CacheDiskLayer moka caches are off, so
-//!   every account/code/storage read reaches RocksDB — the first-touch
-//!   miss path the prefetch batches (2 MultiGets instead of 40 scalar
-//!   point reads; storage stays on demand). The DB is flushed to SST
-//!   and padded with filler keys so reads pay the SST + block-cache
-//!   path rather than the memtable.
-//! - `warm_cache_enabled`: moka caches on and warmed after the first
-//!   iteration, so the prefetch resolves from cache — this variant
-//!   guards against a regression on the hot path.
+//! - `cold_block_cache_miss`: the CacheDiskLayer moka caches are off,
+//!   the DB is flushed to SST, the RocksDB block cache is squeezed to
+//!   1MB, and every iteration calls the next of 1000 disjoint 20-
+//!   contract sets (~15MB of state), so by the time a set comes around
+//!   again its blocks have been evicted — every account/code/storage
+//!   read is a real block-cache miss. This is the first-touch path the
+//!   prefetch batches: 2 MultiGets instead of 40 scalar point reads
+//!   (storage stays on demand).
+//! - `warm_cache_enabled`: one fixed set, moka caches on and warmed
+//!   after the first iteration, so the prefetch resolves from cache —
+//!   this variant guards against a regression on the hot path.
 //!
 //! Compare against the pre-prefetch baseline:
 //!   git stash push -- crates/leafage-evm-rpc/src/api_impl/debank.rs
@@ -34,6 +36,7 @@ use leafage_evm_types::{
     Bytes, CallRequest, CfgEnv, DebankBlockContext, IndexValuePair, MainnetSpecId, NewAccount,
     NewCode, H256, U256,
 };
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,24 +55,33 @@ fn block_info(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
 }
 
 fn contract(n: usize) -> Address {
-    Address::repeat_byte(0x30 + n as u8)
+    Address::from_slice(&keccak256((n as u64).to_be_bytes())[..20])
 }
 
 /// Runtime code `PUSH1 0; SLOAD; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0;
-/// RETURN` plus never-executed distinct padding, sized like a small
-/// real contract so the code read dominates the account read.
+/// RETURN` plus never-executed distinct LCG-filled padding, sized like
+/// a small real contract so the code read dominates the account read
+/// and SST blocks don't collapse under compression.
 fn sload0_code(n: usize) -> Bytes {
     let mut code = vec![
         0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
     ];
-    code.extend_from_slice(&vec![n as u8; 500]);
+    let mut x = n as u32 ^ 0x9e37_79b9;
+    code.extend((0..500).map(|_| {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (x >> 16) as u8
+    }));
     Bytes::from(code)
+}
+
+fn word(n: u64) -> Bytes {
+    Bytes::from(U256::from(n).to_be_bytes::<32>().to_vec())
 }
 
 struct Fixture {
     rt: tokio::runtime::Runtime,
     client: HttpClient,
-    requests: Vec<CallRequest>,
+    request_sets: Vec<Vec<CallRequest>>,
     ctx: DebankBlockContext,
     _handle: jsonrpsee::server::ServerHandle,
     dir: std::path::PathBuf,
@@ -81,7 +93,7 @@ impl Drop for Fixture {
     }
 }
 
-fn setup(enable_cache: bool, addr: &str) -> Fixture {
+fn setup(enable_cache: bool, block_cache_mb: usize, sets: usize, addr: &str) -> Fixture {
     let dir = std::env::temp_dir().join(format!(
         "leafage-bench-multicall-prefetch-{}-{}",
         std::process::id(),
@@ -98,7 +110,7 @@ fn setup(enable_cache: bool, addr: &str) -> Fixture {
         nonce: 0,
         code_hash: H256::ZERO,
     });
-    for n in 0..CALLS {
+    for n in 0..sets * CALLS {
         let code = sload0_code(n);
         genesis.new_codes.push(NewCode {
             code_hash: keccak256(&code),
@@ -118,26 +130,16 @@ fn setup(enable_cache: bool, addr: &str) -> Fixture {
             }],
         });
     }
-    // Filler keys so lookups walk real SST index/bloom work instead of
-    // finding everything in a near-empty database.
-    for n in 0..50_000u64 {
-        let address = keccak256(n.to_be_bytes());
-        genesis.new_accounts.push(NewAccount {
-            address,
-            balance: U256::from(n),
-            nonce: 1,
-            code_hash: H256::ZERO,
-        });
-        genesis.storage_diffs.push(AccountStorageDiff {
-            address,
-            diffs: vec![IndexValuePair {
-                index: keccak256(n.to_le_bytes()),
-                value: U256::from(n),
-            }],
-        });
-    }
 
-    let db = MultiStorage::open(&dir, 64, StorageKind::Rocksdb, false, false, false).unwrap();
+    let db = MultiStorage::open(
+        &dir,
+        block_cache_mb,
+        StorageKind::Rocksdb,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
     StateDBWrapper(
         db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
             .unwrap()
@@ -199,10 +201,16 @@ fn setup(enable_cache: bool, addr: &str) -> Fixture {
         .build(format!("http://{addr}"))
         .unwrap();
 
-    let requests = (0..CALLS)
-        .map(|n| CallRequest {
-            inner: TransactionRequest::default().from(alice).to(contract(n)),
-            tempo: None,
+    let request_sets = (0..sets)
+        .map(|s| {
+            (0..CALLS)
+                .map(|i| CallRequest {
+                    inner: TransactionRequest::default()
+                        .from(alice)
+                        .to(contract(s * CALLS + i)),
+                    tempo: None,
+                })
+                .collect()
         })
         .collect();
     let ctx = DebankBlockContext {
@@ -212,18 +220,18 @@ fn setup(enable_cache: bool, addr: &str) -> Fixture {
     Fixture {
         rt,
         client,
-        requests,
+        request_sets,
         ctx,
         _handle: handle,
         dir,
     }
 }
 
-fn run_multicall(fixture: &Fixture) {
+fn run_multicall(fixture: &Fixture, set: usize) {
     fixture.rt.block_on(async {
         let resp = DebankApiClient::contract_multi_call(
             &fixture.client,
-            fixture.requests.clone(),
+            fixture.request_sets[set].clone(),
             Some(fixture.ctx.clone()),
             None,
             None,
@@ -235,6 +243,7 @@ fn run_multicall(fixture: &Fixture) {
         .unwrap();
         assert!(resp.stats.success, "{:?}", resp.results);
         assert_eq!(resp.results.len(), CALLS);
+        assert_eq!(resp.results[0].result, word((set * CALLS) as u64 + 1));
     })
 }
 
@@ -242,12 +251,19 @@ fn bench_multicall(c: &mut Criterion) {
     let mut group = c.benchmark_group("multicall_20");
     group.throughput(Throughput::Elements(CALLS as u64));
 
-    let cold = setup(false, "127.0.0.1:18582");
-    group.bench_function("cold_cache_disabled", |b| b.iter(|| run_multicall(&cold)));
+    let cold = setup(false, 1, 1000, "127.0.0.1:18582");
+    let next = Cell::new(0usize);
+    group.bench_function("cold_block_cache_miss", |b| {
+        b.iter(|| {
+            let set = next.get();
+            next.set((set + 1) % cold.request_sets.len());
+            run_multicall(&cold, set)
+        })
+    });
     drop(cold);
 
-    let warm = setup(true, "127.0.0.1:18583");
-    group.bench_function("warm_cache_enabled", |b| b.iter(|| run_multicall(&warm)));
+    let warm = setup(true, 64, 1, "127.0.0.1:18583");
+    group.bench_function("warm_cache_enabled", |b| b.iter(|| run_multicall(&warm, 0)));
     drop(warm);
 
     group.finish();
