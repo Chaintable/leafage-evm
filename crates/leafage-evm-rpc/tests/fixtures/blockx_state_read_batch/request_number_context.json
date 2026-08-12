@@ -1,0 +1,13 @@
+{
+  "blockContext": {
+    "type": "Equals",
+    "block_id": "0x2"
+  },
+  "reads": [
+    {
+      "kind": "addressCode",
+      "index": 7,
+      "address": "0x1111111111111111111111111111111111111111"
+    }
+  ]
+}
