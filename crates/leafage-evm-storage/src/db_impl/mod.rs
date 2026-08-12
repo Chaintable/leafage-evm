@@ -259,6 +259,39 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::MDBXArchive(db) => db.read_block_hash(block_num),
         }
     }
+
+    // The batched reads must dispatch explicitly: falling back to the
+    // trait defaults here would loop scalar reads on the enum and never
+    // reach the MultiGet override of the non-archive RocksDB backend.
+    fn read_account_many(
+        &self,
+        addresses: &[H256],
+    ) -> Result<Vec<Option<NewAccount>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_account_many(addresses),
+            MultiStateDB::RocksDBArchive(db) => db.read_account_many(addresses),
+            MultiStateDB::MDBXState(db) => db.read_account_many(addresses),
+            MultiStateDB::MDBXArchive(db) => db.read_account_many(addresses),
+        }
+    }
+
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_code_many(code_hashes),
+            MultiStateDB::RocksDBArchive(db) => db.read_code_many(code_hashes),
+            MultiStateDB::MDBXState(db) => db.read_code_many(code_hashes),
+            MultiStateDB::MDBXArchive(db) => db.read_code_many(code_hashes),
+        }
+    }
+
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_storage_many(keys),
+            MultiStateDB::RocksDBArchive(db) => db.read_storage_many(keys),
+            MultiStateDB::MDBXState(db) => db.read_storage_many(keys),
+            MultiStateDB::MDBXArchive(db) => db.read_storage_many(keys),
+        }
+    }
 }
 
 pub enum MultiWriteBatch {

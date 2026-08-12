@@ -20,6 +20,26 @@ pub trait StateDB {
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error>;
     // History related
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error>;
+
+    /// Batched [`StateDB::basic`]: one result per input, same order.
+    /// The scalar default keeps every implementation correct; backends
+    /// that can serve point reads in one storage round trip override it.
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
+        addresses.iter().map(|address| self.basic(*address)).collect()
+    }
+
+    /// Batched [`StateDB::code_by_hash`]: one result per input, same order.
+    fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, Self::Error> {
+        code_hashes.iter().map(|hash| self.code_by_hash(*hash)).collect()
+    }
+
+    /// Batched [`StateDB::storage`] over `(address, index)` pairs: one
+    /// result per input, same order.
+    fn storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Self::Error> {
+        keys.iter()
+            .map(|(address, index)| self.storage(*address, *index))
+            .collect()
+    }
 }
 
 /// [`BlockContext`] is a trait that provides access to the block information at a specific block height.
