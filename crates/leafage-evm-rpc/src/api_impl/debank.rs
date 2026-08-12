@@ -558,6 +558,62 @@ where
         Ok(res)
     }
 
+    /// Warms `cache_db` with every call's `from`/`to` account and the
+    /// deduplicated contract code behind them, using one batched read
+    /// per kind instead of a layered-state walk per first touch during
+    /// the serial call loop. Entries already in the cache (state
+    /// overrides, block overrides) are never replaced, the native-token
+    /// sentinel is skipped because its calls bypass the EVM, and any
+    /// prefetch error is dropped so the affected keys fall back to the
+    /// on-demand scalar path with its unchanged per-call error text.
+    fn prefetch_multi_call_accounts(
+        requests: &[CallRequest],
+        cache_db: &mut CacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+    ) {
+        let mut addresses: Vec<Address> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for request in requests {
+            let to = request.to.and_then(|txkind| txkind.to().copied());
+            for address in request.from.into_iter().chain(to) {
+                if address == *utils::NATIVE_TOKEN_SENTINEL {
+                    continue;
+                }
+                if !cache_db.cache.accounts.contains_key(&address) && seen.insert(address) {
+                    addresses.push(address);
+                }
+            }
+        }
+        if addresses.is_empty() {
+            return;
+        }
+        let Ok(infos) = cache_db.db.basic_many_ref(&addresses) else {
+            return;
+        };
+        let mut code_hashes: Vec<H256> = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
+        for info in infos.iter().flatten() {
+            let code_hash = info.code_hash;
+            if code_hash.is_zero() || code_hash == KECCAK256_EMPTY {
+                continue;
+            }
+            if !cache_db.cache.contracts.contains_key(&code_hash) && seen_hashes.insert(code_hash) {
+                code_hashes.push(code_hash);
+            }
+        }
+        if !code_hashes.is_empty() {
+            if let Ok(codes) = cache_db.db.code_by_hash_many_ref(&code_hashes) {
+                for (code_hash, code) in code_hashes.into_iter().zip(codes) {
+                    cache_db.cache.contracts.insert(code_hash, code);
+                }
+            }
+        }
+        for (address, info) in addresses.into_iter().zip(infos) {
+            if let Some(info) = info {
+                cache_db.insert_account_info(address, info);
+            }
+        }
+    }
+
     fn debank_multi_call_from_state_impl_inner(
         &self,
         requests: Vec<CallRequest>,
@@ -598,6 +654,7 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
         }
+        Self::prefetch_multi_call_accounts(&requests, &mut cache_db);
         let db = utils::RequestCacheDB::new(cache_db);
         // run in sequence
         let mut results: Vec<DebankSingleCallResult> = vec![];
