@@ -278,9 +278,6 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        if let Some(vb) = self.inner.virtual_balance() {
-            return Ok(vb);
-        }
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
@@ -299,6 +296,11 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        // The virtual balance answers without any state read: don't
+        // spend a state-read permit or a blocking-pool slot on it.
+        if let Some(vb) = self.inner.virtual_balance() {
+            return Ok(vb);
+        }
         let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
         utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
@@ -654,7 +656,15 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
         }
-        Self::prefetch_multi_call_accounts(&requests, &mut cache_db);
+        // Prefetch only where the backend has real batched reads: the
+        // archive schema falls back to scalar loops, so prefetching
+        // there just front-loads the same point reads — and under
+        // fast_fail an early failure would turn that into O(N) wasted
+        // reads. On MultiGet backends the fast_fail waste is bounded
+        // by two batched reads.
+        if !self.inner.evm_cfg().is_archive {
+            Self::prefetch_multi_call_accounts(&requests, &mut cache_db);
+        }
         let db = utils::RequestCacheDB::new(cache_db);
         // run in sequence
         let mut results: Vec<DebankSingleCallResult> = vec![];

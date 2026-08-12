@@ -254,13 +254,16 @@ impl StateDBRead for DataBase {
 
     // Batched point reads over one CF, backed by RocksDB MultiGet: one
     // FFI round trip sharing a single superversion, so keys within a
-    // call see a consistent base. Per-read latency metrics are skipped
-    // here on purpose — one batch sample would skew the scalar
-    // histograms; the RPC layer records batch-level latencies instead.
+    // call see a consistent base. The scalar per-read histograms are
+    // skipped on purpose — one batch sample would skew them; each call
+    // records one sample in its own `read_*_many_latency` histogram,
+    // whoever the caller is (blockx_stateReadBatch, multicall
+    // prefetch, ...).
     fn read_account_many(&self, addresses: &[H256]) -> Result<Vec<Option<NewAccount>>, Error> {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
+        let start = std::time::Instant::now();
         let address_to_account_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -276,6 +279,9 @@ impl StateDBRead for DataBase {
         for (address, value) in addresses.iter().zip(raw) {
             out.push(value?.map(|bytes| decode_slim_account(*address, bytes.as_ref())));
         }
+        STORAGE_METRICS
+            .read_account_many_latency
+            .record(start.elapsed().as_secs_f64());
         Ok(out)
     }
 
@@ -283,6 +289,7 @@ impl StateDBRead for DataBase {
         if code_hashes.is_empty() {
             return Ok(Vec::new());
         }
+        let start = std::time::Instant::now();
         let hash_to_code_cf = self
             .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
@@ -298,6 +305,9 @@ impl StateDBRead for DataBase {
         for value in raw {
             out.push(value?.map(|bytes| Bytes::from(bytes.as_ref().to_vec())));
         }
+        STORAGE_METRICS
+            .read_code_many_latency
+            .record(start.elapsed().as_secs_f64());
         Ok(out)
     }
 
@@ -305,6 +315,7 @@ impl StateDBRead for DataBase {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let start = std::time::Instant::now();
         let address_to_storage_cf = self
             .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
@@ -331,6 +342,9 @@ impl StateDBRead for DataBase {
                 None => U256::ZERO,
             });
         }
+        STORAGE_METRICS
+            .read_storage_many_latency
+            .record(start.elapsed().as_secs_f64());
         Ok(out)
     }
 }

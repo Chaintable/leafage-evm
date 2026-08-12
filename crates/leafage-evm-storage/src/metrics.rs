@@ -24,6 +24,12 @@ pub struct StorageMetrics {
     pub read_storage_latency: Histogram,
     /// Read code latency (disk reads only; code-cache hits are not recorded).
     pub read_code_latency: Histogram,
+    /// Batched account read latency (one sample per MultiGet call).
+    pub read_account_many_latency: Histogram,
+    /// Batched storage read latency (one sample per MultiGet call).
+    pub read_storage_many_latency: Histogram,
+    /// Batched code read latency (one sample per MultiGet call).
+    pub read_code_many_latency: Histogram,
     /// Archive code-cache hits (cumulative).
     pub code_cache_hits: Counter,
     /// Archive code-cache misses (cumulative).

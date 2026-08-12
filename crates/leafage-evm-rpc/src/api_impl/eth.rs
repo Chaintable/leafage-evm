@@ -414,9 +414,6 @@ where
     }
 
     fn get_balance_inner(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
-        if let Some(vb) = self.inner.virtual_balance() {
-            return Ok(vb);
-        }
         let state: Option<_> = self
             .inner
             .db()
@@ -447,6 +444,11 @@ where
     }
 
     async fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
+        // The virtual balance answers without any state read: don't
+        // spend a state-read permit or a blocking-pool slot on it.
+        if let Some(vb) = self.inner.virtual_balance() {
+            return Ok(vb);
+        }
         let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
         utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
