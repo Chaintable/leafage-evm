@@ -4,7 +4,7 @@ use super::token_collector::TokenCollector;
 use super::ApiImpl;
 #[cfg(target_os = "linux")]
 use super::{InterceptorConfig, InterceptorLayer};
-use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
+use crate::api::{BlockxApiServer, DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
     ToJsonRpcError,
@@ -32,6 +32,7 @@ pub struct ApiBuilder<DB> {
     warmup_erc20_addresses: Option<(Address, Vec<Address>)>,
     token_collector: Option<TokenCollector>,
     evm_exec_concurrency: usize,
+    state_read_concurrency: usize,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -51,6 +52,7 @@ where
             warmup_erc20_addresses: None,
             token_collector: None,
             evm_exec_concurrency: 0,
+            state_read_concurrency: 0,
         }
     }
 
@@ -104,6 +106,16 @@ where
         self.evm_exec_concurrency = permits;
         self
     }
+
+    /// Cap concurrently executing state reads (getAddressCode /
+    /// getStorageAt / nonce / balance and blockx_stateReadBatch).
+    /// `0` keeps them unbounded. Deliberately a separate semaphore from
+    /// the EVM limiter so disk-bound reads and CPU-bound execution
+    /// cannot starve each other.
+    pub fn with_state_read_concurrency(mut self, permits: usize) -> Self {
+        self.state_read_concurrency = permits;
+        self
+    }
 }
 
 /// Bind a non-blocking TCP listener with an explicit accept-queue `backlog`.
@@ -152,6 +164,9 @@ where
         let exec_limiter = (self.evm_exec_concurrency > 0).then(|| {
             std::sync::Arc::new(tokio::sync::Semaphore::new(self.evm_exec_concurrency))
         });
+        let state_read_limiter = (self.state_read_concurrency > 0).then(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(self.state_read_concurrency))
+        });
 
         let http_middleware = tower::ServiceBuilder::new()
             .layer(HttpMetricLayer)
@@ -191,6 +206,7 @@ where
                     estimate_gas_buffer,
                     self.token_collector.clone(),
                     exec_limiter.clone(),
+                    state_read_limiter.clone(),
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -245,6 +261,7 @@ where
                     estimate_gas_buffer,
                     self.token_collector.clone(),
                     exec_limiter.clone(),
+                    state_read_limiter.clone(),
                 );
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -314,6 +331,14 @@ where
         })?;
     rpc_module
         .merge(EthApiServer::into_rpc(api.clone()))
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to merge rpc module: {}", e),
+            )
+        })?;
+    rpc_module
+        .merge(BlockxApiServer::into_rpc(api.clone()))
         .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,

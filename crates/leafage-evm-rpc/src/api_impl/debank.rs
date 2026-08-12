@@ -72,7 +72,10 @@ where
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
-    fn should_try_historical(&self, block_ctx: &Option<DebankBlockContext>) -> Option<&HttpClient> {
+    pub(crate) fn should_try_historical(
+        &self,
+        block_ctx: &Option<DebankBlockContext>,
+    ) -> Option<&HttpClient> {
         let client = self.inner.historical_client()?;
 
         if let Some(ctx) = block_ctx {
@@ -96,7 +99,7 @@ where
         Ok(self.inner.evm_cfg().version.clone())
     }
 
-    fn debank_get_state_by_ctx_impl(
+    pub(crate) fn debank_get_state_by_ctx_impl(
         &self,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<<C::DB as EvmStorageRead>::StateDB> {
@@ -261,8 +264,9 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_address_nonce_inner(address, block_ctx)
         })
         .await
@@ -295,8 +299,9 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_address_balance_inner(address, block_ctx)
         })
         .await
@@ -333,8 +338,9 @@ where
         index: H256,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<H256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_storage_at_inner(address, index, block_ctx)
         })
         .await
@@ -373,8 +379,9 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_code_inner(address, block_ctx)
         })
         .await
@@ -632,7 +639,7 @@ where
     ) -> RpcResult<DebankMultiCallResp> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.debank_multi_call_from_state_impl_inner(
                 requests,
                 block_ctx,
@@ -655,7 +662,7 @@ where
     ) -> RpcResult<DebankSimulateResp> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.debank_simulate_transactions_impl_inner(
                 requests,
                 block_ctx,
@@ -985,7 +992,7 @@ where
     ) -> RpcResult<U256> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.debank_estimate_gas_inner(request, block_ctx, block_overrides, token)
         })
         .await
@@ -1098,6 +1105,20 @@ fn update_estimated_gas_range<R: GetHaltReason + Clone>(
     Ok(())
 }
 
+/// Shared message shape for "local failed, historical also failed".
+/// blockx_stateReadBatch item errors reuse it so batch and single
+/// requests stay byte-identical on this path.
+#[inline]
+pub(crate) fn combine_error_message(
+    local_message: &str,
+    historical_err: &jsonrpsee::core::ClientError,
+) -> String {
+    format!(
+        "Local error: {}; Historical RPC error: {}",
+        local_message, historical_err
+    )
+}
+
 #[inline]
 fn combine_errors(
     local_err: jsonrpsee::types::ErrorObjectOwned,
@@ -1105,11 +1126,7 @@ fn combine_errors(
 ) -> jsonrpsee::types::ErrorObjectOwned {
     rpc_error_with_code(
         local_err.code(),
-        format!(
-            "Local error: {}; Historical RPC error: {}",
-            local_err.message(),
-            historical_err
-        ),
+        combine_error_message(local_err.message(), &historical_err),
     )
 }
 

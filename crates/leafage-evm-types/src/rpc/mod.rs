@@ -20,6 +20,12 @@ pub use alloy::rpc::types::{
 mod pre;
 pub use pre::{PreError, PreErrorCode, PreResult};
 
+mod blockx;
+pub use blockx::{
+    BlockxStateRead, BlockxStateReadBatch, BlockxStateReadBatchResp, BlockxStateReadError,
+    BlockxStateReadOutcome, BlockxStateReadValue, BLOCKX_STATE_READ_BATCH_MAX_ITEMS,
+};
+
 mod debank;
 pub use alloy::rpc::types::state::{AccountOverride, StateOverride};
 pub use debank::{

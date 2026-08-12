@@ -153,7 +153,7 @@ where
     ) -> RpcResult<Bytes> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.call_inner(request, block_id, state_override, block_overrides)
         })
         .await
@@ -287,7 +287,7 @@ where
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
 
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.multi_call_impl_inner(requests, block_id, fast_fail.unwrap_or_default(), token)
         })
         .await
