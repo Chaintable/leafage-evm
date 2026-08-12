@@ -40,3 +40,8 @@ procfs.workspace = true
 
 [dev-dependencies]
 metrics-util.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "state_read_batch"
+harness = false

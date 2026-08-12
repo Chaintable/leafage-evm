@@ -203,7 +203,10 @@ impl StateDBRead for DataBase {
             return Ok(None);
         }
         let raw_account_bytes = raw_account_bytes.unwrap();
-        Ok(Some(decode_slim_account(address, raw_account_bytes.as_ref())))
+        Ok(Some(decode_slim_account(
+            address,
+            raw_account_bytes.as_ref(),
+        )))
     }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
@@ -254,10 +257,7 @@ impl StateDBRead for DataBase {
     // call see a consistent base. Per-read latency metrics are skipped
     // here on purpose — one batch sample would skew the scalar
     // histograms; the RPC layer records batch-level latencies instead.
-    fn read_account_many(
-        &self,
-        addresses: &[H256],
-    ) -> Result<Vec<Option<NewAccount>>, Error> {
+    fn read_account_many(&self, addresses: &[H256]) -> Result<Vec<Option<NewAccount>>, Error> {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
@@ -634,6 +634,25 @@ impl DataBase {
     }
 }
 
+impl DataBase {
+    /// Flush every column family's memtable to SST files. Test/bench
+    /// helper so read measurements exercise the SST + block-cache path
+    /// instead of the memtable; not used on any production path.
+    pub fn flush_all(&self) {
+        for column in [
+            StorageTypeColumn::LatestBlockHash,
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::HashToCode,
+        ] {
+            let cf = self.db.cf_handle(column.to_str()).unwrap();
+            self.db.flush_cf(cf).unwrap();
+        }
+    }
+}
+
 impl StateDBProvider for Arc<DataBase> {
     type StateDBReadWrite = Arc<DataBase>;
 
@@ -824,7 +843,11 @@ mod tests {
                     address: H256::repeat_byte(n),
                     balance: U256::from(n as u64 * 100),
                     nonce: n as u64,
-                    code_hash: if n % 2 == 0 { code_hash } else { KECCAK256_EMPTY.0.into() },
+                    code_hash: if n % 2 == 0 {
+                        code_hash
+                    } else {
+                        KECCAK256_EMPTY.0.into()
+                    },
                 });
                 diff.storage_diffs.push(AccountStorageDiff {
                     address: H256::repeat_byte(n),
