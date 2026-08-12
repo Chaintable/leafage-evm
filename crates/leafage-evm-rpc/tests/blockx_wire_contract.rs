@@ -47,6 +47,37 @@ fn request_golden_number_context() {
     );
 }
 
+/// Balance and nonce items are kind + address, no slot.
+#[test]
+fn request_golden_balance_nonce() {
+    let golden = concat!(
+        "01",               // version
+        "01",               // ctx_kind = number
+        "0000000000000002", // height 2
+        "0002",             // count
+        "02",               // kind = balance
+        "3333333333333333333333333333333333333333",
+        "03", // kind = nonce
+        "4444444444444444444444444444444444444444",
+    );
+    let request = BsrbRequest {
+        context: BsrbContext::Number(2),
+        reads: vec![
+            BsrbRead::Balance {
+                address: Address::repeat_byte(0x33),
+            },
+            BsrbRead::Nonce {
+                address: Address::repeat_byte(0x44),
+            },
+        ],
+    };
+    assert_eq!(hex::encode(request.encode()), golden);
+    assert_eq!(
+        BsrbRequest::decode(&hex::decode(golden).unwrap()).unwrap(),
+        request
+    );
+}
+
 #[test]
 fn request_golden_hash_context() {
     let golden = concat!(
@@ -108,6 +139,38 @@ fn response_golden() {
     assert_eq!(hex::encode(response.encode()), golden);
     assert_eq!(
         BsrbResponse::decode(&hex::decode(&golden).unwrap()).unwrap(),
+        response
+    );
+}
+
+/// Balance/nonce ok payloads are the quantity as minimal big-endian
+/// bytes; zero is an empty payload. The facade renders these as the
+/// single-method quantity text ("0x1", "0x0"), so odd-nibble quantities
+/// never appear on the wire.
+#[test]
+fn response_golden_quantities() {
+    let golden = concat!(
+        "01",       // version
+        "0003",     // count
+        "00",       // tag = ok — balance 1 => "0x1"
+        "00000001", // len
+        "01",
+        "00",       // tag = ok — nonce 0 => "0x0"
+        "00000000", // len (empty payload)
+        "00",       // tag = ok — balance 2^256-1
+        "00000020", // len 32
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    let response = BsrbResponse {
+        results: vec![
+            BsrbOutcome::Value(Bytes::from(vec![0x01])),
+            BsrbOutcome::Value(Bytes::new()),
+            BsrbOutcome::Value(Bytes::copy_from_slice(&U256::MAX.to_be_bytes::<32>())),
+        ],
+    };
+    assert_eq!(hex::encode(response.encode()), golden);
+    assert_eq!(
+        BsrbResponse::decode(&hex::decode(golden).unwrap()).unwrap(),
         response
     );
 }

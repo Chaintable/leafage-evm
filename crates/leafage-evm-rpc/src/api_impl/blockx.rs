@@ -1,13 +1,16 @@
 //! Handler for the BlockX-internal `blockx_stateReadBatch` method.
 //!
-//! One batch resolves N `getAddressCode` / `getStorageAt` reads against
-//! a single state view of a fixed block: one `state_at`, deduplicated
-//! keys, and batched storage reads (RocksDB MultiGet on the non-archive
-//! backend, scalar fallback elsewhere). The wire payload is BSRB/1
-//! binary in a JSON-RPC hex shell; item order is the correlation.
-//! Per-item results keep the exact value shapes and error code/message
-//! text of the single methods — BlockX's provider forwards item errors
-//! verbatim and leafage-py parses -39006/-39007 message text.
+//! One batch resolves N `getAddressCode` / `getStorageAt` /
+//! `getAddressBalance` / `getAddressNonce` reads against a single state
+//! view of a fixed block: one `state_at`, deduplicated keys, and
+//! batched storage reads (RocksDB MultiGet on the non-archive backend,
+//! scalar fallback elsewhere). Code, balance and nonce reads share one
+//! account pool — the same address requested by several kinds costs one
+//! account read. The wire payload is BSRB/1 binary in a JSON-RPC hex
+//! shell; item order is the correlation. Per-item results keep the
+//! exact value shapes and error code/message text of the single methods
+//! — BlockX's provider forwards item errors verbatim and leafage-py
+//! parses -39006/-39007 message text.
 
 use super::debank::combine_error_message;
 use super::utils;
@@ -49,6 +52,13 @@ fn storage_value(word: H256) -> Bytes {
     Bytes::copy_from_slice(word.as_slice())
 }
 
+/// `getAddressBalance` / `getAddressNonce` value shape: the quantity as
+/// minimal big-endian bytes (empty for zero). The Go facade renders the
+/// single-method `"0x…"` quantity text from these.
+fn quantity_value(value: U256) -> Bytes {
+    Bytes::from(value.to_be_bytes_trimmed_vec())
+}
+
 /// The `DebankBlockContext` equivalent of a BSRB context: always
 /// `Equals` on a fixed hash or height. Dynamic contexts are
 /// unrepresentable on the wire by construction.
@@ -79,6 +89,23 @@ where
         block_ctx: &DebankBlockContext,
     ) -> RpcResult<Vec<BsrbOutcome>> {
         let total_start = Instant::now();
+        // getAddressBalance answers from the virtual balance before
+        // resolving any state; mirror that for balance items — including
+        // blocks local state cannot resolve, when nothing else in the
+        // batch needs a state view.
+        let virtual_balance = self.inner.virtual_balance();
+        if let Some(vb) = virtual_balance {
+            if batch
+                .reads
+                .iter()
+                .all(|read| matches!(read, BsrbRead::Balance { .. }))
+            {
+                return Ok(vec![
+                    BsrbOutcome::Value(quantity_value(vb));
+                    batch.reads.len()
+                ]);
+            }
+        }
         let stage_start = Instant::now();
         let state = self.debank_get_state_by_ctx_impl(Some(block_ctx.clone()))?;
         histogram!("leafage_state_batch_latency_seconds", "stage" => "state_at")
@@ -89,19 +116,42 @@ where
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
 
-        // Deduplicate keys per kind while remembering, for every read,
-        // which unique slot it resolves from.
-        let mut code_addresses: Vec<Address> = Vec::new();
-        let mut code_slots: HashMap<Address, usize> = HashMap::new();
+        // Per-kind logical item counts, before deduplication.
+        let mut kind_counts = [0usize; 4];
+        for read in &batch.reads {
+            kind_counts[match read {
+                BsrbRead::AddressCode { .. } => 0,
+                BsrbRead::StorageAt { .. } => 1,
+                BsrbRead::Balance { .. } => 2,
+                BsrbRead::Nonce { .. } => 3,
+            }] += 1;
+        }
+        for (kind, count) in ["addressCode", "storageAt", "balance", "nonce"]
+            .into_iter()
+            .zip(kind_counts)
+        {
+            histogram!("leafage_state_batch_size", "kind" => kind).record(count as f64);
+        }
+
+        // Deduplicate keys while remembering, for every read, which
+        // unique slot it resolves from. addressCode, balance and nonce
+        // share one account pool — the same address asked for by
+        // several kinds costs one account read — and only addresses
+        // actually asked for code join the code-hash fetch below.
+        let mut account_addresses: Vec<Address> = Vec::new();
+        let mut account_slots: HashMap<Address, usize> = HashMap::new();
+        let mut account_needs_code: Vec<bool> = Vec::new();
         let mut storage_keys: Vec<(Address, H256)> = Vec::new();
         let mut storage_slots: HashMap<(Address, H256), usize> = HashMap::new();
         for read in &batch.reads {
             match read {
                 BsrbRead::AddressCode { address } => {
-                    code_slots.entry(*address).or_insert_with(|| {
-                        code_addresses.push(*address);
-                        code_addresses.len() - 1
+                    let slot = *account_slots.entry(*address).or_insert_with(|| {
+                        account_addresses.push(*address);
+                        account_needs_code.push(false);
+                        account_addresses.len() - 1
                     });
+                    account_needs_code[slot] = true;
                 }
                 BsrbRead::StorageAt { address, slot } => {
                     let key = (*address, *slot);
@@ -110,12 +160,18 @@ where
                         storage_keys.len() - 1
                     });
                 }
+                // Balance answered from the virtual balance needs no
+                // account read.
+                BsrbRead::Balance { .. } if virtual_balance.is_some() => {}
+                BsrbRead::Balance { address } | BsrbRead::Nonce { address } => {
+                    account_slots.entry(*address).or_insert_with(|| {
+                        account_addresses.push(*address);
+                        account_needs_code.push(false);
+                        account_addresses.len() - 1
+                    });
+                }
             }
         }
-        histogram!("leafage_state_batch_size", "kind" => "addressCode")
-            .record(code_slots.len() as f64);
-        histogram!("leafage_state_batch_size", "kind" => "storageAt")
-            .record(storage_slots.len() as f64);
 
         // Storage values, per unique (address, slot).
         let stage_start = Instant::now();
@@ -149,9 +205,9 @@ where
 
         // Account infos, then deduplicated code fetches by code hash.
         let stage_start = Instant::now();
-        let account_results = match state.basic_many_ref(&code_addresses) {
+        let account_results = match state.basic_many_ref(&account_addresses) {
             Ok(values) => values.into_iter().map(Ok).collect::<Vec<_>>(),
-            Err(_) => code_addresses
+            Err(_) => account_addresses
                 .iter()
                 .map(|address| {
                     state.basic_ref(address.0.into()).map_err(|e| ItemError {
@@ -167,8 +223,14 @@ where
         let stage_start = Instant::now();
         let mut code_hashes: Vec<H256> = Vec::new();
         let mut code_hash_slots: HashMap<H256, usize> = HashMap::new();
-        for account in account_results.iter().flatten() {
-            if let Some(account) = account {
+        for (account, needs_code) in account_results
+            .iter()
+            .zip(account_needs_code.iter().copied())
+        {
+            if !needs_code {
+                continue;
+            }
+            if let Ok(Some(account)) = account {
                 if !account.code_hash.is_zero() && account.code_hash != KECCAK256_EMPTY {
                     code_hash_slots.entry(account.code_hash).or_insert_with(|| {
                         code_hashes.push(account.code_hash);
@@ -192,13 +254,19 @@ where
         histogram!("leafage_state_batch_latency_seconds", "stage" => "multiget_code")
             .record(stage_start.elapsed().as_secs_f64());
 
-        // Per unique address: the same empty-code rules as getAddressCode.
+        // Per unique address that was asked for code: the same
+        // empty-code rules as getAddressCode. Entries for balance/nonce
+        // -only addresses are placeholders and never read.
         let code_results: Vec<Result<Bytes, ItemError>> = account_results
-            .into_iter()
-            .map(|account| {
+            .iter()
+            .zip(account_needs_code.iter().copied())
+            .map(|(account, needs_code)| {
+                if !needs_code {
+                    return Ok(Bytes::new());
+                }
                 let account = match account {
                     Ok(account) => account,
-                    Err(err) => return Err(err),
+                    Err(err) => return Err(err.clone()),
                 };
                 let Some(account) = account else {
                     return Ok(Bytes::new());
@@ -217,7 +285,7 @@ where
             .reads
             .iter()
             .map(|read| match read {
-                BsrbRead::AddressCode { address } => match &code_results[code_slots[address]] {
+                BsrbRead::AddressCode { address } => match &code_results[account_slots[address]] {
                     Ok(code) => BsrbOutcome::Value(code.clone()),
                     Err(err) => item_error(err.clone()),
                 },
@@ -230,6 +298,21 @@ where
                         Err(err) => item_error(err.clone()),
                     }
                 }
+                BsrbRead::Balance { address } => match virtual_balance {
+                    Some(vb) => BsrbOutcome::Value(quantity_value(vb)),
+                    None => match &account_results[account_slots[address]] {
+                        Ok(account) => BsrbOutcome::Value(quantity_value(
+                            account.as_ref().map(|a| a.balance).unwrap_or_default(),
+                        )),
+                        Err(err) => item_error(err.clone()),
+                    },
+                },
+                BsrbRead::Nonce { address } => match &account_results[account_slots[address]] {
+                    Ok(account) => BsrbOutcome::Value(quantity_value(U256::from(
+                        account.as_ref().map(|a| a.nonce).unwrap_or_default(),
+                    ))),
+                    Err(err) => item_error(err.clone()),
+                },
             })
             .collect();
         histogram!("leafage_state_batch_latency_seconds", "stage" => "total")
@@ -323,6 +406,14 @@ async fn historical_item(
             .get_storage_at(*address, JsonStorageKey::from(*slot), block_ctx.clone())
             .await
             .map(storage_value),
+        BsrbRead::Balance { address } => client
+            .get_address_balance(*address, block_ctx.clone())
+            .await
+            .map(quantity_value),
+        BsrbRead::Nonce { address } => client
+            .get_address_nonce(*address, block_ctx.clone())
+            .await
+            .map(quantity_value),
     }
 }
 

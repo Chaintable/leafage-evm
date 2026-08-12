@@ -1,8 +1,10 @@
 //! End-to-end tests for `blockx_stateReadBatch` (BSRB/1 wire) over a
 //! real RocksDB-backed StateTree and jsonrpsee HTTP server: batch
 //! results must be byte-identical to the single getAddressCode /
-//! getStorageAt responses, including error code/message text, strict
-//! decode rejects and the per-item historical fallback.
+//! getStorageAt / getAddressBalance / getAddressNonce responses
+//! (quantities as minimal big-endian bytes), including error
+//! code/message text, strict decode rejects and the per-item historical
+//! fallback.
 
 use alloy::primitives::keccak256;
 use jsonrpsee::core::ClientError;
@@ -135,6 +137,19 @@ fn storage_read(address: Address, slot: H256) -> BsrbRead {
     BsrbRead::StorageAt { address, slot }
 }
 
+fn balance_read(address: Address) -> BsrbRead {
+    BsrbRead::Balance { address }
+}
+
+fn nonce_read(address: Address) -> BsrbRead {
+    BsrbRead::Nonce { address }
+}
+
+/// Balance/nonce wire shape: the quantity as minimal big-endian bytes.
+fn quantity_bytes(value: U256) -> Bytes {
+    Bytes::from(value.to_be_bytes_trimmed_vec())
+}
+
 async fn send(client: &HttpClient, request: &BsrbRequest) -> Result<BsrbResponse, ClientError> {
     let payload = BlockxApiClient::state_read_batch(client, Bytes::from(request.encode())).await?;
     Ok(BsrbResponse::decode(&payload).expect("server must return a decodable BSRB response"))
@@ -220,6 +235,13 @@ async fn batch_matches_single_methods_byte_for_byte() {
                 // Duplicate key is legal and must resolve to the same
                 // value; order is the correlation.
                 storage_read(CONTRACT, pos(1)),
+                balance_read(ALICE),
+                balance_read(MISSING),
+                nonce_read(CONTRACT),
+                nonce_read(ALICE),
+                // Address already asked for code and storage above:
+                // shares the deduplicated account pool.
+                balance_read(CONTRACT),
             ],
         };
         let resp = send(&client, &request).await.unwrap();
@@ -243,6 +265,16 @@ async fn batch_matches_single_methods_byte_for_byte() {
                     .await
                     .unwrap(),
                 ),
+                BsrbRead::Balance { address } => quantity_bytes(
+                    DebankApiClient::get_address_balance(&client, *address, Some(ctx.clone()))
+                        .await
+                        .unwrap(),
+                ),
+                BsrbRead::Nonce { address } => quantity_bytes(
+                    DebankApiClient::get_address_nonce(&client, *address, Some(ctx.clone()))
+                        .await
+                        .unwrap(),
+                ),
             };
             assert_eq!(batch_value, single_value, "read {:?}", read);
         }
@@ -254,6 +286,13 @@ async fn batch_matches_single_methods_byte_for_byte() {
         assert_eq!(value(&resp.results[4]), &word_bytes(word.into()));
         assert_eq!(value(&resp.results[5]), &word_bytes(H256::ZERO));
         assert_eq!(value(&resp.results[6]), value(&resp.results[4]));
+        // Quantities: non-zero is minimal bytes, zero and missing
+        // accounts are the empty payload.
+        assert_eq!(value(&resp.results[7]), &Bytes::from(vec![0x01]));
+        assert_eq!(value(&resp.results[8]), &Bytes::new());
+        assert_eq!(value(&resp.results[9]), &Bytes::from(vec![0x01]));
+        assert_eq!(value(&resp.results[10]), &Bytes::new());
+        assert_eq!(value(&resp.results[11]), &Bytes::new());
     }
 
     // A fixed block the state node does not have: the batch-level error
@@ -411,6 +450,8 @@ async fn batch_falls_back_to_historical_per_item() {
                 code_read(CONTRACT),
                 storage_read(CONTRACT, pos(1)),
                 storage_read(CONTRACT, pos(2)),
+                balance_read(ALICE),
+                nonce_read(CONTRACT),
             ],
         },
     )
@@ -433,6 +474,14 @@ async fn batch_falls_back_to_historical_per_item() {
     .await
     .unwrap();
     assert_eq!(value(&resp.results[1]), &word_bytes(hist_storage));
+    let hist_balance = DebankApiClient::get_address_balance(&hist, ALICE, Some(debank_ctx(remote)))
+        .await
+        .unwrap();
+    assert_eq!(value(&resp.results[3]), &quantity_bytes(hist_balance));
+    let hist_nonce = DebankApiClient::get_address_nonce(&hist, CONTRACT, Some(debank_ctx(remote)))
+        .await
+        .unwrap();
+    assert_eq!(value(&resp.results[4]), &quantity_bytes(hist_nonce));
 
     // Block 7 exists nowhere: per-item combined errors, identical to
     // the single-method fallback error.

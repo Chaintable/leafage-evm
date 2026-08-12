@@ -16,7 +16,8 @@
 //! 32B / 8B           the hash, or the height as u64
 //! u16 count          1..=BLOCKX_STATE_READ_BATCH_MAX_ITEMS
 //! per item:
-//!   u8  kind         0 = addressCode, 1 = storageAt
+//!   u8  kind         0 = addressCode, 1 = storageAt,
+//!                    2 = balance, 3 = nonce
 //!   20B address
 //!   32B slot         (storageAt only)
 //! ```
@@ -30,7 +31,11 @@
 //! per item:
 //!   u8  tag          0 = ok, 1 = error
 //!   ok:  u32 len + payload      (storageAt: the full 32-byte word;
-//!                                addressCode: raw code bytes, may be empty)
+//!                                addressCode: raw code bytes, may be
+//!                                empty; balance/nonce: the quantity as
+//!                                minimal big-endian bytes, empty for
+//!                                zero — the facade renders the
+//!                                single-method "0x…" quantity text)
 //!   err: i32 code + u32 msg_len + msg   (single-method error code and
 //!                                        byte-exact message text)
 //! ```
@@ -52,6 +57,8 @@ const CTX_KIND_HASH: u8 = 0;
 const CTX_KIND_NUMBER: u8 = 1;
 const READ_KIND_ADDRESS_CODE: u8 = 0;
 const READ_KIND_STORAGE_AT: u8 = 1;
+const READ_KIND_BALANCE: u8 = 2;
+const READ_KIND_NONCE: u8 = 3;
 const TAG_OK: u8 = 0;
 const TAG_ERROR: u8 = 1;
 
@@ -71,6 +78,12 @@ pub enum BsrbRead {
     AddressCode { address: Address },
     /// Same semantics as `getStorageAt`.
     StorageAt { address: Address, slot: H256 },
+    /// Same semantics as `getAddressBalance`; the value is the quantity
+    /// as minimal big-endian bytes (empty for zero).
+    Balance { address: Address },
+    /// Same semantics as `getAddressNonce`; same value shape as
+    /// `Balance`.
+    Nonce { address: Address },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +213,14 @@ impl BsrbRequest {
                     out.extend_from_slice(address.as_slice());
                     out.extend_from_slice(slot.as_slice());
                 }
+                BsrbRead::Balance { address } => {
+                    out.push(READ_KIND_BALANCE);
+                    out.extend_from_slice(address.as_slice());
+                }
+                BsrbRead::Nonce { address } => {
+                    out.push(READ_KIND_NONCE);
+                    out.extend_from_slice(address.as_slice());
+                }
             }
         }
         out
@@ -229,6 +250,12 @@ impl BsrbRequest {
                 READ_KIND_STORAGE_AT => BsrbRead::StorageAt {
                     address: Address::from_slice(cursor.take(20)?),
                     slot: H256::from_slice(cursor.take(32)?),
+                },
+                READ_KIND_BALANCE => BsrbRead::Balance {
+                    address: Address::from_slice(cursor.take(20)?),
+                },
+                READ_KIND_NONCE => BsrbRead::Nonce {
+                    address: Address::from_slice(cursor.take(20)?),
                 },
                 other => return Err(BsrbDecodeError::ReadKind(other, item)),
             };
@@ -310,6 +337,12 @@ mod tests {
                     address: Address::repeat_byte(0x22),
                     slot: H256::with_last_byte(0xfe),
                 },
+                BsrbRead::Balance {
+                    address: Address::repeat_byte(0x33),
+                },
+                BsrbRead::Nonce {
+                    address: Address::repeat_byte(0x44),
+                },
             ],
         }
     }
@@ -358,6 +391,15 @@ mod tests {
             BsrbRequest::decode(truncated),
             Err(BsrbDecodeError::Truncated { .. })
         ));
+
+        let mut bad_kind = good.clone();
+        // version(1) + ctx_kind(1) + height(8) + count(2) => first item
+        // kind byte.
+        bad_kind[12] = 4;
+        assert_eq!(
+            BsrbRequest::decode(&bad_kind),
+            Err(BsrbDecodeError::ReadKind(4, 0))
+        );
 
         let empty = BsrbRequest {
             context: BsrbContext::Number(1),
