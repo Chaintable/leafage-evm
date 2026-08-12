@@ -19,7 +19,7 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{
     AccountStorageDiff, Address, Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff,
-    BlockType, BlockxStateRead, BlockxStateReadBatch, Bytes, CfgEnv, DebankBlockContext,
+    BlockType, BsrbContext, BsrbRead, BsrbRequest, BsrbResponse, Bytes, CfgEnv, DebankBlockContext,
     IndexValuePair, JsonStorageKey, MainnetSpecId, NewAccount, NewCode, H256, U256,
 };
 use std::sync::Arc;
@@ -52,7 +52,7 @@ struct Fixture {
     rt: tokio::runtime::Runtime,
     client: HttpClient,
     ctx: DebankBlockContext,
-    batch: BlockxStateReadBatch,
+    batch: BsrbRequest,
     _handle: jsonrpsee::server::ServerHandle,
     dir: std::path::PathBuf,
 }
@@ -153,20 +153,18 @@ fn setup() -> Fixture {
     };
     let mut reads = Vec::new();
     for n in 0..CODE_READS {
-        reads.push(BlockxStateRead::AddressCode {
-            index: n as u32,
+        reads.push(BsrbRead::AddressCode {
             address: contract(n),
         });
     }
     for n in 0..STORAGE_READS {
-        reads.push(BlockxStateRead::StorageAt {
-            index: (CODE_READS + n) as u32,
+        reads.push(BsrbRead::StorageAt {
             address: contract(n % 3),
-            position: JsonStorageKey::from(position(n)),
+            slot: position(n),
         });
     }
-    let batch = BlockxStateReadBatch {
-        block_context: ctx.clone(),
+    let batch = BsrbRequest {
+        context: BsrbContext::Number(2),
         reads,
     };
     Fixture {
@@ -219,10 +217,12 @@ fn bench_state_read_workload(c: &mut Criterion) {
     group.bench_function("blockx_state_read_batch", |b| {
         b.iter(|| {
             fixture.rt.block_on(async {
-                let resp =
-                    BlockxApiClient::state_read_batch(&fixture.client, fixture.batch.clone())
-                        .await
-                        .unwrap();
+                // Encoding is part of the per-request client cost.
+                let payload = Bytes::from(fixture.batch.encode());
+                let resp = BlockxApiClient::state_read_batch(&fixture.client, payload)
+                    .await
+                    .unwrap();
+                let resp = BsrbResponse::decode(&resp).unwrap();
                 assert_eq!(resp.results.len(), CODE_READS + STORAGE_READS);
             })
         })

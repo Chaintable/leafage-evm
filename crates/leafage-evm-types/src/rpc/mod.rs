@@ -22,8 +22,8 @@ pub use pre::{PreError, PreErrorCode, PreResult};
 
 mod blockx;
 pub use blockx::{
-    BlockxStateRead, BlockxStateReadBatch, BlockxStateReadBatchResp, BlockxStateReadError,
-    BlockxStateReadOutcome, BlockxStateReadValue, BLOCKX_STATE_READ_BATCH_MAX_ITEMS,
+    BsrbContext, BsrbDecodeError, BsrbOutcome, BsrbRead, BsrbRequest, BsrbResponse,
+    BLOCKX_STATE_READ_BATCH_MAX_ITEMS, BSRB_VERSION,
 };
 
 mod debank;

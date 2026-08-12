@@ -1,161 +1,148 @@
-//! Wire-contract tests for `blockx_stateReadBatch`.
+//! Wire-contract tests for `blockx_stateReadBatch` (BSRB/1).
 //!
-//! The JSON fixtures under `tests/fixtures/blockx_state_read_batch/`
-//! are the cross-repo serde contract with BlockX's semantic batch
-//! facade (to be vendored there when the facade lands). Structure is
-//! asserted via `serde_json::Value` equality; error `message` strings
-//! are asserted byte-for-byte because leafage-py parses -39006/-39007
-//! message text.
+//! The golden hex payloads below are the cross-repo contract with
+//! BlockX's executor-side provider, which packs requests with
+//! `struct.pack` and parses responses with `memoryview` (mirrored in
+//! the BlockX repository). All integers are big-endian:
+//!
+//! request  = ">B B (32s|Q) H" + per item ">B 20s (32s)?"
+//! response = ">B H"           + per item ">B I payload" (ok)
+//!                             |          ">B i I msg"    (error)
+//!
+//! Change the layout only by bumping BSRB_VERSION.
 
+use alloy::primitives::hex;
 use leafage_evm_types::{
-    BlockId, BlockNumberOrTag, BlockType, BlockxStateRead, BlockxStateReadBatch,
-    BlockxStateReadBatchResp, BlockxStateReadValue, Bytes, H256, U256,
+    Address, BsrbContext, BsrbOutcome, BsrbRead, BsrbRequest, BsrbResponse, Bytes, H256, U256,
 };
-use serde_json::{json, Value};
 
-fn fixture(name: &str) -> Value {
-    let raw = match name {
-        "request" => include_str!("fixtures/blockx_state_read_batch/request.json"),
-        "request_number_context" => {
-            include_str!("fixtures/blockx_state_read_batch/request_number_context.json")
-        }
-        "response_success" => {
-            include_str!("fixtures/blockx_state_read_batch/response_success.json")
-        }
-        "response_item_error" => {
-            include_str!("fixtures/blockx_state_read_batch/response_item_error.json")
-        }
-        _ => panic!("unknown fixture {name}"),
+fn request_number_ctx() -> BsrbRequest {
+    BsrbRequest {
+        context: BsrbContext::Number(2),
+        reads: vec![
+            BsrbRead::AddressCode {
+                address: Address::repeat_byte(0x11),
+            },
+            BsrbRead::StorageAt {
+                address: Address::repeat_byte(0x22),
+                slot: H256::with_last_byte(0xfe),
+            },
+        ],
+    }
+}
+
+#[test]
+fn request_golden_number_context() {
+    let golden = concat!(
+        "01",               // version
+        "01",               // ctx_kind = number
+        "0000000000000002", // height 2
+        "0002",             // count
+        "00",               // kind = addressCode
+        "1111111111111111111111111111111111111111",
+        "01", // kind = storageAt
+        "2222222222222222222222222222222222222222",
+        "00000000000000000000000000000000000000000000000000000000000000fe",
+    );
+    let request = request_number_ctx();
+    assert_eq!(hex::encode(request.encode()), golden);
+    assert_eq!(
+        BsrbRequest::decode(&hex::decode(golden).unwrap()).unwrap(),
+        request
+    );
+}
+
+#[test]
+fn request_golden_hash_context() {
+    let golden = concat!(
+        "01", // version
+        "00", // ctx_kind = hash
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "0001", // count
+        "00",   // kind = addressCode
+        "1111111111111111111111111111111111111111",
+    );
+    let request = BsrbRequest {
+        context: BsrbContext::Hash(H256::repeat_byte(0xcc)),
+        reads: vec![BsrbRead::AddressCode {
+            address: Address::repeat_byte(0x11),
+        }],
     };
-    serde_json::from_str(raw).unwrap()
-}
-
-#[test]
-fn request_fixture_roundtrips() {
-    let value = fixture("request");
-    let batch: BlockxStateReadBatch = serde_json::from_value(value.clone()).unwrap();
-
-    assert_eq!(batch.block_context.block_type, BlockType::Equals);
-    assert!(matches!(batch.block_context.block_id, BlockId::Hash(_)));
-    assert_eq!(batch.reads.len(), 3);
-    assert!(matches!(
-        &batch.reads[0],
-        BlockxStateRead::AddressCode { index: 0, .. }
-    ));
-    // Shortest-hex position (leafage-py canonical shape) and 32-byte
-    // position both parse, and as_b256 agrees with the padded form.
-    match (&batch.reads[1], &batch.reads[2]) {
-        (
-            BlockxStateRead::StorageAt { position: p1, .. },
-            BlockxStateRead::StorageAt { position: p2, .. },
-        ) => {
-            assert_eq!(p1.as_b256(), H256::ZERO);
-            assert_eq!(p2.as_b256(), H256::with_last_byte(0xfe));
-        }
-        other => panic!("unexpected reads: {other:?}"),
-    }
-
-    // `reads` round-trips structurally. The block context is asserted
-    // semantically instead: alloy's BlockId accepts the bare hash
-    // string BlockX sends but serializes hashes as {"blockHash": ...},
-    // and Leafage only ever deserializes this field.
-    let reserialized = serde_json::to_value(&batch).unwrap();
-    assert_eq!(reserialized["reads"], value["reads"]);
-    let reparsed: BlockxStateReadBatch = serde_json::from_value(reserialized.clone()).unwrap();
+    assert_eq!(hex::encode(request.encode()), golden);
     assert_eq!(
-        reparsed.block_context.block_id,
-        batch.block_context.block_id
+        BsrbRequest::decode(&hex::decode(golden).unwrap()).unwrap(),
+        request
     );
-    assert_eq!(reserialized["blockContext"]["type"], json!("Equals"));
 }
 
 #[test]
-fn number_context_fixture_roundtrips() {
-    let value = fixture("request_number_context");
-    let batch: BlockxStateReadBatch = serde_json::from_value(value.clone()).unwrap();
-    assert!(matches!(
-        batch.block_context.block_id,
-        BlockId::Number(BlockNumberOrTag::Number(2))
-    ));
-    assert_eq!(batch.reads[0].index(), 7);
-    assert_eq!(serde_json::to_value(&batch).unwrap(), value);
-}
-
-#[test]
-fn response_fixtures_roundtrip() {
-    for name in ["response_success", "response_item_error"] {
-        let value = fixture(name);
-        let resp: BlockxStateReadBatchResp = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&resp).unwrap(), value, "{name}");
-    }
-
-    // Typed checks on the success fixture: code parses as bytes,
-    // storage as a 32-byte word, and absent fields stay absent.
-    let resp: BlockxStateReadBatchResp =
-        serde_json::from_value(fixture("response_success")).unwrap();
+fn response_golden() {
+    // -39006 as big-endian i32 is 0xffff67a2; the message is the
+    // byte-exact single-method error text (leafage-py parses it).
+    let message = "block 999 not found for state node";
+    let golden = format!(
+        concat!(
+            "01",       // version
+            "0003",     // count
+            "00",       // tag = ok (code bytes)
+            "00000005", // len
+            "6080604052",
+            "00",       // tag = ok (storage word)
+            "00000020", // len 32
+            "000000000000000000000000000000000000000000000000000000000000abcd",
+            "01",       // tag = error
+            "ffff67a2", // -39006
+            "{:08x}",   // msg len
+            "{}",
+        ),
+        message.len(),
+        hex::encode(message.as_bytes()),
+    );
+    let response = BsrbResponse {
+        results: vec![
+            BsrbOutcome::Value(Bytes::from(vec![0x60, 0x80, 0x60, 0x40, 0x52])),
+            BsrbOutcome::Value(Bytes::copy_from_slice(
+                &U256::from(0xabcdu64).to_be_bytes::<32>(),
+            )),
+            BsrbOutcome::Error {
+                code: -39006,
+                message: message.to_string(),
+            },
+        ],
+    };
+    assert_eq!(hex::encode(response.encode()), golden);
     assert_eq!(
-        resp.results[0].value,
-        Some(BlockxStateReadValue::code(Bytes::from(vec![
-            0x60, 0x80, 0x60, 0x40, 0x52
-        ])))
+        BsrbResponse::decode(&hex::decode(&golden).unwrap()).unwrap(),
+        response
     );
-    let word: [u8; 32] = U256::from(0xabcdu64).to_be_bytes();
+}
+
+/// Empty code (codeless account) is a zero-length ok payload, distinct
+/// from any error.
+#[test]
+fn empty_code_value_round_trips() {
+    let response = BsrbResponse {
+        results: vec![BsrbOutcome::Value(Bytes::new())],
+    };
     assert_eq!(
-        resp.results[1].value,
-        Some(BlockxStateReadValue::storage(word.into()))
+        hex::encode(response.encode()),
+        "01000100".to_owned() + "00000000"
     );
-    assert!(resp.results.iter().all(|r| r.error.is_none()));
-
-    // Item error carries code and byte-exact message.
-    let resp: BlockxStateReadBatchResp =
-        serde_json::from_value(fixture("response_item_error")).unwrap();
-    let err = resp.results[1].error.as_ref().unwrap();
-    assert_eq!(err.code, -39005);
-    assert_eq!(err.message, "database failed");
-    assert!(resp.results[1].value.is_none());
+    assert_eq!(BsrbResponse::decode(&response.encode()).unwrap(), response);
 }
 
+/// A 32-byte contract code and a storage word are the same payload on
+/// the wire by design: the request item at the same position carries
+/// the kind, so the value never guesses. This pins the regression that
+/// motivated dropping self-describing values.
 #[test]
-fn unknown_kind_is_rejected() {
-    let value = json!({
-        "blockContext": {"type": "Equals", "block_id": "0x2"},
-        "reads": [
-            {"kind": "traceCall", "index": 0, "address": "0x1111111111111111111111111111111111111111"}
-        ]
-    });
-    assert!(serde_json::from_value::<BlockxStateReadBatch>(value).is_err());
-}
-
-#[test]
-fn malformed_address_is_rejected() {
-    let value = json!({
-        "blockContext": {"type": "Equals", "block_id": "0x2"},
-        "reads": [
-            {"kind": "addressCode", "index": 0, "address": "0x123"}
-        ]
-    });
-    assert!(serde_json::from_value::<BlockxStateReadBatch>(value).is_err());
-}
-
-/// Storage values always serialize as full 32-byte words and code as
-/// variable-length hex — the exact single-method shapes. A 32-byte
-/// contract code and a storage word are the same value on the wire;
-/// the request item's `kind` carries the distinction, the value type
-/// deliberately does not guess.
-#[test]
-fn value_shapes_match_single_methods() {
-    let storage = BlockxStateReadValue::storage(H256::with_last_byte(1));
-    assert_eq!(
-        serde_json::to_value(&storage).unwrap(),
-        json!("0x0000000000000000000000000000000000000000000000000000000000000001")
-    );
-    let code = BlockxStateReadValue::code(Bytes::new());
-    assert_eq!(serde_json::to_value(&code).unwrap(), json!("0x"));
-
+fn value_payloads_are_kind_agnostic() {
     let word = H256::repeat_byte(0x60);
-    let code_32 = BlockxStateReadValue::code(Bytes::copy_from_slice(word.as_slice()));
-    assert_eq!(code_32, BlockxStateReadValue::storage(word));
-    let roundtripped: BlockxStateReadValue =
-        serde_json::from_value(serde_json::to_value(&code_32).unwrap()).unwrap();
-    assert_eq!(roundtripped, code_32);
+    let as_code = BsrbResponse {
+        results: vec![BsrbOutcome::Value(Bytes::copy_from_slice(word.as_slice()))],
+    };
+    let as_storage = BsrbResponse {
+        results: vec![BsrbOutcome::Value(Bytes::copy_from_slice(word.as_slice()))],
+    };
+    assert_eq!(as_code.encode(), as_storage.encode());
 }

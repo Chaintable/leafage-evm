@@ -1,8 +1,8 @@
-//! End-to-end tests for `blockx_stateReadBatch` over a real
-//! RocksDB-backed StateTree and jsonrpsee HTTP server: batch results
-//! must be byte-identical to the single getAddressCode / getStorageAt
-//! responses, including error code/message text, validation rejects
-//! and the per-item historical fallback.
+//! End-to-end tests for `blockx_stateReadBatch` (BSRB/1 wire) over a
+//! real RocksDB-backed StateTree and jsonrpsee HTTP server: batch
+//! results must be byte-identical to the single getAddressCode /
+//! getStorageAt responses, including error code/message text, strict
+//! decode rejects and the per-item historical fallback.
 
 use alloy::primitives::keccak256;
 use jsonrpsee::core::ClientError;
@@ -14,8 +14,9 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{
     AccountStorageDiff, Address, Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff,
-    BlockType, BlockxStateRead, BlockxStateReadBatch, Bytes, CfgEnv, DebankBlockContext,
-    IndexValuePair, JsonStorageKey, MainnetSpecId, NewAccount, NewCode, H256, U256,
+    BlockType, BsrbContext, BsrbOutcome, BsrbRead, BsrbRequest, BsrbResponse, Bytes, CfgEnv,
+    DebankBlockContext, IndexValuePair, JsonStorageKey, MainnetSpecId, NewAccount, NewCode, H256,
+    U256,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,23 +116,48 @@ fn test_cfg() -> MultiChainCfgEnv {
     MultiChainCfgEnv::Mainnet(cfg)
 }
 
-fn ctx(block_id: BlockId) -> DebankBlockContext {
+/// The single-method block context equivalent to a BSRB context.
+fn debank_ctx(context: BsrbContext) -> DebankBlockContext {
     DebankBlockContext {
-        block_id,
+        block_id: match context {
+            BsrbContext::Hash(hash) => BlockId::Hash(hash.into()),
+            BsrbContext::Number(number) => BlockId::Number(BlockNumberOrTag::Number(number)),
+        },
         block_type: BlockType::Equals,
     }
 }
 
-fn code_read(index: u32, address: Address) -> BlockxStateRead {
-    BlockxStateRead::AddressCode { index, address }
+fn code_read(address: Address) -> BsrbRead {
+    BsrbRead::AddressCode { address }
 }
 
-fn storage_read(index: u32, address: Address, position: H256) -> BlockxStateRead {
-    BlockxStateRead::StorageAt {
-        index,
-        address,
-        position: JsonStorageKey::from(position),
+fn storage_read(address: Address, slot: H256) -> BsrbRead {
+    BsrbRead::StorageAt { address, slot }
+}
+
+async fn send(client: &HttpClient, request: &BsrbRequest) -> Result<BsrbResponse, ClientError> {
+    let payload = BlockxApiClient::state_read_batch(client, Bytes::from(request.encode())).await?;
+    Ok(BsrbResponse::decode(&payload).expect("server must return a decodable BSRB response"))
+}
+
+fn value(outcome: &BsrbOutcome) -> &Bytes {
+    match outcome {
+        BsrbOutcome::Value(value) => value,
+        BsrbOutcome::Error { code, message } => {
+            panic!("expected value, got error {code}: {message}")
+        }
     }
+}
+
+fn error(outcome: &BsrbOutcome) -> (i32, &str) {
+    match outcome {
+        BsrbOutcome::Error { code, message } => (*code, message.as_str()),
+        BsrbOutcome::Value(value) => panic!("expected error, got value {value}"),
+    }
+}
+
+fn word_bytes(word: H256) -> Bytes {
+    Bytes::copy_from_slice(word.as_slice())
 }
 
 fn call_error(err: ClientError) -> jsonrpsee::types::ErrorObjectOwned {
@@ -141,9 +167,9 @@ fn call_error(err: ClientError) -> jsonrpsee::types::ErrorObjectOwned {
     }
 }
 
-async fn expect_invalid_params(client: &HttpClient, batch: BlockxStateReadBatch, what: &str) {
+async fn expect_invalid_params(client: &HttpClient, payload: Vec<u8>, what: &str) {
     let err = call_error(
-        BlockxApiClient::state_read_batch(client, batch)
+        BlockxApiClient::state_read_batch(client, Bytes::from(payload))
             .await
             .expect_err(what),
     );
@@ -180,80 +206,65 @@ async fn batch_matches_single_methods_byte_for_byte() {
         .build(format!("http://{addr}"))
         .unwrap();
 
-    for block_id in [
-        BlockId::Number(BlockNumberOrTag::Number(2)),
-        BlockId::Hash(h(0xcc).into()),
-    ] {
-        let ctx = ctx(block_id);
-        let batch = BlockxStateReadBatch {
-            block_context: ctx.clone(),
+    for context in [BsrbContext::Number(2), BsrbContext::Hash(h(0xcc))] {
+        let ctx = debank_ctx(context);
+        let request = BsrbRequest {
+            context,
             reads: vec![
-                code_read(0, CONTRACT),
-                code_read(1, PROXY),
-                code_read(2, ALICE),
-                code_read(3, MISSING),
-                storage_read(4, CONTRACT, pos(1)),
-                storage_read(5, CONTRACT, pos(2)),
-                // Duplicate key with a distinct index is legal and must
-                // resolve to the same value.
-                storage_read(6, CONTRACT, pos(1)),
+                code_read(CONTRACT),
+                code_read(PROXY),
+                code_read(ALICE),
+                code_read(MISSING),
+                storage_read(CONTRACT, pos(1)),
+                storage_read(CONTRACT, pos(2)),
+                // Duplicate key is legal and must resolve to the same
+                // value; order is the correlation.
+                storage_read(CONTRACT, pos(1)),
             ],
         };
-        let resp = BlockxApiClient::state_read_batch(&client, batch.clone())
-            .await
-            .unwrap();
-        assert_eq!(resp.results.len(), batch.reads.len());
+        let resp = send(&client, &request).await.unwrap();
+        assert_eq!(resp.results.len(), request.reads.len());
 
-        for (read, outcome) in batch.reads.iter().zip(&resp.results) {
-            assert_eq!(outcome.index, read.index());
-            assert!(outcome.error.is_none(), "unexpected error: {outcome:?}");
-            let batch_value = serde_json::to_value(outcome.value.as_ref().unwrap()).unwrap();
+        for (read, outcome) in request.reads.iter().zip(&resp.results) {
+            let batch_value = value(outcome).clone();
             let single_value = match read {
-                BlockxStateRead::AddressCode { address, .. } => serde_json::to_value(
+                BsrbRead::AddressCode { address } => {
                     DebankApiClient::get_address_code(&client, *address, Some(ctx.clone()))
                         .await
-                        .unwrap(),
-                )
-                .unwrap(),
-                BlockxStateRead::StorageAt {
-                    address, position, ..
-                } => serde_json::to_value(
+                        .unwrap()
+                }
+                BsrbRead::StorageAt { address, slot } => word_bytes(
                     DebankApiClient::get_storage_at(
                         &client,
                         *address,
-                        position.clone(),
+                        JsonStorageKey::from(*slot),
                         Some(ctx.clone()),
                     )
                     .await
                     .unwrap(),
-                )
-                .unwrap(),
+                ),
             };
             assert_eq!(batch_value, single_value, "read {:?}", read);
         }
 
         // Spot-check the actual values, not only equality.
-        let code_json = serde_json::to_value(resp.results[0].value.as_ref().unwrap()).unwrap();
-        assert_eq!(code_json, serde_json::to_value(contract_code()).unwrap());
-        let storage_json = serde_json::to_value(resp.results[4].value.as_ref().unwrap()).unwrap();
+        assert_eq!(value(&resp.results[0]), &contract_code());
+        assert_eq!(value(&resp.results[3]), &Bytes::new());
         let word: [u8; 32] = U256::from(0xabcdu64).to_be_bytes();
-        assert_eq!(
-            storage_json,
-            serde_json::to_value(H256::from(word)).unwrap()
-        );
-        let zero_json = serde_json::to_value(resp.results[5].value.as_ref().unwrap()).unwrap();
-        assert_eq!(zero_json, serde_json::to_value(H256::ZERO).unwrap());
+        assert_eq!(value(&resp.results[4]), &word_bytes(word.into()));
+        assert_eq!(value(&resp.results[5]), &word_bytes(H256::ZERO));
+        assert_eq!(value(&resp.results[6]), value(&resp.results[4]));
     }
 
     // A fixed block the state node does not have: the batch-level error
     // must match the single-method error byte-for-byte.
-    let stale = ctx(BlockId::Number(BlockNumberOrTag::Number(999)));
+    let stale = BsrbContext::Number(999);
     let batch_err = call_error(
-        BlockxApiClient::state_read_batch(
+        send(
             &client,
-            BlockxStateReadBatch {
-                block_context: stale.clone(),
-                reads: vec![storage_read(0, CONTRACT, pos(1))],
+            &BsrbRequest {
+                context: stale,
+                reads: vec![storage_read(CONTRACT, pos(1))],
             },
         )
         .await
@@ -264,7 +275,7 @@ async fn batch_matches_single_methods_byte_for_byte() {
             &client,
             CONTRACT,
             JsonStorageKey::from(pos(1)),
-            Some(stale),
+            Some(debank_ctx(stale)),
         )
         .await
         .expect_err("unknown block must fail"),
@@ -273,56 +284,49 @@ async fn batch_matches_single_methods_byte_for_byte() {
     assert_eq!(batch_err.message(), single_err.message());
     assert_eq!(batch_err.code(), -39006);
 
-    // Deterministic validation rejects.
-    let good_ctx = ctx(BlockId::Number(BlockNumberOrTag::Number(2)));
+    // Strict decode rejects: every malformed payload fails with -32602
+    // before any state work.
+    let good = BsrbRequest {
+        context: BsrbContext::Number(2),
+        reads: vec![code_read(CONTRACT)],
+    }
+    .encode();
+
     expect_invalid_params(
         &client,
-        BlockxStateReadBatch {
-            block_context: good_ctx.clone(),
+        BsrbRequest {
+            context: BsrbContext::Number(2),
             reads: vec![],
-        },
+        }
+        .encode(),
         "empty reads",
     )
     .await;
     expect_invalid_params(
         &client,
-        BlockxStateReadBatch {
-            block_context: good_ctx.clone(),
-            reads: vec![code_read(0, CONTRACT), code_read(0, ALICE)],
-        },
-        "duplicate index",
-    )
-    .await;
-    expect_invalid_params(
-        &client,
-        BlockxStateReadBatch {
-            block_context: good_ctx.clone(),
-            reads: (0..65).map(|i| code_read(i, CONTRACT)).collect(),
-        },
+        BsrbRequest {
+            context: BsrbContext::Number(2),
+            reads: (0..65).map(|_| code_read(CONTRACT)).collect(),
+        }
+        .encode(),
         "over hard cap",
     )
     .await;
-    expect_invalid_params(
-        &client,
-        BlockxStateReadBatch {
-            block_context: DebankBlockContext {
-                block_id: BlockId::Number(BlockNumberOrTag::Number(2)),
-                block_type: BlockType::Contains,
-            },
-            reads: vec![code_read(0, CONTRACT)],
-        },
-        "Contains context",
-    )
-    .await;
-    expect_invalid_params(
-        &client,
-        BlockxStateReadBatch {
-            block_context: ctx(BlockId::Number(BlockNumberOrTag::Latest)),
-            reads: vec![code_read(0, CONTRACT)],
-        },
-        "latest tag",
-    )
-    .await;
+    let mut bad_version = good.clone();
+    bad_version[0] = 9;
+    expect_invalid_params(&client, bad_version, "unknown version").await;
+    let mut bad_ctx_kind = good.clone();
+    bad_ctx_kind[1] = 7;
+    expect_invalid_params(&client, bad_ctx_kind, "unknown context kind").await;
+    let mut bad_read_kind = good.clone();
+    // version(1) + ctx_kind(1) + height(8) + count(2) => first item kind.
+    bad_read_kind[12] = 9;
+    expect_invalid_params(&client, bad_read_kind, "unknown read kind").await;
+    let mut trailing = good.clone();
+    trailing.push(0);
+    expect_invalid_params(&client, trailing, "trailing bytes").await;
+    let truncated = good[..good.len() - 1].to_vec();
+    expect_invalid_params(&client, truncated, "truncated payload").await;
 
     handle.stop().unwrap();
     let _ = std::fs::remove_dir_all(&db_path);
@@ -398,69 +402,66 @@ async fn batch_falls_back_to_historical_per_item() {
         .unwrap();
 
     // Block 2 exists only on the historical node.
-    let remote_ctx = ctx(BlockId::Number(BlockNumberOrTag::Number(2)));
-    let resp = BlockxApiClient::state_read_batch(
+    let remote = BsrbContext::Number(2);
+    let resp = send(
         &primary,
-        BlockxStateReadBatch {
-            block_context: remote_ctx.clone(),
+        &BsrbRequest {
+            context: remote,
             reads: vec![
-                code_read(0, CONTRACT),
-                storage_read(1, CONTRACT, pos(1)),
-                storage_read(2, CONTRACT, pos(2)),
+                code_read(CONTRACT),
+                storage_read(CONTRACT, pos(1)),
+                storage_read(CONTRACT, pos(2)),
             ],
         },
     )
     .await
     .unwrap();
-    assert!(resp.results.iter().all(|r| r.error.is_none()));
-    let hist_code = DebankApiClient::get_address_code(&hist, CONTRACT, Some(remote_ctx.clone()))
+    assert!(resp
+        .results
+        .iter()
+        .all(|r| matches!(r, BsrbOutcome::Value(_))));
+    let hist_code = DebankApiClient::get_address_code(&hist, CONTRACT, Some(debank_ctx(remote)))
         .await
         .unwrap();
-    assert_eq!(
-        serde_json::to_value(resp.results[0].value.as_ref().unwrap()).unwrap(),
-        serde_json::to_value(hist_code).unwrap()
-    );
+    assert_eq!(value(&resp.results[0]), &hist_code);
     let hist_storage = DebankApiClient::get_storage_at(
         &hist,
         CONTRACT,
         JsonStorageKey::from(pos(1)),
-        Some(remote_ctx.clone()),
+        Some(debank_ctx(remote)),
     )
     .await
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(resp.results[1].value.as_ref().unwrap()).unwrap(),
-        serde_json::to_value(hist_storage).unwrap()
-    );
+    assert_eq!(value(&resp.results[1]), &word_bytes(hist_storage));
 
     // Block 7 exists nowhere: per-item combined errors, identical to
     // the single-method fallback error.
-    let nowhere_ctx = ctx(BlockId::Number(BlockNumberOrTag::Number(7)));
-    let resp = BlockxApiClient::state_read_batch(
+    let nowhere = BsrbContext::Number(7);
+    let resp = send(
         &primary,
-        BlockxStateReadBatch {
-            block_context: nowhere_ctx.clone(),
-            reads: vec![storage_read(0, CONTRACT, pos(1))],
+        &BsrbRequest {
+            context: nowhere,
+            reads: vec![storage_read(CONTRACT, pos(1))],
         },
     )
     .await
     .unwrap();
-    let item_err = resp.results[0].error.as_ref().unwrap();
+    let (item_code, item_message) = error(&resp.results[0]);
     let single_err = call_error(
         DebankApiClient::get_storage_at(
             &primary,
             CONTRACT,
             JsonStorageKey::from(pos(1)),
-            Some(nowhere_ctx),
+            Some(debank_ctx(nowhere)),
         )
         .await
         .expect_err("block exists nowhere"),
     );
-    assert_eq!(item_err.code, single_err.code());
-    assert_eq!(item_err.message, single_err.message());
-    assert_eq!(item_err.code, -39006);
-    assert!(item_err.message.starts_with("Local error: "));
-    assert!(item_err.message.contains("Historical RPC error: "));
+    assert_eq!(item_code, single_err.code());
+    assert_eq!(item_message, single_err.message());
+    assert_eq!(item_code, -39006);
+    assert!(item_message.starts_with("Local error: "));
+    assert!(item_message.contains("Historical RPC error: "));
 
     primary_handle.stop().unwrap();
     hist_handle.stop().unwrap();
