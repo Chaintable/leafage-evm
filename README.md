@@ -145,6 +145,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-cache` | 2048 | Database cache size (MB) |
 | `--diff-depth-limit` | 64 | Block diff depth retained in memory |
 | `--catchup-safe-depth` | 0 | S3 catch-up reorg buffer: blocks below the Kafka head backfilled via the exact parent-hash chain instead of the by-number index. 0 disables it (legacy behavior); set above the chain's max reorg depth (e.g. 64 for Moonriver) |
+| `--bundle-range-size` | 32 MiB | Target size for combining multiple StateDiff entries into one S3 Range request. A larger single entry is still read alone. Also available on `archive-init` |
 | `--archive` | false | Enable archive mode |
 | `--prometheus-addr` | - | Prometheus metrics address |
 | `--kafka-s3-config` | - | Path to Kafka + S3 config JSON file |
@@ -164,12 +165,17 @@ When using Kafka + S3 mode, provide a JSON config file:
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
   "version": "v1"
 }
 ```
+
+`bundle_bucket_name` is optional; omit it or leave it empty to keep the legacy per-block S3 path.
+
+Both `standalone` and `archive-init` accept `--bundle-range-size <MIB>` to tune the compacted StateDiff request size. The limit applies only when grouping multiple entries; a single entry larger than the configured value is fetched by itself.
 
 ### Data Migration
 

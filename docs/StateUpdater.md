@@ -82,13 +82,18 @@ Startup:
   1. Read persisted offset from offset_dir
   2. Fetch Kafka watermarks (lowest, latest)
   3. Decision:
+     ├── bundle_bucket_name set ──► Sync from bundle/block storage, start from latest
      ├── offset >= lowest ──► Resume from offset
      └── offset < lowest or missing ──► Sync from S3, start from latest
 ```
 
+Bundle-enabled nodes always perform the startup catch-up even when the saved
+Kafka offset is still within retention. A valid but old notification can refer
+to source objects already deleted by the compactor.
+
 ### S3 Catch-up
 
-When offset is invalid (missing or expired), KafkaUpdater synchronizes from S3:
+When startup catch-up is required, KafkaUpdater synchronizes from S3:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -98,15 +103,23 @@ When offset is invalid (missing or expired), KafkaUpdater synchronizes from S3:
 │  Current DB block: N                                        │
 │  Target block (from Kafka): M                               │
 │                                                             │
-│  for block_num in (N+1)..=M:                                │
-│      1. Fetch block info by number from S3                  │
-│      2. Fetch state diff from S3                            │
-│      3. Apply to StateTree                                  │
+│  1. Read compacted bundles in block order                   │
+│     ├── Header: read the complete gzip JSON array           │
+│     └── StateDiff: grouped Range reads (32 MiB by default)   │
+│  2. On the first missing bundle, stop bundle probes         │
+│  3. Read that height and all newer blocks from source S3    │
+│  4. Apply every block to StateTree                          │
 │                                                             │
 │  Batch size controlled by: --init-task-queue-size           │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+Use `--bundle-range-size <MIB>` to tune the grouped Range request size. The
+limit applies only to requests containing multiple entries; an oversized
+single entry is still read by itself.
+After the first missing bundle, retries resume from the in-memory latest block
+and use only per-block source reads for the rest of the process.
 
 ### Configuration
 
@@ -118,6 +131,7 @@ Kafka + S3 config file (`--kafka-s3-config`):
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
@@ -131,6 +145,7 @@ Kafka + S3 config file (`--kafka-s3-config`):
 | `brokers` | Kafka broker addresses |
 | `partition` | Kafka partition to consume |
 | `bucket_name` | S3 bucket for state diffs |
+| `bundle_bucket_name` | Optional S3 bucket for compacted Header and StateDiff bundles; empty disables bundle reads |
 | `outer_bucket_name` | S3 bucket for block info |
 | `offset_dir` | Directory to persist Kafka offset |
 | `s3_chain_id` | Chain identifier in S3 paths |
@@ -218,6 +233,7 @@ Detection:
 | `--update-interval` | HTTP polling interval (ms) |
 | `--diff-depth-limit` | Max block diffs in memory / reorg depth |
 | `--init-task-queue-size` | Batch size for S3 catch-up (default: 256) |
+| `--bundle-range-size <MIB>` | Target size for grouping multiple compacted StateDiff entries into one S3 Range request (default: 32 MiB); oversized single entries are read alone |
 
 ## Related Documentation
 

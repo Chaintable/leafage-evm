@@ -23,6 +23,8 @@ pub struct KafkaS3Config {
     pub brokers: String,
     pub partition: i32,
     pub bucket_name: String,
+    #[serde(default)]
+    pub bundle_bucket_name: String,
     pub outer_bucket_name: String,
     #[serde(default)]
     pub offset_dir: String,
@@ -367,7 +369,26 @@ async fn s3_resolve_block_diff(
         "s3 get parent block info failed, {}",
         block_info.header.parent_hash
     ))?;
-    if parent_block_info.header.state_root != block_info.header.state_root {
+    s3_resolve_block_diff_with_parent_state_root(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        block_info,
+        parent_block_info.header.state_root,
+    )
+    .await
+}
+
+async fn s3_resolve_block_diff_with_parent_state_root(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    block_info: &BlockInfo,
+    parent_state_root: H256,
+) -> Result<BlockStorageDiff> {
+    if parent_state_root != block_info.header.state_root {
         s3_get_block_diff(
             s3_client,
             bucket_name,
@@ -381,10 +402,11 @@ async fn s3_resolve_block_diff(
             block_info.header.state_root, block_info.header.number
         ))
     } else {
-        let mut diff = BlockStorageDiff::default();
-        diff.hash = block_info.header.state_root;
-        diff.parent_hash = parent_block_info.header.state_root;
-        Ok(diff)
+        Ok(BlockStorageDiff {
+            hash: block_info.header.state_root,
+            parent_hash: parent_state_root,
+            ..Default::default()
+        })
     }
 }
 
@@ -410,6 +432,42 @@ pub async fn s3_get_block_info_and_diff_by_number(
 
     let block_diff =
         s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
+    Ok((block_info, block_diff))
+}
+
+/// Resolve a block by number when the caller already has its parent's state
+/// root. This avoids reading the parent Header source object, which may have
+/// been deleted after its bundle was compacted.
+#[allow(clippy::too_many_arguments)]
+pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
+    rpc_client: &Option<HttpClient>,
+    s3_client: &Client,
+    bucket_name: &str,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    number: u64,
+    parent_state_root: H256,
+) -> Result<(BlockInfo, BlockStorageDiff)> {
+    let block_info = s3_get_block_info_by_number(
+        rpc_client,
+        s3_client,
+        bucket_name,
+        outer_bucket_name,
+        s3_chain_id,
+        version,
+        number,
+    )
+    .await?;
+    let block_diff = s3_resolve_block_diff_with_parent_state_root(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        &block_info,
+        parent_state_root,
+    )
+    .await?;
     Ok((block_info, block_diff))
 }
 
@@ -497,6 +555,91 @@ pub enum StateType {
 pub enum NodeType {
     State = 1,
     Archive = 2,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rlp::Encodable;
+    use aws_sdk_s3::config::{Credentials, Region};
+    use axum::{
+        body::Body,
+        extract::State,
+        http::{Request, Response},
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    type DiffServerState = (Vec<u8>, Arc<Mutex<Vec<String>>>);
+
+    fn test_hash(value: u8) -> H256 {
+        H256::from([value; 32])
+    }
+
+    async fn serve_diff(
+        State((body, requests)): State<DiffServerState>,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        requests
+            .lock()
+            .unwrap()
+            .push(request.uri().path().to_owned());
+        Response::builder()
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn known_parent_state_root_does_not_fetch_the_parent_header() {
+        let parent_root = test_hash(1);
+        let block_root = test_hash(2);
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = block_root;
+        let expected = BlockStorageDiff {
+            hash: block_root,
+            parent_hash: parent_root,
+            ..Default::default()
+        };
+        let mut body = Vec::new();
+        expected.encode(&mut body);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(serve_diff)
+            .with_state((body, requests.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .build();
+        let client = Client::from_conf(config);
+
+        let actual = s3_resolve_block_diff_with_parent_state_root(
+            &client,
+            "source",
+            "1",
+            "",
+            &block_info,
+            parent_root,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![format!("/source/1/{block_root}/stateDiff")]
+        );
+        server.abort();
+    }
 }
 
 /// CLI selector for the node type registered to etcd. `Auto` (the default)

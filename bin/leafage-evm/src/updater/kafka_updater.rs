@@ -1,6 +1,8 @@
+use crate::bundle::{bundle_end, s3_read_bundle};
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
-    s3_get_block_info_and_diff_by_number, KafkaS3Config,
+    s3_get_block_info_and_diff_by_number,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -20,7 +22,10 @@ use rdkafka::{
     ClientConfig, Message, Offset, TopicPartitionList,
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use std::time::Duration;
 use tokio::{sync::watch, task::JoinSet, time};
 use tracing::{debug, error, info};
@@ -47,6 +52,11 @@ pub struct Updater<Tree> {
     /// Kafka head that are backfilled by following the exact parent-hash chain
     /// instead of the by-number index. 0 disables it (legacy behavior).
     catchup_safe_depth: usize,
+    bundle_range_size_mib: u32,
+    /// Bundle reads stop permanently after the first definitive miss in this
+    /// process. Retries continue from the in-memory latest block, so they do
+    /// not need to reread the already-applied bundle prefix.
+    read_from_bundle: AtomicBool,
 }
 
 impl<Tree> Updater<Tree>
@@ -64,6 +74,7 @@ where
         max_diff_depth: usize,
         init_task_queue_size: usize,
         catchup_safe_depth: usize,
+        bundle_range_size_mib: u32,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -83,6 +94,7 @@ where
 
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
+        let read_from_bundle = !kafka_s3_cfg.bundle_bucket_name.is_empty();
 
         Ok(Self {
             rpc_client,
@@ -95,6 +107,8 @@ where
             read_from_kafka: true,
             init_task_queue_size,
             catchup_safe_depth,
+            bundle_range_size_mib,
+            read_from_bundle: AtomicBool::new(read_from_bundle),
         })
     }
 
@@ -284,6 +298,94 @@ where
         Ok(())
     }
 
+    /// Catch up the stable by-number segment from compacted bundles first.
+    /// After the first missing bundle, all remaining blocks and retries use
+    /// the original per-block reads without probing bundle storage again.
+    async fn update_stable_range_from_s3(
+        &self,
+        start_block_number: u64,
+        end_block_number: u64,
+        mut parent_state_root: H256,
+    ) -> Result<()> {
+        let mut next_block_number = start_block_number;
+
+        while self.read_from_bundle.load(Ordering::Relaxed) && next_block_number <= end_block_number
+        {
+            let current_bundle_end = bundle_end(next_block_number).min(end_block_number);
+            let last_bundle_block = s3_read_bundle(
+                &self.s3_client,
+                &self.kafka_s3_cfg.bundle_bucket_name,
+                &self.kafka_s3_cfg.s3_chain_id,
+                &self.kafka_s3_cfg.version,
+                next_block_number,
+                current_bundle_end,
+                self.bundle_range_size_mib,
+                |block_info, block_diff| async move {
+                    info!(target:"updater", "update bundle block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+                    self.tree.update_block(block_info, block_diff)?;
+                    Ok(())
+                },
+            )
+            .await?;
+
+            let Some(last_bundle_block) = last_bundle_block else {
+                self.read_from_bundle.store(false, Ordering::Relaxed);
+                info!(target: "updater",
+                    "Bundle containing block {} is not available; switching to per-block reads for the rest of this catch-up",
+                    next_block_number);
+                break;
+            };
+            parent_state_root = last_bundle_block.header.state_root;
+
+            info!(target: "updater",
+                "Updated blocks {}..={} from bundle storage",
+                next_block_number, current_bundle_end);
+            if current_bundle_end == end_block_number {
+                return Ok(());
+            }
+            next_block_number = current_bundle_end + 1;
+        }
+
+        // The first source block can follow a compacted block whose source
+        // Header has already been deleted. Use the root retained from the DB
+        // or last bundle for this hand-off block.
+        if next_block_number <= end_block_number {
+            let (block_info, block_diff) =
+                s3_get_block_info_and_diff_by_number_with_parent_state_root(
+                    &self.rpc_client,
+                    &self.s3_client,
+                    &self.kafka_s3_cfg.bucket_name,
+                    &self.kafka_s3_cfg.outer_bucket_name,
+                    &self.kafka_s3_cfg.s3_chain_id,
+                    &self.kafka_s3_cfg.version,
+                    next_block_number,
+                    parent_state_root,
+                )
+                .await?;
+            info!(target:"updater", "update first per-block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+            self.tree.update_block(block_info, block_diff)?;
+            if next_block_number == end_block_number {
+                return Ok(());
+            }
+            next_block_number += 1;
+        }
+
+        let batch_size = std::cmp::max(1, self.init_task_queue_size as u64);
+        while next_block_number <= end_block_number {
+            let current_end = std::cmp::min(
+                next_block_number.saturating_add(batch_size - 1),
+                end_block_number,
+            );
+            self.update_range_from_s3(next_block_number, current_end)
+                .await?;
+            if current_end == end_block_number {
+                break;
+            }
+            next_block_number = current_end + 1;
+        }
+        Ok(())
+    }
+
     async fn update_from_s3(&self, messages: &Vec<BorrowedMessage<'_>>) -> Result<()> {
         let block_change_notification: KafkaBlockChangeNotification =
             messages[0].payload().unwrap().try_into()?;
@@ -292,7 +394,12 @@ where
             .first()
             .ok_or_else(|| anyhow::anyhow!("No new blocks in the message"))?
             .clone();
-        let last_committed_number = self.tree.last_committed_block()?.unwrap().header.number;
+        let last_applied_block = self
+            .tree
+            .state_at(BlockId::Number(BlockNumberOrTag::Latest))?
+            .ok_or_else(|| anyhow::anyhow!("No latest block in StateTree"))?
+            .block_info()?;
+        let last_applied_number = last_applied_block.header.number;
         let tip_block_number = target_block.block_number.saturating_sub(1);
 
         // The by-number S3 index can resolve the wrong branch around the chain
@@ -313,19 +420,21 @@ where
         // nothing (legacy by-number-only catch-up).
         let by_number_target = tip_block_number
             .saturating_sub(depth)
-            .max(last_committed_number)
+            .max(last_applied_number)
             .min(tip_block_number);
 
-        // Phase 1: by-number catch-up over the stable segment.
-        let batch_size = self.init_task_queue_size as u64;
-        let mut start_block_number = last_committed_number + 1;
+        // Phase 1: by-number catch-up over the stable segment. Prefer compacted
+        // bundles until their first definitive miss, then retain the legacy
+        // per-block batching for the remainder.
+        let start_block_number = last_applied_number + 1;
         info!(target:"updater", "update from s3 by number, start block number {}, target block number {}", start_block_number, by_number_target);
-        while start_block_number <= by_number_target {
-            let end_block_number =
-                std::cmp::min(start_block_number + batch_size - 1, by_number_target);
-            self.update_range_from_s3(start_block_number, end_block_number)
-                .await?;
-            start_block_number += batch_size;
+        if start_block_number <= by_number_target {
+            self.update_stable_range_from_s3(
+                start_block_number,
+                by_number_target,
+                last_applied_block.header.state_root,
+            )
+            .await?;
         }
 
         // Phase 2: backfill (by_number_target, tip] by walking the parent-hash
@@ -445,6 +554,18 @@ where
             .await
             .expect("Failed to get latest offset");
         match offset {
+            Some(offset)
+                if offset >= lowest_offset && !self.kafka_s3_cfg.bundle_bucket_name.is_empty() =>
+            {
+                // A still-valid Kafka offset can nevertheless point at source
+                // objects already removed by the compactor. With bundle
+                // storage enabled, catch up from the latest notification via
+                // bundle/block reads first, then resume live Kafka updates.
+                info!(target: "updater", "kafka offset {} is valid, but bundle storage is enabled; catching up from bundle/block storage", offset);
+                self.read_from_kafka = false;
+                self.set_offset(latest_offset)
+                    .expect("Failed to set latest offset");
+            }
             Some(offset) if offset >= lowest_offset => {
                 self.set_offset(offset).expect("Failed to set offset");
                 info!(target: "updater", "kafka updater start with offset {}", offset);

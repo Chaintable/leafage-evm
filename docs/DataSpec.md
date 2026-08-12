@@ -251,6 +251,7 @@ For each new block:
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
