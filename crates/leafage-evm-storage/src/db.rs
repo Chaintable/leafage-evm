@@ -66,6 +66,14 @@ pub trait StateDBRead {
             .map(|(address, key)| self.read_storage(*address, *key))
             .collect()
     }
+
+    /// Whether the `*_many` reads above are served by a real batched
+    /// storage primitive (RocksDB MultiGet) instead of the scalar
+    /// defaults. A performance hint for callers deciding whether eager
+    /// batched reads are worth issuing; correctness never depends on it.
+    fn supports_batched_reads(&self) -> bool {
+        false
+    }
 }
 
 #[auto_impl(&, Box, Arc)]
@@ -222,6 +230,10 @@ where
 
     fn storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Self::Error> {
         self.0.read_storage_many(keys)
+    }
+
+    fn supports_batched_reads(&self) -> bool {
+        self.0.supports_batched_reads()
     }
 }
 

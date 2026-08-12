@@ -347,6 +347,10 @@ impl StateDBRead for DataBase {
             .record(start.elapsed().as_secs_f64());
         Ok(out)
     }
+
+    fn supports_batched_reads(&self) -> bool {
+        true
+    }
 }
 
 impl StateDBWrite for DataBase {

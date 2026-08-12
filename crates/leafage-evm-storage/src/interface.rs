@@ -46,6 +46,14 @@ pub trait StateDB {
             .map(|(address, index)| self.storage(*address, *index))
             .collect()
     }
+
+    /// Whether the `*_many` reads above are served by a real batched
+    /// storage primitive instead of the scalar defaults. A performance
+    /// hint for callers deciding whether eager batched reads are worth
+    /// issuing; correctness never depends on it.
+    fn supports_batched_reads(&self) -> bool {
+        false
+    }
 }
 
 /// [`BlockContext`] is a trait that provides access to the block information at a specific block height.
@@ -193,6 +201,14 @@ impl<T: StateDB> EvmStorageWrapper<T> {
     /// same order.
     pub fn code_by_hash_many_ref(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, T::Error> {
         self.db.code_by_hash_many(code_hashes)
+    }
+
+    /// Whether the `*_many_ref` reads above actually batch at the
+    /// storage layer: needs a backend with real batched point reads,
+    /// and no OVM balance override (which forces `basic_many_ref` onto
+    /// the scalar path).
+    pub fn supports_batched_reads(&self) -> bool {
+        self.ovm_address.is_none() && self.db.supports_batched_reads()
     }
 }
 

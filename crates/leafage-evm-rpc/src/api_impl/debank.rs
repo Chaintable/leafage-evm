@@ -21,7 +21,7 @@ use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
-use revm::database::{CacheDB, DatabaseRef};
+use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::sync::Arc;
@@ -568,13 +568,22 @@ where
     /// sentinel is skipped because its calls bypass the EVM, and any
     /// prefetch error is dropped so the affected keys fall back to the
     /// on-demand scalar path with its unchanged per-call error text.
+    /// Nonexistent accounts get a negative cache entry — without it the
+    /// call loop would re-read them through the scalar path, making the
+    /// prefetch a net extra read for fresh addresses.
     fn prefetch_multi_call_accounts(
         requests: &[CallRequest],
         cache_db: &mut CacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        cancel_token: &CancellationToken,
     ) {
+        // leafage-py chunks multicalls at 20 calls, so real traffic
+        // always fits this window; on oversized batches the tail keeps
+        // lazy on-demand reads instead of growing the eager work done
+        // ahead of the loop's fast_fail / cancellation checks.
+        const MAX_PREFETCH_CALLS: usize = 32;
         let mut addresses: Vec<Address> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for request in requests {
+        for request in requests.iter().take(MAX_PREFETCH_CALLS) {
             let to = request.to.and_then(|txkind| txkind.to().copied());
             for address in request.from.into_iter().chain(to) {
                 if address == *utils::NATIVE_TOKEN_SENTINEL {
@@ -591,6 +600,9 @@ where
         let Ok(infos) = cache_db.db.basic_many_ref(&addresses) else {
             return;
         };
+        if cancel_token.is_cancelled() {
+            return;
+        }
         let mut code_hashes: Vec<H256> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
         for info in infos.iter().flatten() {
@@ -610,8 +622,14 @@ where
             }
         }
         for (address, info) in addresses.into_iter().zip(infos) {
-            if let Some(info) = info {
-                cache_db.insert_account_info(address, info);
+            match info {
+                Some(info) => cache_db.insert_account_info(address, info),
+                None => {
+                    cache_db
+                        .cache
+                        .accounts
+                        .insert(address, DbAccount::new_not_existing());
+                }
             }
         }
     }
@@ -656,14 +674,15 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
         }
-        // Prefetch only where the backend has real batched reads: the
-        // archive schema falls back to scalar loops, so prefetching
-        // there just front-loads the same point reads — and under
-        // fast_fail an early failure would turn that into O(N) wasted
-        // reads. On MultiGet backends the fast_fail waste is bounded
-        // by two batched reads.
-        if !self.inner.evm_cfg().is_archive {
-            Self::prefetch_multi_call_accounts(&requests, &mut cache_db);
+        // Prefetch only where the batched reads are real: archive and
+        // MDBX backends fall back to scalar loops, and OVM chains force
+        // scalar account reads, so prefetching there just front-loads
+        // the same point reads — under fast_fail (the SDK default) an
+        // early failure would turn that into O(N) wasted reads. On
+        // MultiGet backends the fast_fail waste is bounded by two
+        // batched reads over the capped prefetch window.
+        if cache_db.db.supports_batched_reads() {
+            Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token);
         }
         let db = utils::RequestCacheDB::new(cache_db);
         // run in sequence

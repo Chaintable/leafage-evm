@@ -619,6 +619,10 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
         )
     }
 
+    fn supports_batched_reads(&self) -> bool {
+        self.statedb.supports_batched_reads()
+    }
+
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         for layer in self.flattened.layers.iter() {
             let diff = layer.unwrap_diff_layer();
