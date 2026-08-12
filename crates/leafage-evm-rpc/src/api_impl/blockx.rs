@@ -89,23 +89,6 @@ where
         block_ctx: &DebankBlockContext,
     ) -> RpcResult<Vec<BsrbOutcome>> {
         let total_start = Instant::now();
-        // getAddressBalance answers from the virtual balance before
-        // resolving any state; mirror that for balance items — including
-        // blocks local state cannot resolve, when nothing else in the
-        // batch needs a state view.
-        let virtual_balance = self.inner.virtual_balance();
-        if let Some(vb) = virtual_balance {
-            if batch
-                .reads
-                .iter()
-                .all(|read| matches!(read, BsrbRead::Balance { .. }))
-            {
-                return Ok(vec![
-                    BsrbOutcome::Value(quantity_value(vb));
-                    batch.reads.len()
-                ]);
-            }
-        }
         let stage_start = Instant::now();
         let state = self.debank_get_state_by_ctx_impl(Some(block_ctx.clone()))?;
         histogram!("leafage_state_batch_latency_seconds", "stage" => "state_at")
@@ -160,9 +143,6 @@ where
                         storage_keys.len() - 1
                     });
                 }
-                // Balance answered from the virtual balance needs no
-                // account read.
-                BsrbRead::Balance { .. } if virtual_balance.is_some() => {}
                 BsrbRead::Balance { address } | BsrbRead::Nonce { address } => {
                     account_slots.entry(*address).or_insert_with(|| {
                         account_addresses.push(*address);
@@ -298,14 +278,11 @@ where
                         Err(err) => item_error(err.clone()),
                     }
                 }
-                BsrbRead::Balance { address } => match virtual_balance {
-                    Some(vb) => BsrbOutcome::Value(quantity_value(vb)),
-                    None => match &account_results[account_slots[address]] {
-                        Ok(account) => BsrbOutcome::Value(quantity_value(
-                            account.as_ref().map(|a| a.balance).unwrap_or_default(),
-                        )),
-                        Err(err) => item_error(err.clone()),
-                    },
+                BsrbRead::Balance { address } => match &account_results[account_slots[address]] {
+                    Ok(account) => BsrbOutcome::Value(quantity_value(
+                        account.as_ref().map(|a| a.balance).unwrap_or_default(),
+                    )),
+                    Err(err) => item_error(err.clone()),
                 },
                 BsrbRead::Nonce { address } => match &account_results[account_slots[address]] {
                     Ok(account) => BsrbOutcome::Value(quantity_value(U256::from(
@@ -391,6 +368,109 @@ where
             })
             .collect()
     }
+
+    /// The full resolution pipeline for one batch: state-read
+    /// admission, one blocking local pass, then per-item or whole-batch
+    /// historical fallback. `Err` is a batch-level failure with no
+    /// eligible historical client (same gate as the single methods).
+    async fn blockx_resolve_batch(&self, batch: &BsrbRequest) -> RpcResult<Vec<BsrbOutcome>> {
+        // State-read admission: wait on the async side (cancellable),
+        // move the permit into the blocking task so it is held until the
+        // reads finish. One batch takes one permit; the per-batch item
+        // cap bounds the work behind it.
+        let permit = match self.inner.evm_cfg().state_read_limiter.clone() {
+            Some(limiter) => {
+                let wait_start = Instant::now();
+                // acquire_owned only errors when the semaphore is closed,
+                // which never happens here.
+                let permit = limiter.acquire_owned().await.ok();
+                histogram!("leafage_state_read_queue_wait_seconds")
+                    .record(wait_start.elapsed().as_secs_f64());
+                permit
+            }
+            None => None,
+        };
+        let context = block_context(&batch.context);
+        let this = self.clone();
+        let local_batch = batch.clone();
+        let local_ctx = context.clone();
+        let local = utils::spawn_blocking_with_cancel(move |_token| {
+            let _permit = permit;
+            this.blockx_state_read_batch_inner(&local_batch, &local_ctx)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("state read batch failed"))?;
+
+        let block_ctx = Some(context);
+        match local {
+            Ok(outcomes) => Ok(self
+                .blockx_retry_items_via_historical(batch, outcomes, &block_ctx)
+                .await),
+            Err(local_err) => {
+                // Same fallback gate as the single methods: without an
+                // eligible historical client the batch-level error (e.g.
+                // -39006/-39007 from state resolution) is returned as-is.
+                if self.should_try_historical(&block_ctx).is_none() {
+                    return Err(local_err);
+                }
+                Ok(self
+                    .blockx_all_items_via_historical(batch, &local_err, &block_ctx)
+                    .await)
+            }
+        }
+    }
+
+    /// Virtual-balance chains: `getAddressBalance` answers before any
+    /// state resolution, so balance items are fixed up front and only
+    /// the remaining reads resolve against state. This holds on every
+    /// path — balance items still answer when the batch's block cannot
+    /// be resolved locally (state-dependent items then fail per item
+    /// with the batch-level code/message each single method would
+    /// return), and they are never re-read through the historical
+    /// client.
+    async fn blockx_resolve_with_virtual_balance(
+        &self,
+        batch: &BsrbRequest,
+        vb: U256,
+    ) -> Vec<BsrbOutcome> {
+        let balance = BsrbOutcome::Value(quantity_value(vb));
+        let rest: Vec<BsrbRead> = batch
+            .reads
+            .iter()
+            .copied()
+            .filter(|read| !matches!(read, BsrbRead::Balance { .. }))
+            .collect();
+        let rest_outcomes = if rest.is_empty() {
+            Vec::new()
+        } else {
+            let count = rest.len();
+            let sub = BsrbRequest {
+                context: batch.context,
+                reads: rest,
+            };
+            match self.blockx_resolve_batch(&sub).await {
+                Ok(outcomes) => outcomes,
+                Err(err) => vec![
+                    BsrbOutcome::Error {
+                        code: err.code(),
+                        message: err.message().to_string(),
+                    };
+                    count
+                ],
+            }
+        };
+        let mut rest_outcomes = rest_outcomes.into_iter();
+        batch
+            .reads
+            .iter()
+            .map(|read| match read {
+                BsrbRead::Balance { .. } => balance.clone(),
+                _ => rest_outcomes
+                    .next()
+                    .expect("one outcome per non-balance read"),
+            })
+            .collect()
+    }
 }
 
 async fn historical_item(
@@ -438,51 +518,16 @@ where
             }
         };
 
-        // State-read admission: wait on the async side (cancellable),
-        // move the permit into the blocking task so it is held until the
-        // reads finish. One batch takes one permit; the per-batch item
-        // cap bounds the work behind it.
-        let permit = match self.inner.evm_cfg().state_read_limiter.clone() {
-            Some(limiter) => {
-                let wait_start = Instant::now();
-                // acquire_owned only errors when the semaphore is closed,
-                // which never happens here.
-                let permit = limiter.acquire_owned().await.ok();
-                histogram!("leafage_state_read_queue_wait_seconds")
-                    .record(wait_start.elapsed().as_secs_f64());
-                permit
-            }
-            None => None,
-        };
-        let context = block_context(&batch.context);
-        let this = self.clone();
-        let local_batch = batch.clone();
-        let local_ctx = context.clone();
-        let local = utils::spawn_blocking_with_cancel(move |_token| {
-            let _permit = permit;
-            this.blockx_state_read_batch_inner(&local_batch, &local_ctx)
-        })
-        .await
-        .map_err(|_| internal_rpc_err("state read batch failed"))?;
-
-        let block_ctx = Some(context);
-        let results = match local {
-            Ok(outcomes) => {
-                self.blockx_retry_items_via_historical(&batch, outcomes, &block_ctx)
-                    .await
-            }
-            Err(local_err) => {
-                // Same fallback gate as the single methods: without an
-                // eligible historical client the batch-level error (e.g.
-                // -39006/-39007 from state resolution) is returned as-is.
-                if self.should_try_historical(&block_ctx).is_none() {
+        let results = match self.inner.virtual_balance() {
+            Some(vb) => self.blockx_resolve_with_virtual_balance(&batch, vb).await,
+            None => match self.blockx_resolve_batch(&batch).await {
+                Ok(results) => results,
+                Err(err) => {
                     counter!("leafage_state_batch_requests_total", "outcome" => "error")
                         .increment(1);
-                    return Err(local_err);
+                    return Err(err);
                 }
-                self.blockx_all_items_via_historical(&batch, &local_err, &block_ctx)
-                    .await
-            }
+            },
         };
         counter!("leafage_state_batch_requests_total", "outcome" => "ok").increment(1);
         Ok(Bytes::from(BsrbResponse { results }.encode()))

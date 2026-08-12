@@ -371,6 +371,124 @@ async fn batch_matches_single_methods_byte_for_byte() {
     let _ = std::fs::remove_dir_all(&db_path);
 }
 
+/// Virtual-balance chains (Tempo): getAddressBalance answers before
+/// any state resolution, so batch balance items must too — on a block
+/// the state node cannot resolve, balance items still return the
+/// virtual balance while state-dependent items fail per item with the
+/// exact single-method error.
+#[tokio::test(flavor = "multi_thread")]
+async fn virtual_balance_answers_before_state_resolution() {
+    let db_path = std::env::temp_dir().join(format!(
+        "leafage-blockx-vb-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&db_path);
+    std::fs::create_dir_all(&db_path).unwrap();
+    let tree = build_full_tree(&db_path);
+
+    let mut cfg = CfgEnv::new_with_spec(leafage_evm_chains::tempo::hardfork::TempoHardfork::T2);
+    cfg.chain_id = 1;
+    let addr = "127.0.0.1:18564";
+    let handle = ApiBuilder::new(tree.clone(), MultiChainCfgEnv::Tempo(cfg))
+        .build_and_run(
+            addr,
+            100,
+            Duration::from_secs(10),
+            false,
+            false,
+            "blockx-vb-test".to_string(),
+            100,
+            1024,
+        )
+        .await
+        .unwrap();
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let vb = quantity_bytes(leafage_evm_chains::tempo::VIRTUAL_BALANCE);
+
+    // Resolvable block: balance items are the virtual balance, the
+    // rest read real state.
+    let good = BsrbContext::Number(2);
+    let resp = send(
+        &client,
+        &BsrbRequest {
+            context: good,
+            reads: vec![
+                balance_read(ALICE),
+                nonce_read(CONTRACT),
+                storage_read(CONTRACT, pos(1)),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(value(&resp.results[0]), &vb);
+    let single_balance =
+        DebankApiClient::get_address_balance(&client, ALICE, Some(debank_ctx(good)))
+            .await
+            .unwrap();
+    assert_eq!(value(&resp.results[0]), &quantity_bytes(single_balance));
+    assert_eq!(value(&resp.results[1]), &Bytes::from(vec![0x01]));
+    let word: [u8; 32] = U256::from(0xabcdu64).to_be_bytes();
+    assert_eq!(value(&resp.results[2]), &word_bytes(word.into()));
+
+    // Unresolvable block, mixed batch: balance items still answer
+    // (exactly like the single method), state-dependent items carry
+    // the single-method error per item.
+    let stale = BsrbContext::Number(999);
+    let resp = send(
+        &client,
+        &BsrbRequest {
+            context: stale,
+            reads: vec![
+                balance_read(ALICE),
+                storage_read(CONTRACT, pos(1)),
+                balance_read(MISSING),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(value(&resp.results[0]), &vb);
+    assert_eq!(value(&resp.results[2]), &vb);
+    let single_balance =
+        DebankApiClient::get_address_balance(&client, ALICE, Some(debank_ctx(stale)))
+            .await
+            .unwrap();
+    assert_eq!(value(&resp.results[0]), &quantity_bytes(single_balance));
+    let (item_code, item_message) = error(&resp.results[1]);
+    let single_err = call_error(
+        DebankApiClient::get_storage_at(
+            &client,
+            CONTRACT,
+            JsonStorageKey::from(pos(1)),
+            Some(debank_ctx(stale)),
+        )
+        .await
+        .expect_err("unknown block must fail"),
+    );
+    assert_eq!(item_code, single_err.code());
+    assert_eq!(item_message, single_err.message());
+    assert_eq!(item_code, -39006);
+
+    // Unresolvable block, all-balance batch: no state work at all.
+    let resp = send(
+        &client,
+        &BsrbRequest {
+            context: stale,
+            reads: vec![balance_read(ALICE), balance_read(MISSING)],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(resp.results.iter().all(|r| value(r) == &vb));
+
+    handle.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
 /// Primary node only has genesis; the historical node has the full
 /// chain. Items failing locally are retried per item against the
 /// historical client, and items failing on both sides carry the
