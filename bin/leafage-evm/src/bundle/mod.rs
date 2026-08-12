@@ -13,7 +13,7 @@ use tokio::{io::AsyncReadExt, time::sleep};
 use tracing::warn;
 
 const BUNDLE_SIZE: u64 = 1_000;
-const STATE_DIFF_RANGE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const STATE_DIFF_GROUP_RANGE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 const BODY_READ_MAX_ATTEMPTS: u32 = 3;
 #[cfg(not(test))]
 const BODY_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -428,19 +428,13 @@ fn state_diff_range_end(
     start_position: usize,
     end_position: usize,
 ) -> Result<usize> {
-    let (payload_start, first_end) = index.payload_range(start_position)?;
-    let first_size = first_end - payload_start;
-    if first_size > STATE_DIFF_RANGE_LIMIT_BYTES {
-        bail!(
-            "StateDiff entry {start_position} is {first_size} bytes, exceeding the {} byte range limit",
-            STATE_DIFF_RANGE_LIMIT_BYTES
-        );
-    }
-
+    let (payload_start, _) = index.payload_range(start_position)?;
     let mut range_end = start_position;
     for position in start_position + 1..=end_position {
         let (_, payload_end) = index.payload_range(position)?;
-        if payload_end - payload_start > STATE_DIFF_RANGE_LIMIT_BYTES {
+        // The limit only bounds ranges that combine multiple entries. A single
+        // entry may itself be larger and must still be fetched on its own.
+        if payload_end - payload_start > STATE_DIFF_GROUP_RANGE_LIMIT_BYTES {
             break;
         }
         range_end = position;
@@ -679,18 +673,23 @@ mod tests {
 
     #[test]
     fn groups_ranges_without_exceeding_limit() {
-        let index = index_with_sizes(&[STATE_DIFF_RANGE_LIMIT_BYTES - 1, 1, 1]);
+        let index = index_with_sizes(&[STATE_DIFF_GROUP_RANGE_LIMIT_BYTES - 1, 1, 1]);
         assert_eq!(state_diff_range_end(&index, 0, 2).unwrap(), 1);
         assert_eq!(state_diff_range_end(&index, 2, 2).unwrap(), 2);
     }
 
     #[test]
-    fn rejects_one_entry_larger_than_limit() {
-        let index = index_with_sizes(&[STATE_DIFF_RANGE_LIMIT_BYTES + 1]);
-        assert!(state_diff_range_end(&index, 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("exceeding"));
+    fn fetches_an_oversized_entry_by_itself() {
+        let index = index_with_sizes(&[
+            STATE_DIFF_GROUP_RANGE_LIMIT_BYTES + 1,
+            STATE_DIFF_GROUP_RANGE_LIMIT_BYTES / 2,
+            STATE_DIFF_GROUP_RANGE_LIMIT_BYTES / 2,
+            1,
+        ]);
+
+        assert_eq!(state_diff_range_end(&index, 0, 3).unwrap(), 0);
+        assert_eq!(state_diff_range_end(&index, 1, 3).unwrap(), 2);
+        assert_eq!(state_diff_range_end(&index, 3, 3).unwrap(), 3);
     }
 
     #[tokio::test]
