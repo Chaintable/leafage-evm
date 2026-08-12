@@ -447,10 +447,13 @@ where
     }
 
     async fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| this.get_balance_inner(address, block_id))
-            .await
-            .map_err(|e| internal_rpc_err(e.to_string()))?
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
+            this.get_balance_inner(address, block_id)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
     fn get_block_by_id_inner(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
@@ -530,10 +533,13 @@ where
     }
 
     async fn get_code_impl(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| this.get_code_inner(address, block_number))
-            .await
-            .map_err(|e| internal_rpc_err(e.to_string()))?
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
+            this.get_code_inner(address, block_number)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
     fn get_storage_at_inner(
@@ -584,8 +590,9 @@ where
         index: H256,
         block_number: BlockId,
     ) -> RpcResult<H256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.get_storage_at_inner(address, index, block_number)
         })
         .await
@@ -632,8 +639,9 @@ where
         address: Address,
         block_number: BlockId,
     ) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.get_transaction_count_inner(address, block_number)
         })
         .await
