@@ -242,7 +242,7 @@ where
             .map(|read| match read {
                 BlockxStateRead::AddressCode { index, address } => {
                     match &code_results[code_slots[address]] {
-                        Ok(code) => ok_outcome(*index, BlockxStateReadValue::Code(code.clone())),
+                        Ok(code) => ok_outcome(*index, BlockxStateReadValue::code(code.clone())),
                         Err(err) => err_outcome(*index, err.clone()),
                     }
                 }
@@ -253,7 +253,7 @@ where
                 } => match &storage_results[storage_slots[&(*address, position.as_b256())]] {
                     Ok(value) => {
                         let raw: [u8; 32] = value.to_be_bytes();
-                        ok_outcome(*index, BlockxStateReadValue::Storage(raw.into()))
+                        ok_outcome(*index, BlockxStateReadValue::storage(raw.into()))
                     }
                     Err(err) => err_outcome(*index, err.clone()),
                 },
@@ -349,13 +349,13 @@ async fn historical_item(
         BlockxStateRead::AddressCode { address, .. } => client
             .get_address_code(*address, block_ctx.clone())
             .await
-            .map(BlockxStateReadValue::Code),
+            .map(BlockxStateReadValue::code),
         BlockxStateRead::StorageAt {
             address, position, ..
         } => client
             .get_storage_at(*address, position.clone(), block_ctx.clone())
             .await
-            .map(BlockxStateReadValue::Storage),
+            .map(BlockxStateReadValue::storage),
     }
 }
 

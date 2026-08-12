@@ -95,14 +95,14 @@ fn response_fixtures_roundtrip() {
         serde_json::from_value(fixture("response_success")).unwrap();
     assert_eq!(
         resp.results[0].value,
-        Some(BlockxStateReadValue::Code(Bytes::from(vec![
+        Some(BlockxStateReadValue::code(Bytes::from(vec![
             0x60, 0x80, 0x60, 0x40, 0x52
         ])))
     );
     let word: [u8; 32] = U256::from(0xabcdu64).to_be_bytes();
     assert_eq!(
         resp.results[1].value,
-        Some(BlockxStateReadValue::Storage(word.into()))
+        Some(BlockxStateReadValue::storage(word.into()))
     );
     assert!(resp.results.iter().all(|r| r.error.is_none()));
 
@@ -138,14 +138,24 @@ fn malformed_address_is_rejected() {
 }
 
 /// Storage values always serialize as full 32-byte words and code as
-/// variable-length hex — the exact single-method shapes.
+/// variable-length hex — the exact single-method shapes. A 32-byte
+/// contract code and a storage word are the same value on the wire;
+/// the request item's `kind` carries the distinction, the value type
+/// deliberately does not guess.
 #[test]
 fn value_shapes_match_single_methods() {
-    let storage = BlockxStateReadValue::Storage(H256::with_last_byte(1));
+    let storage = BlockxStateReadValue::storage(H256::with_last_byte(1));
     assert_eq!(
         serde_json::to_value(&storage).unwrap(),
         json!("0x0000000000000000000000000000000000000000000000000000000000000001")
     );
-    let code = BlockxStateReadValue::Code(Bytes::new());
+    let code = BlockxStateReadValue::code(Bytes::new());
     assert_eq!(serde_json::to_value(&code).unwrap(), json!("0x"));
+
+    let word = H256::repeat_byte(0x60);
+    let code_32 = BlockxStateReadValue::code(Bytes::copy_from_slice(word.as_slice()));
+    assert_eq!(code_32, BlockxStateReadValue::storage(word));
+    let roundtripped: BlockxStateReadValue =
+        serde_json::from_value(serde_json::to_value(&code_32).unwrap()).unwrap();
+    assert_eq!(roundtripped, code_32);
 }
