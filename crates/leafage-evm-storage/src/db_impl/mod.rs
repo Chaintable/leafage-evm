@@ -292,6 +292,15 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::MDBXArchive(db) => db.read_storage_many(keys),
         }
     }
+
+    fn supports_batched_reads(&self) -> bool {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.supports_batched_reads(),
+            MultiStateDB::RocksDBArchive(db) => db.supports_batched_reads(),
+            MultiStateDB::MDBXState(db) => db.supports_batched_reads(),
+            MultiStateDB::MDBXArchive(db) => db.supports_batched_reads(),
+        }
+    }
 }
 
 pub enum MultiWriteBatch {
@@ -470,5 +479,54 @@ impl StateDBWrite for MultiStateDB {
             (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => db.commit(b),
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::StateDBWrapper;
+    use crate::interface::{EvmStorageWrapper, StateDB};
+    use leafage_evm_types::BlockNumberOrTag;
+
+    /// The capability flag must survive every wrapper of the real
+    /// non-archive RocksDB stack: a missed forwarding anywhere defaults
+    /// to `false` and silently disables batch-capability consumers
+    /// (multicall prefetch) with no functional failure to catch it.
+    #[test]
+    fn batched_read_capability_propagates_through_the_stack() {
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-cap-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let db =
+                MultiStorage::open(&dir, 64, StorageKind::Rocksdb, false, false, false).unwrap();
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .unwrap()
+                .unwrap();
+            assert!(StateDBRead::supports_batched_reads(&state));
+            let wrapped = StateDBWrapper(state);
+            assert!(StateDB::supports_batched_reads(&wrapped));
+            assert!(EvmStorageWrapper {
+                db: &wrapped,
+                ovm_address: None,
+                normalize_state_key: false,
+            }
+            .supports_batched_reads());
+            // The OVM balance override forces the scalar account path,
+            // so the wrapper reports false there.
+            assert!(!EvmStorageWrapper {
+                db: &wrapped,
+                ovm_address: Some(H256::repeat_byte(1)),
+                normalize_state_key: false,
+            }
+            .supports_batched_reads());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
