@@ -6,8 +6,8 @@ use leafage_evm_types::Bytes;
 /// a fixed block. The parameter and result are hex-encoded BSRB/1
 /// binary payloads (see `leafage_evm_types::rpc::blockx`): the JSON-RPC
 /// shell exists so nodex-proxy keeps routing by method name, while the
-/// payload itself stays cheap to build and parse inside BlockX's
-/// executor sandbox. Not part of the public SDK surface, but validated
+/// payload stays memcpy-cheap for BlockX's worker-side Go facade and
+/// this server. Not part of the public SDK surface, but validated
 /// and rate-limited like any other network input.
 #[rpc(server, client, namespace = "blockx")]
 #[async_trait::async_trait]

@@ -1,15 +1,10 @@
 //! Wire-contract tests for `blockx_stateReadBatch` (BSRB/1).
 //!
-//! The golden hex payloads below are the cross-repo contract with
-//! BlockX's executor-side provider, which packs requests with
-//! `struct.pack` and parses responses with `memoryview` (mirrored in
-//! the BlockX repository). All integers are big-endian:
-//!
-//! request  = ">B B (32s|Q) H" + per item ">B 20s (32s)?"
-//! response = ">B H"           + per item ">B I payload" (ok)
-//!                             |          ">B i I msg"    (error)
-//!
-//! Change the layout only by bumping BSRB_VERSION.
+//! The golden hex payloads below are the cross-repo contract with the
+//! Go batching facade in BlockX's worker (fixed-offset encoding/binary;
+//! the executor sandbox never sees this wire), mirrored in the BlockX
+//! repository. All integers are big-endian; change the layout only by
+//! bumping BSRB_VERSION.
 
 use alloy::primitives::hex;
 use leafage_evm_types::{

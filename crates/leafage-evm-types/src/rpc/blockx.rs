@@ -2,9 +2,9 @@
 //!
 //! The method carries a compact binary payload inside the ordinary
 //! JSON-RPC shell: `params` is one hex-encoded byte string and the
-//! result is another. The layout is a cross-repo contract with BlockX's
-//! executor-side provider (which packs it with `struct.pack` and parses
-//! it with `memoryview`); the golden byte vectors live in
+//! result is another. The layout is a cross-repo contract with the Go
+//! batching facade in BlockX's worker (fixed-offset encoding/binary;
+//! the executor sandbox never sees it); the golden byte vectors live in
 //! `tests/blockx_wire_contract.rs` in leafage-evm-rpc and are mirrored
 //! in the BlockX repository. Evolve it only by bumping [`BSRB_VERSION`].
 //!
