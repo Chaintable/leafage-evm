@@ -61,9 +61,11 @@ fn request_fixture_roundtrips() {
     // and Leafage only ever deserializes this field.
     let reserialized = serde_json::to_value(&batch).unwrap();
     assert_eq!(reserialized["reads"], value["reads"]);
-    let reparsed: BlockxStateReadBatch =
-        serde_json::from_value(reserialized.clone()).unwrap();
-    assert_eq!(reparsed.block_context.block_id, batch.block_context.block_id);
+    let reparsed: BlockxStateReadBatch = serde_json::from_value(reserialized.clone()).unwrap();
+    assert_eq!(
+        reparsed.block_context.block_id,
+        batch.block_context.block_id
+    );
     assert_eq!(reserialized["blockContext"]["type"], json!("Equals"));
 }
 

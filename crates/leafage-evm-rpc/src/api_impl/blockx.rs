@@ -21,8 +21,8 @@ use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     Address, BlockId, BlockNumberOrTag, BlockType, BlockxStateRead, BlockxStateReadBatch,
     BlockxStateReadBatchResp, BlockxStateReadError, BlockxStateReadOutcome, BlockxStateReadValue,
-    Bytes, DebankBlockContext, DebankErrorCode, H256, KECCAK256_EMPTY, U256,
-    BLOCKX_STATE_READ_BATCH_MAX_ITEMS,
+    Bytes, DebankBlockContext, DebankErrorCode, BLOCKX_STATE_READ_BATCH_MAX_ITEMS, H256,
+    KECCAK256_EMPTY, U256,
 };
 use metrics::{counter, histogram};
 use revm::database::DatabaseRef;
@@ -242,9 +242,7 @@ where
             .map(|read| match read {
                 BlockxStateRead::AddressCode { index, address } => {
                     match &code_results[code_slots[address]] {
-                        Ok(code) => {
-                            ok_outcome(*index, BlockxStateReadValue::Code(code.clone()))
-                        }
+                        Ok(code) => ok_outcome(*index, BlockxStateReadValue::Code(code.clone())),
                         Err(err) => err_outcome(*index, err.clone()),
                     }
                 }
@@ -252,15 +250,13 @@ where
                     index,
                     address,
                     position,
-                } => {
-                    match &storage_results[storage_slots[&(*address, position.as_b256())]] {
-                        Ok(value) => {
-                            let raw: [u8; 32] = value.to_be_bytes();
-                            ok_outcome(*index, BlockxStateReadValue::Storage(raw.into()))
-                        }
-                        Err(err) => err_outcome(*index, err.clone()),
+                } => match &storage_results[storage_slots[&(*address, position.as_b256())]] {
+                    Ok(value) => {
+                        let raw: [u8; 32] = value.to_be_bytes();
+                        ok_outcome(*index, BlockxStateReadValue::Storage(raw.into()))
                     }
-                }
+                    Err(err) => err_outcome(*index, err.clone()),
+                },
             })
             .collect();
         histogram!("leafage_state_batch_latency_seconds", "stage" => "total")

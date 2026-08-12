@@ -72,10 +72,7 @@ fn genesis_diff() -> BlockStorageDiff {
             code_hash,
         });
     }
-    diff.new_codes.push(NewCode {
-        code_hash,
-        code,
-    });
+    diff.new_codes.push(NewCode { code_hash, code });
     diff
 }
 
@@ -240,7 +237,10 @@ async fn batch_matches_single_methods_byte_for_byte() {
         assert_eq!(code_json, serde_json::to_value(contract_code()).unwrap());
         let storage_json = serde_json::to_value(resp.results[4].value.as_ref().unwrap()).unwrap();
         let word: [u8; 32] = U256::from(0xabcdu64).to_be_bytes();
-        assert_eq!(storage_json, serde_json::to_value(H256::from(word)).unwrap());
+        assert_eq!(
+            storage_json,
+            serde_json::to_value(H256::from(word)).unwrap()
+        );
         let zero_json = serde_json::to_value(resp.results[5].value.as_ref().unwrap()).unwrap();
         assert_eq!(zero_json, serde_json::to_value(H256::ZERO).unwrap());
     }
@@ -334,11 +334,7 @@ async fn batch_matches_single_methods_byte_for_byte() {
 /// combined error — identical to the single-method fallback text.
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_falls_back_to_historical_per_item() {
-    let unique = format!(
-        "{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    );
+    let unique = format!("{}-{:?}", std::process::id(), std::thread::current().id());
     let hist_path = std::env::temp_dir().join(format!("leafage-blockx-hist-{unique}"));
     let primary_path = std::env::temp_dir().join(format!("leafage-blockx-primary-{unique}"));
     for p in [&hist_path, &primary_path] {

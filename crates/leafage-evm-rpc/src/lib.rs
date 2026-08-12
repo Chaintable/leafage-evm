@@ -1,7 +1,7 @@
 mod api;
 pub use api::{
-    BlockxApiClient, BlockxApiServer, DebankApiClient, DebankApiServer, EthApiClient,
-    EthApiServer, TraceApiClient,
+    BlockxApiClient, BlockxApiServer, DebankApiClient, DebankApiServer, EthApiClient, EthApiServer,
+    TraceApiClient,
 };
 
 mod error;

@@ -25,12 +25,18 @@ pub trait StateDB {
     /// The scalar default keeps every implementation correct; backends
     /// that can serve point reads in one storage round trip override it.
     fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
-        addresses.iter().map(|address| self.basic(*address)).collect()
+        addresses
+            .iter()
+            .map(|address| self.basic(*address))
+            .collect()
     }
 
     /// Batched [`StateDB::code_by_hash`]: one result per input, same order.
     fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, Self::Error> {
-        code_hashes.iter().map(|hash| self.code_by_hash(*hash)).collect()
+        code_hashes
+            .iter()
+            .map(|hash| self.code_by_hash(*hash))
+            .collect()
     }
 
     /// Batched [`StateDB::storage`] over `(address, index)` pairs: one
