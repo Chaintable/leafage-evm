@@ -141,6 +141,55 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     }
 }
 
+impl<T: StateDB> EvmStorageWrapper<T> {
+    /// Batched [`DatabaseRef::basic_ref`]: one result per input, same
+    /// order. On OVM-configured chains every account read needs an extra
+    /// balance-slot read whose key derivation bypasses
+    /// normalize-state-key, so the batch falls back to the scalar path
+    /// there to keep that special case in exactly one place.
+    pub fn basic_many_ref(
+        &self,
+        addresses: &[Address],
+    ) -> Result<Vec<Option<AccountInfo>>, T::Error> {
+        if self.ovm_address.is_some() {
+            return addresses
+                .iter()
+                .map(|address| self.basic_ref(*address))
+                .collect();
+        }
+        let hashed: Vec<H256> = addresses
+            .iter()
+            .map(|address| keccak256(address.as_slice()))
+            .collect();
+        self.db.basic_many(&hashed)
+    }
+
+    /// Batched [`DatabaseRef::storage_ref`] over `(address, index)`
+    /// pairs: one result per input, same order. Applies the same
+    /// address keccak and normalize-state-key rules as the scalar path.
+    pub fn storage_many_ref(&self, keys: &[(Address, U256)]) -> Result<Vec<U256>, T::Error> {
+        let hashed: Vec<(H256, H256)> = keys
+            .iter()
+            .map(|(address, index)| {
+                let address = keccak256(address.as_slice());
+                let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
+                    to_normalize_state_key(*index)
+                } else {
+                    index.to_be_bytes()
+                });
+                (address, index)
+            })
+            .collect();
+        self.db.storage_many(&hashed)
+    }
+
+    /// Batched [`DatabaseRef::code_by_hash_ref`]: one result per input,
+    /// same order.
+    pub fn code_by_hash_many_ref(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, T::Error> {
+        self.db.code_by_hash_many(code_hashes)
+    }
+}
+
 /// NormalizeStateKey ANDs the 0th bit of the first byte in `key`,
 /// which ensures this bit will be 0 and all other bits are left the same.
 /// This partitions normal state storage from multicoin storage.
@@ -215,9 +264,95 @@ pub trait EvmStorageWrite {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::str::FromStr;
 
     use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("mock error")]
+    struct MockErr;
+    impl DBErrorMarker for MockErr {}
+
+    /// Records every key reaching the underlying [`StateDB`], so the
+    /// tests can assert the batched wrappers derive exactly the same
+    /// keys as the scalar `DatabaseRef` methods.
+    #[derive(Debug, Default)]
+    struct RecordingDB {
+        basic_keys: RefCell<Vec<H256>>,
+        storage_keys: RefCell<Vec<(H256, H256)>>,
+    }
+
+    impl StateDB for RecordingDB {
+        type Error = MockErr;
+        fn basic(&self, address: H256) -> Result<Option<AccountInfo>, MockErr> {
+            self.basic_keys.borrow_mut().push(address);
+            let mut info = AccountInfo::default();
+            info.nonce = 7;
+            Ok(Some(info))
+        }
+        fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
+            Ok(Bytecode::default())
+        }
+        fn storage(&self, address: H256, index: H256) -> Result<U256, MockErr> {
+            self.storage_keys.borrow_mut().push((address, index));
+            Ok(U256::from(42u64))
+        }
+        fn block_hash(&self, _number: u64) -> Result<H256, MockErr> {
+            Ok(H256::ZERO)
+        }
+    }
+
+    #[test]
+    fn batched_wrapper_reads_derive_same_keys_as_scalar() {
+        for normalize in [false, true] {
+            let wrapper = EvmStorageWrapper {
+                db: RecordingDB::default(),
+                ovm_address: None,
+                normalize_state_key: normalize,
+            };
+            let address = Address::repeat_byte(0x11);
+            let index = U256::from(0x8000_0001u64) << 248usize;
+
+            let scalar = wrapper.storage_ref(address, index).unwrap();
+            let batched = wrapper.storage_many_ref(&[(address, index)]).unwrap();
+            assert_eq!(batched, vec![scalar]);
+            let keys = wrapper.db.storage_keys.borrow();
+            assert_eq!(keys[0], keys[1], "normalize={normalize}");
+
+            let scalar = wrapper.basic_ref(address).unwrap();
+            let batched = wrapper.basic_many_ref(&[address]).unwrap();
+            assert_eq!(batched, vec![scalar]);
+            let keys = wrapper.db.basic_keys.borrow();
+            assert_eq!(keys[0], keys[1]);
+        }
+    }
+
+    /// OVM chains fall back to the scalar path so the balance-slot
+    /// override (whose key derivation skips normalize-state-key) stays
+    /// in one place.
+    #[test]
+    fn batched_basic_keeps_ovm_balance_override() {
+        let ovm_address = H256::repeat_byte(0x42);
+        let wrapper = EvmStorageWrapper {
+            db: RecordingDB::default(),
+            ovm_address: Some(ovm_address),
+            normalize_state_key: true,
+        };
+        let address = Address::repeat_byte(0x11);
+
+        let batched = wrapper.basic_many_ref(&[address]).unwrap();
+        let account = batched[0].as_ref().unwrap();
+        // Balance overridden from the OVM storage slot, nonce untouched.
+        assert_eq!(account.balance, U256::from(42u64));
+        assert_eq!(account.nonce, 7);
+        // The balance slot is keyed by the raw (non-normalized) OVM key.
+        let keys = wrapper.db.storage_keys.borrow();
+        assert_eq!(
+            keys[0],
+            (ovm_address, keccak256(get_ovm_balance_key(address)).into())
+        );
+    }
 
     #[test]
     fn test_get_ovm_balance_key() {

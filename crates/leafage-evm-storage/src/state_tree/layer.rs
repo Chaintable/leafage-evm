@@ -408,6 +408,68 @@ impl<DB> HybridStateDB<DB> {
     }
 }
 
+impl<DB: StateDB> HybridStateDB<DB> {
+    /// Shared walk for the batched reads: resolve each key through the
+    /// diff layers and the shared cache first, fetch the remaining
+    /// unique keys from the bottom DB in one batched call, refill the
+    /// cache under the same strictly-higher-tag rule as the scalar
+    /// paths, and restore input order (duplicates share one fetch).
+    fn read_many_layered<K, V>(
+        &self,
+        keys: &[K],
+        diff_lookup: impl Fn(&DiffLayer, &K) -> Option<V>,
+        cache_lookup: impl Fn(&CacheDiskLayer, &K) -> Option<V>,
+        cache_fill: impl Fn(&CacheDiskLayer, &K, u64, &V),
+        fetch_many: impl Fn(&[K]) -> Result<Vec<V>, DB::Error>,
+    ) -> Result<Vec<V>, Error<DB::Error>>
+    where
+        K: Copy + Eq + std::hash::Hash,
+        V: Clone,
+    {
+        let cache = match self.flattened.terminal.as_ref() {
+            LinkedDiffLayer::CacheDiskLayer(cache) if cache.enabled => Some(cache),
+            _ => None,
+        };
+        let mut out: Vec<Option<V>> = vec![None; keys.len()];
+        let mut unresolved: Vec<K> = Vec::new();
+        let mut unresolved_slots: FastMap<K, Vec<usize>> = FastMap::default();
+        'keys: for (pos, key) in keys.iter().enumerate() {
+            for layer in self.flattened.layers.iter() {
+                if let Some(value) = diff_lookup(layer.unwrap_diff_layer(), key) {
+                    out[pos] = Some(value);
+                    continue 'keys;
+                }
+            }
+            if let Some(cache) = cache {
+                if let Some(value) = cache_lookup(cache, key) {
+                    out[pos] = Some(value);
+                    continue 'keys;
+                }
+            }
+            unresolved_slots
+                .entry(*key)
+                .or_insert_with(|| {
+                    unresolved.push(*key);
+                    Vec::new()
+                })
+                .push(pos);
+        }
+        if !unresolved.is_empty() {
+            let fetched = fetch_many(&unresolved)?;
+            debug_assert_eq!(fetched.len(), unresolved.len());
+            for (key, value) in unresolved.iter().zip(fetched) {
+                if let (Some(cache), Some(h)) = (cache, self.cache_view_height) {
+                    cache_fill(cache, key, h, &value);
+                }
+                for pos in unresolved_slots.get(key).into_iter().flatten() {
+                    out[*pos] = Some(value.clone());
+                }
+            }
+        }
+        Ok(out.into_iter().map(|value| value.unwrap()).collect())
+    }
+}
+
 impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
@@ -500,6 +562,63 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
         }
     }
 
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
+        self.read_many_layered(
+            addresses,
+            |diff, key| diff.accounts.get(key).cloned(),
+            |cache, key| cache.accounts.get(key).map(|(_, value)| value),
+            |cache, key, h, value| {
+                let new_val = (h, value.clone());
+                cache
+                    .accounts
+                    .entry(*key)
+                    .and_compute_with(|maybe| match maybe {
+                        Some(e) if e.value().0 >= h => Op::Nop,
+                        _ => Op::Put(new_val),
+                    });
+            },
+            |keys| self.statedb.basic_many(keys),
+        )
+    }
+
+    fn storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Self::Error> {
+        self.read_many_layered(
+            keys,
+            |diff, key| diff.storage.get(key).copied(),
+            |cache, key| cache.storages.get(key).map(|(_, value)| value),
+            |cache, key, h, value| {
+                let new_val = (h, *value);
+                cache
+                    .storages
+                    .entry(*key)
+                    .and_compute_with(|maybe| match maybe {
+                        Some(e) if e.value().0 >= h => Op::Nop,
+                        _ => Op::Put(new_val),
+                    });
+            },
+            |keys| self.statedb.storage_many(keys),
+        )
+    }
+
+    fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, Self::Error> {
+        self.read_many_layered(
+            code_hashes,
+            |diff, key| diff.contracts.get(key).cloned(),
+            |cache, key| cache.contracts.get(key).map(|(_, value)| value),
+            |cache, key, h, value| {
+                let new_val = (h, value.clone());
+                cache
+                    .contracts
+                    .entry(*key)
+                    .and_compute_with(|maybe| match maybe {
+                        Some(e) if e.value().0 >= h => Op::Nop,
+                        _ => Op::Put(new_val),
+                    });
+            },
+            |keys| self.statedb.code_by_hash_many(keys),
+        )
+    }
+
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         for layer in self.flattened.layers.iter() {
             let diff = layer.unwrap_diff_layer();
@@ -554,28 +673,30 @@ mod tests {
         storage: HashMap<(H256, H256), U256>,
         accounts: HashMap<H256, Option<AccountInfo>>,
         last_block: Option<Arc<BlockInfo>>,
+        reads: u64,
+    }
+
+    impl MockDB {
+        fn reads(&self) -> u64 {
+            self.inner.lock().unwrap().reads
+        }
     }
 
     impl StateDB for MockDB {
         type Error = MockErr;
         fn basic(&self, address: H256) -> Result<Option<AccountInfo>, MockErr> {
-            Ok(self
-                .inner
-                .lock()
-                .unwrap()
-                .accounts
-                .get(&address)
-                .cloned()
-                .flatten())
+            let mut inner = self.inner.lock().unwrap();
+            inner.reads += 1;
+            Ok(inner.accounts.get(&address).cloned().flatten())
         }
         fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
+            self.inner.lock().unwrap().reads += 1;
             Ok(Bytecode::default())
         }
         fn storage(&self, address: H256, index: H256) -> Result<U256, MockErr> {
-            Ok(self
-                .inner
-                .lock()
-                .unwrap()
+            let mut inner = self.inner.lock().unwrap();
+            inner.reads += 1;
+            Ok(inner
                 .storage
                 .get(&(address, index))
                 .copied()
@@ -702,6 +823,85 @@ mod tests {
         assert!(db.basic(key(9999)).unwrap().is_none());
         // Block hashes resolve from layer metadata.
         assert_eq!(db.block_hash(3).unwrap(), key(3000 + 2));
+    }
+
+    /// Batched reads resolve through the same layers as the scalar
+    /// reads, only fetch each unique unresolved key once, and refill
+    /// the shared cache so later reads skip the bottom DB entirely.
+    #[test]
+    fn batched_reads_match_scalar_and_dedup() {
+        let (top, addr) = build_chain(4);
+        let mock = MockDB::default();
+        {
+            let mut inner = mock.inner.lock().unwrap();
+            inner.storage.insert((addr, key(7000)), U256::from(70u64));
+            let mut info = AccountInfo::default();
+            info.nonce = 9;
+            inner.accounts.insert(key(7001), Some(info));
+        }
+        let db = HybridStateDB::new(top, mock.clone(), Some(0));
+
+        // diff-layer hit, bottom hit, missing key and a duplicate.
+        let storage_keys = vec![
+            (addr, key(1000)),
+            (addr, key(7000)),
+            (addr, key(9999)),
+            (addr, key(7000)),
+        ];
+        let batched = db.storage_many(&storage_keys).unwrap();
+        assert_eq!(batched[0], U256::from(1u64));
+        assert_eq!(batched[1], U256::from(70u64));
+        assert_eq!(batched[2], U256::ZERO);
+        assert_eq!(batched[3], U256::from(70u64));
+        // 7000 deduped to one bottom read, 9999 read once.
+        assert_eq!(mock.reads(), 2);
+
+        let addresses = vec![key(2000), key(7001), key(8888), key(7001)];
+        let accounts = db.basic_many(&addresses).unwrap();
+        assert_eq!(accounts[0].as_ref().unwrap().nonce, 1);
+        assert_eq!(accounts[1].as_ref().unwrap().nonce, 9);
+        assert!(accounts[2].is_none());
+        assert_eq!(accounts[3].as_ref().unwrap().nonce, 9);
+        assert_eq!(mock.reads(), 4);
+
+        // Scalar reads agree and are now served from diff layers/cache.
+        for (k, got) in storage_keys.iter().zip(&batched) {
+            assert_eq!(*got, db.storage(k.0, k.1).unwrap());
+        }
+        for (a, got) in addresses.iter().zip(&accounts) {
+            assert_eq!(*got, db.basic(*a).unwrap());
+        }
+        // The batch refilled the shared cache: no further bottom reads.
+        let _ = db.storage_many(&storage_keys).unwrap();
+        let _ = db.basic_many(&addresses).unwrap();
+        assert_eq!(mock.reads(), 4);
+    }
+
+    /// With the shared cache disabled the batch goes straight to the
+    /// bottom DB for unresolved keys and never touches moka.
+    #[test]
+    fn batched_reads_bypass_disabled_cache() {
+        let addr = key(0xabcd);
+        let cache = Arc::new(LinkedDiffLayer::CacheDiskLayer(CacheDiskLayer::new(
+            1000, 1000, 1000, 0, false,
+        )));
+        let mock = MockDB::default();
+        mock.inner
+            .lock()
+            .unwrap()
+            .storage
+            .insert((addr, key(1)), U256::from(5u64));
+        let db = HybridStateDB::new(cache, mock.clone(), None);
+
+        let keys = vec![(addr, key(1)), (addr, key(1))];
+        assert_eq!(
+            db.storage_many(&keys).unwrap(),
+            vec![U256::from(5u64), U256::from(5u64)]
+        );
+        // Deduped fetch, and repeated batches keep hitting the bottom DB.
+        assert_eq!(mock.reads(), 1);
+        let _ = db.storage_many(&keys).unwrap();
+        assert_eq!(mock.reads(), 2);
     }
 
     #[test]
