@@ -46,6 +46,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 custom_cfg,
                 exec_limiter,
                 state_read_limiter,
+                multicall_parallelism: 0,
             },
             historical_client,
             historical_height,

@@ -392,6 +392,37 @@ where
     })
     .await
 }
+
+/// [`spawn_blocking_limited_with_cancel`] holding `permits` permits for
+/// the lifetime of the blocking task. Used by parallel multicall, where
+/// one request fans out onto `permits` worker threads and each must be
+/// accounted against the EVM exec limiter — the builder guarantees
+/// `permits` never exceeds the semaphore's total, so acquire_many
+/// cannot deadlock.
+pub async fn spawn_blocking_limited_many_with_cancel<F, R>(
+    limiter: Option<Arc<Semaphore>>,
+    permits: u32,
+    task: F,
+) -> Result<R, JoinError>
+where
+    F: FnOnce(CancellationToken) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let permit = match limiter {
+        Some(sem) => sem.acquire_many_owned(permits).await.ok(),
+        None => None,
+    };
+
+    let token = CancellationToken::new();
+
+    let _guard = token.clone().drop_guard();
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task(token)
+    })
+    .await
+}
 #[cfg(test)]
 mod tests {
     use super::*;
