@@ -3,6 +3,9 @@ use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
+use crate::api_impl::historical_overload::{
+    historical_rpc_overloaded_error, is_historical_rpc_overloaded,
+};
 use crate::api_impl::utils::build_debank_traces;
 use crate::error::{internal_rpc_err, rpc_error_with_code};
 
@@ -1113,6 +1116,24 @@ fn combine_errors(
     )
 }
 
+#[inline]
+fn map_historical_error(
+    local_err: Option<jsonrpsee::types::ErrorObjectOwned>,
+    historical_err: jsonrpsee::core::ClientError,
+) -> jsonrpsee::types::ErrorObjectOwned {
+    if is_historical_rpc_overloaded(&historical_err) {
+        return historical_rpc_overloaded_error();
+    }
+
+    match local_err {
+        Some(local_err) => combine_errors(local_err, historical_err),
+        None => rpc_error_with_code(
+            DebankErrorCode::InternalError as i32,
+            format!("Historical RPC error: {}", historical_err),
+        ),
+    }
+}
+
 #[async_trait::async_trait]
 impl<C> DebankApiServer for Api<C>
 where
@@ -1143,7 +1164,7 @@ where
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1169,7 +1190,7 @@ where
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1189,7 +1210,7 @@ where
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
                     match historical_client.get_address_code(address, block_ctx).await {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1216,7 +1237,7 @@ where
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1263,7 +1284,7 @@ where
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1294,7 +1315,7 @@ where
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1325,12 +1346,7 @@ where
                 return historical_client
                     .get_block_by_height(height)
                     .await
-                    .map_err(|e| {
-                        rpc_error_with_code(
-                            DebankErrorCode::InternalError as i32,
-                            format!("Historical RPC error: {}", e),
-                        )
-                    });
+                    .map_err(|error| map_historical_error(None, error));
             }
         }
 
@@ -1344,7 +1360,7 @@ where
                 if let Some(historical_client) = self.inner.historical_client() {
                     match historical_client.get_block_by_id(id).await {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1360,7 +1376,7 @@ where
                 if let Some(historical_client) = self.inner.historical_client() {
                     match historical_client.block_is_valid(id).await {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
@@ -1387,7 +1403,7 @@ where
                         .await
                     {
                         Ok(result) => Ok(result),
-                        Err(historical_err) => Err(combine_errors(err, historical_err)),
+                        Err(historical_err) => Err(map_historical_error(Some(err), historical_err)),
                     }
                 } else {
                     Err(err)
