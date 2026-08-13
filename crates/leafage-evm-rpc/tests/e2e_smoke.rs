@@ -202,16 +202,14 @@ async fn multicall_prefetch_matches_scalar_semantics() {
     let bob = Address::repeat_byte(0x22);
     let contract = |n: u8| Address::repeat_byte(0x40 + n);
 
-    // Genesis: alice plus 6 contracts, each with distinct code and
-    // storage slot 0 = n + 100, committed straight to the DB.
+    // Genesis: 6 contracts, each with distinct code and storage slot
+    // 0 = n + 100, committed straight to the DB. Alice deliberately
+    // lands in the in-memory diff layer of block 1 instead: the DB
+    // decode path rewrites a zero code hash to KECCAK_EMPTY, but diff
+    // layers serve the raw `NewAccount` value, which is where the
+    // prefetch/lazy divergence is observable.
     let db = MultiStorage::open(&db_path, 64, StorageKind::Rocksdb, false, false, false).unwrap();
     let mut genesis_diff = BlockStorageDiff::default();
-    genesis_diff.new_accounts.push(NewAccount {
-        address: keccak256(alice.as_slice()),
-        balance: U256::from(ONE_ETH),
-        nonce: 0,
-        code_hash: H256::ZERO,
-    });
     for n in 0..6u8 {
         let code = sload0_code(n);
         genesis_diff.new_codes.push(NewCode {
@@ -232,6 +230,23 @@ async fn multicall_prefetch_matches_scalar_semantics() {
             }],
         });
     }
+    // contract(6): `CALLER; EXTCODEHASH; MSTORE; RETURN` — alice is
+    // stored with a raw zero code hash, and the prefetch must expose it
+    // to the EVM unchanged instead of normalizing it to KECCAK_EMPTY
+    // the way the lazy load_account path never does.
+    let extcodehash_code = Bytes::from(vec![
+        0x33, 0x3f, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    ]);
+    genesis_diff.new_codes.push(NewCode {
+        code_hash: keccak256(&extcodehash_code),
+        code: extcodehash_code.clone(),
+    });
+    genesis_diff.new_accounts.push(NewAccount {
+        address: keccak256(contract(6).as_slice()),
+        balance: U256::ZERO,
+        nonce: 1,
+        code_hash: keccak256(&extcodehash_code),
+    });
     let genesis = block_info(0, h(0xaa), H256::ZERO);
     StateDBWrapper(
         db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
@@ -243,7 +258,16 @@ async fn multicall_prefetch_matches_scalar_semantics() {
 
     let tree =
         Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
-    tree.update_block(block_info(1, h(0xbb), h(0xaa)), BlockStorageDiff::default())
+    // Alice — an EOA whose stored code hash is literally zero — enters
+    // through block 1's diff so reads hit the diff layer, not the DB.
+    let mut layer1_diff = BlockStorageDiff::default();
+    layer1_diff.new_accounts.push(NewAccount {
+        address: keccak256(alice.as_slice()),
+        balance: U256::from(ONE_ETH),
+        nonce: 0,
+        code_hash: H256::ZERO,
+    });
+    tree.update_block(block_info(1, h(0xbb), h(0xaa)), layer1_diff)
         .unwrap();
     tree.update_block(block_info(2, h(0xcc), h(0xbb)), BlockStorageDiff::default())
         .unwrap();
@@ -311,6 +335,9 @@ async fn multicall_prefetch_matches_scalar_semantics() {
             .value(U256::from(1u64)),
         tempo: None,
     });
+    // EXTCODEHASH(CALLER) with alice as caller: her stored code hash
+    // is literally zero and must survive the prefetch unnormalized.
+    requests.push(call(contract(6)));
 
     let resp = DebankApiClient::contract_multi_call(
         &client,
@@ -325,7 +352,7 @@ async fn multicall_prefetch_matches_scalar_semantics() {
     .await
     .unwrap();
     assert!(resp.stats.success, "multicall failed: {:?}", resp.results);
-    assert_eq!(resp.results.len(), 8);
+    assert_eq!(resp.results.len(), 9);
     assert_eq!(resp.results[0].result, word(42), "code override clobbered");
     assert_eq!(
         resp.results[1].result,
@@ -337,6 +364,26 @@ async fn multicall_prefetch_matches_scalar_semantics() {
     }
     assert_eq!(resp.results[6].result, Bytes::default());
     assert_eq!(resp.results[7].code, 0);
+    // eth_call never prefetches, so it pins the lazy load_account
+    // semantics the prefetched multicall must reproduce byte for byte.
+    let lazy = EthApiClient::call(
+        &client,
+        call(contract(6)),
+        BlockId::Number(BlockNumberOrTag::Latest),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.results[8].result, lazy,
+        "prefetched EXTCODEHASH diverged from the lazy path"
+    );
+    assert_eq!(
+        resp.results[8].result,
+        word(0),
+        "zero code_hash was normalized on the way into the cache"
+    );
 
     handle.stop().unwrap();
     let _ = std::fs::remove_dir_all(&db_path);

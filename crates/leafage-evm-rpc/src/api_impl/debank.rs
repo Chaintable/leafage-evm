@@ -622,15 +622,19 @@ where
             }
         }
         for (address, info) in addresses.into_iter().zip(infos) {
-            match info {
-                Some(info) => cache_db.insert_account_info(address, info),
-                None => {
-                    cache_db
-                        .cache
-                        .accounts
-                        .insert(address, DbAccount::new_not_existing());
-                }
-            }
+            // Mirrors `CacheDB::load_account`'s construction byte for
+            // byte: `insert_account_info` would rewrite a raw zero
+            // `code_hash` to `KECCAK_EMPTY`, making prefetched accounts
+            // observably differ from lazily loaded ones (e.g. through
+            // EXTCODEHASH) — the store keeps zero hashes for EOAs.
+            let entry = match info {
+                Some(info) => DbAccount {
+                    info,
+                    ..Default::default()
+                },
+                None => DbAccount::new_not_existing(),
+            };
+            cache_db.cache.accounts.insert(address, entry);
         }
     }
 
