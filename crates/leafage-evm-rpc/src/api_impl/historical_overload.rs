@@ -143,3 +143,123 @@ where
         .boxed()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonrpsee::core::client::ClientT;
+    use jsonrpsee::core::params::BatchRequestBuilder;
+    use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+    use jsonrpsee::rpc_params;
+    use jsonrpsee::server::{RpcModule, RpcServiceBuilder, ServerBuilder, ServerHandle};
+    use tower::ServiceBuilder;
+
+    fn rejected(status_code: u16) -> ClientError {
+        ClientError::Transport(Box::new(HttpTransportError::Rejected { status_code }))
+    }
+
+    fn assert_rejected_with_status(error: ClientError, expected_status: StatusCode) {
+        let ClientError::Transport(error) = error else {
+            panic!("expected transport error, got {error:?}");
+        };
+        let error = error
+            .downcast::<HttpTransportError>()
+            .expect("transport error should come from the HTTP client");
+        assert!(matches!(
+            *error,
+            HttpTransportError::Rejected { status_code }
+                if status_code == expected_status.as_u16()
+        ));
+    }
+
+    #[test]
+    fn only_http_429_is_classified_as_historical_overload() {
+        assert!(is_historical_rpc_overloaded(&rejected(
+            StatusCode::TOO_MANY_REQUESTS.as_u16()
+        )));
+        assert!(!is_historical_rpc_overloaded(&rejected(
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        )));
+        assert!(!is_historical_rpc_overloaded(&ClientError::RequestTimeout));
+        assert!(!is_historical_rpc_overloaded(&ClientError::Call(
+            ErrorObjectOwned::owned(-32000, "ordinary RPC error", None::<()>),
+        )));
+    }
+
+    async fn test_server() -> (HttpClient, ServerHandle) {
+        let http_middleware = ServiceBuilder::new().layer(HistoricalOverloadHttpLayer);
+        let rpc_middleware =
+            RpcServiceBuilder::new().layer_fn(|service| HistoricalOverloadRpc::new(service));
+        let server = ServerBuilder::default()
+            .http_only()
+            .set_http_middleware(http_middleware)
+            .set_rpc_middleware(rpc_middleware)
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let mut module = RpcModule::new(());
+        module.register_method("ok", |_, _, _| "ok").unwrap();
+        module
+            .register_method::<Result<(), ErrorObjectOwned>, _>("overloaded", |_, _, _| {
+                Err(historical_rpc_overloaded_error())
+            })
+            .unwrap();
+        module
+            .register_method::<Result<(), ErrorObjectOwned>, _>("rpc_error", |_, _, _| {
+                Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "ordinary RPC error",
+                    None::<()>,
+                ))
+            })
+            .unwrap();
+
+        let handle = server.start(module);
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        (client, handle)
+    }
+
+    #[tokio::test]
+    async fn middleware_preserves_normal_responses_and_only_converts_overload() {
+        let (client, handle) = test_server().await;
+
+        let result: String = client.request("ok", rpc_params![]).await.unwrap();
+        assert_eq!(result, "ok");
+
+        let rpc_error = client
+            .request::<(), _>("rpc_error", rpc_params![])
+            .await
+            .unwrap_err();
+        assert!(matches!(rpc_error, ClientError::Call(error) if error.code() == -32000));
+
+        let overload = client
+            .request::<(), _>("overloaded", rpc_params![])
+            .await
+            .unwrap_err();
+        assert_rejected_with_status(overload, StatusCode::TOO_MANY_REQUESTS);
+
+        let result: String = client.request("ok", rpc_params![]).await.unwrap();
+        assert_eq!(result, "ok");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn one_overloaded_call_rejects_the_entire_batch() {
+        let (client, handle) = test_server().await;
+        let mut batch = BatchRequestBuilder::new();
+        batch.insert("ok", rpc_params![]).unwrap();
+        batch.insert("overloaded", rpc_params![]).unwrap();
+
+        let error = client.batch_request::<String>(batch).await.unwrap_err();
+        assert_rejected_with_status(error, StatusCode::TOO_MANY_REQUESTS);
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+}
