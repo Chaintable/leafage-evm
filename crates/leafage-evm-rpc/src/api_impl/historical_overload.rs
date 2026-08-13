@@ -120,7 +120,7 @@ impl<S> HistoricalOverloadRpc<S> {
 
 impl<'a, S> RpcServiceT<'a> for HistoricalOverloadRpc<S>
 where
-    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+    S: RpcServiceT<'a> + Send + Sync + 'static,
 {
     type Future = BoxFuture<'a, MethodResponse>;
 
@@ -129,10 +129,10 @@ where
             .extensions()
             .get::<Arc<HistoricalOverloadState>>()
             .cloned();
-        let service = self.service.clone();
+        let response = self.service.call(request);
 
         async move {
-            let response = service.call(request).await;
+            let response = response.await;
             if response.as_error_code() == Some(HISTORICAL_RPC_OVERLOADED_CODE) {
                 if let Some(state) = state {
                     state.mark_overloaded();
