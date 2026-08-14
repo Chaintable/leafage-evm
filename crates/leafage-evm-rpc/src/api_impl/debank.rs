@@ -169,6 +169,47 @@ where
             .map_err(|_| internal_rpc_err("get latest block failed"))?
     }
 
+    fn warn_contract_multi_call_state_block_not_found(
+        &self,
+        block_ctx: &Option<DebankBlockContext>,
+        request_count: usize,
+        request_metadata: &RequestMetadata,
+    ) {
+        let requested_height = block_ctx.as_ref().and_then(|ctx| ctx.block_id.as_u64());
+        let requested_height_display = requested_height
+            .map(|height| height.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let (latest_height, latest_height_error) = match self
+            .inner
+            .db()
+            .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Latest))
+        {
+            Ok(Some(block)) => (Some(block.header.number), None),
+            Ok(None) => (None, None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        let height_delta = requested_height
+            .zip(latest_height)
+            .map(|(requested, latest)| i128::from(latest) - i128::from(requested));
+
+        warn!(
+            target: "rpc",
+            method = "contractMultiCall",
+            error_code = DebankErrorCode::BlockNotFound as i32,
+            client_ip = %request_metadata.client_ip.as_deref().unwrap_or("unknown"),
+            x_forwarded_for = %request_metadata.forwarded_for.as_deref().unwrap_or(""),
+            x_dbk_source = %request_metadata.dbk_source.as_deref().unwrap_or(""),
+            requested_block_id = ?block_ctx.as_ref().map(|ctx| ctx.block_id),
+            requested_block_type = ?block_ctx.as_ref().map(|ctx| &ctx.block_type),
+            requested_height = %requested_height_display,
+            latest_height = ?latest_height,
+            height_delta = ?height_delta,
+            latest_height_error = %latest_height_error.as_deref().unwrap_or(""),
+            request_count,
+            "state block not found"
+        );
+    }
+
     fn debank_get_block_by_height_inner(
         &self,
         height: U256,
@@ -1369,6 +1410,7 @@ where
 
     async fn contract_multi_call(
         &self,
+        extensions: &jsonrpsee::Extensions,
         requests: Vec<CallRequest>,
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
@@ -1377,7 +1419,13 @@ where
         use_parallel: Option<bool>,
         disable_cache: Option<bool>,
     ) -> RpcResult<DebankMultiCallResp> {
-        match self
+        let request_metadata = extensions
+            .get::<RequestMetadata>()
+            .cloned()
+            .unwrap_or_default();
+        let diagnostic_block_ctx = block_ctx.clone();
+        let request_count = requests.len();
+        let result = match self
             .contract_multi_call_impl(
                 requests.clone(),
                 block_ctx.clone(),
@@ -1411,7 +1459,21 @@ where
                     Err(err)
                 }
             }
+        };
+
+        if !self.inner.evm_cfg().is_archive
+            && result
+                .as_ref()
+                .is_err_and(|err| err.code() == DebankErrorCode::BlockNotFound as i32)
+        {
+            self.warn_contract_multi_call_state_block_not_found(
+                &diagnostic_block_ctx,
+                request_count,
+                &request_metadata,
+            );
         }
+
+        result
     }
 
     async fn simulate_transactions(

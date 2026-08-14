@@ -40,7 +40,7 @@ pub trait DebankApi {
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<H256>;
 
-    #[method(name = "contractMultiCall")]
+    #[method(name = "contractMultiCall", with_extensions)]
     async fn contract_multi_call(
         &self,
         requests: Vec<CallRequest>,
