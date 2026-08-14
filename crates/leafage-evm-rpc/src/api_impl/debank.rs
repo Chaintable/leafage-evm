@@ -5,6 +5,7 @@ use crate::api_impl::core::{
 };
 use crate::api_impl::utils::build_debank_traces;
 use crate::error::{internal_rpc_err, rpc_error_with_code};
+use crate::metrics::RequestMetadata;
 
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
@@ -26,7 +27,7 @@ use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, warn};
 
 fn estimate_gas_limit_cap(
     configured_rpc_cap: Option<u64>,
@@ -168,7 +169,11 @@ where
             .map_err(|_| internal_rpc_err("get latest block failed"))?
     }
 
-    fn debank_get_block_by_height_inner(&self, height: U256) -> RpcResult<DebankBlock> {
+    fn debank_get_block_by_height_inner(
+        &self,
+        height: U256,
+        request_metadata: RequestMetadata,
+    ) -> RpcResult<DebankBlock> {
         let number: u64 = height.try_into().map_err(|_| {
             rpc_error_with_code(
                 DebankErrorCode::InvalidParams as i32,
@@ -189,6 +194,32 @@ where
                     format!("block height {:?} is invalid", height),
                 ));
             } else {
+                let (latest_height, latest_height_error) = match self
+                    .inner
+                    .db()
+                    .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Latest))
+                {
+                    Ok(Some(block)) => (Some(block.header.number), None),
+                    Ok(None) => (None, None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+                // A positive delta means the requested block is behind the
+                // local State node head; a negative delta means it is ahead.
+                let height_delta =
+                    latest_height.map(|latest| i128::from(latest) - i128::from(number));
+                warn!(
+                    target: "rpc",
+                    method = "getBlockByHeight",
+                    error_code = DebankErrorCode::BlockNotFound as i32,
+                    client_ip = %request_metadata.client_ip.as_deref().unwrap_or("unknown"),
+                    x_forwarded_for = %request_metadata.forwarded_for.as_deref().unwrap_or(""),
+                    x_dbk_source = %request_metadata.dbk_source.as_deref().unwrap_or(""),
+                    requested_height = number,
+                    latest_height = ?latest_height,
+                    height_delta = ?height_delta,
+                    latest_height_error = %latest_height_error.as_deref().unwrap_or(""),
+                    "state block not found"
+                );
                 return Err(rpc_error_with_code(
                     DebankErrorCode::BlockNotFound as i32,
                     format!("block height {:?} not found for state node", height),
@@ -200,10 +231,14 @@ where
         Ok(block.into())
     }
 
-    async fn debank_get_block_by_height_impl(&self, height: U256) -> RpcResult<DebankBlock> {
+    async fn debank_get_block_by_height_impl(
+        &self,
+        height: U256,
+        request_metadata: RequestMetadata,
+    ) -> RpcResult<DebankBlock> {
         let this = self.clone();
         utils::spawn_blocking_with_cancel(move |_token| {
-            this.debank_get_block_by_height_inner(height)
+            this.debank_get_block_by_height_inner(height, request_metadata)
         })
         .await
         .map_err(|_| internal_rpc_err("get block by height failed"))?
@@ -1414,7 +1449,11 @@ where
         self.debank_get_latest_block_impl().await
     }
 
-    async fn get_block_by_height(&self, height: U256) -> RpcResult<DebankBlock> {
+    async fn get_block_by_height(
+        &self,
+        height: U256,
+        extensions: &jsonrpsee::Extensions,
+    ) -> RpcResult<DebankBlock> {
         let block_number: u64 = height.try_into().map_err(|_| {
             rpc_error_with_code(
                 DebankErrorCode::InvalidParams as i32,
@@ -1441,7 +1480,12 @@ where
             }
         }
 
-        self.debank_get_block_by_height_impl(height).await
+        let request_metadata = extensions
+            .get::<RequestMetadata>()
+            .cloned()
+            .unwrap_or_default();
+        self.debank_get_block_by_height_impl(height, request_metadata)
+            .await
     }
 
     async fn get_block_by_id(&self, id: H256) -> RpcResult<DebankBlock> {

@@ -3,12 +3,57 @@ use futures::FutureExt;
 use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::server::MethodResponse;
 use jsonrpsee::types::Request;
-use metrics::{counter, histogram};
 #[cfg(any(target_os = "linux", test))]
 use metrics::gauge;
+use metrics::{counter, histogram};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{BoxError, Layer, Service};
+
+const NODEX_CLIENT_IP_HEADER: &str = "x-nodex-client-ip";
+const DBK_SOURCE_HEADER: &str = "x-dbk-source";
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RequestMetadata {
+    pub(crate) client_ip: Option<String>,
+    pub(crate) forwarded_for: Option<String>,
+    pub(crate) dbk_source: Option<String>,
+}
+
+impl RequestMetadata {
+    fn from_headers(headers: &http::HeaderMap) -> Self {
+        let nodex_client_ip = header_value(headers, NODEX_CLIENT_IP_HEADER);
+        let dbk_source = header_value(headers, DBK_SOURCE_HEADER);
+        let forwarded_for = header_value(headers, FORWARDED_FOR_HEADER);
+        let client_ip = nodex_client_ip
+            .or_else(|| dbk_source.clone())
+            .or_else(|| first_forwarded_ip(forwarded_for.as_deref()));
+
+        Self {
+            client_ip,
+            forwarded_for,
+            dbk_source,
+        }
+    }
+}
+
+fn header_value(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn first_forwarded_ip(forwarded_for: Option<&str>) -> Option<String> {
+    forwarded_for
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HttpMetricLayer;
@@ -41,9 +86,11 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
         let http_method = http_method_label(request.method());
         let started_at = Instant::now();
+        let request_metadata = RequestMetadata::from_headers(request.headers());
+        request.extensions_mut().insert(request_metadata);
         let response = self.service.call(request);
 
         async move {
@@ -173,6 +220,58 @@ mod tests {
             http_method_label(&http::Method::from_bytes(b"CUSTOM").unwrap()),
             "OTHER"
         );
+    }
+
+    #[test]
+    fn extracts_request_metadata_with_expected_precedence() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(NODEX_CLIENT_IP_HEADER, "203.0.113.10".parse().unwrap());
+        headers.insert(DBK_SOURCE_HEADER, "198.51.100.20".parse().unwrap());
+        headers.insert(
+            FORWARDED_FOR_HEADER,
+            "192.0.2.30, 10.0.0.8".parse().unwrap(),
+        );
+
+        let metadata = RequestMetadata::from_headers(&headers);
+
+        assert_eq!(metadata.client_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!(metadata.dbk_source.as_deref(), Some("198.51.100.20"));
+        assert_eq!(
+            metadata.forwarded_for.as_deref(),
+            Some("192.0.2.30, 10.0.0.8")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_first_forwarded_ip() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            FORWARDED_FOR_HEADER,
+            "192.0.2.30, 10.0.0.8".parse().unwrap(),
+        );
+
+        let metadata = RequestMetadata::from_headers(&headers);
+
+        assert_eq!(metadata.client_ip.as_deref(), Some("192.0.2.30"));
+    }
+
+    #[test]
+    fn http_metric_adds_request_metadata_extension() {
+        let inner = service_fn(|request: http::Request<()>| async move {
+            let metadata = request
+                .extensions()
+                .get::<RequestMetadata>()
+                .expect("request metadata should be present");
+            assert_eq!(metadata.client_ip.as_deref(), Some("203.0.113.10"));
+            Ok::<_, BoxError>(http::Response::new(()))
+        });
+        let mut service = HttpMetricLayer.layer(inner);
+        let request = http::Request::builder()
+            .header(NODEX_CLIENT_IP_HEADER, "203.0.113.10")
+            .body(())
+            .unwrap();
+
+        futures::executor::block_on(service.call(request)).unwrap();
     }
 
     #[test]

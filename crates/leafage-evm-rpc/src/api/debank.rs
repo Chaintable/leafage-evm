@@ -63,7 +63,7 @@ pub trait DebankApi {
     #[method(name = "getLatestBlock")]
     async fn get_latest_block(&self) -> RpcResult<DebankBlock>;
 
-    #[method(name = "getBlockByHeight")]
+    #[method(name = "getBlockByHeight", with_extensions)]
     async fn get_block_by_height(&self, height: U256) -> RpcResult<DebankBlock>;
 
     #[method(name = "getBlockById")]
