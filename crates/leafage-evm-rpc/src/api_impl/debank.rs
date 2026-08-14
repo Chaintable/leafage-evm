@@ -1451,8 +1451,8 @@ where
 
     async fn get_block_by_height(
         &self,
-        height: U256,
         extensions: &jsonrpsee::Extensions,
+        height: U256,
     ) -> RpcResult<DebankBlock> {
         let block_number: u64 = height.try_into().map_err(|_| {
             rpc_error_with_code(
