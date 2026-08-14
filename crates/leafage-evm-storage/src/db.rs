@@ -37,6 +37,43 @@ pub trait StateDBRead {
 
     /// account address | storage index -> storage value
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, StorageError>;
+
+    /// Batched [`StateDBRead::read_account`]: one result per input, same
+    /// order. The scalar default keeps archive/MDBX/mock backends correct;
+    /// exact-key backends (non-archive RocksDB) override it with MultiGet.
+    fn read_account_many(
+        &self,
+        addresses: &[H256],
+    ) -> Result<Vec<Option<NewAccount>>, StorageError> {
+        addresses
+            .iter()
+            .map(|address| self.read_account(*address))
+            .collect()
+    }
+
+    /// Batched [`StateDBRead::read_code`]: one result per input, same order.
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, StorageError> {
+        code_hashes
+            .iter()
+            .map(|code_hash| self.read_code(*code_hash))
+            .collect()
+    }
+
+    /// Batched [`StateDBRead::read_storage`] over `(address, key)` pairs:
+    /// one result per input, same order.
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, StorageError> {
+        keys.iter()
+            .map(|(address, key)| self.read_storage(*address, *key))
+            .collect()
+    }
+
+    /// Whether the `*_many` reads above are served by a real batched
+    /// storage primitive (RocksDB MultiGet) instead of the scalar
+    /// defaults. A performance hint for callers deciding whether eager
+    /// batched reads are worth issuing; correctness never depends on it.
+    fn supports_batched_reads(&self) -> bool {
+        false
+    }
 }
 
 #[auto_impl(&, Box, Arc)]
@@ -168,6 +205,35 @@ where
     // History related
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         Ok(self.0.read_block_hash(number)?.into())
+    }
+
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
+        Ok(self
+            .0
+            .read_account_many(addresses)?
+            .into_iter()
+            .map(|raw| raw.map(Into::into))
+            .collect())
+    }
+
+    fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, Self::Error> {
+        Ok(self
+            .0
+            .read_code_many(code_hashes)?
+            .into_iter()
+            .map(|code| match code {
+                Some(code) => Bytecode::new_raw(code.0.into()),
+                None => Bytecode::default(),
+            })
+            .collect())
+    }
+
+    fn storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Self::Error> {
+        self.0.read_storage_many(keys)
+    }
+
+    fn supports_batched_reads(&self) -> bool {
+        self.0.supports_batched_reads()
     }
 }
 

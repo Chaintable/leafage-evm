@@ -153,7 +153,7 @@ where
     ) -> RpcResult<Bytes> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.call_inner(request, block_id, state_override, block_overrides)
         })
         .await
@@ -287,7 +287,7 @@ where
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
 
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.multi_call_impl_inner(requests, block_id, fast_fail.unwrap_or_default(), token)
         })
         .await
@@ -414,9 +414,6 @@ where
     }
 
     fn get_balance_inner(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
-        if let Some(vb) = self.inner.virtual_balance() {
-            return Ok(vb);
-        }
         let state: Option<_> = self
             .inner
             .db()
@@ -447,10 +444,18 @@ where
     }
 
     async fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
+        // The virtual balance answers without any state read: don't
+        // spend a state-read permit or a blocking-pool slot on it.
+        if let Some(vb) = self.inner.virtual_balance() {
+            return Ok(vb);
+        }
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| this.get_balance_inner(address, block_id))
-            .await
-            .map_err(|e| internal_rpc_err(e.to_string()))?
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
+            this.get_balance_inner(address, block_id)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
     fn get_block_by_id_inner(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
@@ -530,10 +535,13 @@ where
     }
 
     async fn get_code_impl(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| this.get_code_inner(address, block_number))
-            .await
-            .map_err(|e| internal_rpc_err(e.to_string()))?
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
+            this.get_code_inner(address, block_number)
+        })
+        .await
+        .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
     fn get_storage_at_inner(
@@ -584,8 +592,9 @@ where
         index: H256,
         block_number: BlockId,
     ) -> RpcResult<H256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.get_storage_at_inner(address, index, block_number)
         })
         .await
@@ -632,8 +641,9 @@ where
         address: Address,
         block_number: BlockId,
     ) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.get_transaction_count_inner(address, block_number)
         })
         .await

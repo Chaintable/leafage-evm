@@ -10,6 +10,8 @@ pub use build::ApiBuilder;
 
 mod pre;
 
+mod blockx;
+
 mod debank;
 
 #[cfg(target_os = "linux")]

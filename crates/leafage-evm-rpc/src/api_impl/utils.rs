@@ -362,12 +362,13 @@ where
     tokio::task::spawn_blocking(move || task(token)).await
 }
 
-/// [`spawn_blocking_with_cancel`] gated by the server's optional EVM
-/// execution limiter (`None` keeps the old unbounded behavior). Waiting
+/// [`spawn_blocking_with_cancel`] gated by an optional concurrency
+/// limiter (`None` keeps the old unbounded behavior) — used for both
+/// the EVM execution limiter and the state-read limiter. Waiting
 /// happens on the async side (cheap and cancellable — a dropped caller
 /// releases its queue slot); the permit is moved into the blocking task
 /// so it is held until execution really finishes.
-pub async fn spawn_blocking_evm_with_cancel<F, R>(
+pub async fn spawn_blocking_limited_with_cancel<F, R>(
     limiter: Option<Arc<Semaphore>>,
     task: F,
 ) -> Result<R, JoinError>

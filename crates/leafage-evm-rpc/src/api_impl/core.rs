@@ -35,6 +35,12 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     /// Per-server limiter for CPU-bound EVM execution (call / multicall /
     /// estimateGas / simulate / trace). `None` keeps execution unbounded.
     pub exec_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-server limiter for plain state reads (getAddressCode /
+    /// getStorageAt / nonce / balance and blockx_stateReadBatch), kept
+    /// separate from the EVM limiter: reads are disk-bound and must not
+    /// starve — or be starved by — CPU-bound execution. `None` keeps
+    /// reads unbounded.
+    pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 pub(crate) trait ApiCore:

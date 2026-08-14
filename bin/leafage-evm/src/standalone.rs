@@ -125,6 +125,20 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     evm_exec_concurrency: usize,
 
+    /// Maximum number of concurrently executing state reads
+    /// (getAddressCode / getStorageAt / nonce / balance and
+    /// blockx_stateReadBatch).
+    /// Default: 0 (unbounded, same as before)
+    ///
+    /// State reads are disk-bound and currently the only path that can
+    /// fill the blocking pool without any admission while EVM execution
+    /// is capped by --evm-exec-concurrency. A separate semaphore keeps
+    /// reads and execution from starving each other. The production
+    /// value must come from load-testing the target instance type, not
+    /// from guessing off max_connections or the EVM limiter.
+    #[arg(long, default_value = "0")]
+    state_read_concurrency: usize,
+
     /// The TCP accept-queue backlog for the HTTP-RPC listener.
     /// Default: 4096
     ///
@@ -656,6 +670,27 @@ impl Command {
                     ),
                     LATENCY_BUCKETS,
                 )?
+                // blockx_stateReadBatch stage latencies and state-read
+                // admission queue wait; buckets must be registered per
+                // metric name or the exporter renders summaries.
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_state_batch_latency_seconds".to_string(),
+                    ),
+                    LATENCY_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_state_read_queue_wait_seconds".to_string(),
+                    ),
+                    LATENCY_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_state_batch_size".to_string(),
+                    ),
+                    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+                )?
                 .install()?;
             let labels = [("role", "replica".to_string())];
             let gauge = gauge!("pipeline_node_info", &labels);
@@ -766,7 +801,8 @@ impl Command {
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
-            .with_evm_exec_concurrency(self.evm_exec_concurrency);
+            .with_evm_exec_concurrency(self.evm_exec_concurrency)
+            .with_state_read_concurrency(self.state_read_concurrency);
 
         #[cfg(target_os = "linux")]
         {

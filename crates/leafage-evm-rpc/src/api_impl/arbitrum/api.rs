@@ -550,6 +550,7 @@ mod tests {
             100,
             None,
             None,
+            None,
         )
     }
 

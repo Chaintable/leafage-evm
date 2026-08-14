@@ -21,7 +21,7 @@ use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
-use revm::database::{CacheDB, DatabaseRef};
+use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::sync::Arc;
@@ -72,7 +72,10 @@ where
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<<C as EvmExecutor>::EvmHaltReason>,
 {
-    fn should_try_historical(&self, block_ctx: &Option<DebankBlockContext>) -> Option<&HttpClient> {
+    pub(crate) fn should_try_historical(
+        &self,
+        block_ctx: &Option<DebankBlockContext>,
+    ) -> Option<&HttpClient> {
         let client = self.inner.historical_client()?;
 
         if let Some(ctx) = block_ctx {
@@ -96,7 +99,7 @@ where
         Ok(self.inner.evm_cfg().version.clone())
     }
 
-    fn debank_get_state_by_ctx_impl(
+    pub(crate) fn debank_get_state_by_ctx_impl(
         &self,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<<C::DB as EvmStorageRead>::StateDB> {
@@ -261,8 +264,9 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_address_nonce_inner(address, block_ctx)
         })
         .await
@@ -274,9 +278,6 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
-        if let Some(vb) = self.inner.virtual_balance() {
-            return Ok(vb);
-        }
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let state = EvmStorageWrapper {
             db: state,
@@ -295,8 +296,14 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
+        // The virtual balance answers without any state read: don't
+        // spend a state-read permit or a blocking-pool slot on it.
+        if let Some(vb) = self.inner.virtual_balance() {
+            return Ok(vb);
+        }
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_address_balance_inner(address, block_ctx)
         })
         .await
@@ -333,8 +340,9 @@ where
         index: H256,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<H256> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_storage_at_inner(address, index, block_ctx)
         })
         .await
@@ -373,8 +381,9 @@ where
         address: Address,
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes> {
+        let limiter = self.inner.evm_cfg().state_read_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |_token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
             this.debank_get_code_inner(address, block_ctx)
         })
         .await
@@ -551,6 +560,84 @@ where
         Ok(res)
     }
 
+    /// Warms `cache_db` with every call's `from`/`to` account and the
+    /// deduplicated contract code behind them, using one batched read
+    /// per kind instead of a layered-state walk per first touch during
+    /// the serial call loop. Entries already in the cache (state
+    /// overrides, block overrides) are never replaced, the native-token
+    /// sentinel is skipped because its calls bypass the EVM, and any
+    /// prefetch error is dropped so the affected keys fall back to the
+    /// on-demand scalar path with its unchanged per-call error text.
+    /// Nonexistent accounts get a negative cache entry — without it the
+    /// call loop would re-read them through the scalar path, making the
+    /// prefetch a net extra read for fresh addresses.
+    fn prefetch_multi_call_accounts(
+        requests: &[CallRequest],
+        cache_db: &mut CacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        cancel_token: &CancellationToken,
+    ) {
+        // leafage-py chunks multicalls at 20 calls, so real traffic
+        // always fits this window; on oversized batches the tail keeps
+        // lazy on-demand reads instead of growing the eager work done
+        // ahead of the loop's fast_fail / cancellation checks.
+        const MAX_PREFETCH_CALLS: usize = 32;
+        let mut addresses: Vec<Address> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for request in requests.iter().take(MAX_PREFETCH_CALLS) {
+            let to = request.to.and_then(|txkind| txkind.to().copied());
+            for address in request.from.into_iter().chain(to) {
+                if address == *utils::NATIVE_TOKEN_SENTINEL {
+                    continue;
+                }
+                if !cache_db.cache.accounts.contains_key(&address) && seen.insert(address) {
+                    addresses.push(address);
+                }
+            }
+        }
+        if addresses.is_empty() {
+            return;
+        }
+        let Ok(infos) = cache_db.db.basic_many_ref(&addresses) else {
+            return;
+        };
+        if cancel_token.is_cancelled() {
+            return;
+        }
+        let mut code_hashes: Vec<H256> = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
+        for info in infos.iter().flatten() {
+            let code_hash = info.code_hash;
+            if code_hash.is_zero() || code_hash == KECCAK256_EMPTY {
+                continue;
+            }
+            if !cache_db.cache.contracts.contains_key(&code_hash) && seen_hashes.insert(code_hash) {
+                code_hashes.push(code_hash);
+            }
+        }
+        if !code_hashes.is_empty() {
+            if let Ok(codes) = cache_db.db.code_by_hash_many_ref(&code_hashes) {
+                for (code_hash, code) in code_hashes.into_iter().zip(codes) {
+                    cache_db.cache.contracts.insert(code_hash, code);
+                }
+            }
+        }
+        for (address, info) in addresses.into_iter().zip(infos) {
+            // Mirrors `CacheDB::load_account`'s construction byte for
+            // byte: `insert_account_info` would rewrite a raw zero
+            // `code_hash` to `KECCAK_EMPTY`, making prefetched accounts
+            // observably differ from lazily loaded ones (e.g. through
+            // EXTCODEHASH) — the store keeps zero hashes for EOAs.
+            let entry = match info {
+                Some(info) => DbAccount {
+                    info,
+                    ..Default::default()
+                },
+                None => DbAccount::new_not_existing(),
+            };
+            cache_db.cache.accounts.insert(address, entry);
+        }
+    }
+
     fn debank_multi_call_from_state_impl_inner(
         &self,
         requests: Vec<CallRequest>,
@@ -590,6 +677,16 @@ where
         }
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
+        }
+        // Prefetch only where the batched reads are real: archive and
+        // MDBX backends fall back to scalar loops, and OVM chains force
+        // scalar account reads, so prefetching there just front-loads
+        // the same point reads — under fast_fail (the SDK default) an
+        // early failure would turn that into O(N) wasted reads. On
+        // MultiGet backends the fast_fail waste is bounded by two
+        // batched reads over the capped prefetch window.
+        if cache_db.db.supports_batched_reads() {
+            Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token);
         }
         let db = utils::RequestCacheDB::new(cache_db);
         // run in sequence
@@ -632,7 +729,7 @@ where
     ) -> RpcResult<DebankMultiCallResp> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.debank_multi_call_from_state_impl_inner(
                 requests,
                 block_ctx,
@@ -655,7 +752,7 @@ where
     ) -> RpcResult<DebankSimulateResp> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.debank_simulate_transactions_impl_inner(
                 requests,
                 block_ctx,
@@ -985,7 +1082,7 @@ where
     ) -> RpcResult<U256> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_evm_with_cancel(limiter, move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.debank_estimate_gas_inner(request, block_ctx, block_overrides, token)
         })
         .await
@@ -1098,6 +1195,20 @@ fn update_estimated_gas_range<R: GetHaltReason + Clone>(
     Ok(())
 }
 
+/// Shared message shape for "local failed, historical also failed".
+/// blockx_stateReadBatch item errors reuse it so batch and single
+/// requests stay byte-identical on this path.
+#[inline]
+pub(crate) fn combine_error_message(
+    local_message: &str,
+    historical_err: &jsonrpsee::core::ClientError,
+) -> String {
+    format!(
+        "Local error: {}; Historical RPC error: {}",
+        local_message, historical_err
+    )
+}
+
 #[inline]
 fn combine_errors(
     local_err: jsonrpsee::types::ErrorObjectOwned,
@@ -1105,11 +1216,7 @@ fn combine_errors(
 ) -> jsonrpsee::types::ErrorObjectOwned {
     rpc_error_with_code(
         local_err.code(),
-        format!(
-            "Local error: {}; Historical RPC error: {}",
-            local_err.message(),
-            historical_err
-        ),
+        combine_error_message(local_err.message(), &historical_err),
     )
 }
 
