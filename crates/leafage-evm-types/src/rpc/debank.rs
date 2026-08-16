@@ -320,6 +320,9 @@ pub struct DebankTransaction {
     pub from: Address,
     #[serde(rename = "to_addr")]
     pub to: Address,
+    /// Warmup-only transaction kind recovered from the root trace.
+    #[serde(skip)]
+    pub is_create: Option<bool>,
     pub gas_limit: u64,
     pub gas_price: u128,
     pub gas_used: u64,
@@ -337,9 +340,12 @@ pub struct DebankTransaction {
 
 impl Into<TransactionRequest> for DebankTransaction {
     fn into(self) -> TransactionRequest {
+        // Legacy BlockFiles have no root-trace metadata and encode top-level
+        // contract creation with a zero `to_addr`.
+        let is_create = self.is_create.unwrap_or_else(|| self.to.is_zero());
         TransactionRequest {
             from: self.from.into(),
-            to: Some(if self.to.is_empty() {
+            to: Some(if is_create {
                 TxKind::Create
             } else {
                 TxKind::Call(self.to)
@@ -475,5 +481,57 @@ mod tests {
             IDChecker {}.debank_id(),
             "6e24a85785fd5e2688f1a23aee9d88f3".to_string()
         );
+    }
+
+    #[test]
+    fn transaction_request_prefers_root_trace_kind() {
+        let created_contract = Address::with_last_byte(1);
+        let create: TransactionRequest = DebankTransaction {
+            to: created_contract,
+            is_create: Some(true),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(create.to, Some(TxKind::Create));
+
+        let call_to_zero: TransactionRequest = DebankTransaction {
+            to: Address::ZERO,
+            is_create: Some(false),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(call_to_zero.to, Some(TxKind::Call(Address::ZERO)));
+    }
+
+    #[test]
+    fn transaction_request_falls_back_to_legacy_zero_address_rule() {
+        let create: TransactionRequest = DebankTransaction {
+            to: Address::ZERO,
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(create.to, Some(TxKind::Create));
+
+        let target = Address::with_last_byte(1);
+        let call: TransactionRequest = DebankTransaction {
+            to: target,
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(call.to, Some(TxKind::Call(target)));
+    }
+
+    #[test]
+    fn transaction_root_trace_kind_is_internal() {
+        let transaction = DebankTransaction {
+            is_create: Some(true),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&transaction).unwrap();
+        assert!(serialized.get("is_create").is_none());
+
+        let deserialized: DebankTransaction =
+            serde_json::from_value(serde_json::json!({ "is_create": true })).unwrap();
+        assert_eq!(deserialized.is_create, None);
     }
 }

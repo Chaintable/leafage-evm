@@ -8,6 +8,7 @@ use leafage_evm_types::{BlockInfo, BlockStorageDiff, DebankTransaction, H256};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::sync::RwLock;
@@ -178,14 +179,44 @@ pub async fn s3_get_block_transactions(
         .await
         .context(format!("{bucket_name}: {s3_key}"))?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
-    let mut gz = read::GzDecoder::new(&bytes[..]);
-    let mut bytes = Vec::new();
-    gz.read_to_end(&mut bytes)?;
-    let block_file: Value = serde_json::from_slice(&bytes)?;
-    Ok(match block_file.get("txs").cloned() {
-        None => Vec::new(),
-        Some(txs) => serde_json::from_value(txs)?,
-    })
+    decode_block_transactions(&bytes)
+}
+
+#[derive(Deserialize)]
+struct WarmupBlockFile {
+    #[serde(default)]
+    txs: Vec<DebankTransaction>,
+    traces: Option<Vec<WarmupTrace>>,
+    error_traces: Option<Vec<WarmupTrace>>,
+}
+
+#[derive(Deserialize)]
+struct WarmupTrace {
+    tx_id: H256,
+    #[serde(rename = "type")]
+    trace_type: String,
+    parent_trace_id: String,
+}
+
+fn decode_block_transactions(bytes: &[u8]) -> Result<Vec<DebankTransaction>> {
+    let mut gz = read::GzDecoder::new(bytes);
+    let mut decoded = Vec::new();
+    gz.read_to_end(&mut decoded)?;
+    let block_file: WarmupBlockFile = serde_json::from_slice(&decoded)?;
+
+    let root_trace_kinds: HashMap<_, _> = block_file
+        .traces
+        .into_iter()
+        .flatten()
+        .chain(block_file.error_traces.into_iter().flatten())
+        .filter(|trace| trace.parent_trace_id.is_empty())
+        .map(|trace| (trace.tx_id, trace.trace_type == "create"))
+        .collect();
+    let mut transactions = block_file.txs;
+    for transaction in &mut transactions {
+        transaction.is_create = root_trace_kinds.get(&transaction.id).copied();
+    }
+    Ok(transactions)
 }
 
 pub async fn s3_get_block_transactions_by_number(
@@ -568,12 +599,74 @@ mod tests {
         http::{Request, Response},
         Router,
     };
+    use flate2::{write::GzEncoder, Compression};
+    use serde_json::json;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     type DiffServerState = (Vec<u8>, Arc<Mutex<Vec<String>>>);
 
     fn test_hash(value: u8) -> H256 {
         H256::from([value; 32])
+    }
+
+    fn gzip_json(value: &Value) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(value.to_string().as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn block_transactions_use_success_and_error_root_traces() {
+        let successful_create = test_hash(1);
+        let failed_create = test_hash(2);
+        let internal_create = test_hash(3);
+        let zero_address_call = test_hash(4);
+        let block_file = json!({
+            "txs": [
+                { "id": successful_create, "to_addr": "0x0000000000000000000000000000000000000011" },
+                { "id": failed_create, "to_addr": "0x0000000000000000000000000000000000000022" },
+                { "id": internal_create, "to_addr": "0x0000000000000000000000000000000000000033" },
+                { "id": zero_address_call, "to_addr": "0x0000000000000000000000000000000000000000" }
+            ],
+            "traces": [
+                { "tx_id": successful_create, "type": "create", "parent_trace_id": "" },
+                { "tx_id": internal_create, "type": "call", "parent_trace_id": "" },
+                { "tx_id": internal_create, "type": "create", "parent_trace_id": "root-trace" },
+                { "tx_id": zero_address_call, "type": "call", "parent_trace_id": "" }
+            ],
+            "error_traces": [
+                { "tx_id": failed_create, "type": "create", "parent_trace_id": "" }
+            ]
+        });
+
+        let transactions = decode_block_transactions(&gzip_json(&block_file)).unwrap();
+
+        assert_eq!(transactions[0].is_create, Some(true));
+        assert_eq!(transactions[1].is_create, Some(true));
+        assert_eq!(transactions[2].is_create, Some(false));
+        assert_eq!(transactions[3].is_create, Some(false));
+    }
+
+    #[test]
+    fn block_transactions_without_traces_keep_legacy_fallback() {
+        let tx_id = test_hash(1);
+        for block_file in [
+            json!({
+                "txs": [{ "id": tx_id, "to_addr": "0x0000000000000000000000000000000000000000" }]
+            }),
+            json!({
+                "txs": [{ "id": tx_id, "to_addr": "0x0000000000000000000000000000000000000000" }],
+                "traces": null,
+                "error_traces": null
+            }),
+        ] {
+            let transactions = decode_block_transactions(&gzip_json(&block_file)).unwrap();
+            assert_eq!(transactions[0].is_create, None);
+            let request: alloy::rpc::types::TransactionRequest =
+                transactions.into_iter().next().unwrap().into();
+            assert_eq!(request.to, Some(alloy::primitives::TxKind::Create));
+        }
     }
 
     async fn serve_diff(
