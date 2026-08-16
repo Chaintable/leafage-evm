@@ -191,11 +191,34 @@ struct WarmupBlockFile {
 }
 
 #[derive(Deserialize)]
-struct WarmupTrace {
-    tx_id: H256,
-    #[serde(rename = "type")]
-    trace_type: String,
-    parent_trace_id: String,
+#[serde(untagged)]
+enum WarmupTrace {
+    Complete {
+        tx_id: H256,
+        #[serde(rename = "type")]
+        trace_type: String,
+        parent_trace_id: String,
+    },
+    Ignored(Value),
+}
+
+impl WarmupTrace {
+    fn into_root_kind(self) -> Option<(H256, bool)> {
+        match self {
+            Self::Complete {
+                tx_id,
+                trace_type,
+                parent_trace_id,
+            } if parent_trace_id.is_empty() => Some((tx_id, trace_type == "create")),
+            // Keep old or chain-specific malformed internal traces from making
+            // the entire BlockFile unusable for warmup.
+            Self::Ignored(value) => {
+                drop(value);
+                None
+            }
+            Self::Complete { .. } => None,
+        }
+    }
 }
 
 fn decode_block_transactions(bytes: &[u8]) -> Result<Vec<DebankTransaction>> {
@@ -209,8 +232,7 @@ fn decode_block_transactions(bytes: &[u8]) -> Result<Vec<DebankTransaction>> {
         .into_iter()
         .flatten()
         .chain(block_file.error_traces.into_iter().flatten())
-        .filter(|trace| trace.parent_trace_id.is_empty())
-        .map(|trace| (trace.tx_id, trace.trace_type == "create"))
+        .filter_map(WarmupTrace::into_root_kind)
         .collect();
     let mut transactions = block_file.txs;
     for transaction in &mut transactions {
@@ -667,6 +689,25 @@ mod tests {
                 transactions.into_iter().next().unwrap().into();
             assert_eq!(request.to, Some(alloy::primitives::TxKind::Create));
         }
+    }
+
+    #[test]
+    fn block_transactions_ignore_malformed_internal_traces() {
+        let tx_id = test_hash(1);
+        let block_file = json!({
+            "txs": [
+                { "id": tx_id, "to_addr": "0x0000000000000000000000000000000000000011" }
+            ],
+            "traces": [
+                null,
+                { "tx_id": "not-a-hash", "type": null, "parent_trace_id": 1 },
+                { "type": "create", "parent_trace_id": "internal" },
+                { "tx_id": tx_id, "type": "call", "parent_trace_id": "" }
+            ]
+        });
+
+        let transactions = decode_block_transactions(&gzip_json(&block_file)).unwrap();
+        assert_eq!(transactions[0].is_create, Some(false));
     }
 
     async fn serve_diff(
