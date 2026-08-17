@@ -9,6 +9,7 @@ use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
     ToJsonRpcError,
 };
+use crate::api_impl::historical_overload::{HistoricalOverloadHttpLayer, HistoricalOverloadRpc};
 use crate::metrics::{HttpMetricLayer, RpcMetric};
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
@@ -170,13 +171,16 @@ where
 
         let http_middleware = tower::ServiceBuilder::new()
             .layer(HttpMetricLayer)
+            .layer(HistoricalOverloadHttpLayer)
             .timeout(rpc_timeout);
         #[cfg(target_os = "linux")]
         let http_middleware = http_middleware.layer(InterceptorLayer::new(
             &self.interceptor_cfg.unwrap_or_default(),
         ));
 
-        let rpc_middleware = RpcServiceBuilder::new().layer_fn(|service| RpcMetric { service });
+        let rpc_middleware = RpcServiceBuilder::new()
+            .layer_fn(|service| HistoricalOverloadRpc::new(service))
+            .layer_fn(|service| RpcMetric { service });
         // Bind the listener ourselves so we can set the accept-queue backlog
         // (jsonrpsee's `build(addr)` uses tokio's default of ~1024). The kernel
         // caps the effective queue at `min(backlog, net.core.somaxconn)`, so a
