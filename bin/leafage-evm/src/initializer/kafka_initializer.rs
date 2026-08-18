@@ -1,8 +1,10 @@
+use crate::bundle::s3_read_bundle;
 use crate::utils::{s3_get_block_info_and_diff_by_number_for_genesis, KafkaS3Config};
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use aws_sdk_s3::Client;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::EvmStorageWrite;
+use leafage_evm_types::{BlockInfo, BlockStorageDiff};
 use tracing::info;
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
@@ -40,8 +42,29 @@ where
         })
     }
 
-    pub async fn init(&mut self) -> Result<()> {
-        let (first_block_info, first_block_diff) =
+    async fn load_genesis(&self) -> Result<(BlockInfo, BlockStorageDiff)> {
+        if !self.kafka_s3_cfg.bundle_bucket_name.is_empty() {
+            let mut block = None;
+            let _ = s3_read_bundle(
+                &self.s3_client,
+                &self.kafka_s3_cfg.bundle_bucket_name,
+                &self.kafka_s3_cfg.s3_chain_id,
+                &self.kafka_s3_cfg.version,
+                self.genesis_number,
+                self.genesis_number,
+                32,
+                |block_info, block_diff| {
+                    block = Some((block_info, block_diff));
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await?;
+            let Some(block) = block else {
+                return Err(anyhow::anyhow!("Get genesis block missing from s3 bundle"));
+            };
+            info!(target: "initializer","loaded genesis block {} from bundle storage",self.genesis_number);
+            Ok(block)
+        } else {
             s3_get_block_info_and_diff_by_number_for_genesis(
                 &self.rpc_client,
                 &self.s3_client,
@@ -51,7 +74,12 @@ where
                 &self.kafka_s3_cfg.version,
                 self.genesis_number,
             )
-            .await?;
+            .await
+        }
+    }
+
+    pub async fn init(&mut self) -> Result<()> {
+        let (first_block_info, first_block_diff) = self.load_genesis().await?;
         self.db
             .update_block(first_block_info.clone(), first_block_diff)?;
         info!(target: "initializer", "initialized genesis block, num {}, hash {}", first_block_info.header.number,first_block_info.header.hash);

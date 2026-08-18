@@ -461,7 +461,7 @@ fn state_diff_range_end(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_rlp::Encodable;
     use aws_sdk_s3::config::{Credentials, Region};
@@ -577,6 +577,14 @@ mod tests {
             .force_path_style(true)
             .build();
         (Client::from_conf(config), server)
+    }
+
+    pub(crate) async fn full_bundle_mock_client() -> (Client, tokio::task::JoinHandle<()>) {
+        mock_client(MockS3 {
+            objects: Arc::new(Mutex::new(full_bundle_objects())),
+            ..Default::default()
+        })
+        .await
     }
 
     fn genesis_bundle_objects() -> HashMap<String, Vec<u8>> {
@@ -785,6 +793,29 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[2].1.as_deref(), Some(expected_range.as_str()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reads_one_block_from_a_full_bundle() {
+        let state = MockS3 {
+            objects: Arc::new(Mutex::new(full_bundle_objects())),
+            ..Default::default()
+        };
+        let requests = state.requests.clone();
+        let (client, server) = mock_client(state).await;
+
+        let (block_info, block_diff) = s3_read_bundle_block(&client, "bundle", "1", "", 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(block_info.header.number, 1);
+        assert_eq!(block_diff.hash, block_info.header.state_root);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].0, "1/1/stateDiff");
+        assert_eq!(requests[1], ("1/1/block".to_owned(), None));
         server.abort();
     }
 
