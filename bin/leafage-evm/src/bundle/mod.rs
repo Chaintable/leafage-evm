@@ -461,7 +461,7 @@ fn state_diff_range_end(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_rlp::Encodable;
     use aws_sdk_s3::config::{Credentials, Region};

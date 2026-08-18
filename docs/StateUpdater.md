@@ -91,6 +91,10 @@ Bundle-enabled nodes always perform the startup catch-up even when the saved
 Kafka offset is still within retention. A valid but old notification can refer
 to source objects already deleted by the compactor.
 
+For an empty database, initialization follows the same storage preference:
+the configured genesis block is read from compacted bundle storage first, with
+a fallback to the legacy per-block objects only when the bundle is absent.
+
 ### S3 Catch-up
 
 When startup catch-up is required, KafkaUpdater synchronizes from S3:
