@@ -58,10 +58,10 @@ The updater mode is selected based on CLI parameters:
 │     └── Contains: new_blocks[] with block hash, parent hash │
 │                                                             │
 │  2. Fetch block info from S3 (parallel)                     │
-│     └── s3://{bucket}/{chain_id}/{version}/block/{hash}     │
+│     └── s3://{bucket}/{chain_id}/[{ver}/]{hash}/block       │
 │                                                             │
 │  3. Fetch state diff from S3 (parallel)                     │
-│     └── s3://{bucket}/{chain_id}/{version}/diff/{state_root}│
+│     └── s3://{bucket}/{chain_id}/[{ver}/]{root}/stateDiff   │
 │     └── Skip if state_root unchanged (empty diff)           │
 │                                                             │
 │  4. Apply updates to StateTree                              │
@@ -72,6 +72,12 @@ The updater mode is selected based on CLI parameters:
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+S3 keys are `{chain_id}/[{version}/]{block_hash}/block` for block info and
+`{chain_id}/[{version}/]{state_root}/stateDiff` for the state diff. The
+`{version}` segment is only present when `version` is set in the config.
+State diffs are keyed by state root, so blocks that leave the root unchanged
+share one object.
 
 ### Offset Management
 
