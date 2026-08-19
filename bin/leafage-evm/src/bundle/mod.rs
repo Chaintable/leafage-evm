@@ -9,7 +9,7 @@ use leafage_evm_types::{
     BlockInfo, BlockStorageDiff, BundleStorageDiffIndex, STATE_DIFF_ENTRY_CAPACITY,
     STATE_DIFF_INDEX_BYTES,
 };
-use std::{future::Future, io::Read};
+use std::{fmt, future::Future, io::Read};
 use tokio::{io::AsyncReadExt, time::sleep};
 use tracing::warn;
 
@@ -21,6 +21,33 @@ const BODY_READ_MAX_ATTEMPTS: u32 = 3;
 const BODY_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(test)]
 const BODY_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// A bundle was fetched and decoded successfully, but its Header and
+/// StateDiff roots do not describe one continuous state transition.
+///
+/// Callers that require fail-closed input handling can downcast this error;
+/// transport, body-read, and decode failures deliberately keep their existing
+/// error types so they remain retryable.
+#[derive(Debug)]
+pub(crate) struct BundleIntegrityError {
+    reason: String,
+}
+
+impl BundleIntegrityError {
+    pub(crate) fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for BundleIntegrityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for BundleIntegrityError {}
 
 #[derive(Debug, Clone, Copy, Args)]
 pub(crate) struct BundleReadArgs {
@@ -177,20 +204,22 @@ where
 
             let block_info = headers[entry_position].clone();
             if block_diff.hash != block_info.header.state_root {
-                bail!(
+                return Err(BundleIntegrityError::new(format!(
                     "StateDiff bundle {bundle_id} entry {entry_position} root {} does not match Header root {}",
                     block_diff.hash,
                     block_info.header.state_root
-                );
+                ))
+                .into());
             }
             if entry_position > 0 {
                 let expected_parent_root = headers[entry_position - 1].header.state_root;
                 if block_diff.parent_hash != expected_parent_root {
-                    bail!(
+                    return Err(BundleIntegrityError::new(format!(
                         "StateDiff bundle {bundle_id} entry {entry_position} parent root {} does not match previous Header root {}",
                         block_diff.parent_hash,
                         expected_parent_root
-                    );
+                    ))
+                    .into());
                 }
             }
 
@@ -734,6 +763,77 @@ pub(crate) mod tests {
         );
         assert_eq!(requests[1], ("1/0/block".to_owned(), None));
         assert!(requests[2].1.as_deref().unwrap().starts_with("bytes=8133-"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn decoded_root_mismatch_has_typed_integrity_error() {
+        let mut objects = genesis_bundle_objects();
+        let mut mismatched_header = BlockInfo::default();
+        mismatched_header.header.state_root = test_hash(99);
+        let mut header_encoder = GzEncoder::new(Vec::new(), Compression::default());
+        header_encoder
+            .write_all(&serde_json::to_vec(&vec![mismatched_header]).unwrap())
+            .unwrap();
+        objects.insert("1/0/block".to_owned(), header_encoder.finish().unwrap());
+        let state = MockS3 {
+            objects: Arc::new(Mutex::new(objects)),
+            ..Default::default()
+        };
+        let (client, server) = mock_client(state).await;
+
+        let error = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            0,
+            0,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<BundleIntegrityError>().is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn decoded_parent_root_mismatch_has_typed_integrity_error() {
+        let mut objects = full_bundle_objects();
+        let state_diff = objects.get_mut("1/1/stateDiff").unwrap();
+        let index = BundleStorageDiffIndex::decode(&state_diff[..STATE_DIFF_INDEX_BYTES]).unwrap();
+        let (entry_start, entry_end) = index.payload_range(1).unwrap();
+        let entry_start = STATE_DIFF_INDEX_BYTES + entry_start as usize;
+        let entry_end = STATE_DIFF_INDEX_BYTES + entry_end as usize;
+        let mut bytes = &state_diff[entry_start..entry_end];
+        let mut block_diff = BlockStorageDiff::decode(&mut bytes).unwrap();
+        block_diff.parent_hash = test_hash(99_999);
+        let mut encoded = Vec::new();
+        block_diff.encode(&mut encoded);
+        assert_eq!(encoded.len(), entry_end - entry_start);
+        state_diff[entry_start..entry_end].copy_from_slice(&encoded);
+
+        let state = MockS3 {
+            objects: Arc::new(Mutex::new(objects)),
+            ..Default::default()
+        };
+        let (client, server) = mock_client(state).await;
+        let error = s3_read_bundle(
+            &client,
+            "bundle",
+            "1",
+            "",
+            2,
+            2,
+            DEFAULT_BUNDLE_RANGE_SIZE_MIB,
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<BundleIntegrityError>().is_some());
         server.abort();
     }
 
