@@ -1,7 +1,10 @@
 mod config;
 mod evm;
+mod frame_result;
 mod handler;
 mod hardforks;
+mod native;
+mod opcode;
 mod query_env;
 
 pub use config::{ArcChainConfig, ArcExecutionSpec, ARC_MAINNET_CHAIN_ID};
