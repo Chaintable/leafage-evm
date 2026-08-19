@@ -44,6 +44,32 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
+/// Keeps the legacy estimator semantics for every non-Arc API implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DefaultEstimateGasPolicy;
+
+/// Enables the Reth-compatible estimator semantics required by Arc.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArcEstimateGasPolicy;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EstimateGasPolicy {
+    Default(DefaultEstimateGasPolicy),
+    Arc(ArcEstimateGasPolicy),
+}
+
+impl Default for EstimateGasPolicy {
+    fn default() -> Self {
+        Self::Default(DefaultEstimateGasPolicy)
+    }
+}
+
+impl EstimateGasPolicy {
+    pub(crate) const fn is_arc(self) -> bool {
+        matches!(self, Self::Arc(_))
+    }
+}
+
 pub(crate) trait ApiCore:
     ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
 {
@@ -67,6 +93,10 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
+
+    fn estimate_gas_policy(&self) -> EstimateGasPolicy {
+        EstimateGasPolicy::default()
+    }
 
     fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
         if spec.is_enabled_in(EthSpecId::OSAKA) {
@@ -166,6 +196,25 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
     where
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static;
+
+    /// Executes one estimator probe. Arc overrides this to apply the same
+    /// account-check relaxations and protocol/RPC execution cap as Reth.
+    fn transact_for_estimate<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+        _hard_gas_cap: u64,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        self.transact(block_env, state, tx)
+    }
 
     fn inspect_tx_commit<StateDB, R, F>(
         &self,

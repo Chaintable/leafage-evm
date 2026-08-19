@@ -1,4 +1,6 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
+use crate::api_impl::core::{
+    ApiCore, ArcEstimateGasPolicy, EstimateGasPolicy, EvmExecutor, GasFeeHandler,
+};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
@@ -36,6 +38,10 @@ where
     DB: Sync + Send + 'static,
 {
     type Tx = TxEnv;
+
+    fn estimate_gas_policy(&self) -> EstimateGasPolicy {
+        EstimateGasPolicy::Arc(ArcEstimateGasPolicy)
+    }
 }
 
 impl<DB> EvmExecutor for ArcApiImpl<DB>
@@ -77,6 +83,32 @@ where
     {
         let factory = self.arc_factory().map_err(EVMError::Custom)?;
         let env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
+        let mut evm = factory
+            .create(env, WrapDatabaseRef(state), NoOpInspector {})
+            .map_err(|err| EVMError::Custom(err.to_string()))?;
+        evm.transact(tx).map(|result| result.result)
+    }
+
+    fn transact_for_estimate<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+        hard_gas_cap: u64,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let factory = self.arc_factory().map_err(EVMError::Custom)?;
+        let mut cfg = self.evm_cfg.cfg.clone();
+        cfg.disable_eip3607 = true;
+        cfg.disable_base_fee = true;
+        cfg.tx_gas_limit_cap = Some(hard_gas_cap);
+        let env = EvmEnv::new(cfg, block_env.clone());
         let mut evm = factory
             .create(env, WrapDatabaseRef(state), NoOpInspector {})
             .map_err(|err| EVMError::Custom(err.to_string()))?;
