@@ -5,6 +5,7 @@ mod handler;
 mod hardforks;
 mod native;
 mod opcode;
+mod precompile;
 mod query_env;
 
 pub use config::{ArcChainConfig, ArcExecutionSpec, ARC_MAINNET_CHAIN_ID};

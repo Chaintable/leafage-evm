@@ -5,6 +5,7 @@ use super::{
         ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS, NATIVE_COIN_CONTROL_ADDRESS,
     },
     opcode::arc_selfdestruct,
+    precompile::extend_arc_precompiles,
     ArcChainConfig, ArcExecutionSpec, ArcHardfork,
 };
 use alloy::primitives::{Address, Log};
@@ -221,8 +222,9 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         cfg.amsterdam_eip7708_disabled = true;
         cfg.amsterdam_eip7708_delayed_burn_disabled = true;
         let spec = cfg.spec;
-        let precompiles =
+        let mut precompiles =
             PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec)));
+        extend_arc_precompiles(&mut precompiles, execution_spec.arc_flags);
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
         instructions.insert_instruction(
             SELFDESTRUCT,
