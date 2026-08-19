@@ -185,3 +185,51 @@ impl<J: JournalTr> B20Port for MeteredB20Port<'_, J> {
         self.is_static
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context::JournalTr;
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::primitives::address;
+
+    /// Reading a second account's storage must not panic when that account has not been
+    /// loaded into the journal.
+    ///
+    /// This is the production failure: a policy-gated B20 transfer reads the PolicyRegistry
+    /// at `0x8453…0002`, an account nothing has touched. revm's `sload` assumes the account
+    /// is present and returns `ColdLoadSkipped` when it is not, which the default `JournalTr`
+    /// wrapper turns into `panic!("Expected DBError")` — surfacing as a -32603 internal error
+    /// rather than a normal RPC failure. A mock port cannot reproduce this; it needs a real
+    /// journal.
+    #[test]
+    fn sload_on_an_unloaded_account_does_not_panic() {
+        const REGISTRY: Address = address!("0x8453000000000000000000000000000000000002");
+
+        let mut journal: revm::Journal<CacheDB<EmptyDB>> =
+            revm::Journal::new(CacheDB::new(EmptyDB::default()));
+        let mut port = MeteredB20Port::new(
+            &mut journal,
+            1_000_000,
+            GasParams::default(),
+            Address::ZERO,
+            U256::ZERO,
+            8453,
+            U256::ZERO,
+            false,
+        );
+
+        // Never loaded, and read straight away — exactly the production path.
+        let value = port.sload(REGISTRY, U256::from(1u64));
+        assert!(value.is_ok(), "sload on an unloaded account must not panic or error");
+        assert_eq!(value.unwrap(), U256::ZERO, "an unwritten slot reads zero");
+
+        // Only the storage read is billed: the account load itself is free, matching Base.
+        let params = GasParams::default();
+        assert_eq!(
+            port.gas_spent(),
+            params.warm_storage_read_cost() + params.cold_storage_additional_cost(),
+            "a cold SLOAD costs exactly one cold storage read, with nothing for the account"
+        );
+    }
+}
