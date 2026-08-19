@@ -1,4 +1,5 @@
 pub mod arbitrum;
+pub mod arc;
 pub mod base;
 pub mod bsc;
 pub mod citrea;

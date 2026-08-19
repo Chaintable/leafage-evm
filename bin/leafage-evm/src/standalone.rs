@@ -9,6 +9,7 @@ use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
@@ -42,6 +43,7 @@ pub struct Command {
         long,
         value_parser = [
             "mainnet",
+            "arc",
             "arbitrum",
             "op",
             "base",
@@ -70,9 +72,9 @@ pub struct Command {
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
-    /// if not specified, the default spec_id is u8::MAX
-    #[arg(long, default_value = "255")]
-    spec_id: u8,
+    /// If omitted, use the evm-type's built-in spec.
+    #[arg(long)]
+    spec_id: Option<u8>,
 
     /// Maximum gas limit for RPC methods
     /// [default: 100000000]
@@ -417,6 +419,9 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "tempo" {
         return Ok(4217);
     }
+    if arg == "arc" {
+        return Ok(ARC_MAINNET_CHAIN_ID);
+    }
     if arg.parse::<u64>().is_ok() {
         return Ok(arg.parse().unwrap());
     } else {
@@ -455,13 +460,26 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
-/// Resolve `--spec-id` to a typed EVM spec; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
-fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Result<T> {
+/// Resolve `--spec-id` to a typed EVM spec; omitted or `u8::MAX` keeps the built-in spec.
+fn resolve_spec<T: TryFrom<u8>>(spec_id: Option<u8>, default: T, type_label: &str) -> Result<T> {
+    let Some(spec_id) = spec_id else {
+        return Ok(default);
+    };
     if spec_id == u8::MAX {
         return Ok(default);
     }
     T::try_from(spec_id)
         .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
+}
+
+const ARC_EXECUTOR_UNAVAILABLE: &str =
+    "Arc EVM executor is not available; refusing to start with Ethereum mainnet execution rules";
+
+fn ensure_executor_available(chain_cfg: &MultiChainCfgEnv) -> Result<()> {
+    if matches!(chain_cfg, MultiChainCfgEnv::Arc(_)) {
+        bail!(ARC_EXECUTOR_UNAVAILABLE);
+    }
+    Ok(())
 }
 
 impl Command {
@@ -470,6 +488,9 @@ impl Command {
         let evm_type = self.evm_type.clone();
         let custom_evm_cfg = self.evm_custom_config.clone();
         let gas_cap = self.rpc_gas_cap;
+        if chain_id == ARC_MAINNET_CHAIN_ID && evm_type != "arc" {
+            bail!("chain ID 5042 requires --evm-type arc");
+        }
         match evm_type.as_str() {
             "mainnet" => {
                 let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
@@ -481,6 +502,29 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "arc" => {
+                if chain_id != ARC_MAINNET_CHAIN_ID {
+                    bail!("Arc EVM requires chain ID 5042");
+                }
+                if self.spec_id.is_some() {
+                    bail!("Arc EVM uses its network hardfork schedule; --spec-id is unsupported");
+                }
+                if custom_evm_cfg.is_some() {
+                    bail!("Arc EVM does not accept --evm-custom-config");
+                }
+                if self.ovm_address.is_some() {
+                    bail!("Arc EVM does not accept --ovm-address");
+                }
+                if self.normalize_state_key {
+                    bail!("Arc EVM requires --normalize-state-key=false");
+                }
+
+                let arc_config = ArcChainConfig::mainnet();
+                let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
+                chain_cfg.chain_id = arc_config.chain_id();
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
             }
             "arbitrum" => {
                 // RPC execution replaces this fallback with the target block's
@@ -875,10 +919,12 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let chain_cfg = self.build_chain_cfg_env()?;
+        ensure_executor_available(&chain_cfg)?;
+
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
-        let (updater_handle, rpc_handle, resgitry_handle) =
-            self.start(self.build_chain_cfg_env()?).await?;
+        let (updater_handle, rpc_handle, resgitry_handle) = self.start(chain_cfg).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
@@ -897,5 +943,158 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_command(args: &[&str]) -> Command {
+        let mut argv = vec![
+            "standalone-test",
+            "--db-path",
+            "/dev/null/leafage-arc-must-not-open",
+        ];
+        argv.extend_from_slice(args);
+        Command::try_parse_from(argv).expect("command should parse")
+    }
+
+    fn assert_arc_config_error(args: &[&str], expected: &str) {
+        let command = parse_command(args);
+        let error = command
+            .build_chain_cfg_env()
+            .expect_err("Arc configuration should be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn arc_alias_and_numeric_chain_id_build_mainnet_config() {
+        for chain_cfg_arg in ["arc", "5042"] {
+            let command = parse_command(&["--evm-type", "arc", "--chain-cfg", chain_cfg_arg]);
+            let chain_cfg = command
+                .build_chain_cfg_env()
+                .expect("Arc mainnet config should build");
+
+            let MultiChainCfgEnv::Arc((cfg, arc_config)) = chain_cfg else {
+                panic!("expected Arc chain config");
+            };
+            assert_eq!(cfg.chain_id, ARC_MAINNET_CHAIN_ID);
+            assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+            assert!(!cfg.disable_balance_check);
+            assert!(!cfg.disable_eip3607);
+            assert!(!cfg.disable_block_gas_limit);
+            assert!(!cfg.disable_base_fee);
+            assert_eq!(arc_config, ArcChainConfig::mainnet());
+        }
+    }
+
+    #[test]
+    fn arc_rejects_mismatched_chain_and_evm_type() {
+        assert_arc_config_error(
+            &["--evm-type", "arc", "--chain-cfg", "1"],
+            "Arc EVM requires chain ID 5042",
+        );
+        assert_arc_config_error(
+            &["--evm-type", "mainnet", "--chain-cfg", "5042"],
+            "chain ID 5042 requires --evm-type arc",
+        );
+    }
+
+    #[test]
+    fn arc_rejects_explicit_execution_overrides() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--spec-id",
+                    "255",
+                ],
+                "--spec-id is unsupported",
+            ),
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--evm-custom-config",
+                    "{}",
+                ],
+                "does not accept --evm-custom-config",
+            ),
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--ovm-address",
+                    "0x0000000000000000000000000000000000000001",
+                ],
+                "does not accept --ovm-address",
+            ),
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--normalize-state-key",
+                ],
+                "requires --normalize-state-key=false",
+            ),
+        ] {
+            assert_arc_config_error(&args, expected);
+        }
+    }
+
+    #[test]
+    fn non_arc_spec_id_keeps_legacy_default_and_sentinel_behavior() {
+        for args in [
+            vec!["--evm-type", "mainnet", "--chain-cfg", "1"],
+            vec![
+                "--evm-type",
+                "mainnet",
+                "--chain-cfg",
+                "1",
+                "--spec-id",
+                "255",
+            ],
+        ] {
+            let command = parse_command(&args);
+            let MultiChainCfgEnv::Mainnet(cfg) = command
+                .build_chain_cfg_env()
+                .expect("mainnet config should build")
+            else {
+                panic!("expected mainnet chain config");
+            };
+            assert_eq!(cfg.spec, MainnetSpecId::AMSTERDAM);
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_startup_fails_before_metrics_or_database_initialization() {
+        for args in [
+            vec!["--evm-type", "arc", "--chain-cfg", "arc"],
+            vec![
+                "--evm-type",
+                "arc",
+                "--chain-cfg",
+                "arc",
+                "--prometheus-addr",
+                "not-a-socket-address",
+            ],
+        ] {
+            let mut command = parse_command(&args);
+            let error = command.run().await.expect_err("Arc startup should fail");
+            assert_eq!(error.to_string(), ARC_EXECUTOR_UNAVAILABLE);
+        }
     }
 }

@@ -16,6 +16,7 @@ use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
     RpcModule,
 };
+use leafage_evm_chains::arc::ARC_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
@@ -147,6 +148,31 @@ fn bind_listener(addr: &str, backlog: u32) -> std::io::Result<std::net::TcpListe
     Ok(socket.into())
 }
 
+fn ensure_executor_available(cfg: &MultiChainCfgEnv) -> std::io::Result<()> {
+    match cfg {
+        MultiChainCfgEnv::Arc((evm_cfg, arc_cfg)) => {
+            if evm_cfg.chain_id != arc_cfg.chain_id()
+                || evm_cfg.spec != arc_cfg.ethereum_spec()
+                || arc_cfg.chain_id() != ARC_MAINNET_CHAIN_ID
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Arc EVM configuration does not match the Arc mainnet schedule",
+                ));
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Arc EVM executor is not available yet",
+            ))
+        }
+        _ if cfg.chain_id() == ARC_MAINNET_CHAIN_ID => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "chain ID 5042 requires the Arc EVM executor",
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl<DB> ApiBuilder<DB>
 where
     DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
@@ -162,6 +188,8 @@ where
         estimate_gas_buffer: u64,
         listen_backlog: u32,
     ) -> std::io::Result<ServerHandle> {
+        ensure_executor_available(&self.cfg)?;
+
         let exec_limiter = (self.evm_exec_concurrency > 0).then(|| {
             std::sync::Arc::new(tokio::sync::Semaphore::new(self.evm_exec_concurrency))
         });
@@ -227,6 +255,9 @@ where
             MultiChainCfgEnv::Mainnet(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
+            MultiChainCfgEnv::Arc((env, custom_evm_cfg)) => {
+                run_chain_setup!(env, Some(custom_evm_cfg))
+            }
             MultiChainCfgEnv::Arbitrum((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
@@ -283,6 +314,50 @@ where
 
         let handle = server.start(rpc_module);
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_chains::arc::ArcChainConfig;
+    use leafage_evm_types::{CfgEnv, MainnetSpecId};
+
+    #[test]
+    fn executor_guard_rejects_arc_chain_id_on_the_generic_mainnet_variant() {
+        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        cfg.chain_id = ARC_MAINNET_CHAIN_ID;
+
+        let error = ensure_executor_available(&MultiChainCfgEnv::Mainnet(cfg)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "chain ID 5042 requires the Arc EVM executor"
+        );
+    }
+
+    #[test]
+    fn executor_guard_rejects_inconsistent_or_unavailable_arc_variants() {
+        let arc_cfg = ArcChainConfig::mainnet();
+        let mut evm_cfg = CfgEnv::new_with_spec(arc_cfg.ethereum_spec());
+        evm_cfg.chain_id = arc_cfg.chain_id();
+
+        let error = ensure_executor_available(&MultiChainCfgEnv::Arc((evm_cfg.clone(), arc_cfg)))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+
+        evm_cfg.chain_id = 1;
+        let error =
+            ensure_executor_available(&MultiChainCfgEnv::Arc((evm_cfg, arc_cfg))).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn executor_guard_keeps_other_chain_variants_available() {
+        let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+        cfg.chain_id = 1;
+
+        assert!(ensure_executor_available(&MultiChainCfgEnv::Mainnet(cfg)).is_ok());
     }
 }
 
