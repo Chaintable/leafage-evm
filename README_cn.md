@@ -2,7 +2,9 @@
 
 [English](README.md)
 
-leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm](https://github.com/bluealloy/revm) 实现的轻量级 EVM 执行器。专注于**状态查询**（`eth_call`、`eth_estimateGas` 等），**不存储交易数据**。通过 Kafka + S3 获取状态更新，而非 P2P 同步。
+leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm](https://github.com/bluealloy/revm) 实现的轻量级 EVM 执行器。专注于**状态查询**（`eth_call`、`eth_getBalance` 和自定义 `estimateGas` 等），**不存储交易数据**。通过 Kafka + S3 获取状态更新，而非 P2P 同步。
+
+Arc 查询适配使用 `scripts/test-arc.sh` 作为统一测试入口：`unit` 运行离线参数解析和请求/响应归一化测试，`rpc` 在固定高度与官方 Arc RPC 做差分，`all` 依次运行两者。RPC URL 只从 `LEAFAGE_RPC` 和 `ARC_REFERENCE_RPC` 环境变量读取，不进入 Python argv 或 JSON 报告。真实 Header/StateDiff/BlockFile loader fixtures 由后续独立 PR 提供，当前 Python 测试不宣称覆盖这些输入对象。可选 nodectl 阶段只接受无凭证的loopback URL；JSON报告只包含确定性Python测试，启用nodectl时应以整个脚本的exit code为准。
 
 ## 特性
 

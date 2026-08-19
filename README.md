@@ -2,7 +2,7 @@
 
 [中文文档](README_cn.md)
 
-leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_estimateGas`, etc.) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
+leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_getBalance`, and the custom `estimateGas` method) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
 
 ## Features
 
@@ -97,6 +97,46 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | `blockIsValid` | Validate block |
 
 > **Note**: Block query methods (`eth_getBlockByNumber`, `eth_getBlockByHash`, `getLatestBlock`, `getBlockByHeight`, `getBlockById`) return **header only** - `transactions` and `uncles` are always empty. leafage-evm does not store transaction data.
+
+### Arc query verification
+
+`scripts/test-arc.sh` is the reusable Arc test entry point. `unit` runs the
+offline parser and request/response normalization tests; `rpc` runs deterministic differential checks
+against a fixed Arc archive block; `all` runs both. The RPC suite compares
+`eth_getBalance`, `getAddressBalance`, `simulateTransactions`, and the custom
+`estimateGas` method with the Arc node's standard RPCs. The fixtures include
+USDC, P256, NativeCoinAuthority, EIP-2935, and EIP-7708 native value transfer
+paths. Producer-captured Header/StateDiff/BlockFile loader fixtures are tracked
+in a separate follow-up PR; these Python tests do not claim to cover them.
+
+```bash
+./scripts/test-arc.sh unit
+```
+
+```bash
+LEAFAGE_RPC=http://127.0.0.1:8545 \
+ARC_REFERENCE_RPC=http://127.0.0.1:38545 \
+ARC_BLOCK=15818173 \
+ARC_QUERY_REPORT=/tmp/arc-query-report.json \
+./scripts/test-arc.sh all
+```
+
+The selected block must have a canonical successor: the script uses the fixed
+block's post-state and pins both simulators to the real next-block environment.
+Both endpoints should be synchronized before stable-latest checks are interpreted.
+RPC URLs are read from environment variables so credentials do not appear in
+the Python process arguments.
+
+Set `LEAFAGE_NODECTL_ENDPOINT=http://127.0.0.1:8545/5042` to run the existing
+randomized `nodectl node verify` suite after the fixed fixtures. Exit code `0`
+means every comparison passed, `1` means a deterministic difference was found,
+and `2` means the run was incomplete because an anchor or RPC dependency was
+unavailable. RPC URLs are never written to the JSON report.
+The JSON report covers only the deterministic Python suite; when `nodectl` is
+enabled, the process exit code covers both phases and is authoritative.
+`nodectl` accepts both endpoints as command-line arguments, so the wrapper
+requires uncredentialed loopback URLs for that optional phase. Use a local
+tunnel rather than a credential-bearing public URL.
 
 ### pre_*
 
