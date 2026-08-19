@@ -296,3 +296,68 @@ fn unset_multiplier_defaults_to_wad() {
         B20Outcome::Revert(_) => panic!("multiplier reverted"),
     }
 }
+
+/// A token whose transfer policies are real (not `ALWAYS_ALLOW`) makes the token consult the
+/// PolicyRegistry mid-transfer — a second account's storage, reached only on this path.
+///
+/// This is the shape that panicked in production before the account-load fix: leafage read
+/// the registry's storage while its account was absent from the journal, and revm's `sload`
+/// turns that into `ColdLoadSkipped` → `unwrap_db_error` → panic. Every token exercised
+/// until then had policy ID 0, so the `ALWAYS_ALLOW` fast path returned before the registry
+/// was ever touched and the gap stayed hidden.
+///
+/// Reference: Base mainnet token `0xb20000000000000000000078ee7ce2fe4908108c` ("NVIDIA
+/// Corporation"), whose packed policy slot reads sender/receiver/executor = 5. `eth_call`
+/// binary-searched to 36,563 against a 21,344 intrinsic → 15,219 inside the precompile,
+/// which is the 10,574 of an ordinary transfer plus two cold registry SLOADs (4,200) plus
+/// the 445 stipend reserve. Note the registry *account* load is not billed — only its
+/// storage reads are.
+#[test]
+fn policy_gated_transfer_matches_base_mainnet_gas() {
+    // `base.b20` namespace root + 9 = the slot packing the three transfer policy IDs.
+    const ROOT_B20: U256 = U256::from_limbs([
+        0xbb5f01ed48434000,
+        0x4c938c3196430e10,
+        0x4aff64ea9b247419,
+        0xc78b71fee795ddd7,
+    ]);
+    let policy_slot = ROOT_B20 + U256::from(9u64);
+    // sender / receiver / executor all = 5, packed at byte offsets 0 / 8 / 16.
+    let packed = U256::from(5u64)
+        | (U256::from(5u64) << 64)
+        | (U256::from(5u64) << 128);
+    // Policy 5 has type byte 0 (BLOCKLIST) and is neither built-in ID, so authorization
+    // falls through to `members[5][account]`. Those slots are unwritten, so each reads
+    // false — an empty blocklist authorizes everyone — at the cost of one cold SLOAD each.
+    let dead = address!("0x000000000000000000000000000000000000dead");
+    let calldata = IB20::transferCall { to: dead, amount: U256::ZERO }.abi_encode();
+
+    let seed = |port: &mut MockPort| {
+        port.storage.insert((TOKEN, policy_slot), packed);
+    };
+
+    // The call must succeed, not revert.
+    let mut probe = MockPort::new(200_000);
+    seed(&mut probe);
+    assert!(
+        matches!(
+            dispatch(&mut probe, TOKEN, true, &calldata),
+            Ok(B20Outcome::Return(_))
+        ),
+        "policy-gated transfer must be authorized by an empty blocklist"
+    );
+
+    // And it must cost what Base charges.
+    let (mut lo, mut hi) = (0u64, 200_000u64);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let mut port = MockPort::new(mid);
+        seed(&mut port);
+        if matches!(dispatch(&mut port, TOKEN, true, &calldata), Err(B20Error::OutOfGas)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    assert_eq!(hi, 15219, "policy-gated transfer must match Base mainnet gas");
+}
