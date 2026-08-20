@@ -2,7 +2,7 @@
 
 [中文文档](README_cn.md)
 
-leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_estimateGas`, etc.) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
+leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `estimateGas`, etc.) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
 
 ## Features
 
@@ -11,7 +11,7 @@ leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/
   - **Archive Node**: Retains complete historical state, ~360GB for ETH mainnet (as of 2025.1)
 - **Multi-chain Support**: Ethereum mainnet, Optimism, BSC, Cosmos EVM
 - **Multiple Database Backends**: RocksDB (default), MDBX
-- **Data Migration**: Import initial state from Geth snapshots
+- **Database Tooling**: Bulk archive initialization, RocksDB/MDBX migration, compaction and rewind
 
 ## Supported Write Node Repositories
 
@@ -177,18 +177,28 @@ When using Kafka + S3 mode, provide a JSON config file:
 
 Both `standalone` and `archive-init` accept `--bundle-range-size <MIB>` to tune the compacted StateDiff request size. The limit applies only when grouping multiple entries; a single entry larger than the configured value is fetched by itself.
 
-### Data Migration
+### CLI Subcommands
 
-Migrate initial data from Geth snapshot:
+| Subcommand | Purpose |
+|------------|---------|
+| `standalone` | Start the node |
+| `archive-init` | Initialize an archive database in bulk from S3 and RPC |
+| `db-migrate` | Migrate between databases (RocksDB ↔ MDBX, archive → state) |
+| `compact` | Compact the database to reclaim space |
+| `force-compact` | Force bottommost compaction so bulk-loaded SSTs regenerate the prefix bloom / partitioned index |
+| `rewind` | Reset the committed head to an earlier block and resync from S3 |
+| `archive-scan` | Read-only scan of an archive column family (forensics/debugging) |
+
+Run `leafage-evm <subcommand> --help` for the full parameter list.
 
 ```bash
-# 1. Export snapshot from Geth
-./geth snapshot dump2 --dumpdb /nodex_backup --datadir /eth/state/geth/
+# Initialize an archive database
+RUST_LOG=info ./target/release/leafage-evm archive-init --help
 
-# 2. Import to leafage-evm
-RUST_LOG=info ./target/release/leafage-evm file-migrate \
-  --source-path /nodex_backup \
-  --db-path /path/to/leafage/db
+# Migrate a database (e.g. archive → state)
+RUST_LOG=info ./target/release/leafage-evm db-migrate \
+  --src /path/to/source/db \
+  --dst /path/to/leafage/db
 ```
 
 ## Benchmark

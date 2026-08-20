@@ -50,7 +50,7 @@ Lightweight EVM executor for state queries:
 - **Port Mapping**: 8659 → 8659
 - **Features**:
   - Receives block state updates from geth
-  - Provides `eth_call`, `eth_estimateGas` and other query APIs
+  - Provides `eth_call`, `estimateGas` and other query APIs
 
 > **Scaling**: QPS scales approximately linearly with the number of CPU cores — each request is handled by an independent worker with little cross-core contention. For higher throughput, increase the CPU allocation (e.g., 8c/32G, 16c/64G) and memory roughly proportionally.
 
