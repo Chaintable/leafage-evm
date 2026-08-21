@@ -71,10 +71,31 @@ impl<'a, J: JournalTr> MeteredB20Port<'a, J> {
             Err(B20Error::OutOfGas)
         }
     }
+
+    /// Ensures `address` is present in the journal before its storage is touched.
+    ///
+    /// revm's `sload`/`sstore` assume the account is already loaded and return
+    /// `ColdLoadSkipped` otherwise (`revm-context/src/journal/inner.rs`), which the default
+    /// `JournalTr` wrappers hand to `unwrap_db_error` -- a panic, not an error. The token's
+    /// own account always arrives loaded via the initialization check, but the PolicyRegistry
+    /// does not: nothing touches it until a token whose policy ID is not ALWAYS_ALLOW consults
+    /// it mid-transfer, so the gap only opens on policy-gated tokens.
+    ///
+    /// Charges no gas, deliberately. Base reaches state through `alloy_evm::EvmInternals`,
+    /// which loads the account implicitly, and measurement against Base mainnet confirms only
+    /// the storage read is billed: a policy-gated `transfer` costs exactly two cold SLOADs for
+    /// the registry and nothing for the account itself.
+    fn ensure_loaded(&mut self, address: Address) -> B20Result<()> {
+        self.journal
+            .load_account(address)
+            .map(|_| ())
+            .map_err(|_| B20Error::Fatal("load_account failed".to_string()))
+    }
 }
 
 impl<J: JournalTr> B20Port for MeteredB20Port<'_, J> {
     fn sload(&mut self, address: Address, key: U256) -> B20Result<U256> {
+        self.ensure_loaded(address)?;
         let loaded = self
             .journal
             .sload(address, key)
@@ -98,6 +119,7 @@ impl<J: JournalTr> B20Port for MeteredB20Port<'_, J> {
         if self.gas.remaining() <= self.gas_params.call_stipend() {
             return Err(B20Error::OutOfGas);
         }
+        self.ensure_loaded(address)?;
 
         let stored = self
             .journal
@@ -161,5 +183,53 @@ impl<J: JournalTr> B20Port for MeteredB20Port<'_, J> {
 
     fn is_static(&self) -> bool {
         self.is_static
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context::JournalTr;
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::primitives::address;
+
+    /// Reading a second account's storage must not panic when that account has not been
+    /// loaded into the journal.
+    ///
+    /// This is the production failure: a policy-gated B20 transfer reads the PolicyRegistry
+    /// at `0x8453…0002`, an account nothing has touched. revm's `sload` assumes the account
+    /// is present and returns `ColdLoadSkipped` when it is not, which the default `JournalTr`
+    /// wrapper turns into `panic!("Expected DBError")` — surfacing as a -32603 internal error
+    /// rather than a normal RPC failure. A mock port cannot reproduce this; it needs a real
+    /// journal.
+    #[test]
+    fn sload_on_an_unloaded_account_does_not_panic() {
+        const REGISTRY: Address = address!("0x8453000000000000000000000000000000000002");
+
+        let mut journal: revm::Journal<CacheDB<EmptyDB>> =
+            revm::Journal::new(CacheDB::new(EmptyDB::default()));
+        let mut port = MeteredB20Port::new(
+            &mut journal,
+            1_000_000,
+            GasParams::default(),
+            Address::ZERO,
+            U256::ZERO,
+            8453,
+            U256::ZERO,
+            false,
+        );
+
+        // Never loaded, and read straight away — exactly the production path.
+        let value = port.sload(REGISTRY, U256::from(1u64));
+        assert!(value.is_ok(), "sload on an unloaded account must not panic or error");
+        assert_eq!(value.unwrap(), U256::ZERO, "an unwritten slot reads zero");
+
+        // Only the storage read is billed: the account load itself is free, matching Base.
+        let params = GasParams::default();
+        assert_eq!(
+            port.gas_spent(),
+            params.warm_storage_read_cost() + params.cold_storage_additional_cost(),
+            "a cold SLOAD costs exactly one cold storage read, with nothing for the account"
+        );
     }
 }
