@@ -93,13 +93,62 @@ common read path is a plain ERC-20 read over the namespaced layout.
    addresses.
 4. Stage 3: registries added to the unsupported set → `-39008`.
 
-## Validation (required)
+## Status: full port (reads + writes, metered gas)
 
-For several known B20 token addresses on Base, compare leafage's
-`balanceOf`/`totalSupply`/`decimals`/`name`/`symbol`/`allowance`/`scaledBalanceOf`
-against a real Base node at the same block. Do not ship without this.
+Stages 2 and 3 above are superseded. `crates/leafage-evm-chains/src/base/b20/` now ports
+the whole token surface — every `IB20` selector plus the asset and stablecoin extensions,
+mutations included — and meters gas per storage access instead of charging a flat fee.
+
+Why a port and not a dependency on `base-common-precompiles`: that crate is built against
+revm 40 / alloy-evm 0.36, leafage against revm 36 / alloy-evm 0.29, and no published
+`op-revm` supports revm 40 (the latest, 20.0.0, requires revm ^38) while leafage's entire
+Base path is built on `op_revm::OpEvm`. Linking it would mean a four-major revm bump plus
+replacing op-revm across every OP-stack chain leafage supports. The port is confined to two
+modules instead.
+
+Still forwarded as `-39008` (`is_forwarded_registry`): the B20 factory, the activation
+registry, and the policy registry's *administrative* dispatch. The policy registry's read
+path is ported, because every transfer consults it.
+
+### Gas semantics worth knowing
+
+Two things are easy to get wrong and are pinned by tests:
+
+- **Mapping-slot keccak is not metered.** Base charges keccak gas only for the factory's
+  address derivation, never for `keccak256(key ++ slot)`. Slot math is free; only the
+  resulting SLOAD/SSTORE costs.
+- **An `SSTORE` requires more than the 2300 call stipend to *remain*, though it does not
+  spend it** (EIP-2200). A call whose last write is followed by little work is bounded by
+  that reserve rather than by its own total. `transfer` spends 10,574 but requires 11,019.
+  Summing charges without modelling the reserve under-reports by 445.
+
+## Validation
+
+`crates/leafage-evm-chains/tests/b20_gas.rs` pins the port against Base mainnet. Reference
+numbers were obtained by binary-searching `eth_call`'s `gas` parameter for the smallest
+limit that does not run out, minus the intrinsic cost — i.e. the exact gas each call needs.
+Eleven cases match to the gas, and each primitive is pinned independently:
+
+| call | Base mainnet | what it pins |
+| --- | --- | --- |
+| `DEFAULT_ADMIN_ROLE()` | 106 | calldata (6/word) + init account read (100) |
+| `balanceOf` / `policyId` | 2212 | cold SLOAD = 2100 |
+| `transfer -> 0x0` | 2218 | pause read, then revert |
+| `transfer` (insufficient) | 6518 | both policy checks + sender balance read |
+| `approve(0)` | 4074 | first-touch no-op SSTORE 2200 + LOG 1756 |
+| `approve(1)` | 23974 | real 0→1 SSTORE: +19,900 |
+| `transfer` | 11019 | the stipend reserve |
+| `transfer` to self | 9019 | recipient read warm: −2000 |
+| `transferWithMemo` | 12080 | extra LOG lifts it off the reserve |
+| `transferFrom` | 14981 | allowance write-back is the last SSTORE |
+
+Re-run those probes against a real Base node after any change to the charge sequence in
+`ops.rs` or `layout.rs`; the ordering of guards decides both the error a failing call
+reports and the gas a succeeding one costs.
 
 ## References
 
-- Base reth: `crates/common/precompiles/src/{common/core_storage.rs,b20_asset/*,b20_stablecoin/*,lookup.rs,provider.rs}`
-- leafage: `crates/leafage-evm-chains/src/base/precompile.rs`, `crates/leafage-evm-rpc/src/api_impl/base/`
+- Base reth: `crates/common/precompiles/src/{common/core_storage.rs,common/ops/*,b20_asset/*,b20_stablecoin/*,policy/*,lookup.rs,provider.rs}`,
+  `crates/common/precompile-storage/src/evm.rs` (the metering model)
+- leafage: `crates/leafage-evm-chains/src/base/b20/`,
+  `crates/leafage-evm-rpc/src/api_impl/base/{metered.rs,precompiles.rs}`

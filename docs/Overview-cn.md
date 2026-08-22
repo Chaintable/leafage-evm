@@ -62,7 +62,7 @@ Leafage 通过将单体全节点拆分为分布式流水线来解决上述问题
 
 ### 适用场景
 
-**DeFi 协议和钱包**——需要跨多条链高吞吐执行 `eth_call`、`eth_estimateGas` 和批量合约调用。
+**DeFi 协议和钱包**——需要跨多条链高吞吐执行 `eth_call`、`estimateGas` 和批量合约调用。
 
 **数据平台和分析团队**——需要结构化访问区块执行数据（交易、调用追踪、事件日志），无需自建全节点或维护定制 ETL 管道。Pipeline 的外部 S3 桶以 JSON+gzip 格式交付这些数据，可直接导入数据仓库。
 
@@ -292,7 +292,6 @@ leafage-evm 通过 `--evm-type` 参数支持多条 EVM 兼容链：
 | 方法 | 说明 |
 |------|------|
 | `eth_call` | 执行消息调用 |
-| `eth_estimateGas` | 估算交易 Gas |
 | `eth_getBalance` | 账户余额 |
 | `eth_getCode` | 合约字节码 |
 | `eth_getStorageAt` | 存储槽值 |

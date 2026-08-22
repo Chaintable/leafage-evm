@@ -336,7 +336,7 @@ These APIs return a `Block` structure with:
 
 ### Rationale
 
-leafage-evm is designed as a lightweight EVM executor focused on state queries (`eth_call`, `eth_estimateGas`). It does not:
+leafage-evm is designed as a lightweight EVM executor focused on state queries (`eth_call`, `estimateGas`). It does not:
 - Store full transaction data
 - Process transaction receipts
 - Maintain transaction indices

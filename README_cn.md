@@ -13,7 +13,7 @@ Arc 查询适配使用 `scripts/test-arc.sh` 作为统一测试入口：`unit` �
   - **Archive 节点**：保留完整历史状态，ETH 主网约 360GB（截至 2025.1）
 - **多链支持**：Ethereum mainnet、Optimism、BSC、Cosmos EVM
 - **多数据库后端**：RocksDB（默认）、MDBX
-- **数据迁移**：支持从 Geth 快照导入初始状态
+- **数据库工具**：Archive 批量初始化、RocksDB/MDBX 迁移、压缩与回退
 
 ## 支持的写节点仓库
 
@@ -179,18 +179,28 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 
 `standalone` 和 `archive-init` 均可通过 `--bundle-range-size <MIB>` 调整 compacted StateDiff 的请求大小。该限制只作用于多个 entry 的合并读取；单个 entry 超过配置值时会独立获取。
 
-### 数据迁移
+### 子命令
 
-从 Geth 快照迁移初始数据：
+| 子命令 | 用途 |
+|--------|------|
+| `standalone` | 启动节点 |
+| `archive-init` | 从 S3 和 RPC 批量初始化 Archive 数据库 |
+| `db-migrate` | 数据库迁移（RocksDB ↔ MDBX、Archive → State） |
+| `compact` | 压缩数据库以回收空间 |
+| `force-compact` | 强制 bottommost compaction，重建批量导入 SST 缺失的 prefix bloom / 分区索引 |
+| `rewind` | 把已提交的链头回退到更早的区块，从 S3 重新同步 |
+| `archive-scan` | 只读扫描 Archive 列族（排查用） |
+
+完整参数用 `leafage-evm <子命令> --help` 查看。
 
 ```bash
-# 1. 在 Geth 端导出快照
-./geth snapshot dump2 --dumpdb /nodex_backup --datadir /eth/state/geth/
+# 初始化 Archive 数据库
+RUST_LOG=info ./target/release/leafage-evm archive-init --help
 
-# 2. 导入到 leafage-evm
-RUST_LOG=info ./target/release/leafage-evm file-migrate \
-  --source-path /nodex_backup \
-  --db-path /path/to/leafage/db
+# 数据库迁移（例如 Archive → State）
+RUST_LOG=info ./target/release/leafage-evm db-migrate \
+  --src /path/to/source/db \
+  --dst /path/to/leafage/db
 ```
 
 ## 性能测试
