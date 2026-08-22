@@ -354,9 +354,14 @@ pub async fn s3_get_block_info_by_number(
     }
 }
 
-/// Compute the [`BlockStorageDiff`] for an already-resolved [`BlockInfo`] by
-/// fetching its parent (by hash) and comparing state roots: an unchanged root
-/// yields an empty diff, otherwise the diff is read from S3.
+/// Read the [`BlockStorageDiff`] for an already-resolved [`BlockInfo`].
+///
+/// The diff is always read from S3, addressed by block hash. It is
+/// deliberately *not* skipped when the block's state root matches its
+/// parent's: on chains that leave the state root constant — including chains
+/// that report a zero root for every block — an equal-root test matches every
+/// block and would suppress every diff. The producer writes one object per
+/// block hash, so there is nothing to infer from the root.
 async fn s3_resolve_block_diff(
     s3_client: &Client,
     bucket_name: &str,
@@ -364,57 +369,18 @@ async fn s3_resolve_block_diff(
     version: &str,
     block_info: &BlockInfo,
 ) -> Result<BlockStorageDiff> {
-    let parent_block_info = s3_get_block_info(
+    s3_get_block_diff(
         s3_client,
         bucket_name,
         s3_chain_id,
         version,
-        block_info.header.parent_hash,
+        block_info.header.hash,
     )
     .await
     .context(format!(
-        "s3 get parent block info failed, {}",
-        block_info.header.parent_hash
-    ))?;
-    s3_resolve_block_diff_with_parent_state_root(
-        s3_client,
-        bucket_name,
-        s3_chain_id,
-        version,
-        block_info,
-        parent_block_info.header.state_root,
-    )
-    .await
-}
-
-async fn s3_resolve_block_diff_with_parent_state_root(
-    s3_client: &Client,
-    bucket_name: &str,
-    s3_chain_id: &str,
-    version: &str,
-    block_info: &BlockInfo,
-    parent_state_root: H256,
-) -> Result<BlockStorageDiff> {
-    if parent_state_root != block_info.header.state_root {
-        s3_get_block_diff(
-            s3_client,
-            bucket_name,
-            s3_chain_id,
-            version,
-            block_info.header.hash,
-        )
-        .await
-        .context(format!(
-            "s3 get block diff failed, hash: {}, root: {}, number: {}",
-            block_info.header.hash, block_info.header.state_root, block_info.header.number
-        ))
-    } else {
-        Ok(BlockStorageDiff {
-            hash: block_info.header.state_root,
-            parent_hash: parent_state_root,
-            ..Default::default()
-        })
-    }
+        "s3 get block diff failed, hash: {}, root: {}, number: {}",
+        block_info.header.hash, block_info.header.state_root, block_info.header.number
+    ))
 }
 
 pub async fn s3_get_block_info_and_diff_by_number(
@@ -442,42 +408,6 @@ pub async fn s3_get_block_info_and_diff_by_number(
     Ok((block_info, block_diff))
 }
 
-/// Resolve a block by number when the caller already has its parent's state
-/// root. This avoids reading the parent Header source object, which may have
-/// been deleted after its bundle was compacted.
-#[allow(clippy::too_many_arguments)]
-pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
-    rpc_client: &Option<HttpClient>,
-    s3_client: &Client,
-    bucket_name: &str,
-    outer_bucket_name: &str,
-    s3_chain_id: &str,
-    version: &str,
-    number: u64,
-    parent_state_root: H256,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = s3_get_block_info_by_number(
-        rpc_client,
-        s3_client,
-        bucket_name,
-        outer_bucket_name,
-        s3_chain_id,
-        version,
-        number,
-    )
-    .await?;
-    let block_diff = s3_resolve_block_diff_with_parent_state_root(
-        s3_client,
-        bucket_name,
-        s3_chain_id,
-        version,
-        &block_info,
-        parent_state_root,
-    )
-    .await?;
-    Ok((block_info, block_diff))
-}
-
 /// Resolve a block to its [`BlockInfo`] and [`BlockStorageDiff`] strictly by
 /// hash, following the by-hash S3 layout instead of the by-number index. Used
 /// to backfill the chain tip along the exact parent-hash links carried by
@@ -493,40 +423,6 @@ pub async fn s3_get_block_info_and_diff_by_hash(
     let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, hash).await?;
     let block_diff =
         s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
-    Ok((block_info, block_diff))
-}
-
-pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
-    rpc_client: &Option<HttpClient>,
-    s3_client: &Client,
-    bucket_name: &str,
-    outer_bucket_name: &str,
-    s3_chain_id: &str,
-    version: &str,
-    number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = s3_get_block_info_by_number(
-        rpc_client,
-        s3_client,
-        bucket_name,
-        outer_bucket_name,
-        s3_chain_id,
-        version,
-        number,
-    )
-    .await?;
-    let block_diff = s3_get_block_diff(
-        s3_client,
-        bucket_name,
-        s3_chain_id,
-        version,
-        block_info.header.hash,
-    )
-    .await
-    .context(format!(
-        "s3 get block diff failed, hash: {}, root: {}, number: {}",
-        block_info.header.hash, block_info.header.state_root, number
-    ))?;
     Ok((block_info, block_diff))
 }
 
@@ -597,19 +493,21 @@ mod tests {
             .unwrap()
     }
 
+    /// A chain whose state root never changes — including one reporting a zero
+    /// root for every block — must still have every diff fetched. The diff is
+    /// also addressed by block hash, so the asserted key can only match if the
+    /// fetch ignores the root entirely.
     #[tokio::test]
-    async fn known_parent_state_root_does_not_fetch_the_parent_header() {
-        let parent_root = test_hash(1);
-        let block_root = test_hash(2);
-        // Distinct from both state roots so the asserted key can only match
-        // if the fetch is addressed by block hash.
+    async fn fetches_the_diff_by_hash_even_when_the_state_root_is_unchanged() {
+        let block_root = H256::ZERO;
         let block_hash = test_hash(3);
         let mut block_info = BlockInfo::default();
         block_info.header.state_root = block_root;
+        block_info.header.parent_hash = test_hash(4);
         block_info.header.hash = block_hash;
         let expected = BlockStorageDiff {
             hash: block_root,
-            parent_hash: parent_root,
+            parent_hash: block_root,
             ..Default::default()
         };
         let mut body = Vec::new();
@@ -633,18 +531,12 @@ mod tests {
             .build();
         let client = Client::from_conf(config);
 
-        let actual = s3_resolve_block_diff_with_parent_state_root(
-            &client,
-            "source",
-            "1",
-            "",
-            &block_info,
-            parent_root,
-        )
-        .await
-        .unwrap();
+        let actual = s3_resolve_block_diff(&client, "source", "1", "", &block_info)
+            .await
+            .unwrap();
 
         assert_eq!(actual, expected);
+        // Exactly one request, for the diff: no parent Header read.
         assert_eq!(
             *requests.lock().unwrap(),
             vec![format!("/source/1/{block_hash}/stateDiff")]

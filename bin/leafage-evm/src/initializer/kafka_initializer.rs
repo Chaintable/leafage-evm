@@ -1,5 +1,5 @@
 use crate::bundle::s3_read_bundle;
-use crate::utils::{s3_get_block_info_and_diff_by_number_for_genesis, KafkaS3Config};
+use crate::utils::{s3_get_block_info_and_diff_by_number, KafkaS3Config};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -65,7 +65,7 @@ where
             info!(target: "initializer","loaded genesis block {} from bundle storage",self.genesis_number);
             Ok(block)
         } else {
-            s3_get_block_info_and_diff_by_number_for_genesis(
+            s3_get_block_info_and_diff_by_number(
                 &self.rpc_client,
                 &self.s3_client,
                 &self.kafka_s3_cfg.bucket_name,

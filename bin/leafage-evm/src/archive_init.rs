@@ -1,8 +1,5 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
-use crate::utils::{
-    s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root,
-};
+use crate::utils::s3_get_block_info_and_diff_by_number;
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use clap::Parser;
@@ -932,7 +929,7 @@ impl Command {
         }
 
         // Determine start block (support resume)
-        let (start_block, parent_state_root) = self.get_start_block(&db)?;
+        let start_block = self.get_start_block(&db)?;
 
         if start_block > self.end_block {
             info!(target: "archive_init", "Database already contains blocks up to {}, nothing to do", start_block - 1);
@@ -1012,7 +1009,6 @@ impl Command {
                     chain_id.clone(),
                     version.clone(),
                     start_block,
-                    parent_state_root,
                     self.end_block,
                     max_tasks,
                 )
@@ -1056,7 +1052,6 @@ impl Command {
                     chain_id.clone(),
                     version.clone(),
                     start_block,
-                    parent_state_root,
                     self.end_block,
                     max_tasks,
                 )
@@ -1282,11 +1277,11 @@ impl Command {
     }
 
     /// Get the start block number, checking for existing data to support resume
-    fn get_start_block(&self, db: &Arc<ArchiveStorage>) -> Result<(u64, Option<H256>)> {
+    fn get_start_block(&self, db: &Arc<ArchiveStorage>) -> Result<u64> {
         let latest_hash = db.read_latest_block_hash()?;
         if latest_hash == H256::ZERO {
             // Database is empty, start from 0
-            Ok((0, None))
+            Ok(0)
         } else {
             // Find the latest block number
             let latest_block = db.read_block_info(latest_hash)?;
@@ -1295,7 +1290,7 @@ impl Command {
                     let next_block = block.header.number + 1;
                     info!(target: "archive_init", "Resuming from block {} (last committed: {})",
                           next_block, block.header.number);
-                    Ok((next_block, Some(block.header.state_root)))
+                    Ok(next_block)
                 }
                 None => {
                     // Latest hash exists but block info not found - database is corrupted
@@ -1322,7 +1317,6 @@ impl Command {
         chain_id: String,
         version: String,
         start_block: u64,
-        mut parent_state_root: Option<H256>,
         end_block: u64,
         max_tasks: usize,
     ) -> Result<()> {
@@ -1351,13 +1345,12 @@ impl Command {
             )
             .await?;
 
-            let Some(last_bundle_block) = last_bundle_block else {
+            if last_bundle_block.is_none() {
                 info!(target: "archive_init",
                     "Bundle for block {} is not available; switching to per-block reads for the rest of this run",
                     next_block);
                 break;
-            };
-            parent_state_root = Some(last_bundle_block.header.state_root);
+            }
 
             info!(target: "archive_init",
                 "Fetched blocks {}..={} from bundle storage",
@@ -1366,36 +1359,6 @@ impl Command {
                 return Ok(());
             }
             next_block = current_bundle_end + 1;
-        }
-
-        // The parent Header of the first source block may belong to the last
-        // compacted bundle and may already have been deleted. Resolve this one
-        // block with the state root retained from the DB/bundle, then the
-        // remaining source blocks can use the original concurrent path.
-        if next_block > 0 && next_block <= end_block {
-            let parent_state_root = parent_state_root.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing parent state root for first per-block read at block {next_block}"
-                )
-            })?;
-            let block_data = Self::fetch_block_with_retry(
-                rpc_client.clone(),
-                s3_client.clone(),
-                bucket.clone(),
-                outer_bucket.clone(),
-                chain_id.clone(),
-                version.clone(),
-                next_block,
-                Some(parent_state_root),
-            )
-            .await?;
-            tx.send(block_data)
-                .await
-                .map_err(|_| anyhow::anyhow!("archive block writer channel closed"))?;
-            if next_block == end_block {
-                return Ok(());
-            }
-            next_block += 1;
         }
 
         if next_block <= end_block {
@@ -1416,7 +1379,6 @@ impl Command {
                             chain_id,
                             version,
                             block_num,
-                            None,
                         )
                         .await
                     }
@@ -1446,7 +1408,6 @@ impl Command {
         chain_id: String,
         version: String,
         block_num: u64,
-        parent_state_root: Option<H256>,
     ) -> Result<EncodedBlockData> {
         let mut last_error = String::new();
 
@@ -1459,7 +1420,6 @@ impl Command {
                 chain_id.clone(),
                 version.clone(),
                 block_num,
-                parent_state_root,
             )
             .await
             {
@@ -1499,44 +1459,19 @@ impl Command {
         chain_id: String,
         version: String,
         block_num: u64,
-        parent_state_root: Option<H256>,
     ) -> Result<EncodedBlockData> {
-        let (block_info, block_diff) = if block_num == 0 {
-            // Genesis block has no parent
-            s3_get_block_info_and_diff_by_number_for_genesis(
-                &rpc_client,
-                &s3_client,
-                &bucket,
-                &outer_bucket,
-                &chain_id,
-                &version,
-                block_num,
-            )
-            .await?
-        } else if let Some(parent_state_root) = parent_state_root {
-            s3_get_block_info_and_diff_by_number_with_parent_state_root(
-                &rpc_client,
-                &s3_client,
-                &bucket,
-                &outer_bucket,
-                &chain_id,
-                &version,
-                block_num,
-                parent_state_root,
-            )
-            .await?
-        } else {
-            s3_get_block_info_and_diff_by_number(
-                &rpc_client,
-                &s3_client,
-                &bucket,
-                &outer_bucket,
-                &chain_id,
-                &version,
-                block_num,
-            )
-            .await?
-        };
+        // Genesis needs no special case: no parent Header is read for any
+        // block, and every block's diff is fetched unconditionally.
+        let (block_info, block_diff) = s3_get_block_info_and_diff_by_number(
+            &rpc_client,
+            &s3_client,
+            &bucket,
+            &outer_bucket,
+            &chain_id,
+            &version,
+            block_num,
+        )
+        .await?;
 
         Self::encode_block(block_info, block_diff)
     }
