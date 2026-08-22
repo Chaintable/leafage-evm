@@ -101,16 +101,40 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 ### Arc query verification
 
 `scripts/test-arc.sh` is the reusable Arc test entry point. `unit` runs the
-offline parser and request/response normalization tests; `rpc` runs deterministic differential checks
-against a fixed Arc archive block; `all` runs both. The RPC suite compares
-`eth_getBalance`, `getAddressBalance`, `simulateTransactions`, and the custom
-`estimateGas` method with the Arc node's standard RPCs. The fixtures include
-USDC, P256, NativeCoinAuthority, EIP-2935, and EIP-7708 native value transfer
-paths. Producer-captured Header/StateDiff/BlockFile loader fixtures are tracked
-in a separate follow-up PR; these Python tests do not claim to cover them.
+offline parser, schema, and normalization tests; `rpc` runs deterministic
+differential checks against a fixed Arc archive block; `all` runs both.
+
+The three execution APIs use different writer oracles:
+
+- `contractMultiCall` is expanded into independent writer `eth_call` and
+  `debug_traceCall` requests with the same block/state overrides.
+- `simulateTransactions` uses `eth_simulateV1(validation=false,
+  traceTransfers=false)` for output, transaction gas, logs, and ordered state,
+  with `pre_traceMany` as a successful-frame trace oracle where it has matching
+  pre-execution semantics.
+- `estimateGas` is compared exactly with writer `eth_estimateGas`; requests
+  with block overrides reproduce the Arc/Reth binary search with writer
+  `eth_call` probes and replay the returned Leafage limit.
+
+The fixed corpus covers number and hash block selectors, empty/large batches,
+fast-fail, state and block overrides, EIP-1559/EIP-2930/EIP-7702, standard and
+Arc precompiles, NCA/NCC/system contracts, EIP-2935/EIP-7708/EIP-6780,
+CREATE/CREATE2/SELFDESTRUCT/revert rollback, and historical balance/nonce/code/
+storage boundaries. Asset checks include Arc native USDC plus USDC, AWORP,
+AUSD, AGBP, and Permit2 reads. Producer-captured Header/StateDiff/BlockFile
+loader fixtures remain a separate test layer.
 
 ```bash
 ./scripts/test-arc.sh unit
+```
+
+Validate only the writer oracle and fixed corpus, without claiming Leafage
+equivalence:
+
+```bash
+ARC_REFERENCE_RPC=http://127.0.0.1:38545 \
+ARC_BLOCK=15818173 \
+./scripts/test-arc.sh rpc --reference-only
 ```
 
 ```bash
@@ -132,11 +156,40 @@ randomized `nodectl node verify` suite after the fixed fixtures. Exit code `0`
 means every comparison passed, `1` means a deterministic difference was found,
 and `2` means the run was incomplete because an anchor or RPC dependency was
 unavailable. RPC URLs are never written to the JSON report.
-The JSON report covers only the deterministic Python suite; when `nodectl` is
+Only a run with both `LEAFAGE_RPC` and `ARC_REFERENCE_RPC` is evidence of API
+equivalence. A `--reference-only` result proves only that the writer oracle and
+fixtures are executable at the selected anchor. The JSON report covers only the deterministic Python suite; when `nodectl` is
 enabled, the process exit code covers both phases and is authoritative.
 `nodectl` accepts both endpoints as command-line arguments, so the wrapper
 requires uncredentialed loopback URLs for that optional phase. Use a local
 tunnel rather than a credential-bearing public URL.
+
+The breadth suite complements the deep fixed fixtures with a data-driven Arc
+mainnet matrix. It counts a case only when target, semantic scenario, block
+context, actor, or endpoint differs; output, gas, status, and events remain
+assertion dimensions inside that case. The frozen matrix contains 3,042 unique
+endpoint/block cases derived from 565 base vectors, across 42 target labels
+(41 on-chain addresses) and 89 historical heights. It covers important
+contracts and deployed assets, four successful historical business
+transactions, P256/PQ, NCA/NCC, SystemAccounting, EIP-2935, CREATE2, proxy/code
+history, access-control failures, and stateful ERC-20 sequences. The endpoint
+case count is 13.284 times the audited 229-case A8 baseline; 3,042 must not be
+described as 3,042 independent semantic vectors. It does not access public
+RPCs or testnet.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+LEAFAGE_RPC=http://127.0.0.1:48548 \
+ARC_REFERENCE_RPC=http://127.0.0.1:38545 \
+python3 -B scripts/verify_arc_breadth.py \
+  --block 15818173 \
+  --funded-address 0x7e8f45d07f1a182fa59aa5b62012459c15309791 \
+  --output /tmp/arc-mainnet-breadth-15818173.json
+```
+
+Use `--plan-only` to inspect the case inventory without calling either RPC.
+The breadth suite has the same exit convention: `0` means every planned case
+passed, `1` means the run completed with differences, and `2` means incomplete.
 
 ### pre_*
 
