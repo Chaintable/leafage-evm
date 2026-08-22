@@ -160,10 +160,7 @@ fn ensure_executor_available(cfg: &MultiChainCfgEnv) -> std::io::Result<()> {
                     "Arc EVM configuration does not match the Arc mainnet schedule",
                 ));
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Arc EVM executor is not available yet",
-            ))
+            Ok(())
         }
         _ if cfg.chain_id() == ARC_MAINNET_CHAIN_ID => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -337,19 +334,23 @@ mod tests {
     }
 
     #[test]
-    fn executor_guard_rejects_inconsistent_or_unavailable_arc_variants() {
+    fn executor_guard_accepts_consistent_arc_and_rejects_inconsistent_arc() {
         let arc_cfg = ArcChainConfig::mainnet();
         let mut evm_cfg = CfgEnv::new_with_spec(arc_cfg.ethereum_spec());
         evm_cfg.chain_id = arc_cfg.chain_id();
 
-        let error = ensure_executor_available(&MultiChainCfgEnv::Arc((evm_cfg.clone(), arc_cfg)))
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            ensure_executor_available(&MultiChainCfgEnv::Arc((evm_cfg.clone(), arc_cfg))).is_ok()
+        );
 
         evm_cfg.chain_id = 1;
         let error =
             ensure_executor_available(&MultiChainCfgEnv::Arc((evm_cfg, arc_cfg))).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "Arc EVM configuration does not match the Arc mainnet schedule"
+        );
     }
 
     #[test]

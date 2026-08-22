@@ -472,17 +472,8 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: Option<u8>, default: T, type_label: &st
         .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
 }
 
-const ARC_EXECUTOR_UNAVAILABLE: &str =
-    "Arc EVM executor is not available; refusing to start with Ethereum mainnet execution rules";
 const ARC_KAFKA_REQUIRED: &str =
     "Arc finalized input requires --kafka-s3-config; HTTP-only and disabled updaters are unsupported";
-
-fn ensure_executor_available(chain_cfg: &MultiChainCfgEnv) -> Result<()> {
-    if matches!(chain_cfg, MultiChainCfgEnv::Arc(_)) {
-        bail!(ARC_EXECUTOR_UNAVAILABLE);
-    }
-    Ok(())
-}
 
 fn readiness_is_healthy(startup_ready: &AtomicBool, arc_fatal: &AtomicBool) -> bool {
     startup_ready.load(std::sync::atomic::Ordering::SeqCst)
@@ -969,8 +960,6 @@ impl Command {
         if matches!(&chain_cfg, MultiChainCfgEnv::Arc(_)) && self.kafka_s3_config.is_none() {
             bail!(ARC_KAFKA_REQUIRED);
         }
-        ensure_executor_available(&chain_cfg)?;
-
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         let readiness_enabled = !self.readiness_addr.is_empty();
@@ -1170,32 +1159,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arc_executor_guard_remains_after_valid_updater_config() {
+    async fn arc_startup_reaches_runtime_initialization() {
         let kafka_config = r#"{"topic":"arc","brokers":"127.0.0.1:9092","partition":0,"bucket_name":"blocks","outer_bucket_name":"index","s3_chain_id":"5042"}"#;
-        for args in [
-            vec![
-                "--evm-type",
-                "arc",
-                "--chain-cfg",
-                "arc",
-                "--kafka-s3-config",
-                kafka_config,
-            ],
-            vec![
-                "--evm-type",
-                "arc",
-                "--chain-cfg",
-                "arc",
-                "--kafka-s3-config",
-                kafka_config,
-                "--prometheus-addr",
-                "not-a-socket-address",
-            ],
-        ] {
-            let mut command = parse_command(&args);
-            let error = command.run().await.expect_err("Arc startup should fail");
-            assert_eq!(error.to_string(), ARC_EXECUTOR_UNAVAILABLE);
-        }
+        let mut command = parse_command(&[
+            "--evm-type",
+            "arc",
+            "--chain-cfg",
+            "arc",
+            "--kafka-s3-config",
+            kafka_config,
+            "--prometheus-addr",
+            "not-a-socket-address",
+        ]);
+        let error = command
+            .run()
+            .await
+            .expect_err("invalid metrics address should stop startup");
+        assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
     }
 
     #[test]
