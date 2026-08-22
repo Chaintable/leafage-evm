@@ -44,10 +44,10 @@ use std::{
 
 const FIXTURE_CHAIN: &str = "arc-a1b";
 const FIXTURE_BUCKET: &str = "fixtures";
-const WRITER_BASELINE_COMMIT: &str = "1ff564adb44a54d5ddd7a31e60a4f64498650801";
+const WRITER_BASELINE_COMMIT: &str = "23d38e7d0cbf54e184faf3751c619f2169b3ed79";
 const WRITER_RELEASE_COMMIT: &str = "79b6fddf18345732007bb94b4af3add4c2efd12d";
-const EXPORTER_COMMIT: &str = "b99ded766a11c8aba9ccc598faf882f22af656ba";
-const TRANSFORMER_BLOB: &str = "d45a1f59c940901095088609e2c8e274de29ec77";
+const EXPORTER_COMMIT: &str = "5ab40f925d551f36fda40210bd4f81afd92de1ba";
+const TRANSFORMER_BLOB: &str = "9b10987627f4bfac9b0b5b94cf8f3c9643950f14";
 const FORMAT_REFERENCE_COMMIT: &str = "7c4e096bfbc132dcb79312e2371c80919b966a52";
 const STATE_DIFF_INDEX_BYTES: usize = 8_133;
 const HISTORY_STORAGE_ADDRESS: Address = address!("0000f90827f1c53a10cb7a02335b175320002935");
@@ -55,7 +55,7 @@ const SYSTEM_ACCOUNTING_ADDRESS: Address = address!("180000000000000000000000000
 const NORMALIZED_CAPTURE_SHA256: [(&str, &str); 5] = [
     (
         "genesis",
-        "e7748dbf38661b073c42ba14ec1fcd545c2003f8d21fcf237337aafeffae5bb1",
+        "58639c78e6c0ddac56ed00600b84b3af0709ab6d1cffd213716f45bfdaa4f84f",
     ),
     (
         "empty-hooks",
@@ -951,6 +951,39 @@ fn arc_producer_objects_have_pipeline_formats_and_locked_digests() -> Result<()>
         previous_root = manifest.state_root;
     }
 
+    let genesis_block_file = &fixtures.blocks[0].rpc_json["block_file"];
+    let genesis_txs = genesis_block_file["txs"]
+        .as_array()
+        .context("genesis BlockFile transactions are missing")?;
+    let genesis_traces = genesis_block_file["traces"]
+        .as_array()
+        .context("genesis BlockFile traces are missing")?;
+    let genesis_tx_ids = genesis_txs
+        .iter()
+        .map(|tx| {
+            tx["id"]
+                .as_str()
+                .context("genesis transaction ID is missing")
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    let genesis_trace_tx_ids = genesis_traces
+        .iter()
+        .map(|trace| {
+            trace["tx_id"]
+                .as_str()
+                .context("genesis trace transaction ID is missing")
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    ensure!(genesis_tx_ids.len() == genesis_txs.len());
+    ensure!(genesis_traces.len() == genesis_txs.len());
+    ensure!(genesis_trace_tx_ids == genesis_tx_ids);
+    ensure!(genesis_tx_ids
+        .iter()
+        .all(|tx_id| tx_id.parse::<H256>().is_ok()));
+    ensure!(genesis_tx_ids
+        .iter()
+        .all(|tx_id| !tx_id.contains("genesis")));
+
     let bundle_header = decode_gzip(&fs::read(fixtures.root.join("bundle/0/block"))?)?;
     let bundle_headers: Vec<BlockInfo> = serde_json::from_slice(&bundle_header)?;
     ensure!(bundle_headers == vec![fixtures.blocks[0].block_info.clone()]);
@@ -997,10 +1030,10 @@ async fn production_loaders_read_arc_per_block_outer_and_bundle_zero() -> Result
         .with_context(|| format!("load {} per-block StateDiff", block.manifest.label))?;
         ensure!(loaded_info == block.block_info);
         ensure!(loaded_diff == block.diff);
-        // Genesis uses producer-only synthetic transaction ids such as
-        // `0xgenesis...`, while the warmup transaction loader deliberately
-        // accepts only real transaction hashes and is never used for genesis.
-        // Bundle 0 below is the production genesis path.
+        // Genesis uses canonical bytes32 IDs for synthetic transactions, but
+        // they still do not identify signed chain transactions. The warmup
+        // transaction loader is never used for genesis; bundle 0 below is the
+        // production genesis path.
         if block.manifest.number != 0 {
             let transactions = s3_get_block_transactions(
                 &client,

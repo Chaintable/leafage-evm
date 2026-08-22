@@ -8,11 +8,11 @@
       "label": "genesis",
       "number": 0,
       "parent_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-      "process_start_timestamp": 1787166534774,
+      "process_start_timestamp": 1787371655088,
       "rpc": "rpc/0-genesis.json",
       "state_diff": "per-block/0x130943fd93181e709898eb91b72bc986d474c1828a4f50edcdbeb285dfe2b29b/stateDiff",
       "state_root": "0x130943fd93181e709898eb91b72bc986d474c1828a4f50edcdbeb285dfe2b29b",
-      "validation_hash": 106099
+      "validation_hash": 74841
     },
     {
       "block_file": "outer/0x05ebfea77cfeb7a3615a475343d048828474b5844c97a25f0e606db5ae129e4f",
@@ -22,7 +22,7 @@
       "label": "empty-hooks",
       "number": 1,
       "parent_hash": "0xc04b1737f472319e6fc4ce5f2f66eb926d77e16c3eef6ad61f544ac7df396702",
-      "process_start_timestamp": 1787166534786,
+      "process_start_timestamp": 1787371655099,
       "rpc": "rpc/1-empty-hooks.json",
       "state_diff": "per-block/0x82c55333705a3d53c477bf462f7cdfb92742b73a59c4d075fa4568060032816e/stateDiff",
       "state_root": "0x82c55333705a3d53c477bf462f7cdfb92742b73a59c4d075fa4568060032816e",
@@ -36,7 +36,7 @@
       "label": "native-transfer",
       "number": 2,
       "parent_hash": "0x05ebfea77cfeb7a3615a475343d048828474b5844c97a25f0e606db5ae129e4f",
-      "process_start_timestamp": 1787166534801,
+      "process_start_timestamp": 1787371655114,
       "rpc": "rpc/2-native-transfer.json",
       "state_diff": "per-block/0x6efce77ca2fad656daedd6f46a7f8fac62b611b47134834df0f9f90f8e002638/stateDiff",
       "state_root": "0x6efce77ca2fad656daedd6f46a7f8fac62b611b47134834df0f9f90f8e002638",
@@ -50,7 +50,7 @@
       "label": "create2",
       "number": 3,
       "parent_hash": "0xd0ce1f8dbc6e0b4ba24760130b0c7f53e8a82412347831576cbb07ced7109f3d",
-      "process_start_timestamp": 1787166534825,
+      "process_start_timestamp": 1787371655139,
       "rpc": "rpc/3-create2.json",
       "state_diff": "per-block/0xbb6a184bc22fc5b4eb08aae90c8dff09898bc9dcf56322d75ef769bf8be196c5/stateDiff",
       "state_root": "0xbb6a184bc22fc5b4eb08aae90c8dff09898bc9dcf56322d75ef769bf8be196c5",
@@ -64,7 +64,7 @@
       "label": "failed-create",
       "number": 4,
       "parent_hash": "0xc04429697a4b18d94827146ef41f6692d57bdb19676fc22d65124131834c7508",
-      "process_start_timestamp": 1787166534851,
+      "process_start_timestamp": 1787371655170,
       "rpc": "rpc/4-failed-create.json",
       "state_diff": "per-block/0x1272d03da1faa11ea63078f068f2988d57d91bdc21c451d78691b7f5def52a02/stateDiff",
       "state_root": "0x1272d03da1faa11ea63078f068f2988d57d91bdc21c451d78691b7f5def52a02",
@@ -96,7 +96,7 @@
     "StorageCleared"
   ],
   "exporter": {
-    "commit": "b99ded766a11c8aba9ccc598faf882f22af656ba",
+    "commit": "5ab40f925d551f36fda40210bd4f81afd92de1ba",
     "repository": "Chaintable/arc-node"
   },
   "files": [
@@ -117,35 +117,35 @@
       "bytes": 336,
       "kind": "outer_block_file_gzip_json",
       "path": "outer/0x05ebfea77cfeb7a3615a475343d048828474b5844c97a25f0e606db5ae129e4f",
-      "sha256": "44a8b8c8e3496ea4ba72bfaf0f3bfc7eb0455589bc0c33d9d94cc0f7d1918eef"
+      "sha256": "7c9516f3b7d36110b67b252d32555730cba9e59f0dd06d46947af6871e03c321"
     },
     {
       "block_number": 4,
-      "bytes": 777,
+      "bytes": 776,
       "kind": "outer_block_file_gzip_json",
       "path": "outer/0x31b50c974053a3ef4da86326dd89df78eb939c3d995a8e94ce3b20036a5d897d",
-      "sha256": "90e9aaa04b8e60039813932246c39fb8592a51ed69f115f64bbcaef47e770f5c"
+      "sha256": "5b93e12abc4b651c9558d1c8f1654fb8de76b405307655462bad063bbdad80fc"
     },
     {
       "block_number": 3,
       "bytes": 1084,
       "kind": "outer_block_file_gzip_json",
       "path": "outer/0xc04429697a4b18d94827146ef41f6692d57bdb19676fc22d65124131834c7508",
-      "sha256": "69c980e2efa5eade6a7bcaff83741ac8e0b0799b681304c8b764b387731fd388"
+      "sha256": "4039acad6cdd2592616df2305d39f240dc1b66bdcf2ab4b9b0d02fc1b62c6f49"
     },
     {
       "block_number": 0,
-      "bytes": 85503,
+      "bytes": 85466,
       "kind": "outer_block_file_gzip_json",
       "path": "outer/0xc04b1737f472319e6fc4ce5f2f66eb926d77e16c3eef6ad61f544ac7df396702",
-      "sha256": "2f808c9e3a3c12da4b05f4166f2039a57b238ed01813cc59026d8b2672f22ccf"
+      "sha256": "843133fef81b6bd455f6a8cac28e37c4f21729c303dcbf670197f600d75d0c8a"
     },
     {
       "block_number": 2,
       "bytes": 725,
       "kind": "outer_block_file_gzip_json",
       "path": "outer/0xd0ce1f8dbc6e0b4ba24760130b0c7f53e8a82412347831576cbb07ced7109f3d",
-      "sha256": "c6ad15701e5799cdecfcad643b1433793d01ab20e642a2679b07b7307b9eb5eb"
+      "sha256": "0fd24a2f67105b866069a324527269b8703442dac87cf0571cbc540bd7958d75"
     },
     {
       "block_number": 1,
@@ -219,42 +219,42 @@
     },
     {
       "block_number": 0,
-      "bytes": 989832,
+      "bytes": 989831,
       "kind": "rpc_debank_output_json",
       "path": "rpc/0-genesis.json",
-      "sha256": "ac55a0e35b02dbb6b8b2177c57bdd6a0018f486685688a106871f530022a89c9"
+      "sha256": "05550faaa7789d94aebd9ed6077e43dd4d60c0838bac54f2591af1a0cfbf2142"
     },
     {
       "block_number": 1,
       "bytes": 3371,
       "kind": "rpc_debank_output_json",
       "path": "rpc/1-empty-hooks.json",
-      "sha256": "edd8663f872c0d8d4e1af0b558df60d40c9f19f9ea45356e2531b0394bce45e1"
+      "sha256": "e5a0919f8764498baf0f57d40659107bdd2104b42f46ab483efed35afef90383"
     },
     {
       "block_number": 2,
       "bytes": 5765,
       "kind": "rpc_debank_output_json",
       "path": "rpc/2-native-transfer.json",
-      "sha256": "9592bf53d4a1baf27faf355b2d9cb8ae0d62c7e5b71f6fe464be25021342df29"
+      "sha256": "13ac86cfbff009a42708462d9ac6949b4e70f015943b2e43d267ceb818aeab24"
     },
     {
       "block_number": 3,
       "bytes": 9365,
       "kind": "rpc_debank_output_json",
       "path": "rpc/3-create2.json",
-      "sha256": "85d32f6a5bcbcc32ac331f36bad08ba3af148ceb6c06da284582e20cb6f53d52"
+      "sha256": "ae11b26c3f63810e4082c0b55c1b2556987f98fdccdc86cbfe08746b6b2fd179"
     },
     {
       "block_number": 4,
       "bytes": 5547,
       "kind": "rpc_debank_output_json",
       "path": "rpc/4-failed-create.json",
-      "sha256": "a77482fd6139e48f6575edffc7df1835637f8d36a73f9159a9b1cca3e166eeb0"
+      "sha256": "0f173b1b4984a41c0a7f9bf9322143c45c0b9970777bf18b6cff3d07335b61ad"
     }
   ],
   "fixture_transformer": {
-    "commit": "b99ded766a11c8aba9ccc598faf882f22af656ba",
+    "commit": "5ab40f925d551f36fda40210bd4f81afd92de1ba",
     "compatibility_contract": {
       "gzip_container": "deterministic fixture encoding; gzip header and compressed bytes are not a pipeline contract",
       "gzip_json_payload": "compact JSON without a trailing newline, matching background-tracer serde_json::to_vec semantics"
@@ -267,7 +267,7 @@
       "rpc": "DebankOutPut JSON"
     },
     "entrypoint": "scripts/fixtures/build_leafage_a1b_fixtures.py",
-    "entrypoint_blob": "d45a1f59c940901095088609e2c8e274de29ec77",
+    "entrypoint_blob": "9b10987627f4bfac9b0b5b94cf8f3c9643950f14",
     "repository": "Chaintable/arc-node"
   },
   "format_reference": {
@@ -307,7 +307,7 @@
     "independent_capture_verification": [
       {
         "label": "genesis",
-        "sha256": "e7748dbf38661b073c42ba14ec1fcd545c2003f8d21fcf237337aafeffae5bb1"
+        "sha256": "58639c78e6c0ddac56ed00600b84b3af0709ab6d1cffd213716f45bfdaa4f84f"
       },
       {
         "label": "empty-hooks",
@@ -328,19 +328,19 @@
     ]
   },
   "producer": {
-    "baseline_commit": "1ff564adb44a54d5ddd7a31e60a4f64498650801",
+    "baseline_commit": "23d38e7d0cbf54e184faf3751c619f2169b3ed79",
     "changes_from_baseline": [
       "crates/execution-e2e/src/setup.rs",
       "crates/execution-e2e/tests/export_leafage_a1b.rs",
       "scripts/fixtures/build_leafage_a1b_fixtures.py",
       "scripts/generate-leafage-a1b-fixtures.sh"
     ],
-    "commit": "b99ded766a11c8aba9ccc598faf882f22af656ba",
+    "commit": "5ab40f925d551f36fda40210bd4f81afd92de1ba",
     "repository": "Chaintable/arc-node",
     "source_policy": "only test harness and fixture scripts may differ"
   },
   "producer_baseline": {
-    "commit": "1ff564adb44a54d5ddd7a31e60a4f64498650801",
+    "commit": "23d38e7d0cbf54e184faf3751c619f2169b3ed79",
     "release": "v0.7.3",
     "release_commit": "79b6fddf18345732007bb94b4af3add4c2efd12d",
     "repository": "Chaintable/arc-node"
