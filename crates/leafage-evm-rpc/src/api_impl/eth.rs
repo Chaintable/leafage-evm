@@ -3,8 +3,9 @@ use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, To
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
-use alloy::sol_types::{decode_revert_reason, SolValue};
+use alloy::sol_types::SolValue;
 use jsonrpsee::core::RpcResult;
+use leafage_evm_chains::arc::{build_arc_query_environment, ArcQueryKind};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
@@ -12,7 +13,6 @@ use leafage_evm_types::{
     MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, H256, KECCAK256_EMPTY,
     U256,
 };
-use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
 use serde_json::Value;
 use std::error::Error;
@@ -108,7 +108,18 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        if let Some(overrides) = block_overrides {
+        let is_arc = self.inner.arc_chain_config().is_some();
+        if let Some(arc_config) = self.inner.arc_chain_config() {
+            block_env = build_arc_query_environment(
+                block.header.clone(),
+                block_overrides,
+                ArcQueryKind::CallLike,
+                Some(arc_config.fallback_next_base_fee(&block.header)),
+                &mut db,
+            )
+            .map_err(|error| invalid_params_rpc_err(error.to_string()))?
+            .block_env;
+        } else if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
                 &mut db,
@@ -117,31 +128,24 @@ where
             );
         }
         if let Some(state_override) = state_override {
-            super::utils::apply_state_overrides(state_override, &mut db)?;
+            if is_arc {
+                super::utils::apply_state_overrides_reth(state_override, &mut db)?;
+            } else {
+                super::utils::apply_state_overrides(state_override, &mut db)?;
+            }
         }
-        let tx = self.inner.create_txn_env(
+        let (block_env, tx) = self.inner.create_txn_env_for_eth_call(
             &block,
-            &block_env,
+            block_env,
             request,
             &db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         let res = self
             .inner
-            .transact(&block_env, &db, tx)
-            .map_err(|e| e.to_rpc_error())?
-            .into();
-        match res {
-            ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
-            ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
-                "Reverted: {:?}",
-                decode_revert_reason(&output).unwrap_or("execution revert".to_string())
-            ))
-            .into()),
-            ExecutionResult::Halt { reason, gas, .. } => {
-                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.used())).into())
-            }
-        }
+            .transact_for_call(&block_env, &db, tx)
+            .map_err(|error| self.inner.call_error(&error))?;
+        self.inner.call_result(res)
     }
 
     async fn call_impl(
@@ -276,6 +280,86 @@ where
         }
     }
 
+    fn execute_multi_call_requests<StateDB>(
+        &self,
+        requests: Vec<CallRequest>,
+        block: &leafage_evm_types::BlockInfo,
+        block_env: &leafage_evm_types::BlockEnv,
+        state: &StateDB,
+        fast_fail: bool,
+        cancellation_token: CancellationToken,
+    ) -> RpcResult<MultiCallResp>
+    where
+        StateDB: DatabaseRef + std::fmt::Debug,
+        StateDB::Error: Error + Sync + Send + 'static,
+    {
+        let mut stats = MultiCallStats {
+            block_num: block.header.number,
+            block_time: block.header.timestamp,
+            block_hash: block.header.hash,
+            success: true,
+            cache_enabled: false,
+        };
+        let mut results: Vec<SingleCallResult> = vec![];
+        let token_collector = self.inner.token_collector();
+        for request in requests {
+            if let Some(collector) = token_collector {
+                let to = request.to.and_then(|txkind| txkind.to().copied());
+                let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
+                collector.maybe_collect_call(to, data);
+            }
+
+            if cancellation_token.is_cancelled() {
+                return Err(internal_rpc_err(
+                    "multicall cancelled by caller".to_string(),
+                ));
+            }
+            let start = std::time::Instant::now();
+            if fast_fail
+                && !results.is_empty()
+                && results.last().unwrap().code != MultiCallErrorCode::Success as i32
+            {
+                let mut res = results.last().unwrap().clone();
+                res.code = MultiCallErrorCode::EVMFastFailed as i32;
+                results.push(res);
+                continue;
+            }
+            if let Some(txkind) = request.to {
+                if let Some(address) = txkind.to() {
+                    if *address == *utils::NATIVE_TOKEN_SENTINEL {
+                        let mut res = Self::eth_erc20_handle(&block.header, state, request);
+                        if res.code != MultiCallErrorCode::Success as i32 {
+                            stats.success = false;
+                        }
+                        res.time_cost = start.elapsed().as_secs_f64();
+                        results.push(res);
+                        continue;
+                    }
+                }
+            }
+            let (call_block_env, tx) = self.inner.create_txn_env_for_call(
+                block,
+                block_env.clone(),
+                request,
+                state,
+                self.inner.evm_cfg().cfg.chain_id,
+            )?;
+
+            let mut res: SingleCallResult = self
+                .inner
+                .transact_for_call(&call_block_env, state, tx)
+                .map_err(|e| e.to_rpc_error())?
+                .into();
+            res.time_cost = start.elapsed().as_secs_f64();
+            if res.code != MultiCallErrorCode::Success as i32 {
+                stats.success = false;
+            }
+            results.push(res);
+        }
+
+        Ok(MultiCallResp { results, stats })
+    }
+
     async fn multi_call_impl(
         &self,
         requests: Vec<CallRequest>,
@@ -319,75 +403,37 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
-        let block_env = block_env_from_block(&block);
-        let mut stats = MultiCallStats {
-            block_num: block.header.number,
-            block_time: block.header.timestamp,
-            block_hash: block.header.hash,
-            success: true,
-            cache_enabled: false,
-        };
-        // run in sequence
-        let mut results: Vec<SingleCallResult> = vec![];
-        let token_collector = self.inner.token_collector();
-        for request in requests {
-            // Collect ERC20 token address if token_collector is enabled
-            if let Some(collector) = token_collector {
-                let to = request.to.and_then(|txkind| txkind.to().copied());
-                let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
-                collector.maybe_collect_call(to, data);
-            }
-
-            if cancellation_token.is_cancelled() {
-                return Err(internal_rpc_err(
-                    "multicall cancelled by caller".to_string(),
-                ));
-            }
-            let start = std::time::Instant::now();
-            if fast_fail
-                && !results.is_empty()
-                && results.last().unwrap().code != MultiCallErrorCode::Success as i32
-            {
-                let mut res = results.last().unwrap().clone();
-                res.code = MultiCallErrorCode::EVMFastFailed as i32;
-                results.push(res);
-                continue;
-            }
-            if let Some(txkind) = request.to {
-                if let Some(address) = txkind.to() {
-                    if *address == *utils::NATIVE_TOKEN_SENTINEL {
-                        let mut res = Self::eth_erc20_handle(&block.header, state.clone(), request);
-                        if res.code != MultiCallErrorCode::Success as i32 {
-                            stats.success = false;
-                        }
-                        res.time_cost = start.elapsed().as_secs_f64();
-                        results.push(res);
-                        continue;
-                    }
-                }
-            }
-            let tx = self.inner.create_txn_env(
+        if let Some(arc_config) = self.inner.arc_chain_config() {
+            let mut cache_db = CacheDB::new(state);
+            let block_env = build_arc_query_environment(
+                block.header.clone(),
+                None,
+                ArcQueryKind::CallLike,
+                Some(arc_config.fallback_next_base_fee(&block.header)),
+                &mut cache_db,
+            )
+            .map_err(|error| invalid_params_rpc_err(error.to_string()))?
+            .block_env;
+            let state = utils::RequestCacheDB::new(cache_db);
+            self.execute_multi_call_requests(
+                requests,
                 &block,
                 &block_env,
-                request,
-                state.clone(),
-                self.inner.evm_cfg().cfg.chain_id,
-            )?;
-
-            let mut res: SingleCallResult = self
-                .inner
-                .transact(&block_env, state.clone(), tx)
-                .map_err(|e| e.to_rpc_error())?
-                .into();
-            res.time_cost = start.elapsed().as_secs_f64();
-            if res.code != MultiCallErrorCode::Success as i32 {
-                stats.success = false;
-            }
-            results.push(res);
+                &state,
+                fast_fail,
+                cancellation_token,
+            )
+        } else {
+            let block_env = block_env_from_block(&block);
+            self.execute_multi_call_requests(
+                requests,
+                &block,
+                &block_env,
+                &state,
+                fast_fail,
+                cancellation_token,
+            )
         }
-
-        let rsp = MultiCallResp { results, stats };
-        Ok(rsp)
     }
 
     fn block_number_inner(&self) -> RpcResult<U256> {

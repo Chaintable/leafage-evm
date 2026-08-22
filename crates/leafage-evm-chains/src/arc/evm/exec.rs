@@ -1,5 +1,6 @@
 use super::{ArcContext, ArcEvm};
 use crate::arc::handler::ArcHandler;
+use alloy::primitives::{Address, Bytes};
 use alloy_evm::Database;
 use leafage_evm_types::BlockEnv;
 use revm::{
@@ -10,7 +11,7 @@ use revm::{
     handler::Handler,
     inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorHandler},
     state::EvmState,
-    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
+    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, SystemCallEvm,
 };
 
 impl<DB: Database, I> ExecuteEvm for ArcEvm<DB, I> {
@@ -71,4 +72,18 @@ where
     DB: Database + DatabaseCommit,
     I: Inspector<ArcContext<DB>>,
 {
+}
+
+impl<DB: Database, I> SystemCallEvm for ArcEvm<DB, I> {
+    fn system_call_one_with_caller(
+        &mut self,
+        caller: Address,
+        system_contract_address: Address,
+        data: Bytes,
+    ) -> Result<Self::ExecutionResult, Self::Error> {
+        // Arc's current system calls are zero-value calls and intentionally use
+        // REVM's system-call handler rather than Arc frame-init transfer hooks.
+        self.inner
+            .system_call_one_with_caller(caller, system_contract_address, data)
+    }
 }

@@ -19,11 +19,14 @@ use revm::{
         instructions::EthInstructions,
         EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult, PrecompileProvider,
     },
-    inspector::InspectorEvmTr,
+    inspector::{
+        handler::{frame_end, frame_start},
+        InspectorEvmTr, InspectorFrame,
+    },
     interpreter::{
         interpreter::EthInterpreter,
         interpreter_action::{FrameInit, FrameInput},
-        CallScheme, CreateScheme, Instruction,
+        CallOutcome, CallScheme, CreateScheme, Instruction,
     },
     precompile::{PrecompileSpecId, Precompiles},
     Context, Inspector, Journal,
@@ -543,6 +546,57 @@ where
         &mut Self::Inspector,
     ) {
         self.inner.all_mut_inspector()
+    }
+
+    fn inspect_frame_init(
+        &mut self,
+        mut frame_init: FrameInit,
+    ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        let (ctx, inspector) = self.ctx_inspector();
+        if let Some(mut output) = frame_start(ctx, inspector, &mut frame_init.frame_input) {
+            frame_end(ctx, inspector, &frame_init.frame_input, &mut output);
+            return Ok(ItemOrResult::Result(output));
+        }
+
+        let frame_input = frame_init.frame_input.clone();
+        let logs_i = ctx.journal().logs().len();
+        if let ItemOrResult::Result(mut output) = self.frame_init(frame_init)? {
+            let (ctx, inspector) = self.ctx_inspector();
+            // Arc can emit EIP-7708 while initializing any successful value
+            // frame. REVM's default inspector only forwards journal logs for
+            // immediate precompile frames, so forward every log added during
+            // Arc frame init before preserving its precompile-only log list.
+            let logs_len = ctx.journal().logs().len();
+            for log_index in logs_i..logs_len {
+                let log = ctx.journal().logs()[log_index].clone();
+                inspector.log(ctx, log);
+            }
+            if let FrameResult::Call(CallOutcome {
+                was_precompile_called,
+                precompile_call_logs,
+                ..
+            }) = &mut output
+            {
+                if *was_precompile_called {
+                    for log in precompile_call_logs.iter().cloned() {
+                        inspector.log(ctx, log);
+                    }
+                }
+            }
+            frame_end(ctx, inspector, &frame_input, &mut output);
+            return Ok(ItemOrResult::Result(output));
+        }
+
+        let (ctx, inspector, frame) = self.ctx_inspector_frame();
+        let logs_len = ctx.journal().logs().len();
+        for log_index in logs_i..logs_len {
+            let log = ctx.journal().logs()[log_index].clone();
+            inspector.log(ctx, log);
+        }
+        if let Some(frame) = frame.eth_frame() {
+            inspector.initialize_interp(&mut frame.interpreter, ctx);
+        }
+        Ok(ItemOrResult::Item(frame))
     }
 }
 

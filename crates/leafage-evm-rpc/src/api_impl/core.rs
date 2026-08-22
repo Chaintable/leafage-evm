@@ -1,5 +1,7 @@
 use crate::api_impl::token_collector::TokenCollector;
+use crate::error::internal_rpc_err;
 use alloy::consensus::BlockHeader;
+use alloy::sol_types::decode_revert_reason;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
@@ -14,11 +16,13 @@ use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
+use leafage_evm_types::{
+    BlockEnv, BlockInfo, Bytes, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
+};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
-use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
+use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId, Address};
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
@@ -67,6 +71,21 @@ impl Default for EstimateGasPolicy {
 impl EstimateGasPolicy {
     pub(crate) const fn is_arc(self) -> bool {
         matches!(self, Self::Arc(_))
+    }
+}
+
+fn default_call_result<R: Debug>(result: ExecutionResult<R>) -> RpcResult<Bytes> {
+    match result {
+        ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
+        ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
+            "Reverted: {:?}",
+            decode_revert_reason(&output).unwrap_or("execution revert".to_string())
+        ))),
+        ExecutionResult::Halt { reason, gas, .. } => Err(internal_rpc_err(format!(
+            "Halted: {:?} {}",
+            reason,
+            gas.used()
+        ))),
     }
 }
 
@@ -162,6 +181,12 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 
     type EvmHaltReason: std::fmt::Debug + Clone;
 
+    /// Returns Arc's typed chain configuration for Arc-only RPC preparation.
+    /// All other executors keep the default generic path.
+    fn arc_chain_config(&self) -> Option<ArcChainConfig> {
+        None
+    }
+
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
         block: &BlockInfo,
@@ -170,6 +195,77 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx>;
+
+    fn create_txn_env_for_call<StateDB: DatabaseRef>(
+        &self,
+        block: &BlockInfo,
+        block_env: BlockEnv,
+        request: CallRequest,
+        db: StateDB,
+        chain_id: u64,
+    ) -> RpcResult<(BlockEnv, Self::Tx)> {
+        let tx = self.create_txn_env(block, &block_env, request, db, chain_id)?;
+        Ok((block_env, tx))
+    }
+
+    /// Prepares an `eth_call` transaction. Other call-like APIs continue to
+    /// use `create_txn_env_for_call`, so Arc can expose Reth error codes on
+    /// `eth_call` without changing DeBank multicall contracts.
+    fn create_txn_env_for_eth_call<StateDB: DatabaseRef>(
+        &self,
+        block: &BlockInfo,
+        block_env: BlockEnv,
+        request: CallRequest,
+        db: StateDB,
+        chain_id: u64,
+    ) -> RpcResult<(BlockEnv, Self::Tx)> {
+        self.create_txn_env_for_call(block, block_env, request, db, chain_id)
+    }
+
+    fn create_txn_env_for_simulation<StateDB: DatabaseRef>(
+        &self,
+        block: &BlockInfo,
+        block_env: &BlockEnv,
+        request: CallRequest,
+        db: StateDB,
+        chain_id: u64,
+    ) -> RpcResult<Self::Tx> {
+        self.create_txn_env(block, block_env, request, db, chain_id)
+    }
+
+    /// Prepares a transaction for gas estimation. Generic executors preserve
+    /// their existing transaction builder; Arc overrides this with the
+    /// Reth-compatible call-fee conversion used by its estimator.
+    fn create_txn_env_for_estimate<StateDB: DatabaseRef>(
+        &self,
+        block: &BlockInfo,
+        block_env: &BlockEnv,
+        request: CallRequest,
+        db: StateDB,
+        chain_id: u64,
+    ) -> RpcResult<Self::Tx> {
+        self.create_txn_env(block, block_env, request, db, chain_id)
+    }
+
+    /// Maps an EVM error produced by `eth_call`. Generic executors preserve
+    /// Leafage's existing error contract; Arc overrides this with
+    /// Reth-compatible call errors.
+    fn call_error<DBError>(
+        &self,
+        error: &EVMError<DBError, Self::TransactionError>,
+    ) -> jsonrpsee::types::ErrorObjectOwned
+    where
+        DBError: std::error::Error,
+    {
+        error.to_rpc_error()
+    }
+
+    /// Converts the completed `eth_call` result into its RPC response.
+    /// Generic executors preserve Leafage's existing error contract; Arc
+    /// overrides this with Reth-compatible execution errors.
+    fn call_result(&self, result: ExecutionResult<Self::EvmHaltReason>) -> RpcResult<Bytes> {
+        default_call_result(result)
+    }
 
     fn apply_pre_execution_changes<StateDB>(
         &self,
@@ -196,6 +292,23 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
     where
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static;
+
+    #[allow(clippy::type_complexity)]
+    fn transact_for_call<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        self.transact(block_env, state, tx)
+    }
 
     /// Executes one estimator probe. Arc overrides this to apply the same
     /// account-check relaxations and protocol/RPC execution cap as Reth.
@@ -231,6 +344,29 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
+
+    #[allow(clippy::type_complexity)]
+    /// The third return value maps each global `CallLog::index` to its
+    /// canonical emitter. Non-Arc implementations leave it empty.
+    fn inspect_tx_commit_for_simulation<StateDB, R, F>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        inspector_cfg: TracingInspectorConfig,
+        inspector_collect: F,
+        tx: Self::Tx,
+    ) -> Result<
+        (ExecutionResult<Self::EvmHaltReason>, R, Vec<Address>),
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseCommit + DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+        F: FnOnce(TracingInspector) -> R,
+    {
+        self.inspect_tx_commit(block_env, state, inspector_cfg, inspector_collect, tx)
+            .map(|(result, collected)| (result, collected, Vec::new()))
+    }
 }
 
 pub(crate) trait TxSetter {
@@ -338,5 +474,19 @@ mod tests {
         let multi_chain = MultiChainCfgEnv::Arc((cfg, config));
         assert_eq!(multi_chain.chain_id(), 5042);
         assert!(matches!(multi_chain, MultiChainCfgEnv::Arc(_)));
+    }
+
+    #[test]
+    fn default_call_result_keeps_the_existing_internal_revert_error() {
+        let error = default_call_result::<HaltReason>(ExecutionResult::Revert {
+            gas: revm::context::result::ResultGas::new(30_000, 21_000, 0, 0, 21_000),
+            logs: Vec::new(),
+            output: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), -32603);
+        assert_eq!(error.message(), "Reverted: \"execution revert\"");
+        assert!(error.data().is_none());
     }
 }
