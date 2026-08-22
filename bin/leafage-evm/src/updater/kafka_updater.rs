@@ -185,7 +185,7 @@ where
         }
 
         let mut blockhash_to_block_info = HashMap::new();
-        let mut roothash_to_block_info = HashMap::new();
+        let mut blockhash_to_block_diff = HashMap::new();
 
         // get block info first
         while let Some(res) = get_block_info_join_set.join_next().await {
@@ -206,18 +206,20 @@ where
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
                 let version = self.kafka_s3_cfg.version.clone();
-                let block_root = block_info.header.state_root;
+                let block_hash = block_info.header.hash;
                 get_block_diff_join_set.spawn(async move {
-                    s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, block_root)
-                        .await
+                    let diff =
+                        s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, block_hash)
+                            .await?;
+                    anyhow::Ok((block_hash, diff))
                 });
             };
         }
 
         // get block diff
         while let Some(res) = get_block_diff_join_set.join_next().await {
-            let block_diff = res??;
-            roothash_to_block_info.insert(block_diff.hash, block_diff);
+            let (block_hash, block_diff) = res??;
+            blockhash_to_block_diff.insert(block_hash, block_diff);
         }
 
         let mut block_contexts = Vec::new();
@@ -234,7 +236,7 @@ where
                         diff.parent_hash = parent_block_info.header.state_root;
                         diff
                     } else {
-                        roothash_to_block_info[&block_info.header.state_root].clone()
+                        blockhash_to_block_diff[&block_info.header.hash].clone()
                     };
 
                 let block_ctx_with_offset = BlockContextWithOffset {

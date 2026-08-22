@@ -72,17 +72,23 @@ fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
     serde_json::from_value(block).context("rpc get block by hash parse failed")
 }
 
+/// Read one block's [`BlockStorageDiff`] source object from S3.
+///
+/// The object is keyed by **block hash**, not by state root:
+/// `{s3_chain_id}[/{version}]/{block_hash}/stateDiff`. A block hash is unique
+/// per block, so sibling blocks on competing branches — and consecutive blocks
+/// that leave the state root untouched — each address their own object.
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
-    block_root: H256,
+    block_hash: H256,
 ) -> Result<BlockStorageDiff> {
     let s3_key = if version.is_empty() {
-        format!("{}/{}/stateDiff", s3_chain_id, block_root)
+        format!("{}/{}/stateDiff", s3_chain_id, block_hash)
     } else {
-        format!("{}/{}/{}/stateDiff", s3_chain_id, version, block_root)
+        format!("{}/{}/{}/stateDiff", s3_chain_id, version, block_hash)
     };
     let s3_obj = s3_client
         .get_object()
@@ -96,7 +102,8 @@ pub async fn s3_get_block_diff(
     // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
     // per-account / per-slot detail).
     debug!(target: "state_diff",
-        "fetched stateDiff: root {}, parent_root {}, new_accounts {}, deleted_accounts {}, storage_accounts {}, storage_slots {}, new_codes {}",
+        "fetched stateDiff: block {}, root {}, parent_root {}, new_accounts {}, deleted_accounts {}, storage_accounts {}, storage_slots {}, new_codes {}",
+        block_hash,
         block_storage_diff.hash,
         block_storage_diff.parent_hash,
         block_storage_diff.new_accounts.len(),
@@ -394,12 +401,12 @@ async fn s3_resolve_block_diff_with_parent_state_root(
             bucket_name,
             s3_chain_id,
             version,
-            block_info.header.state_root,
+            block_info.header.hash,
         )
         .await
         .context(format!(
-            "s3 get block diff failed, root: {}, number: {}",
-            block_info.header.state_root, block_info.header.number
+            "s3 get block diff failed, hash: {}, root: {}, number: {}",
+            block_info.header.hash, block_info.header.state_root, block_info.header.number
         ))
     } else {
         Ok(BlockStorageDiff {
@@ -513,12 +520,12 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
         bucket_name,
         s3_chain_id,
         version,
-        block_info.header.state_root,
+        block_info.header.hash,
     )
     .await
     .context(format!(
-        "s3 get block diff failed, root: {}, number: {}",
-        block_info.header.state_root, number
+        "s3 get block diff failed, hash: {}, root: {}, number: {}",
+        block_info.header.hash, block_info.header.state_root, number
     ))?;
     Ok((block_info, block_diff))
 }
@@ -594,8 +601,12 @@ mod tests {
     async fn known_parent_state_root_does_not_fetch_the_parent_header() {
         let parent_root = test_hash(1);
         let block_root = test_hash(2);
+        // Distinct from both state roots so the asserted key can only match
+        // if the fetch is addressed by block hash.
+        let block_hash = test_hash(3);
         let mut block_info = BlockInfo::default();
         block_info.header.state_root = block_root;
+        block_info.header.hash = block_hash;
         let expected = BlockStorageDiff {
             hash: block_root,
             parent_hash: parent_root,
@@ -636,7 +647,7 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(
             *requests.lock().unwrap(),
-            vec![format!("/source/1/{block_root}/stateDiff")]
+            vec![format!("/source/1/{block_hash}/stateDiff")]
         );
         server.abort();
     }
