@@ -61,8 +61,8 @@ The updater mode is selected based on CLI parameters:
 │     └── s3://{bucket}/{chain_id}/[{ver}/]{hash}/block       │
 │                                                             │
 │  3. Fetch state diff from S3 (parallel)                     │
-│     └── s3://{bucket}/{chain_id}/[{ver}/]{root}/stateDiff   │
-│     └── Skip if state_root unchanged (empty diff)           │
+│     └── s3://{bucket}/{chain_id}/[{ver}/]{hash}/stateDiff   │
+│     └── Always fetched, one object per block                │
 │                                                             │
 │  4. Apply updates to StateTree                              │
 │     └── tree.update_block(block_info, block_diff)           │
@@ -74,10 +74,10 @@ The updater mode is selected based on CLI parameters:
 ```
 
 S3 keys are `{chain_id}/[{version}/]{block_hash}/block` for block info and
-`{chain_id}/[{version}/]{state_root}/stateDiff` for the state diff. The
+`{chain_id}/[{version}/]{block_hash}/stateDiff` for the state diff. The
 `{version}` segment is only present when `version` is set in the config.
-State diffs are keyed by state root, so blocks that leave the root unchanged
-share one object.
+Both are keyed by block hash, so every block addresses its own objects, and
+the diff is fetched for every block rather than inferred from the state root.
 
 ### Offset Management
 

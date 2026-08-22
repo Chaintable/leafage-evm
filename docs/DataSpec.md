@@ -173,11 +173,22 @@ s3://{bucket_name}/{chain_id}/{version}/{data_type}
 
 #### 2. State Diff
 
-**Path**: `s3://{bucket_name}/{chain_id}/{version}/{state_root}/stateDiff`
+**Path**: `s3://{bucket_name}/{chain_id}/{version}/{block_hash}/stateDiff`
 
 **Format**: Raw RLP-encoded `BlockStorageDiff` (not compressed)
 
 **Content**: Binary RLP data
+
+Keyed by **block hash**, matching the Block Info object above. One object per
+block, written for *every* block — including blocks that change no state,
+which carry an empty `BlockStorageDiff`. Readers fetch this object for every
+block and never infer an empty diff from the state root.
+
+> **Note**: earlier revisions keyed this object by `{state_root}` and skipped
+> blocks whose state root matched their parent's. That layout cannot address
+> two blocks that share a state root — sibling blocks on competing branches,
+> and any chain whose state root is constant (for example one reporting a zero
+> root for every block), where a single object would serve the entire chain.
 
 #### 3. Block Hash Index (Optional, for number-based lookup)
 
@@ -231,9 +242,9 @@ For each new block:
    Content: gzip(json(block_info))
    ```
 
-2. **Upload State Diff** (if state changed)
+2. **Upload State Diff** (every block, including state-unchanged ones)
    ```
-   PUT s3://{bucket}/{chain_id}/{version}/{state_root}/stateDiff
+   PUT s3://{bucket}/{chain_id}/{version}/{block_hash}/stateDiff
    Content: rlp_encode(BlockStorageDiff)
    ```
 
