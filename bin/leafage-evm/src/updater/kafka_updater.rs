@@ -1,9 +1,11 @@
 use crate::bundle::{bundle_end, s3_read_bundle};
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
-    s3_get_block_info_and_diff_by_number, KafkaS3Config,
+    s3_get_block_info_and_diff_by_number,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, state_diff_keyed_by_block_hash,
+    KafkaS3Config,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -128,6 +130,22 @@ where
         Ok(())
     }
 
+    #[inline]
+    async fn get_block_info(&self, block_hash: H256) -> Result<BlockInfo> {
+        if let Some(block_ctx) = self.hash_to_blockctx.lock().unwrap().get(&block_hash) {
+            return Ok(block_ctx.block_info.clone());
+        }
+        s3_get_block_info(
+            &self.s3_client,
+            &self.kafka_s3_cfg.bucket_name,
+            &self.kafka_s3_cfg.s3_chain_id,
+            &self.kafka_s3_cfg.version,
+            block_hash,
+        )
+        .await
+        .context(format!("s3 get block info failed, {block_hash}"))
+    }
+
     fn clear(
         &self,
         presist_block_num: u64,
@@ -170,21 +188,45 @@ where
         let mut blockhash_to_block_info = HashMap::new();
         let mut blockhash_to_block_diff = HashMap::new();
 
+        let hash_keyed = state_diff_keyed_by_block_hash(&self.kafka_s3_cfg.s3_chain_id);
+
         // get block info first
         while let Some(res) = get_block_info_join_set.join_next().await {
             let block_info = res??;
             let block_hash = block_info.header.hash;
-            blockhash_to_block_info.insert(block_hash, block_info);
-            let client = self.s3_client.clone();
-            let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
-            let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
-            let version = self.kafka_s3_cfg.version.clone();
-            get_block_diff_join_set.spawn(async move {
-                let diff =
-                    s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, block_hash)
-                        .await?;
-                anyhow::Ok((block_hash, diff))
-            });
+            blockhash_to_block_info.insert(block_hash, block_info.clone());
+
+            // Block-hash-keyed chains have one object per block, so every
+            // block is fetched. Elsewhere the parent is read only to decide
+            // whether an object was written for this block at all.
+            let diff_key = if hash_keyed {
+                Some(block_hash)
+            } else {
+                let parent_hash = block_info.header.parent_hash;
+                let parent_block_info =
+                    if let Some(parent_block_info) = blockhash_to_block_info.get(&parent_hash) {
+                        parent_block_info.clone()
+                    } else {
+                        let parent_block_info = self.get_block_info(parent_hash).await?;
+                        blockhash_to_block_info.insert(parent_hash, parent_block_info.clone());
+                        parent_block_info
+                    };
+                (parent_block_info.header.state_root != block_info.header.state_root)
+                    .then_some(block_info.header.state_root)
+            };
+
+            if let Some(diff_key) = diff_key {
+                let client = self.s3_client.clone();
+                let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
+                let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
+                let version = self.kafka_s3_cfg.version.clone();
+                get_block_diff_join_set.spawn(async move {
+                    let diff =
+                        s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, diff_key)
+                            .await?;
+                    anyhow::Ok((block_hash, diff))
+                });
+            }
         }
 
         // get block diff
@@ -198,7 +240,17 @@ where
             debug!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
             for new_block in block_change_notification.new_blocks.drain(..) {
                 let block_info = blockhash_to_block_info[&new_block.hash].clone();
-                let block_diff = blockhash_to_block_diff[&new_block.hash].clone();
+                let block_diff = match blockhash_to_block_diff.get(&new_block.hash) {
+                    Some(block_diff) => block_diff.clone(),
+                    None => {
+                        let parent_block_info = &blockhash_to_block_info[&new_block.parent_hash];
+                        BlockStorageDiff {
+                            hash: block_info.header.state_root,
+                            parent_hash: parent_block_info.header.state_root,
+                            ..Default::default()
+                        }
+                    }
+                };
 
                 let block_ctx_with_offset = BlockContextWithOffset {
                     block_diff,
@@ -268,6 +320,7 @@ where
         &self,
         start_block_number: u64,
         end_block_number: u64,
+        mut parent_state_root: H256,
     ) -> Result<()> {
         let mut next_block_number = start_block_number;
 
@@ -290,13 +343,15 @@ where
             )
             .await?;
 
-            if last_bundle_block.is_none() {
+            let Some(last_bundle_block) = last_bundle_block else {
                 self.read_from_bundle.store(false, Ordering::Relaxed);
                 info!(target: "updater",
                     "Bundle containing block {} is not available; switching to per-block reads for the rest of this catch-up",
                     next_block_number);
                 break;
-            }
+            };
+            parent_state_root = last_bundle_block.header.state_root;
+
             info!(target: "updater",
                 "Updated blocks {}..={} from bundle storage",
                 next_block_number, current_bundle_end);
@@ -304,6 +359,30 @@ where
                 return Ok(());
             }
             next_block_number = current_bundle_end + 1;
+        }
+
+        // The first source block can follow a compacted block whose source
+        // Header has already been deleted. Use the root retained from the DB
+        // or last bundle for this hand-off block.
+        if next_block_number <= end_block_number {
+            let (block_info, block_diff) =
+                s3_get_block_info_and_diff_by_number_with_parent_state_root(
+                    &self.rpc_client,
+                    &self.s3_client,
+                    &self.kafka_s3_cfg.bucket_name,
+                    &self.kafka_s3_cfg.outer_bucket_name,
+                    &self.kafka_s3_cfg.s3_chain_id,
+                    &self.kafka_s3_cfg.version,
+                    next_block_number,
+                    parent_state_root,
+                )
+                .await?;
+            info!(target:"updater", "update first per-block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
+            self.tree.update_block(block_info, block_diff)?;
+            if next_block_number == end_block_number {
+                return Ok(());
+            }
+            next_block_number += 1;
         }
 
         let batch_size = std::cmp::max(1, self.init_task_queue_size as u64);
@@ -365,8 +444,12 @@ where
         let start_block_number = last_applied_number + 1;
         info!(target:"updater", "update from s3 by number, start block number {}, target block number {}", start_block_number, by_number_target);
         if start_block_number <= by_number_target {
-            self.update_stable_range_from_s3(start_block_number, by_number_target)
-                .await?;
+            self.update_stable_range_from_s3(
+                start_block_number,
+                by_number_target,
+                last_applied_block.header.state_root,
+            )
+            .await?;
         }
 
         // Phase 2: backfill (by_number_target, tip] by walking the parent-hash

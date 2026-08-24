@@ -61,8 +61,9 @@ The updater mode is selected based on CLI parameters:
 │     └── s3://{bucket}/{chain_id}/[{ver}/]{hash}/block       │
 │                                                             │
 │  3. Fetch state diff from S3 (parallel)                     │
-│     └── s3://{bucket}/{chain_id}/[{ver}/]{hash}/stateDiff   │
-│     └── Always fetched, one object per block                │
+│     └── s3://{bucket}/{chain_id}/[{ver}/]{root}/stateDiff   │
+│     └── Skip if state_root unchanged (empty diff)           │
+│     └── Chain 999: {hash}/stateDiff, always fetched         │
 │                                                             │
 │  4. Apply updates to StateTree                              │
 │     └── tree.update_block(block_info, block_diff)           │
@@ -74,10 +75,15 @@ The updater mode is selected based on CLI parameters:
 ```
 
 S3 keys are `{chain_id}/[{version}/]{block_hash}/block` for block info and
-`{chain_id}/[{version}/]{block_hash}/stateDiff` for the state diff. The
+`{chain_id}/[{version}/]{state_root}/stateDiff` for the state diff. The
 `{version}` segment is only present when `version` is set in the config.
-Both are keyed by block hash, so every block addresses its own objects, and
-the diff is fetched for every block rather than inferred from the state root.
+State diffs are keyed by state root, so blocks that leave the root unchanged
+share one object and are skipped rather than fetched.
+
+HyperEVM (chain `999`) is the exception: it reports a zero state root on every
+block, so its diffs are keyed by `{block_hash}` and fetched for every block.
+See `docs/DataSpec.md` for why, and `state_diff_keyed_by_block_hash()` in
+`bin/leafage-evm/src/utils.rs` for the gate.
 
 ### Offset Management
 

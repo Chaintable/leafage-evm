@@ -173,22 +173,32 @@ s3://{bucket_name}/{chain_id}/{version}/{data_type}
 
 #### 2. State Diff
 
-**Path**: `s3://{bucket_name}/{chain_id}/{version}/{block_hash}/stateDiff`
+**Path**: `s3://{bucket_name}/{chain_id}/{version}/{state_root}/stateDiff`
 
 **Format**: Raw RLP-encoded `BlockStorageDiff` (not compressed)
 
 **Content**: Binary RLP data
 
-Keyed by **block hash**, matching the Block Info object above. One object per
-block, written for *every* block — including blocks that change no state,
-which carry an empty `BlockStorageDiff`. Readers fetch this object for every
-block and never infer an empty diff from the state root.
+Keyed by **state root**, and written only when the state root actually changes.
+Blocks that leave the root untouched have no object; the reader synthesizes an
+empty `BlockStorageDiff` for them instead of fetching.
 
-> **Note**: earlier revisions keyed this object by `{state_root}` and skipped
-> blocks whose state root matched their parent's. That layout cannot address
-> two blocks that share a state root — sibling blocks on competing branches,
-> and any chain whose state root is constant (for example one reporting a zero
-> root for every block), where a single object would serve the entire chain.
+##### HyperEVM (chain 999): keyed by block hash
+
+**Path**: `s3://{bucket_name}/999/{version}/{block_hash}/stateDiff`
+
+HyperEVM reports a **zero state root on every block**, which breaks both halves
+of the layout above: a single object would serve the entire chain, and the
+"root unchanged since the parent" test — normally meaning the block wrote no
+state — matches every block, suppressing every diff.
+
+So chain `999` alone keys the object by **block hash**, matching the Block Info
+object above, and the producer writes one for *every* block — including blocks
+that change no state, which carry an empty `BlockStorageDiff`. The reader
+fetches it for every block and never infers an empty diff from the state root.
+
+No other chain is affected. The gate is `state_diff_keyed_by_block_hash()` in
+`bin/leafage-evm/src/utils.rs`, keyed off the configured `s3_chain_id`.
 
 #### 3. Block Hash Index (Optional, for number-based lookup)
 
@@ -242,9 +252,16 @@ For each new block:
    Content: gzip(json(block_info))
    ```
 
-2. **Upload State Diff** (every block, including state-unchanged ones)
+2. **Upload State Diff** (if state changed)
    ```
-   PUT s3://{bucket}/{chain_id}/{version}/{block_hash}/stateDiff
+   PUT s3://{bucket}/{chain_id}/{version}/{state_root}/stateDiff
+   Content: rlp_encode(BlockStorageDiff)
+   ```
+
+   On chain `999` (HyperEVM), key by block hash and upload for *every* block,
+   including state-unchanged ones:
+   ```
+   PUT s3://{bucket}/999/{version}/{block_hash}/stateDiff
    Content: rlp_encode(BlockStorageDiff)
    ```
 
