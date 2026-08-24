@@ -635,16 +635,12 @@ mod tests {
 
     /// Drive `s3_resolve_block_diff_with_parent_state_root` against a stub S3
     /// serving `diff`, returning the resolved diff and the request paths.
-    async fn resolve_against_stub(
-        s3_chain_id: &str,
-        block_info: &BlockInfo,
-        parent_state_root: H256,
-        diff: &BlockStorageDiff,
-    ) -> (BlockStorageDiff, Vec<String>) {
-        let mut body = Vec::new();
-        diff.encode(&mut body);
+    /// Stand up a stub S3 serving `body` for every key, returning a client
+    /// pointed at it, the recorded request paths, and the server handle.
+    async fn diff_stub(
+        body: Vec<u8>,
+    ) -> (Client, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
@@ -660,7 +656,18 @@ mod tests {
             .endpoint_url(format!("http://{address}"))
             .force_path_style(true)
             .build();
-        let client = Client::from_conf(config);
+        (Client::from_conf(config), requests, server)
+    }
+
+    async fn resolve_against_stub(
+        s3_chain_id: &str,
+        block_info: &BlockInfo,
+        parent_state_root: H256,
+        diff: &BlockStorageDiff,
+    ) -> (BlockStorageDiff, Vec<String>) {
+        let mut body = Vec::new();
+        diff.encode(&mut body);
+        let (client, requests, server) = diff_stub(body).await;
 
         let actual = s3_resolve_block_diff_with_parent_state_root(
             &client,
@@ -675,6 +682,63 @@ mod tests {
         server.abort();
         let paths = requests.lock().unwrap().clone();
         (actual, paths)
+    }
+
+    /// Only chain 999 switches layout. Everything else — including ids that
+    /// merely resemble it — keeps the state root.
+    #[test]
+    fn only_chain_999_is_keyed_by_block_hash() {
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = test_hash(2);
+        block_info.header.hash = test_hash(3);
+
+        for s3_chain_id in ["1", "56", "137", "9999", "99", "0999", " 999", "999a", ""] {
+            assert!(
+                !state_diff_keyed_by_block_hash(s3_chain_id),
+                "{s3_chain_id:?} must keep the state-root layout"
+            );
+            assert_eq!(
+                state_diff_key(s3_chain_id, &block_info),
+                block_info.header.state_root,
+                "{s3_chain_id:?} must key the diff by state root"
+            );
+        }
+
+        assert!(state_diff_keyed_by_block_hash("999"));
+        assert_eq!(
+            state_diff_key("999", &block_info),
+            block_info.header.hash,
+            "chain 999 must key the diff by block hash"
+        );
+    }
+
+    /// The genesis path has no parent to compare against, so it always
+    /// fetches — but on a legacy chain still under the state-root key. This is
+    /// the read that a cold start performs first.
+    #[tokio::test]
+    async fn legacy_chain_keys_the_genesis_diff_by_state_root() {
+        let block_root = test_hash(2);
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = block_root;
+        block_info.header.hash = test_hash(3);
+        let expected = BlockStorageDiff {
+            hash: block_root,
+            ..Default::default()
+        };
+        let mut body = Vec::new();
+        expected.encode(&mut body);
+        let (client, requests, server) = diff_stub(body).await;
+
+        let actual = s3_fetch_block_diff(&client, "source", "1", "", &block_info)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![format!("/source/1/{block_root}/stateDiff")]
+        );
     }
 
     /// Chains other than HyperEVM keep the legacy layout: the object is keyed
