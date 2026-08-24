@@ -179,6 +179,27 @@ s3://{bucket_name}/{chain_id}/{version}/{data_type}
 
 **Content**: Binary RLP data
 
+Keyed by **state root**, and written only when the state root actually changes.
+Blocks that leave the root untouched have no object; the reader synthesizes an
+empty `BlockStorageDiff` for them instead of fetching.
+
+##### HyperEVM (chain 999): keyed by block hash
+
+**Path**: `s3://{bucket_name}/999/{version}/{block_hash}/stateDiff`
+
+HyperEVM reports a **zero state root on every block**, which breaks both halves
+of the layout above: a single object would serve the entire chain, and the
+"root unchanged since the parent" test — normally meaning the block wrote no
+state — matches every block, suppressing every diff.
+
+So chain `999` alone keys the object by **block hash**, matching the Block Info
+object above, and the producer writes one for *every* block — including blocks
+that change no state, which carry an empty `BlockStorageDiff`. The reader
+fetches it for every block and never infers an empty diff from the state root.
+
+No other chain is affected. The gate is `state_diff_keyed_by_block_hash()` in
+`bin/leafage-evm/src/utils.rs`, keyed off the configured `s3_chain_id`.
+
 #### 3. Block Hash Index (Optional, for number-based lookup)
 
 **Path**: `s3://{outer_bucket_name}/{chain_id}/{version}/{block_number}/{block_hash}`
@@ -234,6 +255,13 @@ For each new block:
 2. **Upload State Diff** (if state changed)
    ```
    PUT s3://{bucket}/{chain_id}/{version}/{state_root}/stateDiff
+   Content: rlp_encode(BlockStorageDiff)
+   ```
+
+   On chain `999` (HyperEVM), key by block hash and upload for *every* block,
+   including state-unchanged ones:
+   ```
+   PUT s3://{bucket}/999/{version}/{block_hash}/stateDiff
    Content: rlp_encode(BlockStorageDiff)
    ```
 

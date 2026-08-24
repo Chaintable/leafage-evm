@@ -2,7 +2,8 @@ use crate::bundle::{bundle_end, s3_read_bundle};
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
     s3_get_block_info_and_diff_by_number,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root, KafkaS3Config,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, state_diff_keyed_by_block_hash,
+    KafkaS3Config,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
@@ -185,57 +186,71 @@ where
         }
 
         let mut blockhash_to_block_info = HashMap::new();
-        let mut roothash_to_block_info = HashMap::new();
+        let mut blockhash_to_block_diff = HashMap::new();
+
+        let hash_keyed = state_diff_keyed_by_block_hash(&self.kafka_s3_cfg.s3_chain_id);
 
         // get block info first
         while let Some(res) = get_block_info_join_set.join_next().await {
             let block_info = res??;
-            let hash = block_info.header.hash;
-            blockhash_to_block_info.insert(hash, block_info.clone());
-            let parent_hash = block_info.header.parent_hash;
-            let parent_block_info =
-                if let Some(parent_block_info) = blockhash_to_block_info.get(&parent_hash) {
-                    parent_block_info.clone()
-                } else {
-                    let parent_block_info = self.get_block_info(parent_hash).await?;
-                    blockhash_to_block_info.insert(parent_hash, parent_block_info.clone());
-                    parent_block_info
-                };
-            if parent_block_info.header.state_root != block_info.header.state_root {
+            let block_hash = block_info.header.hash;
+            blockhash_to_block_info.insert(block_hash, block_info.clone());
+
+            // Block-hash-keyed chains have one object per block, so every
+            // block is fetched. Elsewhere the parent is read only to decide
+            // whether an object was written for this block at all.
+            let diff_key = if hash_keyed {
+                Some(block_hash)
+            } else {
+                let parent_hash = block_info.header.parent_hash;
+                let parent_block_info =
+                    if let Some(parent_block_info) = blockhash_to_block_info.get(&parent_hash) {
+                        parent_block_info.clone()
+                    } else {
+                        let parent_block_info = self.get_block_info(parent_hash).await?;
+                        blockhash_to_block_info.insert(parent_hash, parent_block_info.clone());
+                        parent_block_info
+                    };
+                (parent_block_info.header.state_root != block_info.header.state_root)
+                    .then_some(block_info.header.state_root)
+            };
+
+            if let Some(diff_key) = diff_key {
                 let client = self.s3_client.clone();
                 let bucket_name = self.kafka_s3_cfg.bucket_name.clone();
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
                 let version = self.kafka_s3_cfg.version.clone();
-                let block_root = block_info.header.state_root;
                 get_block_diff_join_set.spawn(async move {
-                    s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, block_root)
-                        .await
+                    let diff =
+                        s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, diff_key)
+                            .await?;
+                    anyhow::Ok((block_hash, diff))
                 });
-            };
+            }
         }
 
         // get block diff
         while let Some(res) = get_block_diff_join_set.join_next().await {
-            let block_diff = res??;
-            roothash_to_block_info.insert(block_diff.hash, block_diff);
+            let (block_hash, block_diff) = res??;
+            blockhash_to_block_diff.insert(block_hash, block_diff);
         }
 
         let mut block_contexts = Vec::new();
         for (offset, mut block_change_notification) in msgs.drain(..) {
             debug!(target:"updater", "get block_change_notification {:?}, offset {:?}", block_change_notification, offset);
             for new_block in block_change_notification.new_blocks.drain(..) {
-                let parent_block_info = &blockhash_to_block_info[&new_block.parent_hash];
                 let block_info = blockhash_to_block_info[&new_block.hash].clone();
-
-                let block_diff =
-                    if parent_block_info.header.state_root == block_info.header.state_root {
-                        let mut diff = BlockStorageDiff::default();
-                        diff.hash = block_info.header.state_root;
-                        diff.parent_hash = parent_block_info.header.state_root;
-                        diff
-                    } else {
-                        roothash_to_block_info[&block_info.header.state_root].clone()
-                    };
+                let block_diff = match blockhash_to_block_diff.get(&new_block.hash) {
+                    Some(block_diff) => block_diff.clone(),
+                    None => {
+                        let parent_block_info = &blockhash_to_block_info[&new_block.parent_hash];
+                        BlockStorageDiff {
+                            hash: block_info.header.state_root,
+                            parent_hash: parent_block_info.header.state_root,
+                            ..Default::default()
+                        }
+                    }
+                };
 
                 let block_ctx_with_offset = BlockContextWithOffset {
                     block_diff,
