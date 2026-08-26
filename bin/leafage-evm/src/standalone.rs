@@ -3,7 +3,7 @@ use crate::initializer::initialize_check;
 use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
-use crate::updater::updater_build;
+use crate::updater::{updater_build, UpdaterHandle, UpdaterInputPolicy};
 use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
@@ -474,11 +474,54 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: Option<u8>, default: T, type_label: &st
 
 const ARC_EXECUTOR_UNAVAILABLE: &str =
     "Arc EVM executor is not available; refusing to start with Ethereum mainnet execution rules";
+const ARC_KAFKA_REQUIRED: &str =
+    "Arc finalized input requires --kafka-s3-config; HTTP-only and disabled updaters are unsupported";
 
 fn ensure_executor_available(chain_cfg: &MultiChainCfgEnv) -> Result<()> {
     if matches!(chain_cfg, MultiChainCfgEnv::Arc(_)) {
         bail!(ARC_EXECUTOR_UNAVAILABLE);
     }
+    Ok(())
+}
+
+fn readiness_is_healthy(startup_ready: &AtomicBool, arc_fatal: &AtomicBool) -> bool {
+    startup_ready.load(std::sync::atomic::Ordering::SeqCst)
+        && !arc_fatal.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn readiness_response(
+    startup_ready: &AtomicBool,
+    arc_fatal: &AtomicBool,
+) -> (axum::http::StatusCode, &'static str) {
+    if readiness_is_healthy(startup_ready, arc_fatal) {
+        (axum::http::StatusCode::OK, "ready")
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    }
+}
+
+fn arc_fatal_exit_result(
+    result: std::result::Result<anyhow::Error, tokio::sync::oneshot::error::RecvError>,
+) -> Result<()> {
+    let error = result.map_err(|_| anyhow!("Arc updater fatal channel closed unexpectedly"))?;
+    Err(error.context("Arc updater stopped on invalid finalized input"))
+}
+
+async fn stop_services(
+    updater_stop: tokio::sync::watch::Sender<()>,
+    rpc_handle: jsonrpsee::server::ServerHandle,
+    registry_stop: tokio::sync::watch::Sender<()>,
+    stop_wait_timeout: u64,
+) -> Result<()> {
+    info!("stopping leafage server...");
+    let _ = updater_stop.send(());
+    let _ = registry_stop.send(());
+    info!(
+        "waiting for etcd lease to expire in {} seconds...",
+        stop_wait_timeout
+    );
+    time::sleep(std::time::Duration::from_secs(stop_wait_timeout)).await;
+    let _ = rpc_handle.stop();
     Ok(())
 }
 
@@ -686,7 +729,7 @@ impl Command {
         &mut self,
         chain_cfg: MultiChainCfgEnv,
     ) -> Result<(
-        tokio::sync::watch::Sender<()>,
+        UpdaterHandle,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
     )> {
@@ -741,22 +784,18 @@ impl Command {
             gauge.set(1.0);
         }
         let ready = Arc::new(AtomicBool::new(false));
+        let arc_fatal = Arc::new(AtomicBool::new(false));
         if !self.readiness_addr.is_empty() {
             let readiness_addr = self.readiness_addr.parse::<std::net::SocketAddr>()?;
             info!(target: "updater", "starting readiness server on {}", readiness_addr);
 
             let handle = ready.clone();
+            let fatal = arc_fatal.clone();
 
             tokio::spawn(async move {
                 let app = axum::Router::new().route(
                     "/",
-                    axum::routing::get(move || async move {
-                        if handle.load(std::sync::atomic::Ordering::SeqCst) {
-                            (axum::http::StatusCode::OK, "ready")
-                        } else {
-                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
-                        }
-                    }),
+                    axum::routing::get(move || async move { readiness_response(&handle, &fatal) }),
                 );
 
                 let listener = tokio::net::TcpListener::bind(readiness_addr)
@@ -892,6 +931,11 @@ impl Command {
             )
             .await?;
 
+        let input_policy = if matches!(&chain_cfg, MultiChainCfgEnv::Arc(_)) {
+            UpdaterInputPolicy::ArcFinalizedLinear
+        } else {
+            UpdaterInputPolicy::Legacy
+        };
         let updater_handle = updater_build(
             tree.clone(),
             self.rpc_addr.clone(),
@@ -901,6 +945,8 @@ impl Command {
             self.init_task_queue_size,
             self.catchup_safe_depth,
             self.bundle_read.bundle_range_size_mib,
+            input_policy,
+            arc_fatal,
         )
         .await?;
 
@@ -920,27 +966,44 @@ impl Command {
 
     pub async fn run(&mut self) -> Result<()> {
         let chain_cfg = self.build_chain_cfg_env()?;
+        if matches!(&chain_cfg, MultiChainCfgEnv::Arc(_)) && self.kafka_s3_config.is_none() {
+            bail!(ARC_KAFKA_REQUIRED);
+        }
         ensure_executor_available(&chain_cfg)?;
 
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
-        let (updater_handle, rpc_handle, resgitry_handle) = self.start(chain_cfg).await?;
-        run_until_ctrl_c(async move {
-            info!("stopping leafage server...");
-            let _ = updater_handle.send(());
-            let _ = resgitry_handle.send(());
-            // wait for lease to unregist
-            info!(
-                "waiting for etcd lease to expire in {} seconds...",
-                self.stop_wait_timeout
-            );
-            time::sleep(std::time::Duration::from_secs(
-                self.stop_wait_timeout as u64,
-            ))
-            .await;
-            let _ = rpc_handle.stop();
-            Ok(())
-        })
+        let readiness_enabled = !self.readiness_addr.is_empty();
+        let stop_wait_timeout = self.stop_wait_timeout;
+        let (mut updater_handle, rpc_handle, registry_handle) = self.start(chain_cfg).await?;
+        if !readiness_enabled {
+            if let Some(mut fatal) = updater_handle.fatal.take() {
+                tokio::select! {
+                    result = run_until_ctrl_c(stop_services(
+                        updater_handle.stop.clone(),
+                        rpc_handle.clone(),
+                        registry_handle.clone(),
+                        stop_wait_timeout,
+                    )) => result?,
+                    result = &mut fatal => {
+                        stop_services(
+                            updater_handle.stop,
+                            rpc_handle,
+                            registry_handle,
+                            stop_wait_timeout,
+                        ).await?;
+                        return arc_fatal_exit_result(result);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        run_until_ctrl_c(stop_services(
+            updater_handle.stop,
+            rpc_handle,
+            registry_handle,
+            stop_wait_timeout,
+        ))
         .await?;
         Ok(())
     }
@@ -1080,9 +1143,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arc_startup_fails_before_metrics_or_database_initialization() {
+    async fn arc_requires_kafka_before_metrics_or_database_initialization() {
         for args in [
             vec!["--evm-type", "arc", "--chain-cfg", "arc"],
+            vec![
+                "--evm-type",
+                "arc",
+                "--chain-cfg",
+                "arc",
+                "--rpc-addr",
+                "http://127.0.0.1:8545",
+            ],
             vec![
                 "--evm-type",
                 "arc",
@@ -1094,7 +1165,62 @@ mod tests {
         ] {
             let mut command = parse_command(&args);
             let error = command.run().await.expect_err("Arc startup should fail");
+            assert_eq!(error.to_string(), ARC_KAFKA_REQUIRED);
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_executor_guard_remains_after_valid_updater_config() {
+        let kafka_config = r#"{"topic":"arc","brokers":"127.0.0.1:9092","partition":0,"bucket_name":"blocks","outer_bucket_name":"index","s3_chain_id":"5042"}"#;
+        for args in [
+            vec![
+                "--evm-type",
+                "arc",
+                "--chain-cfg",
+                "arc",
+                "--kafka-s3-config",
+                kafka_config,
+            ],
+            vec![
+                "--evm-type",
+                "arc",
+                "--chain-cfg",
+                "arc",
+                "--kafka-s3-config",
+                kafka_config,
+                "--prometheus-addr",
+                "not-a-socket-address",
+            ],
+        ] {
+            let mut command = parse_command(&args);
+            let error = command.run().await.expect_err("Arc startup should fail");
             assert_eq!(error.to_string(), ARC_EXECUTOR_UNAVAILABLE);
         }
+    }
+
+    #[test]
+    fn fatal_input_keeps_readiness_unhealthy_after_startup_finishes() {
+        let startup_ready = AtomicBool::new(false);
+        let fatal = AtomicBool::new(true);
+        assert_eq!(
+            readiness_response(&startup_ready, &fatal),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        );
+
+        startup_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            readiness_response(&startup_ready, &fatal),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        );
+    }
+
+    #[test]
+    fn fatal_input_without_readiness_returns_an_error() {
+        let error = arc_fatal_exit_result(Ok(anyhow!("bad finalized parent")))
+            .expect_err("fatal Arc input must terminate standalone with an error");
+
+        assert!(error
+            .to_string()
+            .contains("Arc updater stopped on invalid finalized input"));
     }
 }
