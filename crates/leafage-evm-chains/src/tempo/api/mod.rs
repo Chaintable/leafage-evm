@@ -1279,7 +1279,7 @@ mod tests {
 
         // Build an authorize_key call. expiry=0 so pre-T2 hits ExpiryInPast after
         // admin check succeeds. keyId is nonzero to avoid ZeroPublicKey error.
-        let call = IAccountKeychain::authorizeKeyCall {
+        let call = IAccountKeychain::authorizeKey_0Call {
             keyId: key_id,
             signatureType: IAccountKeychain::SignatureType::Secp256k1,
             expiry: 0,

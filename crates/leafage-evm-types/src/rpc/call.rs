@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, B256, U256};
 use alloy::rpc::types::TransactionRequest;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
@@ -105,6 +105,11 @@ pub struct TempoKeyAuthGasInfo {
     /// listed scopes. Used to derive `ScopeCounts` for `key_auth_gas`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_calls: Option<Vec<CallScope>>,
+
+    /// (T5+, TIP-1053) Optional key-authorization witness. Presence matters;
+    /// `bytes32(0)` is still a witness and incurs witness gas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<B256>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -264,12 +269,14 @@ mod tests {
     fn test_tempo_key_auth_gas_info_deserialization() {
         let json = serde_json::json!({
             "sigType": "webauthn",
-            "numLimits": 3
+            "numLimits": 3,
+            "witness": "0x0000000000000000000000000000000000000000000000000000000000000000"
         });
 
         let info: TempoKeyAuthGasInfo = serde_json::from_value(json).expect("should deserialize");
         assert_eq!(info.sig_type, Some("webauthn".to_string()));
         assert_eq!(info.num_limits, 3);
+        assert_eq!(info.witness, Some(B256::ZERO));
     }
 
     /// TempoKeyAuthGasInfo defaults when fields are missing.
@@ -280,6 +287,7 @@ mod tests {
         let info: TempoKeyAuthGasInfo = serde_json::from_value(json).expect("should deserialize empty");
         assert!(info.sig_type.is_none());
         assert_eq!(info.num_limits, 0);
+        assert!(info.witness.is_none());
     }
 
     /// CallRequest serialization round-trip: serialize then deserialize.

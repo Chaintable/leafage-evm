@@ -16,6 +16,7 @@
 //! |  4   | total_supply                   | Mapping<B256, U256>                         |
 //! |  5   | liquidity_balances             | Mapping<B256, Mapping<Address, U256>>       |
 //! |  6   | pending_fee_swap_reservation   | Mapping<B256, u128> (transient)             |
+//! |  7   | two_hop_intermediate           | Address (transient, T5+)                    |
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
@@ -114,6 +115,13 @@ pub struct Pool {
     pub reserve_validator_token: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeRoute {
+    SameToken,
+    Direct,
+    TwoHop(Address),
+}
+
 impl StorableType for Pool {
     const LAYOUT: Layout = Layout::Slots(1);
     type Handler = Slot<Self>;
@@ -201,6 +209,8 @@ pub struct TipFeeManager {
     pub liquidity_balances: Mapping<B256, Mapping<Address, U256>>,
     // Slot 6: pending_fee_swap_reservation (transient storage)
     pub pending_fee_swap_reservation: Mapping<B256, u128>,
+    // Slot 7: selected TIP-1033 two-hop intermediate (transient storage)
+    pub two_hop_intermediate: Slot<Address>,
 
     pub address: Address,
     pub storage: StorageCtx,
@@ -217,6 +227,7 @@ impl TipFeeManager {
             total_supply: Mapping::new(U256::from(4), address),
             liquidity_balances: Mapping::new(U256::from(5), address),
             pending_fee_swap_reservation: Mapping::new(U256::from(6), address),
+            two_hop_intermediate: Slot::new(U256::from(7), address),
             address,
             storage: StorageCtx::default(),
         }
@@ -332,10 +343,17 @@ impl TipFeeManager {
         tip20_token.ensure_transfer_authorized(fee_payer, self.address)?;
         tip20_token.transfer_fee_pre_tx(fee_payer, max_amount)?;
 
-        if user_token != validator_token {
-            let pool_id = PoolKey::new(user_token, validator_token).get_id();
-            let _amount_out_needed = self.check_sufficient_liquidity(pool_id, max_amount)?;
-            // T1C+ reservation handled in full Tempo node; leafage omits transient storage reservation
+        let route = self.plan_fee_route(user_token, validator_token, max_amount)?;
+        match route {
+            Some(FeeRoute::SameToken | FeeRoute::Direct) => {}
+            Some(FeeRoute::TwoHop(intermediate)) => {
+                self.two_hop_intermediate.t_write(intermediate)?;
+            }
+            None => {
+                return Err(TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
+                ));
+            }
         }
 
         Ok(user_token)
@@ -355,14 +373,21 @@ impl TipFeeManager {
 
         let validator_token = self.get_validator_token(beneficiary)?;
 
-        if fee_token != validator_token && !actual_spending.is_zero() {
-            self.execute_fee_swap(fee_token, validator_token, actual_spending)?;
-        }
-
+        let intermediate = self.two_hop_intermediate.t_read()?;
         let amount = if fee_token == validator_token {
             actual_spending
-        } else {
+        } else if intermediate.is_zero() {
+            if !actual_spending.is_zero() {
+                self.execute_fee_swap(fee_token, validator_token, actual_spending)?;
+            }
             compute_amount_out(actual_spending)?
+        } else {
+            if !actual_spending.is_zero() {
+                let first_output =
+                    self.execute_fee_swap(fee_token, intermediate, actual_spending)?;
+                self.execute_fee_swap(intermediate, validator_token, first_output)?;
+            }
+            compute_amount_out(compute_amount_out(actual_spending)?)?
         };
 
         self.increment_collected_fees(beneficiary, validator_token, amount)?;
@@ -437,6 +462,44 @@ impl TipFeeManager {
     pub fn get_pool(&self, call: ITIPFeeAMM::getPoolCall) -> Result<Pool> {
         let pool_id = self.pool_id(call.userToken, call.validatorToken);
         self.pools[pool_id].read()
+    }
+
+    /// Selects the fee swap route. T5 adds a fallback through the user's
+    /// token quote token when the direct pool cannot cover the swap.
+    pub fn plan_fee_route(
+        &self,
+        user_token: Address,
+        validator_token: Address,
+        max_amount: U256,
+    ) -> Result<Option<FeeRoute>> {
+        if user_token == validator_token {
+            return Ok(Some(FeeRoute::SameToken));
+        }
+
+        let amount_out = compute_amount_out(max_amount)?;
+        let direct = self.pools[self.pool_id(user_token, validator_token)].read()?;
+        if U256::from(direct.reserve_validator_token) >= amount_out {
+            return Ok(Some(FeeRoute::Direct));
+        }
+        if !self.storage.spec().is_t5() {
+            return Ok(None);
+        }
+
+        let intermediate = TIP20Token::from_address(user_token)?.quote_token()?;
+        if intermediate.is_zero() || intermediate == validator_token {
+            return Ok(None);
+        }
+        let leg1 = self.pools[self.pool_id(user_token, intermediate)].read()?;
+        if U256::from(leg1.reserve_validator_token) < amount_out {
+            return Ok(None);
+        }
+
+        let second_amount_out = compute_amount_out(amount_out)?;
+        let leg2 = self.pools[self.pool_id(intermediate, validator_token)].read()?;
+        if U256::from(leg2.reserve_validator_token) < second_amount_out {
+            return Ok(None);
+        }
+        Ok(Some(FeeRoute::TwoHop(intermediate)))
     }
 
     /// Checks that the pool has enough reserves for the fee swap.
@@ -973,5 +1036,83 @@ impl Precompile for TipFeeManager {
                 })
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::address;
+
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+
+    #[test]
+    fn two_hop_fee_route_activates_at_t5() {
+        let user = address!("0x20c0000000000000000000000000000000000011");
+        let intermediate = address!("0x20c0000000000000000000000000000000000022");
+        let validator = address!("0x20c0000000000000000000000000000000000033");
+        let max_amount = U256::from(1_000_000u64);
+        let first_output = compute_amount_out(max_amount).unwrap();
+        let second_output = compute_amount_out(first_output).unwrap();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(user)
+                .quote_token
+                .write(intermediate)?;
+            let mut manager = TipFeeManager::new();
+            let first_pool = manager.pool_id(user, intermediate);
+            let second_pool = manager.pool_id(intermediate, validator);
+            manager.pools[first_pool].write(Pool {
+                reserve_user_token: 0,
+                reserve_validator_token: first_output.to::<u128>(),
+            })?;
+            manager.pools[second_pool].write(Pool {
+                reserve_user_token: 0,
+                reserve_validator_token: second_output.to::<u128>(),
+            })?;
+            assert_eq!(
+                manager.plan_fee_route(user, validator, max_amount)?,
+                None,
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        provider.set_spec(TempoHardfork::T5);
+        StorageCtx::enter(&mut provider, || {
+            let manager = TipFeeManager::new();
+            assert_eq!(
+                manager.plan_fee_route(user, validator, max_amount)?,
+                Some(FeeRoute::TwoHop(intermediate)),
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_fee_route_wins_over_t5_fallback() {
+        let user = address!("0x20c0000000000000000000000000000000000044");
+        let validator = address!("0x20c0000000000000000000000000000000000055");
+        let max_amount = U256::from(1_000_000u64);
+        let output = compute_amount_out(max_amount).unwrap();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut manager = TipFeeManager::new();
+            let direct_pool = manager.pool_id(user, validator);
+            manager.pools[direct_pool].write(Pool {
+                reserve_user_token: 0,
+                reserve_validator_token: output.to::<u128>(),
+            })?;
+            assert_eq!(
+                manager.plan_fee_route(user, validator, max_amount)?,
+                Some(FeeRoute::Direct),
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
     }
 }

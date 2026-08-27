@@ -514,6 +514,9 @@ impl Encodable for TempoSignature {
 pub struct TokenLimit {
     pub token: Address,
     pub limit: U256,
+    /// Period duration in seconds. Zero means a one-time limit.
+    #[serde(default, with = "alloy::serde::quantity")]
+    pub period: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +530,7 @@ pub use leafage_evm_types::{CallScope, SelectorRule};
 
 /// Key authorization for provisioning access keys.
 ///
-/// RLP encoding: `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?]`
+/// RLP encoding: `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?]`
 /// Uses `#[rlp(trailing(canonical))]` semantics: trailing optionals are omitted
 /// when `None` (canonical) and any `None` preceding a `Some` is encoded as the
 /// empty bytestring `0x80` for positional correctness.
@@ -546,6 +549,9 @@ pub struct KeyAuthorization {
     /// = scoped deny-all; `Some([scope, ...])` = the listed scopes.
     #[serde(default)]
     pub allowed_calls: Option<Vec<CallScope>>,
+    /// TIP-1053 witness. Presence is significant, including `B256::ZERO`.
+    #[serde(default)]
+    pub witness: Option<B256>,
 }
 
 /// Manual RLP Encodable to match the writer's `#[rlp(trailing(canonical))]`
@@ -579,6 +585,12 @@ impl Encodable for KeyAuthorization {
                 None => out.put_u8(EMPTY_STRING_CODE),
             }
         }
+        if last_present >= 4 {
+            match self.witness {
+                Some(witness) => witness.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
+            }
+        }
     }
 
     fn length(&self) -> usize {
@@ -589,10 +601,12 @@ impl Encodable for KeyAuthorization {
 
 impl KeyAuthorization {
     /// Returns the 1-indexed position of the latest `Some` trailing field
-    /// (1=expiry, 2=limits, 3=allowed_calls), or 0 if all are `None`. Used to
+    /// (1=expiry, 2=limits, 3=allowed_calls, 4=witness), or 0 if all are `None`. Used to
     /// decide which preceding `None`s require positional 0x80 encoding.
     fn last_trailing_present(&self) -> u8 {
-        if self.allowed_calls.is_some() {
+        if self.witness.is_some() {
+            4
+        } else if self.allowed_calls.is_some() {
             3
         } else if self.limits.is_some() {
             2
@@ -617,6 +631,9 @@ impl KeyAuthorization {
         if last_present >= 3 {
             len += self.allowed_calls.as_ref().map_or(1, |s| s.length());
         }
+        if last_present >= 4 {
+            len += self.witness.map_or(1, |w| w.length());
+        }
         len
     }
 }
@@ -627,7 +644,7 @@ impl KeyAuthorization {
 
 /// Signed key authorization (key authorization + root key signature).
 ///
-/// RLP: `[chain_id, key_type, key_id, expiry?, limits?, signature?]`
+/// RLP: `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?, signature]`
 /// The `#[rlp(trailing)]` in the writer means `signature` is trailing after
 /// KeyAuthorization's own trailing fields. We match this exactly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -663,6 +680,11 @@ impl Encodable for SignedKeyAuthorization {
         } else {
             out.put_u8(EMPTY_STRING_CODE);
         }
+        if let Some(witness) = self.authorization.witness {
+            witness.encode(out);
+        } else {
+            out.put_u8(EMPTY_STRING_CODE);
+        }
         self.signature.encode(out);
     }
 
@@ -680,6 +702,7 @@ impl SignedKeyAuthorization {
             + self.authorization.expiry.map_or(1, |e| e.length())
             + self.authorization.limits.as_ref().map_or(1, |l| l.length())
             + self.authorization.allowed_calls.as_ref().map_or(1, |s| s.length())
+            + self.authorization.witness.map_or(1, |w| w.length())
             + self.signature.length()
     }
 }
@@ -1146,6 +1169,7 @@ mod tests {
                 expiry: Some(1000),
                 limits: None,
                 allowed_calls: None,
+                witness: None,
             },
             signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
         };
@@ -1164,6 +1188,7 @@ mod tests {
             expiry: None,
             limits: None,
             allowed_calls: None,
+            witness: None,
         };
         let mut buf1 = Vec::new();
         auth1.encode(&mut buf1);
@@ -1176,6 +1201,7 @@ mod tests {
             expiry: Some(1000),
             limits: None,
             allowed_calls: None,
+            witness: None,
         };
         let mut buf2 = Vec::new();
         auth2.encode(&mut buf2);
@@ -1189,8 +1215,10 @@ mod tests {
             limits: Some(vec![TokenLimit {
                 token: Address::ZERO,
                 limit: U256::from(100u64),
+                period: 0,
             }]),
             allowed_calls: None,
+            witness: None,
         };
         let mut buf3 = Vec::new();
         auth3.encode(&mut buf3);
@@ -1224,6 +1252,7 @@ mod tests {
             expiry: Some(1000),
             limits: None,
             allowed_calls: None,
+            witness: None,
         };
         let mut base_buf = Vec::new();
         base.encode(&mut base_buf);
@@ -1256,6 +1285,7 @@ mod tests {
             expiry: Some(1000),
             limits: None,
             allowed_calls: Some(Vec::new()),
+            witness: None,
         };
         let mut buf = Vec::new();
         deny_all.encode(&mut buf);
@@ -1279,6 +1309,7 @@ mod tests {
             expiry: None,
             limits: Some(Vec::new()),
             allowed_calls: None,
+            witness: None,
         };
         let mut buf = Vec::new();
         auth.encode(&mut buf);
@@ -1311,6 +1342,7 @@ mod tests {
             expiry: None,
             limits: None,
             allowed_calls: Some(Vec::new()),
+            witness: None,
         };
         let mut buf = Vec::new();
         auth.encode(&mut buf);
@@ -1329,6 +1361,37 @@ mod tests {
     }
 
     #[test]
+    fn key_authorization_witness_is_a_distinct_trailing_field() {
+        let witness = B256::repeat_byte(0x53);
+        let auth = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: Some(witness),
+        };
+        let mut buf = Vec::new();
+        auth.encode(&mut buf);
+
+        let mut expected = vec![0xf8, 0x3b, 0x01, 0x80, 0x94];
+        expected.extend_from_slice(Address::ZERO.as_slice());
+        expected.extend_from_slice(&[0x80, 0x80, 0x80, 0xa0]);
+        expected.extend_from_slice(witness.as_slice());
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), auth.length());
+
+        let zero_witness = KeyAuthorization {
+            witness: Some(B256::ZERO),
+            ..auth
+        };
+        let mut zero_buf = Vec::new();
+        zero_witness.encode(&mut zero_buf);
+        assert_eq!(zero_buf.len(), buf.len(), "zero is present, not omitted");
+    }
+
+    #[test]
     fn key_authorization_deny_all_rlp_byte_fixture() {
         // Pins the exact wire bytes for the deny-all envelope so the manual
         // RLP impl can't drift away from writer's `#[derive(Encodable)]`
@@ -1342,6 +1405,7 @@ mod tests {
             expiry: Some(1000),                 // 0x82 0x03 0xe8
             limits: None,                       // positional placeholder 0x80
             allowed_calls: Some(Vec::new()),    // empty list 0xc0
+            witness: None,
         };
         let mut buf = Vec::new();
         deny_all.encode(&mut buf);
@@ -1374,6 +1438,7 @@ mod tests {
                 expiry: Some(1000),
                 limits: None,
                 allowed_calls: Some(Vec::new()),
+                witness: None,
             },
             signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
         };

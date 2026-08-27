@@ -20,7 +20,7 @@
 //! |  2   | name                     | String                                  |
 //! |  3   | symbol                   | String                                  |
 //! |  4   | currency                 | String                                  |
-//! |  5   | _domain_separator        | B256                                    |
+//! |  5   | logo_uri                 | String (T5+, zero/empty before T5)       |
 //! |  6   | quote_token              | Address                                 |
 //! |  7   | next_quote_token         | Address (offset 0)                      |
 //! |  7   | transfer_policy_id       | u64 (offset 20, packed)                 |
@@ -36,7 +36,7 @@
 //! | 17   | user_reward_info         | Mapping<Address, UserRewardInfo>        |
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
-use alloy::sol_types::{SolError, SolInterface, SolValue};
+use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
 use revm::precompile::{PrecompileError, PrecompileResult};
 use std::sync::LazyLock;
 
@@ -46,7 +46,7 @@ use super::storage_types::{
     BytesLikeHandler, FromWord, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
 };
 use super::{
-    dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile,
+    dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view, Precompile,
     STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
 };
 use crate::tempo::address::TempoAddressExt;
@@ -108,6 +108,7 @@ alloy::sol! {
         function paused() external view returns (bool);
         function quoteToken() external view returns (address);
         function nextQuoteToken() external view returns (address);
+        function logoURI() external view returns (string memory);
 
         // Role constants (view)
         function PAUSE_ROLE() external view returns (bytes32);
@@ -136,6 +137,7 @@ alloy::sol! {
         function burn(uint256 amount) external;
         function burnWithMemo(uint256 amount, bytes32 memo) external;
         function burnBlocked(address from, uint256 amount) external;
+        function setLogoURI(string calldata newLogoURI) external;
         function pause() external;
         function unpause() external;
         function setSupplyCap(uint256 newSupplyCap) external;
@@ -172,6 +174,7 @@ alloy::sol! {
         event TransferWithMemo(address indexed from, address indexed to, uint256 amount, bytes32 memo);
         event RewardDistributed(address indexed funder, uint256 amount);
         event RewardRecipientSet(address indexed holder, address recipient);
+        event LogoURIUpdated(address indexed updater, string newLogoURI);
 
         // Errors
         error InsufficientBalance(uint256 balance, uint256 amount, address token);
@@ -192,6 +195,8 @@ alloy::sol! {
         error InvalidSignature();
         error SpendingLimitExceeded();
         error Uninitialized();
+        error LogoURITooLong();
+        error InvalidLogoURI();
     }
 
     // ---- IRolesAuth interface ----
@@ -300,8 +305,8 @@ pub struct TIP20Token {
     pub symbol: BytesLikeHandler<String>,
     // Slot 4: currency
     pub currency: BytesLikeHandler<String>,
-    // Slot 5: _domain_separator (unused, kept for layout compatibility)
-    _domain_separator: Slot<B256>,
+    // Slot 5: logo_uri (TIP-1026; previously unused and therefore zero before T5)
+    pub logo_uri: BytesLikeHandler<String>,
     // Slot 6: quote_token
     pub quote_token: Slot<Address>,
     // Slot 7 offset 0: next_quote_token
@@ -344,7 +349,7 @@ impl TIP20Token {
             name: BytesLikeHandler::new(U256::from(2), address),
             symbol: BytesLikeHandler::new(U256::from(3), address),
             currency: BytesLikeHandler::new(U256::from(4), address),
-            _domain_separator: Slot::new(U256::from(5), address),
+            logo_uri: BytesLikeHandler::new(U256::from(5), address),
             quote_token: Slot::new(U256::from(6), address),
             next_quote_token: Slot::new(U256::from(7), address),
             transfer_policy_id: Slot::new_with_ctx(U256::from(7), LayoutCtx::packed(20), address),
@@ -439,6 +444,12 @@ impl TIP20Token {
     /// Returns the token's currency denomination (e.g. `"USD"`).
     pub fn currency(&self) -> Result<String> {
         self.currency.read()
+    }
+
+    /// Returns the TIP-1026 logo URI. Pre-T5 tokens read the previously-unused
+    /// zero slot as an empty Solidity string.
+    pub fn logo_uri(&self) -> Result<String> {
+        self.logo_uri.read()
     }
 
     /// Returns the current total supply.
@@ -829,6 +840,57 @@ impl TIP20Token {
         self.emit_event(ITIP20::SupplyCapUpdate {
             updater: msg_sender,
             newSupplyCap: call.newSupplyCap,
+        })
+    }
+
+    /// Maximum encoded UTF-8 byte length accepted by TIP-1026.
+    pub const MAX_LOGO_URI_BYTES: usize = 256;
+    pub const ALLOWED_LOGO_URI_SCHEMES: &'static [&'static str] =
+        &["https", "http", "ipfs", "data"];
+
+    fn validate_logo_uri(uri: &str) -> Result<()> {
+        if uri.len() > Self::MAX_LOGO_URI_BYTES {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::LogoURITooLong {}.abi_encode().into(),
+            ));
+        }
+        if !uri.is_empty() && !Self::is_allowed_logo_uri(uri) {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidLogoURI {}.abi_encode().into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_allowed_logo_uri(uri: &str) -> bool {
+        let Some((scheme, _)) = uri.split_once(':') else {
+            return false;
+        };
+        let mut bytes = scheme.bytes();
+        let Some(first) = bytes.next() else {
+            return false;
+        };
+        if !first.is_ascii_alphabetic()
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        {
+            return false;
+        }
+        Self::ALLOWED_LOGO_URI_SCHEMES
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    }
+
+    pub fn set_logo_uri(
+        &mut self,
+        msg_sender: Address,
+        call: ITIP20::setLogoURICall,
+    ) -> Result<()> {
+        self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
+        Self::validate_logo_uri(&call.newLogoURI)?;
+        self.logo_uri.write(call.newLogoURI.clone())?;
+        self.emit_event(ITIP20::LogoURIUpdated {
+            updater: msg_sender,
+            newLogoURI: call.newLogoURI,
         })
     }
 
@@ -1895,6 +1957,15 @@ impl Precompile for TIP20Token {
             TIP20Call::TIP20(ITIP20::ITIP20Calls::currency(_)) => {
                 metadata::<ITIP20::currencyCall>(|| self.currency())
             }
+            TIP20Call::TIP20(ITIP20::ITIP20Calls::logoURI(_)) => {
+                if !self.storage.spec().is_t5() {
+                    return unknown_selector(
+                        ITIP20::logoURICall::SELECTOR,
+                        self.storage.gas_used(),
+                    );
+                }
+                metadata::<ITIP20::logoURICall>(|| self.logo_uri())
+            }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::totalSupply(_)) => {
                 metadata::<ITIP20::totalSupplyCall>(|| self.total_supply())
             }
@@ -1951,6 +2022,15 @@ impl Precompile for TIP20Token {
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::setSupplyCap(call)) => {
                 mutate_void(call, msg_sender, |s, c| self.set_supply_cap(s, c))
+            }
+            TIP20Call::TIP20(ITIP20::ITIP20Calls::setLogoURI(call)) => {
+                if !self.storage.spec().is_t5() {
+                    return unknown_selector(
+                        ITIP20::setLogoURICall::SELECTOR,
+                        self.storage.gas_used(),
+                    );
+                }
+                mutate_void(call, msg_sender, |s, c| self.set_logo_uri(s, c))
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::pause(call)) => {
                 mutate_void(call, msg_sender, |s, c| self.pause(s, c))
@@ -2046,9 +2126,88 @@ impl Precompile for TIP20Token {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::sol_types::SolCall;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::PATH_USD_ADDRESS;
+
+    #[test]
+    fn logo_uri_validation_matches_tip1026() {
+        for uri in [
+            "",
+            "https://example.com/logo.svg",
+            "HTTP://example.com/logo.png",
+            "ipfs://bafybeigdyrzt",
+            "data:image/svg+xml;base64,PHN2Zz4=",
+        ] {
+            assert!(TIP20Token::validate_logo_uri(uri).is_ok(), "{uri}");
+        }
+        for uri in [
+            "javascript:alert(1)",
+            "example.com/logo.png",
+            "1https://example.com/logo.png",
+        ] {
+            assert!(TIP20Token::validate_logo_uri(uri).is_err(), "{uri}");
+        }
+        assert!(TIP20Token::validate_logo_uri(&format!(
+            "https:{}",
+            "a".repeat(TIP20Token::MAX_LOGO_URI_BYTES - 6)
+        ))
+        .is_ok());
+        assert!(TIP20Token::validate_logo_uri(&format!(
+            "https:{}",
+            "a".repeat(TIP20Token::MAX_LOGO_URI_BYTES - 5)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn logo_uri_selectors_activate_at_t5_and_reuse_slot_5() {
+        let admin = Address::repeat_byte(0xaa);
+        let uri = "https://example.com/logo.svg";
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+                Address::ZERO,
+                "Path USD",
+                "pathUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )
+        })
+        .unwrap();
+
+        let pre_t5 = StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                .call(&ITIP20::logoURICall {}.abi_encode(), admin)
+        })
+        .unwrap();
+        assert!(pre_t5.reverted);
+        assert_eq!(provider.storage(PATH_USD_ADDRESS, U256::from(5)), U256::ZERO);
+
+        provider.set_spec(TempoHardfork::T5);
+        let set_result = StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).call(
+                &ITIP20::setLogoURICall {
+                    newLogoURI: uri.to_string(),
+                }
+                .abi_encode(),
+                admin,
+            )
+        })
+        .unwrap();
+        assert!(!set_result.reverted);
+
+        let view_result = StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                .call(&ITIP20::logoURICall {}.abi_encode(), admin)
+        })
+        .unwrap();
+        assert!(!view_result.reverted);
+        assert_eq!(String::abi_decode(&view_result.bytes).unwrap(), uri);
+    }
 
     #[test]
     fn system_transfer_from_rejects_unlisted_caller_from_t5() {

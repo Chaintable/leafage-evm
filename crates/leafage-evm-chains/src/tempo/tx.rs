@@ -71,6 +71,8 @@ pub struct TempoKeyAuthGas {
     /// `call_scope_storage_slots(...) * sstore + call_scope_extra_gas(...)`
     /// for AA tx that DO. See `key_auth_gas` in `api/exec.rs`.
     pub scope_counts: ScopeCounts,
+    /// Whether the authorization carries a TIP-1053 witness, including zero.
+    pub has_witness: bool,
 }
 
 /// Per-authorization gas info with optional EIP-7702 delegation data.

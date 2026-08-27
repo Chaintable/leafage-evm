@@ -48,6 +48,9 @@ const KEY_AUTH_BASE_GAS: u64 = 27_000;
 /// Gas per spending limit in KeyAuthorization pre-T1B.
 const KEY_AUTH_PER_LIMIT_GAS: u64 = 22_000;
 
+/// T5 witness authorization emits one additional LOG3 event.
+const KEY_AUTH_EXTRA_EVENT_BUFFER: u64 = 1_500;
+
 /// Custom GasId for TIP-1000 auth account creation cost (250k).
 /// Same as Tempo writer: crates/revm/src/gas_params.rs `GasId::new(255)`.
 const TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID: GasId = GasId::new(255);
@@ -580,15 +583,17 @@ fn increment_2d_nonce_if_needed<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>
 }
 
 fn set_keychain_tx_origin<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
-    use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+    use crate::tempo::precompile::{account_keychain::transient_slots, ACCOUNT_KEYCHAIN_ADDRESS};
     use revm::context_interface::JournalTr;
 
     let caller = evm.ctx().tx.base.caller;
-    // tx_origin = Slot::new(U256::from(3), ACCOUNT_KEYCHAIN_ADDRESS)
+    let (_, tx_origin_slot) = transient_slots(evm.ctx().cfg.spec);
     // tstore is infallible on the journal (no DB access needed).
-    evm.ctx_mut()
-        .journal_mut()
-        .tstore(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3), caller.into_word().into());
+    evm.ctx_mut().journal_mut().tstore(
+        ACCOUNT_KEYCHAIN_ADDRESS,
+        U256::from(tx_origin_slot),
+        caller.into_word().into(),
+    );
 }
 
 fn set_channel_open_context_hash<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
@@ -605,7 +610,7 @@ fn set_channel_open_context_hash<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP
     );
 }
 
-/// Sets `transaction_key` in AccountKeychain transient storage (slot 2).
+/// Sets `transaction_key` in AccountKeychain's fork-dependent transient slot.
 ///
 /// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:1128-1133)
 /// when the transaction uses a Keychain signature. TIP20 `authorize_transfer` and
@@ -616,12 +621,15 @@ fn set_keychain_transaction_key<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
     key_id: revm::primitives::Address,
 ) {
-    use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+    use crate::tempo::precompile::{account_keychain::transient_slots, ACCOUNT_KEYCHAIN_ADDRESS};
     use revm::context_interface::JournalTr;
 
-    evm.ctx_mut()
-        .journal_mut()
-        .tstore(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2), key_id.into_word().into());
+    let (transaction_key_slot, _) = transient_slots(evm.ctx().cfg.spec);
+    evm.ctx_mut().journal_mut().tstore(
+        ACCOUNT_KEYCHAIN_ADDRESS,
+        U256::from(transaction_key_slot),
+        key_id.into_word().into(),
+    );
 }
 
 /// Executes a batch of AA calls atomically.
@@ -966,6 +974,7 @@ fn key_auth_gas(
     sig_type: TempoSigType,
     num_limits: u32,
     scope_counts: &ScopeCounts,
+    has_witness: bool,
     gas_params: &GasParams,
     hardfork: TempoHardfork,
 ) -> u64 {
@@ -1002,6 +1011,10 @@ fn key_auth_gas(
     // T4+: bookkeeping surcharge around the scope tree.
     if hardfork.is_t4() {
         total = total.saturating_add(call_scope_extra_gas(scope_counts));
+    }
+
+    if has_witness {
+        total = total.saturating_add(sload_cost + KEY_AUTH_EXTRA_EVENT_BUFFER);
     }
 
     total
@@ -1065,7 +1078,14 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
     // 5. Key authorization costs (if present).
     if let Some(ka) = &fields.key_auth {
         gas.initial_gas +=
-            key_auth_gas(ka.sig_type, ka.num_limits, &ka.scope_counts, gas_params, hardfork);
+            key_auth_gas(
+                ka.sig_type,
+                ka.num_limits,
+                &ka.scope_counts,
+                ka.has_witness,
+                gas_params,
+                hardfork,
+            );
     }
 
     // 6. Per-call costs (calldata + CREATE).
@@ -1227,7 +1247,7 @@ where
 mod tests {
     use super::*;
     use crate::tempo::api::TempoEvm;
-    use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+    use crate::tempo::precompile::{account_keychain::transient_slots, ACCOUNT_KEYCHAIN_ADDRESS};
     use alloy_evm::EvmEnv;
     use crate::tempo::hardfork::TempoHardfork;
     use revm::context::{BlockEnv, CfgEnv};
@@ -1235,14 +1255,22 @@ mod tests {
     use revm::inspector::NoOpInspector;
     use revm::primitives::Address;
 
-    fn make_evm() -> TempoEvm<EmptyDB, NoOpInspector> {
-        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::default());
+    fn make_evm_with_spec(spec: TempoHardfork) -> TempoEvm<EmptyDB, NoOpInspector> {
+        let mut cfg = CfgEnv::new_with_spec(spec);
         cfg.chain_id = 4217;
         let mut block_env = BlockEnv::default();
         block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64); // Post-T1A
         block_env.gas_limit = 100_000_000;
         let env = EvmEnv::new(cfg, block_env);
-        TempoEvm::new(env, EmptyDB::default(), NoOpInspector, false)
+        let mut evm = TempoEvm::new(env, EmptyDB::default(), NoOpInspector, false);
+        // TempoEvm::new derives the runtime spec from timestamp. These unit tests
+        // exercise helpers directly, so select the requested layout explicitly.
+        evm.inner.ctx.cfg.spec = spec;
+        evm
+    }
+
+    fn make_evm() -> TempoEvm<EmptyDB, NoOpInspector> {
+        make_evm_with_spec(TempoHardfork::default())
     }
 
     #[test]
@@ -1251,23 +1279,24 @@ mod tests {
         let mut evm = make_evm();
         evm.inner.ctx.tx.base.caller = caller;
 
-        // Before: slot 3 should be zero (transient storage default)
+        let (_, tx_origin_slot) = transient_slots(TempoHardfork::default());
+        // Before: the fork-dependent slot should be zero (transient storage default)
         let before = evm
             .inner
             .ctx
             .journal_mut()
-            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3));
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(tx_origin_slot));
         assert_eq!(before, U256::ZERO, "tx_origin should be zero before set");
 
         // Act
         set_keychain_tx_origin(&mut evm);
 
-        // After: slot 3 should contain the caller address
+        // After: the fork-dependent slot should contain the caller address
         let after = evm
             .inner
             .ctx
             .journal_mut()
-            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3));
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(tx_origin_slot));
         let expected: U256 = caller.into_word().into();
         assert_eq!(after, expected, "tx_origin should equal caller after set");
     }
@@ -1275,6 +1304,7 @@ mod tests {
     #[test]
     fn test_set_keychain_tx_origin_zero_caller() {
         let mut evm = make_evm();
+        let (_, tx_origin_slot) = transient_slots(TempoHardfork::default());
         // caller defaults to Address::ZERO
         assert_eq!(evm.inner.ctx.tx.base.caller, Address::ZERO);
 
@@ -1285,7 +1315,7 @@ mod tests {
             .inner
             .ctx
             .journal_mut()
-            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3));
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(tx_origin_slot));
         assert_eq!(after, U256::ZERO, "zero caller should result in zero tx_origin");
     }
 
@@ -1327,15 +1357,16 @@ mod tests {
     // ==================== set_transaction_key tests ====================
 
     #[test]
-    fn test_set_keychain_transaction_key_writes_to_slot_2() {
+    fn test_set_keychain_transaction_key_writes_to_active_slot() {
         let key_id = Address::with_last_byte(0xBB);
         let mut evm = make_evm();
+        let (transaction_key_slot, _) = transient_slots(TempoHardfork::default());
 
         let before = evm
             .inner
             .ctx
             .journal_mut()
-            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2));
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(transaction_key_slot));
         assert_eq!(before, U256::ZERO, "transaction_key should be zero before set");
 
         set_keychain_transaction_key(&mut evm, key_id);
@@ -1344,7 +1375,7 @@ mod tests {
             .inner
             .ctx
             .journal_mut()
-            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2));
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(transaction_key_slot));
         let expected: U256 = key_id.into_word().into();
         assert_eq!(after, expected, "transaction_key should equal key_id after set");
     }
@@ -1352,14 +1383,47 @@ mod tests {
     #[test]
     fn test_set_keychain_transaction_key_not_set_without_key_id() {
         let mut evm = make_evm();
+        let (transaction_key_slot, _) = transient_slots(TempoHardfork::default());
         // No key_id → set_keychain_transaction_key not called
-        // Verify slot 2 stays zero
+        // Verify the active slot stays zero
         let val = evm
             .inner
             .ctx
             .journal_mut()
-            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(2));
+            .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(transaction_key_slot));
         assert_eq!(val, U256::ZERO, "transaction_key should be zero when key_id absent");
+    }
+
+    #[test]
+    fn test_keychain_transient_storage_tracks_layout_boundaries() {
+        let caller = Address::with_last_byte(0xAA);
+        let key_id = Address::with_last_byte(0xBB);
+
+        for (spec, expected_slots) in [
+            (TempoHardfork::T2, (2, 3)),
+            (TempoHardfork::T3, (3, 4)),
+            (TempoHardfork::T4, (3, 4)),
+            (TempoHardfork::T5, (4, 5)),
+            (TempoHardfork::T10, (4, 5)),
+        ] {
+            assert_eq!(transient_slots(spec), expected_slots);
+
+            let mut evm = make_evm_with_spec(spec);
+            evm.inner.ctx.tx.base.caller = caller;
+            set_keychain_tx_origin(&mut evm);
+            set_keychain_transaction_key(&mut evm, key_id);
+
+            let transaction_key = evm.inner.ctx.journal_mut().tload(
+                ACCOUNT_KEYCHAIN_ADDRESS,
+                U256::from(expected_slots.0),
+            );
+            let tx_origin = evm.inner.ctx.journal_mut().tload(
+                ACCOUNT_KEYCHAIN_ADDRESS,
+                U256::from(expected_slots.1),
+            );
+            assert_eq!(transaction_key, U256::from_be_bytes(key_id.into_word().0));
+            assert_eq!(tx_origin, U256::from_be_bytes(caller.into_word().0));
+        }
     }
 
     // ==================== validate_time_window tests ====================
@@ -1751,6 +1815,7 @@ mod tests {
             sig_type: TempoSigType::Secp256k1,
             num_limits: 0,
             scope_counts: Default::default(),
+            has_witness: false,
         }));
 
         let mut evm = make_evm();
@@ -1803,6 +1868,7 @@ mod tests {
                 sig_type: TempoSigType::Secp256k1,
                 num_limits,
                 scope_counts: Default::default(),
+                has_witness: false,
             }),
             ..Default::default()
         };
@@ -1960,6 +2026,7 @@ mod tests {
             TempoSigType::Secp256k1,
             2,
             &ScopeCounts::default(),
+            false,
             &gp,
             TempoHardfork::T1A,
         );
@@ -1974,6 +2041,7 @@ mod tests {
             TempoSigType::Secp256k1,
             2,
             &ScopeCounts::default(),
+            false,
             &gas_params_for(TempoHardfork::T1B),
             TempoHardfork::T1B,
         );
@@ -1987,6 +2055,7 @@ mod tests {
             TempoSigType::Secp256k1,
             3,
             &ScopeCounts::default(),
+            false,
             &gas_params_for(TempoHardfork::T2),
             TempoHardfork::T2,
         );
@@ -2001,6 +2070,7 @@ mod tests {
             TempoSigType::Secp256k1,
             2,
             &ScopeCounts::default(),
+            false,
             &gas_params_for(TempoHardfork::T3),
             TempoHardfork::T3,
         );
@@ -2015,6 +2085,7 @@ mod tests {
             TempoSigType::Secp256k1,
             2,
             &ScopeCounts::default(),
+            false,
             &gas_params_for(TempoHardfork::T4),
             TempoHardfork::T4,
         );
@@ -2040,6 +2111,7 @@ mod tests {
                 TempoSigType::Secp256k1,
                 0,
                 &ScopeCounts::default(),
+                false,
                 &gas_params_for(hf),
                 hf,
             );
@@ -2149,6 +2221,7 @@ mod tests {
             TempoSigType::Secp256k1,
             0,
             &s,
+            false,
             &gas_params_for(TempoHardfork::T4),
             TempoHardfork::T4,
         );
@@ -2161,5 +2234,30 @@ mod tests {
         let extra = BASE_SCOPE_GAS + 1 * TARGET_SCOPE_GAS + 1 * SELECTOR_SCOPE_GAS + 1 * RECIPIENT_SCOPE_GAS;
         let expected = sig_gas + sload + sstore * (1 + 0 + 10) + 2_000 + extra;
         assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t5_witness_adds_sload_and_event_buffer() {
+        let hardfork = TempoHardfork::T5;
+        let gas_params = gas_params_for(hardfork);
+        let without = key_auth_gas(
+            TempoSigType::Secp256k1,
+            0,
+            &ScopeCounts::default(),
+            false,
+            &gas_params,
+            hardfork,
+        );
+        let with = key_auth_gas(
+            TempoSigType::Secp256k1,
+            0,
+            &ScopeCounts::default(),
+            true,
+            &gas_params,
+            hardfork,
+        );
+        let sload =
+            gas_params.warm_storage_read_cost() + gas_params.cold_storage_additional_cost();
+        assert_eq!(with - without, sload + KEY_AUTH_EXTRA_EVENT_BUFFER);
     }
 }

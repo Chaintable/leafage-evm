@@ -1,4 +1,5 @@
 use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
+use crate::error::invalid_params_rpc_err;
 use revm::context::Transaction as TransactionTrait;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
@@ -166,6 +167,17 @@ where
         let valid_after = te.valid_after;
         let valid_before = te.valid_before;
 
+        let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
+        if key_authorization
+            .as_ref()
+            .is_some_and(|authorization| authorization.witness.is_some())
+            && !hardfork.is_t5()
+        {
+            return Err(invalid_params_rpc_err(
+                "key authorization witnesses are not active before T5",
+            ));
+        }
+
         // Auto-fill 2D nonce from NonceManager storage when not provided.
         // Ported from writer compat.rs:309-324.
         if let Some(nk) = nonce_key {
@@ -238,6 +250,7 @@ where
                     .unwrap_or_default(),
                 num_limits: ka.num_limits,
                 scope_counts: derive_scope_counts(ka.allowed_calls.as_deref()),
+                has_witness: ka.witness.is_some(),
             });
 
             // Tempo authorization list: gas info + optional delegation fields.

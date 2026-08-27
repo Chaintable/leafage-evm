@@ -8,8 +8,9 @@
 //! |------|------------------|---------------------------------------------|
 //! |  0   | keys             | Mapping<Address, Mapping<Address, AuthorizedKey>> |
 //! |  1   | spending_limits  | Mapping<B256, Mapping<Address, U256>>        |
-//! |  2   | transaction_key  | Address (transient)                          |
-//! |  3   | tx_origin        | Address (transient)                          |
+//! |  2   | key_scopes       | Mapping (T3+)                                |
+//! |  3   | witnesses        | Mapping (T5+)                                |
+//! | 2/3, 3/4, 4/5 | transaction_key / tx_origin | transient by fork       |
 //!
 //! ## Signature verification
 //!
@@ -39,7 +40,7 @@ use super::tip20::ITIP20;
 use super::tip20_factory::TIP20Factory;
 use super::super::address::TempoAddressExt;
 use super::{
-    dispatch_call, input_cost, mutate_void, view, Precompile,
+    dispatch_call, input_cost, mutate_void, unknown_selector, view, Precompile,
     ACCOUNT_KEYCHAIN_ADDRESS,
 };
 
@@ -56,9 +57,15 @@ alloy::sol! {
             WebAuthn,
         }
 
+        struct LegacyTokenLimit {
+            address token;
+            uint256 amount;
+        }
+
         struct TokenLimit {
             address token;
             uint256 amount;
+            uint64 period;
         }
 
         /// Selector-level recipient rule (TIP-1011, T3+).
@@ -73,6 +80,14 @@ alloy::sol! {
             SelectorRule[] selectorRules;
         }
 
+        struct KeyRestrictions {
+            uint64 expiry;
+            bool enforceLimits;
+            TokenLimit[] limits;
+            bool allowAnyCalls;
+            CallScope[] allowedCalls;
+        }
+
         struct KeyInfo {
             SignatureType signatureType;
             address keyId;
@@ -84,14 +99,31 @@ alloy::sol! {
         event KeyAuthorized(address indexed account, address indexed publicKey, uint8 signatureType, uint64 expiry);
         event KeyRevoked(address indexed account, address indexed publicKey);
         event SpendingLimitUpdated(address indexed account, address indexed publicKey, address indexed token, uint256 newLimit);
+        event KeyAuthorizationWitness(address indexed account, bytes32 indexed witness);
+        event KeyAuthorizationWitnessBurned(address indexed account, bytes32 indexed witness);
 
         function authorizeKey(
             address keyId,
             SignatureType signatureType,
             uint64 expiry,
             bool enforceLimits,
-            TokenLimit[] calldata limits
+            LegacyTokenLimit[] calldata limits
         ) external;
+
+        function authorizeKey(
+            address keyId,
+            SignatureType signatureType,
+            KeyRestrictions calldata config
+        ) external;
+
+        function authorizeKey(
+            address keyId,
+            SignatureType signatureType,
+            KeyRestrictions calldata config,
+            bytes32 witness
+        ) external;
+
+        function burnKeyAuthorizationWitness(bytes32 witness) external;
 
         function revokeKey(address keyId) external;
 
@@ -130,6 +162,11 @@ alloy::sol! {
 
         function getTransactionKey() external view returns (address);
 
+        function isKeyAuthorizationWitnessBurned(
+            address account,
+            bytes32 witness
+        ) external view returns (bool);
+
         error UnauthorizedCaller();
         error KeyAlreadyExists();
         error KeyNotFound();
@@ -144,6 +181,8 @@ alloy::sol! {
         error InvalidCallScope();
         /// (T3+) Spending limit value exceeds the TIP-20 `u128` supply range.
         error InvalidSpendingLimit();
+        error KeyAuthorizationWitnessAlreadyBurned();
+        error LegacyAuthorizeKeySelectorChanged(bytes4 newSelector);
     }
 }
 
@@ -211,6 +250,24 @@ fn err_invalid_call_scope() -> TempoPrecompileError {
 fn err_invalid_spending_limit() -> TempoPrecompileError {
     TempoPrecompileError::Revert(
         IAccountKeychain::InvalidSpendingLimit {}.abi_encode().into(),
+    )
+}
+
+fn err_key_authorization_witness_already_burned() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        IAccountKeychain::KeyAuthorizationWitnessAlreadyBurned {}
+            .abi_encode()
+            .into(),
+    )
+}
+
+fn err_legacy_authorize_key_selector_changed(selector: [u8; 4]) -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        IAccountKeychain::LegacyAuthorizeKeySelectorChanged {
+            newSelector: FixedBytes::new(selector),
+        }
+        .abi_encode()
+        .into(),
     )
 }
 
@@ -534,11 +591,7 @@ pub struct AccountKeychain {
     // (pre-T3: only `.remaining` is meaningful; T3+ adds max/period/period_end
     //  packed in slot+1)
     pub(crate) spending_limits: Mapping<B256, Mapping<Address, SpendingLimitState>>,
-    // Slot 2: transaction_key (transient)
-    pub(crate) transaction_key: Slot<Address>,
-    // Slot 3: tx_origin (transient)
-    pub(crate) tx_origin: Slot<Address>,
-    // Slot 4 (T3+, TIP-1011): key_scopes[hash(account, keyId)] -> KeyScope
+    // Slot 2 (T3+, TIP-1011): key_scopes[hash(account, keyId)] -> KeyScope
     //
     // Per-entry layout (mirrors writer's `#[derive(Storable)]` for KeyScope;
     // 4 reserved slots starting at `keccak256(key . slot_be_32)`):
@@ -552,9 +605,22 @@ pub struct AccountKeychain {
     // `target_scope_base`, `selector_scope_base`) that compute the nested
     // base slot and pass it to a fresh `SetHandler`/`Slot`/`Mapping` instance.
     pub(crate) call_scope_base: U256,
+    // Slot 3 (T5+, TIP-1053): burned witnesses by account.
+    pub(crate) key_authorization_witnesses: Mapping<Address, Mapping<B256, bool>>,
 
     pub address: Address,
     pub storage: StorageCtx,
+}
+
+/// Returns `(transaction_key, tx_origin)` transient slots for the active layout.
+pub const fn transient_slots(spec: crate::tempo::hardfork::TempoHardfork) -> (u64, u64) {
+    if spec.is_t5() {
+        (4, 5)
+    } else if spec.is_t3() {
+        (3, 4)
+    } else {
+        (2, 3)
+    }
 }
 
 impl AccountKeychain {
@@ -563,12 +629,21 @@ impl AccountKeychain {
         Self {
             keys: Mapping::new(U256::from(0), address),
             spending_limits: Mapping::new(U256::from(1), address),
-            transaction_key: Slot::new(U256::from(2), address),
-            tx_origin: Slot::new(U256::from(3), address),
-            call_scope_base: U256::from(4),
+            call_scope_base: U256::from(2),
+            key_authorization_witnesses: Mapping::new(U256::from(3), address),
             address,
             storage: StorageCtx::default(),
         }
+    }
+
+    fn transaction_key(&self) -> Slot<Address> {
+        let (slot, _) = transient_slots(self.storage.spec());
+        Slot::new(U256::from(slot), self.address)
+    }
+
+    fn tx_origin(&self) -> Slot<Address> {
+        let (_, slot) = transient_slots(self.storage.spec());
+        Slot::new(U256::from(slot), self.address)
     }
 
     fn __initialize(&mut self) -> Result<()> {
@@ -610,12 +685,12 @@ impl AccountKeychain {
     /// - transaction must be signed by the main key (`transaction_key == Address::ZERO`)
     /// - T2+: caller must match tx.origin (prevents confused-deputy self-administration)
     fn ensure_admin_caller(&self, msg_sender: Address) -> Result<()> {
-        if !self.transaction_key.t_read()?.is_zero() {
+        if !self.transaction_key().t_read()?.is_zero() {
             return Err(err_unauthorized_caller());
         }
 
         if self.storage.spec().is_t2() {
-            let tx_origin = self.tx_origin.t_read()?;
+            let tx_origin = self.tx_origin().t_read()?;
             if tx_origin.is_zero() || tx_origin != msg_sender {
                 return Err(err_unauthorized_caller());
             }
@@ -628,8 +703,13 @@ impl AccountKeychain {
     pub fn authorize_key(
         &mut self,
         msg_sender: Address,
-        call: IAccountKeychain::authorizeKeyCall,
+        call: IAccountKeychain::authorizeKey_0Call,
     ) -> Result<()> {
+        if self.storage.spec().is_t3() {
+            return Err(err_legacy_authorize_key_selector_changed(
+                IAccountKeychain::authorizeKey_1Call::SELECTOR,
+            ));
+        }
         self.ensure_admin_caller(msg_sender)?;
 
         if call.keyId == Address::ZERO {
@@ -700,6 +780,144 @@ impl AccountKeychain {
             signatureType: signature_type,
             expiry: call.expiry,
         })
+    }
+
+    /// T3+ key authorization entry point, optionally carrying a T5 witness.
+    fn authorize_key_with_restrictions(
+        &mut self,
+        msg_sender: Address,
+        key_id: Address,
+        signature_type: IAccountKeychain::SignatureType,
+        config: IAccountKeychain::KeyRestrictions,
+        witness: Option<B256>,
+    ) -> Result<()> {
+        self.ensure_admin_caller(msg_sender)?;
+
+        if key_id.is_zero() {
+            return Err(err_zero_public_key());
+        }
+
+        let now = self.storage.timestamp().to::<u64>();
+        if config.expiry <= now {
+            return Err(err_expiry_in_past());
+        }
+
+        let existing_key = self.keys[msg_sender][key_id].read()?;
+        if existing_key.expiry > 0 {
+            return Err(err_key_already_exists());
+        }
+        if existing_key.is_revoked {
+            return Err(err_key_already_revoked());
+        }
+
+        let signature_type = match signature_type {
+            IAccountKeychain::SignatureType::Secp256k1 => 0u8,
+            IAccountKeychain::SignatureType::P256 => 1u8,
+            IAccountKeychain::SignatureType::WebAuthn => 2u8,
+            _ => return Err(err_invalid_signature_type()),
+        };
+
+        if config.enforceLimits {
+            let mut seen_tokens = HashSet::with_capacity(config.limits.len());
+            for limit in &config.limits {
+                if !seen_tokens.insert(limit.token) {
+                    return Err(err_invalid_spending_limit());
+                }
+                Self::t3_spending_limit_cap(limit.amount)?;
+            }
+        }
+
+        let allowed_calls = if config.allowAnyCalls {
+            if self.storage.spec().is_t5() && !config.allowedCalls.is_empty() {
+                return Err(err_invalid_call_scope());
+            }
+            None
+        } else {
+            self.validate_call_scopes(&config.allowedCalls)?;
+            Some(config.allowedCalls.as_slice())
+        };
+
+        if let Some(witness) = witness {
+            self.ensure_key_authorization_witness_not_burned(msg_sender, witness)?;
+        }
+
+        self.keys[msg_sender][key_id].write(AuthorizedKey {
+            signature_type,
+            expiry: config.expiry,
+            enforce_limits: config.enforceLimits,
+            is_revoked: false,
+        })?;
+
+        if config.enforceLimits {
+            let limit_key = Self::spending_limit_key(msg_sender, key_id);
+            for limit in &config.limits {
+                let period_end = if limit.period == 0 {
+                    0
+                } else {
+                    now.saturating_add(limit.period)
+                };
+                self.spending_limits[limit_key][limit.token].write(SpendingLimitState {
+                    remaining: limit.amount,
+                    max: Self::t3_spending_limit_cap(limit.amount)?,
+                    period: limit.period,
+                    period_end,
+                })?;
+            }
+        }
+
+        if let Some(scopes) = allowed_calls {
+            let key_hash = Self::spending_limit_key(msg_sender, key_id);
+            for scope in scopes {
+                self.upsert_target_scope(key_hash, scope)?;
+            }
+            self.is_scoped_slot(key_hash).write(true)?;
+        }
+
+        if let Some(witness) = witness {
+            self.emit_event(IAccountKeychain::KeyAuthorizationWitness {
+                account: msg_sender,
+                witness,
+            })?;
+        }
+
+        self.emit_event(IAccountKeychain::KeyAuthorized {
+            account: msg_sender,
+            publicKey: key_id,
+            signatureType: signature_type,
+            expiry: config.expiry,
+        })
+    }
+
+    fn ensure_key_authorization_witness_not_burned(
+        &self,
+        account: Address,
+        witness: B256,
+    ) -> Result<()> {
+        if self.key_authorization_witnesses[account][witness].read()? {
+            return Err(err_key_authorization_witness_already_burned());
+        }
+        Ok(())
+    }
+
+    fn burn_key_authorization_witness(
+        &mut self,
+        msg_sender: Address,
+        call: IAccountKeychain::burnKeyAuthorizationWitnessCall,
+    ) -> Result<()> {
+        self.ensure_admin_caller(msg_sender)?;
+        self.ensure_key_authorization_witness_not_burned(msg_sender, call.witness)?;
+        self.key_authorization_witnesses[msg_sender][call.witness].write(true)?;
+        self.emit_event(IAccountKeychain::KeyAuthorizationWitnessBurned {
+            account: msg_sender,
+            witness: call.witness,
+        })
+    }
+
+    fn is_key_authorization_witness_burned(
+        &self,
+        call: IAccountKeychain::isKeyAuthorizationWitnessBurnedCall,
+    ) -> Result<bool> {
+        self.key_authorization_witnesses[call.account][call.witness].read()
     }
 
     /// Permanently revokes an access key.
@@ -828,17 +1046,17 @@ impl AccountKeychain {
         _call: IAccountKeychain::getTransactionKeyCall,
         _msg_sender: Address,
     ) -> Result<Address> {
-        self.transaction_key.t_read()
+        self.transaction_key().t_read()
     }
 
     /// Internal: Set the transaction key (called during transaction validation).
     pub fn set_transaction_key(&mut self, key_id: Address) -> Result<()> {
-        self.transaction_key.t_write(key_id)
+        self.transaction_key().t_write(key_id)
     }
 
     /// Sets the transaction origin for the current transaction.
     pub fn set_tx_origin(&mut self, origin: Address) -> Result<()> {
-        self.tx_origin.t_write(origin)
+        self.tx_origin().t_write(origin)
     }
 
     /// Load and validate a key exists and is not revoked.
@@ -948,13 +1166,13 @@ impl AccountKeychain {
         token: Address,
         amount: U256,
     ) -> Result<()> {
-        let transaction_key = self.transaction_key.t_read()?;
+        let transaction_key = self.transaction_key().t_read()?;
 
         if transaction_key == Address::ZERO {
             return Ok(());
         }
 
-        let tx_origin = self.tx_origin.t_read()?;
+        let tx_origin = self.tx_origin().t_read()?;
         if account != tx_origin {
             return Ok(());
         }
@@ -999,13 +1217,13 @@ impl AccountKeychain {
         token: Address,
         amount: U256,
     ) -> Result<()> {
-        let transaction_key = self.transaction_key.t_read()?;
+        let transaction_key = self.transaction_key().t_read()?;
 
         if transaction_key == Address::ZERO {
             return Ok(());
         }
 
-        let tx_origin = self.tx_origin.t_read()?;
+        let tx_origin = self.tx_origin().t_read()?;
         if account != tx_origin {
             return Ok(());
         }
@@ -1022,13 +1240,13 @@ impl AccountKeychain {
         old_approval: U256,
         new_approval: U256,
     ) -> Result<()> {
-        let transaction_key = self.transaction_key.t_read()?;
+        let transaction_key = self.transaction_key().t_read()?;
 
         if transaction_key == Address::ZERO {
             return Ok(());
         }
 
-        let tx_origin = self.tx_origin.t_read()?;
+        let tx_origin = self.tx_origin().t_read()?;
         if account != tx_origin {
             return Ok(());
         }
@@ -1411,6 +1629,11 @@ impl Precompile for AccountKeychain {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        let selector = calldata
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .unwrap_or_default();
+
         dispatch_call(
             calldata,
             |data| {
@@ -1420,8 +1643,44 @@ impl Precompile for AccountKeychain {
                 )
             },
             |call| match call {
-                IAccountKeychain::IAccountKeychainCalls::authorizeKey(call) => {
+                IAccountKeychain::IAccountKeychainCalls::authorizeKey_0(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.authorize_key(sender, c))
+                }
+                IAccountKeychain::IAccountKeychainCalls::authorizeKey_1(call) => {
+                    if !self.storage.spec().is_t3() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    mutate_void(call, msg_sender, |sender, c| {
+                        self.authorize_key_with_restrictions(
+                            sender,
+                            c.keyId,
+                            c.signatureType,
+                            c.config,
+                            None,
+                        )
+                    })
+                }
+                IAccountKeychain::IAccountKeychainCalls::authorizeKey_2(call) => {
+                    if !self.storage.spec().is_t5() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    mutate_void(call, msg_sender, |sender, c| {
+                        self.authorize_key_with_restrictions(
+                            sender,
+                            c.keyId,
+                            c.signatureType,
+                            c.config,
+                            Some(c.witness),
+                        )
+                    })
+                }
+                IAccountKeychain::IAccountKeychainCalls::burnKeyAuthorizationWitness(call) => {
+                    if !self.storage.spec().is_t5() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    mutate_void(call, msg_sender, |sender, c| {
+                        self.burn_key_authorization_witness(sender, c)
+                    })
                 }
                 IAccountKeychain::IAccountKeychainCalls::revokeKey(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.revoke_key(sender, c))
@@ -1439,6 +1698,12 @@ impl Precompile for AccountKeychain {
                 }
                 IAccountKeychain::IAccountKeychainCalls::getTransactionKey(call) => {
                     view(call, |c| self.get_transaction_key(c, msg_sender))
+                }
+                IAccountKeychain::IAccountKeychainCalls::isKeyAuthorizationWitnessBurned(call) => {
+                    if !self.storage.spec().is_t5() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    view(call, |c| self.is_key_authorization_witness_burned(c))
                 }
                 IAccountKeychain::IAccountKeychainCalls::setAllowedCalls(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.set_allowed_calls(sender, c))
@@ -1461,8 +1726,20 @@ mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::primitives::address;
+    use alloy::sol_types::SolEvent;
     use revm::database::EmptyDB;
+
+    fn unrestricted_restrictions() -> IAccountKeychain::KeyRestrictions {
+        IAccountKeychain::KeyRestrictions {
+            expiry: 100,
+            enforceLimits: false,
+            limits: Vec::new(),
+            allowAnyCalls: true,
+            allowedCalls: Vec::new(),
+        }
+    }
 
     fn tip20_addr() -> Address {
         // 12-byte TIP-20 prefix (0x20C00000_0000_0000_0000_0000) + 8 random tail bytes
@@ -1492,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn key_scope_base_matches_keccak_of_left_padded_key_and_slot4() {
+    fn key_scope_base_matches_keccak_of_left_padded_key_and_slot2() {
         let kc = AccountKeychain::new();
         let key_hash = B256::repeat_byte(0xAB);
 
@@ -1500,10 +1777,190 @@ mod tests {
 
         let mut buf = [0u8; 64];
         buf[..32].copy_from_slice(key_hash.as_slice());
-        buf[32..].copy_from_slice(&U256::from(4u8).to_be_bytes::<32>());
+        buf[32..].copy_from_slice(&U256::from(2u8).to_be_bytes::<32>());
         let expected = U256::from_be_bytes(keccak256(buf).0);
 
-        assert_eq!(computed, expected, "key_scope_base = keccak(key || slot4)");
+        assert_eq!(computed, expected, "key_scope_base = keccak(key || slot2)");
+    }
+
+    #[test]
+    fn transient_slots_match_persistent_layout_changes() {
+        assert_eq!(transient_slots(TempoHardfork::T2), (2, 3));
+        assert_eq!(transient_slots(TempoHardfork::T3), (3, 4));
+        assert_eq!(transient_slots(TempoHardfork::T4), (3, 4));
+        assert_eq!(transient_slots(TempoHardfork::T5), (4, 5));
+        assert_eq!(transient_slots(TempoHardfork::T10), (4, 5));
+    }
+
+    #[test]
+    fn t5_witness_is_reusable_until_manually_burned() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        let account = Address::repeat_byte(0x11);
+        let first_key = Address::repeat_byte(0x21);
+        let second_key = Address::repeat_byte(0x22);
+        let witness = B256::ZERO;
+
+        StorageCtx::enter(&mut provider, || {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_tx_origin(account)?;
+            keychain.authorize_key_with_restrictions(
+                account,
+                first_key,
+                IAccountKeychain::SignatureType::Secp256k1,
+                unrestricted_restrictions(),
+                Some(witness),
+            )?;
+            assert!(!keychain.is_key_authorization_witness_burned(
+                IAccountKeychain::isKeyAuthorizationWitnessBurnedCall { account, witness },
+            )?);
+
+            keychain.authorize_key_with_restrictions(
+                account,
+                second_key,
+                IAccountKeychain::SignatureType::Secp256k1,
+                unrestricted_restrictions(),
+                Some(witness),
+            )?;
+            assert!(keychain.keys[account][second_key].read()?.expiry > 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        let events = provider.events(ACCOUNT_KEYCHAIN_ADDRESS);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].topics()[0], IAccountKeychain::KeyAuthorizationWitness::SIGNATURE_HASH);
+        assert_eq!(events[1].topics()[0], IAccountKeychain::KeyAuthorized::SIGNATURE_HASH);
+    }
+
+    #[test]
+    fn t5_burned_witness_blocks_authorization_and_access_key_burn() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        let account = Address::repeat_byte(0x31);
+        let access_key = Address::repeat_byte(0x32);
+        let witness = B256::repeat_byte(0x55);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_tx_origin(account)?;
+            keychain.burn_key_authorization_witness(
+                account,
+                IAccountKeychain::burnKeyAuthorizationWitnessCall { witness },
+            )?;
+            assert!(keychain.is_key_authorization_witness_burned(
+                IAccountKeychain::isKeyAuthorizationWitnessBurnedCall { account, witness },
+            )?);
+
+            let error = keychain
+                .authorize_key_with_restrictions(
+                    account,
+                    access_key,
+                    IAccountKeychain::SignatureType::Secp256k1,
+                    unrestricted_restrictions(),
+                    Some(witness),
+                )
+                .unwrap_err();
+            assert_eq!(error, err_key_authorization_witness_already_burned());
+
+            keychain.set_transaction_key(access_key)?;
+            let error = keychain
+                .burn_key_authorization_witness(
+                    account,
+                    IAccountKeychain::burnKeyAuthorizationWitnessCall {
+                        witness: B256::repeat_byte(0x56),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error, err_unauthorized_caller());
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn contradictory_allow_any_scope_is_rejected_from_t5() {
+        let account = Address::repeat_byte(0x41);
+        let key_id = Address::repeat_byte(0x42);
+        let mut restrictions = unrestricted_restrictions();
+        restrictions.allowedCalls.push(IAccountKeychain::CallScope {
+            target: Address::repeat_byte(0x43),
+            selectorRules: Vec::new(),
+        });
+
+        for (spec, should_succeed) in [(TempoHardfork::T4, true), (TempoHardfork::T5, false)] {
+            let mut provider = TestStorageProvider::new(spec);
+            let result = StorageCtx::enter(&mut provider, || {
+                let mut keychain = AccountKeychain::new();
+                keychain.set_tx_origin(account)?;
+                keychain.authorize_key_with_restrictions(
+                    account,
+                    key_id,
+                    IAccountKeychain::SignatureType::Secp256k1,
+                    restrictions.clone(),
+                    None,
+                )
+            });
+            assert_eq!(result.is_ok(), should_succeed, "unexpected {spec:?} result");
+        }
+    }
+
+    #[test]
+    fn t5_witness_selector_is_inactive_before_t5() {
+        let call = IAccountKeychain::authorizeKey_2Call {
+            keyId: Address::repeat_byte(0x51),
+            signatureType: IAccountKeychain::SignatureType::Secp256k1,
+            config: unrestricted_restrictions(),
+            witness: B256::ZERO,
+        };
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+        let output = StorageCtx::enter(&mut provider, || {
+            AccountKeychain::new().call(&call.abi_encode(), Address::repeat_byte(0x50))
+        })
+        .unwrap();
+        assert!(output.reverted);
+        assert_eq!(output.bytes.as_ref(), IAccountKeychain::authorizeKey_2Call::SELECTOR);
+    }
+
+    #[test]
+    fn t3_restrictions_seed_periodic_limit_layout() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        provider.set_timestamp(U256::from(10));
+        let account = Address::repeat_byte(0x61);
+        let key_id = Address::repeat_byte(0x62);
+        let token = Address::repeat_byte(0x63);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_tx_origin(account)?;
+            keychain.authorize_key_with_restrictions(
+                account,
+                key_id,
+                IAccountKeychain::SignatureType::Secp256k1,
+                IAccountKeychain::KeyRestrictions {
+                    expiry: 100,
+                    enforceLimits: true,
+                    limits: vec![IAccountKeychain::TokenLimit {
+                        token,
+                        amount: U256::from(500),
+                        period: 30,
+                    }],
+                    allowAnyCalls: true,
+                    allowedCalls: Vec::new(),
+                },
+                None,
+            )?;
+            let limit_key = AccountKeychain::spending_limit_key(account, key_id);
+            assert_eq!(
+                keychain.spending_limits[limit_key][token].read()?,
+                SpendingLimitState {
+                    remaining: U256::from(500),
+                    max: 500,
+                    period: 30,
+                    period_end: 40,
+                },
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

@@ -131,6 +131,8 @@ alloy::sol! {
         event OrderFilled(uint128 orderId, address maker, address taker, uint128 amountFilled, bool partialFill);
         event OrderCancelled(uint128 orderId);
         event PairCreated(bytes32 key, address base, address quote);
+        event OrderFlipped(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, int16 flipTick);
+        event FlipFailed(uint128 indexed orderId, address indexed maker, bytes4 reason);
 
         error OrderDoesNotExist();
         error Unauthorized();
@@ -440,11 +442,14 @@ impl Order {
         tick: i16,
         is_bid: bool,
         flip_tick: i16,
+        hardfork: crate::tempo::hardfork::TempoHardfork,
     ) -> Result<Self> {
-        if is_bid && flip_tick <= tick {
-            return Err(err_invalid_flip_tick());
-        }
-        if !is_bid && flip_tick >= tick {
+        let invalid = if is_bid {
+            flip_tick < tick || (!hardfork.is_t5() && flip_tick == tick)
+        } else {
+            flip_tick > tick || (!hardfork.is_t5() && flip_tick == tick)
+        };
+        if invalid {
             return Err(err_invalid_flip_tick());
         }
         Ok(Self {
@@ -462,15 +467,9 @@ impl Order {
         })
     }
 
-    #[allow(dead_code)]
-    fn create_flipped_order(&self, new_order_id: u128) -> Result<Self> {
-        if !self.is_flip {
-            return Err(err_order_does_not_exist()); // not a flip order
-        }
-        if self.remaining != 0 {
-            return Err(err_order_does_not_exist()); // not fully filled
-        }
-        Ok(Self {
+    fn create_flipped_order(&self, new_order_id: u128) -> Self {
+        debug_assert!(self.is_flip);
+        Self {
             order_id: new_order_id,
             maker: self.maker,
             book_key: self.book_key,
@@ -482,7 +481,7 @@ impl Order {
             next: 0,
             is_flip: true,
             flip_tick: self.tick,
-        })
+        }
     }
 }
 
@@ -1280,7 +1279,10 @@ impl StablecoinDEX {
         if flip_tick % TICK_SPACING != 0 {
             return Err(err_invalid_flip_tick());
         }
-        if (is_bid && flip_tick <= tick) || (!is_bid && flip_tick >= tick) {
+        if (flip_tick == tick && !self.storage.spec().is_t5())
+            || (is_bid && flip_tick < tick)
+            || (!is_bid && flip_tick > tick)
+        {
             return Err(err_invalid_flip_tick());
         }
         if amount < MIN_ORDER_AMOUNT {
@@ -1320,7 +1322,16 @@ impl StablecoinDEX {
         }
 
         let order_id = self.next_order_id_val()?;
-        let order = Order::new_flip(order_id, sender, book_key, amount, tick, is_bid, flip_tick)?;
+        let order = Order::new_flip(
+            order_id,
+            sender,
+            book_key,
+            amount,
+            tick,
+            is_bid,
+            flip_tick,
+            self.storage.spec(),
+        )?;
 
         self.next_order_id.write(order_id + 1)?;
         self.commit_order_to_book(order)?;
@@ -1355,6 +1366,55 @@ impl StablecoinDEX {
             amountFilled: amount_filled,
             partialFill: partial_fill,
         })
+    }
+
+    /// Rewrites a fully filled T5 flip order under the same order ID.
+    fn flip_in_place(
+        &mut self,
+        order: &Order,
+        base_token: Address,
+        quote_token: Address,
+    ) -> Result<()> {
+        let batch = self.storage.checkpoint();
+        let flipped = order.create_flipped_order(order.order_id);
+        let (escrow_token, escrow_amount, non_escrow_token) = if flipped.is_bid {
+            let quote_amount = base_to_quote(
+                flipped.amount,
+                flipped.tick,
+                RoundingDirection::Up,
+            )
+            .ok_or_else(err_insufficient_balance)?;
+            (quote_token, quote_amount, base_token)
+        } else {
+            (base_token, flipped.amount, quote_token)
+        };
+
+        if self.balance_of(flipped.maker, escrow_token)? < escrow_amount {
+            return Err(err_insufficient_balance());
+        }
+
+        let escrow_tip20 = TIP20Token::from_address(escrow_token)?;
+        escrow_tip20.check_not_paused()?;
+        escrow_tip20.ensure_transfer_authorized(flipped.maker, self.address)?;
+
+        let non_escrow_tip20 = TIP20Token::from_address(non_escrow_token)?;
+        non_escrow_tip20.check_not_paused()?;
+        non_escrow_tip20.ensure_transfer_authorized(self.address, flipped.maker)?;
+
+        self.sub_balance(flipped.maker, escrow_token, escrow_amount)?;
+        self.commit_order_to_book(flipped.clone())?;
+        self.emit_event(IStablecoinDEX::OrderFlipped {
+            orderId: flipped.order_id,
+            maker: flipped.maker,
+            token: base_token,
+            amount: flipped.amount,
+            isBid: flipped.is_bid,
+            tick: flipped.tick,
+            flipTick: flipped.flip_tick,
+        })?;
+
+        batch.commit();
+        Ok(())
     }
 
     /// Partial fill an order.
@@ -1434,23 +1494,39 @@ impl StablecoinDEX {
         self.emit_order_filled(order.order_id, order.maker, taker, fill_amount, false)?;
 
         if order.is_flip {
-            if let Err(e) = self.place_flip(
-                order.maker,
-                orderbook.base,
-                order.amount,
-                !order.is_bid,
-                order.flip_tick,
-                order.tick,
-                true,
-            ) {
-                if e.is_system_error() {
-                    return Err(e);
+            let result = if self.storage.spec().is_t5() {
+                self.flip_in_place(order, orderbook.base, orderbook.quote)
+            } else {
+                self.place_flip(
+                    order.maker,
+                    orderbook.base,
+                    order.amount,
+                    !order.is_bid,
+                    order.flip_tick,
+                    order.tick,
+                    true,
+                )
+                .map(|_| ())
+            };
+            if let Err(error) = &result {
+                if error.is_system_error() {
+                    return Err(error.clone());
                 }
-                // Business logic errors are swallowed for flip orders
+                if self.storage.spec().is_t5() {
+                    self.emit_event(IStablecoinDEX::FlipFailed {
+                        orderId: order.order_id,
+                        maker: order.maker,
+                        reason: error.selector(),
+                    })?;
+                }
             }
-        }
 
-        self.orders[order.order_id].delete()?;
+            if !self.storage.spec().is_t5() || result.is_err() {
+                self.orders[order.order_id].delete()?;
+            }
+        } else {
+            self.orders[order.order_id].delete()?;
+        }
 
         let next_tick_info = if order.next == 0 {
             handle.delete_tick_level(order.tick, order.is_bid)?;
@@ -2230,5 +2306,238 @@ impl Precompile for StablecoinDEX {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{address, FixedBytes};
+    use alloy::sol_types::SolEvent;
+
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
+    use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
+    use crate::tempo::precompile::PATH_USD_ADDRESS;
+
+    #[test]
+    fn same_tick_flip_order_activates_at_t5() {
+        let args = (
+            1,
+            Address::repeat_byte(1),
+            B256::repeat_byte(2),
+            MIN_ORDER_AMOUNT,
+            100,
+            true,
+            100,
+        );
+        assert!(Order::new_flip(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+            TempoHardfork::T4,
+        )
+        .is_err());
+        assert!(Order::new_flip(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+            TempoHardfork::T5,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn t5_flip_reuses_order_id_and_emits_order_flipped() {
+        let admin = Address::repeat_byte(0xa1);
+        let alice = Address::repeat_byte(0xa2);
+        let bob = Address::repeat_byte(0xb1);
+        let base_token = address!("0x20c0000000000000000000000000000000000001");
+        let amount = MIN_ORDER_AMOUNT;
+        let tick = 100;
+        let escrow = base_to_quote(amount, tick, RoundingDirection::Up).unwrap();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut quote = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            quote.initialize(
+                Address::ZERO,
+                "Path USD",
+                "pathUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )?;
+            quote.grant_role(
+                admin,
+                IRolesAuth::grantRoleCall {
+                    role: *ISSUER_ROLE,
+                    account: admin,
+                },
+            )?;
+            quote.mint(
+                admin,
+                ITIP20::mintCall {
+                    to: alice,
+                    amount: U256::from(escrow),
+                },
+            )?;
+
+            TIP20Token::from_address_unchecked(base_token).initialize(
+                Address::ZERO,
+                "Base USD",
+                "baseUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )?;
+
+            let mut dex = StablecoinDEX::new();
+            dex.initialize()?;
+            dex.create_pair(base_token)?;
+            let order_id = dex.place_flip(
+                alice,
+                base_token,
+                amount,
+                true,
+                tick,
+                tick,
+                false,
+            )?;
+            let next_order_id = dex.next_order_id_val()?;
+
+            dex.set_balance(bob, base_token, amount)?;
+            dex.swap_exact_amount_in(bob, base_token, PATH_USD_ADDRESS, amount, 0)?;
+
+            assert_eq!(dex.next_order_id_val()?, next_order_id);
+            let flipped = dex.get_order(order_id)?;
+            assert_eq!(flipped.order_id, order_id);
+            assert_eq!(flipped.maker, alice);
+            assert!(!flipped.is_bid);
+            assert!(flipped.is_flip);
+            assert_eq!(flipped.tick, tick);
+            assert_eq!(flipped.flip_tick, tick);
+            assert_eq!(flipped.remaining, amount);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        assert!(provider
+            .events(STABLECOIN_DEX_ADDRESS)
+            .iter()
+            .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH));
+    }
+
+    #[test]
+    fn t5_failed_flip_emits_reason_and_removes_filled_order() {
+        let admin = Address::repeat_byte(0xc1);
+        let alice = Address::repeat_byte(0xc2);
+        let bob = Address::repeat_byte(0xc3);
+        let base_token = address!("0x20c0000000000000000000000000000000000002");
+        let amount = MIN_ORDER_AMOUNT;
+        let tick = 100;
+        let escrow = base_to_quote(amount, tick, RoundingDirection::Up).unwrap();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+
+        let order_id = StorageCtx::enter(&mut provider, || {
+            let mut quote = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            quote.initialize(
+                Address::ZERO,
+                "Path USD",
+                "pathUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )?;
+            quote.grant_role(
+                admin,
+                IRolesAuth::grantRoleCall {
+                    role: *ISSUER_ROLE,
+                    account: admin,
+                },
+            )?;
+            quote.mint(
+                admin,
+                ITIP20::mintCall {
+                    to: alice,
+                    amount: U256::from(escrow),
+                },
+            )?;
+
+            let mut base = TIP20Token::from_address_unchecked(base_token);
+            base.initialize(
+                Address::ZERO,
+                "Base USD",
+                "baseUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )?;
+
+            let mut dex = StablecoinDEX::new();
+            dex.initialize()?;
+            dex.create_pair(base_token)?;
+            let order_id = dex.place_flip(
+                alice,
+                base_token,
+                amount,
+                true,
+                tick,
+                tick,
+                false,
+            )?;
+
+            let mut registry = TIP403Registry::new();
+            registry.initialize()?;
+            let policy_id = registry.create_policy(
+                admin,
+                ITIP403Registry::createPolicyCall {
+                    admin,
+                    policyType: ITIP403Registry::PolicyType::BLACKLIST,
+                },
+            )?;
+            registry.modify_policy_blacklist(
+                admin,
+                ITIP403Registry::modifyPolicyBlacklistCall {
+                    policyId: policy_id,
+                    account: alice,
+                    restricted: true,
+                },
+            )?;
+            base.change_transfer_policy_id(
+                admin,
+                ITIP20::changeTransferPolicyIdCall {
+                    newPolicyId: policy_id,
+                },
+            )?;
+
+            dex.set_balance(bob, base_token, amount)?;
+            dex.swap_exact_amount_in(bob, base_token, PATH_USD_ADDRESS, amount, 0)?;
+            assert!(dex.get_order(order_id).is_err());
+            Result::<u128>::Ok(order_id)
+        })
+        .unwrap();
+
+        let events = provider.events(STABLECOIN_DEX_ADDRESS);
+        let failed = events
+            .iter()
+            .find(|event| event.topics()[0] == IStablecoinDEX::FlipFailed::SIGNATURE_HASH)
+            .expect("FlipFailed event");
+        let decoded = IStablecoinDEX::FlipFailed::decode_log_data(failed).unwrap();
+        assert_eq!(decoded.orderId, order_id);
+        assert_eq!(decoded.maker, alice);
+        assert_ne!(decoded.reason, FixedBytes::<4>::ZERO);
+        assert!(!events
+            .iter()
+            .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH));
     }
 }
