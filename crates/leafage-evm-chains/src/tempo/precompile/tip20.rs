@@ -41,13 +41,16 @@ use revm::precompile::{PrecompileError, PrecompileResult};
 use std::sync::LazyLock;
 
 use super::error::{Result, TempoPrecompileError};
+use super::receive_policy_guard::{
+    address_reserved, IReceivePolicyGuard, ReceivePolicyGuard, RecoveryMode,
+};
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
 use super::storage_types::{
     BytesLikeHandler, FromWord, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
 };
 use super::{
     dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view, Precompile,
-    STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+    RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
 };
 use crate::tempo::address::TempoAddressExt;
 
@@ -87,6 +90,49 @@ pub static BURN_BLOCKED_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"BURN
 /// Returns true if the address has the TIP20 prefix.
 pub fn is_tip20_prefix(token: Address) -> bool {
     token.as_slice().starts_with(&TIP20_TOKEN_PREFIX)
+}
+
+/// Resolved transfer recipient for TIP-1022 virtual-address support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Recipient {
+    /// Effective account whose balance is credited.
+    pub(crate) target: Address,
+    /// Original virtual address, when `target` is its registered master.
+    pub(crate) virtual_addr: Option<Address>,
+}
+
+impl Recipient {
+    pub(crate) fn direct(target: Address) -> Self {
+        Self {
+            target,
+            virtual_addr: None,
+        }
+    }
+
+    pub(crate) fn resolve(address: Address) -> Result<Self> {
+        let target = super::address_registry::AddressRegistry::new().resolve_recipient(address)?;
+        Ok(if target == address {
+            Self::direct(address)
+        } else {
+            Self {
+                target,
+                virtual_addr: Some(address),
+            }
+        })
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.target.is_zero() || is_tip20_prefix(self.target) {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidRecipient {}.abi_encode().into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn event_address(self) -> Address {
+        self.virtual_addr.unwrap_or(self.target)
+    }
 }
 
 // ===========================================================================
@@ -572,16 +618,6 @@ impl TIP20Token {
         if self.paused()? {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::ContractPaused {}.abi_encode().into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Validates that the recipient is not the zero address or another TIP20 token.
-    fn check_recipient(&self, to: Address) -> Result<()> {
-        if to.is_zero() || is_tip20_prefix(to) {
-            return Err(TempoPrecompileError::Revert(
-                ITIP20::InvalidRecipient {}.abi_encode().into(),
             ));
         }
         Ok(())
@@ -1107,17 +1143,13 @@ impl TIP20Token {
 
     /// Transfers `amount` tokens from the caller to `to`.
     pub fn transfer(&mut self, msg_sender: Address, call: ITIP20::transferCall) -> Result<bool> {
-        self.check_not_paused()?;
-        self.check_recipient(call.to)?;
-        self.ensure_transfer_authorized(msg_sender, call.to)?;
-
-        // AccountKeychain spending limit check for transfer
-        super::account_keychain::AccountKeychain::new().authorize_transfer(
-            msg_sender,
-            self.address,
-            call.amount,
-        )?;
-        self._transfer(msg_sender, call.to, call.amount)?;
+        let Some(to) =
+            self.validate_transfer(None, msg_sender, call.to, call.amount, B256::ZERO)?
+        else {
+            return Ok(true);
+        };
+        self._transfer_to(msg_sender, to, call.amount)?;
+        self.emit_virtual_hop(to, call.amount)?;
         Ok(true)
     }
 
@@ -1127,7 +1159,19 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::transferFromCall,
     ) -> Result<bool> {
-        self._transfer_from(msg_sender, call.from, call.to, call.amount)
+        let Some(to) = self.validate_transfer(
+            Some(msg_sender),
+            call.from,
+            call.to,
+            call.amount,
+            B256::ZERO,
+        )?
+        else {
+            return Ok(true);
+        };
+        self._transfer_to(call.from, to, call.amount)?;
+        self.emit_virtual_hop(to, call.amount)?;
+        Ok(true)
     }
 
     /// Like `transfer_from`, but attaches a 32-byte memo.
@@ -1136,7 +1180,12 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::transferFromWithMemoCall,
     ) -> Result<bool> {
-        self._transfer_from(msg_sender, call.from, call.to, call.amount)?;
+        let Some(to) =
+            self.validate_transfer(Some(msg_sender), call.from, call.to, call.amount, call.memo)?
+        else {
+            return Ok(true);
+        };
+        self._transfer_to(call.from, to, call.amount)?;
 
         self.emit_event(ITIP20::TransferWithMemo {
             from: call.from,
@@ -1144,36 +1193,7 @@ impl TIP20Token {
             amount: call.amount,
             memo: call.memo,
         })?;
-
-        Ok(true)
-    }
-
-    fn _transfer_from(
-        &mut self,
-        msg_sender: Address,
-        from: Address,
-        to: Address,
-        amount: U256,
-    ) -> Result<bool> {
-        self.check_not_paused()?;
-        self.check_recipient(to)?;
-        self.ensure_transfer_authorized(from, to)?;
-
-        let allowed = self.get_allowance(from, msg_sender)?;
-        if amount > allowed {
-            return Err(TempoPrecompileError::Revert(
-                ITIP20::InsufficientAllowance {}.abi_encode().into(),
-            ));
-        }
-
-        if allowed != U256::MAX {
-            let new_allowance = allowed.checked_sub(amount).ok_or_else(|| {
-                TempoPrecompileError::Revert(ITIP20::InsufficientAllowance {}.abi_encode().into())
-            })?;
-            self.set_allowance(from, msg_sender, new_allowance)?;
-        }
-
-        self._transfer(from, to, amount)?;
+        self.emit_virtual_hop(to, call.amount)?;
         Ok(true)
     }
 
@@ -1183,24 +1203,19 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::transferWithMemoCall,
     ) -> Result<()> {
-        self.check_not_paused()?;
-        self.check_recipient(call.to)?;
-        self.ensure_transfer_authorized(msg_sender, call.to)?;
-
-        // AccountKeychain spending limit check for transferWithMemo
-        super::account_keychain::AccountKeychain::new().authorize_transfer(
-            msg_sender,
-            self.address,
-            call.amount,
-        )?;
-        self._transfer(msg_sender, call.to, call.amount)?;
+        let Some(to) = self.validate_transfer(None, msg_sender, call.to, call.amount, call.memo)?
+        else {
+            return Ok(());
+        };
+        self._transfer_to(msg_sender, to, call.amount)?;
 
         self.emit_event(ITIP20::TransferWithMemo {
             from: msg_sender,
             to: call.to,
             amount: call.amount,
             memo: call.memo,
-        })
+        })?;
+        self.emit_virtual_hop(to, call.amount)
     }
 
     /// Transfers `amount` from `from` to `to` without approval, for use by other
@@ -1220,16 +1235,11 @@ impl TIP20Token {
             ));
         }
 
-        self.check_not_paused()?;
-        self.check_recipient(caller)?;
-        self.ensure_transfer_authorized(from, caller)?;
-        // AccountKeychain spending limit
-        super::account_keychain::AccountKeychain::new().authorize_transfer(
-            from,
-            self.address,
-            amount,
-        )?;
-        self._transfer(from, caller, amount)?;
+        let Some(to) = self.validate_transfer(None, from, caller, amount, B256::ZERO)? else {
+            return Ok(true);
+        };
+        self._transfer_to(from, to, amount)?;
+        self.emit_virtual_hop(to, amount)?;
         Ok(true)
     }
 
@@ -1340,17 +1350,152 @@ impl TIP20Token {
         })
     }
 
-    /// Core internal transfer. Adjusts balances and emits Transfer event.
-    fn _transfer(&mut self, from: Address, to: Address, amount: U256) -> Result<()> {
-        // TIP-1022 (T3+): if `to` is a TIP-1022 virtual address, resolve to its
-        // registered master so the balance is credited to the master EOA.
-        // Reverts VirtualAddressUnregistered if the master isn't registered.
-        let to = if self.storage.spec().is_t3() && to.is_virtual() {
-            super::address_registry::AddressRegistry::new().resolve_recipient(to)?
+    fn consume_allowance(&mut self, owner: Address, spender: Address, amount: U256) -> Result<()> {
+        let allowed = self.get_allowance(owner, spender)?;
+        if amount > allowed {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::InsufficientAllowance {}.abi_encode().into(),
+            ));
+        }
+        if allowed != U256::MAX {
+            self.set_allowance(
+                owner,
+                spender,
+                allowed.checked_sub(amount).ok_or_else(|| {
+                    TempoPrecompileError::Revert(
+                        ITIP20::InsufficientAllowance {}.abi_encode().into(),
+                    )
+                })?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Performs common transfer validation and T6 receive-policy redirection.
+    fn validate_transfer(
+        &mut self,
+        spender: Option<Address>,
+        from: Address,
+        to: Address,
+        amount: U256,
+        memo: B256,
+    ) -> Result<Option<Recipient>> {
+        let to = Recipient::resolve(to)?;
+        self.check_not_paused()?;
+        to.validate()?;
+        self.ensure_transfer_authorized(from, to.target)?;
+
+        if let Some(spender) = spender {
+            self.consume_allowance(from, spender, amount)?;
         } else {
-            to
+            super::account_keychain::AccountKeychain::new().authorize_transfer(
+                from,
+                self.address,
+                amount,
+            )?;
+        }
+
+        if self.validate_inbound_or_block(from, to, amount, None, memo)? {
+            return Ok(None);
+        }
+        Ok(Some(to))
+    }
+
+    /// Resolves and validates a mint, returning the pre-mint supply and effective recipient.
+    fn validate_mint(
+        &mut self,
+        msg_sender: Address,
+        to: Address,
+        amount: U256,
+        memo: B256,
+    ) -> Result<Option<(U256, Recipient)>> {
+        let to = Recipient::resolve(to)?;
+        self.check_role(msg_sender, *ISSUER_ROLE)?;
+        let total_supply = self.total_supply()?;
+        if self.storage.spec().is_t3() {
+            self.check_not_paused()?;
+            to.validate()?;
+        }
+
+        let policy_id = self.transfer_policy_id.read()?;
+        if !super::tip403_registry::TIP403Registry::new().is_authorized_as(
+            policy_id,
+            to.target,
+            super::tip403_registry::AuthRole::mint_recipient(),
+        )? {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::PolicyForbids {}.abi_encode().into(),
+            ));
+        }
+
+        if self.validate_inbound_or_block(msg_sender, to, amount, Some(total_supply), memo)? {
+            return Ok(None);
+        }
+        Ok(Some((total_supply, to)))
+    }
+
+    /// Redirects a T6-blocked inbound transfer or mint to the guard and stores its receipt.
+    fn validate_inbound_or_block(
+        &mut self,
+        originator: Address,
+        to: Recipient,
+        amount: U256,
+        mint_total_supply: Option<U256>,
+        memo: B256,
+    ) -> Result<bool> {
+        if !self.storage.spec().is_t6() {
+            return Ok(false);
+        }
+        if to.target == RECEIVE_POLICY_GUARD_ADDRESS {
+            return Err(address_reserved());
+        }
+
+        let Some((reason, recovery_authority)) = super::tip403_registry::TIP403Registry::new()
+            .check_receive_policy(self.address, originator, to.target)?
+        else {
+            return Ok(false);
         };
 
+        let guard = Recipient::direct(RECEIVE_POLICY_GUARD_ADDRESS);
+        let kind = if let Some(total_supply) = mint_total_supply {
+            self._mint_to(guard, total_supply, amount)?;
+            self.emit_event(ITIP20::Mint {
+                to: guard.target,
+                amount,
+            })?;
+            IReceivePolicyGuard::InboundKind::MINT
+        } else {
+            self._transfer_to(originator, guard, amount)?;
+            IReceivePolicyGuard::InboundKind::TRANSFER
+        };
+
+        ReceivePolicyGuard::new().store_blocked(
+            self.address,
+            originator,
+            to.event_address(),
+            to.target,
+            recovery_authority,
+            amount,
+            reason as u8,
+            kind,
+            memo,
+        )?;
+        Ok(true)
+    }
+
+    fn emit_virtual_hop(&mut self, to: Recipient, amount: U256) -> Result<()> {
+        if let Some(virtual_address) = to.virtual_addr {
+            self.emit_event(ITIP20::Transfer {
+                from: virtual_address,
+                to: to.target,
+                amount,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Core internal transfer. Adjusts balances and emits the primary Transfer event.
+    fn _transfer_to(&mut self, from: Address, to: Recipient, amount: U256) -> Result<()> {
         let from_balance = self.get_balance(from)?;
         if amount > from_balance {
             return Err(TempoPrecompileError::Revert(
@@ -1364,31 +1509,48 @@ impl TIP20Token {
             ));
         }
 
-        self.handle_rewards_on_transfer(from, to, amount)?;
+        self.handle_rewards_on_transfer(from, to.target, amount)?;
 
         let new_from_balance = from_balance
             .checked_sub(amount)
             .ok_or_else(|| TempoPrecompileError::Fatal("underflow in _transfer".to_string()))?;
         self.set_balance(from, new_from_balance)?;
 
-        if to != Address::ZERO {
-            let to_balance = self.get_balance(to)?;
+        if to.target != Address::ZERO {
+            let to_balance = self.get_balance(to.target)?;
             let new_to_balance = to_balance
                 .checked_add(amount)
                 .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _transfer".to_string()))?;
-            self.set_balance(to, new_to_balance)?;
+            self.set_balance(to.target, new_to_balance)?;
         }
 
-        self.emit_event(ITIP20::Transfer { from, to, amount })
+        self.emit_event(ITIP20::Transfer {
+            from,
+            to: to.event_address(),
+            amount,
+        })
+    }
+
+    /// Address-only wrapper used by internal protocol flows.
+    fn _transfer(&mut self, from: Address, to: Address, amount: U256) -> Result<()> {
+        let to = Recipient::resolve(to)?;
+        self._transfer_to(from, to, amount)?;
+        self.emit_virtual_hop(to, amount)
     }
 
     /// Mints `amount` tokens to the specified `to` address.
     pub fn mint(&mut self, msg_sender: Address, call: ITIP20::mintCall) -> Result<()> {
-        self._mint(msg_sender, call.to, call.amount)?;
+        let Some((total_supply, to)) =
+            self.validate_mint(msg_sender, call.to, call.amount, B256::ZERO)?
+        else {
+            return Ok(());
+        };
+        self._mint_to(to, total_supply, call.amount)?;
         self.emit_event(ITIP20::Mint {
             to: call.to,
             amount: call.amount,
-        })
+        })?;
+        self.emit_virtual_hop(to, call.amount)
     }
 
     /// Like `mint`, but attaches a 32-byte memo.
@@ -1397,7 +1559,12 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::mintWithMemoCall,
     ) -> Result<()> {
-        self._mint(msg_sender, call.to, call.amount)?;
+        let Some((total_supply, to)) =
+            self.validate_mint(msg_sender, call.to, call.amount, call.memo)?
+        else {
+            return Ok(());
+        };
+        self._mint_to(to, total_supply, call.amount)?;
 
         self.emit_event(ITIP20::TransferWithMemo {
             from: Address::ZERO,
@@ -1408,35 +1575,11 @@ impl TIP20Token {
         self.emit_event(ITIP20::Mint {
             to: call.to,
             amount: call.amount,
-        })
+        })?;
+        self.emit_virtual_hop(to, call.amount)
     }
 
-    fn _mint(&mut self, msg_sender: Address, to: Address, amount: U256) -> Result<()> {
-        self.check_role(msg_sender, *ISSUER_ROLE)?;
-        // TIP-1038 #2 (T3+): mint must respect the paused flag. Pre-T3 callers
-        // could mint into a paused token; T3 closes that gap.
-        if self.storage.spec().is_t3() {
-            self.check_not_paused()?;
-        }
-        // TIP-1022 (T3+): credit the master EOA when `to` is a virtual address.
-        let to = if self.storage.spec().is_t3() && to.is_virtual() {
-            super::address_registry::AddressRegistry::new().resolve_recipient(to)?
-        } else {
-            to
-        };
-        let total_supply = self.total_supply()?;
-
-        // TIP403Registry mint recipient authorization check
-        let policy_id = self.transfer_policy_id.read()?;
-        if !super::tip403_registry::TIP403Registry::new().is_authorized_as(
-            policy_id,
-            to,
-            super::tip403_registry::AuthRole::mint_recipient(),
-        )? {
-            return Err(TempoPrecompileError::Revert(
-                ITIP20::PolicyForbids {}.abi_encode().into(),
-            ));
-        }
+    fn _mint_to(&mut self, to: Recipient, total_supply: U256, amount: U256) -> Result<()> {
         let new_supply = total_supply
             .checked_add(amount)
             .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
@@ -1448,18 +1591,18 @@ impl TIP20Token {
             ));
         }
 
-        self.handle_rewards_on_mint(to, amount)?;
+        self.handle_rewards_on_mint(to.target, amount)?;
 
         self.set_total_supply(new_supply)?;
-        let to_balance = self.get_balance(to)?;
+        let to_balance = self.get_balance(to.target)?;
         let new_to_balance = to_balance
             .checked_add(amount)
             .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
-        self.set_balance(to, new_to_balance)?;
+        self.set_balance(to.target, new_to_balance)?;
 
         self.emit_event(ITIP20::Transfer {
             from: Address::ZERO,
-            to,
+            to: to.event_address(),
             amount,
         })
     }
@@ -1499,17 +1642,29 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::burnBlockedCall,
     ) -> Result<()> {
+        self.burn_blocked_internal(msg_sender, call.from, call.amount, true)
+    }
+
+    /// Burns funds owned directly by `owner`, or held by the receive-policy guard on its behalf.
+    pub(crate) fn burn_blocked_internal(
+        &mut self,
+        msg_sender: Address,
+        owner: Address,
+        amount: U256,
+        check_protected: bool,
+    ) -> Result<()> {
         self.check_role(msg_sender, *BURN_BLOCKED_ROLE)?;
         // TIP-1038 #2 (T3+): burn_blocked must respect the paused flag.
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
         }
 
-        if call.from == TIP_FEE_MANAGER_ADDRESS
-            || call.from == STABLECOIN_DEX_ADDRESS
-            || (self.storage.spec().is_t5()
-                && (call.from == super::TIP20_CHANNEL_RESERVE_ADDRESS
-                    || call.from == self.address))
+        if check_protected
+            && (owner == TIP_FEE_MANAGER_ADDRESS
+                || owner == STABLECOIN_DEX_ADDRESS
+                || (self.storage.spec().is_t5()
+                    && (owner == super::TIP20_CHANNEL_RESERVE_ADDRESS || owner == self.address))
+                || (self.storage.spec().is_t6() && owner == RECEIVE_POLICY_GUARD_ADDRESS))
         {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::ProtectedAddress {}.abi_encode().into(),
@@ -1520,7 +1675,7 @@ impl TIP20Token {
         let policy_id = self.transfer_policy_id.read()?;
         if super::tip403_registry::TIP403Registry::new().is_authorized_as(
             policy_id,
-            call.from,
+            owner,
             super::tip403_registry::AuthRole::sender(),
         )? {
             // burn_blocked only works on accounts that are NOT authorized (i.e., blocked)
@@ -1528,14 +1683,19 @@ impl TIP20Token {
                 ITIP20::PolicyForbids {}.abi_encode().into(),
             ));
         }
-        self._transfer(call.from, Address::ZERO, call.amount)?;
+        let burn_from = if check_protected {
+            owner
+        } else {
+            RECEIVE_POLICY_GUARD_ADDRESS
+        };
+        self._transfer(burn_from, Address::ZERO, amount)?;
 
         let total_supply = self.total_supply()?;
-        let new_supply = total_supply.checked_sub(call.amount).ok_or_else(|| {
+        let new_supply = total_supply.checked_sub(amount).ok_or_else(|| {
             TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
                     balance: total_supply,
-                    amount: call.amount,
+                    amount,
                     token: self.address,
                 }
                 .abi_encode()
@@ -1545,9 +1705,52 @@ impl TIP20Token {
         self.set_total_supply(new_supply)?;
 
         self.emit_event(ITIP20::BurnBlocked {
-            from: call.from,
-            amount: call.amount,
+            from: owner,
+            amount,
         })
+    }
+
+    /// Releases guarded funds. A resume skips the receive-policy check; a reroute revalidates it.
+    pub(crate) fn release_blocked_funds(
+        &mut self,
+        originator: Address,
+        receiver: Address,
+        to: Address,
+        amount: U256,
+        recovery_mode: RecoveryMode,
+        recovery_authority: Address,
+    ) -> Result<()> {
+        self.check_not_paused()?;
+        let destination = Recipient::resolve(to)?;
+        destination.validate()?;
+
+        if recovery_mode.is_reroute(to, receiver) {
+            let policy_subject = recovery_mode.policy_subject(originator, receiver);
+            self.ensure_transfer_authorized(policy_subject, destination.target)?;
+            if super::tip403_registry::TIP403Registry::new()
+                .validate_receive_policy(self.address, policy_subject, destination.target)?
+                .is_some()
+            {
+                return Err(TempoPrecompileError::Revert(
+                    ITIP20::PolicyForbids {}.abi_encode().into(),
+                ));
+            }
+            if let Some(account) = recovery_mode.spending_account(recovery_authority) {
+                super::account_keychain::AccountKeychain::new().authorize_transfer(
+                    account,
+                    self.address,
+                    amount,
+                )?;
+            }
+        } else {
+            self.ensure_authorized_as(&[(
+                destination.target,
+                super::tip403_registry::AuthRole::recipient(),
+            )])?;
+        }
+
+        self._transfer_to(RECEIVE_POLICY_GUARD_ADDRESS, destination, amount)?;
+        self.emit_virtual_hop(destination, amount)
     }
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
@@ -2126,10 +2329,10 @@ impl Precompile for TIP20Token {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::sol_types::SolCall;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::PATH_USD_ADDRESS;
+    use alloy::sol_types::SolCall;
 
     #[test]
     fn logo_uri_validation_matches_tip1026() {
@@ -2185,7 +2388,10 @@ mod tests {
         })
         .unwrap();
         assert!(pre_t5.reverted);
-        assert_eq!(provider.storage(PATH_USD_ADDRESS, U256::from(5)), U256::ZERO);
+        assert_eq!(
+            provider.storage(PATH_USD_ADDRESS, U256::from(5)),
+            U256::ZERO
+        );
 
         provider.set_spec(TempoHardfork::T5);
         let set_result = StorageCtx::enter(&mut provider, || {

@@ -15,6 +15,7 @@ pub mod current_committee;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
+pub mod receive_policy_guard;
 pub mod signature_verifier;
 pub mod stablecoin_dex;
 pub mod storage;
@@ -75,6 +76,9 @@ pub const SIGNATURE_VERIFIER_ADDRESS: Address =
 /// T3+ TIP-1022 virtual address registry.
 pub const ADDRESS_REGISTRY_ADDRESS: Address =
     address!("0xFDC0000000000000000000000000000000000000");
+/// T6+ TIP-1028 custody for blocked inbound TIP-20 transfers and mints.
+pub const RECEIVE_POLICY_GUARD_ADDRESS: Address =
+    address!("0xB10C000000000000000000000000000000000000");
 /// T8+ TIP-1070 current consensus committee.
 pub const CURRENT_COMMITTEE_ADDRESS: Address =
     address!("0xC077E00000000000000000000000000000000000");
@@ -335,6 +339,8 @@ pub fn extend_tempo_precompiles(
             Some(create_address_registry_precompile(chain_id))
         } else if *address == TIP20_CHANNEL_RESERVE_ADDRESS && spec.is_t5() {
             Some(create_tip20_channel_reserve_precompile(chain_id))
+        } else if *address == RECEIVE_POLICY_GUARD_ADDRESS && spec.is_t6() {
+            Some(create_receive_policy_guard_precompile(chain_id))
         } else if *address == CURRENT_COMMITTEE_ADDRESS && spec.is_t8() {
             Some(create_current_committee_precompile(chain_id))
         } else {
@@ -412,6 +418,12 @@ fn create_address_registry_precompile(chain_id: u64) -> DynPrecompile {
 fn create_tip20_channel_reserve_precompile(chain_id: u64) -> DynPrecompile {
     tempo_precompile!("TIP20ChannelReserve", chain_id, |input| {
         tip20_channel_reserve::TIP20ChannelReserve::new()
+    })
+}
+
+fn create_receive_policy_guard_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("ReceivePolicyGuard", chain_id, |input| {
+        receive_policy_guard::ReceivePolicyGuard::new()
     })
 }
 

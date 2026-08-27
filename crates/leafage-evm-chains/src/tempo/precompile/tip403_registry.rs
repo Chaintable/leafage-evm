@@ -12,17 +12,24 @@
 //! |  0   | policy_id_counter | u64                                         |
 //! |  1   | policy_records    | Mapping<u64, PolicyRecord>                  |
 //! |  2   | policy_set        | Mapping<u64, Mapping<Address, bool>>        |
+//! |  3   | receive_policies  | Mapping<Address, ReceivePolicy> (T6+)      |
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
+use super::super::address::TempoAddressExt;
 use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
 use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::{
-    dispatch_call, input_cost, mutate, mutate_void, view, Precompile, TIP403_REGISTRY_ADDRESS,
+    dispatch_call, input_cost, mutate, mutate_void, unknown_selector, view, Precompile,
+    ACCOUNT_KEYCHAIN_ADDRESS, ADDRESS_REGISTRY_ADDRESS, CURRENT_COMMITTEE_ADDRESS,
+    NONCE_PRECOMPILE_ADDRESS, RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS,
+    STABLECOIN_DEX_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS,
+    TIP403_REGISTRY_ADDRESS, TIP_FEE_MANAGER_ADDRESS, VALIDATOR_CONFIG_ADDRESS,
+    VALIDATOR_CONFIG_V2_ADDRESS,
 };
 
 // ===========================================================================
@@ -48,6 +55,12 @@ alloy::sol! {
             COMPOUND,
         }
 
+        enum BlockedReason {
+            NONE,
+            TOKEN_FILTER,
+            RECEIVE_POLICY,
+        }
+
         function policyIdCounter() external view returns (uint64);
         function policyExists(uint64 policyId) external view returns (bool);
         function policyData(uint64 policyId) external view returns (PolicyType policyType, address admin);
@@ -56,6 +69,8 @@ alloy::sol! {
         function isAuthorizedRecipient(uint64 policyId, address user) external view returns (bool);
         function isAuthorizedMintRecipient(uint64 policyId, address user) external view returns (bool);
         function compoundPolicyData(uint64 policyId) external view returns (uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId);
+        function receivePolicy(address account) external view returns (bool hasReceivePolicy, uint64 senderPolicyId, PolicyType senderPolicyType, uint64 tokenFilterId, PolicyType tokenFilterType, address recoveryAuthority);
+        function validateReceivePolicy(address token, address sender, address receiver) external view returns (bool authorized, BlockedReason blockedReason);
 
         function createPolicy(address admin, PolicyType policyType) external returns (uint64);
         function createPolicyWithAccounts(address admin, PolicyType policyType, address[] calldata accounts) external returns (uint64);
@@ -63,18 +78,23 @@ alloy::sol! {
         function modifyPolicyWhitelist(uint64 policyId, address account, bool allowed) external;
         function modifyPolicyBlacklist(uint64 policyId, address account, bool restricted) external;
         function createCompoundPolicy(uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId) external returns (uint64);
+        function setReceivePolicy(uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority) external;
 
         event PolicyAdminUpdated(uint64 indexed policyId, address indexed updater, address indexed admin);
         event PolicyCreated(uint64 indexed policyId, address indexed updater, PolicyType policyType);
         event WhitelistUpdated(uint64 indexed policyId, address indexed updater, address indexed account, bool allowed);
         event BlacklistUpdated(uint64 indexed policyId, address indexed updater, address indexed account, bool restricted);
         event CompoundPolicyCreated(uint64 indexed policyId, address indexed creator, uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId);
+        event ReceivePolicyUpdated(address indexed account, uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority);
 
         error Unauthorized();
         error PolicyNotFound();
         error PolicyNotSimple();
         error InvalidPolicyType();
         error IncompatiblePolicyType();
+        error VirtualAddressNotAllowed();
+        error InvalidReceivePolicyType();
+        error InvalidRecoveryAuthority();
     }
 }
 
@@ -101,6 +121,30 @@ fn err_invalid_policy_type() -> TempoPrecompileError {
 fn err_incompatible_policy_type() -> TempoPrecompileError {
     TempoPrecompileError::Revert(
         ITIP403Registry::IncompatiblePolicyType {}
+            .abi_encode()
+            .into(),
+    )
+}
+
+fn err_virtual_address_not_allowed() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        ITIP403Registry::VirtualAddressNotAllowed {}
+            .abi_encode()
+            .into(),
+    )
+}
+
+fn err_invalid_receive_policy_type() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        ITIP403Registry::InvalidReceivePolicyType {}
+            .abi_encode()
+            .into(),
+    )
+}
+
+fn err_invalid_recovery_authority() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(
+        ITIP403Registry::InvalidRecoveryAuthority {}
             .abi_encode()
             .into(),
     )
@@ -355,6 +399,117 @@ impl Storable for PolicyRecord {
     }
 }
 
+/// Compact recovery-authority representation used by T6 receive policies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RecoveryMode {
+    #[default]
+    Originator,
+    Receiver,
+    ThirdParty,
+}
+
+impl RecoveryMode {
+    fn encode(authority: Address, account: Address) -> (Self, Address) {
+        if authority.is_zero() {
+            (Self::Originator, Address::ZERO)
+        } else if authority == account {
+            (Self::Receiver, Address::ZERO)
+        } else {
+            (Self::ThirdParty, authority)
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Originator),
+            1 => Ok(Self::Receiver),
+            2 => Ok(Self::ThirdParty),
+            _ => Err(err_invalid_receive_policy_type()),
+        }
+    }
+}
+
+/// Slot 3 mapping value: packed config followed by an optional third-party address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReceivePolicy {
+    pub has_receive_policy: bool,
+    pub sender_policy_id: u64,
+    pub sender_policy_type: u8,
+    pub token_filter_id: u64,
+    pub token_filter_type: u8,
+    pub recovery_mode: RecoveryMode,
+    pub recovery_address: Address,
+}
+
+impl StorableType for ReceivePolicy {
+    const LAYOUT: Layout = Layout::Slots(2);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new(slot, address)
+    }
+}
+
+impl Storable for ReceivePolicy {
+    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let bytes = storage.load(slot)?.to_be_bytes::<32>();
+        let recovery_word = storage.load(slot + U256::ONE)?.to_be_bytes::<32>();
+        Ok(Self {
+            has_receive_policy: bytes[31] != 0,
+            sender_policy_id: u64::from_be_bytes(bytes[23..31].try_into().unwrap()),
+            sender_policy_type: bytes[22],
+            token_filter_id: u64::from_be_bytes(bytes[14..22].try_into().unwrap()),
+            token_filter_type: bytes[13],
+            recovery_mode: RecoveryMode::decode(bytes[12])?,
+            recovery_address: Address::from_slice(&recovery_word[12..32]),
+        })
+    }
+
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        let mut bytes = [0u8; 32];
+        bytes[31] = u8::from(self.has_receive_policy);
+        bytes[23..31].copy_from_slice(&self.sender_policy_id.to_be_bytes());
+        bytes[22] = self.sender_policy_type;
+        bytes[14..22].copy_from_slice(&self.token_filter_id.to_be_bytes());
+        bytes[13] = self.token_filter_type;
+        bytes[12] = self.recovery_mode as u8;
+        storage.store(slot, U256::from_be_bytes(bytes))?;
+        let mut recovery_word = [0u8; 32];
+        recovery_word[12..32].copy_from_slice(self.recovery_address.as_slice());
+        storage.store(slot + U256::ONE, U256::from_be_bytes(recovery_word))
+    }
+
+    fn delete<S: StorageOps>(storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        storage.store(slot, U256::ZERO)?;
+        storage.store(slot + U256::ONE, U256::ZERO)
+    }
+}
+
+fn is_reserved_recovery_authority(address: Address) -> bool {
+    let bytes = address.as_slice();
+    let ethereum_precompile =
+        bytes[..19].iter().all(|byte| *byte == 0) && (1..=17).contains(&bytes[19]);
+    ethereum_precompile
+        || address.is_tip20()
+        || matches!(
+            address,
+            TIP_FEE_MANAGER_ADDRESS
+                | TIP403_REGISTRY_ADDRESS
+                | TIP20_FACTORY_ADDRESS
+                | STABLECOIN_DEX_ADDRESS
+                | TIP20_CHANNEL_RESERVE_ADDRESS
+                | NONCE_PRECOMPILE_ADDRESS
+                | VALIDATOR_CONFIG_ADDRESS
+                | ACCOUNT_KEYCHAIN_ADDRESS
+                | VALIDATOR_CONFIG_V2_ADDRESS
+                | SIGNATURE_VERIFIER_ADDRESS
+                | ADDRESS_REGISTRY_ADDRESS
+                | RECEIVE_POLICY_GUARD_ADDRESS
+                | CURRENT_COMMITTEE_ADDRESS
+        )
+}
+
 // ===========================================================================
 // TIP403Registry struct
 // ===========================================================================
@@ -367,6 +522,8 @@ pub struct TIP403Registry {
     pub(crate) policy_records: Mapping<u64, PolicyRecord>,
     // Slot 2: policy_set
     pub(crate) policy_set: Mapping<u64, Mapping<Address, bool>>,
+    // Slot 3 (T6+): per-account receive policy.
+    pub(crate) receive_policies: Mapping<Address, ReceivePolicy>,
 
     pub address: Address,
     pub storage: StorageCtx,
@@ -379,6 +536,7 @@ impl TIP403Registry {
             policy_id_counter: Slot::new(U256::from(0), address),
             policy_records: Mapping::new(U256::from(1), address),
             policy_set: Mapping::new(U256::from(2), address),
+            receive_policies: Mapping::new(U256::from(3), address),
             address,
             storage: StorageCtx::default(),
         }
@@ -697,6 +855,124 @@ impl TIP403Registry {
         Ok(new_policy_id)
     }
 
+    /// Returns an account's T6 receive-policy configuration.
+    pub fn receive_policy(&self, account: Address) -> Result<ITIP403Registry::receivePolicyReturn> {
+        let policy = self.receive_policies[account].read()?;
+        let sender_policy_type = policy
+            .sender_policy_type
+            .try_into()
+            .map_err(|_| err_invalid_receive_policy_type())?;
+        let token_filter_type = policy
+            .token_filter_type
+            .try_into()
+            .map_err(|_| err_invalid_receive_policy_type())?;
+        Ok(ITIP403Registry::receivePolicyReturn {
+            hasReceivePolicy: policy.has_receive_policy,
+            senderPolicyId: policy.sender_policy_id,
+            senderPolicyType: sender_policy_type,
+            tokenFilterId: policy.token_filter_id,
+            tokenFilterType: token_filter_type,
+            recoveryAuthority: self.receive_policy_recovery(account, &policy),
+        })
+    }
+
+    /// Returns the blocking reason for an inbound token transfer, if any.
+    pub fn validate_receive_policy(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+    ) -> Result<Option<ITIP403Registry::BlockedReason>> {
+        Ok(self
+            .check_receive_policy(token, sender, receiver)?
+            .map(|(reason, _)| reason))
+    }
+
+    pub(crate) fn check_receive_policy(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+    ) -> Result<Option<(ITIP403Registry::BlockedReason, Address)>> {
+        let policy = self.receive_policies[receiver].read()?;
+        if !policy.has_receive_policy {
+            return Ok(None);
+        }
+
+        if !self.is_authorized_simple(policy.token_filter_id, token)? {
+            return Ok(Some((
+                ITIP403Registry::BlockedReason::TOKEN_FILTER,
+                self.receive_policy_recovery(receiver, &policy),
+            )));
+        }
+        if !self.is_authorized_simple(policy.sender_policy_id, sender)? {
+            return Ok(Some((
+                ITIP403Registry::BlockedReason::RECEIVE_POLICY,
+                self.receive_policy_recovery(receiver, &policy),
+            )));
+        }
+        Ok(None)
+    }
+
+    fn receive_policy_recovery(&self, account: Address, policy: &ReceivePolicy) -> Address {
+        match policy.recovery_mode {
+            RecoveryMode::Originator => Address::ZERO,
+            RecoveryMode::Receiver => account,
+            RecoveryMode::ThirdParty => policy.recovery_address,
+        }
+    }
+
+    /// Configures the caller's T6 receive policy.
+    pub fn set_receive_policy(
+        &mut self,
+        msg_sender: Address,
+        call: ITIP403Registry::setReceivePolicyCall,
+    ) -> Result<()> {
+        if msg_sender.is_virtual() {
+            return Err(err_virtual_address_not_allowed());
+        }
+        if call.recoveryAuthority.is_virtual()
+            || is_reserved_recovery_authority(call.recoveryAuthority)
+        {
+            return Err(err_invalid_recovery_authority());
+        }
+
+        let sender_policy_type = self.validate_receive_policy_id(call.senderPolicyId)?;
+        let token_filter_type = self.validate_receive_policy_id(call.tokenFilterId)?;
+        let (recovery_mode, recovery_address) =
+            RecoveryMode::encode(call.recoveryAuthority, msg_sender);
+        self.receive_policies[msg_sender].write(ReceivePolicy {
+            has_receive_policy: true,
+            sender_policy_id: call.senderPolicyId,
+            sender_policy_type,
+            token_filter_id: call.tokenFilterId,
+            token_filter_type,
+            recovery_mode,
+            recovery_address,
+        })?;
+
+        self.emit_event(ITIP403Registry::ReceivePolicyUpdated {
+            account: msg_sender,
+            senderPolicyId: call.senderPolicyId,
+            tokenFilterId: call.tokenFilterId,
+            recoveryAuthority: call.recoveryAuthority,
+        })
+    }
+
+    fn validate_receive_policy_id(&self, policy_id: u64) -> Result<u8> {
+        if self.builtin_authorization(policy_id).is_some() {
+            return Ok(policy_id as u8);
+        }
+        if policy_id >= self.policy_id_counter()? {
+            return Err(err_policy_not_found());
+        }
+        let data = self.get_policy_data(policy_id)?;
+        if !data.is_simple() {
+            return Err(err_invalid_receive_policy_type());
+        }
+        Ok(data.policy_type)
+    }
+
     /// Core role-based authorization check (TIP-1015).
     pub fn is_authorized_as(&self, policy_id: u64, user: Address, role: AuthRole) -> Result<bool> {
         if let Some(auth) = self.builtin_authorization(policy_id) {
@@ -881,6 +1157,10 @@ impl Precompile for TIP403Registry {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        let selector = calldata
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .unwrap_or_default();
         dispatch_call(
             calldata,
             |data| {
@@ -921,6 +1201,26 @@ impl Precompile for TIP403Registry {
                 ITIP403Registry::ITIP403RegistryCalls::compoundPolicyData(call) => {
                     view(call, |c| self.compound_policy_data(c))
                 }
+                ITIP403Registry::ITIP403RegistryCalls::receivePolicy(call) => {
+                    if !self.storage.spec().is_t6() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    view(call, |c| self.receive_policy(c.account))
+                }
+                ITIP403Registry::ITIP403RegistryCalls::validateReceivePolicy(call) => {
+                    if !self.storage.spec().is_t6() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    view(call, |c| {
+                        let blocked = self
+                            .validate_receive_policy(c.token, c.sender, c.receiver)?
+                            .unwrap_or(ITIP403Registry::BlockedReason::NONE);
+                        Ok(ITIP403Registry::validateReceivePolicyReturn {
+                            authorized: blocked == ITIP403Registry::BlockedReason::NONE,
+                            blockedReason: blocked,
+                        })
+                    })
+                }
                 ITIP403Registry::ITIP403RegistryCalls::createPolicy(call) => {
                     mutate(call, msg_sender, |s, c| self.create_policy(s, c))
                 }
@@ -942,7 +1242,102 @@ impl Precompile for TIP403Registry {
                 ITIP403Registry::ITIP403RegistryCalls::createCompoundPolicy(call) => {
                     mutate(call, msg_sender, |s, c| self.create_compound_policy(s, c))
                 }
+                ITIP403Registry::ITIP403RegistryCalls::setReceivePolicy(call) => {
+                    if !self.storage.spec().is_t6() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    mutate_void(call, msg_sender, |s, c| self.set_receive_policy(s, c))
+                }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use alloy::sol_types::SolCall;
+
+    #[test]
+    fn t6_receive_policy_checks_token_before_sender() {
+        let receiver = Address::repeat_byte(0x61);
+        let sender = Address::repeat_byte(0x62);
+        let token = Address::repeat_byte(0x63);
+        let recovery = Address::repeat_byte(0x64);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut registry = TIP403Registry::new();
+            registry.set_receive_policy(
+                receiver,
+                ITIP403Registry::setReceivePolicyCall {
+                    senderPolicyId: REJECT_ALL_POLICY_ID,
+                    tokenFilterId: REJECT_ALL_POLICY_ID,
+                    recoveryAuthority: recovery,
+                },
+            )?;
+
+            let stored = registry.receive_policies[receiver].read()?;
+            assert_eq!(stored.recovery_mode, RecoveryMode::ThirdParty);
+            assert_eq!(stored.recovery_address, recovery);
+            assert_eq!(
+                registry.check_receive_policy(token, sender, receiver)?,
+                Some((ITIP403Registry::BlockedReason::TOKEN_FILTER, recovery)),
+            );
+
+            registry.set_receive_policy(
+                receiver,
+                ITIP403Registry::setReceivePolicyCall {
+                    senderPolicyId: REJECT_ALL_POLICY_ID,
+                    tokenFilterId: ALLOW_ALL_POLICY_ID,
+                    recoveryAuthority: Address::ZERO,
+                },
+            )?;
+            assert_eq!(
+                registry.check_receive_policy(token, sender, receiver)?,
+                Some((
+                    ITIP403Registry::BlockedReason::RECEIVE_POLICY,
+                    Address::ZERO,
+                )),
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t6_receive_policy_rejects_reserved_recovery_authority() {
+        let account = Address::repeat_byte(0x71);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+        let result = StorageCtx::enter(&mut provider, || {
+            TIP403Registry::new().set_receive_policy(
+                account,
+                ITIP403Registry::setReceivePolicyCall {
+                    senderPolicyId: ALLOW_ALL_POLICY_ID,
+                    tokenFilterId: ALLOW_ALL_POLICY_ID,
+                    recoveryAuthority: STABLECOIN_DEX_ADDRESS,
+                },
+            )
+        });
+        assert_eq!(result.unwrap_err(), err_invalid_recovery_authority());
+    }
+
+    #[test]
+    fn receive_policy_selectors_are_gated_at_t6() {
+        let call = ITIP403Registry::receivePolicyCall {
+            account: Address::repeat_byte(0x81),
+        };
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        let output = StorageCtx::enter(&mut provider, || {
+            TIP403Registry::new().call(&call.abi_encode(), Address::ZERO)
+        })
+        .unwrap();
+        assert!(output.reverted);
+        assert_eq!(
+            output.bytes.as_ref(),
+            ITIP403Registry::receivePolicyCall::SELECTOR
+        );
     }
 }
