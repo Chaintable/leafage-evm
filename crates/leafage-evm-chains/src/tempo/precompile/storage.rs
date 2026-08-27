@@ -31,6 +31,9 @@ use std::cell::RefCell;
 use super::error::{Result, TempoPrecompileError};
 use crate::tempo::gas_params::TempoGasCosts;
 use crate::tempo::hardfork::TempoHardfork;
+use crate::tempo::precompile::storage_credits::{
+    account_storage_write, AccountingError, StorageCreditsBackend,
+};
 
 /// Re-export of `revm::context_interface::journaled_state::JournalCheckpoint`.
 ///
@@ -102,6 +105,12 @@ pub trait PrecompileStorageProvider {
 
     /// Returns whether the current call context is static.
     fn is_static(&self) -> bool;
+
+    /// Enables or disables all TIP-1060 accounting for subsequent storage writes.
+    fn set_tip1060_storage_credits(&mut self, _enabled: bool) {}
+
+    /// Enables or disables minting credits on clears while retaining creation accounting.
+    fn set_tip1060_storage_credit_minting(&mut self, _enabled: bool) {}
 
     /// Creates a new journal checkpoint.
     fn checkpoint(&mut self) -> JournalCheckpoint;
@@ -249,6 +258,8 @@ pub struct LeafageStorageProvider<'a> {
     chain_id: u64,
     spec: TempoHardfork,
     is_static: bool,
+    tip1060_storage_credits_enabled: bool,
+    tip1060_storage_credit_minting_enabled: bool,
 }
 
 impl<'a> LeafageStorageProvider<'a> {
@@ -276,6 +287,8 @@ impl<'a> LeafageStorageProvider<'a> {
             chain_id,
             spec,
             is_static,
+            tip1060_storage_credits_enabled: spec.is_t7(),
+            tip1060_storage_credit_minting_enabled: true,
         }
     }
 
@@ -413,6 +426,16 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     #[inline]
     fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
         let result = self.internals.sstore(address, key, value)?;
+        if self.tip1060_storage_credits_enabled {
+            account_storage_write(self, address, Some(key), &result).map_err(
+                |error| match error {
+                    AccountingError::OutOfGas => TempoPrecompileError::OutOfGas,
+                    AccountingError::Fatal => {
+                        TempoPrecompileError::Fatal("storage credit accounting failed".into())
+                    }
+                },
+            )?;
+        }
         let sstore_data = &result.data;
 
         // Use GasParams API for all sstore gas (static + dynamic + cold + refund)
@@ -489,6 +512,14 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         self.is_static
     }
 
+    fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        self.tip1060_storage_credits_enabled = enabled && self.spec.is_t7();
+    }
+
+    fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        self.tip1060_storage_credit_minting_enabled = enabled;
+    }
+
     #[inline]
     fn checkpoint(&mut self) -> JournalCheckpoint {
         self.internals.checkpoint()
@@ -502,6 +533,65 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     #[inline]
     fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
         self.internals.checkpoint_revert(checkpoint)
+    }
+}
+
+impl StorageCreditsBackend for LeafageStorageProvider<'_> {
+    fn gas_params(&self) -> revm::context_interface::cfg::gas_params::GasParams {
+        self.tempo_gas_params()
+    }
+
+    fn remaining_gas(&self) -> u64 {
+        self.gas_remaining
+    }
+
+    fn charge_gas(&mut self, gas: u64) -> core::result::Result<(), AccountingError> {
+        self.gas_remaining = self
+            .gas_remaining
+            .checked_sub(gas)
+            .ok_or(AccountingError::OutOfGas)?;
+        Ok(())
+    }
+
+    fn sload_raw(
+        &mut self,
+        address: Address,
+        key: U256,
+        _skip_cold: bool,
+    ) -> core::result::Result<revm::interpreter::StateLoad<U256>, AccountingError> {
+        self.internals
+            .sload(address, key)
+            .map_err(|_| AccountingError::Fatal)
+    }
+
+    fn sstore_raw(
+        &mut self,
+        address: Address,
+        key: U256,
+        value: U256,
+    ) -> core::result::Result<
+        revm::interpreter::StateLoad<revm::interpreter::SStoreResult>,
+        AccountingError,
+    > {
+        self.internals
+            .sstore(address, key, value)
+            .map_err(|_| AccountingError::Fatal)
+    }
+
+    fn tload_raw(&mut self, address: Address, key: U256) -> U256 {
+        self.internals.tload(address, key)
+    }
+
+    fn tstore_raw(&mut self, address: Address, key: U256, value: U256) {
+        self.internals.tstore(address, key, value);
+    }
+
+    fn is_non_creditable_slot(&self, owner: Address, key: U256) -> bool {
+        crate::tempo::precompile::storage_credits::is_non_creditable_slot(owner, key)
+    }
+
+    fn storage_credit_minting_enabled(&self) -> bool {
+        self.tip1060_storage_credit_minting_enabled
     }
 }
 
@@ -677,6 +767,14 @@ impl StorageCtx {
     /// Returns whether the current call context is static.
     pub fn is_static(&self) -> bool {
         Self::with_storage(|s| s.is_static())
+    }
+
+    pub fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        Self::with_storage(|s| s.set_tip1060_storage_credits(enabled))
+    }
+
+    pub fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        Self::with_storage(|s| s.set_tip1060_storage_credit_minting(enabled))
     }
 
     /// Creates a journal checkpoint and returns a RAII guard.
@@ -878,13 +976,11 @@ mod tests {
     fn contract_storage_reader_load_returns_zero_from_empty_db() {
         let addr = address!("0x1111111111111111111111111111111111111111");
         let reader = ContractStorageReader::new(addr);
-        let value = with_read_only_storage_ctx(
-            &EmptyDB::default(),
-            TempoHardfork::T3,
-            4217,
-            || reader.load(U256::from(42u8)),
-        )
-        .unwrap();
+        let value =
+            with_read_only_storage_ctx(&EmptyDB::default(), TempoHardfork::T3, 4217, || {
+                reader.load(U256::from(42u8))
+            })
+            .unwrap();
         assert_eq!(value, U256::ZERO);
     }
 

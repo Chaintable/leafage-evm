@@ -412,6 +412,8 @@ impl TipFeeManager {
 
     /// Transfers a validator's accumulated fee balance and zeroes the ledger.
     pub fn distribute_fees(&mut self, validator: Address, token: Address) -> Result<()> {
+        // Fee collection creates this ledger slot outside normal TIP-1060 charging.
+        self.storage.set_tip1060_storage_credit_minting(false);
         let amount = self.collected_fees[validator][token].read()?;
         if amount.is_zero() {
             return Ok(());
@@ -575,6 +577,8 @@ impl TipFeeManager {
         )?;
 
         // Transfer user tokens from pool to recipient
+        // Fee collection creates the corresponding pool balance slot for free.
+        self.storage.set_tip1060_storage_credit_minting(false);
         TIP20Token::from_address(user_token)?.transfer(
             self.address,
             super::tip20::ITIP20::transferCall {
@@ -1045,7 +1049,110 @@ mod tests {
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::PATH_USD_ADDRESS;
+    use crate::tempo::precompile::storage_credits::StorageCredits;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
+
+    fn initialize_issuer_token(
+        token: Address,
+        admin: Address,
+        recipient: Address,
+        amount: U256,
+    ) -> Result<()> {
+        let mut tip20 = TIP20Token::from_address_unchecked(token);
+        tip20.initialize(
+            Address::ZERO,
+            "Fee Token",
+            "FEE",
+            "USD",
+            PATH_USD_ADDRESS,
+            admin,
+        )?;
+        tip20.grant_role(
+            admin,
+            IRolesAuth::grantRoleCall {
+                role: *ISSUER_ROLE,
+                account: admin,
+            },
+        )?;
+        tip20.mint(
+            admin,
+            ITIP20::mintCall {
+                to: recipient,
+                amount,
+            },
+        )
+    }
+
+    #[test]
+    fn t7_distribute_fees_does_not_mint_credits_from_fee_ledger_clear() {
+        let admin = Address::repeat_byte(0xa1);
+        let validator = Address::repeat_byte(0xa2);
+        let token = address!("0x20c00000000000000000000000000000000000a3");
+        let amount = U256::from(100u64);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            initialize_issuer_token(token, admin, TIP_FEE_MANAGER_ADDRESS, amount)?;
+            let mut manager = TipFeeManager::new();
+            manager.collected_fees[validator][token].write(amount)?;
+            manager.distribute_fees(validator, token)?;
+
+            assert_eq!(manager.collected_fees[validator][token].read()?, U256::ZERO);
+            assert_eq!(
+                TIP20Token::from_address_unchecked(token)
+                    .balance_of(ITIP20::balanceOfCall { account: validator })?,
+                amount,
+            );
+            assert_eq!(StorageCredits::new().balance_of(manager.address)?, 0);
+            assert_eq!(StorageCredits::new().balance_of(token)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t7_rebalance_swap_does_not_mint_credit_from_fee_token_balance_clear() {
+        let admin = Address::repeat_byte(0xb1);
+        let swapper = Address::repeat_byte(0xb2);
+        let recipient = Address::repeat_byte(0xb3);
+        let user_token = address!("0x20c00000000000000000000000000000000000b4");
+        let validator_token = address!("0x20c00000000000000000000000000000000000b5");
+        let amount_out = U256::from(100u64);
+        let amount_in = amount_out * N / SCALE + U256::ONE;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            initialize_issuer_token(user_token, admin, TIP_FEE_MANAGER_ADDRESS, amount_out)?;
+            initialize_issuer_token(validator_token, admin, swapper, amount_in)?;
+
+            let mut manager = TipFeeManager::new();
+            let pool_id = manager.pool_id(user_token, validator_token);
+            manager.pools[pool_id].write(Pool {
+                reserve_user_token: amount_out.to::<u128>(),
+                reserve_validator_token: 0,
+            })?;
+            assert_eq!(
+                manager.rebalance_swap(
+                    swapper,
+                    user_token,
+                    validator_token,
+                    amount_out,
+                    recipient,
+                )?,
+                amount_in,
+            );
+            assert_eq!(
+                TIP20Token::from_address_unchecked(user_token)
+                    .balance_of(ITIP20::balanceOfCall { account: recipient })?,
+                amount_out,
+            );
+            assert_eq!(StorageCredits::new().balance_of(user_token)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn two_hop_fee_route_activates_at_t5() {

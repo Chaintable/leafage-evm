@@ -10,6 +10,7 @@ use super::address_registry::AddressRegistry;
 use super::error::{Result, TempoPrecompileError};
 use super::signature_verifier::SignatureVerifier;
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
+use super::storage_credits::StorageCredits;
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::tip20::{is_tip20_prefix, TIP20Token, ITIP20};
 use super::tip403_registry::AuthRole;
@@ -214,6 +215,13 @@ impl TIP20ChannelReserve {
 
     pub fn storage_credits(&self, payer: Address) -> Result<u64> {
         self.channel_storage_credits[payer].read()
+    }
+
+    fn preserve_storage_credits(&mut self) -> Result<()> {
+        if self.storage.spec().is_t7() {
+            StorageCredits::new().preserve(self.address)?;
+        }
+        Ok(())
     }
 
     pub fn open(
@@ -546,18 +554,61 @@ impl TIP20ChannelReserve {
     fn delete_channel_state_and_credit_payer(
         &mut self,
         channel_id: B256,
-        _payer: Address,
+        payer: Address,
     ) -> Result<()> {
-        self.channel_states[channel_id].delete()
+        let (_, credits) = StorageCredits::new()
+            .track_minted_credits(self.address, || self.channel_states[channel_id].delete())?;
+        self.credit_channel_storage_slots(payer, credits)
+    }
+
+    fn credit_channel_storage_slots(&mut self, payer: Address, slots: u64) -> Result<()> {
+        if slots == 0 {
+            return Ok(());
+        }
+
+        let current = self.channel_storage_credits[payer].read()?;
+        let updated = current.saturating_add(slots);
+        if current == 0 {
+            let (_, delta) = StorageCredits::new().with_budget(self.address, 1, || {
+                self.channel_storage_credits[payer].write(updated)
+            })?;
+            if delta != -1 {
+                return Err(TempoPrecompileError::Fatal(format!(
+                    "channel storage credit bookkeeping spend mismatch: {delta}"
+                )));
+            }
+            Ok(())
+        } else {
+            self.channel_storage_credits[payer].write(updated)
+        }
     }
 
     fn write_channel_state_spending_credit(
         &mut self,
-        _payer: Address,
+        payer: Address,
         channel_id: B256,
         state: PackedChannelState,
     ) -> Result<()> {
-        self.channel_states[channel_id].write(state)
+        if !self.storage.spec().is_t7() {
+            return self.channel_states[channel_id].write(state);
+        }
+
+        let current = self.channel_storage_credits[payer].read()?;
+        if current == 0 {
+            return self.channel_states[channel_id].write(state);
+        }
+
+        self.channel_storage_credits[payer].delete()?;
+        let (_, delta) = StorageCredits::new().with_budget(self.address, current, || {
+            self.channel_states[channel_id].write(state)
+        })?;
+        let spent = delta.checked_neg().unwrap_or_default() as u64;
+        if spent != 1 {
+            return Err(TempoPrecompileError::Fatal(format!(
+                "channel storage credit spend mismatch: {spent}"
+            )));
+        }
+        self.credit_channel_storage_slots(payer, current.saturating_sub(spent))
     }
 
     fn now(&self) -> u64 {
@@ -722,24 +773,40 @@ impl Precompile for TIP20ChannelReserve {
                     metadata::<ITIP20ChannelReserve::VOUCHER_TYPEHASHCall>(|| Ok(*VOUCHER_TYPEHASH))
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::open(call) => {
-                    mutate(call, msg_sender, |sender, call| self.open(sender, call))
+                    mutate(call, msg_sender, |sender, call| {
+                        self.preserve_storage_credits()?;
+                        self.open(sender, call)
+                    })
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::settle(call) => {
-                    mutate_void(call, msg_sender, |sender, call| self.settle(sender, call))
+                    mutate_void(call, msg_sender, |sender, call| {
+                        self.preserve_storage_credits()?;
+                        self.settle(sender, call)
+                    })
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::topUp(call) => {
-                    mutate_void(call, msg_sender, |sender, call| self.top_up(sender, call))
+                    mutate_void(call, msg_sender, |sender, call| {
+                        self.preserve_storage_credits()?;
+                        self.top_up(sender, call)
+                    })
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::close(call) => {
-                    mutate_void(call, msg_sender, |sender, call| self.close(sender, call))
+                    mutate_void(call, msg_sender, |sender, call| {
+                        self.preserve_storage_credits()?;
+                        self.close(sender, call)
+                    })
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::requestClose(call) => {
                     mutate_void(call, msg_sender, |sender, call| {
+                        self.preserve_storage_credits()?;
                         self.request_close(sender, call)
                     })
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::withdraw(call) => {
-                    mutate_void(call, msg_sender, |sender, call| self.withdraw(sender, call))
+                    mutate_void(call, msg_sender, |sender, call| {
+                        self.preserve_storage_credits()?;
+                        self.withdraw(sender, call)
+                    })
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::getChannel(call) => {
                     view(call, |call| self.get_channel(call))
@@ -968,6 +1035,79 @@ mod tests {
 
             let reopened = reserve.open(payer, open_call);
             assert!(matches!(reopened, Err(TempoPrecompileError::Revert(_))));
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t7_closed_channel_credit_is_reused_for_new_channel() {
+        let payer = Address::repeat_byte(0x51);
+        let payee = Address::repeat_byte(0x52);
+        let first_context = B256::repeat_byte(0x53);
+        let second_context = B256::repeat_byte(0x54);
+        let deposit = U96::from(100);
+        let open_call = ITIP20ChannelReserve::openCall {
+            payee,
+            operator: Address::ZERO,
+            token: super::super::PATH_USD_ADDRESS,
+            deposit,
+            salt: B256::repeat_byte(0x55),
+            authorizedSigner: Address::ZERO,
+        };
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(super::super::PATH_USD_ADDRESS);
+            token.initialize(
+                Address::ZERO,
+                "Path USD",
+                "pathUSD",
+                "USD",
+                super::super::PATH_USD_ADDRESS,
+                payer,
+            )?;
+            token.grant_role(
+                payer,
+                IRolesAuth::grantRoleCall {
+                    role: *ISSUER_ROLE,
+                    account: payer,
+                },
+            )?;
+            token.mint(
+                payer,
+                ITIP20::mintCall {
+                    to: payer,
+                    amount: U256::from(deposit),
+                },
+            )?;
+
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.set_channel_open_context_hash(first_context)?;
+            let channel_id = reserve.open(payer, open_call.clone())?;
+            reserve.close(
+                payee,
+                ITIP20ChannelReserve::closeCall {
+                    descriptor: ITIP20ChannelReserve::ChannelDescriptor {
+                        payer,
+                        payee,
+                        operator: open_call.operator,
+                        token: open_call.token,
+                        salt: open_call.salt,
+                        authorizedSigner: open_call.authorizedSigner,
+                        expiringNonceHash: first_context,
+                    },
+                    cumulativeAmount: U96::ZERO,
+                    captureAmount: U96::ZERO,
+                    signature: Bytes::new(),
+                },
+            )?;
+            assert_eq!(reserve.storage_credits(payer)?, 1);
+
+            reserve.set_channel_open_context_hash(second_context)?;
+            let reopened = reserve.open(payer, open_call)?;
+            assert_ne!(reopened, channel_id);
+            assert_eq!(reserve.storage_credits(payer)?, 0);
             Result::<()>::Ok(())
         })
         .unwrap();

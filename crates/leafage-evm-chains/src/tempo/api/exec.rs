@@ -7,10 +7,10 @@ use revm::{
     context_interface::{
         cfg::gas_params::{GasId, GasParams},
         journaled_state::account::JournaledAccountTr,
-        result::{EVMError, ExecutionResult, ResultAndState},
+        result::{EVMError, ExecutionResult, ResultAndState, ResultGas},
         Cfg, ContextTr, JournalTr,
     },
-    handler::{EthFrame, FrameResult, Handler, MainnetHandler},
+    handler::{post_execution, EthFrame, FrameResult, Handler, MainnetHandler},
     inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Gas, InitialAndFloorGas},
     primitives::U256,
@@ -458,6 +458,32 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 .execution(evm, init_and_floor_gas)
         }
     }
+
+    #[inline]
+    fn post_execution(
+        &self,
+        evm: &mut Self::Evm,
+        exec_result: &mut FrameResult,
+        init_and_floor_gas: InitialAndFloorGas,
+        eip7702_gas_refund: i64,
+    ) -> Result<ResultGas, Self::Error> {
+        let hardfork = evm.ctx().cfg.spec;
+        if hardfork.is_t7() && exec_result.instruction_result().is_ok() {
+            super::storage_credits::apply_refund(evm, exec_result.gas_mut())?;
+        }
+
+        if hardfork.is_t7() {
+            exec_result.gas_mut().record_refund(eip7702_gas_refund);
+        } else {
+            self.refund(evm, exec_result, eip7702_gas_refund);
+        }
+
+        let result_gas = post_execution::build_result_gas(exec_result.gas(), init_and_floor_gas);
+        self.eip7623_check_gas_floor(evm, exec_result, init_and_floor_gas);
+        self.reimburse_caller(evm, exec_result)?;
+        self.reward_beneficiary(evm, exec_result)?;
+        Ok(result_gas)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,11 +538,18 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     use revm::context_interface::JournalTr;
 
     let caller = evm.ctx().tx.base.caller;
+    let (fee_payer, fee_token_override) = evm
+        .ctx()
+        .tx
+        .tempo_fields
+        .as_ref()
+        .map(|fields| (fields.fee_payer.unwrap_or(caller), fields.fee_token))
+        .unwrap_or((caller, None));
 
-    // 1. Read FeeManager.user_tokens[caller] — Mapping<Address,Address> at slot 1
+    // 1. Read FeeManager.user_tokens[fee_payer] — Mapping<Address,Address> at slot 1
     let fee_manager_slot = {
         let mut data = [0u8; 64];
-        data[12..32].copy_from_slice(caller.as_slice());
+        data[12..32].copy_from_slice(fee_payer.as_slice());
         data[63] = 1;
         revm::primitives::keccak256(&data)
     };
@@ -531,16 +564,18 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         .sload(TIP_FEE_MANAGER_ADDRESS, fee_manager_slot.into())
         .map(|r| r.data)?;
 
-    let fee_token = if user_token.is_zero() {
-        DEFAULT_FEE_TOKEN
-    } else {
-        revm::primitives::Address::from_word(user_token.into())
-    };
+    let fee_token = fee_token_override.unwrap_or_else(|| {
+        if user_token.is_zero() {
+            DEFAULT_FEE_TOKEN
+        } else {
+            revm::primitives::Address::from_word(user_token.into())
+        }
+    });
 
-    // 2. Read TIP20.balances[caller] — Mapping<Address,U256> at slot 9
+    // 2. Read TIP20.balances[fee_payer] — Mapping<Address,U256> at slot 9
     let balance_slot = {
         let mut data = [0u8; 64];
-        data[12..32].copy_from_slice(caller.as_slice());
+        data[12..32].copy_from_slice(fee_payer.as_slice());
         data[63] = 9;
         revm::primitives::keccak256(&data)
     };
@@ -1273,7 +1308,12 @@ fn key_auth_gas(
     }
 
     const BUFFER: u64 = 2_000;
-    let sstore_cost = gas_params.get(GasId::sstore_set_without_load_cost());
+    let mut sstore_cost = gas_params.get(GasId::sstore_set_without_load_cost());
+    if hardfork.is_t7() {
+        // Key authorization writes are charged only through intrinsic gas, so
+        // add the TIP-1060 creditable portion hidden by the T7 gas table.
+        sstore_cost = sstore_cost.saturating_add(245_000);
+    }
     let sload_cost =
         gas_params.warm_storage_read_cost() + gas_params.cold_storage_additional_cost();
 
@@ -2427,6 +2467,13 @@ mod tests {
                 (GasId::new(255), 250_000),
             ]);
         }
+        if hf.is_t7() {
+            gp.override_gas([
+                (GasId::sstore_set_without_load_cost(), 5_000),
+                (GasId::sstore_set_refund(), 5_000),
+                (GasId::sstore_clearing_slot_refund(), 0),
+            ]);
+        }
         gp
     }
 
@@ -2441,7 +2488,10 @@ mod tests {
         const BUFFER: u64 = 2_000;
         let gp = gas_params_for(hf);
         let sig_gas = ECRECOVER_GAS + primitive_sig_gas(sig_type, 0);
-        let sstore_cost = gp.get(GasId::sstore_set_without_load_cost());
+        let mut sstore_cost = gp.get(GasId::sstore_set_without_load_cost());
+        if hf.is_t7() {
+            sstore_cost += 245_000;
+        }
         let sload_cost = gp.warm_storage_read_cost() + gp.cold_storage_additional_cost();
         sig_gas + sload_cost + sstore_cost * (1 + limit_slots) + BUFFER + scope_extra
     }
@@ -2528,6 +2578,23 @@ mod tests {
             BASE_SCOPE_GAS,
         );
         assert_eq!(g, expected);
+    }
+
+    #[test]
+    fn key_auth_gas_t7_restores_creditable_sstore_cost() {
+        let gas = |hardfork| {
+            key_auth_gas(
+                TempoSigType::Secp256k1,
+                2,
+                &ScopeCounts::default(),
+                false,
+                false,
+                &gas_params_for(hardfork),
+                hardfork,
+            )
+        };
+
+        assert_eq!(gas(TempoHardfork::T7), gas(TempoHardfork::T6));
     }
 
     #[test]

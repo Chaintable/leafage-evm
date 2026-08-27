@@ -3,7 +3,11 @@ use std::ops::{Deref, DerefMut};
 
 use crate::tempo::block::TempoBlockEnv;
 use crate::tempo::hardfork::TempoHardfork;
-use crate::tempo::precompile::{extend_tempo_precompiles, storage::take_last_precompile_refund};
+use crate::tempo::precompile::{
+    extend_tempo_precompiles,
+    storage::take_last_precompile_refund,
+    storage_credits::{with_non_creditable_slots, NonCreditableSlots},
+};
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
 use revm::{
@@ -20,7 +24,7 @@ use revm::{
         InterpreterResult,
     },
     precompile::{PrecompileSpecId, Precompiles},
-    primitives::Address,
+    primitives::{Address, U256},
     Context, Inspector, Journal,
 };
 
@@ -54,7 +58,10 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
         context: &mut TempoContext<DB>,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
-        let result = self.0.run(context, inputs)?;
+        let non_creditable_slots = resolve_non_creditable_slots(context);
+        let result = with_non_creditable_slots(&non_creditable_slots, || {
+            self.0.run(context, inputs)
+        })?;
         // Drain the thread-local refund set by the precompile macro.
         // We intentionally do NOT call record_refund() here — the writer
         // also uses PrecompilesMap which doesn't propagate precompile
@@ -73,7 +80,57 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     }
 }
 
+fn resolve_non_creditable_slots<DB: Database>(
+    context: &mut TempoContext<DB>,
+) -> NonCreditableSlots {
+    use crate::tempo::precompile::{DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS};
+    use crate::tempo::precompile::storage_types::StorageKey;
+
+    if !context.cfg.spec.is_t7() {
+        return NonCreditableSlots::default();
+    }
+
+    let caller = context.tx.base.caller;
+    let (fee_payer, fee_token_override, keychain_fee_key) = context
+        .tx
+        .tempo_fields
+        .as_ref()
+        .map(|fields| {
+            (
+                fields.fee_payer.unwrap_or(caller),
+                fields.fee_token,
+                fields.is_keychain.then_some(fields.key_id).flatten(),
+            )
+        })
+        .unwrap_or((caller, None, None));
+
+    let fee_token = fee_token_override.unwrap_or_else(|| {
+        let slot = fee_payer.mapping_slot(U256::ONE);
+        let account_loaded = context
+            .journaled_state
+            .load_account(TIP_FEE_MANAGER_ADDRESS)
+            .is_ok();
+        let stored = if account_loaded {
+            context
+                .journaled_state
+                .sload(TIP_FEE_MANAGER_ADDRESS, slot)
+                .map(|load| load.data)
+                .unwrap_or_default()
+        } else {
+            U256::ZERO
+        };
+        if stored.is_zero() {
+            DEFAULT_FEE_TOKEN
+        } else {
+            Address::from_word(stored.into())
+        }
+    });
+
+    NonCreditableSlots::new(fee_payer, fee_token, keychain_fee_key)
+}
+
 mod exec;
+mod storage_credits;
 
 /// Type alias for the default context type of the TempoEvm.
 pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<TempoHardfork>, DB>;
@@ -144,6 +201,12 @@ impl<DB: Database, I> TempoEvm<DB, I> {
 
         // Build instruction table with MILLIS_TIMESTAMP opcode for pre-T1C archive mode.
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+        if hardfork.is_t7() {
+            instructions.insert_instruction(
+                0x55,
+                Instruction::new(storage_credits::sstore::<DB>, 0),
+            );
+        }
         if !hardfork.is_t1c() {
             // Register MILLIS_TIMESTAMP (0x4F) opcode — active pre-T1C only.
             // Ported from Tempo writer: crates/revm/src/instructions.rs

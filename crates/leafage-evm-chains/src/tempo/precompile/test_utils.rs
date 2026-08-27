@@ -3,10 +3,15 @@
 use std::collections::HashMap;
 
 use alloy::primitives::{Address, LogData, U256};
+use revm::context_interface::cfg::{gas_params::GasId, GasParams};
+use revm::interpreter::{SStoreResult, StateLoad};
 use revm::state::{AccountInfo, Bytecode};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{JournalCheckpoint, PrecompileStorageProvider};
+use super::storage_credits::{
+    account_storage_write, is_non_creditable_slot, AccountingError, StorageCreditsBackend,
+};
 use crate::tempo::hardfork::TempoHardfork;
 
 #[derive(Clone)]
@@ -33,6 +38,8 @@ pub(crate) struct TestStorageProvider {
     gas_limit: u64,
     gas_remaining: u64,
     gas_refunded: i64,
+    tip1060_storage_credits_enabled: bool,
+    tip1060_storage_credit_minting_enabled: bool,
 }
 
 impl TestStorageProvider {
@@ -52,6 +59,8 @@ impl TestStorageProvider {
             gas_limit: u64::MAX,
             gas_remaining: u64::MAX,
             gas_refunded: 0,
+            tip1060_storage_credits_enabled: spec.is_t7(),
+            tip1060_storage_credit_minting_enabled: true,
         }
     }
 
@@ -79,6 +88,7 @@ impl TestStorageProvider {
 
     pub(crate) fn set_spec(&mut self, spec: TempoHardfork) {
         self.spec = spec;
+        self.tip1060_storage_credits_enabled = spec.is_t7();
     }
 
     pub(crate) fn set_timestamp(&mut self, timestamp: U256) {
@@ -146,7 +156,24 @@ impl PrecompileStorageProvider for TestStorageProvider {
     }
 
     fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        let present_value = self.storage(address, key);
         self.storage.insert((address, key), value);
+        if self.tip1060_storage_credits_enabled {
+            let result = StateLoad {
+                data: SStoreResult {
+                    original_value: present_value,
+                    present_value,
+                    new_value: value,
+                },
+                is_cold: false,
+            };
+            account_storage_write(self, address, Some(key), &result).map_err(|error| match error {
+                AccountingError::OutOfGas => TempoPrecompileError::OutOfGas,
+                AccountingError::Fatal => {
+                    TempoPrecompileError::Fatal("storage credit accounting failed".into())
+                }
+            })?;
+        }
         Ok(())
     }
 
@@ -188,6 +215,14 @@ impl PrecompileStorageProvider for TestStorageProvider {
         self.is_static
     }
 
+    fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        self.tip1060_storage_credits_enabled = enabled && self.spec.is_t7();
+    }
+
+    fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        self.tip1060_storage_credit_minting_enabled = enabled;
+    }
+
     fn checkpoint(&mut self) -> JournalCheckpoint {
         let journal_i = self.snapshots.len();
         self.snapshots.push(Snapshot {
@@ -215,6 +250,78 @@ impl PrecompileStorageProvider for TestStorageProvider {
         self.transient = snapshot.transient;
         self.accounts = snapshot.accounts;
         self.events = snapshot.events;
+    }
+}
+
+impl StorageCreditsBackend for TestStorageProvider {
+    fn gas_params(&self) -> GasParams {
+        let mut params = GasParams::new_spec(revm::primitives::hardfork::SpecId::OSAKA);
+        if self.spec.is_t7() {
+            params.override_gas([
+                (GasId::sstore_set_without_load_cost(), 5_000),
+                (GasId::sstore_set_refund(), 5_000),
+                (GasId::sstore_clearing_slot_refund(), 0),
+            ]);
+        }
+        params
+    }
+
+    fn remaining_gas(&self) -> u64 {
+        self.gas_remaining
+    }
+
+    fn charge_gas(&mut self, gas: u64) -> core::result::Result<(), AccountingError> {
+        self.gas_remaining = self
+            .gas_remaining
+            .checked_sub(gas)
+            .ok_or(AccountingError::OutOfGas)?;
+        Ok(())
+    }
+
+    fn sload_raw(
+        &mut self,
+        address: Address,
+        key: U256,
+        _skip_cold: bool,
+    ) -> core::result::Result<StateLoad<U256>, AccountingError> {
+        Ok(StateLoad {
+            data: self.storage(address, key),
+            is_cold: false,
+        })
+    }
+
+    fn sstore_raw(
+        &mut self,
+        address: Address,
+        key: U256,
+        value: U256,
+    ) -> core::result::Result<StateLoad<SStoreResult>, AccountingError> {
+        let present_value = self.storage(address, key);
+        self.storage.insert((address, key), value);
+        Ok(StateLoad {
+            data: SStoreResult {
+                original_value: present_value,
+                present_value,
+                new_value: value,
+            },
+            is_cold: false,
+        })
+    }
+
+    fn tload_raw(&mut self, address: Address, key: U256) -> U256 {
+        self.transient(address, key)
+    }
+
+    fn tstore_raw(&mut self, address: Address, key: U256, value: U256) {
+        self.transient.insert((address, key), value);
+    }
+
+    fn is_non_creditable_slot(&self, owner: Address, key: U256) -> bool {
+        is_non_creditable_slot(owner, key)
+    }
+
+    fn storage_credit_minting_enabled(&self) -> bool {
+        self.tip1060_storage_credit_minting_enabled
     }
 }
 

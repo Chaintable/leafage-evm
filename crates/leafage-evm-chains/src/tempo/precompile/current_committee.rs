@@ -62,8 +62,11 @@ impl CurrentCommittee {
             ));
         }
 
+        // This is a system-only update: it must neither mint nor consume TIP-1060 credits.
+        self.storage.set_tip1060_storage_credits(false);
         self.epoch.write(call.epoch)?;
-        self.public_keys.write(call.publicKeys)
+        self.public_keys.write(call.publicKeys)?;
+        Ok(())
     }
 }
 
@@ -190,6 +193,11 @@ mod tests {
             let members = committee.get_committee_members()?;
             assert_eq!(members.epoch, 2);
             assert_eq!(members.publicKeys, vec![B256::repeat_byte(3)]);
+            assert_eq!(
+                super::super::storage_credits::StorageCredits::new()
+                    .balance_of(CURRENT_COMMITTEE_ADDRESS)?,
+                0,
+            );
             Result::<()>::Ok(())
         })
         .unwrap();

@@ -15,6 +15,7 @@
 //! |  2   | balances       | Mapping<Address, Mapping<Address, u128>>    |
 //! |  3   | next_order_id  | u128                                        |
 //! |  4   | book_keys      | Vec<B256>                                   |
+//! |  5   | dex_storage_credits | Mapping<Address, u64>                   |
 //!
 //! ## Cross-precompile dependencies
 //!
@@ -37,12 +38,13 @@ use super::storage::{ContractStorage, StorageCtx, StorageOps};
 use super::storage_types::{
     Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType, VecHandler,
 };
+use super::storage_credits::{StorageCreditDeltas, StorageCredits};
 use super::tip20::{is_tip20_prefix, TIP20Token};
 use super::tip20_factory::TIP20Factory;
 use super::tip403_registry::{is_policy_lookup_error, AuthRole, TIP403Registry};
 use super::{
-    dispatch_call, input_cost, mutate, mutate_void, view, Precompile, PATH_USD_ADDRESS,
-    STABLECOIN_DEX_ADDRESS,
+    dispatch_call, input_cost, mutate, mutate_void, unknown_selector, view, Precompile,
+    PATH_USD_ADDRESS, STABLECOIN_DEX_ADDRESS,
 };
 
 // ===========================================================================
@@ -76,6 +78,7 @@ alloy::sol! {
         function place(address token, uint128 amount, bool isBid, int16 tick) external returns (uint128);
         function placeFlip(address token, uint128 amount, bool isBid, int16 tick, int16 flipTick) external returns (uint128);
         function balanceOf(address user, address token) external view returns (uint128);
+        function storageCredits(address user) external view returns (uint64 credits);
         function getOrder(uint128 orderId) external view returns (Order memory);
         function getTickLevel(address base, int16 tick, bool isBid) external view returns (uint128 head, uint128 tail, uint128 totalLiquidity);
         function pairKey(address tokenA, address tokenB) external view returns (bytes32);
@@ -930,6 +933,8 @@ pub struct StablecoinDEX {
     next_order_id: Slot<u128>,
     // Slot 4: book_keys
     book_keys: VecHandler<B256>,
+    // Slot 5: reusable order storage credits by maker
+    dex_storage_credits: Mapping<Address, u64>,
 
     pub address: Address,
     pub storage: StorageCtx,
@@ -944,6 +949,7 @@ impl StablecoinDEX {
             balances: Mapping::new(U256::from(2), address),
             next_order_id: Slot::new(U256::from(3), address),
             book_keys: VecHandler::new(U256::from(4), address),
+            dex_storage_credits: Mapping::new(U256::from(5), address),
             address,
             storage: StorageCtx::default(),
         }
@@ -963,6 +969,86 @@ impl StablecoinDEX {
     /// Initializes the stablecoin DEX precompile.
     pub fn initialize(&mut self) -> Result<()> {
         self.__initialize()
+    }
+
+    /// Returns the number of reusable order storage credits owned by `user`.
+    pub fn storage_credits(&self, user: Address) -> Result<u64> {
+        self.dex_storage_credits[user].read()
+    }
+
+    fn preserve_storage_credits(&mut self) -> Result<()> {
+        if self.storage.spec().is_t7() {
+            StorageCredits::new().preserve(self.address)?;
+        }
+        Ok(())
+    }
+
+    fn credit_dex_storage_slots(&mut self, user: Address, slots: u64) -> Result<()> {
+        if slots == 0 || !self.storage.spec().is_t7() {
+            return Ok(());
+        }
+
+        let current = self.dex_storage_credits[user].read()?;
+        let updated = current.saturating_add(slots);
+        if current != 0 {
+            return self.dex_storage_credits[user].write(updated);
+        }
+
+        let (_, delta) = StorageCredits::new().with_budget(self.address, 1, || {
+            self.dex_storage_credits[user].write(updated)
+        })?;
+        if delta != -1 {
+            return Err(TempoPrecompileError::Fatal(format!(
+                "DEX storage credit bookkeeping spend mismatch: reserved 1, delta {delta}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn delete_order(&mut self, order: &Order) -> Result<u64> {
+        StorageCredits::new()
+            .track_minted_credits(self.address, || self.orders[order.order_id].delete())
+            .map(|(_, credits)| credits)
+    }
+
+    fn unlink_neighbor_and_credit_maker(
+        &mut self,
+        order_id: u128,
+        update: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let (_, credits) =
+            StorageCredits::new().track_minted_credits(self.address, || update(self))?;
+        if credits == 0 {
+            return Ok(());
+        }
+
+        let maker = self.orders[order_id].read()?.maker;
+        self.credit_dex_storage_slots(maker, credits)
+    }
+
+    fn delete_order_and_track_deltas(
+        &mut self,
+        storage_credits: &mut StorageCreditDeltas,
+        order: &Order,
+    ) -> Result<()> {
+        let credits = self.delete_order(order)?;
+        storage_credits.credit_slots(order.maker, credits);
+        Ok(())
+    }
+
+    fn write_order_spending_dex_storage_credits(&mut self, order: Order) -> Result<()> {
+        let user = order.maker;
+        let user_credits = self.dex_storage_credits[user].read()?;
+        if user_credits == 0 {
+            return self.orders[order.order_id].write(order);
+        }
+
+        self.dex_storage_credits[user].delete()?;
+        let (_, delta) = StorageCredits::new().with_budget(self.address, user_credits, || {
+            self.orders[order.order_id].write(order)
+        })?;
+        let spent_credits = if delta < 0 { (-delta) as u64 } else { 0 };
+        self.credit_dex_storage_slots(user, user_credits.saturating_sub(spent_credits))
     }
 
     /// Helper to get a book handle for a given pair key.
@@ -1191,7 +1277,7 @@ impl StablecoinDEX {
         } else {
             Order::new_ask(order_id, sender, book_key, amount, tick)
         };
-        self.commit_order_to_book(order)?;
+        self.commit_order_to_book(order, true)?;
 
         self.emit_event(IStablecoinDEX::OrderPlaced {
             orderId: order_id,
@@ -1208,7 +1294,7 @@ impl StablecoinDEX {
     }
 
     /// Commits an order to the orderbook.
-    fn commit_order_to_book(&mut self, mut order: Order) -> Result<()> {
+    fn commit_order_to_book(&mut self, mut order: Order, charge_credits: bool) -> Result<()> {
         let mut handle = self.book_handle(order.book_key);
         let orderbook = handle.read_data()?;
         let mut level = handle.read_tick_level(order.tick, order.is_bid)?;
@@ -1243,7 +1329,11 @@ impl StablecoinDEX {
         level.total_liquidity = new_liquidity;
 
         handle.write_tick_level(order.tick, order.is_bid, level)?;
-        self.orders[order.order_id].write(order)
+        if charge_credits && self.storage.spec().is_t7() {
+            self.write_order_spending_dex_storage_credits(order)
+        } else {
+            self.orders[order.order_id].write(order)
+        }
     }
 
     /// Places a flip order.
@@ -1334,7 +1424,7 @@ impl StablecoinDEX {
         )?;
 
         self.next_order_id.write(order_id + 1)?;
-        self.commit_order_to_book(order)?;
+        self.commit_order_to_book(order, true)?;
 
         self.emit_event(IStablecoinDEX::OrderPlaced {
             orderId: order_id,
@@ -1402,7 +1492,8 @@ impl StablecoinDEX {
         non_escrow_tip20.ensure_transfer_authorized(self.address, flipped.maker)?;
 
         self.sub_balance(flipped.maker, escrow_token, escrow_amount)?;
-        self.commit_order_to_book(flipped.clone())?;
+        // A taker-triggered flip must not spend the maker's reusable credits.
+        self.commit_order_to_book(flipped.clone(), false)?;
         self.emit_event(IStablecoinDEX::OrderFlipped {
             orderId: flipped.order_id,
             maker: flipped.maker,
@@ -1471,6 +1562,7 @@ impl StablecoinDEX {
     /// Fill an order completely and return next order info.
     fn fill_order(
         &mut self,
+        storage_credits: &mut StorageCreditDeltas,
         book_key: B256,
         order: &mut Order,
         mut level: TickLevel,
@@ -1522,10 +1614,10 @@ impl StablecoinDEX {
             }
 
             if !self.storage.spec().is_t5() || result.is_err() {
-                self.orders[order.order_id].delete()?;
+                self.delete_order_and_track_deltas(storage_credits, order)?;
             }
         } else {
-            self.orders[order.order_id].delete()?;
+            self.delete_order_and_track_deltas(storage_credits, order)?;
         }
 
         let next_tick_info = if order.next == 0 {
@@ -1551,9 +1643,12 @@ impl StablecoinDEX {
             }
         } else {
             level.head = order.next;
-            let mut next_order = self.orders[order.next].read()?;
-            next_order.prev = 0;
-            self.orders[order.next].write(next_order)?;
+            let (_, credits) =
+                StorageCredits::new().track_minted_credits(self.address, || {
+                    let mut next_order = self.orders[order.next].read()?;
+                    next_order.prev = 0;
+                    self.orders[order.next].write(next_order)
+                })?;
 
             let new_liquidity = level
                 .total_liquidity
@@ -1563,6 +1658,7 @@ impl StablecoinDEX {
 
             handle.write_tick_level(order.tick, order.is_bid, level)?;
             let new_order = self.orders[order.next].read()?;
+            storage_credits.credit_slots(new_order.maker, credits);
             Some((level, new_order))
         };
 
@@ -1591,6 +1687,7 @@ impl StablecoinDEX {
     /// Fill orders for exact input amount.
     fn fill_orders_exact_in(
         &mut self,
+        storage_credits: &mut StorageCreditDeltas,
         book_key: B256,
         bid: bool,
         mut amount_in: u128,
@@ -1619,7 +1716,7 @@ impl StablecoinDEX {
                 break;
             } else {
                 let (amount_out, next_order_info) =
-                    self.fill_order(book_key, &mut order, level, taker)?;
+                    self.fill_order(storage_credits, book_key, &mut order, level, taker)?;
                 total_amount_out = total_amount_out
                     .checked_add(amount_out)
                     .ok_or(TempoPrecompileError::under_overflow())?;
@@ -1664,6 +1761,7 @@ impl StablecoinDEX {
     /// Fill orders for exact output amount.
     fn fill_orders_exact_out(
         &mut self,
+        storage_credits: &mut StorageCreditDeltas,
         book_key: B256,
         bid: bool,
         mut amount_out: u128,
@@ -1695,7 +1793,7 @@ impl StablecoinDEX {
                 break;
             } else {
                 let (amount_out_received, next_order_info) =
-                    self.fill_order(book_key, &mut order, level, taker)?;
+                    self.fill_order(storage_credits, book_key, &mut order, level, taker)?;
                 total_amount_in = total_amount_in
                     .checked_add(amount_in)
                     .ok_or(TempoPrecompileError::under_overflow())?;
@@ -1970,8 +2068,15 @@ impl StablecoinDEX {
         self.decrement_balance_or_transfer_from(sender, token_in, amount_in)?;
 
         let mut amount = amount_in;
+        let mut storage_credits = StorageCreditDeltas::new();
         for (book_key, base_for_quote) in route {
-            amount = self.fill_orders_exact_in(book_key, base_for_quote, amount, sender)?;
+            amount = self.fill_orders_exact_in(
+                &mut storage_credits,
+                book_key,
+                base_for_quote,
+                amount,
+                sender,
+            )?;
         }
 
         if amount < min_amount_out {
@@ -1979,6 +2084,7 @@ impl StablecoinDEX {
         }
 
         self.transfer(token_out, sender, amount)?;
+        storage_credits.flush(|user, slots| self.credit_dex_storage_slots(user, slots))?;
         Ok(amount)
     }
 
@@ -1994,8 +2100,15 @@ impl StablecoinDEX {
         let route = self.find_trade_path(token_in, token_out)?;
 
         let mut amount = amount_out;
+        let mut storage_credits = StorageCreditDeltas::new();
         for (book_key, base_for_quote) in route.iter().rev() {
-            amount = self.fill_orders_exact_out(*book_key, *base_for_quote, amount, sender)?;
+            amount = self.fill_orders_exact_out(
+                &mut storage_credits,
+                *book_key,
+                *base_for_quote,
+                amount,
+                sender,
+            )?;
         }
 
         if amount > max_amount_in {
@@ -2004,6 +2117,7 @@ impl StablecoinDEX {
 
         self.decrement_balance_or_transfer_from(sender, token_in, amount)?;
         self.transfer(token_out, sender, amount_out)?;
+        storage_credits.flush(|user, slots| self.credit_dex_storage_slots(user, slots))?;
         Ok(amount)
     }
 
@@ -2058,17 +2172,21 @@ impl StablecoinDEX {
 
         // Update linked list
         if order.prev != 0 {
-            let mut prev = self.orders[order.prev].read()?;
-            prev.next = order.next;
-            self.orders[order.prev].write(prev)?;
+            self.unlink_neighbor_and_credit_maker(order.prev, |dex| {
+                let mut prev = dex.orders[order.prev].read()?;
+                prev.next = order.next;
+                dex.orders[order.prev].write(prev)
+            })?;
         } else {
             level.head = order.next;
         }
 
         if order.next != 0 {
-            let mut next = self.orders[order.next].read()?;
-            next.prev = order.prev;
-            self.orders[order.next].write(next)?;
+            self.unlink_neighbor_and_credit_maker(order.next, |dex| {
+                let mut next = dex.orders[order.next].read()?;
+                next.prev = order.prev;
+                dex.orders[order.next].write(next)
+            })?;
         } else {
             level.tail = order.prev;
         }
@@ -2115,7 +2233,8 @@ impl StablecoinDEX {
             self.increment_balance(order.maker, orderbook.base, order.remaining)?;
         }
 
-        self.orders[order.order_id].delete()?;
+        let credits = self.delete_order(&order)?;
+        self.credit_dex_storage_slots(order.maker, credits)?;
 
         self.emit_event(IStablecoinDEX::OrderCancelled {
             orderId: order.order_id,
@@ -2191,16 +2310,25 @@ impl Precompile for StablecoinDEX {
             |call| match call {
                 IStablecoinDEX::IStablecoinDEXCalls::place(call) => {
                     mutate(call, msg_sender, |s, c| {
+                        self.preserve_storage_credits()?;
                         self.place(s, c.token, c.amount, c.isBid, c.tick)
                     })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::placeFlip(call) => {
                     mutate(call, msg_sender, |s, c| {
+                        self.preserve_storage_credits()?;
                         self.place_flip(s, c.token, c.amount, c.isBid, c.tick, c.flipTick, false)
                     })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::balanceOf(call) => {
                     view(call, |c| self.balance_of(c.user, c.token))
+                }
+                IStablecoinDEX::IStablecoinDEXCalls::storageCredits(call) => {
+                    if !self.storage.spec().is_t7() {
+                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
+                    } else {
+                        view(call, |c| self.storage_credits(c.user))
+                    }
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::getOrder(call) => view(call, |c| {
                     let order = self.get_order(c.orderId)?;
@@ -2238,19 +2366,32 @@ impl Precompile for StablecoinDEX {
                     view(call, |_| self.next_order_id_val())
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::createPair(call) => {
-                    mutate(call, msg_sender, |_, c| self.create_pair(c.base))
+                    mutate(call, msg_sender, |_, c| {
+                        self.preserve_storage_credits()?;
+                        self.create_pair(c.base)
+                    })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::withdraw(call) => {
-                    mutate_void(call, msg_sender, |s, c| self.withdraw(s, c.token, c.amount))
+                    mutate_void(call, msg_sender, |s, c| {
+                        self.preserve_storage_credits()?;
+                        self.withdraw(s, c.token, c.amount)
+                    })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::cancel(call) => {
-                    mutate_void(call, msg_sender, |s, c| self.cancel(s, c.orderId))
+                    mutate_void(call, msg_sender, |s, c| {
+                        self.preserve_storage_credits()?;
+                        self.cancel(s, c.orderId)
+                    })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::cancelStaleOrder(call) => {
-                    mutate_void(call, msg_sender, |_, c| self.cancel_stale_order(c.orderId))
+                    mutate_void(call, msg_sender, |_, c| {
+                        self.preserve_storage_credits()?;
+                        self.cancel_stale_order(c.orderId)
+                    })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::swapExactAmountIn(call) => {
                     mutate(call, msg_sender, |s, c| {
+                        self.preserve_storage_credits()?;
                         self.swap_exact_amount_in(
                             s,
                             c.tokenIn,
@@ -2262,6 +2403,7 @@ impl Precompile for StablecoinDEX {
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::swapExactAmountOut(call) => {
                     mutate(call, msg_sender, |s, c| {
+                        self.preserve_storage_credits()?;
                         self.swap_exact_amount_out(
                             s,
                             c.tokenIn,
@@ -2312,7 +2454,7 @@ impl Precompile for StablecoinDEX {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, FixedBytes};
-    use alloy::sol_types::SolEvent;
+    use alloy::sol_types::{SolCall, SolEvent};
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
@@ -2320,6 +2462,185 @@ mod tests {
     use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
     use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
     use crate::tempo::precompile::PATH_USD_ADDRESS;
+
+    fn setup_dex_tokens(
+        dex: &mut StablecoinDEX,
+        admin: Address,
+        base_token: Address,
+    ) -> Result<()> {
+        TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+            Address::ZERO,
+            "Path USD",
+            "pathUSD",
+            "USD",
+            PATH_USD_ADDRESS,
+            admin,
+        )?;
+        TIP20Token::from_address_unchecked(base_token).initialize(
+            Address::ZERO,
+            "Base USD",
+            "baseUSD",
+            "USD",
+            PATH_USD_ADDRESS,
+            admin,
+        )?;
+        dex.initialize()?;
+        dex.create_pair(base_token)?;
+        Ok(())
+    }
+
+    fn grant_and_mint(
+        token: Address,
+        admin: Address,
+        recipient: Address,
+        amount: u128,
+    ) -> Result<()> {
+        let mut tip20 = TIP20Token::from_address_unchecked(token);
+        tip20.grant_role(
+            admin,
+            IRolesAuth::grantRoleCall {
+                role: *ISSUER_ROLE,
+                account: admin,
+            },
+        )?;
+        tip20.mint(
+            admin,
+            ITIP20::mintCall {
+                to: recipient,
+                amount: U256::from(amount),
+            },
+        )
+    }
+
+    #[test]
+    fn storage_credits_selector_activates_at_t7() {
+        let call = IStablecoinDEX::storageCreditsCall {
+            user: Address::ZERO,
+        };
+        let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+        let before = StorageCtx::enter(&mut provider, || {
+            StablecoinDEX::new().call(&call.abi_encode(), Address::ZERO)
+        })
+        .unwrap();
+        assert!(before.reverted);
+
+        provider.set_spec(TempoHardfork::T7);
+        let after = StorageCtx::enter(&mut provider, || {
+            StablecoinDEX::new().call(&call.abi_encode(), Address::ZERO)
+        })
+        .unwrap();
+        assert!(!after.reverted);
+    }
+
+    #[test]
+    fn t7_cancelled_order_credits_are_reused_by_same_maker() {
+        let admin = Address::repeat_byte(0xd1);
+        let alice = Address::repeat_byte(0xd2);
+        let base_token = address!("0x20c0000000000000000000000000000000000003");
+        let amount = MIN_ORDER_AMOUNT;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, base_token)?;
+            dex.set_balance(alice, PATH_USD_ADDRESS, amount)?;
+
+            let order_id = dex.place(alice, base_token, amount, true, 0)?;
+            assert_eq!(dex.storage_credits(alice)?, 0);
+
+            dex.cancel(alice, order_id)?;
+            let reusable = dex.storage_credits(alice)?;
+            assert!(reusable > 0 && reusable <= Order::SLOTS as u64);
+
+            dex.place(alice, base_token, amount, true, 0)?;
+            assert_eq!(dex.storage_credits(alice)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t7_tail_cancel_credits_cleared_neighbor_slot_to_neighbor_maker() {
+        let admin = Address::repeat_byte(0xe1);
+        let alice = Address::repeat_byte(0xe2);
+        let bob = Address::repeat_byte(0xe3);
+        let base_token = address!("0x20c0000000000000000000000000000000000004");
+        let amount = MIN_ORDER_AMOUNT;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, base_token)?;
+            dex.set_balance(alice, PATH_USD_ADDRESS, amount)?;
+            dex.set_balance(bob, PATH_USD_ADDRESS, amount)?;
+
+            let alice_order = dex.place(alice, base_token, amount, true, 0)?;
+            let bob_order = dex.place(bob, base_token, amount, true, 0)?;
+            assert_eq!(dex.orders[alice_order].read()?.next, bob_order);
+
+            dex.cancel(bob, bob_order)?;
+            assert_eq!(dex.orders[alice_order].read()?.next, 0);
+            assert_eq!(dex.storage_credits(alice)?, 1);
+            assert!(dex.storage_credits(bob)? > 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t7_full_fill_credits_deleted_order_to_its_maker() {
+        let admin = Address::repeat_byte(0xf1);
+        let alice = Address::repeat_byte(0xf2);
+        let bob = Address::repeat_byte(0xf3);
+        let taker = Address::repeat_byte(0xf4);
+        let base_token = address!("0x20c0000000000000000000000000000000000005");
+        let amount = MIN_ORDER_AMOUNT;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, base_token)?;
+            grant_and_mint(base_token, admin, alice, amount)?;
+            grant_and_mint(base_token, admin, bob, amount)?;
+            grant_and_mint(PATH_USD_ADDRESS, admin, taker, amount)?;
+
+            let alice_order = dex.place(alice, base_token, amount, false, 0)?;
+            let bob_order = dex.place(bob, base_token, amount, false, 0)?;
+            assert_eq!(dex.orders[alice_order].read()?.next, bob_order);
+
+            dex.swap_exact_amount_in(taker, PATH_USD_ADDRESS, base_token, amount, 0)?;
+            assert!(dex.storage_credits(alice)? > 0);
+            assert_eq!(dex.storage_credits(bob)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t7_partial_fill_does_not_credit_live_order() {
+        let admin = Address::repeat_byte(0x61);
+        let maker = Address::repeat_byte(0x62);
+        let taker = Address::repeat_byte(0x63);
+        let base_token = address!("0x20c0000000000000000000000000000000000006");
+        let amount = MIN_ORDER_AMOUNT * 2;
+        let fill = MIN_ORDER_AMOUNT;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, base_token)?;
+            grant_and_mint(base_token, admin, maker, amount)?;
+            grant_and_mint(PATH_USD_ADDRESS, admin, taker, fill)?;
+
+            let order_id = dex.place(maker, base_token, amount, false, 0)?;
+            dex.swap_exact_amount_in(taker, PATH_USD_ADDRESS, base_token, fill, 0)?;
+
+            assert_eq!(dex.get_order(order_id)?.remaining, amount - fill);
+            assert_eq!(dex.storage_credits(maker)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn same_tick_flip_order_activates_at_t5() {
@@ -2357,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn t5_flip_reuses_order_id_and_emits_order_flipped() {
+    fn t5_and_t7_flip_reuse_order_id_without_changing_maker_credits() {
         let admin = Address::repeat_byte(0xa1);
         let alice = Address::repeat_byte(0xa2);
         let bob = Address::repeat_byte(0xb1);
@@ -2365,9 +2686,10 @@ mod tests {
         let amount = MIN_ORDER_AMOUNT;
         let tick = 100;
         let escrow = base_to_quote(amount, tick, RoundingDirection::Up).unwrap();
-        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        for hardfork in [TempoHardfork::T5, TempoHardfork::T7] {
+            let mut provider = TestStorageProvider::new(hardfork);
 
-        StorageCtx::enter(&mut provider, || {
+            StorageCtx::enter(&mut provider, || {
             let mut quote = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
             quote.initialize(
                 Address::ZERO,
@@ -2427,14 +2749,18 @@ mod tests {
             assert_eq!(flipped.tick, tick);
             assert_eq!(flipped.flip_tick, tick);
             assert_eq!(flipped.remaining, amount);
+            if hardfork.is_t7() {
+                assert_eq!(dex.storage_credits(alice)?, 0);
+            }
             Result::<()>::Ok(())
-        })
-        .unwrap();
+            })
+            .unwrap();
 
-        assert!(provider
-            .events(STABLECOIN_DEX_ADDRESS)
-            .iter()
-            .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH));
+            assert!(provider
+                .events(STABLECOIN_DEX_ADDRESS)
+                .iter()
+                .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH));
+        }
     }
 
     #[test]
