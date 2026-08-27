@@ -131,6 +131,14 @@ pub enum PrimitiveSignature {
 }
 
 impl PrimitiveSignature {
+    pub const fn signature_type(&self) -> SignatureType {
+        match self {
+            Self::Secp256k1(_) => SignatureType::Secp256k1,
+            Self::P256(_) => SignatureType::P256,
+            Self::WebAuthn(_) => SignatureType::WebAuthn,
+        }
+    }
+
     /// Encode signature to bytes.
     ///
     /// Wire format:
@@ -569,10 +577,7 @@ impl Encodable for TempoSignature {
 // ---------------------------------------------------------------------------
 
 /// TIP20 per-token spending limit for access keys.
-#[derive(
-    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize,
-    alloy::rlp::RlpEncodable,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenLimit {
     pub token: Address,
@@ -580,6 +585,27 @@ pub struct TokenLimit {
     /// Period duration in seconds. Zero means a one-time limit.
     #[serde(default, with = "alloy::serde::quantity")]
     pub period: u64,
+}
+
+impl Encodable for TokenLimit {
+    fn encode(&self, out: &mut dyn BufMut) {
+        let payload = self.token.length()
+            + self.limit.length()
+            + if self.period == 0 { 0 } else { self.period.length() };
+        Header { list: true, payload_length: payload }.encode(out);
+        self.token.encode(out);
+        self.limit.encode(out);
+        if self.period != 0 {
+            self.period.encode(out);
+        }
+    }
+
+    fn length(&self) -> usize {
+        let payload = self.token.length()
+            + self.limit.length()
+            + if self.period == 0 { 0 } else { self.period.length() };
+        payload + length_of_length(payload)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +709,12 @@ impl Encodable for KeyAuthorization {
 }
 
 impl KeyAuthorization {
+    pub fn signature_hash(&self) -> B256 {
+        let mut encoded = Vec::new();
+        self.encode(&mut encoded);
+        keccak256(encoded)
+    }
+
     /// Returns the 1-indexed position of the latest `Some` trailing field
     /// (1=expiry, 2=limits, 3=allowed_calls, 4=witness, 5=is_admin, 6=account),
     /// or 0 if all trailing fields are absent. Used to decide which preceding
@@ -738,10 +770,8 @@ impl KeyAuthorization {
 
 /// Signed key authorization (key authorization + root key signature).
 ///
-/// RLP:
-/// `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?, is_admin?, account?, signature]`
-/// The `#[rlp(trailing)]` in the writer means `signature` is trailing after
-/// KeyAuthorization's own trailing fields. We match this exactly.
+/// RLP: `[authorization, signature]`, where `authorization` is its own nested
+/// canonical RLP list. This matches the writer's derived `RlpEncodable` layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedKeyAuthorization {
@@ -754,42 +784,7 @@ impl Encodable for SignedKeyAuthorization {
     fn encode(&self, out: &mut dyn BufMut) {
         let payload = self.fields_len();
         Header { list: true, payload_length: payload }.encode(out);
-        // Encode all KeyAuthorization fields inline (not as a nested list).
-        self.authorization.chain_id.encode(out);
-        self.authorization.key_type.encode(out);
-        self.authorization.key_id.encode(out);
-        // signature is always present at the trailing position, so every
-        // preceding optional must be encoded positionally (None -> 0x80).
-        if let Some(expiry) = self.authorization.expiry {
-            expiry.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
-        if let Some(ref limits) = self.authorization.limits {
-            limits.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
-        if let Some(ref scopes) = self.authorization.allowed_calls {
-            scopes.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
-        if let Some(witness) = self.authorization.witness {
-            witness.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
-        if self.authorization.is_admin {
-            1u64.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
-        if let Some(account) = self.authorization.account {
-            account.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
+        self.authorization.encode(out);
         self.signature.encode(out);
     }
 
@@ -800,17 +795,13 @@ impl Encodable for SignedKeyAuthorization {
 }
 
 impl SignedKeyAuthorization {
+    pub fn recover_signer(&self) -> Result<Address, &'static str> {
+        self.signature
+            .recover_signer(&self.authorization.signature_hash())
+    }
+
     fn fields_len(&self) -> usize {
-        self.authorization.chain_id.length()
-            + self.authorization.key_type.length()
-            + self.authorization.key_id.length()
-            + self.authorization.expiry.map_or(1, |e| e.length())
-            + self.authorization.limits.as_ref().map_or(1, |l| l.length())
-            + self.authorization.allowed_calls.as_ref().map_or(1, |s| s.length())
-            + self.authorization.witness.map_or(1, |w| w.length())
-            + if self.authorization.is_admin { 1u64.length() } else { 1 }
-            + self.authorization.account.map_or(1, |account| account.length())
-            + self.signature.length()
+        self.authorization.length() + self.signature.length()
     }
 }
 
@@ -1273,18 +1264,55 @@ mod tests {
                 chain_id: 1,
                 key_type: SignatureType::Secp256k1,
                 key_id: Address::ZERO,
-                expiry: Some(1000),
+                expiry: None,
                 limits: None,
                 allowed_calls: None,
                 witness: None,
                 is_admin: false,
                 account: None,
             },
-            signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
+            signature: PrimitiveSignature::Secp256k1(Signature::new(
+                U256::from(1u64),
+                U256::from(2u64),
+                false,
+            )),
         };
         let mut buf = Vec::new();
         signed.encode(&mut buf);
         assert_eq!(buf.len(), signed.length());
+
+        let expected = alloy::primitives::hex!(
+            "f85bd70180940000000000000000000000000000000000000000b841000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000021b"
+        );
+        assert_eq!(buf, expected, "nested signed authorization must match writer RLP");
+    }
+
+    #[test]
+    fn token_limit_period_uses_canonical_trailing_rlp() {
+        let one_time = TokenLimit {
+            token: Address::ZERO,
+            limit: U256::from(100u64),
+            period: 0,
+        };
+        let mut one_time_encoded = Vec::new();
+        one_time.encode(&mut one_time_encoded);
+        let mut one_time_expected = vec![0xd6, 0x94];
+        one_time_expected.extend_from_slice(Address::ZERO.as_slice());
+        one_time_expected.push(0x64);
+        assert_eq!(one_time_encoded, one_time_expected);
+        assert_eq!(one_time_encoded.len(), one_time.length());
+
+        let periodic = TokenLimit {
+            period: 60,
+            ..one_time
+        };
+        let mut periodic_encoded = Vec::new();
+        periodic.encode(&mut periodic_encoded);
+        let mut periodic_expected = vec![0xd7, 0x94];
+        periodic_expected.extend_from_slice(Address::ZERO.as_slice());
+        periodic_expected.extend_from_slice(&[0x64, 0x3c]);
+        assert_eq!(periodic_encoded, periodic_expected);
+        assert_eq!(periodic_encoded.len(), periodic.length());
     }
 
     #[test]
@@ -1615,9 +1643,9 @@ mod tests {
     }
 
     #[test]
-    fn signed_key_authorization_includes_allowed_calls_positionally() {
-        // signature is always trailing → both `limits` (None) and
-        // `allowed_calls` (Some(vec![])) must take slots before signature.
+    fn signed_key_authorization_nests_canonical_allowed_calls() {
+        // The nested authorization retains its own canonical trailing layout;
+        // the outer signature does not force absent authorization fields into it.
         let signed = SignedKeyAuthorization {
             authorization: KeyAuthorization {
                 chain_id: 1,

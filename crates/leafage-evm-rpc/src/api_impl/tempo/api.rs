@@ -8,7 +8,9 @@ use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::tempo::tx::TempoTxEnv;
 use leafage_evm_chains::tempo::TempoEvm;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
+use leafage_evm_types::{
+    BlockEnv, BlockInfo, CallRequest, TempoKeyAuthGasInfo, TempoPrimitiveSignatureInfo,
+};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
@@ -132,6 +134,104 @@ fn derive_scope_counts(
     }
 }
 
+fn parse_key_authorization_signature_type(
+    value: Option<&str>,
+) -> Result<leafage_evm_chains::tempo::fee_payer::SignatureType, String> {
+    use leafage_evm_chains::tempo::fee_payer::SignatureType;
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("secp256k1") => Ok(SignatureType::Secp256k1),
+        Some("p256") => Ok(SignatureType::P256),
+        Some("webauthn") => Ok(SignatureType::WebAuthn),
+        Some(value) => Err(format!("unsupported key authorization keyType: {value}")),
+        None => Err("full key authorization requires keyType".into()),
+    }
+}
+
+const fn tempo_sig_type_from_authorization(
+    value: leafage_evm_chains::tempo::fee_payer::SignatureType,
+) -> leafage_evm_chains::tempo::tx::TempoSigType {
+    use leafage_evm_chains::tempo::fee_payer::SignatureType;
+    use leafage_evm_chains::tempo::tx::TempoSigType;
+    match value {
+        SignatureType::Secp256k1 => TempoSigType::Secp256k1,
+        SignatureType::P256 => TempoSigType::P256,
+        SignatureType::WebAuthn => TempoSigType::WebAuthn,
+    }
+}
+
+/// Converts the official signed `keyAuthorization` RPC shape into the chains-layer
+/// transaction primitive. A signature-less object retains the original Leafage
+/// gas-only behavior and therefore returns `None`.
+fn parse_signed_key_authorization(
+    value: &TempoKeyAuthGasInfo,
+) -> Result<Option<leafage_evm_chains::tempo::fee_payer::SignedKeyAuthorization>, String> {
+    use leafage_evm_chains::tempo::fee_payer::{
+        KeyAuthorization, P256SignatureWithPreHash, PrimitiveSignature,
+        SignedKeyAuthorization, TokenLimit, WebAuthnSignature,
+    };
+
+    let Some(signature) = value.signature.clone() else {
+        return Ok(None);
+    };
+    let chain_id = value
+        .chain_id
+        .ok_or_else(|| "full key authorization requires chainId".to_string())?;
+    let key_id = value
+        .key_id
+        .ok_or_else(|| "full key authorization requires keyId".to_string())?;
+    if value.expiry == Some(0) {
+        return Err("key authorization expiry must be non-zero".into());
+    }
+
+    let signature = match signature {
+        TempoPrimitiveSignatureInfo::Secp256k1(signature) => {
+            PrimitiveSignature::Secp256k1(signature)
+        }
+        TempoPrimitiveSignatureInfo::P256(signature) => {
+            PrimitiveSignature::P256(P256SignatureWithPreHash {
+                r: signature.r,
+                s: signature.s,
+                pub_key_x: signature.pub_key_x,
+                pub_key_y: signature.pub_key_y,
+                pre_hash: signature.pre_hash,
+            })
+        }
+        TempoPrimitiveSignatureInfo::WebAuthn(signature) => {
+            PrimitiveSignature::WebAuthn(WebAuthnSignature {
+                r: signature.r,
+                s: signature.s,
+                pub_key_x: signature.pub_key_x,
+                pub_key_y: signature.pub_key_y,
+                webauthn_data: signature.webauthn_data,
+            })
+        }
+    };
+
+    Ok(Some(SignedKeyAuthorization {
+        authorization: KeyAuthorization {
+            chain_id,
+            key_type: parse_key_authorization_signature_type(value.sig_type.as_deref())?,
+            key_id,
+            expiry: value.expiry,
+            limits: value.limits.as_ref().map(|limits| {
+                limits
+                    .iter()
+                    .map(|limit| TokenLimit {
+                        token: limit.token,
+                        limit: limit.limit,
+                        period: limit.period,
+                    })
+                    .collect()
+            }),
+            allowed_calls: value.allowed_calls.clone(),
+            witness: value.witness,
+            is_admin: value.is_admin,
+            account: value.account,
+        },
+        signature,
+    }))
+}
+
 impl<DB> EvmExecutor for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
@@ -242,16 +342,36 @@ where
             // TIP-1011 `allowedCalls` list on the wire if present; otherwise
             // ScopeCounts::default() (has_allowed_calls = false) and the gas
             // formula's pre-T3 branch fires.
-            let key_auth = key_authorization.map(|ka| TempoKeyAuthGas {
-                sig_type: ka
-                    .sig_type
-                    .as_deref()
-                    .map(TempoSigType::from_str_lossy)
-                    .unwrap_or_default(),
-                num_limits: ka.num_limits,
-                scope_counts: derive_scope_counts(ka.allowed_calls.as_deref()),
-                has_witness: ka.witness.is_some(),
-            });
+            let key_auth = key_authorization
+                .map(|ka| {
+                    let signed_authorization = parse_signed_key_authorization(&ka)
+                        .map_err(invalid_params_rpc_err)?;
+                    let authorization_sig_type = signed_authorization
+                        .as_ref()
+                        .map(|authorization| {
+                            tempo_sig_type_from_authorization(
+                                authorization.signature.signature_type(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            ka.sig_type
+                                .as_deref()
+                                .map(TempoSigType::from_str_lossy)
+                                .unwrap_or_default()
+                        });
+                    Ok::<_, jsonrpsee::types::error::ErrorObject<'static>>(TempoKeyAuthGas {
+                        sig_type: authorization_sig_type,
+                        num_limits: ka
+                            .limits
+                            .as_ref()
+                            .map_or(ka.num_limits, |limits| limits.len() as u32),
+                        scope_counts: derive_scope_counts(ka.allowed_calls.as_deref()),
+                        has_witness: ka.witness.is_some(),
+                        is_admin: ka.is_admin,
+                        signed_authorization,
+                    })
+                })
+                .transpose()?;
 
             // Tempo authorization list: gas info + optional delegation fields.
             let auth_list = tempo_authorization_list

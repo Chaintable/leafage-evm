@@ -1,7 +1,8 @@
 mod call;
 pub use call::{
     CallRequest, CallScope, SelectorRule, TempoAuthGasInfo, TempoCallExtension,
-    TempoKeyAuthGasInfo,
+    TempoKeyAuthGasInfo, TempoP256SignatureInfo, TempoPrimitiveSignatureInfo,
+    TempoTokenLimitInfo, TempoWebAuthnSignatureInfo,
 };
 
 mod key;

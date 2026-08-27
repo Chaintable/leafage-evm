@@ -4,6 +4,8 @@ use revm::{
     primitives::{Address, Bytes, TxKind, B256, U256},
 };
 
+use crate::tempo::fee_payer::SignedKeyAuthorization;
+
 /// Non-zero replay context used by Tempo's official RPC simulation path.
 pub const RPC_SIMULATION_UNIQUE_TX_IDENTIFIER: B256 =
     B256::new(*b"TEMPO_RPC_SIMULATION_MPP_CONTEXT");
@@ -73,6 +75,11 @@ pub struct TempoKeyAuthGas {
     pub scope_counts: ScopeCounts,
     /// Whether the authorization carries a TIP-1053 witness, including zero.
     pub has_witness: bool,
+    /// Whether this is a T6 admin-key authorization.
+    pub is_admin: bool,
+    /// Complete signed authorization for same-transaction state mutation.
+    /// `None` preserves compatibility with the original gas-only RPC input.
+    pub signed_authorization: Option<SignedKeyAuthorization>,
 }
 
 /// Per-authorization gas info with optional EIP-7702 delegation data.

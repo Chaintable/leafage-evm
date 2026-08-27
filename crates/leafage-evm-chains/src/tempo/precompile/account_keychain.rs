@@ -806,7 +806,7 @@ impl AccountKeychain {
     }
 
     /// T3+ key authorization entry point, optionally carrying a T5 witness.
-    fn authorize_key_with_restrictions(
+    pub(crate) fn authorize_key_with_restrictions(
         &mut self,
         msg_sender: Address,
         key_id: Address,
@@ -941,11 +941,25 @@ impl AccountKeychain {
         msg_sender: Address,
         call: IAccountKeychain::authorizeAdminKeyCall,
     ) -> Result<()> {
-        let key_id = call.keyId;
+        self.authorize_admin_key_authorization(
+            msg_sender,
+            call.keyId,
+            call.signatureType,
+            Some(call.witness),
+        )
+    }
+
+    pub(crate) fn authorize_admin_key_authorization(
+        &mut self,
+        msg_sender: Address,
+        key_id: Address,
+        signature_type: IAccountKeychain::SignatureType,
+        witness: Option<B256>,
+    ) -> Result<()> {
         self.authorize_key_with_restrictions_internal(
             msg_sender,
             key_id,
-            call.signatureType,
+            signature_type,
             IAccountKeychain::KeyRestrictions {
                 expiry: u64::MAX,
                 enforceLimits: false,
@@ -953,7 +967,7 @@ impl AccountKeychain {
                 allowAnyCalls: true,
                 allowedCalls: Vec::new(),
             },
-            Some(call.witness),
+            witness,
             true,
         )?;
         self.emit_event(IAccountKeychain::AdminKeyAuthorized {
