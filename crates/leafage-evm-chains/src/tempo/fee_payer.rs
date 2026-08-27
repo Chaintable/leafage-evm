@@ -451,6 +451,30 @@ impl core::hash::Hash for KeychainSignature {
     }
 }
 
+impl KeychainSignature {
+    /// Creates a V2 keychain signature whose inner signature commits to the root account.
+    pub fn new(user_address: Address, signature: PrimitiveSignature) -> Self {
+        Self {
+            user_address,
+            signature,
+            version: KeychainVersion::V2,
+        }
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.version == KeychainVersion::V1
+    }
+
+    /// `keccak256(0x04 || hash || user_address)`.
+    pub fn signing_hash(hash: B256, user_address: Address) -> B256 {
+        let mut input = [0u8; 53];
+        input[0] = SIGNATURE_TYPE_KEYCHAIN_V2;
+        input[1..33].copy_from_slice(hash.as_slice());
+        input[33..].copy_from_slice(user_address.as_slice());
+        keccak256(input)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TempoSignature
 // ---------------------------------------------------------------------------
@@ -466,6 +490,45 @@ pub enum TempoSignature {
 }
 
 impl TempoSignature {
+    /// Parses a primitive or V1/V2 keychain signature from its transaction wire bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("Signature data is empty");
+        }
+
+        if data.len() != SECP256K1_SIGNATURE_LENGTH
+            && matches!(
+                data.first().copied(),
+                Some(SIGNATURE_TYPE_KEYCHAIN | SIGNATURE_TYPE_KEYCHAIN_V2)
+            )
+        {
+            if data.len() < 22 {
+                return Err("Invalid Keychain signature: too short for user_address");
+            }
+            let version = if data[0] == SIGNATURE_TYPE_KEYCHAIN {
+                KeychainVersion::V1
+            } else {
+                KeychainVersion::V2
+            };
+            let user_address = Address::from_slice(&data[1..21]);
+            let signature = PrimitiveSignature::from_bytes(&data[21..])?;
+            return Ok(Self::Keychain(KeychainSignature {
+                user_address,
+                signature,
+                version,
+            }));
+        }
+
+        PrimitiveSignature::from_bytes(data).map(Self::Primitive)
+    }
+
+    pub fn as_keychain(&self) -> Option<&KeychainSignature> {
+        match self {
+            Self::Keychain(signature) => Some(signature),
+            Self::Primitive(_) => None,
+        }
+    }
+
     /// Encode signature to bytes.
     ///
     /// Wire format:
@@ -530,7 +593,8 @@ pub use leafage_evm_types::{CallScope, SelectorRule};
 
 /// Key authorization for provisioning access keys.
 ///
-/// RLP encoding: `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?]`
+/// RLP encoding:
+/// `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?, is_admin?, account?]`
 /// Uses `#[rlp(trailing(canonical))]` semantics: trailing optionals are omitted
 /// when `None` (canonical) and any `None` preceding a `Some` is encoded as the
 /// empty bytestring `0x80` for positional correctness.
@@ -552,6 +616,12 @@ pub struct KeyAuthorization {
     /// TIP-1053 witness. Presence is significant, including `B256::ZERO`.
     #[serde(default)]
     pub witness: Option<B256>,
+    /// T6 admin-key marker. Encoded as integer `1` when set and omitted otherwise.
+    #[serde(default)]
+    pub is_admin: bool,
+    /// T6 target account binding, required for admin-signed authorizations.
+    #[serde(default)]
+    pub account: Option<Address>,
 }
 
 /// Manual RLP Encodable to match the writer's `#[rlp(trailing(canonical))]`
@@ -591,6 +661,19 @@ impl Encodable for KeyAuthorization {
                 None => out.put_u8(EMPTY_STRING_CODE),
             }
         }
+        if last_present >= 5 {
+            if self.is_admin {
+                1u64.encode(out);
+            } else {
+                out.put_u8(EMPTY_STRING_CODE);
+            }
+        }
+        if last_present >= 6 {
+            match self.account {
+                Some(account) => account.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
+            }
+        }
     }
 
     fn length(&self) -> usize {
@@ -601,10 +684,15 @@ impl Encodable for KeyAuthorization {
 
 impl KeyAuthorization {
     /// Returns the 1-indexed position of the latest `Some` trailing field
-    /// (1=expiry, 2=limits, 3=allowed_calls, 4=witness), or 0 if all are `None`. Used to
-    /// decide which preceding `None`s require positional 0x80 encoding.
+    /// (1=expiry, 2=limits, 3=allowed_calls, 4=witness, 5=is_admin, 6=account),
+    /// or 0 if all trailing fields are absent. Used to decide which preceding
+    /// fields require positional 0x80 encoding.
     fn last_trailing_present(&self) -> u8 {
-        if self.witness.is_some() {
+        if self.account.is_some() {
+            6
+        } else if self.is_admin {
+            5
+        } else if self.witness.is_some() {
             4
         } else if self.allowed_calls.is_some() {
             3
@@ -634,6 +722,12 @@ impl KeyAuthorization {
         if last_present >= 4 {
             len += self.witness.map_or(1, |w| w.length());
         }
+        if last_present >= 5 {
+            len += if self.is_admin { 1u64.length() } else { 1 };
+        }
+        if last_present >= 6 {
+            len += self.account.map_or(1, |account| account.length());
+        }
         len
     }
 }
@@ -644,7 +738,8 @@ impl KeyAuthorization {
 
 /// Signed key authorization (key authorization + root key signature).
 ///
-/// RLP: `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?, signature]`
+/// RLP:
+/// `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?, is_admin?, account?, signature]`
 /// The `#[rlp(trailing)]` in the writer means `signature` is trailing after
 /// KeyAuthorization's own trailing fields. We match this exactly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -685,6 +780,16 @@ impl Encodable for SignedKeyAuthorization {
         } else {
             out.put_u8(EMPTY_STRING_CODE);
         }
+        if self.authorization.is_admin {
+            1u64.encode(out);
+        } else {
+            out.put_u8(EMPTY_STRING_CODE);
+        }
+        if let Some(account) = self.authorization.account {
+            account.encode(out);
+        } else {
+            out.put_u8(EMPTY_STRING_CODE);
+        }
         self.signature.encode(out);
     }
 
@@ -703,6 +808,8 @@ impl SignedKeyAuthorization {
             + self.authorization.limits.as_ref().map_or(1, |l| l.length())
             + self.authorization.allowed_calls.as_ref().map_or(1, |s| s.length())
             + self.authorization.witness.map_or(1, |w| w.length())
+            + if self.authorization.is_admin { 1u64.length() } else { 1 }
+            + self.authorization.account.map_or(1, |account| account.length())
             + self.signature.length()
     }
 }
@@ -1170,6 +1277,8 @@ mod tests {
                 limits: None,
                 allowed_calls: None,
                 witness: None,
+                is_admin: false,
+                account: None,
             },
             signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
         };
@@ -1189,6 +1298,8 @@ mod tests {
             limits: None,
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf1 = Vec::new();
         auth1.encode(&mut buf1);
@@ -1202,6 +1313,8 @@ mod tests {
             limits: None,
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf2 = Vec::new();
         auth2.encode(&mut buf2);
@@ -1219,6 +1332,8 @@ mod tests {
             }]),
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf3 = Vec::new();
         auth3.encode(&mut buf3);
@@ -1253,6 +1368,8 @@ mod tests {
             limits: None,
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut base_buf = Vec::new();
         base.encode(&mut base_buf);
@@ -1286,6 +1403,8 @@ mod tests {
             limits: None,
             allowed_calls: Some(Vec::new()),
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf = Vec::new();
         deny_all.encode(&mut buf);
@@ -1310,6 +1429,8 @@ mod tests {
             limits: Some(Vec::new()),
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf = Vec::new();
         auth.encode(&mut buf);
@@ -1343,6 +1464,8 @@ mod tests {
             limits: None,
             allowed_calls: Some(Vec::new()),
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf = Vec::new();
         auth.encode(&mut buf);
@@ -1371,6 +1494,8 @@ mod tests {
             limits: None,
             allowed_calls: None,
             witness: Some(witness),
+            is_admin: false,
+            account: None,
         };
         let mut buf = Vec::new();
         auth.encode(&mut buf);
@@ -1392,6 +1517,67 @@ mod tests {
     }
 
     #[test]
+    fn key_authorization_t6_admin_fields_are_positionally_encoded() {
+        let account = Address::repeat_byte(0x11);
+        let admin = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: true,
+            account: Some(account),
+        };
+        let mut encoded = Vec::new();
+        admin.encode(&mut encoded);
+
+        let mut expected = vec![0xf1, 0x01, 0x80, 0x94];
+        expected.extend_from_slice(Address::ZERO.as_slice());
+        expected.extend_from_slice(&[
+            0x80, // expiry
+            0x80, // limits
+            0x80, // allowed_calls
+            0x80, // witness
+            0x01, // is_admin
+            0x94, // account address header
+        ]);
+        expected.extend_from_slice(account.as_slice());
+
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.len(), admin.length());
+    }
+
+    #[test]
+    fn key_authorization_t6_account_keeps_empty_admin_marker() {
+        let account_bound = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: Some(Address::repeat_byte(0x22)),
+        };
+        let unbound = KeyAuthorization {
+            account: None,
+            ..account_bound.clone()
+        };
+
+        let mut encoded = Vec::new();
+        account_bound.encode(&mut encoded);
+        assert_eq!(encoded[28], 0x80, "is_admin must retain its empty slot");
+
+        let mut unbound_encoded = Vec::new();
+        unbound.encode(&mut unbound_encoded);
+        assert_ne!(encoded, unbound_encoded);
+        assert_ne!(keccak256(encoded), keccak256(unbound_encoded));
+    }
+
+    #[test]
     fn key_authorization_deny_all_rlp_byte_fixture() {
         // Pins the exact wire bytes for the deny-all envelope so the manual
         // RLP impl can't drift away from writer's `#[derive(Encodable)]`
@@ -1406,6 +1592,8 @@ mod tests {
             limits: None,                       // positional placeholder 0x80
             allowed_calls: Some(Vec::new()),    // empty list 0xc0
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf = Vec::new();
         deny_all.encode(&mut buf);
@@ -1439,6 +1627,8 @@ mod tests {
                 limits: None,
                 allowed_calls: Some(Vec::new()),
                 witness: None,
+                is_admin: false,
+                account: None,
             },
             signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
         };

@@ -20,9 +20,10 @@ use alloy::sol_types::{SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
+use super::account_keychain::AccountKeychain;
 use super::storage::{ContractStorage, StorageCtx};
 use super::{dispatch_call, input_cost, unknown_selector, view, Precompile, SIGNATURE_VERIFIER_ADDRESS};
-use crate::tempo::fee_payer::PrimitiveSignature;
+use crate::tempo::fee_payer::{KeychainSignature, PrimitiveSignature, TempoSignature};
 
 // ===========================================================================
 // Gas constants
@@ -52,6 +53,10 @@ alloy::sol! {
 
         /// Verifies a signer against a Tempo signature.
         function verify(address signer, bytes32 hash, bytes calldata signature) external view returns (bool);
+
+        function verifyKeychain(address account, bytes32 hash, bytes calldata signature) external view returns (bool);
+
+        function verifyKeychainAdmin(address account, bytes32 hash, bytes calldata signature) external view returns (bool);
 
         error InvalidFormat();
         error InvalidSignature();
@@ -108,6 +113,54 @@ impl SignatureVerifier {
         let recovered = self.recover(hash, signature)?;
         Ok(recovered == signer)
     }
+
+    pub fn verify_keychain(
+        &mut self,
+        account: Address,
+        hash: B256,
+        signature: Bytes,
+    ) -> Result<bool> {
+        let (embedded_account, key_id) = self.recover_keychain_key(hash, signature)?;
+        if embedded_account != account {
+            return Ok(false);
+        }
+        AccountKeychain::new().is_active_key(account, key_id)
+    }
+
+    pub fn verify_keychain_admin(
+        &mut self,
+        account: Address,
+        hash: B256,
+        signature: Bytes,
+    ) -> Result<bool> {
+        let (embedded_account, key_id) = self.recover_keychain_key(hash, signature)?;
+        if embedded_account != account {
+            return Ok(false);
+        }
+        AccountKeychain::new().is_admin_key(account, key_id)
+    }
+
+    fn recover_keychain_key(&mut self, hash: B256, signature: Bytes) -> Result<(Address, Address)> {
+        let signature = TempoSignature::from_bytes(&signature).map_err(|_| {
+            TempoPrecompileError::Revert(
+                ISignatureVerifier::InvalidFormat {}.abi_encode().into(),
+            )
+        })?;
+        let keychain = signature.as_keychain().ok_or_else(|| {
+            TempoPrecompileError::Revert(
+                ISignatureVerifier::InvalidFormat {}.abi_encode().into(),
+            )
+        })?;
+        if keychain.is_legacy() {
+            return Err(TempoPrecompileError::Revert(
+                ISignatureVerifier::InvalidFormat {}.abi_encode().into(),
+            ));
+        }
+
+        let signing_hash = KeychainSignature::signing_hash(hash, keychain.user_address);
+        let key_id = self.recover(signing_hash, keychain.signature.to_bytes())?;
+        Ok((keychain.user_address, key_id))
+    }
 }
 
 impl ContractStorage for SignatureVerifier {
@@ -150,8 +203,16 @@ impl Precompile for SignatureVerifier {
             .map_err(|_| PrecompileError::OutOfGas)?;
 
         if calldata.len() > MAX_CALLDATA_LEN {
-            return Err(PrecompileError::other("calldata exceeds MAX_CALLDATA_LEN"));
+            return Ok(revm::precompile::PrecompileOutput::new_reverted(
+                self.storage.gas_used(),
+                ISignatureVerifier::InvalidFormat {}.abi_encode().into(),
+            ));
         }
+
+        let selector = calldata
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .unwrap_or([0; 4]);
 
         dispatch_call(
             calldata,
@@ -168,6 +229,18 @@ impl Precompile for SignatureVerifier {
                 ISignatureVerifier::ISignatureVerifierCalls::verify(c) => {
                     view(c, |c| self.verify(c.signer, c.hash, c.signature))
                 }
+                ISignatureVerifier::ISignatureVerifierCalls::verifyKeychain(c) => {
+                    if !self.storage.spec().is_t6() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    view(c, |c| self.verify_keychain(c.account, c.hash, c.signature))
+                }
+                ISignatureVerifier::ISignatureVerifierCalls::verifyKeychainAdmin(c) => {
+                    if !self.storage.spec().is_t6() {
+                        return unknown_selector(selector, self.storage.gas_used());
+                    }
+                    view(c, |c| self.verify_keychain_admin(c.account, c.hash, c.signature))
+                }
             },
         )
     }
@@ -176,9 +249,12 @@ impl Precompile for SignatureVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tempo::fee_payer::P256SignatureWithPreHash;
+    use crate::tempo::fee_payer::{KeychainVersion, P256SignatureWithPreHash};
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::account_keychain::AuthorizedKey;
     use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+    use crate::tempo::precompile::storage_types::Handler;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::primitives::Signature;
     use alloy::sol_types::SolCall;
     use revm::database::EmptyDB;
@@ -234,8 +310,104 @@ mod tests {
             SignatureVerifier::new().call(&calldata, Address::ZERO)
         });
 
-        // Returns Err(PrecompileError::Other) at the size guard.
-        assert!(result.is_err());
+        let output = result.expect("oversized call returns an ABI revert");
+        assert!(output.reverted);
+        assert_eq!(&output.bytes[..4], &ISignatureVerifier::InvalidFormat::SELECTOR);
+    }
+
+    #[test]
+    fn keychain_selectors_are_gated_at_t6() {
+        let call = ISignatureVerifier::verifyKeychainCall {
+            account: Address::repeat_byte(1),
+            hash: B256::ZERO,
+            signature: Bytes::new(),
+        };
+        let result = run_with_spec(TempoHardfork::T5, || {
+            SignatureVerifier::new().call(&call.abi_encode(), Address::ZERO)
+        })
+        .unwrap();
+        assert!(result.reverted);
+        assert_eq!(result.bytes.as_ref(), ISignatureVerifier::verifyKeychainCall::SELECTOR);
+    }
+
+    #[test]
+    fn t6_verifies_active_and_admin_keychain_signatures() {
+        use p256::ecdsa::{
+            signature::hazmat::PrehashSigner, Signature as P256Signature, SigningKey,
+        };
+        use p256::elliptic_curve::rand_core::OsRng;
+
+        let account = Address::repeat_byte(0x61);
+        let hash = B256::repeat_byte(0x62);
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let encoded = verifying_key.to_encoded_point(false);
+        let pub_key_x = B256::from_slice(encoded.x().unwrap());
+        let pub_key_y = B256::from_slice(encoded.y().unwrap());
+        let signing_hash = KeychainSignature::signing_hash(hash, account);
+        let signature: P256Signature = signing_key
+            .sign_prehash(signing_hash.as_slice())
+            .unwrap();
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let primitive = PrimitiveSignature::P256(P256SignatureWithPreHash {
+            r: B256::from_slice(&signature.r().to_bytes()),
+            s: B256::from_slice(&signature.s().to_bytes()),
+            pub_key_x,
+            pub_key_y,
+            pre_hash: false,
+        });
+        let key_id = primitive.recover_signer(&signing_hash).unwrap();
+        let encoded_signature = TempoSignature::Keychain(KeychainSignature::new(
+            account,
+            primitive.clone(),
+        ))
+        .to_bytes();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let mut keychain = AccountKeychain::new();
+            keychain.keys[account][key_id].write(AuthorizedKey {
+                signature_type: 1,
+                expiry: u64::MAX,
+                enforce_limits: false,
+                is_revoked: false,
+                is_admin: false,
+            })?;
+
+            let mut verifier = SignatureVerifier::new();
+            assert!(verifier.verify_keychain(account, hash, encoded_signature.clone())?);
+            assert!(!verifier.verify_keychain_admin(
+                account,
+                hash,
+                encoded_signature.clone()
+            )?);
+            assert!(!verifier.verify_keychain(
+                Address::repeat_byte(0x63),
+                hash,
+                encoded_signature.clone()
+            )?);
+
+            let existing_key = keychain.keys[account][key_id].read()?;
+            keychain.keys[account][key_id].write(AuthorizedKey {
+                is_admin: true,
+                ..existing_key
+            })?;
+            assert!(verifier.verify_keychain_admin(
+                account,
+                hash,
+                encoded_signature.clone()
+            )?);
+
+            let legacy = TempoSignature::Keychain(crate::tempo::fee_payer::KeychainSignature {
+                user_address: account,
+                signature: primitive,
+                version: KeychainVersion::V1,
+            })
+            .to_bytes();
+            assert!(verifier.verify_keychain(account, hash, legacy).is_err());
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
