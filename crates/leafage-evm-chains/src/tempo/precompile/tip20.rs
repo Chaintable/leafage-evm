@@ -35,22 +35,22 @@
 //! | 16   | opted_in_supply          | u128                                    |
 //! | 17   | user_reward_info         | Mapping<Address, UserRewardInfo>        |
 
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
 use revm::precompile::{PrecompileError, PrecompileResult};
 use std::sync::LazyLock;
 
 use super::error::{Result, TempoPrecompileError};
 use super::receive_policy_guard::{
-    address_reserved, IReceivePolicyGuard, ReceivePolicyGuard, RecoveryMode,
+    IReceivePolicyGuard, ReceivePolicyGuard, RecoveryMode, address_reserved,
 };
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
 use super::storage_types::{
     BytesLikeHandler, FromWord, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
 };
 use super::{
-    dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view, Precompile,
-    RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+    Precompile, RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+    dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view,
 };
 use crate::tempo::address::TempoAddressExt;
 
@@ -274,7 +274,7 @@ alloy::sol! {
 ///   - slot+0: reward_recipient (Address, 20 bytes at offset 0)
 ///   - slot+1: reward_per_token (U256, 32 bytes)
 ///   - slot+2: reward_balance (U256, 32 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRewardInfo {
     pub reward_recipient: Address,
     pub reward_per_token: U256,
@@ -1791,6 +1791,10 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::distributeRewardCall,
     ) -> Result<()> {
+        if self.storage.spec().is_t7() {
+            return Ok(());
+        }
+
         self.check_not_paused()?;
         let token_address = self.address;
 
@@ -1837,6 +1841,10 @@ impl TIP20Token {
 
     /// Updates and accumulates accrued rewards for a specific token holder.
     pub fn update_rewards(&mut self, holder: Address) -> Result<Address> {
+        if self.storage.spec().is_t8() {
+            return Ok(Address::ZERO);
+        }
+
         let mut info = self.user_reward_info[holder].read()?;
         let cached_delegate = info.reward_recipient;
 
@@ -1886,6 +1894,10 @@ impl TIP20Token {
         msg_sender: Address,
         call: ITIP20::setRewardRecipientCall,
     ) -> Result<()> {
+        if self.storage.spec().is_t7() {
+            return Ok(());
+        }
+
         self.check_not_paused()?;
         // TIP-1022 (T3+): reward recipients cannot be virtual addresses. They are
         // accumulators that must be claimed; routing to a virtual recipient would
@@ -1940,7 +1952,7 @@ impl TIP20Token {
         self.check_not_paused()?;
         self.ensure_transfer_authorized(self.address, msg_sender)?;
 
-        self.update_rewards(msg_sender)?;
+        let reward_recipient = self.update_rewards(msg_sender)?;
 
         let mut info = self.user_reward_info[msg_sender].read()?;
         let amount = info.reward_balance;
@@ -1948,7 +1960,6 @@ impl TIP20Token {
         let contract_balance = self.get_balance(contract_address)?;
         let max_amount = amount.min(contract_balance);
 
-        let reward_recipient = info.reward_recipient;
         info.reward_balance = amount
             .checked_sub(max_amount)
             .ok_or_else(|| TempoPrecompileError::Fatal("underflow in claim_rewards".to_string()))?;
@@ -2077,6 +2088,12 @@ impl TIP20Token {
         let info = self.user_reward_info[account].read()?;
 
         let mut pending = info.reward_balance;
+
+        if self.storage.spec().is_t8() {
+            return pending.try_into().map_err(|_| {
+                TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string())
+            });
+        }
 
         if info.reward_recipient == account {
             let holder_balance = self.get_balance(account)?;
@@ -2330,8 +2347,8 @@ impl Precompile for TIP20Token {
 mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
-    use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::PATH_USD_ADDRESS;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::sol_types::SolCall;
 
     #[test]
@@ -2352,16 +2369,20 @@ mod tests {
         ] {
             assert!(TIP20Token::validate_logo_uri(uri).is_err(), "{uri}");
         }
-        assert!(TIP20Token::validate_logo_uri(&format!(
-            "https:{}",
-            "a".repeat(TIP20Token::MAX_LOGO_URI_BYTES - 6)
-        ))
-        .is_ok());
-        assert!(TIP20Token::validate_logo_uri(&format!(
-            "https:{}",
-            "a".repeat(TIP20Token::MAX_LOGO_URI_BYTES - 5)
-        ))
-        .is_err());
+        assert!(
+            TIP20Token::validate_logo_uri(&format!(
+                "https:{}",
+                "a".repeat(TIP20Token::MAX_LOGO_URI_BYTES - 6)
+            ))
+            .is_ok()
+        );
+        assert!(
+            TIP20Token::validate_logo_uri(&format!(
+                "https:{}",
+                "a".repeat(TIP20Token::MAX_LOGO_URI_BYTES - 5)
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2461,6 +2482,96 @@ mod tests {
             token.system_transfer_from(unlisted, payer, U256::from(3))?;
             assert_eq!(token.get_balance(payer)?, U256::from(7));
             assert_eq!(token.get_balance(unlisted)?, U256::from(3));
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_reward_configuration_becomes_noop_at_t7() {
+        let holder = Address::repeat_byte(0x66);
+        let recipient = Address::repeat_byte(0x67);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.paused.write(true)?;
+            assert!(
+                token
+                    .distribute_reward(holder, ITIP20::distributeRewardCall { amount: U256::ONE })
+                    .is_err()
+            );
+            assert!(
+                token
+                    .set_reward_recipient(holder, ITIP20::setRewardRecipientCall { recipient })
+                    .is_err()
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        provider.set_spec(TempoHardfork::T7);
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.distribute_reward(holder, ITIP20::distributeRewardCall { amount: U256::ONE })?;
+            token.set_reward_recipient(holder, ITIP20::setRewardRecipientCall { recipient })?;
+            assert_eq!(
+                token.get_user_reward_info(holder)?,
+                UserRewardInfo::default()
+            );
+            assert_eq!(token.get_global_reward_per_token()?, U256::ZERO);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t8_rewards_expose_and_claim_only_settled_balance() {
+        let holder = Address::repeat_byte(0x71);
+        let settled = U256::from(30u64);
+        let holder_balance = U256::from(100u64);
+        let contract_balance = U256::from(50u64);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.transfer_policy_id.write(1)?;
+            token.set_balance(holder, holder_balance)?;
+            token.set_balance(token.address, contract_balance)?;
+            token.global_reward_per_token.write(ACC_PRECISION)?;
+            token.opted_in_supply.write(holder_balance.to::<u128>())?;
+            token.user_reward_info[holder].write(UserRewardInfo {
+                reward_recipient: holder,
+                reward_per_token: U256::ZERO,
+                reward_balance: settled,
+            })?;
+            assert_eq!(token.get_pending_rewards(holder)?, 130);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        provider.set_spec(TempoHardfork::T8);
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            assert_eq!(token.get_pending_rewards(holder)?, settled.to::<u128>());
+            assert_eq!(token.update_rewards(holder)?, Address::ZERO);
+            assert_eq!(
+                token.get_user_reward_info(holder)?,
+                UserRewardInfo {
+                    reward_recipient: holder,
+                    reward_per_token: U256::ZERO,
+                    reward_balance: settled,
+                }
+            );
+
+            assert_eq!(token.claim_rewards(holder)?, settled);
+            assert_eq!(token.get_balance(holder)?, holder_balance + settled);
+            assert_eq!(
+                token.get_balance(token.address)?,
+                contract_balance - settled
+            );
+            assert_eq!(token.get_opted_in_supply()?, holder_balance.to::<u128>());
+            assert_eq!(token.get_pending_rewards(holder)?, 0);
             Result::<()>::Ok(())
         })
         .unwrap();

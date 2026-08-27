@@ -18,7 +18,7 @@
 //! |  6   | pending_fee_swap_reservation   | Mapping<B256, u128> (transient)             |
 //! |  7   | two_hop_intermediate           | Address (transient, T5+)                    |
 
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
@@ -27,9 +27,10 @@ use super::storage::StorageOps;
 use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::tip20::TIP20Token;
+use super::tip403_registry::AuthRole;
 use super::{
-    dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile, DEFAULT_FEE_TOKEN,
-    TIP_FEE_MANAGER_ADDRESS,
+    DEFAULT_FEE_TOKEN, Precompile, TIP_FEE_MANAGER_ADDRESS, dispatch_call, input_cost, metadata,
+    mutate, mutate_void, view,
 };
 
 // ===========================================================================
@@ -622,6 +623,17 @@ impl TipFeeManager {
         validate_usd_currency(user_token)?;
         validate_usd_currency(validator_token)?;
 
+        let user_tip20 = TIP20Token::from_address(user_token)?;
+        let validator_tip20 = TIP20Token::from_address(validator_token)?;
+        if self.storage.spec().is_t8() {
+            user_tip20.ensure_authorized_as(&[
+                (msg_sender, AuthRole::sender()),
+                (self.address, AuthRole::recipient()),
+                (to, AuthRole::recipient()),
+            ])?;
+            validator_tip20.ensure_authorized_as(&[(to, AuthRole::recipient())])?;
+        }
+
         let pool_id = self.pool_id(user_token, validator_token);
         let mut pool = self.pools[pool_id].read()?;
         let mut total_supply_val = self.total_supply[pool_id].read()?;
@@ -752,6 +764,13 @@ impl TipFeeManager {
 
         validate_usd_currency(user_token)?;
         validate_usd_currency(validator_token)?;
+
+        let user_tip20 = TIP20Token::from_address(user_token)?;
+        let validator_tip20 = TIP20Token::from_address(validator_token)?;
+        if self.storage.spec().is_t8() {
+            user_tip20.ensure_authorized_as(&[(msg_sender, AuthRole::sender())])?;
+            validator_tip20.ensure_authorized_as(&[(msg_sender, AuthRole::sender())])?;
+        }
 
         let pool_id = self.pool_id(user_token, validator_token);
         let balance = self.liquidity_balances[pool_id][msg_sender].read()?;
@@ -1053,6 +1072,7 @@ mod tests {
     use crate::tempo::precompile::storage_credits::StorageCredits;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
+    use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
 
     fn initialize_issuer_token(
         token: Address,
@@ -1083,6 +1103,120 @@ mod tests {
                 amount,
             },
         )
+    }
+
+    fn set_whitelist_policy(
+        registry: &mut TIP403Registry,
+        token: Address,
+        admin: Address,
+        accounts: &[Address],
+    ) -> Result<()> {
+        let policy_id = registry.create_policy(
+            admin,
+            ITIP403Registry::createPolicyCall {
+                admin,
+                policyType: ITIP403Registry::PolicyType::WHITELIST,
+            },
+        )?;
+        for account in accounts {
+            registry.modify_policy_whitelist(
+                admin,
+                ITIP403Registry::modifyPolicyWhitelistCall {
+                    policyId: policy_id,
+                    account: *account,
+                    allowed: true,
+                },
+            )?;
+        }
+        TIP20Token::from_address_unchecked(token).change_transfer_policy_id(
+            admin,
+            ITIP20::changeTransferPolicyIdCall {
+                newPolicyId: policy_id,
+            },
+        )
+    }
+
+    #[test]
+    fn fee_amm_mint_lp_policy_checks_activate_at_t8() {
+        let admin = Address::repeat_byte(0xc1);
+        let lp = Address::repeat_byte(0xc2);
+        let recipient = Address::repeat_byte(0xc3);
+        let user_token = address!("0x20c00000000000000000000000000000000000c4");
+        let validator_token = address!("0x20c00000000000000000000000000000000000c5");
+        let deposit = U256::from(10_000u64);
+
+        for hardfork in [TempoHardfork::T7, TempoHardfork::T8] {
+            let mut provider = TestStorageProvider::new(hardfork);
+            StorageCtx::enter(&mut provider, || {
+                initialize_issuer_token(user_token, admin, admin, U256::ZERO)?;
+                initialize_issuer_token(validator_token, admin, lp, deposit)?;
+                let mut registry = TIP403Registry::new();
+                registry.initialize()?;
+                set_whitelist_policy(&mut registry, user_token, admin, &[])?;
+
+                let result =
+                    TipFeeManager::new().mint(lp, user_token, validator_token, deposit, recipient);
+                if hardfork.is_t8() {
+                    assert_eq!(
+                        result.unwrap_err().selector(),
+                        ITIP20::PolicyForbids::SELECTOR
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn fee_amm_burn_checks_lp_sender_policy_from_t8() {
+        let admin = Address::repeat_byte(0xd1);
+        let lp = Address::repeat_byte(0xd2);
+        let recipient = Address::repeat_byte(0xd3);
+        let user_token = address!("0x20c00000000000000000000000000000000000d4");
+        let validator_token = address!("0x20c00000000000000000000000000000000000d5");
+        let deposit = U256::from(10_000u64);
+
+        for hardfork in [TempoHardfork::T7, TempoHardfork::T8] {
+            let mut provider = TestStorageProvider::new(hardfork);
+            StorageCtx::enter(&mut provider, || {
+                initialize_issuer_token(user_token, admin, admin, U256::ZERO)?;
+                initialize_issuer_token(validator_token, admin, lp, deposit)?;
+                let liquidity =
+                    TipFeeManager::new().mint(lp, user_token, validator_token, deposit, lp)?;
+
+                let mut registry = TIP403Registry::new();
+                registry.initialize()?;
+                for token in [user_token, validator_token] {
+                    set_whitelist_policy(
+                        &mut registry,
+                        token,
+                        admin,
+                        &[TIP_FEE_MANAGER_ADDRESS, recipient],
+                    )?;
+                }
+
+                let result = TipFeeManager::new().burn(
+                    lp,
+                    user_token,
+                    validator_token,
+                    liquidity / U256::from(2),
+                    recipient,
+                );
+                if hardfork.is_t8() {
+                    assert_eq!(
+                        result.unwrap_err().selector(),
+                        ITIP20::PolicyForbids::SELECTOR
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
     }
 
     #[test]
@@ -1179,10 +1313,7 @@ mod tests {
                 reserve_user_token: 0,
                 reserve_validator_token: second_output.to::<u128>(),
             })?;
-            assert_eq!(
-                manager.plan_fee_route(user, validator, max_amount)?,
-                None,
-            );
+            assert_eq!(manager.plan_fee_route(user, validator, max_amount)?, None,);
             Result::<()>::Ok(())
         })
         .unwrap();

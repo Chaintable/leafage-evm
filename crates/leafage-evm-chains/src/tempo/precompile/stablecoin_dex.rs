@@ -27,24 +27,28 @@
 //! Token transfers (transfer, transfer_from) delegate to TIP20 system_transfer_from.
 //! View methods (balance_of, get_order, quote_swap_*) work correctly against on-chain state.
 
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::{SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    ops::{Deref, Index, IndexMut},
+};
 
 use super::error::{Result, TempoPrecompileError};
 use super::fee_manager::validate_usd_currency;
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
-use super::storage_types::{
-    Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType, VecHandler,
-};
 use super::storage_credits::{StorageCreditDeltas, StorageCredits};
-use super::tip20::{is_tip20_prefix, TIP20Token};
+use super::storage_types::{
+    Handler, HandlerCache, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType, StorageKey,
+    VecHandler, packing,
+};
+use super::tip20::{TIP20Token, is_tip20_prefix};
 use super::tip20_factory::TIP20Factory;
-use super::tip403_registry::{is_policy_lookup_error, AuthRole, TIP403Registry};
+use super::tip403_registry::{AuthRole, TIP403Registry, is_policy_lookup_error};
 use super::{
-    dispatch_call, input_cost, mutate, mutate_void, unknown_selector, view, Precompile,
-    PATH_USD_ADDRESS, STABLECOIN_DEX_ADDRESS,
+    PATH_USD_ADDRESS, Precompile, STABLECOIN_DEX_ADDRESS, dispatch_call, input_cost, mutate,
+    mutate_void, unknown_selector, view,
 };
 
 // ===========================================================================
@@ -92,6 +96,9 @@ alloy::sol! {
         function swapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut, uint128 maxAmountIn) external returns (uint128);
         function quoteSwapExactAmountIn(address tokenIn, address tokenOut, uint128 amountIn) external view returns (uint128);
         function quoteSwapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut) external view returns (uint128);
+        function bookIndexForKey(bytes32 bookKey) external view returns (bool set, uint32 index);
+        function bookKeyForIndex(uint32 index) external view returns (bytes32 bookKey);
+        function setBookIndex(uint32 index) external;
 
         function MIN_TICK() external view returns (int16);
         function MAX_TICK() external view returns (int16);
@@ -154,6 +161,7 @@ alloy::sol! {
         error InvalidFlipTick();
         error BelowMinimumOrderSize(uint128 amount);
         error OrderNotStale();
+        error IndexAlreadySet();
     }
 }
 
@@ -227,6 +235,10 @@ fn err_identical_tokens() -> TempoPrecompileError {
 
 fn err_order_not_stale() -> TempoPrecompileError {
     TempoPrecompileError::Revert(IStablecoinDEX::OrderNotStale {}.abi_encode().into())
+}
+
+fn err_index_already_set() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(IStablecoinDEX::IndexAlreadySet {}.abi_encode().into())
 }
 
 // ===========================================================================
@@ -371,7 +383,7 @@ impl Storable for TickLevel {
 // ===========================================================================
 
 /// An order in the CLOB.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Order {
     order_id: u128,
     maker: Address,
@@ -632,6 +644,498 @@ impl Storable for Order {
     }
 }
 
+/// Physical storage layout used by a DEX order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum OrderVersion {
+    Legacy = 0,
+    V1 = 1,
+    V2 = 2,
+}
+
+impl TryFrom<U256> for OrderVersion {
+    type Error = TempoPrecompileError;
+
+    fn try_from(slot0: U256) -> Result<Self> {
+        match packing::extract_from_word::<u8>(slot0, 31, 1)? {
+            0 => Ok(Self::Legacy),
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            version => Err(TempoPrecompileError::Fatal(format!(
+                "unknown stablecoin DEX order storage version {version}"
+            ))),
+        }
+    }
+}
+
+struct OrderFlags;
+
+impl OrderFlags {
+    const IS_BID: u8 = 1;
+    const IS_FLIP: u8 = 1 << 1;
+
+    fn pack(order: &Order) -> u8 {
+        u8::from(order.is_bid) * Self::IS_BID | u8::from(order.is_flip) * Self::IS_FLIP
+    }
+
+    fn is_bid(metadata: u8) -> bool {
+        metadata & Self::IS_BID != 0
+    }
+
+    fn is_flip(metadata: u8) -> bool {
+        metadata & Self::IS_FLIP != 0
+    }
+}
+
+const LEGACY_MAKER_LOC: packing::FieldLocation = packing::FieldLocation::new(1, 0, 20);
+const LEGACY_REMAINING_LOC: packing::FieldLocation = packing::FieldLocation::new(4, 0, 16);
+const LEGACY_PREV_LOC: packing::FieldLocation = packing::FieldLocation::new(4, 16, 16);
+const LEGACY_NEXT_LOC: packing::FieldLocation = packing::FieldLocation::new(5, 0, 16);
+const COMPACT_MAKER_LOC: packing::FieldLocation = packing::FieldLocation::new(0, 0, 20);
+const COMPACT_REMAINING_LOC: packing::FieldLocation = packing::FieldLocation::new(1, 16, 16);
+const COMPACT_PREV_LOC: packing::FieldLocation = packing::FieldLocation::new(2, 0, 16);
+const COMPACT_NEXT_LOC: packing::FieldLocation = packing::FieldLocation::new(2, 16, 16);
+
+fn pack_field<T: super::storage_types::FromWord + StorableType>(
+    word: U256,
+    value: &T,
+    offset: usize,
+) -> Result<U256> {
+    packing::insert_into_word(word, value, offset, T::BYTES)
+}
+
+fn unpack_field<T: super::storage_types::FromWord + StorableType>(
+    word: U256,
+    offset: usize,
+) -> Result<T> {
+    packing::extract_from_word(word, offset, T::BYTES)
+}
+
+/// T8 TIP-1062 compact layout. The order ID is recovered from the mapping key.
+#[derive(Debug, Clone)]
+struct V1Order {
+    maker: Address,
+    metadata: u8,
+    tick: i16,
+    flip_tick: i16,
+    amount: u128,
+    remaining: u128,
+    prev: u128,
+    next: u128,
+    book_key: B256,
+}
+
+impl V1Order {
+    const SLOTS: usize = 4;
+
+    fn from_order(order: Order) -> Self {
+        Self {
+            maker: order.maker,
+            metadata: OrderFlags::pack(&order),
+            tick: order.tick,
+            flip_tick: order.flip_tick,
+            amount: order.amount,
+            remaining: order.remaining,
+            prev: order.prev,
+            next: order.next,
+            book_key: order.book_key,
+        }
+    }
+
+    fn into_order(self, order_id: u128) -> Order {
+        Order {
+            order_id,
+            maker: self.maker,
+            book_key: self.book_key,
+            is_bid: OrderFlags::is_bid(self.metadata),
+            tick: self.tick,
+            amount: self.amount,
+            remaining: self.remaining,
+            prev: self.prev,
+            next: self.next,
+            is_flip: OrderFlags::is_flip(self.metadata),
+            flip_tick: self.flip_tick,
+        }
+    }
+
+    fn load<S: StorageOps>(storage: &S, slot: U256) -> Result<Self> {
+        let word0 = storage.load(slot)?;
+        let word1 = storage.load(slot + U256::from(1))?;
+        let word2 = storage.load(slot + U256::from(2))?;
+        let word3 = storage.load(slot + U256::from(3))?;
+        Ok(Self {
+            maker: unpack_field(word0, 0)?,
+            metadata: unpack_field(word0, 20)?,
+            tick: unpack_field(word0, 21)?,
+            flip_tick: unpack_field(word0, 23)?,
+            amount: unpack_field(word1, 0)?,
+            remaining: unpack_field(word1, 16)?,
+            prev: unpack_field(word2, 0)?,
+            next: unpack_field(word2, 16)?,
+            book_key: B256::from(word3.to_be_bytes::<32>()),
+        })
+    }
+
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256) -> Result<()> {
+        let mut word0 = U256::ZERO;
+        word0 = pack_field(word0, &self.maker, 0)?;
+        word0 = pack_field(word0, &self.metadata, 20)?;
+        word0 = pack_field(word0, &self.tick, 21)?;
+        word0 = pack_field(word0, &self.flip_tick, 23)?;
+        word0 = pack_field(word0, &(OrderVersion::V1 as u8), 31)?;
+        storage.store(slot, word0)?;
+
+        let mut word1 = U256::ZERO;
+        word1 = pack_field(word1, &self.amount, 0)?;
+        word1 = pack_field(word1, &self.remaining, 16)?;
+        storage.store(slot + U256::from(1), word1)?;
+
+        let mut word2 = U256::ZERO;
+        word2 = pack_field(word2, &self.prev, 0)?;
+        word2 = pack_field(word2, &self.next, 16)?;
+        storage.store(slot + U256::from(2), word2)?;
+        storage.store(slot + U256::from(3), U256::from_be_bytes(self.book_key.0))
+    }
+}
+
+/// T8 TIP-1087 compact layout. The book key is recovered through `book_keys`.
+#[derive(Debug, Clone)]
+struct V2Order {
+    maker: Address,
+    metadata: u8,
+    tick: i16,
+    flip_tick: i16,
+    book_index: u32,
+    amount: u128,
+    remaining: u128,
+    prev: u128,
+    next: u128,
+}
+
+impl V2Order {
+    const SLOTS: usize = 3;
+
+    fn from_order(order: Order, book_index: u32) -> Self {
+        Self {
+            maker: order.maker,
+            metadata: OrderFlags::pack(&order),
+            tick: order.tick,
+            flip_tick: order.flip_tick,
+            book_index,
+            amount: order.amount,
+            remaining: order.remaining,
+            prev: order.prev,
+            next: order.next,
+        }
+    }
+
+    fn into_order(self, order_id: u128, book_key: B256) -> Order {
+        Order {
+            order_id,
+            maker: self.maker,
+            book_key,
+            is_bid: OrderFlags::is_bid(self.metadata),
+            tick: self.tick,
+            amount: self.amount,
+            remaining: self.remaining,
+            prev: self.prev,
+            next: self.next,
+            is_flip: OrderFlags::is_flip(self.metadata),
+            flip_tick: self.flip_tick,
+        }
+    }
+
+    fn load<S: StorageOps>(storage: &S, slot: U256) -> Result<Self> {
+        let word0 = storage.load(slot)?;
+        let word1 = storage.load(slot + U256::from(1))?;
+        let word2 = storage.load(slot + U256::from(2))?;
+        Ok(Self {
+            maker: unpack_field(word0, 0)?,
+            metadata: unpack_field(word0, 20)?,
+            tick: unpack_field(word0, 21)?,
+            flip_tick: unpack_field(word0, 23)?,
+            book_index: unpack_field(word0, 25)?,
+            amount: unpack_field(word1, 0)?,
+            remaining: unpack_field(word1, 16)?,
+            prev: unpack_field(word2, 0)?,
+            next: unpack_field(word2, 16)?,
+        })
+    }
+
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256) -> Result<()> {
+        let mut word0 = U256::ZERO;
+        word0 = pack_field(word0, &self.maker, 0)?;
+        word0 = pack_field(word0, &self.metadata, 20)?;
+        word0 = pack_field(word0, &self.tick, 21)?;
+        word0 = pack_field(word0, &self.flip_tick, 23)?;
+        word0 = pack_field(word0, &self.book_index, 25)?;
+        word0 = pack_field(word0, &(OrderVersion::V2 as u8), 31)?;
+        storage.store(slot, word0)?;
+
+        let mut word1 = U256::ZERO;
+        word1 = pack_field(word1, &self.amount, 0)?;
+        word1 = pack_field(word1, &self.remaining, 16)?;
+        storage.store(slot + U256::from(1), word1)?;
+
+        let mut word2 = U256::ZERO;
+        word2 = pack_field(word2, &self.prev, 0)?;
+        word2 = pack_field(word2, &self.next, 16)?;
+        storage.store(slot + U256::from(2), word2)
+    }
+}
+
+/// One-based orderbook ID; zero indicates a pre-T8 book without an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BookId(u32);
+
+impl BookId {
+    const UNSET: Self = Self(0);
+
+    fn from_index(index: u32) -> Self {
+        Self(index + 1)
+    }
+
+    fn index(self) -> Option<u32> {
+        self.0.checked_sub(1)
+    }
+}
+
+impl Deref for BookId {
+    type Target = u32;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Version-aware storage handler for one DEX order.
+#[derive(Debug, Clone)]
+struct OrderHandler {
+    base_slot: U256,
+    order_id: u128,
+    address: Address,
+}
+
+impl OrderHandler {
+    fn new(base_slot: U256, order_id: u128, address: Address) -> Self {
+        Self {
+            base_slot,
+            order_id,
+            address,
+        }
+    }
+
+    fn version_and_slot(&self) -> Result<(OrderVersion, Option<U256>)> {
+        if !StorageCtx.spec().is_t8() {
+            return Ok((OrderVersion::Legacy, None));
+        }
+        let slot0 = self.load(self.base_slot)?;
+        Ok((OrderVersion::try_from(slot0)?, Some(slot0)))
+    }
+
+    fn version(&self) -> Result<OrderVersion> {
+        self.version_and_slot().map(|(version, _)| version)
+    }
+
+    fn maker(&self) -> Result<Address> {
+        let (version, slot0) = self.version_and_slot()?;
+        let loc = match version {
+            OrderVersion::Legacy => LEGACY_MAKER_LOC,
+            OrderVersion::V1 | OrderVersion::V2 => COMPACT_MAKER_LOC,
+        };
+        if loc.offset_slots == 0 {
+            if let Some(slot0) = slot0 {
+                return unpack_field(slot0, loc.offset_bytes);
+            }
+        }
+        Slot::new_at_loc(self.base_slot, loc, self.address).read()
+    }
+
+    fn remaining(&self) -> Result<Slot<u128>> {
+        self.u128_field(LEGACY_REMAINING_LOC, COMPACT_REMAINING_LOC)
+    }
+
+    fn prev(&self) -> Result<Slot<u128>> {
+        self.u128_field(LEGACY_PREV_LOC, COMPACT_PREV_LOC)
+    }
+
+    fn next(&self) -> Result<Slot<u128>> {
+        self.u128_field(LEGACY_NEXT_LOC, COMPACT_NEXT_LOC)
+    }
+
+    fn u128_field(
+        &self,
+        legacy: packing::FieldLocation,
+        compact: packing::FieldLocation,
+    ) -> Result<Slot<u128>> {
+        let loc = match self.version()? {
+            OrderVersion::Legacy => legacy,
+            OrderVersion::V1 | OrderVersion::V2 => compact,
+        };
+        Ok(Slot::new_at_loc(self.base_slot, loc, self.address))
+    }
+
+    fn read_in_book(&self, book_key: B256) -> Result<Order> {
+        self.read_with_book_key(Some(book_key))
+    }
+
+    fn read_with_book_key(&self, known_book: Option<B256>) -> Result<Order> {
+        match self.version()? {
+            OrderVersion::Legacy => Order::load(self, self.base_slot, LayoutCtx::FULL),
+            OrderVersion::V1 => {
+                V1Order::load(self, self.base_slot).map(|order| order.into_order(self.order_id))
+            }
+            OrderVersion::V2 => {
+                let order = V2Order::load(self, self.base_slot)?;
+                let book_key = match known_book {
+                    Some(book_key) => book_key,
+                    None => StablecoinDEX::new().book_key_for_index(order.book_index)?,
+                };
+                Ok(order.into_order(self.order_id, book_key))
+            }
+        }
+    }
+
+    fn write_in_book(&mut self, value: Order, book_id: BookId) -> Result<()> {
+        self.write_with_book_id(value, Some(book_id))
+    }
+
+    fn write_with_book_id(&mut self, value: Order, known_id: Option<BookId>) -> Result<()> {
+        debug_assert_eq!(value.order_id, self.order_id);
+        if !StorageCtx.spec().is_t8() {
+            return value.store(self, self.base_slot, LayoutCtx::FULL);
+        }
+
+        let (old_version, slot0) = self.version_and_slot()?;
+        let old_slots = match old_version {
+            OrderVersion::Legacy => Order::SLOTS,
+            OrderVersion::V1 => V1Order::SLOTS,
+            OrderVersion::V2 => V2Order::SLOTS,
+        };
+        let book_index = match known_id {
+            Some(id) => id.index(),
+            None => StablecoinDEX::new().book_key_index(value.book_key)?,
+        };
+        let new_slots = if let Some(book_index) = book_index {
+            V2Order::from_order(value, book_index).store(self, self.base_slot)?;
+            V2Order::SLOTS
+        } else {
+            V1Order::from_order(value).store(self, self.base_slot)?;
+            V1Order::SLOTS
+        };
+
+        if slot0.is_none_or(|word| !word.is_zero()) {
+            for offset in new_slots..old_slots {
+                self.store(self.base_slot + U256::from(offset), U256::ZERO)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StorageOps for OrderHandler {
+    fn load(&self, slot: U256) -> Result<U256> {
+        StorageCtx.sload(self.address, slot)
+    }
+
+    fn store(&mut self, slot: U256, value: U256) -> Result<()> {
+        StorageCtx.sstore(self.address, slot, value)
+    }
+}
+
+impl Handler<Order> for OrderHandler {
+    fn read(&self) -> Result<Order> {
+        self.read_with_book_key(None)
+    }
+
+    fn write(&mut self, value: Order) -> Result<()> {
+        self.write_with_book_id(value, None)
+    }
+
+    fn delete(&mut self) -> Result<()> {
+        let slots = match self.version()? {
+            OrderVersion::Legacy => Order::SLOTS,
+            OrderVersion::V1 => V1Order::SLOTS,
+            OrderVersion::V2 => V2Order::SLOTS,
+        };
+        for offset in 0..slots {
+            self.store(self.base_slot + U256::from(offset), U256::ZERO)?;
+        }
+        Ok(())
+    }
+
+    fn t_read(&self) -> Result<Order> {
+        Err(TempoPrecompileError::Fatal(
+            "transient order storage is unsupported".to_string(),
+        ))
+    }
+
+    fn t_write(&mut self, _value: Order) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "transient order storage is unsupported".to_string(),
+        ))
+    }
+
+    fn t_delete(&mut self) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "transient order storage is unsupported".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct OrderMapping {
+    cache: HandlerCache<u128, OrderHandler>,
+}
+
+impl OrderMapping {
+    fn new() -> Self {
+        Self {
+            cache: HandlerCache::new(),
+        }
+    }
+
+    fn at(&self, order_id: u128) -> &OrderHandler {
+        self.cache.get_or_insert(&order_id, || {
+            OrderHandler::new(
+                order_id.mapping_slot(U256::from(1)),
+                order_id,
+                STABLECOIN_DEX_ADDRESS,
+            )
+        })
+    }
+
+    fn at_mut(&mut self, order_id: u128) -> &mut OrderHandler {
+        self.cache.get_or_insert_mut(&order_id, || {
+            OrderHandler::new(
+                order_id.mapping_slot(U256::from(1)),
+                order_id,
+                STABLECOIN_DEX_ADDRESS,
+            )
+        })
+    }
+}
+
+impl Index<u128> for OrderMapping {
+    type Output = OrderHandler;
+
+    fn index(&self, order_id: u128) -> &Self::Output {
+        self.at(order_id)
+    }
+}
+
+impl IndexMut<u128> for OrderMapping {
+    fn index_mut(&mut self, order_id: u128) -> &mut Self::Output {
+        self.at_mut(order_id)
+    }
+}
+
+impl Clone for OrderMapping {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Orderbook storage type
 // ===========================================================================
@@ -652,6 +1156,7 @@ pub(crate) struct OrderbookData {
     quote: Address,
     best_bid_tick: i16,
     best_ask_tick: i16,
+    book_id: u32,
 }
 
 impl Default for OrderbookData {
@@ -661,6 +1166,7 @@ impl Default for OrderbookData {
             quote: Address::ZERO,
             best_bid_tick: i16::MIN,
             best_ask_tick: i16::MAX,
+            book_id: *BookId::UNSET,
         }
     }
 }
@@ -672,7 +1178,19 @@ impl OrderbookData {
             quote,
             best_bid_tick: i16::MIN,
             best_ask_tick: i16::MAX,
+            book_id: *BookId::UNSET,
         }
+    }
+
+    fn new_with_index(base: Address, quote: Address, index: u32) -> Self {
+        Self {
+            book_id: *BookId::from_index(index),
+            ..Self::new(base, quote)
+        }
+    }
+
+    fn id(&self) -> BookId {
+        BookId(self.book_id)
     }
 
     fn is_initialized(&self) -> bool {
@@ -721,12 +1239,14 @@ impl OrderbookHandle {
         let b4 = w4.to_be_bytes::<32>();
         let best_bid_tick = i16::from_be_bytes(b4[30..32].try_into().unwrap());
         let best_ask_tick = i16::from_be_bytes(b4[28..30].try_into().unwrap());
+        let book_id = u32::from_be_bytes(b4[24..28].try_into().unwrap());
 
         Ok(OrderbookData {
             base,
             quote,
             best_bid_tick,
             best_ask_tick,
+            book_id,
         })
     }
 
@@ -752,6 +1272,7 @@ impl OrderbookHandle {
         let mut b4 = [0u8; 32];
         b4[30..32].copy_from_slice(&data.best_bid_tick.to_be_bytes());
         b4[28..30].copy_from_slice(&data.best_ask_tick.to_be_bytes());
+        b4[24..28].copy_from_slice(&data.book_id.to_be_bytes());
         ctx.sstore(
             self.address,
             self.slot + U256::from(4),
@@ -771,6 +1292,14 @@ impl OrderbookHandle {
         let mut data = self.read_data()?;
         data.best_ask_tick = tick;
         self.write_data(&data)
+    }
+
+    fn write_book_id(&mut self, book_id: BookId) -> Result<()> {
+        let mut ctx = StorageCtx::default();
+        let slot = self.slot + U256::from(4);
+        let current = ctx.sload(self.address, slot)?;
+        let updated = packing::insert_into_word(current, &*book_id, 4, 4)?;
+        ctx.sstore(self.address, slot, updated)
     }
 
     fn read_tick_level(&self, tick: i16, is_bid: bool) -> Result<TickLevel> {
@@ -926,7 +1455,7 @@ pub struct StablecoinDEX {
     // Note: each Orderbook occupies 7 sub-slots in the mapping value space
     books_slot: U256,
     // Slot 1: orders (Mapping<u128, Order>)
-    orders: Mapping<u128, Order>,
+    orders: OrderMapping,
     // Slot 2: balances (Mapping<Address, Mapping<Address, u128>>)
     balances: Mapping<Address, Mapping<Address, u128>>,
     // Slot 3: next_order_id
@@ -945,7 +1474,7 @@ impl StablecoinDEX {
         let address = STABLECOIN_DEX_ADDRESS;
         Self {
             books_slot: U256::from(0),
-            orders: Mapping::new(U256::from(1), address),
+            orders: OrderMapping::new(),
             balances: Mapping::new(U256::from(2), address),
             next_order_id: Slot::new(U256::from(3), address),
             book_keys: VecHandler::new(U256::from(4), address),
@@ -1011,6 +1540,14 @@ impl StablecoinDEX {
             .map(|(_, credits)| credits)
     }
 
+    fn rewrite_order(&mut self, order: Order, book_id: BookId) -> Result<u64> {
+        StorageCredits::new()
+            .track_minted_credits(self.address, || {
+                self.orders[order.order_id].write_in_book(order, book_id)
+            })
+            .map(|(_, credits)| credits)
+    }
+
     fn unlink_neighbor_and_credit_maker(
         &mut self,
         order_id: u128,
@@ -1022,7 +1559,7 @@ impl StablecoinDEX {
             return Ok(());
         }
 
-        let maker = self.orders[order_id].read()?.maker;
+        let maker = self.orders[order_id].maker()?;
         self.credit_dex_storage_slots(maker, credits)
     }
 
@@ -1036,16 +1573,20 @@ impl StablecoinDEX {
         Ok(())
     }
 
-    fn write_order_spending_dex_storage_credits(&mut self, order: Order) -> Result<()> {
+    fn write_order_spending_dex_storage_credits(
+        &mut self,
+        order: Order,
+        book_id: BookId,
+    ) -> Result<()> {
         let user = order.maker;
         let user_credits = self.dex_storage_credits[user].read()?;
         if user_credits == 0 {
-            return self.orders[order.order_id].write(order);
+            return self.orders[order.order_id].write_in_book(order, book_id);
         }
 
         self.dex_storage_credits[user].delete()?;
         let (_, delta) = StorageCredits::new().with_budget(self.address, user_credits, || {
-            self.orders[order.order_id].write(order)
+            self.orders[order.order_id].write_in_book(order, book_id)
         })?;
         let spent_credits = if delta < 0 { (-delta) as u64 } else { 0 };
         self.credit_dex_storage_slots(user, user_credits.saturating_sub(spent_credits))
@@ -1169,6 +1710,36 @@ impl StablecoinDEX {
         self.book_handle(pair_key).read_data()
     }
 
+    /// Returns the zero-based `book_keys` index stored in an initialized orderbook.
+    fn book_key_index(&self, book_key: B256) -> Result<Option<u32>> {
+        let book = self.books(book_key)?;
+        if !book.is_initialized() {
+            return Err(err_pair_does_not_exist());
+        }
+        Ok(book.id().index())
+    }
+
+    /// Resolves a book key from the append-only `book_keys` vector.
+    fn book_key_for_index(&self, index: u32) -> Result<B256> {
+        self.book_keys
+            .at(index as usize)?
+            .ok_or_else(err_pair_does_not_exist)?
+            .read()
+    }
+
+    /// Assigns an existing pre-T8 orderbook its one-based ID.
+    fn set_book_index(&mut self, index: u32) -> Result<()> {
+        let book_key = self.book_key_for_index(index)?;
+        if let Some(current_index) = self.book_key_index(book_key)? {
+            if current_index == index {
+                return Ok(());
+            }
+            return Err(err_index_already_set());
+        }
+        self.book_handle(book_key)
+            .write_book_id(BookId::from_index(index))
+    }
+
     /// Returns a tick level.
     pub fn get_price_level(&self, base: Address, tick: i16, is_bid: bool) -> Result<TickLevel> {
         let quote = TIP20Token::from_address(base)?.quote_token()?;
@@ -1206,7 +1777,11 @@ impl StablecoinDEX {
             return Err(err_pair_already_exists());
         }
 
-        let book = OrderbookData::new(base, quote);
+        let book = if self.storage.spec().is_t8() {
+            OrderbookData::new_with_index(base, quote, self.book_keys.len()? as u32)
+        } else {
+            OrderbookData::new(base, quote)
+        };
         handle.write_data(&book)?;
         self.book_keys.push(book_key)?;
 
@@ -1297,6 +1872,7 @@ impl StablecoinDEX {
     fn commit_order_to_book(&mut self, mut order: Order, charge_credits: bool) -> Result<()> {
         let mut handle = self.book_handle(order.book_key);
         let orderbook = handle.read_data()?;
+        let book_id = orderbook.id();
         let mut level = handle.read_tick_level(order.tick, order.is_bid)?;
 
         let prev_tail = level.tail;
@@ -1314,9 +1890,13 @@ impl StablecoinDEX {
                 handle.write_best_ask_tick(order.tick)?;
             }
         } else {
-            let mut prev_order = self.orders[prev_tail].read()?;
-            prev_order.next = order.order_id;
-            self.orders[prev_tail].write(prev_order)?;
+            if self.storage.spec().is_t8() {
+                self.orders[prev_tail].next()?.write(order.order_id)?;
+            } else {
+                let mut prev_order = self.orders[prev_tail].read_in_book(order.book_key)?;
+                prev_order.next = order.order_id;
+                self.orders[prev_tail].write_in_book(prev_order, book_id)?;
+            }
 
             order.prev = prev_tail;
             level.tail = order.order_id;
@@ -1330,9 +1910,13 @@ impl StablecoinDEX {
 
         handle.write_tick_level(order.tick, order.is_bid, level)?;
         if charge_credits && self.storage.spec().is_t7() {
-            self.write_order_spending_dex_storage_credits(order)
+            self.write_order_spending_dex_storage_credits(order, book_id)
+        } else if !charge_credits && self.storage.spec().is_t8() {
+            let maker = order.maker;
+            let credits = self.rewrite_order(order, book_id)?;
+            self.credit_dex_storage_slots(maker, credits)
         } else {
-            self.orders[order.order_id].write(order)
+            self.orders[order.order_id].write_in_book(order, book_id)
         }
     }
 
@@ -1468,12 +2052,8 @@ impl StablecoinDEX {
         let batch = self.storage.checkpoint();
         let flipped = order.create_flipped_order(order.order_id);
         let (escrow_token, escrow_amount, non_escrow_token) = if flipped.is_bid {
-            let quote_amount = base_to_quote(
-                flipped.amount,
-                flipped.tick,
-                RoundingDirection::Up,
-            )
-            .ok_or_else(err_insufficient_balance)?;
+            let quote_amount = base_to_quote(flipped.amount, flipped.tick, RoundingDirection::Up)
+                .ok_or_else(err_insufficient_balance)?;
             (quote_token, quote_amount, base_token)
         } else {
             (base_token, flipped.amount, quote_token)
@@ -1520,9 +2100,10 @@ impl StablecoinDEX {
         let orderbook = handle.read_data()?;
 
         let new_remaining = order.remaining - fill_amount;
-        let mut stored = self.orders[order.order_id].read()?;
-        stored.remaining = new_remaining;
-        self.orders[order.order_id].write(stored)?;
+        self.orders[order.order_id]
+            .remaining()?
+            .write(new_remaining)?;
+        order.remaining = new_remaining;
 
         let quote_amount = base_to_quote(
             fill_amount,
@@ -1638,17 +2219,13 @@ impl StablecoinDEX {
                 None
             } else {
                 let new_level = handle.read_tick_level(tick, order.is_bid)?;
-                let new_order = self.orders[new_level.head].read()?;
+                let new_order = self.orders[new_level.head].read_in_book(book_key)?;
                 Some((new_level, new_order))
             }
         } else {
             level.head = order.next;
-            let (_, credits) =
-                StorageCredits::new().track_minted_credits(self.address, || {
-                    let mut next_order = self.orders[order.next].read()?;
-                    next_order.prev = 0;
-                    self.orders[order.next].write(next_order)
-                })?;
+            let (_, credits) = StorageCredits::new()
+                .track_minted_credits(self.address, || self.orders[order.next].prev()?.delete())?;
 
             let new_liquidity = level
                 .total_liquidity
@@ -1657,7 +2234,7 @@ impl StablecoinDEX {
             level.total_liquidity = new_liquidity;
 
             handle.write_tick_level(order.tick, order.is_bid, level)?;
-            let new_order = self.orders[order.next].read()?;
+            let new_order = self.orders[order.next].read_in_book(book_key)?;
             storage_credits.credit_slots(new_order.maker, credits);
             Some((level, new_order))
         };
@@ -1694,7 +2271,7 @@ impl StablecoinDEX {
         taker: Address,
     ) -> Result<u128> {
         let mut level = self.get_best_price_level(book_key, bid)?;
-        let mut order = self.orders[level.head].read()?;
+        let mut order = self.orders[level.head].read_in_book(book_key)?;
         let mut total_amount_out: u128 = 0;
 
         while amount_in > 0 {
@@ -1768,7 +2345,7 @@ impl StablecoinDEX {
         taker: Address,
     ) -> Result<u128> {
         let mut level = self.get_best_price_level(book_key, bid)?;
-        let mut order = self.orders[level.head].read()?;
+        let mut order = self.orders[level.head].read_in_book(book_key)?;
         let mut total_amount_in: u128 = 0;
 
         while amount_out > 0 {
@@ -2173,9 +2750,7 @@ impl StablecoinDEX {
         // Update linked list
         if order.prev != 0 {
             self.unlink_neighbor_and_credit_maker(order.prev, |dex| {
-                let mut prev = dex.orders[order.prev].read()?;
-                prev.next = order.next;
-                dex.orders[order.prev].write(prev)
+                dex.orders[order.prev].next()?.write(order.next)
             })?;
         } else {
             level.head = order.next;
@@ -2183,9 +2758,7 @@ impl StablecoinDEX {
 
         if order.next != 0 {
             self.unlink_neighbor_and_credit_maker(order.next, |dex| {
-                let mut next = dex.orders[order.next].read()?;
-                next.prev = order.prev;
-                dex.orders[order.next].write(next)
+                dex.orders[order.next].prev()?.write(order.prev)
             })?;
         } else {
             level.tail = order.prev;
@@ -2330,6 +2903,33 @@ impl Precompile for StablecoinDEX {
                         view(call, |c| self.storage_credits(c.user))
                     }
                 }
+                IStablecoinDEX::IStablecoinDEXCalls::bookIndexForKey(call) => {
+                    if !self.storage.spec().is_t8() {
+                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
+                    } else {
+                        view(call, |c| {
+                            let index = self.book_key_index(c.bookKey)?;
+                            Ok((index.is_some(), index.unwrap_or(*BookId::UNSET)).into())
+                        })
+                    }
+                }
+                IStablecoinDEX::IStablecoinDEXCalls::bookKeyForIndex(call) => {
+                    if !self.storage.spec().is_t8() {
+                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
+                    } else {
+                        view(call, |c| self.book_key_for_index(c.index))
+                    }
+                }
+                IStablecoinDEX::IStablecoinDEXCalls::setBookIndex(call) => {
+                    if !self.storage.spec().is_t8() {
+                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
+                    } else {
+                        mutate_void(call, msg_sender, |_, c| {
+                            self.preserve_storage_credits()?;
+                            self.set_book_index(c.index)
+                        })
+                    }
+                }
                 IStablecoinDEX::IStablecoinDEXCalls::getOrder(call) => view(call, |c| {
                     let order = self.get_order(c.orderId)?;
                     Ok(IStablecoinDEX::Order {
@@ -2453,15 +3053,15 @@ impl Precompile for StablecoinDEX {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, FixedBytes};
+    use alloy::primitives::{FixedBytes, address, b256};
     use alloy::sol_types::{SolCall, SolEvent};
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::PATH_USD_ADDRESS;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
     use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
-    use crate::tempo::precompile::PATH_USD_ADDRESS;
 
     fn setup_dex_tokens(
         dex: &mut StablecoinDEX,
@@ -2530,6 +3130,240 @@ mod tests {
         })
         .unwrap();
         assert!(!after.reverted);
+    }
+
+    fn test_order(order_id: u128, book_key: B256) -> Order {
+        Order {
+            order_id,
+            maker: Address::repeat_byte(0x11),
+            book_key,
+            is_bid: true,
+            tick: 5,
+            amount: MIN_ORDER_AMOUNT,
+            remaining: MIN_ORDER_AMOUNT - 1,
+            prev: order_id - 1,
+            next: order_id + 1,
+            is_flip: true,
+            flip_tick: 10,
+        }
+    }
+
+    fn expected_compact_slots(order: &Order, version: OrderVersion, book_index: u32) -> [U256; 3] {
+        let mut slot0 = [0u8; 32];
+        slot0[0] = version as u8;
+        if version == OrderVersion::V2 {
+            slot0[3..7].copy_from_slice(&book_index.to_be_bytes());
+        }
+        slot0[7..9].copy_from_slice(&order.flip_tick.to_be_bytes());
+        slot0[9..11].copy_from_slice(&order.tick.to_be_bytes());
+        slot0[11] = OrderFlags::pack(order);
+        slot0[12..32].copy_from_slice(order.maker.as_slice());
+
+        let mut slot1 = [0u8; 32];
+        slot1[..16].copy_from_slice(&order.remaining.to_be_bytes());
+        slot1[16..].copy_from_slice(&order.amount.to_be_bytes());
+
+        let mut slot2 = [0u8; 32];
+        slot2[..16].copy_from_slice(&order.next.to_be_bytes());
+        slot2[16..].copy_from_slice(&order.prev.to_be_bytes());
+        [
+            U256::from_be_bytes(slot0),
+            U256::from_be_bytes(slot1),
+            U256::from_be_bytes(slot2),
+        ]
+    }
+
+    #[test]
+    fn t8_order_layouts_match_tip_1062_and_tip_1087() {
+        let v1_key = b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let v2_key = b256!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let mut provider = TestStorageProvider::new(TempoHardfork::T8);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            let v1 = test_order(10, v1_key);
+            let v2 = test_order(20, v2_key);
+            dex.orders[10].write_in_book(v1.clone(), BookId::UNSET)?;
+            dex.orders[20].write_in_book(v2.clone(), BookId::from_index(7))?;
+
+            let v1_slot = dex.orders[10].base_slot;
+            let v2_slot = dex.orders[20].base_slot;
+            let v1_expected = expected_compact_slots(&v1, OrderVersion::V1, 0);
+            let v2_expected = expected_compact_slots(&v2, OrderVersion::V2, 7);
+            for (offset, expected) in v1_expected.into_iter().enumerate() {
+                assert_eq!(
+                    StorageCtx.sload(dex.address, v1_slot + U256::from(offset))?,
+                    expected
+                );
+            }
+            assert_eq!(
+                StorageCtx.sload(dex.address, v1_slot + U256::from(3))?,
+                U256::from_be_bytes(v1_key.0)
+            );
+            for offset in 4..Order::SLOTS {
+                assert_eq!(
+                    StorageCtx.sload(dex.address, v1_slot + U256::from(offset))?,
+                    U256::ZERO
+                );
+            }
+            for (offset, expected) in v2_expected.into_iter().enumerate() {
+                assert_eq!(
+                    StorageCtx.sload(dex.address, v2_slot + U256::from(offset))?,
+                    expected
+                );
+            }
+            for offset in V2Order::SLOTS..Order::SLOTS {
+                assert_eq!(
+                    StorageCtx.sload(dex.address, v2_slot + U256::from(offset))?,
+                    U256::ZERO
+                );
+            }
+            assert_eq!(dex.orders[10].read_in_book(v1_key)?, v1);
+            assert_eq!(dex.orders[20].read_in_book(v2_key)?, v2);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t8_unknown_order_version_is_fatal() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T8);
+        let result = StorageCtx::enter(&mut provider, || {
+            let dex = StablecoinDEX::new();
+            let slot = dex.orders[9].base_slot;
+            StorageCtx.sstore(dex.address, slot, U256::from(3) << 248)?;
+            dex.orders[9].read()
+        });
+        assert!(matches!(
+            result,
+            Err(TempoPrecompileError::Fatal(message))
+                if message == "unknown stablecoin DEX order storage version 3"
+        ));
+    }
+
+    #[test]
+    fn t8_reads_mixed_versions_and_field_updates_preserve_layout() {
+        let book_key = B256::repeat_byte(0x31);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            dex.orders[1].write(test_order(1, book_key))?;
+            dex.book_keys.push(book_key)?;
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        provider.set_spec(TempoHardfork::T8);
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            dex.orders[2].write_in_book(test_order(2, book_key), BookId::UNSET)?;
+            dex.orders[3].write_in_book(test_order(3, book_key), BookId::from_index(0))?;
+
+            for (id, key, version) in [
+                (1, book_key, OrderVersion::Legacy),
+                (2, book_key, OrderVersion::V1),
+                (3, book_key, OrderVersion::V2),
+            ] {
+                assert_eq!(dex.orders[id].read()?.book_key, key);
+                assert_eq!(dex.orders[id].version()?, version);
+                dex.orders[id].remaining()?.write(777)?;
+                dex.orders[id].prev()?.write(88)?;
+                dex.orders[id].next()?.write(99)?;
+                let updated = dex.orders[id].read()?;
+                assert_eq!(
+                    (updated.remaining, updated.prev, updated.next),
+                    (777, 88, 99)
+                );
+                assert_eq!(dex.orders[id].version()?, version);
+                dex.orders[id].delete()?;
+                assert_eq!(dex.orders[id].read()?.maker, Address::ZERO);
+            }
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t8_full_write_lazily_migrates_and_clears_legacy_tail() {
+        let book_key = B256::repeat_byte(0x41);
+        let order = test_order(7, book_key);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+        StorageCtx::enter(&mut provider, || {
+            StablecoinDEX::new().orders[7].write(order.clone())
+        })
+        .unwrap();
+
+        provider.set_spec(TempoHardfork::T8);
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            dex.book_keys.push(book_key)?;
+            dex.orders[7].write_in_book(order.clone(), BookId::from_index(0))?;
+            assert_eq!(dex.orders[7].version()?, OrderVersion::V2);
+            assert_eq!(dex.orders[7].read()?, order);
+            for offset in V2Order::SLOTS..Order::SLOTS {
+                assert_eq!(
+                    StorageCtx.sload(dex.address, dex.orders[7].base_slot + U256::from(offset))?,
+                    U256::ZERO
+                );
+            }
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t8_book_index_selectors_and_conflict_semantics() {
+        let admin = Address::repeat_byte(0x51);
+        let base = address!("0x20c0000000000000000000000000000000000007");
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+        let book_key = StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, base)?;
+            Result::<B256>::Ok(compute_book_key(base, PATH_USD_ADDRESS))
+        })
+        .unwrap();
+
+        let index_call = IStablecoinDEX::bookIndexForKeyCall { bookKey: book_key };
+        let key_call = IStablecoinDEX::bookKeyForIndexCall { index: 0 };
+        let set_call = IStablecoinDEX::setBookIndexCall { index: 0 };
+        for calldata in [
+            index_call.abi_encode(),
+            key_call.abi_encode(),
+            set_call.abi_encode(),
+        ] {
+            let result = StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(result.reverted);
+        }
+
+        provider.set_spec(TempoHardfork::T8);
+        for calldata in [
+            index_call.abi_encode(),
+            key_call.abi_encode(),
+            set_call.abi_encode(),
+        ] {
+            let result = StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(!result.reverted);
+        }
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            assert_eq!(dex.book_key_for_index(0)?, book_key);
+            assert_eq!(dex.book_key_index(book_key)?, Some(0));
+            dex.set_book_index(0)?;
+
+            dex.book_handle(book_key)
+                .write_book_id(BookId::from_index(1))?;
+            assert_eq!(dex.set_book_index(0), Err(err_index_already_set()));
+            Result::<()>::Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -2617,29 +3451,48 @@ mod tests {
     }
 
     #[test]
-    fn t7_partial_fill_does_not_credit_live_order() {
+    fn t7_t8_partial_fill_preserves_layout_and_cancel_deletes_order() {
         let admin = Address::repeat_byte(0x61);
         let maker = Address::repeat_byte(0x62);
         let taker = Address::repeat_byte(0x63);
         let base_token = address!("0x20c0000000000000000000000000000000000006");
         let amount = MIN_ORDER_AMOUNT * 2;
         let fill = MIN_ORDER_AMOUNT;
-        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+        for hardfork in [TempoHardfork::T7, TempoHardfork::T8] {
+            let mut provider = TestStorageProvider::new(hardfork);
 
-        StorageCtx::enter(&mut provider, || {
-            let mut dex = StablecoinDEX::new();
-            setup_dex_tokens(&mut dex, admin, base_token)?;
-            grant_and_mint(base_token, admin, maker, amount)?;
-            grant_and_mint(PATH_USD_ADDRESS, admin, taker, fill)?;
+            StorageCtx::enter(&mut provider, || {
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base_token)?;
+                grant_and_mint(base_token, admin, maker, amount)?;
+                grant_and_mint(PATH_USD_ADDRESS, admin, taker, fill)?;
 
-            let order_id = dex.place(maker, base_token, amount, false, 0)?;
-            dex.swap_exact_amount_in(taker, PATH_USD_ADDRESS, base_token, fill, 0)?;
+                let order_id = dex.place(maker, base_token, amount, false, 0)?;
+                let expected_version = if hardfork.is_t8() {
+                    OrderVersion::V2
+                } else {
+                    OrderVersion::Legacy
+                };
+                assert_eq!(dex.orders[order_id].version()?, expected_version);
+                let base_slot = dex.orders[order_id].base_slot;
 
-            assert_eq!(dex.get_order(order_id)?.remaining, amount - fill);
-            assert_eq!(dex.storage_credits(maker)?, 0);
-            Result::<()>::Ok(())
-        })
-        .unwrap();
+                dex.swap_exact_amount_in(taker, PATH_USD_ADDRESS, base_token, fill, 0)?;
+                assert_eq!(dex.get_order(order_id)?.remaining, amount - fill);
+                assert_eq!(dex.orders[order_id].version()?, expected_version);
+                assert_eq!(dex.storage_credits(maker)?, 0);
+
+                dex.cancel(maker, order_id)?;
+                assert!(dex.storage_credits(maker)? > 0);
+                for offset in 0..Order::SLOTS {
+                    assert_eq!(
+                        StorageCtx.sload(dex.address, base_slot + U256::from(offset))?,
+                        U256::ZERO
+                    );
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
     }
 
     #[test]
@@ -2653,32 +3506,36 @@ mod tests {
             true,
             100,
         );
-        assert!(Order::new_flip(
-            args.0,
-            args.1,
-            args.2,
-            args.3,
-            args.4,
-            args.5,
-            args.6,
-            TempoHardfork::T4,
-        )
-        .is_err());
-        assert!(Order::new_flip(
-            args.0,
-            args.1,
-            args.2,
-            args.3,
-            args.4,
-            args.5,
-            args.6,
-            TempoHardfork::T5,
-        )
-        .is_ok());
+        assert!(
+            Order::new_flip(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                TempoHardfork::T4,
+            )
+            .is_err()
+        );
+        assert!(
+            Order::new_flip(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                TempoHardfork::T5,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn t5_and_t7_flip_reuse_order_id_without_changing_maker_credits() {
+    fn t5_t7_and_t8_flip_reuse_order_id_without_changing_maker_credits() {
         let admin = Address::repeat_byte(0xa1);
         let alice = Address::repeat_byte(0xa2);
         let bob = Address::repeat_byte(0xb1);
@@ -2686,80 +3543,75 @@ mod tests {
         let amount = MIN_ORDER_AMOUNT;
         let tick = 100;
         let escrow = base_to_quote(amount, tick, RoundingDirection::Up).unwrap();
-        for hardfork in [TempoHardfork::T5, TempoHardfork::T7] {
+        for hardfork in [TempoHardfork::T5, TempoHardfork::T7, TempoHardfork::T8] {
             let mut provider = TestStorageProvider::new(hardfork);
 
             StorageCtx::enter(&mut provider, || {
-            let mut quote = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
-            quote.initialize(
-                Address::ZERO,
-                "Path USD",
-                "pathUSD",
-                "USD",
-                PATH_USD_ADDRESS,
-                admin,
-            )?;
-            quote.grant_role(
-                admin,
-                IRolesAuth::grantRoleCall {
-                    role: *ISSUER_ROLE,
-                    account: admin,
-                },
-            )?;
-            quote.mint(
-                admin,
-                ITIP20::mintCall {
-                    to: alice,
-                    amount: U256::from(escrow),
-                },
-            )?;
+                let mut quote = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                quote.initialize(
+                    Address::ZERO,
+                    "Path USD",
+                    "pathUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )?;
+                quote.grant_role(
+                    admin,
+                    IRolesAuth::grantRoleCall {
+                        role: *ISSUER_ROLE,
+                        account: admin,
+                    },
+                )?;
+                quote.mint(
+                    admin,
+                    ITIP20::mintCall {
+                        to: alice,
+                        amount: U256::from(escrow),
+                    },
+                )?;
 
-            TIP20Token::from_address_unchecked(base_token).initialize(
-                Address::ZERO,
-                "Base USD",
-                "baseUSD",
-                "USD",
-                PATH_USD_ADDRESS,
-                admin,
-            )?;
+                TIP20Token::from_address_unchecked(base_token).initialize(
+                    Address::ZERO,
+                    "Base USD",
+                    "baseUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )?;
 
-            let mut dex = StablecoinDEX::new();
-            dex.initialize()?;
-            dex.create_pair(base_token)?;
-            let order_id = dex.place_flip(
-                alice,
-                base_token,
-                amount,
-                true,
-                tick,
-                tick,
-                false,
-            )?;
-            let next_order_id = dex.next_order_id_val()?;
+                let mut dex = StablecoinDEX::new();
+                dex.initialize()?;
+                dex.create_pair(base_token)?;
+                let order_id =
+                    dex.place_flip(alice, base_token, amount, true, tick, tick, false)?;
+                let next_order_id = dex.next_order_id_val()?;
 
-            dex.set_balance(bob, base_token, amount)?;
-            dex.swap_exact_amount_in(bob, base_token, PATH_USD_ADDRESS, amount, 0)?;
+                dex.set_balance(bob, base_token, amount)?;
+                dex.swap_exact_amount_in(bob, base_token, PATH_USD_ADDRESS, amount, 0)?;
 
-            assert_eq!(dex.next_order_id_val()?, next_order_id);
-            let flipped = dex.get_order(order_id)?;
-            assert_eq!(flipped.order_id, order_id);
-            assert_eq!(flipped.maker, alice);
-            assert!(!flipped.is_bid);
-            assert!(flipped.is_flip);
-            assert_eq!(flipped.tick, tick);
-            assert_eq!(flipped.flip_tick, tick);
-            assert_eq!(flipped.remaining, amount);
-            if hardfork.is_t7() {
-                assert_eq!(dex.storage_credits(alice)?, 0);
-            }
-            Result::<()>::Ok(())
+                assert_eq!(dex.next_order_id_val()?, next_order_id);
+                let flipped = dex.get_order(order_id)?;
+                assert_eq!(flipped.order_id, order_id);
+                assert_eq!(flipped.maker, alice);
+                assert!(!flipped.is_bid);
+                assert!(flipped.is_flip);
+                assert_eq!(flipped.tick, tick);
+                assert_eq!(flipped.flip_tick, tick);
+                assert_eq!(flipped.remaining, amount);
+                if hardfork.is_t7() {
+                    assert_eq!(dex.storage_credits(alice)?, 0);
+                }
+                Result::<()>::Ok(())
             })
             .unwrap();
 
-            assert!(provider
-                .events(STABLECOIN_DEX_ADDRESS)
-                .iter()
-                .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH));
+            assert!(
+                provider
+                    .events(STABLECOIN_DEX_ADDRESS)
+                    .iter()
+                    .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH)
+            );
         }
     }
 
@@ -2812,15 +3664,7 @@ mod tests {
             let mut dex = StablecoinDEX::new();
             dex.initialize()?;
             dex.create_pair(base_token)?;
-            let order_id = dex.place_flip(
-                alice,
-                base_token,
-                amount,
-                true,
-                tick,
-                tick,
-                false,
-            )?;
+            let order_id = dex.place_flip(alice, base_token, amount, true, tick, tick, false)?;
 
             let mut registry = TIP403Registry::new();
             registry.initialize()?;
@@ -2862,8 +3706,10 @@ mod tests {
         assert_eq!(decoded.orderId, order_id);
         assert_eq!(decoded.maker, alice);
         assert_ne!(decoded.reason, FixedBytes::<4>::ZERO);
-        assert!(!events
-            .iter()
-            .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH)
+        );
     }
 }

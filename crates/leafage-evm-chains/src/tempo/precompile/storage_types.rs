@@ -12,7 +12,7 @@
 //! - Packing helpers: [`FieldLocation`], [`PackedSlot`], extract/insert/delete operations
 //! - Primitive implementations for `bool`, `Address`, `u8`..`u128`, `U256`
 
-use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256, keccak256};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -667,13 +667,13 @@ where
 
 /// Cache for computed handlers with stable references.
 #[derive(Debug, Default)]
-struct HandlerCache<K, H> {
+pub(crate) struct HandlerCache<K, H> {
     inner: RefCell<HashMap<K, Box<H>>>,
 }
 
 impl<K, H> HandlerCache<K, H> {
     #[inline]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: RefCell::new(HashMap::new()),
         }
@@ -688,7 +688,7 @@ impl<K, H> Clone for HandlerCache<K, H> {
 
 impl<K: Hash + Eq + Clone, H> HandlerCache<K, H> {
     #[inline]
-    fn get_or_insert(&self, key: &K, f: impl FnOnce() -> H) -> &H {
+    pub(crate) fn get_or_insert(&self, key: &K, f: impl FnOnce() -> H) -> &H {
         let mut cache = self.inner.borrow_mut();
         if let Some(boxed) = cache.get(key) {
             // SAFETY: Box provides stable heap address. Cache is append-only.
@@ -700,7 +700,7 @@ impl<K: Hash + Eq + Clone, H> HandlerCache<K, H> {
     }
 
     #[inline]
-    fn get_or_insert_mut(&mut self, key: &K, f: impl FnOnce() -> H) -> &mut H {
+    pub(crate) fn get_or_insert_mut(&mut self, key: &K, f: impl FnOnce() -> H) -> &mut H {
         let mut cache = self.inner.borrow_mut();
         if let Some(boxed) = cache.get_mut(key) {
             // SAFETY: Box provides stable heap address. Cache is append-only. &mut self ensures exclusive.
@@ -837,11 +837,7 @@ impl StorableType for bool {
 impl FromWord for bool {
     #[inline]
     fn to_word(&self) -> U256 {
-        if *self {
-            U256::ONE
-        } else {
-            U256::ZERO
-        }
+        if *self { U256::ONE } else { U256::ZERO }
     }
 
     #[inline]
@@ -853,11 +849,7 @@ impl FromWord for bool {
 impl StorageKey for bool {
     #[inline]
     fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
-        if *self {
-            [1u8]
-        } else {
-            [0u8]
-        }
+        if *self { [1u8] } else { [0u8] }
     }
 }
 
@@ -988,6 +980,30 @@ impl StorageKey for u128 {
 }
 
 impl sealed::OnlyPrimitives for i16 {}
+impl Packable for i16 {}
+
+impl StorableType for i16 {
+    const LAYOUT: Layout = Layout::Bytes(2);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new_with_ctx(slot, ctx, address)
+    }
+}
+
+impl FromWord for i16 {
+    #[inline]
+    fn to_word(&self) -> U256 {
+        U256::from(*self as u16)
+    }
+
+    #[inline]
+    fn from_word(word: U256) -> Result<Self> {
+        u16::try_from(word)
+            .map(|value| value as i16)
+            .map_err(|_| TempoPrecompileError::Fatal("U256 value too large for i16".to_string()))
+    }
+}
 
 impl StorageKey for i16 {
     #[inline]
@@ -1528,9 +1544,8 @@ where
 
     fn index(&self, index: usize) -> &Self::Output {
         let (data_start, address) = (self.data_slot(), self.address);
-        self.cache.get_or_insert(&index, || {
-            Self::compute_handler(data_start, address, index)
-        })
+        self.cache
+            .get_or_insert(&index, || Self::compute_handler(data_start, address, index))
     }
 }
 
@@ -1540,9 +1555,8 @@ where
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         let (data_start, address) = (self.data_slot(), self.address);
-        self.cache.get_or_insert_mut(&index, || {
-            Self::compute_handler(data_start, address, index)
-        })
+        self.cache
+            .get_or_insert_mut(&index, || Self::compute_handler(data_start, address, index))
     }
 }
 
@@ -1831,7 +1845,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, B256};
+    use alloy::primitives::{B256, address};
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
@@ -1869,8 +1883,7 @@ mod tests {
         let expected = U256::from(0xabcd_ef01u32) << (8 * 8);
         assert_eq!(packed.0, expected, "packed bytes at offset 8");
 
-        let recovered =
-            FixedBytes::<4>::load(&packed, U256::ZERO, LayoutCtx::packed(8)).unwrap();
+        let recovered = FixedBytes::<4>::load(&packed, U256::ZERO, LayoutCtx::packed(8)).unwrap();
         assert_eq!(recovered, value, "round-trip from packed offset");
     }
 
@@ -1887,6 +1900,22 @@ mod tests {
         let expected = U256::from_be_bytes(keccak256(buf).0);
 
         assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn i16_packed_storage_preserves_twos_complement_boundaries() {
+        for value in [i16::MIN, -1, 0, 1, i16::MAX] {
+            let mut packed = packing::PackedSlot(U256::MAX);
+            value
+                .store(&mut packed, U256::ZERO, LayoutCtx::packed(7))
+                .unwrap();
+            let recovered = i16::load(&packed, U256::ZERO, LayoutCtx::packed(7)).unwrap();
+            assert_eq!(recovered, value);
+            assert_eq!(
+                (packed.0 >> (7 * 8)) & U256::from(u16::MAX),
+                U256::from(value as u16)
+            );
+        }
     }
 
     #[test]
