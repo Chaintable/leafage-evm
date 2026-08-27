@@ -1018,23 +1018,33 @@ impl StablecoinDEX {
         )
     }
 
-    /// Transfer tokens from the DEX to `to` via TIP20 system_transfer_from.
+    /// Transfer tokens from the DEX to `to`.
     fn transfer(&mut self, token: Address, to: Address, amount: u128) -> Result<()> {
-        TIP20Token::from_address(token)?.system_transfer_from(
+        TIP20Token::from_address(token)?.transfer(
             STABLECOIN_DEX_ADDRESS,
-            to,
-            U256::from(amount),
+            super::tip20::ITIP20::transferCall {
+                to,
+                amount: U256::from(amount),
+            },
         )?;
         Ok(())
     }
 
-    /// Transfer tokens from `from` to the DEX via TIP20 system_transfer_from.
+    /// Transfer tokens from `from` to the DEX.
     fn transfer_from(&mut self, token: Address, from: Address, amount: u128) -> Result<()> {
-        TIP20Token::from_address(token)?.system_transfer_from(
-            from,
-            STABLECOIN_DEX_ADDRESS,
-            U256::from(amount),
-        )?;
+        let mut token = TIP20Token::from_address(token)?;
+        if self.storage.spec().is_t5() {
+            token.system_transfer_from(STABLECOIN_DEX_ADDRESS, from, U256::from(amount))?;
+        } else {
+            token.transfer_from(
+                STABLECOIN_DEX_ADDRESS,
+                super::tip20::ITIP20::transferFromCall {
+                    from,
+                    to: STABLECOIN_DEX_ADDRESS,
+                    amount: U256::from(amount),
+                },
+            )?;
+        }
         Ok(())
     }
 

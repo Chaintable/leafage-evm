@@ -575,6 +575,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            unique_tx_identifier: None,
         };
 
         // Pre-T1A
@@ -639,6 +640,7 @@ mod tests {
                 nonce_key,
                 ..Default::default()
             }),
+            unique_tx_identifier: None,
         }
     }
 
@@ -968,6 +970,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            unique_tx_identifier: None,
         };
 
         let mut evm = TempoEvm::new(
@@ -1417,6 +1420,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            unique_tx_identifier: None,
         };
 
         let mut evm = TempoEvm::new(
@@ -1499,6 +1503,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            unique_tx_identifier: None,
         };
 
         let mut evm_1 = TempoEvm::new(
@@ -1555,6 +1560,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            unique_tx_identifier: None,
         };
 
         // WITHOUT pre-warm: normal T2 execution

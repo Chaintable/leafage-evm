@@ -617,6 +617,23 @@ impl TIP20Token {
         }
         Ok(())
     }
+
+    /// Ensures each account is authorized for the requested TIP-403 role.
+    pub fn ensure_authorized_as(
+        &self,
+        checks: &[(Address, super::tip403_registry::AuthRole)],
+    ) -> Result<()> {
+        let policy_id = self.transfer_policy_id.read()?;
+        let registry = super::tip403_registry::TIP403Registry::new();
+        for &(account, role) in checks {
+            if !registry.is_authorized_as(policy_id, account, role)? {
+                return Err(TempoPrecompileError::Revert(
+                    ITIP20::PolicyForbids {}.abi_encode().into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -1129,20 +1146,28 @@ impl TIP20Token {
     /// and AccountKeychain spending limits.
     pub fn system_transfer_from(
         &mut self,
+        caller: Address,
         from: Address,
-        to: Address,
         amount: U256,
     ) -> Result<bool> {
+        if self.storage.spec().is_t5()
+            && !super::address_registry::is_implicitly_approved(caller, self.storage.spec())
+        {
+            return Err(TempoPrecompileError::Revert(
+                IRolesAuth::Unauthorized {}.abi_encode().into(),
+            ));
+        }
+
         self.check_not_paused()?;
-        self.check_recipient(to)?;
-        self.ensure_transfer_authorized(from, to)?;
+        self.check_recipient(caller)?;
+        self.ensure_transfer_authorized(from, caller)?;
         // AccountKeychain spending limit
         super::account_keychain::AccountKeychain::new().authorize_transfer(
             from,
             self.address,
             amount,
         )?;
-        self._transfer(from, to, amount)?;
+        self._transfer(from, caller, amount)?;
         Ok(true)
     }
 
@@ -1418,7 +1443,12 @@ impl TIP20Token {
             self.check_not_paused()?;
         }
 
-        if call.from == TIP_FEE_MANAGER_ADDRESS || call.from == STABLECOIN_DEX_ADDRESS {
+        if call.from == TIP_FEE_MANAGER_ADDRESS
+            || call.from == STABLECOIN_DEX_ADDRESS
+            || (self.storage.spec().is_t5()
+                && (call.from == super::TIP20_CHANNEL_RESERVE_ADDRESS
+                    || call.from == self.address))
+        {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::ProtectedAddress {}.abi_encode().into(),
             ));
@@ -2010,5 +2040,64 @@ impl Precompile for TIP20Token {
                 mutate_void(call, msg_sender, |s, c| self.set_role_admin(s, c))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::PATH_USD_ADDRESS;
+
+    #[test]
+    fn system_transfer_from_rejects_unlisted_caller_from_t5() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        let payer = Address::repeat_byte(0x11);
+        let unlisted = Address::repeat_byte(0x22);
+
+        let result = StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.set_balance(payer, U256::from(10))?;
+            token.transfer_policy_id.write(1)?;
+            token.system_transfer_from(unlisted, payer, U256::ONE)
+        });
+
+        assert!(matches!(result, Err(TempoPrecompileError::Revert(_))));
+    }
+
+    #[test]
+    fn system_transfer_from_allows_implicit_caller_at_t5() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        let payer = Address::repeat_byte(0x33);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.set_balance(payer, U256::from(10))?;
+            token.transfer_policy_id.write(1)?;
+            token.system_transfer_from(STABLECOIN_DEX_ADDRESS, payer, U256::from(4))?;
+            assert_eq!(token.get_balance(payer)?, U256::from(6));
+            assert_eq!(token.get_balance(STABLECOIN_DEX_ADDRESS)?, U256::from(4));
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn system_transfer_from_preserves_pre_t5_unlisted_behavior() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+        let payer = Address::repeat_byte(0x44);
+        let unlisted = Address::repeat_byte(0x55);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.set_balance(payer, U256::from(10))?;
+            token.transfer_policy_id.write(1)?;
+            token.system_transfer_from(unlisted, payer, U256::from(3))?;
+            assert_eq!(token.get_balance(payer)?, U256::from(7));
+            assert_eq!(token.get_balance(unlisted)?, U256::from(3));
+            Result::<()>::Ok(())
+        })
+        .unwrap();
     }
 }

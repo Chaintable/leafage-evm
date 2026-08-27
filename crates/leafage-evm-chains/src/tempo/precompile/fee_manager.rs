@@ -506,8 +506,8 @@ impl TipFeeManager {
 
         // Transfer validator tokens from swapper into the pool
         TIP20Token::from_address(validator_token)?.system_transfer_from(
-            msg_sender,
             self.address,
+            msg_sender,
             amount_in,
         )?;
 
@@ -621,8 +621,8 @@ impl TipFeeManager {
 
         // Transfer validator tokens from sender into the pool
         TIP20Token::from_address(validator_token)?.system_transfer_from(
-            msg_sender,
             self.address,
+            msg_sender,
             amount_validator_token,
         )?;
 

@@ -299,6 +299,9 @@ where
         Ok(TempoTxEnv {
             base,
             tempo_fields,
+            unique_tx_identifier: Some(
+                leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
+            ),
         })
     }
 

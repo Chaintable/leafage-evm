@@ -314,6 +314,11 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         // authorize_transfer/authorize_approve/refund_spending_limit skip enforcement.
         set_keychain_tx_origin(evm);
 
+        // Seed TIP-1034's transaction-scoped channel-open context. RPC simulations
+        // use Tempo's official fixed non-zero sentinel; real transaction replay can
+        // supply the sender-scoped signing-payload hash in the transaction env.
+        set_channel_open_context_hash(evm);
+
         // Set transaction_key if this is an access key (keychain) transaction.
         // Writer: handler.rs:1128-1133 — sets transaction_key when signature is Keychain.
         // Without this, transaction_key stays ZERO and TIP20 authorize_transfer/
@@ -584,6 +589,20 @@ fn set_keychain_tx_origin<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
     evm.ctx_mut()
         .journal_mut()
         .tstore(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(3), caller.into_word().into());
+}
+
+fn set_channel_open_context_hash<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
+    use crate::tempo::precompile::TIP20_CHANNEL_RESERVE_ADDRESS;
+    use revm::context_interface::JournalTr;
+
+    let Some(hash) = evm.ctx().tx.unique_tx_identifier else {
+        return;
+    };
+    evm.ctx_mut().journal_mut().tstore(
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        U256::from(3),
+        U256::from_be_bytes(hash.0),
+    );
 }
 
 /// Sets `transaction_key` in AccountKeychain transient storage (slot 2).
@@ -1270,6 +1289,41 @@ mod tests {
         assert_eq!(after, U256::ZERO, "zero caller should result in zero tx_origin");
     }
 
+    #[test]
+    fn test_set_channel_open_context_hash_writes_to_transient_slot_3() {
+        use crate::tempo::precompile::TIP20_CHANNEL_RESERVE_ADDRESS;
+        use crate::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER;
+
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.unique_tx_identifier = Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
+        set_channel_open_context_hash(&mut evm);
+
+        let actual = evm
+            .inner
+            .ctx
+            .journal_mut()
+            .tload(TIP20_CHANNEL_RESERVE_ADDRESS, U256::from(3));
+        assert_eq!(
+            actual,
+            U256::from_be_bytes(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER.0),
+        );
+    }
+
+    #[test]
+    fn test_set_channel_open_context_hash_skips_missing_identifier() {
+        use crate::tempo::precompile::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let mut evm = make_evm();
+        set_channel_open_context_hash(&mut evm);
+        assert_eq!(
+            evm.inner
+                .ctx
+                .journal_mut()
+                .tload(TIP20_CHANNEL_RESERVE_ADDRESS, U256::from(3)),
+            U256::ZERO,
+        );
+    }
+
     // ==================== set_transaction_key tests ====================
 
     #[test]
@@ -1507,6 +1561,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            unique_tx_identifier: None,
         }
     }
 
@@ -1524,6 +1579,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
         let err = result.unwrap_err().to_string();
@@ -1599,6 +1655,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
         let err = result.unwrap_err().to_string();
@@ -1632,6 +1689,7 @@ mod tests {
                 valid_before: None,         // missing valid_before
                 ..Default::default()
             }),
+            unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
         let err = result.unwrap_err().to_string();
@@ -1655,6 +1713,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            unique_tx_identifier: None,
         };
         // System tx should pass validate_env (though execution may fail later)
         // We only check it doesn't fail at the validate_env step.

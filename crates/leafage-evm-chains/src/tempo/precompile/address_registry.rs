@@ -16,7 +16,7 @@
 //! `master_address(20)` @ packed offset 0 || `reserved(11)` @ offset 20 || `ty(1)` @ offset 31
 
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
-use alloy::sol_types::{SolError, SolInterface, SolValue};
+use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -26,9 +26,11 @@ use super::storage_types::{
 };
 use super::{
     dispatch_call, input_cost, mutate, unknown_selector, view, Precompile,
-    ADDRESS_REGISTRY_ADDRESS,
+    ADDRESS_REGISTRY_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS,
+    TIP_FEE_MANAGER_ADDRESS,
 };
 use crate::tempo::address::{MasterId, TempoAddressExt, UserTag};
+use crate::tempo::hardfork::TempoHardfork;
 
 // ===========================================================================
 // Solidity ABI
@@ -42,6 +44,7 @@ alloy::sol! {
         function resolveVirtualAddress(address virtualAddr) external view returns (address master);
         function isVirtualAddress(address addr) external pure returns (bool);
         function decodeVirtualAddress(address addr) external pure returns (bool isVirtual, bytes4 masterId, bytes6 userTag);
+        function isImplicitlyApproved(address addr) external view returns (bool);
 
         event MasterRegistered(bytes4 indexed masterId, address indexed masterAddress);
 
@@ -50,6 +53,17 @@ alloy::sol! {
         error ProofOfWorkFailed();
         error VirtualAddressUnregistered();
     }
+}
+
+/// TIP-1035 precompiles allowed to pull a caller's TIP-20 balance without allowance.
+pub const IMPLICIT_APPROVAL_LIST: &[Address] = &[
+    TIP_FEE_MANAGER_ADDRESS,
+    STABLECOIN_DEX_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS,
+];
+
+pub fn is_implicitly_approved(address: Address, spec: TempoHardfork) -> bool {
+    spec.is_t5() && IMPLICIT_APPROVAL_LIST.contains(&address)
 }
 
 // ===========================================================================
@@ -252,6 +266,10 @@ impl AddressRegistry {
             Some((master_id, _)) => Ok(self.get_master(master_id)?.unwrap_or(Address::ZERO)),
         }
     }
+
+    pub fn is_implicitly_approved(&self, address: Address) -> bool {
+        is_implicitly_approved(address, self.storage.spec())
+    }
 }
 
 impl ContractStorage for AddressRegistry {
@@ -331,6 +349,15 @@ impl Precompile for AddressRegistry {
                         })
                     })
                 }
+                IAddressRegistry::IAddressRegistryCalls::isImplicitlyApproved(c) => {
+                    if !self.storage.spec().is_t5() {
+                        return unknown_selector(
+                            IAddressRegistry::isImplicitlyApprovedCall::SELECTOR,
+                            self.storage.gas_used(),
+                        );
+                    }
+                    view(c, |c| Ok(self.is_implicitly_approved(c.addr)))
+                }
             },
         )
     }
@@ -341,6 +368,7 @@ mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::primitives::address;
     use alloy::sol_types::SolCall;
     use revm::database::EmptyDB;
@@ -476,5 +504,39 @@ mod tests {
         });
         // Pre-T3: returns the literal virtual address (no resolution attempted).
         assert_eq!(result.unwrap(), virt);
+    }
+
+    #[test]
+    fn implicit_approval_list_activates_at_t5() {
+        for address in IMPLICIT_APPROVAL_LIST {
+            assert!(!is_implicitly_approved(*address, TempoHardfork::T4));
+            assert!(is_implicitly_approved(*address, TempoHardfork::T5));
+        }
+        assert!(!is_implicitly_approved(
+            Address::repeat_byte(0x11),
+            TempoHardfork::T10,
+        ));
+    }
+
+    #[test]
+    fn implicit_approval_selector_is_gated_at_t5() {
+        let call = IAddressRegistry::isImplicitlyApprovedCall {
+            addr: TIP20_CHANNEL_RESERVE_ADDRESS,
+        };
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        let pre_t5 = StorageCtx::enter(&mut provider, || {
+            AddressRegistry::new().call(&call.abi_encode(), Address::ZERO)
+        })
+        .unwrap();
+        assert!(pre_t5.reverted);
+
+        provider.set_spec(TempoHardfork::T5);
+        let t5 = StorageCtx::enter(&mut provider, || {
+            AddressRegistry::new().call(&call.abi_encode(), Address::ZERO)
+        })
+        .unwrap();
+        assert!(!t5.reverted);
+        assert!(bool::abi_decode(&t5.bytes).unwrap());
     }
 }

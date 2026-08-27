@@ -20,6 +20,7 @@ pub mod stablecoin_dex;
 pub mod storage;
 pub mod storage_types;
 pub mod tip20;
+pub mod tip20_channel_reserve;
 pub mod tip20_factory;
 pub mod tip403_registry;
 pub mod validator_config;
@@ -57,6 +58,9 @@ pub const TIP20_FACTORY_ADDRESS: Address =
     address!("0x20FC000000000000000000000000000000000000");
 pub const STABLECOIN_DEX_ADDRESS: Address =
     address!("0xdec0000000000000000000000000000000000000");
+/// T5+ TIP-1034 payment channel reserve.
+pub const TIP20_CHANNEL_RESERVE_ADDRESS: Address =
+    address!("0x4D50500000000000000000000000000000000000");
 pub const NONCE_PRECOMPILE_ADDRESS: Address =
     address!("0x4E4F4E4345000000000000000000000000000000");
 pub const VALIDATOR_CONFIG_ADDRESS: Address =
@@ -329,6 +333,8 @@ pub fn extend_tempo_precompiles(
             Some(create_signature_verifier_precompile(chain_id))
         } else if *address == ADDRESS_REGISTRY_ADDRESS && spec.is_t3() {
             Some(create_address_registry_precompile(chain_id))
+        } else if *address == TIP20_CHANNEL_RESERVE_ADDRESS && spec.is_t5() {
+            Some(create_tip20_channel_reserve_precompile(chain_id))
         } else if *address == CURRENT_COMMITTEE_ADDRESS && spec.is_t8() {
             Some(create_current_committee_precompile(chain_id))
         } else {
@@ -400,6 +406,12 @@ fn create_signature_verifier_precompile(chain_id: u64) -> DynPrecompile {
 fn create_address_registry_precompile(chain_id: u64) -> DynPrecompile {
     tempo_precompile!("AddressRegistry", chain_id, |input| {
         address_registry::AddressRegistry::new()
+    })
+}
+
+fn create_tip20_channel_reserve_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("TIP20ChannelReserve", chain_id, |input| {
+        tip20_channel_reserve::TIP20ChannelReserve::new()
     })
 }
 

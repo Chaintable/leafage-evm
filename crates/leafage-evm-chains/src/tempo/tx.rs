@@ -4,6 +4,10 @@ use revm::{
     primitives::{Address, Bytes, TxKind, B256, U256},
 };
 
+/// Non-zero replay context used by Tempo's official RPC simulation path.
+pub const RPC_SIMULATION_UNIQUE_TX_IDENTIFIER: B256 =
+    B256::new(*b"TEMPO_RPC_SIMULATION_MPP_CONTEXT");
+
 /// A single call within a Tempo batch (AA tx `Vec<Call>`).
 #[derive(Clone, Debug, Default)]
 pub struct TempoCall {
@@ -135,6 +139,8 @@ pub struct TempoTxEnv {
     pub base: TxEnv,
     /// Present only for type-0x76 batch transactions.
     pub tempo_fields: Option<TempoTxFields>,
+    /// Sender-scoped transaction identifier used by ChannelReserve.open().
+    pub unique_tx_identifier: Option<B256>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +228,7 @@ mod tests {
     fn test_tempo_tx_env_default() {
         let tx = TempoTxEnv::default();
         assert!(tx.tempo_fields.is_none());
+        assert!(tx.unique_tx_identifier.is_none());
         // TxEnv defaults gas_limit to TX_GAS_LIMIT_CAP (EIP-7825).
         assert!(tx.gas_limit() > 0);
     }
@@ -243,6 +250,7 @@ mod tests {
                 nonce_key: U256::ZERO,
                 ..Default::default()
             }),
+            unique_tx_identifier: Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER),
         };
         assert_eq!(tx.tx_type(), 0x76);
         assert_eq!(tx.gas_limit(), 1_000_000);
