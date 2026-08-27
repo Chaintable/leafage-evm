@@ -1828,11 +1828,13 @@ enum TIP20Call {
 impl TIP20Call {
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
+        let config = crate::tempo::precompile::abi_decoder_config();
 
         if IRolesAuth::IRolesAuthCalls::valid_selector(selector) {
-            IRolesAuth::IRolesAuthCalls::abi_decode(calldata).map(Self::RolesAuth)
+            IRolesAuth::IRolesAuthCalls::abi_decode_with_config(calldata, config)
+                .map(Self::RolesAuth)
         } else {
-            ITIP20::ITIP20Calls::abi_decode(calldata).map(Self::TIP20)
+            ITIP20::ITIP20Calls::abi_decode_with_config(calldata, config).map(Self::TIP20)
         }
     }
 }

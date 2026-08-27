@@ -12,6 +12,12 @@
 /// - T2: 1774965600 (Mar 31, 2026 14:00 UTC)
 /// - T3: 1777298400 (Apr 27, 2026 14:00 UTC)
 /// - T4: 1779112800 (May 18, 2026 14:00 UTC)
+/// - T5: 1781013600 (Jun 9, 2026 14:00 UTC)
+/// - T6: 1782223200 (Jun 23, 2026 14:00 UTC)
+/// - T7: 1783605600 (Jul 9, 2026 14:00 UTC)
+/// - T8: 1785420000 (Jul 30, 2026 14:00 UTC)
+/// - T9: 1786024800 (Aug 6, 2026 14:00 UTC)
+/// - T10: 1787320800 (Aug 21, 2026 14:00 UTC)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TempoHardfork {
     Genesis,
@@ -21,8 +27,14 @@ pub enum TempoHardfork {
     T1C,
     T2,
     T3,
-    #[default]
     T4,
+    T5,
+    T6,
+    T7,
+    T8,
+    T9,
+    #[default]
+    T10,
 }
 
 /// Tempo mainnet activation timestamps (from `presto.json` genesis config).
@@ -40,6 +52,12 @@ const MAINNET_T2_TIME: u64 = 1_774_965_600;
 const MAINNET_T3_TIME: u64 = 1_777_298_400;
 // T4 activates on mainnet: 2026-05-18 14:00 UTC (from presto.json genesis).
 const MAINNET_T4_TIME: u64 = 1_779_112_800;
+const MAINNET_T5_TIME: u64 = 1_781_013_600;
+const MAINNET_T6_TIME: u64 = 1_782_223_200;
+const MAINNET_T7_TIME: u64 = 1_783_605_600;
+const MAINNET_T8_TIME: u64 = 1_785_420_000;
+const MAINNET_T9_TIME: u64 = 1_786_024_800;
+const MAINNET_T10_TIME: u64 = 1_787_320_800;
 
 impl TempoHardfork {
     /// Determine the active hardfork for a given block timestamp.
@@ -48,7 +66,19 @@ impl TempoHardfork {
     /// timestamp 0 (same as Genesis), so the `Genesis` variant covers both
     /// the Genesis and T0 eras.
     pub fn from_timestamp(timestamp: u64) -> Self {
-        if timestamp >= MAINNET_T4_TIME {
+        if timestamp >= MAINNET_T10_TIME {
+            Self::T10
+        } else if timestamp >= MAINNET_T9_TIME {
+            Self::T9
+        } else if timestamp >= MAINNET_T8_TIME {
+            Self::T8
+        } else if timestamp >= MAINNET_T7_TIME {
+            Self::T7
+        } else if timestamp >= MAINNET_T6_TIME {
+            Self::T6
+        } else if timestamp >= MAINNET_T5_TIME {
+            Self::T5
+        } else if timestamp >= MAINNET_T4_TIME {
             Self::T4
         } else if timestamp >= MAINNET_T3_TIME {
             Self::T3
@@ -70,29 +100,47 @@ impl TempoHardfork {
         }
     }
 
-    pub fn is_t0(&self) -> bool {
+    pub const fn is_t0(&self) -> bool {
         true // Genesis is always active
     }
-    pub fn is_t1(&self) -> bool {
-        *self >= Self::T1
+    pub const fn is_t1(&self) -> bool {
+        *self as u8 >= Self::T1 as u8
     }
-    pub fn is_t1a(&self) -> bool {
-        *self >= Self::T1A
+    pub const fn is_t1a(&self) -> bool {
+        *self as u8 >= Self::T1A as u8
     }
-    pub fn is_t1b(&self) -> bool {
-        *self >= Self::T1B
+    pub const fn is_t1b(&self) -> bool {
+        *self as u8 >= Self::T1B as u8
     }
-    pub fn is_t1c(&self) -> bool {
-        *self >= Self::T1C
+    pub const fn is_t1c(&self) -> bool {
+        *self as u8 >= Self::T1C as u8
     }
-    pub fn is_t2(&self) -> bool {
-        *self >= Self::T2
+    pub const fn is_t2(&self) -> bool {
+        *self as u8 >= Self::T2 as u8
     }
-    pub fn is_t3(&self) -> bool {
-        *self >= Self::T3
+    pub const fn is_t3(&self) -> bool {
+        *self as u8 >= Self::T3 as u8
     }
-    pub fn is_t4(&self) -> bool {
-        *self >= Self::T4
+    pub const fn is_t4(&self) -> bool {
+        *self as u8 >= Self::T4 as u8
+    }
+    pub const fn is_t5(&self) -> bool {
+        *self as u8 >= Self::T5 as u8
+    }
+    pub const fn is_t6(&self) -> bool {
+        *self as u8 >= Self::T6 as u8
+    }
+    pub const fn is_t7(&self) -> bool {
+        *self as u8 >= Self::T7 as u8
+    }
+    pub const fn is_t8(&self) -> bool {
+        *self as u8 >= Self::T8 as u8
+    }
+    pub const fn is_t9(&self) -> bool {
+        *self as u8 >= Self::T9 as u8
+    }
+    pub const fn is_t10(&self) -> bool {
+        *self as u8 >= Self::T10 as u8
     }
 
     /// Gas cost for using an existing 2D nonce key (cold SLOAD + warm SSTORE reset).
@@ -105,8 +153,16 @@ impl TempoHardfork {
                 // COLD_SLOAD_COST + WARM_SSTORE_RESET = 2100 + 2900
                 5_000
             }
-            Self::T2 | Self::T3 | Self::T4 => {
-                // T2 adds 2 warm SLOADs for extended nonce key lookup; T3/T4 inherit.
+            Self::T2
+            | Self::T3
+            | Self::T4
+            | Self::T5
+            | Self::T6
+            | Self::T7
+            | Self::T8
+            | Self::T9
+            | Self::T10 => {
+                // T2 adds 2 warm SLOADs; later forks inherit the same schedule.
                 5_200
             }
         }
@@ -122,8 +178,16 @@ impl TempoHardfork {
                 // COLD_SLOAD_COST + SSTORE_SET = 2100 + 20000
                 22_100
             }
-            Self::T2 | Self::T3 | Self::T4 => {
-                // T2 adds 2 warm SLOADs for extended nonce key lookup; T3/T4 inherit.
+            Self::T2
+            | Self::T3
+            | Self::T4
+            | Self::T5
+            | Self::T6
+            | Self::T7
+            | Self::T8
+            | Self::T9
+            | Self::T10 => {
+                // T2 adds 2 warm SLOADs; later forks inherit the same schedule.
                 22_300
             }
         }
@@ -132,7 +196,10 @@ impl TempoHardfork {
 
 impl From<TempoHardfork> for revm::primitives::hardfork::SpecId {
     fn from(_: TempoHardfork) -> Self {
-        Self::PRAGUE
+        // Tempo keeps Osaka EVM semantics for every Tempo hardfork. The
+        // Ethereum built-in precompile set is selected independently in
+        // TempoEvm::new: Prague before T1C, Osaka from T1C onward.
+        Self::OSAKA
     }
 }
 
@@ -237,6 +304,24 @@ mod tests {
     }
 
     #[test]
+    fn from_timestamp_t5_through_t10_boundaries() {
+        let boundaries = [
+            (MAINNET_T5_TIME, TempoHardfork::T4, TempoHardfork::T5),
+            (MAINNET_T6_TIME, TempoHardfork::T5, TempoHardfork::T6),
+            (MAINNET_T7_TIME, TempoHardfork::T6, TempoHardfork::T7),
+            (MAINNET_T8_TIME, TempoHardfork::T7, TempoHardfork::T8),
+            (MAINNET_T9_TIME, TempoHardfork::T8, TempoHardfork::T9),
+            (MAINNET_T10_TIME, TempoHardfork::T9, TempoHardfork::T10),
+        ];
+
+        for (timestamp, before, active) in boundaries {
+            assert_eq!(TempoHardfork::from_timestamp(timestamp - 1), before);
+            assert_eq!(TempoHardfork::from_timestamp(timestamp), active);
+            assert_eq!(TempoHardfork::from_timestamp(timestamp + 1), active);
+        }
+    }
+
+    #[test]
     fn is_methods_on_genesis() {
         let hf = TempoHardfork::Genesis;
         assert!(hf.is_t0());
@@ -247,6 +332,12 @@ mod tests {
         assert!(!hf.is_t2());
         assert!(!hf.is_t3());
         assert!(!hf.is_t4());
+        assert!(!hf.is_t5());
+        assert!(!hf.is_t6());
+        assert!(!hf.is_t7());
+        assert!(!hf.is_t8());
+        assert!(!hf.is_t9());
+        assert!(!hf.is_t10());
     }
 
     #[test]
@@ -260,6 +351,8 @@ mod tests {
         assert!(!hf.is_t2());
         assert!(!hf.is_t3());
         assert!(!hf.is_t4());
+        assert!(!hf.is_t5());
+        assert!(!hf.is_t10());
     }
 
     #[test]
@@ -273,6 +366,8 @@ mod tests {
         assert!(hf.is_t2());
         assert!(hf.is_t3());
         assert!(!hf.is_t4());
+        assert!(!hf.is_t5());
+        assert!(!hf.is_t10());
     }
 
     #[test]
@@ -286,33 +381,78 @@ mod tests {
         assert!(hf.is_t2());
         assert!(hf.is_t3());
         assert!(hf.is_t4());
+        assert!(!hf.is_t5());
+        assert!(!hf.is_t10());
+    }
+
+    #[test]
+    fn is_methods_on_t10() {
+        let hf = TempoHardfork::T10;
+        assert!(hf.is_t0());
+        assert!(hf.is_t1());
+        assert!(hf.is_t2());
+        assert!(hf.is_t3());
+        assert!(hf.is_t4());
+        assert!(hf.is_t5());
+        assert!(hf.is_t6());
+        assert!(hf.is_t7());
+        assert!(hf.is_t8());
+        assert!(hf.is_t9());
+        assert!(hf.is_t10());
     }
 
     #[test]
     fn default_is_latest_activated() {
         let hf = TempoHardfork::default();
-        assert_eq!(hf, TempoHardfork::T4);
-        assert!(hf.is_t4());
+        assert_eq!(hf, TempoHardfork::T10);
+        assert!(hf.is_t10());
     }
 
     #[test]
     fn t3_gas_matches_t2() {
-        // T3/T4 inherit T2 nonce gas (no schedule change).
-        assert_eq!(
-            TempoHardfork::T3.gas_existing_nonce_key(),
-            TempoHardfork::T2.gas_existing_nonce_key()
-        );
-        assert_eq!(
-            TempoHardfork::T4.gas_existing_nonce_key(),
-            TempoHardfork::T2.gas_existing_nonce_key()
-        );
-        assert_eq!(
-            TempoHardfork::T3.gas_new_nonce_key(),
-            TempoHardfork::T2.gas_new_nonce_key()
-        );
-        assert_eq!(
-            TempoHardfork::T4.gas_new_nonce_key(),
-            TempoHardfork::T2.gas_new_nonce_key()
-        );
+        // T3-T10 inherit T2 nonce gas (no schedule change).
+        for hardfork in [
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T6,
+            TempoHardfork::T7,
+            TempoHardfork::T8,
+            TempoHardfork::T9,
+            TempoHardfork::T10,
+        ] {
+            assert_eq!(
+                hardfork.gas_existing_nonce_key(),
+                TempoHardfork::T2.gas_existing_nonce_key()
+            );
+            assert_eq!(
+                hardfork.gas_new_nonce_key(),
+                TempoHardfork::T2.gas_new_nonce_key()
+            );
+        }
+    }
+
+    #[test]
+    fn every_tempo_hardfork_uses_osaka_evm_spec() {
+        use revm::primitives::hardfork::SpecId;
+
+        for hardfork in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T1,
+            TempoHardfork::T1A,
+            TempoHardfork::T1B,
+            TempoHardfork::T1C,
+            TempoHardfork::T2,
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T6,
+            TempoHardfork::T7,
+            TempoHardfork::T8,
+            TempoHardfork::T9,
+            TempoHardfork::T10,
+        ] {
+            assert_eq!(SpecId::from(hardfork), SpecId::OSAKA);
+        }
     }
 }

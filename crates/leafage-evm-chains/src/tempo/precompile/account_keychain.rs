@@ -1413,7 +1413,12 @@ impl Precompile for AccountKeychain {
 
         dispatch_call(
             calldata,
-            IAccountKeychain::IAccountKeychainCalls::abi_decode,
+            |data| {
+                IAccountKeychain::IAccountKeychainCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 IAccountKeychain::IAccountKeychainCalls::authorizeKey(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.authorize_key(sender, c))

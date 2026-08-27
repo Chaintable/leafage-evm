@@ -302,7 +302,12 @@ impl Precompile for TIP20Factory {
 
         dispatch_call(
             calldata,
-            ITIP20Factory::ITIP20FactoryCalls::abi_decode,
+            |data| {
+                ITIP20Factory::ITIP20FactoryCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 ITIP20Factory::ITIP20FactoryCalls::createToken(call) => {
                     mutate(call, msg_sender, |s, c| self.create_token(s, c))

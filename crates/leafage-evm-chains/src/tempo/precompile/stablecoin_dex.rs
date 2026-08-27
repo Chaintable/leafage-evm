@@ -2096,7 +2096,12 @@ impl Precompile for StablecoinDEX {
 
         dispatch_call(
             calldata,
-            IStablecoinDEX::IStablecoinDEXCalls::abi_decode,
+            |data| {
+                IStablecoinDEX::IStablecoinDEXCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 IStablecoinDEX::IStablecoinDEXCalls::place(call) => {
                     mutate(call, msg_sender, |s, c| {

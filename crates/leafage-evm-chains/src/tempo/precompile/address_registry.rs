@@ -294,7 +294,12 @@ impl Precompile for AddressRegistry {
 
         dispatch_call(
             calldata,
-            IAddressRegistry::IAddressRegistryCalls::abi_decode,
+            |data| {
+                IAddressRegistry::IAddressRegistryCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 IAddressRegistry::IAddressRegistryCalls::registerVirtualMaster(c) => {
                     mutate(c, msg_sender, |sender, c| {

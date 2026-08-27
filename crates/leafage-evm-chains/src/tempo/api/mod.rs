@@ -111,9 +111,8 @@ impl<DB: Database, I> TempoEvm<DB, I> {
         let timestamp = env.block_env.timestamp.saturating_to::<u64>();
         let hardfork = TempoHardfork::from_timestamp(timestamp);
 
-        let mut precompiles = PrecompilesMap::from_static(Precompiles::new(
-            PrecompileSpecId::from_spec_id(env.cfg_env.spec.into()),
-        ));
+        let mut precompiles =
+            PrecompilesMap::from_static(Precompiles::new(ethereum_precompile_spec(hardfork)));
         extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id, hardfork);
 
         let mut cfg_env = env.cfg_env;
@@ -182,6 +181,18 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             },
             inspect,
         }
+    }
+}
+
+/// Tempo uses Osaka EVM rules at every Tempo hardfork, but did not enable the
+/// Osaka Ethereum built-in precompile set until T1C. Keep this decision
+/// independent from `From<TempoHardfork> for SpecId` so archive calls use the
+/// correct historical MODEXP implementation.
+const fn ethereum_precompile_spec(hardfork: TempoHardfork) -> PrecompileSpecId {
+    if hardfork.is_t1c() {
+        PrecompileSpecId::OSAKA
+    } else {
+        PrecompileSpecId::PRAGUE
     }
 }
 
@@ -469,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hardfork_maps_to_prague() {
+    fn test_hardfork_maps_to_osaka() {
         use revm::primitives::hardfork::SpecId;
         for hf in [
             TempoHardfork::Genesis,
@@ -480,11 +491,49 @@ mod tests {
             TempoHardfork::T2,
             TempoHardfork::T3,
             TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T6,
+            TempoHardfork::T7,
+            TempoHardfork::T8,
+            TempoHardfork::T9,
+            TempoHardfork::T10,
         ] {
             assert_eq!(
                 SpecId::from(hf),
-                SpecId::PRAGUE,
-                "{hf:?} should map to PRAGUE"
+                SpecId::OSAKA,
+                "{hf:?} should map to OSAKA"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ethereum_precompile_spec_switches_at_t1c() {
+        for hardfork in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T1,
+            TempoHardfork::T1A,
+            TempoHardfork::T1B,
+        ] {
+            assert_eq!(
+                ethereum_precompile_spec(hardfork),
+                PrecompileSpecId::PRAGUE
+            );
+        }
+        for hardfork in [
+            TempoHardfork::T1C,
+            TempoHardfork::T2,
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T6,
+            TempoHardfork::T7,
+            TempoHardfork::T8,
+            TempoHardfork::T9,
+            TempoHardfork::T10,
+        ] {
+            assert_eq!(
+                ethereum_precompile_spec(hardfork),
+                PrecompileSpecId::OSAKA
             );
         }
     }

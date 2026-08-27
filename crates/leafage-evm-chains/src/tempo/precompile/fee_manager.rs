@@ -859,11 +859,13 @@ enum TipFeeManagerCall {
 impl TipFeeManagerCall {
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
+        let config = crate::tempo::precompile::abi_decoder_config();
 
         if IFeeManager::IFeeManagerCalls::valid_selector(selector) {
-            IFeeManager::IFeeManagerCalls::abi_decode(calldata).map(Self::FeeManager)
+            IFeeManager::IFeeManagerCalls::abi_decode_with_config(calldata, config)
+                .map(Self::FeeManager)
         } else {
-            ITIPFeeAMM::ITIPFeeAMMCalls::abi_decode(calldata).map(Self::Amm)
+            ITIPFeeAMM::ITIPFeeAMMCalls::abi_decode_with_config(calldata, config).map(Self::Amm)
         }
     }
 }

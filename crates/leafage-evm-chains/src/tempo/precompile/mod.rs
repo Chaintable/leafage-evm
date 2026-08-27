@@ -78,6 +78,16 @@ pub const INPUT_PER_WORD_COST: u64 = 6;
 /// Gas cost for `ecrecover` signature verification.
 pub const ECRECOVER_GAS: u64 = 3_000;
 
+/// Maximum allocation allowed while ABI-decoding one precompile call.
+/// Matches Tempo v1.13.1 and prevents crafted dynamic offsets/lengths from
+/// forcing unbounded allocations during `eth_call` and trace simulation.
+pub const ABI_DECODER_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
+
+#[inline]
+pub const fn abi_decoder_config() -> alloy::sol_types::abi::AbiDecoderConfig {
+    alloy::sol_types::abi::AbiDecoderConfig::new().memory_limit(ABI_DECODER_MEMORY_LIMIT)
+}
+
 /// Returns the gas cost for decoding calldata of the given length, rounded up to word boundaries.
 #[inline]
 pub fn input_cost(calldata_len: usize) -> u64 {
@@ -463,4 +473,30 @@ where
             .unwrap_or_default()
             .saturating_to(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+    use alloy::sol_types::{SolCall, SolInterface};
+
+    alloy::sol! {
+        interface ITestMemoryDispatch {
+            function setValues(uint256[] values) external;
+        }
+    }
+
+    #[test]
+    fn abi_decoder_rejects_allocation_above_limit() {
+        let mut calldata = ITestMemoryDispatch::setValuesCall::SELECTOR.to_vec();
+        calldata.extend(U256::from(32).to_be_bytes::<32>());
+        calldata.extend(U256::from(ABI_DECODER_MEMORY_LIMIT as u64).to_be_bytes::<32>());
+
+        let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+            &calldata,
+            abi_decoder_config(),
+        );
+        assert!(result.is_err());
+    }
 }

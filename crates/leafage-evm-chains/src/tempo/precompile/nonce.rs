@@ -232,7 +232,12 @@ impl Precompile for NonceManager {
 
         dispatch_call(
             calldata,
-            INonce::INonceCalls::abi_decode,
+            |data| {
+                INonce::INonceCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 INonce::INonceCalls::getNonce(call) => view(call, |c| self.get_nonce(c)),
             },

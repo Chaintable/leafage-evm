@@ -155,7 +155,12 @@ impl Precompile for SignatureVerifier {
 
         dispatch_call(
             calldata,
-            ISignatureVerifier::ISignatureVerifierCalls::abi_decode,
+            |data| {
+                ISignatureVerifier::ISignatureVerifierCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 ISignatureVerifier::ISignatureVerifierCalls::recover(c) => {
                     view(c, |c| self.recover(c.hash, c.signature))

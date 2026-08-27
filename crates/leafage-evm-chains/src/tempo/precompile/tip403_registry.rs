@@ -883,7 +883,12 @@ impl Precompile for TIP403Registry {
 
         dispatch_call(
             calldata,
-            ITIP403Registry::ITIP403RegistryCalls::abi_decode,
+            |data| {
+                ITIP403Registry::ITIP403RegistryCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 ITIP403Registry::ITIP403RegistryCalls::policyIdCounter(call) => {
                     view(call, |_| self.policy_id_counter())

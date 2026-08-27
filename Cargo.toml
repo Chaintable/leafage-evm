@@ -133,6 +133,19 @@ arc-swap = "1.7"
 # for test
 metrics-util = "0.19"
 
+[patch.crates-io]
+# Tempo v1.13.1 decoder memory-limit backport. Keep the full Alloy Core set on
+# one revision so sol! macro output and runtime decoding types remain aligned.
+alloy-dyn-abi = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-json-abi = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-primitives = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-sol-macro = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-sol-macro-expander = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-sol-macro-input = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+alloy-sol-types = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+syn-solidity = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
+
 [profile.release]
 opt-level = 3
 debug = true
