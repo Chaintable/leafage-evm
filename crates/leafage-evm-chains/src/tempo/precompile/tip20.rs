@@ -525,7 +525,22 @@ impl TIP20Token {
 
     /// Returns the TIP-403 transfer policy ID governing this token's transfers.
     pub fn transfer_policy_id(&self) -> Result<u64> {
+        if self.storage.spec().is_t9() {
+            if let Some(policy_id) = super::tip403_registry::TIP403Registry::new()
+                .registered_token_transfer_policy_id(self.address)?
+            {
+                return Ok(policy_id);
+            }
+        }
+        self.legacy_transfer_policy_id()
+    }
+
+    pub(crate) fn legacy_transfer_policy_id(&self) -> Result<u64> {
         self.transfer_policy_id.read()
+    }
+
+    pub(crate) fn delete_legacy_transfer_policy_id(&mut self) -> Result<()> {
+        self.transfer_policy_id.delete()
     }
 
     /// Returns the PAUSE_ROLE constant.
@@ -634,7 +649,7 @@ impl TIP20Token {
     /// Reads the token's `transfer_policy_id`, then checks sender and recipient
     /// authorization against TIP403Registry.
     pub fn is_transfer_authorized(&self, from: Address, to: Address) -> Result<bool> {
-        let policy_id = self.transfer_policy_id.read()?;
+        let policy_id = self.transfer_policy_id()?;
         let registry = super::tip403_registry::TIP403Registry::new();
 
         // T2+ short-circuit: skip recipient check if sender fails.
@@ -670,7 +685,7 @@ impl TIP20Token {
         &self,
         checks: &[(Address, super::tip403_registry::AuthRole)],
     ) -> Result<()> {
-        let policy_id = self.transfer_policy_id.read()?;
+        let policy_id = self.transfer_policy_id()?;
         let registry = super::tip403_registry::TIP403Registry::new();
         for &(account, role) in checks {
             if !registry.is_authorized_as(policy_id, account, role)? {
@@ -847,7 +862,15 @@ impl TIP20Token {
         self.next_quote_token.write(quote_token)?;
 
         self.supply_cap.write(U256::from(u128::MAX))?;
-        self.transfer_policy_id.write(1)?;
+        if self.storage.spec().is_t9() {
+            super::tip403_registry::TIP403Registry::new().set_token_transfer_policy(
+                self.address,
+                super::tip403_registry::ALLOW_ALL_POLICY_ID,
+            )?;
+        } else {
+            self.transfer_policy_id
+                .write(super::tip403_registry::ALLOW_ALL_POLICY_ID)?;
+        }
 
         self.initialize_roles()?;
         self.grant_default_admin(msg_sender, admin)
@@ -970,7 +993,12 @@ impl TIP20Token {
                 ITIP20::InvalidTransferPolicyId {}.abi_encode().into(),
             ));
         }
-        self.transfer_policy_id.write(call.newPolicyId)?;
+        if self.storage.spec().is_t9() {
+            super::tip403_registry::TIP403Registry::new()
+                .set_token_transfer_policy(self.address, call.newPolicyId)?;
+        } else {
+            self.transfer_policy_id.write(call.newPolicyId)?;
+        }
 
         self.emit_event(ITIP20::TransferPolicyUpdate {
             updater: msg_sender,
@@ -1417,7 +1445,7 @@ impl TIP20Token {
             to.validate()?;
         }
 
-        let policy_id = self.transfer_policy_id.read()?;
+        let policy_id = self.transfer_policy_id()?;
         if !super::tip403_registry::TIP403Registry::new().is_authorized_as(
             policy_id,
             to.target,
@@ -1672,7 +1700,7 @@ impl TIP20Token {
         }
 
         // TIP403Registry: verify sender is NOT authorized (burn_blocked targets blacklisted accounts)
-        let policy_id = self.transfer_policy_id.read()?;
+        let policy_id = self.transfer_policy_id()?;
         if super::tip403_registry::TIP403Registry::new().is_authorized_as(
             policy_id,
             owner,
