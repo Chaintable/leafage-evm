@@ -11,6 +11,7 @@
 
 pub mod account_keychain;
 pub mod address_registry;
+pub mod current_committee;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
@@ -70,6 +71,9 @@ pub const SIGNATURE_VERIFIER_ADDRESS: Address =
 /// T3+ TIP-1022 virtual address registry.
 pub const ADDRESS_REGISTRY_ADDRESS: Address =
     address!("0xFDC0000000000000000000000000000000000000");
+/// T8+ TIP-1070 current consensus committee.
+pub const CURRENT_COMMITTEE_ADDRESS: Address =
+    address!("0xC077E00000000000000000000000000000000000");
 
 // ===========================================================================
 // Gas constants
@@ -325,6 +329,8 @@ pub fn extend_tempo_precompiles(
             Some(create_signature_verifier_precompile(chain_id))
         } else if *address == ADDRESS_REGISTRY_ADDRESS && spec.is_t3() {
             Some(create_address_registry_precompile(chain_id))
+        } else if *address == CURRENT_COMMITTEE_ADDRESS && spec.is_t8() {
+            Some(create_current_committee_precompile(chain_id))
         } else {
             None
         }
@@ -394,6 +400,12 @@ fn create_signature_verifier_precompile(chain_id: u64) -> DynPrecompile {
 fn create_address_registry_precompile(chain_id: u64) -> DynPrecompile {
     tempo_precompile!("AddressRegistry", chain_id, |input| {
         address_registry::AddressRegistry::new()
+    })
+}
+
+fn create_current_committee_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("CurrentCommittee", chain_id, |input| {
+        current_committee::CurrentCommittee::new()
     })
 }
 
