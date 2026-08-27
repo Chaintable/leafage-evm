@@ -24,6 +24,9 @@ pub mod tip403_registry;
 pub mod validator_config;
 pub mod validator_config_v2;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};
 pub use storage::{
     CheckpointGuard, ContractStorage, LeafageStorageProvider, PrecompileStorageProvider,
