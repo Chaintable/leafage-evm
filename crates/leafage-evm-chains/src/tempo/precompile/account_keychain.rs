@@ -1900,6 +1900,56 @@ mod tests {
     }
 
     #[test]
+    fn aliased_set_allowed_calls_calldata_respects_decoder_memory_limit() {
+        fn word(value: usize) -> [u8; 32] {
+            let mut out = [0_u8; 32];
+            out[24..].copy_from_slice(&(value as u64).to_be_bytes());
+            out
+        }
+
+        fn aliased_calldata(width: usize) -> Vec<u8> {
+            let mut data = Vec::new();
+            data.extend(IAccountKeychain::setAllowedCallsCall::SELECTOR);
+            data.extend(word(0));
+            data.extend(word(64));
+
+            data.extend(word(width));
+            for _ in 0..width {
+                data.extend(word(width * 32));
+            }
+
+            data.extend(word(1));
+            data.extend(word(64));
+            data.extend(word(width));
+            for _ in 0..width {
+                data.extend(word(width * 32));
+            }
+
+            let mut selector = [0_u8; 32];
+            selector[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            data.extend(selector);
+            data.extend(word(64));
+            data.extend(word(width));
+            for index in 0..width {
+                data.extend(word(index + 1));
+            }
+
+            assert_eq!(data.len(), 292 + 96 * width);
+            data
+        }
+
+        let calldata = aliased_calldata(500);
+        assert_eq!(calldata.len(), 48_292);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T3);
+        let output = StorageCtx::enter(&mut provider, || {
+            AccountKeychain::new().call(&calldata, Address::ZERO)
+        })
+        .unwrap();
+        assert!(output.reverted);
+        assert!(output.bytes.is_empty());
+    }
+
+    #[test]
     fn t6_root_authorizes_admin_key() {
         let account = Address::repeat_byte(0x11);
         let admin_key = Address::repeat_byte(0x22);

@@ -27,6 +27,7 @@ pub mod tip20_factory;
 pub mod tip403_registry;
 pub mod validator_config;
 pub mod validator_config_v2;
+pub mod zone_factory;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -86,6 +87,21 @@ pub const STORAGE_CREDITS_ADDRESS: Address =
 /// T8+ TIP-1070 current consensus committee.
 pub const CURRENT_COMMITTEE_ADDRESS: Address =
     address!("0xC077E00000000000000000000000000000000000");
+/// T10+ TIP-1091 native ZoneFactory.
+pub const ZONE_FACTORY_ADDRESS: Address =
+    address!("0x5AF2000000000000000000000000000000000000");
+/// Initial ZoneFactory owner written by the writer at the T10 activation boundary.
+pub const INITIAL_ZONE_FACTORY_OWNER: Address =
+    address!("0xaF571FD4B3AD43a5807A5E58bFb25ea1aB327A14");
+/// Protocol-managed shared ZonePortal implementation.
+pub const ZONE_PORTAL_IMPL_ADDRESS: Address =
+    address!("0x5AD1000000000000000000000000000000000000");
+/// Protocol-managed Zone proof verifier.
+pub const ZONE_VERIFIER_ADDRESS: Address =
+    address!("0x5A56000000000000000000000000000000000000");
+/// Protocol-managed shared ZoneMessenger.
+pub const ZONE_MESSENGER_ADDRESS: Address =
+    address!("0x5A4D000000000000000000000000000000000000");
 
 // ===========================================================================
 // Gas constants
@@ -349,6 +365,8 @@ pub fn extend_tempo_precompiles(
             Some(create_storage_credits_precompile(chain_id))
         } else if *address == CURRENT_COMMITTEE_ADDRESS && spec.is_t8() {
             Some(create_current_committee_precompile(chain_id))
+        } else if *address == ZONE_FACTORY_ADDRESS && spec.is_t10() {
+            Some(create_zone_factory_precompile(chain_id))
         } else {
             None
         }
@@ -445,6 +463,12 @@ fn create_current_committee_precompile(chain_id: u64) -> DynPrecompile {
     })
 }
 
+fn create_zone_factory_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("ZoneFactory", chain_id, |input| {
+        zone_factory::ZoneFactory::new()
+    })
+}
+
 // ===========================================================================
 // caller_gas_allowance — read TIP-20 balance for estimateGas gas cap
 // ===========================================================================
@@ -531,6 +555,7 @@ mod tests {
     use super::*;
     use alloy::primitives::U256;
     use alloy::sol_types::{SolCall, SolInterface};
+    use revm::precompile::{PrecompileSpecId, Precompiles};
 
     alloy::sol! {
         interface ITestMemoryDispatch {
@@ -549,5 +574,19 @@ mod tests {
             abi_decoder_config(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn zone_factory_registration_activates_at_t10() {
+        let mut t9 = PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::OSAKA));
+        extend_tempo_precompiles(&mut t9, 4217, crate::tempo::hardfork::TempoHardfork::T9);
+        assert!(t9.get(&ZONE_FACTORY_ADDRESS).is_none());
+
+        let mut t10 = PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::OSAKA));
+        extend_tempo_precompiles(&mut t10, 4217, crate::tempo::hardfork::TempoHardfork::T10);
+        assert!(t10.get(&ZONE_FACTORY_ADDRESS).is_some());
+        assert!(t10.get(&ZONE_PORTAL_IMPL_ADDRESS).is_none());
+        assert!(t10.get(&ZONE_VERIFIER_ADDRESS).is_none());
+        assert!(t10.get(&ZONE_MESSENGER_ADDRESS).is_none());
     }
 }

@@ -30,11 +30,17 @@ pub trait TempoAddressExt {
     /// NOTE: prefix alone does not prove a token exists — use `TIP20Factory::is_tip20()` for that.
     const TIP20_PREFIX: [u8; 12];
 
+    /// 12-byte prefix shared by all TIP-1091 ZonePortal addresses.
+    const ZONE_PORTAL_PREFIX: [u8; 12];
+
     /// 10-byte magic value occupying bytes `[4:14]` of every TIP-1022 virtual address.
     const VIRTUAL_MAGIC: [u8; 10];
 
     /// Returns `true` if the address has the TIP-20 token prefix.
     fn is_tip20(&self) -> bool;
+
+    /// Returns the nonzero zone ID encoded in a ZonePortal address.
+    fn zone_portal_id(&self) -> Option<u64>;
 
     /// Returns `true` if the address matches the TIP-1022 virtual-address format
     /// (bytes `[4:14]` == [`Self::VIRTUAL_MAGIC`]).
@@ -54,10 +60,23 @@ pub trait TempoAddressExt {
 
 impl TempoAddressExt for Address {
     const TIP20_PREFIX: [u8; 12] = TIP20_TOKEN_PREFIX;
+    const ZONE_PORTAL_PREFIX: [u8; 12] = hex!("5AD000000000000000000000");
     const VIRTUAL_MAGIC: [u8; 10] = [0xFD; 10];
 
     fn is_tip20(&self) -> bool {
         is_tip20_prefix(*self)
+    }
+
+    fn zone_portal_id(&self) -> Option<u64> {
+        let bytes = self.as_slice();
+        if !bytes.starts_with(&Self::ZONE_PORTAL_PREFIX) {
+            return None;
+        }
+
+        let mut suffix = [0u8; 8];
+        suffix.copy_from_slice(&bytes[12..]);
+        let zone_id = u64::from_be_bytes(suffix);
+        (zone_id != 0).then_some(zone_id)
     }
 
     fn is_virtual(&self) -> bool {
@@ -146,6 +165,17 @@ mod tests {
         // Path-USD (the canonical TIP-20 fee token) shares the prefix.
         let path_usd = address!("0x20C0000000000000000000000000000000000000");
         assert!(path_usd.is_tip20());
+    }
+
+    #[test]
+    fn zone_portal_id_requires_prefix_and_nonzero_suffix() {
+        let portal = address!("0x5AD000000000000000000000000000000000002a");
+        assert_eq!(portal.zone_portal_id(), Some(42));
+        assert_eq!(
+            address!("0x5AD0000000000000000000000000000000000000").zone_portal_id(),
+            None
+        );
+        assert_eq!(Address::repeat_byte(0x2a).zone_portal_id(), None);
     }
 
     #[test]

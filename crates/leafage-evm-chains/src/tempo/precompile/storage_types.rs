@@ -965,6 +965,20 @@ impl_uint_storable! {
     u128, 16;
 }
 
+impl StorageKey for u8 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
+impl StorageKey for u32 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
 impl StorageKey for u64 {
     #[inline]
     fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
