@@ -132,6 +132,13 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                 (GasId::new(255), 250_000),
             ]);
         }
+        if hardfork.is_t7() {
+            gas_params.override_gas([
+                (GasId::sstore_set_without_load_cost(), 5_000),
+                (GasId::sstore_set_refund(), 5_000),
+                (GasId::sstore_clearing_slot_refund(), 0),
+            ]);
+        }
         cfg_env.gas_params = gas_params;
         let spec: revm::primitives::hardfork::SpecId = cfg_env.spec.clone().into();
 
@@ -466,6 +473,25 @@ mod tests {
             evm.inner.ctx.cfg.gas_params.get(GasId::new_account_cost()),
             250_000
         );
+    }
+
+    #[test]
+    fn test_t7_storage_credit_gas_params() {
+        let evm = TempoEvm::new(
+            make_env_default_spec(1_783_605_600),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_params = &evm.inner.ctx.cfg.gas_params;
+
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T7);
+        assert_eq!(
+            gas_params.get(GasId::sstore_set_without_load_cost()),
+            5_000
+        );
+        assert_eq!(gas_params.get(GasId::sstore_set_refund()), 5_000);
+        assert_eq!(gas_params.get(GasId::sstore_clearing_slot_refund()), 0);
     }
 
     #[test]

@@ -313,6 +313,13 @@ impl<'a> LeafageStorageProvider<'a> {
                 (GasId::new(255), 250_000),
             ]);
         }
+        if self.spec.is_t7() {
+            gp.override_gas([
+                (GasId::sstore_set_without_load_cost(), 5_000),
+                (GasId::sstore_set_refund(), 5_000),
+                (GasId::sstore_clearing_slot_refund(), 0),
+            ]);
+        }
         gp
     }
 

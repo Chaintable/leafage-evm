@@ -19,6 +19,7 @@ pub mod receive_policy_guard;
 pub mod signature_verifier;
 pub mod stablecoin_dex;
 pub mod storage;
+pub mod storage_credits;
 pub mod storage_types;
 pub mod tip20;
 pub mod tip20_channel_reserve;
@@ -79,6 +80,9 @@ pub const ADDRESS_REGISTRY_ADDRESS: Address =
 /// T6+ TIP-1028 custody for blocked inbound TIP-20 transfers and mints.
 pub const RECEIVE_POLICY_GUARD_ADDRESS: Address =
     address!("0xB10C000000000000000000000000000000000000");
+/// T7+ TIP-1060 storage credits.
+pub const STORAGE_CREDITS_ADDRESS: Address =
+    address!("0x1060000000000000000000000000000000000000");
 /// T8+ TIP-1070 current consensus committee.
 pub const CURRENT_COMMITTEE_ADDRESS: Address =
     address!("0xC077E00000000000000000000000000000000000");
@@ -341,6 +345,8 @@ pub fn extend_tempo_precompiles(
             Some(create_tip20_channel_reserve_precompile(chain_id))
         } else if *address == RECEIVE_POLICY_GUARD_ADDRESS && spec.is_t6() {
             Some(create_receive_policy_guard_precompile(chain_id))
+        } else if *address == STORAGE_CREDITS_ADDRESS && spec.is_t7() {
+            Some(create_storage_credits_precompile(chain_id))
         } else if *address == CURRENT_COMMITTEE_ADDRESS && spec.is_t8() {
             Some(create_current_committee_precompile(chain_id))
         } else {
@@ -424,6 +430,12 @@ fn create_tip20_channel_reserve_precompile(chain_id: u64) -> DynPrecompile {
 fn create_receive_policy_guard_precompile(chain_id: u64) -> DynPrecompile {
     tempo_precompile!("ReceivePolicyGuard", chain_id, |input| {
         receive_policy_guard::ReceivePolicyGuard::new()
+    })
+}
+
+fn create_storage_credits_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("StorageCredits", chain_id, |input| {
+        storage_credits::StorageCredits::new()
     })
 }
 
