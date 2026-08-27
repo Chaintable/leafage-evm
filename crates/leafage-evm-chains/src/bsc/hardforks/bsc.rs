@@ -61,6 +61,12 @@ hardfork!(
         /// BSC `Maxwell` hardfork
         #[default]
         Maxwell,
+        /// BSC `Fermi` hardfork
+        Fermi,
+        /// BSC `Osaka` hardfork
+        Osaka,
+        /// BSC `Mendel` hardfork
+        Mendel,
     }
 );
 
@@ -102,7 +108,11 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::HaberFix
             | BscHardfork::Bohr
             | BscHardfork::Tycho => SpecId::CANCUN,
-            BscHardfork::Pascal | BscHardfork::Lorentz | BscHardfork::Maxwell => SpecId::PRAGUE,
+            BscHardfork::Pascal
+            | BscHardfork::Lorentz
+            | BscHardfork::Maxwell
+            | BscHardfork::Fermi => SpecId::PRAGUE,
+            BscHardfork::Osaka | BscHardfork::Mendel => SpecId::OSAKA,
         }
     }
 }

@@ -45,6 +45,10 @@ impl<DB: Database, I> BscEvm<DB, I> {
         let precompiles =
             PrecompilesMap::from_static(BscPrecompiles::new(env.cfg_env.spec).precompiles());
 
+        // Match the instruction table to the configured spec; `new_mainnet()` defaults to
+        // the latest spec (Prague), which undercharges pre-Berlin SLOAD in early blocks.
+        let spec_id = SpecId::from(env.cfg_env.spec);
+
         Self {
             inner: EvmCtx {
                 ctx: Context {
@@ -57,7 +61,7 @@ impl<DB: Database, I> BscEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: EthInstructions::new_mainnet_with_spec(SpecId::default()),
+                instruction: EthInstructions::new_mainnet_with_spec(spec_id),
                 precompiles,
                 frame_stack: Default::default(),
             },

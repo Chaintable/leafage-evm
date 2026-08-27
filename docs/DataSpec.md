@@ -179,6 +179,27 @@ s3://{bucket_name}/{chain_id}/{version}/{data_type}
 
 **Content**: Binary RLP data
 
+Keyed by **state root**, and written only when the state root actually changes.
+Blocks that leave the root untouched have no object; the reader synthesizes an
+empty `BlockStorageDiff` for them instead of fetching.
+
+##### HyperEVM (chain 999): keyed by block hash
+
+**Path**: `s3://{bucket_name}/999/{version}/{block_hash}/stateDiff`
+
+HyperEVM reports a **zero state root on every block**, which breaks both halves
+of the layout above: a single object would serve the entire chain, and the
+"root unchanged since the parent" test — normally meaning the block wrote no
+state — matches every block, suppressing every diff.
+
+So chain `999` alone keys the object by **block hash**, matching the Block Info
+object above, and the producer writes one for *every* block — including blocks
+that change no state, which carry an empty `BlockStorageDiff`. The reader
+fetches it for every block and never infers an empty diff from the state root.
+
+No other chain is affected. The gate is `state_diff_keyed_by_block_hash()` in
+`bin/leafage-evm/src/utils.rs`, keyed off the configured `s3_chain_id`.
+
 #### 3. Block Hash Index (Optional, for number-based lookup)
 
 **Path**: `s3://{outer_bucket_name}/{chain_id}/{version}/{block_number}/{block_hash}`
@@ -237,6 +258,13 @@ For each new block:
    Content: rlp_encode(BlockStorageDiff)
    ```
 
+   On chain `999` (HyperEVM), key by block hash and upload for *every* block,
+   including state-unchanged ones:
+   ```
+   PUT s3://{bucket}/999/{version}/{block_hash}/stateDiff
+   Content: rlp_encode(BlockStorageDiff)
+   ```
+
 3. **Send Kafka Notification**
    ```
    Topic: {configured_topic}
@@ -251,6 +279,7 @@ For each new block:
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
@@ -335,7 +364,7 @@ These APIs return a `Block` structure with:
 
 ### Rationale
 
-leafage-evm is designed as a lightweight EVM executor focused on state queries (`eth_call`, `eth_estimateGas`). It does not:
+leafage-evm is designed as a lightweight EVM executor focused on state queries (`eth_call`, `estimateGas`). It does not:
 - Store full transaction data
 - Process transaction receipts
 - Maintain transaction indices

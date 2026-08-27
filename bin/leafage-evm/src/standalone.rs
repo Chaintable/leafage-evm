@@ -1,12 +1,18 @@
+use crate::bundle::BundleReadArgs;
 use crate::initializer::initialize_check;
 use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
-use crate::updater::updater_build;
-use crate::utils::{EtcdRegisterConfig, KafkaS3Config};
+use crate::updater::{updater_build, UpdaterHandle, UpdaterInputPolicy};
+use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
+use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
+use leafage_evm_chains::base::BaseHardfork;
+use leafage_evm_chains::citrea::CitreaHardfork;
+use leafage_evm_chains::hemi::HemiHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv, TokenCollector};
@@ -14,7 +20,6 @@ use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
-use leafage_evm_chains::citrea::CitreaHardfork;
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -34,7 +39,27 @@ pub struct Command {
 
     /// The type of evm to use for this node.
     /// Default: mainnet
-    #[arg(long, value_parser = ["mainnet", "op", "bsc", "cosmos", "mantlev2", "tempo", "citrea", "iotex"], default_value = "mainnet")]
+    #[arg(
+        long,
+        value_parser = [
+            "mainnet",
+            "arc",
+            "arbitrum",
+            "op",
+            "base",
+            "bsc",
+            "cosmos",
+            "mantlev2",
+            "tempo",
+            "citrea",
+            "iotex",
+            "moonbeam",
+            "moonriver",
+            "polygon",
+            "hemi",
+        ],
+        default_value = "mainnet"
+    )]
     evm_type: String,
 
     /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
@@ -47,9 +72,9 @@ pub struct Command {
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
-    /// if not specified, the default spec_id is u8::MAX
-    #[arg(long, default_value = "255")]
-    spec_id: u8,
+    /// If omitted, use the evm-type's built-in spec.
+    #[arg(long)]
+    spec_id: Option<u8>,
 
     /// Maximum gas limit for RPC methods
     /// [default: 100000000]
@@ -90,12 +115,61 @@ pub struct Command {
     #[arg(long, default_value = "5000")]
     max_connections: u32,
 
+    /// Maximum number of concurrently executing EVM requests
+    /// (eth_call / multicall / estimateGas / simulate / trace).
+    /// Default: 0 (unbounded, same as before)
+    ///
+    /// EVM execution is CPU-bound; without a cap a load spike can put
+    /// hundreds of executions on the blocking pool at once and inflate
+    /// tail latency through CPU oversubscription. A value around 2-4x
+    /// the core count keeps excess requests queued on the async side
+    /// (cheap and cancellable) instead.
+    #[arg(long, default_value = "0")]
+    evm_exec_concurrency: usize,
+
+    /// Maximum number of concurrently executing state reads
+    /// (getAddressCode / getStorageAt / nonce / balance and
+    /// blockx_stateReadBatch).
+    /// Default: 0 (unbounded, same as before)
+    ///
+    /// State reads are disk-bound and currently the only path that can
+    /// fill the blocking pool without any admission while EVM execution
+    /// is capped by --evm-exec-concurrency. A separate semaphore keeps
+    /// reads and execution from starving each other. The production
+    /// value must come from load-testing the target instance type, not
+    /// from guessing off max_connections or the EVM limiter.
+    #[arg(long, default_value = "0")]
+    state_read_concurrency: usize,
+
+    /// The TCP accept-queue backlog for the HTTP-RPC listener.
+    /// Default: 4096
+    ///
+    /// The kernel caps the effective queue at `min(this, net.core.somaxconn)`.
+    /// A too-small backlog drops completing handshakes under connection bursts
+    /// (kernel `ListenOverflows`), which upstream proxies observe as
+    /// `dial ...: i/o timeout`. Keep this <= the pod's `net.core.somaxconn`.
+    #[arg(long, default_value = "4096")]
+    listen_backlog: u32,
+
     /// The depth limit of the diff tree.
     /// Default: 64 for eth mainnet
     ///
     /// This limit is finalized block number - current block number.
     #[arg(long, default_value = "64")]
     diff_depth_limit: usize,
+
+    /// The reorg buffer depth for S3 catch-up.
+    ///
+    /// During S3 catch-up the by-number index can resolve a wrong branch
+    /// around the chain tip while a reorg is in flight, leaving the hand-off
+    /// block disconnected from the Kafka stream. With a non-zero value, the
+    /// last `catchup_safe_depth` blocks below the Kafka head are backfilled by
+    /// following the exact parent-hash chain instead of the by-number index.
+    /// Set it above the chain's maximum reorg depth (e.g. 64 for Moonriver).
+    ///
+    /// Default: 0 (disabled; identical to the legacy by-number-only behavior).
+    #[arg(long, default_value = "0")]
+    catchup_safe_depth: usize,
 
     /// The size of the account cache.
     /// Default: 200000
@@ -152,6 +226,9 @@ pub struct Command {
     /// This config is used to set the kafka s3 config.
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
+
+    #[command(flatten)]
+    bundle_read: BundleReadArgs,
 
     /// The etcd register config path
     /// Default: None
@@ -254,12 +331,33 @@ pub struct Command {
     #[arg(long, default_value = "false")]
     disable_auto_compactions: bool,
 
+    /// Use ZSTD-with-dict compression at deep levels for the three large
+    /// archive CFs (BlockHashToBlockInfo, AddressToAccount, AddressToStorage).
+    /// Default: false (uniform LZ4 — same as the pre-refactor build).
+    ///
+    /// When enabled, archive disk usage shrinks by ~15-20% over time as
+    /// compaction rewrites deep levels, at the cost of ~2× compaction CPU and
+    /// ~3× cold-read decompression latency on deep-level reads. RocksDB
+    /// records compression type per SST, so existing data remains readable
+    /// regardless of this flag — toggling only affects newly written SSTs.
+    /// Archive-only (RocksDB archive mode).
+    #[arg(long, default_value = "false")]
+    archive_zstd_compression: bool,
+
     /// Iterator timeout in seconds for archive mode.
     /// Default: 0 (disabled)
     /// When > 0, StateDB iterators will be tracked and logged when they exceed this timeout.
     /// At 2x timeout, iterators are force-released to unblock RocksDB compaction.
     #[arg(long, default_value = "0")]
     iterator_timeout_secs: u64,
+
+    /// Size (MB) of the in-memory content-addressed code cache
+    /// (code_hash → code) for archive reads. Serves debank_getAddressCode /
+    /// eth_getCode / multicall code loads at any block height without
+    /// touching the HashToCode CF. 0 disables.
+    /// Archive-only (RocksDB archive mode).
+    #[arg(long, env = "ARCHIVE_CODE_CACHE_MB", default_value = "256")]
+    archive_code_cache_mb: u64,
 
     /// Gas estimation buffer percentage (100 = no buffer, 120 = +20% buffer)
     /// Default: 100
@@ -275,6 +373,26 @@ pub struct Command {
     /// will be automatically saved to this file for future warmup use.
     #[arg(long, default_value = "")]
     token_collector_path: String,
+
+    /// The node type to register to etcd.
+    /// Default: auto (derive from --archive)
+    ///
+    /// `auto` registers archive nodes as archive and all others as state.
+    /// `state` / `archive` override that explicitly, regardless of --archive.
+    #[arg(long, value_enum, default_value_t = NodeTypeArg::Auto)]
+    node_type: NodeTypeArg,
+
+    /// Use the inverted (descending) block-height key encoding for archive
+    /// account/storage reads and writes.
+    /// Default: false (legacy ascending encoding)
+    ///
+    /// The descending encoding turns historical reads into forward seeks that
+    /// use the prefix bloom (much faster `eth_call`). It is a different on-disk
+    /// key layout: only enable this against an archive DB built (via
+    /// `archive-init` / re-sync) with the same flag — mixing layouts silently
+    /// returns wrong values. Has no effect in state-node (non-archive) mode.
+    #[arg(long, default_value_t = false)]
+    inverted_block_encoding: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -301,22 +419,14 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "tempo" {
         return Ok(4217);
     }
+    if arg == "arc" {
+        return Ok(ARC_MAINNET_CHAIN_ID);
+    }
     if arg.parse::<u64>().is_ok() {
         return Ok(arg.parse().unwrap());
     } else {
         bail!("invalid chain cfg: {}", arg);
     }
-}
-
-fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
-    let kafka_s3_config: KafkaS3Config;
-    if arg.starts_with("/") {
-        let file = std::fs::File::open(arg)?;
-        kafka_s3_config = serde_json::from_reader(file)?;
-    } else {
-        kafka_s3_config = serde_json::from_str(arg)?;
-    }
-    Ok(kafka_s3_config)
 }
 
 fn parse_etcd_config(arg: &str) -> Result<EtcdRegisterConfig> {
@@ -350,13 +460,60 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
-/// Resolve `--spec-id` to a typed EVM spec; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
-fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Result<T> {
+/// Resolve `--spec-id` to a typed EVM spec; omitted or `u8::MAX` keeps the built-in spec.
+fn resolve_spec<T: TryFrom<u8>>(spec_id: Option<u8>, default: T, type_label: &str) -> Result<T> {
+    let Some(spec_id) = spec_id else {
+        return Ok(default);
+    };
     if spec_id == u8::MAX {
         return Ok(default);
     }
     T::try_from(spec_id)
         .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
+}
+
+const ARC_KAFKA_REQUIRED: &str =
+    "Arc finalized input requires --kafka-s3-config; HTTP-only and disabled updaters are unsupported";
+
+fn readiness_is_healthy(startup_ready: &AtomicBool, arc_fatal: &AtomicBool) -> bool {
+    startup_ready.load(std::sync::atomic::Ordering::SeqCst)
+        && !arc_fatal.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn readiness_response(
+    startup_ready: &AtomicBool,
+    arc_fatal: &AtomicBool,
+) -> (axum::http::StatusCode, &'static str) {
+    if readiness_is_healthy(startup_ready, arc_fatal) {
+        (axum::http::StatusCode::OK, "ready")
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    }
+}
+
+fn arc_fatal_exit_result(
+    result: std::result::Result<anyhow::Error, tokio::sync::oneshot::error::RecvError>,
+) -> Result<()> {
+    let error = result.map_err(|_| anyhow!("Arc updater fatal channel closed unexpectedly"))?;
+    Err(error.context("Arc updater stopped on invalid finalized input"))
+}
+
+async fn stop_services(
+    updater_stop: tokio::sync::watch::Sender<()>,
+    rpc_handle: jsonrpsee::server::ServerHandle,
+    registry_stop: tokio::sync::watch::Sender<()>,
+    stop_wait_timeout: u64,
+) -> Result<()> {
+    info!("stopping leafage server...");
+    let _ = updater_stop.send(());
+    let _ = registry_stop.send(());
+    info!(
+        "waiting for etcd lease to expire in {} seconds...",
+        stop_wait_timeout
+    );
+    time::sleep(std::time::Duration::from_secs(stop_wait_timeout)).await;
+    let _ = rpc_handle.stop();
+    Ok(())
 }
 
 impl Command {
@@ -365,6 +522,9 @@ impl Command {
         let evm_type = self.evm_type.clone();
         let custom_evm_cfg = self.evm_custom_config.clone();
         let gas_cap = self.rpc_gas_cap;
+        if chain_id == ARC_MAINNET_CHAIN_ID && evm_type != "arc" {
+            bail!("chain ID 5042 requires --evm-type arc");
+        }
         match evm_type.as_str() {
             "mainnet" => {
                 let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
@@ -377,6 +537,49 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
+            "arc" => {
+                if chain_id != ARC_MAINNET_CHAIN_ID {
+                    bail!("Arc EVM requires chain ID 5042");
+                }
+                if self.spec_id.is_some() {
+                    bail!("Arc EVM uses its network hardfork schedule; --spec-id is unsupported");
+                }
+                if custom_evm_cfg.is_some() {
+                    bail!("Arc EVM does not accept --evm-custom-config");
+                }
+                if self.ovm_address.is_some() {
+                    bail!("Arc EVM does not accept --ovm-address");
+                }
+                if self.normalize_state_key {
+                    bail!("Arc EVM requires --normalize-state-key=false");
+                }
+
+                let arc_config = ArcChainConfig::mainnet();
+                let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
+                chain_cfg.chain_id = arc_config.chain_id();
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
+            }
+            "arbitrum" => {
+                // RPC execution replaces this fallback with the target block's
+                // ArbOS-derived hardfork whenever Nitro header metadata is available.
+                let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                let custom_evm_cfg = custom_evm_cfg
+                    .map(|str| {
+                        serde_json::from_str(&str).map_err(|err| {
+                            anyhow!("cannot parse arbitrum custom evm config: {}", err)
+                        })
+                    })
+                    .transpose()?;
+                Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
+            }
             "op" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
                 chain_cfg.disable_balance_check = true;
@@ -386,6 +589,18 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
+            }
+            "base" => {
+                // Base forked from the OP stack; execution is OP-equivalent
+                // (Beryl precompiles are layered on separately).
+                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Base(chain_cfg))
             }
             "bsc" => {
                 let mut chain_cfg = CfgEnv::default();
@@ -425,6 +640,36 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Iotex(chain_cfg))
             }
+            "polygon" => {
+                let spec = resolve_spec(
+                    self.spec_id,
+                    leafage_evm_chains::polygon::PolygonHardfork::default(),
+                    "polygon",
+                )?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Polygon(chain_cfg))
+            }
+            // Moonbeam and Moonriver share an identical EVM and precompile set;
+            // they differ only by chain id (passed via --chain-cfg) and native
+            // token metadata, which leafage does not need. Both map to the same
+            // MoonbeamHardfork executor.
+            "moonbeam" | "moonriver" => {
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, &evm_type)?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Moonbeam(chain_cfg))
+            }
             "mantlev2" => {
                 let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
                 chain_cfg.disable_balance_check = true;
@@ -436,7 +681,9 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mantle(chain_cfg))
             }
             "tempo" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(leafage_evm_chains::tempo::hardfork::TempoHardfork::default());
+                let mut chain_cfg = CfgEnv::new_with_spec(
+                    leafage_evm_chains::tempo::hardfork::TempoHardfork::default(),
+                );
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -446,7 +693,8 @@ impl Command {
                 Ok(MultiChainCfgEnv::Tempo(chain_cfg))
             }
             "citrea" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
+                let mut chain_cfg =
+                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -455,6 +703,16 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Citrea(chain_cfg))
             }
+            "hemi" => {
+                let mut chain_cfg = CfgEnv::new_with_spec(HemiHardfork::from(OpSpecId::OSAKA));
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Hemi(chain_cfg))
+            }
             _ => bail!("Unsupported evm type"),
         }
     }
@@ -462,38 +720,73 @@ impl Command {
         &mut self,
         chain_cfg: MultiChainCfgEnv,
     ) -> Result<(
-        tokio::sync::watch::Sender<()>,
+        UpdaterHandle,
         jsonrpsee::server::ServerHandle,
         tokio::sync::watch::Sender<()>,
     )> {
         info!(target:"updater", "{:?}", self);
         info!(target:"updater", "start leafage server at {}, max_connections: {}, update_interval {:?}", self.listen_addr, self.max_connections, self.update_interval);
         if !self.prometheus_addr.is_empty() {
+            // Latency buckets (seconds) so RPC and HTTP call times export as
+            // Prometheus `_bucket`/`_count`/`_sum` histograms instead of the
+            // exporter's default summary rendering. RPC latency is grouped by
+            // `method_name`; HTTP latency is grouped by `http_method`.
+            const LATENCY_BUCKETS: &[f64] = &[
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                10.0,
+            ];
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_http_listener(self.prometheus_addr.parse::<std::net::SocketAddr>()?)
                 .add_global_label("chain_id", format!("{}", chain_cfg.chain_id()))
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full("leafage_rpc_call_time".to_string()),
+                    LATENCY_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_http_call_time".to_string(),
+                    ),
+                    LATENCY_BUCKETS,
+                )?
+                // blockx_stateReadBatch stage latencies and state-read
+                // admission queue wait; buckets must be registered per
+                // metric name or the exporter renders summaries.
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_state_batch_latency_seconds".to_string(),
+                    ),
+                    LATENCY_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_state_read_queue_wait_seconds".to_string(),
+                    ),
+                    LATENCY_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    metrics_exporter_prometheus::Matcher::Full(
+                        "leafage_state_batch_size".to_string(),
+                    ),
+                    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+                )?
                 .install()?;
             let labels = [("role", "replica".to_string())];
             let gauge = gauge!("pipeline_node_info", &labels);
             gauge.set(1.0);
         }
         let ready = Arc::new(AtomicBool::new(false));
+        let arc_fatal = Arc::new(AtomicBool::new(false));
         if !self.readiness_addr.is_empty() {
             let readiness_addr = self.readiness_addr.parse::<std::net::SocketAddr>()?;
             info!(target: "updater", "starting readiness server on {}", readiness_addr);
 
             let handle = ready.clone();
+            let fatal = arc_fatal.clone();
 
             tokio::spawn(async move {
                 let app = axum::Router::new().route(
                     "/",
-                    axum::routing::get(move || async move {
-                        if handle.load(std::sync::atomic::Ordering::SeqCst) {
-                            (axum::http::StatusCode::OK, "ready")
-                        } else {
-                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
-                        }
-                    }),
+                    axum::routing::get(move || async move { readiness_response(&handle, &fatal) }),
                 );
 
                 let listener = tokio::net::TcpListener::bind(readiness_addr)
@@ -538,6 +831,10 @@ impl Command {
                 "ROCKSDB_ITERATOR_TIMEOUT_SECS",
                 self.iterator_timeout_secs.to_string(),
             );
+            std::env::set_var(
+                "ARCHIVE_CODE_CACHE_MB",
+                self.archive_code_cache_mb.to_string(),
+            );
         }
 
         let db = MultiStorage::open(
@@ -546,6 +843,7 @@ impl Command {
             self.db_type,
             self.archive,
             self.disable_auto_compactions,
+            self.archive_zstd_compression,
         )?;
 
         // check if db shoud be initialized
@@ -560,6 +858,9 @@ impl Command {
         )
         .await?;
 
+        // MDBX has per-handle ro_txn snapshots; the shared CacheDiskLayer
+        // would blur those boundaries, so disable it for MDBX backends.
+        let enable_cache = matches!(self.db_type, StorageKind::Rocksdb);
         let tree = Arc::new(StateTree::new(
             db,
             StateTreeConfig::new(
@@ -567,12 +868,15 @@ impl Command {
                 self.account_cache_size,
                 self.storage_cache_size,
                 self.code_cache_size,
+                enable_cache,
             ),
         )?);
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
-            .with_historical_config(self.historical_rpc.clone(), self.historical_height);
+            .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+            .with_evm_exec_concurrency(self.evm_exec_concurrency)
+            .with_state_read_concurrency(self.state_read_concurrency);
 
         #[cfg(target_os = "linux")]
         {
@@ -580,13 +884,13 @@ impl Command {
         }
         if !self.readiness_addr.is_empty() {
             // Initialize token collector if path is configured (before warmup so it can be used)
-            let token_collector_path =   if !self.token_collector_path.is_empty(){
+            let token_collector_path = if !self.token_collector_path.is_empty() {
                 let collector_path = PathBuf::from(&self.token_collector_path);
                 if let Some(parent) = collector_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 collector_path
-            }else{
+            } else {
                 self.db_path.join("tokens.json")
             };
             info!(target: "updater", "token collector enabled, saving to {:?}", token_collector_path);
@@ -605,7 +909,6 @@ impl Command {
             rpc_builder = rpc_builder.with_token_collector(token_collector);
         }
 
-
         let rpc_handle = rpc_builder
             .build_and_run(
                 &self.listen_addr,
@@ -615,9 +918,15 @@ impl Command {
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
                 self.estimate_gas_buffer,
+                self.listen_backlog,
             )
             .await?;
 
+        let input_policy = if matches!(&chain_cfg, MultiChainCfgEnv::Arc(_)) {
+            UpdaterInputPolicy::ArcFinalizedLinear
+        } else {
+            UpdaterInputPolicy::Legacy
+        };
         let updater_handle = updater_build(
             tree.clone(),
             self.rpc_addr.clone(),
@@ -625,6 +934,10 @@ impl Command {
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,
+            self.catchup_safe_depth,
+            self.bundle_read.bundle_range_size_mib,
+            input_policy,
+            arc_fatal,
         )
         .await?;
 
@@ -632,7 +945,7 @@ impl Command {
             chain_cfg.chain_id(),
             self.kafka_s3_config.clone().unwrap_or_default().version,
             etcd_config.clone(),
-            self.archive,
+            self.node_type.resolve(self.archive),
         )
         .await?;
 
@@ -643,25 +956,251 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let (updater_handle, rpc_handle, resgitry_handle) =
-            self.start(self.build_chain_cfg_env()?).await?;
-        run_until_ctrl_c(async move {
-            info!("stopping leafage server...");
-            let _ = updater_handle.send(());
-            let _ = resgitry_handle.send(());
-            // wait for lease to unregist
-            info!(
-                "waiting for etcd lease to expire in {} seconds...",
-                self.stop_wait_timeout
-            );
-            time::sleep(std::time::Duration::from_secs(
-                self.stop_wait_timeout as u64,
-            ))
-            .await;
-            let _ = rpc_handle.stop();
-            Ok(())
-        })
+        let chain_cfg = self.build_chain_cfg_env()?;
+        if matches!(&chain_cfg, MultiChainCfgEnv::Arc(_)) && self.kafka_s3_config.is_none() {
+            bail!(ARC_KAFKA_REQUIRED);
+        }
+        // Fix the versioned-key encoding mode before any archive DB access.
+        leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        let readiness_enabled = !self.readiness_addr.is_empty();
+        let stop_wait_timeout = self.stop_wait_timeout;
+        let (mut updater_handle, rpc_handle, registry_handle) = self.start(chain_cfg).await?;
+        if !readiness_enabled {
+            if let Some(mut fatal) = updater_handle.fatal.take() {
+                tokio::select! {
+                    result = run_until_ctrl_c(stop_services(
+                        updater_handle.stop.clone(),
+                        rpc_handle.clone(),
+                        registry_handle.clone(),
+                        stop_wait_timeout,
+                    )) => result?,
+                    result = &mut fatal => {
+                        stop_services(
+                            updater_handle.stop,
+                            rpc_handle,
+                            registry_handle,
+                            stop_wait_timeout,
+                        ).await?;
+                        return arc_fatal_exit_result(result);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        run_until_ctrl_c(stop_services(
+            updater_handle.stop,
+            rpc_handle,
+            registry_handle,
+            stop_wait_timeout,
+        ))
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_command(args: &[&str]) -> Command {
+        let mut argv = vec![
+            "standalone-test",
+            "--db-path",
+            "/dev/null/leafage-arc-must-not-open",
+        ];
+        argv.extend_from_slice(args);
+        Command::try_parse_from(argv).expect("command should parse")
+    }
+
+    fn assert_arc_config_error(args: &[&str], expected: &str) {
+        let command = parse_command(args);
+        let error = command
+            .build_chain_cfg_env()
+            .expect_err("Arc configuration should be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn arc_alias_and_numeric_chain_id_build_mainnet_config() {
+        for chain_cfg_arg in ["arc", "5042"] {
+            let command = parse_command(&["--evm-type", "arc", "--chain-cfg", chain_cfg_arg]);
+            let chain_cfg = command
+                .build_chain_cfg_env()
+                .expect("Arc mainnet config should build");
+
+            let MultiChainCfgEnv::Arc((cfg, arc_config)) = chain_cfg else {
+                panic!("expected Arc chain config");
+            };
+            assert_eq!(cfg.chain_id, ARC_MAINNET_CHAIN_ID);
+            assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+            assert!(!cfg.disable_balance_check);
+            assert!(!cfg.disable_eip3607);
+            assert!(!cfg.disable_block_gas_limit);
+            assert!(!cfg.disable_base_fee);
+            assert_eq!(arc_config, ArcChainConfig::mainnet());
+        }
+    }
+
+    #[test]
+    fn arc_rejects_mismatched_chain_and_evm_type() {
+        assert_arc_config_error(
+            &["--evm-type", "arc", "--chain-cfg", "1"],
+            "Arc EVM requires chain ID 5042",
+        );
+        assert_arc_config_error(
+            &["--evm-type", "mainnet", "--chain-cfg", "5042"],
+            "chain ID 5042 requires --evm-type arc",
+        );
+    }
+
+    #[test]
+    fn arc_rejects_explicit_execution_overrides() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--spec-id",
+                    "255",
+                ],
+                "--spec-id is unsupported",
+            ),
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--evm-custom-config",
+                    "{}",
+                ],
+                "does not accept --evm-custom-config",
+            ),
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--ovm-address",
+                    "0x0000000000000000000000000000000000000001",
+                ],
+                "does not accept --ovm-address",
+            ),
+            (
+                vec![
+                    "--evm-type",
+                    "arc",
+                    "--chain-cfg",
+                    "arc",
+                    "--normalize-state-key",
+                ],
+                "requires --normalize-state-key=false",
+            ),
+        ] {
+            assert_arc_config_error(&args, expected);
+        }
+    }
+
+    #[test]
+    fn non_arc_spec_id_keeps_legacy_default_and_sentinel_behavior() {
+        for args in [
+            vec!["--evm-type", "mainnet", "--chain-cfg", "1"],
+            vec![
+                "--evm-type",
+                "mainnet",
+                "--chain-cfg",
+                "1",
+                "--spec-id",
+                "255",
+            ],
+        ] {
+            let command = parse_command(&args);
+            let MultiChainCfgEnv::Mainnet(cfg) = command
+                .build_chain_cfg_env()
+                .expect("mainnet config should build")
+            else {
+                panic!("expected mainnet chain config");
+            };
+            assert_eq!(cfg.spec, MainnetSpecId::AMSTERDAM);
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_requires_kafka_before_metrics_or_database_initialization() {
+        for args in [
+            vec!["--evm-type", "arc", "--chain-cfg", "arc"],
+            vec![
+                "--evm-type",
+                "arc",
+                "--chain-cfg",
+                "arc",
+                "--rpc-addr",
+                "http://127.0.0.1:8545",
+            ],
+            vec![
+                "--evm-type",
+                "arc",
+                "--chain-cfg",
+                "arc",
+                "--prometheus-addr",
+                "not-a-socket-address",
+            ],
+        ] {
+            let mut command = parse_command(&args);
+            let error = command.run().await.expect_err("Arc startup should fail");
+            assert_eq!(error.to_string(), ARC_KAFKA_REQUIRED);
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_startup_reaches_runtime_initialization() {
+        let kafka_config = r#"{"topic":"arc","brokers":"127.0.0.1:9092","partition":0,"bucket_name":"blocks","outer_bucket_name":"index","s3_chain_id":"5042"}"#;
+        let mut command = parse_command(&[
+            "--evm-type",
+            "arc",
+            "--chain-cfg",
+            "arc",
+            "--kafka-s3-config",
+            kafka_config,
+            "--prometheus-addr",
+            "not-a-socket-address",
+        ]);
+        let error = command
+            .run()
+            .await
+            .expect_err("invalid metrics address should stop startup");
+        assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
+    }
+
+    #[test]
+    fn fatal_input_keeps_readiness_unhealthy_after_startup_finishes() {
+        let startup_ready = AtomicBool::new(false);
+        let fatal = AtomicBool::new(true);
+        assert_eq!(
+            readiness_response(&startup_ready, &fatal),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        );
+
+        startup_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            readiness_response(&startup_ready, &fatal),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        );
+    }
+
+    #[test]
+    fn fatal_input_without_readiness_returns_an_error() {
+        let error = arc_fatal_exit_result(Ok(anyhow!("bad finalized parent")))
+            .expect_err("fatal Arc input must terminate standalone with an error");
+
+        assert!(error
+            .to_string()
+            .contains("Arc updater stopped on invalid finalized input"));
     }
 }

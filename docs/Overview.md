@@ -62,7 +62,7 @@ The project is licensed under MIT OR Apache-2.0.
 
 ### Who is this for?
 
-**DeFi protocols and wallets** that need high-throughput `eth_call`, `eth_estimateGas`, and batch contract calls across multiple chains.
+**DeFi protocols and wallets** that need high-throughput `eth_call`, `estimateGas`, and batch contract calls across multiple chains.
 
 **Data platforms and analytics teams** that need structured access to block execution data — transactions, call traces, and event logs — without running full nodes or maintaining custom ETL pipelines. Pipeline's external S3 bucket delivers this data as JSON+gzip files ready for warehouse ingestion.
 
@@ -295,7 +295,6 @@ Adding a new chain requires implementing the `EvmExecutor` trait — chain-speci
 | Method | Notes |
 |--------|-------|
 | `eth_call` | Execute message call |
-| `eth_estimateGas` | Estimate gas for a transaction |
 | `eth_getBalance` | Account balance |
 | `eth_getCode` | Contract bytecode |
 | `eth_getStorageAt` | Storage slot value |

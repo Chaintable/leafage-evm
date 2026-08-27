@@ -1,6 +1,12 @@
+pub mod arbitrum;
+pub mod arc;
+pub mod base;
 pub mod bsc;
 pub mod citrea;
 pub mod cosmos;
+pub mod hemi;
 pub mod iotex;
 pub mod mantle;
+pub mod moonbeam;
+pub mod polygon;
 pub mod tempo;

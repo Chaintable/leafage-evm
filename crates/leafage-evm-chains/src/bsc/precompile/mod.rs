@@ -27,7 +27,9 @@ impl BscPrecompiles {
     /// Create a new precompile provider with the given bsc spec.
     #[inline]
     pub fn new(spec: BscHardfork) -> Self {
-        let precompiles = if spec >= BscHardfork::Pascal {
+        let precompiles = if spec >= BscHardfork::Mendel {
+            mendel()
+        } else if spec >= BscHardfork::Pascal {
             pascal()
         } else if spec >= BscHardfork::Haber {
             haber()
@@ -198,6 +200,17 @@ pub fn pascal() -> &'static Precompiles {
             precompiles.extend(bls12_381::precompiles());
             precompiles
         };
+        Box::new(precompiles)
+    })
+}
+
+/// Returns precompiles for Mendel spec.
+/// Includes EIP-7823/7883 (MODEXP bounds + gas) and EIP-7951/BEP-659 (P256VERIFY gas increase).
+pub fn mendel() -> &'static Precompiles {
+    static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| {
+        let mut precompiles = pascal().clone();
+        precompiles.extend([modexp::OSAKA, secp256r1::P256VERIFY_OSAKA]);
         Box::new(precompiles)
     })
 }

@@ -59,6 +59,22 @@ fn rocksdb_read_options() -> ReadOptions {
     read_options
 }
 
+#[inline]
+fn decode_slim_account(address: H256, raw: &[u8]) -> NewAccount {
+    let mut raw_slice = raw;
+    let account = SlimAccount::decode(&mut raw_slice).unwrap();
+    NewAccount {
+        address,
+        balance: account.balance,
+        nonce: account.nonce,
+        code_hash: if account.code_hash.is_zero() {
+            KECCAK256_EMPTY.0.into()
+        } else {
+            account.code_hash
+        },
+    }
+}
+
 impl StorageTypeColumn {
     fn to_str(&self) -> &'static str {
         match self {
@@ -187,19 +203,10 @@ impl StateDBRead for DataBase {
             return Ok(None);
         }
         let raw_account_bytes = raw_account_bytes.unwrap();
-        let mut raw_account_slice = raw_account_bytes.as_ref();
-        let account = SlimAccount::decode(&mut raw_account_slice).unwrap();
-        let account = NewAccount {
+        Ok(Some(decode_slim_account(
             address,
-            balance: account.balance,
-            nonce: account.nonce,
-            code_hash: if account.code_hash.is_zero() {
-                KECCAK256_EMPTY.0.into()
-            } else {
-                account.code_hash
-            },
-        };
-        Ok(Some(account))
+            raw_account_bytes.as_ref(),
+        )))
     }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
@@ -243,6 +250,106 @@ impl StateDBRead for DataBase {
             return Ok(None);
         }
         Ok(Some(Bytes::from(code.unwrap())))
+    }
+
+    // Batched point reads over one CF, backed by RocksDB MultiGet: one
+    // FFI round trip sharing a single superversion, so keys within a
+    // call see a consistent base. The scalar per-read histograms are
+    // skipped on purpose — one batch sample would skew them; each call
+    // records one sample in its own `read_*_many_latency` histogram,
+    // whoever the caller is (blockx_stateReadBatch, multicall
+    // prefetch, ...).
+    fn read_account_many(&self, addresses: &[H256]) -> Result<Vec<Option<NewAccount>>, Error> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = std::time::Instant::now();
+        let address_to_account_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+            .unwrap();
+        let keys: Vec<[u8; 32]> = addresses.iter().map(|address| (*address).into()).collect();
+        let raw = self.db.batched_multi_get_cf_opt(
+            address_to_account_cf,
+            keys.iter(),
+            false,
+            &rocksdb_read_options(),
+        );
+        let mut out = Vec::with_capacity(addresses.len());
+        for (address, value) in addresses.iter().zip(raw) {
+            out.push(value?.map(|bytes| decode_slim_account(*address, bytes.as_ref())));
+        }
+        STORAGE_METRICS
+            .read_account_many_latency
+            .record(start.elapsed().as_secs_f64());
+        Ok(out)
+    }
+
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, Error> {
+        if code_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = std::time::Instant::now();
+        let hash_to_code_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::HashToCode.to_str())
+            .unwrap();
+        let keys: Vec<[u8; 32]> = code_hashes.iter().map(|hash| (*hash).into()).collect();
+        let raw = self.db.batched_multi_get_cf_opt(
+            hash_to_code_cf,
+            keys.iter(),
+            false,
+            &rocksdb_read_options(),
+        );
+        let mut out = Vec::with_capacity(code_hashes.len());
+        for value in raw {
+            out.push(value?.map(|bytes| Bytes::from(bytes.as_ref().to_vec())));
+        }
+        STORAGE_METRICS
+            .read_code_many_latency
+            .record(start.elapsed().as_secs_f64());
+        Ok(out)
+    }
+
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Error> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = std::time::Instant::now();
+        let address_to_storage_cf = self
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let raw_keys: Vec<[u8; 64]> = keys
+            .iter()
+            .map(|(address, key)| {
+                let mut raw = [0u8; 64];
+                raw[..32].copy_from_slice(address.as_slice());
+                raw[32..].copy_from_slice(key.as_slice());
+                raw
+            })
+            .collect();
+        let raw = self.db.batched_multi_get_cf_opt(
+            address_to_storage_cf,
+            raw_keys.iter(),
+            false,
+            &rocksdb_read_options(),
+        );
+        let mut out = Vec::with_capacity(keys.len());
+        for value in raw {
+            out.push(match value? {
+                Some(bytes) => U256::from_be_slice(bytes.as_ref()),
+                None => U256::ZERO,
+            });
+        }
+        STORAGE_METRICS
+            .read_storage_many_latency
+            .record(start.elapsed().as_secs_f64());
+        Ok(out)
+    }
+
+    fn supports_batched_reads(&self) -> bool {
+        true
     }
 }
 
@@ -545,6 +652,25 @@ impl DataBase {
     }
 }
 
+impl DataBase {
+    /// Flush every column family's memtable to SST files. Test/bench
+    /// helper so read measurements exercise the SST + block-cache path
+    /// instead of the memtable; not used on any production path.
+    pub fn flush_all(&self) {
+        for column in [
+            StorageTypeColumn::LatestBlockHash,
+            StorageTypeColumn::BlockHashToBlockInfo,
+            StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::AddressToAccount,
+            StorageTypeColumn::AddressToStorage,
+            StorageTypeColumn::HashToCode,
+        ] {
+            let cf = self.db.cf_handle(column.to_str()).unwrap();
+            self.db.flush_cf(cf).unwrap();
+        }
+    }
+}
+
 impl StateDBProvider for Arc<DataBase> {
     type StateDBReadWrite = Arc<DataBase>;
 
@@ -668,5 +794,177 @@ impl BlockIterator for DataBase {
             let block_hash = H256::from_slice(value.as_ref());
             Ok((block_num, block_hash))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::StateDBWrapper;
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{AccountStorageDiff, Block, BlockStorageDiff, Header, IndexValuePair};
+
+    fn make_block_info(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
+        let mut raw = leafage_evm_types::RawHeader::default();
+        raw.number = number;
+        raw.parent_hash = parent_hash;
+        BlockInfo {
+            inner: Block {
+                header: Header {
+                    hash,
+                    inner: raw,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            other: Default::default(),
+        }
+    }
+
+    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStorageDiff {
+        BlockStorageDiff {
+            new_accounts: vec![NewAccount {
+                address: addr,
+                balance: U256::from(balance),
+                nonce,
+                code_hash: KECCAK256_EMPTY.0.into(),
+            }],
+            storage_diffs: vec![AccountStorageDiff {
+                address: addr,
+                diffs: vec![IndexValuePair {
+                    index: slot,
+                    value: U256::from(value),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Batched reads must agree with the scalar reads for present keys,
+    /// missing keys (None / zero) and duplicated inputs, in input order.
+    #[test]
+    fn test_batched_reads_match_scalar_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-snapshot-multiget-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBase::open(&dir, 64, false));
+            let state = StateDBWrapper(db.clone());
+
+            let code_hash = H256::repeat_byte(0xcc);
+            let code = Bytes::from(vec![0x60u8, 0x80, 0x60, 0x40]);
+            let mut diff = BlockStorageDiff::default();
+            for n in 1u8..=8 {
+                diff.new_accounts.push(NewAccount {
+                    address: H256::repeat_byte(n),
+                    balance: U256::from(n as u64 * 100),
+                    nonce: n as u64,
+                    code_hash: if n % 2 == 0 {
+                        code_hash
+                    } else {
+                        KECCAK256_EMPTY.0.into()
+                    },
+                });
+                diff.storage_diffs.push(AccountStorageDiff {
+                    address: H256::repeat_byte(n),
+                    diffs: vec![IndexValuePair {
+                        index: H256::repeat_byte(0x10 + n),
+                        value: U256::from(n as u64 * 7),
+                    }],
+                });
+            }
+            diff.new_codes.push(leafage_evm_types::NewCode {
+                code_hash,
+                code: code.clone(),
+            });
+            let block = make_block_info(1, H256::repeat_byte(0x11), H256::ZERO);
+            state.update_block(block, diff).unwrap();
+
+            // Present, missing and duplicated keys, deliberately unsorted.
+            let addresses: Vec<H256> = [3u8, 1, 8, 3, 0xee]
+                .iter()
+                .map(|n| H256::repeat_byte(*n))
+                .collect();
+            let batched = db.read_account_many(&addresses).unwrap();
+            for (address, got) in addresses.iter().zip(&batched) {
+                assert_eq!(got, &db.read_account(*address).unwrap());
+            }
+            assert!(batched[4].is_none());
+
+            let storage_keys: Vec<(H256, H256)> = [5u8, 2, 5, 0xee]
+                .iter()
+                .map(|n| (H256::repeat_byte(*n), H256::repeat_byte(0x10 + n)))
+                .collect();
+            let batched = db.read_storage_many(&storage_keys).unwrap();
+            for ((address, key), got) in storage_keys.iter().zip(&batched) {
+                assert_eq!(got, &db.read_storage(*address, *key).unwrap());
+            }
+            assert_eq!(batched[3], U256::ZERO);
+
+            let code_hashes = vec![code_hash, H256::repeat_byte(0xdd), code_hash];
+            let batched = db.read_code_many(&code_hashes).unwrap();
+            assert_eq!(batched[0], Some(code.clone()));
+            assert_eq!(batched[1], None);
+            assert_eq!(batched[2], Some(code));
+
+            assert!(db.read_account_many(&[]).unwrap().is_empty());
+            assert!(db.read_storage_many(&[]).unwrap().is_empty());
+            assert!(db.read_code_many(&[]).unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `rewind` command relies on `update_block` with an empty diff being
+    /// a pure head-pointer move: it must re-insert the target's BlockInfo and
+    /// reset LatestBlockHash while leaving the flat state untouched, and a
+    /// later replay of the skipped diffs must converge back to the old head.
+    #[test]
+    fn test_empty_diff_update_block_rewinds_head_pointer() {
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-snapshot-rewind-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBase::open(&dir, 64, false));
+            let state = StateDBWrapper(db.clone());
+
+            let addr = H256::repeat_byte(0xaa);
+            let slot = H256::repeat_byte(0x01);
+
+            let block1 = make_block_info(1, H256::repeat_byte(0x11), H256::ZERO);
+            state
+                .update_block(block1.clone(), make_diff(addr, slot, 100, 1, 7))
+                .unwrap();
+            let block2 = make_block_info(2, H256::repeat_byte(0x22), block1.header.hash);
+            let diff2 = make_diff(addr, slot, 200, 2, 9);
+            state.update_block(block2.clone(), diff2.clone()).unwrap();
+
+            // Rewind the head pointer to block 1 with an empty diff.
+            state
+                .update_block(block1.clone(), BlockStorageDiff::default())
+                .unwrap();
+            let head = state.last_committed_block().unwrap().unwrap();
+            assert_eq!(head.header.number, 1);
+            assert_eq!(head.header.hash, block1.header.hash);
+
+            // Flat state is untouched: still the block-2 values.
+            let account = db.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(account.nonce, 2);
+            assert_eq!(db.read_storage(addr, slot).unwrap(), U256::from(9));
+
+            // Replaying block 2's diff converges back to the old head.
+            state.update_block(block2.clone(), diff2).unwrap();
+            let head = state.last_committed_block().unwrap().unwrap();
+            assert_eq!(head.header.number, 2);
+            assert_eq!(head.header.hash, block2.header.hash);
+            let account = db.read_account(addr).unwrap().unwrap();
+            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(db.read_storage(addr, slot).unwrap(), U256::from(9));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

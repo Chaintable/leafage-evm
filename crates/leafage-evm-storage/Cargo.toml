@@ -18,7 +18,7 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 rocksdb = { workspace = true, features = ["jemalloc"] }
-quick_cache.workspace = true
+moka.workspace = true
 alloy-rlp.workspace = true
 alloy.workspace = true
 metrics.workspace = true
@@ -26,3 +26,20 @@ metrics-derive.workspace = true
 libmdbx.workspace = true
 page_size.workspace = true
 dashmap.workspace = true
+ahash.workspace = true
+arc-swap.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "layer_read"
+harness = false
+
+[[bench]]
+name = "state_tree_scenarios"
+harness = false
+
+[[bench]]
+name = "batch_read"
+harness = false

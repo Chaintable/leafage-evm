@@ -8,7 +8,7 @@ use crate::error::{internal_rpc_err, rpc_error_with_code};
 use alloy::consensus::BlockHeader;
 use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, DebankErrorCode, MainnetSpecId, H256};
+use leafage_evm_types::{BlockInfo, CallRequest, DebankErrorCode, MainnetSpecId, H256};
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction};
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
 use revm::inspector::NoOpInspector;
@@ -75,6 +75,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,

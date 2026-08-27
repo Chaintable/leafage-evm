@@ -6,7 +6,7 @@ use crate::api_impl::op::evm::{create_op_evm_from_state, create_op_txn_env};
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_types::{CallRequest, DebankErrorCode, OpSpecId};
+use leafage_evm_types::{BlockInfo, CallRequest, DebankErrorCode, OpSpecId};
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction};
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
@@ -30,6 +30,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,

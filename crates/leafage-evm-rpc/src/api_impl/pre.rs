@@ -16,7 +16,6 @@ use revm::context::result::ExecutionResult;
 use revm::context::Transaction as TransactionTrait;
 use revm::database::CacheDB;
 use revm_inspectors::tracing::TracingInspectorConfig;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -33,18 +32,13 @@ where
         request: CallRequest,
         block_id: Option<BlockId>,
     ) -> RpcResult<DefaultFrame> {
-        let (tx, rx) = oneshot::channel();
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let rsp = this.pre_trace_call_impl_inner(request, block_id);
-            if let Err(e) = tx.send(rsp) {
-                error!("Failed to send trace_call result: {:?}", e);
-            }
-        });
-        let rsp = rx
-            .await
-            .map_err(|_| internal_rpc_err("PreTraceCall failed".to_string()))?;
-        rsp
+        utils::spawn_blocking_limited_with_cancel(limiter, move |_token| {
+            this.pre_trace_call_impl_inner(request, block_id)
+        })
+        .await
+        .map_err(|_| internal_rpc_err("PreTraceCall failed".to_string()))?
     }
 
     fn pre_trace_call_impl_inner(
@@ -84,6 +78,7 @@ where
         // Use geth config to enable step recording for struct logs
         let trace_cfg = TracingInspectorConfig::default_geth();
         let tx = self.inner.create_txn_env(
+            &block,
             &block_env,
             request,
             &memory_db,
@@ -124,8 +119,9 @@ where
         requests: Vec<CallRequest>,
         block_id: Option<BlockId>,
     ) -> RpcResult<Vec<PreResult>> {
+        let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_with_cancel(move |token| {
+        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
             this.pre_trace_many_impl_inner(requests, block_id, token)
         })
         .await
@@ -192,6 +188,7 @@ where
             }
             let trace_cfg = TracingInspectorConfig::default_parity();
             let tx = self.inner.create_txn_env(
+                &block,
                 &block_env,
                 tx,
                 &memory_db,

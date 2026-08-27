@@ -19,8 +19,15 @@ impl DBSource {
         dst_kind: StorageKind,
         cache_size: usize,
     ) -> Result<Self, StorageError> {
-        let src = MultiStorage::open(src_path, cache_size, src_kind, src_is_archive, false)?;
-        let dst = MultiStorage::open(dst_path, cache_size, dst_kind, false, false)?;
+        let src = MultiStorage::open(
+            src_path,
+            cache_size,
+            src_kind,
+            src_is_archive,
+            false,
+            false,
+        )?;
+        let dst = MultiStorage::open(dst_path, cache_size, dst_kind, false, false, false)?;
 
         // 验证 dst 不是 archive 类型
         if matches!(

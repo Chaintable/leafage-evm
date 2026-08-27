@@ -1,4 +1,4 @@
-use crate::error::invalid_params_rpc_err;
+use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use alloy::consensus::TxType;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::Either;
@@ -112,7 +112,6 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         gas,
         value,
         input,
-        nonce,
         mut chain_id,
         access_list,
         blob_versioned_hashes,
@@ -148,14 +147,11 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
         chain_id = Some(origin_chain_id);
     }
 
-    // Use request nonce if provided; otherwise fetch from DB.
-    // Critical for Tempo 0x76 AA: nonce_key>0 bypasses protocol nonce check,
-    // sender may set nonce=0 explicitly. TIP-1000 gas depends on nonce==0.
-    let nonce = nonce.unwrap_or_else(|| {
-        db.basic_ref(caller)
-            .map(|acc| acc.map(|a| a.nonce).unwrap_or_default())
-            .unwrap_or_default()
-    });
+    let nonce = db
+        .basic_ref(caller)
+        .map_err(|_| internal_rpc_err("get nonce failed"))?
+        .map(|acc| acc.nonce)
+        .unwrap_or_default();
 
     let env = TxEnv {
         tx_type,

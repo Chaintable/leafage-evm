@@ -1,11 +1,16 @@
 //! Database implementation for EVM storage.
 
+mod archive_encoding;
 mod rocksdb_impl;
 
 mod mdbx_impl;
 
 mod error;
 
+pub use archive_encoding::{
+    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
+    inverted_block_encoding, set_inverted_block_encoding, ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,
+};
 pub use error::Error as StorageError;
 pub use mdbx_impl::{
     MDBXArchiveOptions, MDBXArchiveStateDB, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXStateDB,
@@ -56,6 +61,7 @@ impl MultiStorage {
         kind: StorageKind,
         is_archive: bool,
         disable_auto_compactions: bool,
+        archive_zstd_compression: bool,
     ) -> Result<Self, StorageError> {
         match (kind, is_archive) {
             (StorageKind::Rocksdb, false) => {
@@ -63,7 +69,12 @@ impl MultiStorage {
                 Ok(MultiStorage::RocksDBState(Arc::new(db)))
             }
             (StorageKind::Rocksdb, true) => {
-                let db = ArchiveRocksDBStorage::open(path, cache_size, disable_auto_compactions);
+                let db = ArchiveRocksDBStorage::open(
+                    path,
+                    cache_size,
+                    disable_auto_compactions,
+                    archive_zstd_compression,
+                );
                 Ok(MultiStorage::RocksDBArchive(Arc::new(db)))
             }
             (StorageKind::MDBX, false) => {
@@ -248,10 +259,53 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::MDBXArchive(db) => db.read_block_hash(block_num),
         }
     }
+
+    // The batched reads must dispatch explicitly: falling back to the
+    // trait defaults here would loop scalar reads on the enum and never
+    // reach the MultiGet override of the non-archive RocksDB backend.
+    fn read_account_many(
+        &self,
+        addresses: &[H256],
+    ) -> Result<Vec<Option<NewAccount>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_account_many(addresses),
+            MultiStateDB::RocksDBArchive(db) => db.read_account_many(addresses),
+            MultiStateDB::MDBXState(db) => db.read_account_many(addresses),
+            MultiStateDB::MDBXArchive(db) => db.read_account_many(addresses),
+        }
+    }
+
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_code_many(code_hashes),
+            MultiStateDB::RocksDBArchive(db) => db.read_code_many(code_hashes),
+            MultiStateDB::MDBXState(db) => db.read_code_many(code_hashes),
+            MultiStateDB::MDBXArchive(db) => db.read_code_many(code_hashes),
+        }
+    }
+
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_storage_many(keys),
+            MultiStateDB::RocksDBArchive(db) => db.read_storage_many(keys),
+            MultiStateDB::MDBXState(db) => db.read_storage_many(keys),
+            MultiStateDB::MDBXArchive(db) => db.read_storage_many(keys),
+        }
+    }
+
+    fn supports_batched_reads(&self) -> bool {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.supports_batched_reads(),
+            MultiStateDB::RocksDBArchive(db) => db.supports_batched_reads(),
+            MultiStateDB::MDBXState(db) => db.supports_batched_reads(),
+            MultiStateDB::MDBXArchive(db) => db.supports_batched_reads(),
+        }
+    }
 }
 
 pub enum MultiWriteBatch {
-    RocksDBBatch(rocksdb::WriteBatch),
+    RocksDBStateBatch(rocksdb::WriteBatch),
+    RocksDBArchiveBatch(<ArchiveStateDB as StateDBWrite>::DBWriteBatch),
     MDBXBatch(MDBXWriteBatch),
     MDBXArchiveBatch(MDBXArchiveWriteBatch),
 }
@@ -261,12 +315,12 @@ impl StateDBWrite for MultiStateDB {
 
     fn prepare_write_batch(&self) -> Result<Self::DBWriteBatch, StorageError> {
         match self {
-            MultiStateDB::RocksDBState(db) => {
-                Ok(MultiWriteBatch::RocksDBBatch(db.prepare_write_batch()?))
-            }
-            MultiStateDB::RocksDBArchive(db) => {
-                Ok(MultiWriteBatch::RocksDBBatch(db.prepare_write_batch()?))
-            }
+            MultiStateDB::RocksDBState(db) => Ok(MultiWriteBatch::RocksDBStateBatch(
+                db.prepare_write_batch()?,
+            )),
+            MultiStateDB::RocksDBArchive(db) => Ok(MultiWriteBatch::RocksDBArchiveBatch(
+                db.prepare_write_batch()?,
+            )),
             MultiStateDB::MDBXState(db) => {
                 Ok(MultiWriteBatch::MDBXBatch(db.prepare_write_batch()?))
             }
@@ -282,10 +336,10 @@ impl StateDBWrite for MultiStateDB {
         block_hash: H256,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_latest_block_hash(b, block_hash)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_latest_block_hash(b, block_hash)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -304,10 +358,10 @@ impl StateDBWrite for MultiStateDB {
         block_info: BlockInfo,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_block_info(b, block_info)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_block_info(b, block_info)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -327,10 +381,10 @@ impl StateDBWrite for MultiStateDB {
         block_hash: H256,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_block_hash(b, block_num, block_hash)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_block_hash(b, block_num, block_hash)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -351,10 +405,10 @@ impl StateDBWrite for MultiStateDB {
         raw_account: Option<NewAccount>,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_account(b, address, block_num, raw_account)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_account(b, address, block_num, raw_account)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -374,10 +428,10 @@ impl StateDBWrite for MultiStateDB {
         code: Bytes,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_code(b, code_hash, code)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_code(b, code_hash, code)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -399,10 +453,10 @@ impl StateDBWrite for MultiStateDB {
         value: U256,
     ) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => {
                 db.write_storage(b, address, key, block_num, value)
             }
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => {
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
                 db.write_storage(b, address, key, block_num, value)
             }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => {
@@ -417,11 +471,62 @@ impl StateDBWrite for MultiStateDB {
 
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError> {
         match (self, batch) {
-            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBBatch(b)) => db.commit(b),
-            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBBatch(b)) => db.commit(b),
+            (MultiStateDB::RocksDBState(db), MultiWriteBatch::RocksDBStateBatch(b)) => db.commit(b),
+            (MultiStateDB::RocksDBArchive(db), MultiWriteBatch::RocksDBArchiveBatch(b)) => {
+                db.commit(b)
+            }
             (MultiStateDB::MDBXState(db), MultiWriteBatch::MDBXBatch(b)) => db.commit(b),
             (MultiStateDB::MDBXArchive(db), MultiWriteBatch::MDBXArchiveBatch(b)) => db.commit(b),
             _ => Err(StorageError::UnSupported("Batch type mismatch".to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::StateDBWrapper;
+    use crate::interface::{EvmStorageWrapper, StateDB};
+    use leafage_evm_types::BlockNumberOrTag;
+
+    /// The capability flag must survive every wrapper of the real
+    /// non-archive RocksDB stack: a missed forwarding anywhere defaults
+    /// to `false` and silently disables batch-capability consumers
+    /// (multicall prefetch) with no functional failure to catch it.
+    #[test]
+    fn batched_read_capability_propagates_through_the_stack() {
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-cap-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let db =
+                MultiStorage::open(&dir, 64, StorageKind::Rocksdb, false, false, false).unwrap();
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .unwrap()
+                .unwrap();
+            assert!(StateDBRead::supports_batched_reads(&state));
+            let wrapped = StateDBWrapper(state);
+            assert!(StateDB::supports_batched_reads(&wrapped));
+            assert!(EvmStorageWrapper {
+                db: &wrapped,
+                ovm_address: None,
+                normalize_state_key: false,
+            }
+            .supports_batched_reads());
+            // The OVM balance override forces the scalar account path,
+            // so the wrapper reports false there.
+            assert!(!EvmStorageWrapper {
+                db: &wrapped,
+                ovm_address: Some(H256::repeat_byte(1)),
+                normalize_state_key: false,
+            }
+            .supports_batched_reads());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

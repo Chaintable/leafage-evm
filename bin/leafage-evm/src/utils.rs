@@ -12,6 +12,7 @@ use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::{io::Read, str::FromStr};
+use tracing::{debug, trace};
 
 static S3_BLOCK_CACHE: LazyLock<RwLock<LruCache<H256, BlockInfo>>> =
     LazyLock::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(1024).unwrap())));
@@ -22,6 +23,8 @@ pub struct KafkaS3Config {
     pub brokers: String,
     pub partition: i32,
     pub bucket_name: String,
+    #[serde(default)]
+    pub bundle_bucket_name: String,
     pub outer_bucket_name: String,
     #[serde(default)]
     pub offset_dir: String,
@@ -30,17 +33,87 @@ pub struct KafkaS3Config {
     pub version: String,
 }
 
+/// Parse a [`KafkaS3Config`] CLI argument: an absolute file path or inline JSON.
+pub fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
+    let kafka_s3_config: KafkaS3Config;
+    if arg.starts_with("/") {
+        let file = std::fs::File::open(arg)?;
+        kafka_s3_config = serde_json::from_reader(file)?;
+    } else {
+        kafka_s3_config = serde_json::from_str(arg)?;
+    }
+    Ok(kafka_s3_config)
+}
+
+/// Parse an `eth_getBlockBy*` JSON response into [`BlockInfo`].
+///
+/// alloy 的 `Block` 把 header 字段 `#[serde(flatten)]` 到顶层，而
+/// `alloy_consensus::Header::mix_hash`（即 `mixHash`）是必填字段（没有
+/// `#[serde(default)]`，也没有 `prevRandao` 别名）。部分链的 RPC 不返回
+/// `mixHash`，会导致 "missing field `mixHash`" 的反序列化错误。
+///
+/// 合并后 `mixHash` 实际承载的是 prevRandao：`block_env_from_block` 在
+/// difficulty 为 0 时会读取 `header.mix_hash` 作为 prevrandao。因此当
+/// `mixHash` 缺失时，优先复用 RPC 返回的 `prevRandao`（避免丢失真实随机值），
+/// 否则才退回零哈希（与 alloy `Header::default()` 一致，对 difficulty 非 0 的
+/// 链无影响）。
+fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
+    if let Some(obj) = block.as_object_mut() {
+        if !obj.contains_key("mixHash") {
+            let mix_hash = obj
+                .get("prevRandao")
+                .cloned()
+                .unwrap_or_else(|| {
+                    serde_json::to_value(H256::ZERO).expect("zero hash serializes")
+                });
+            obj.insert("mixHash".to_string(), mix_hash);
+        }
+    }
+    serde_json::from_value(block).context("rpc get block by hash parse failed")
+}
+
+/// `s3_chain_id` of HyperEVM, the only chain whose stateDiff objects are
+/// addressed by block hash.
+pub const HYPEREVM_S3_CHAIN_ID: &str = "999";
+
+/// Whether this chain's stateDiff objects are keyed by block hash instead of
+/// by state root.
+///
+/// HyperEVM (chain 999) reports a zero state root on every block. Under the
+/// state-root layout a single object would serve the entire chain, and the
+/// "root unchanged since the parent" test — which normally means the block
+/// wrote no state — matches every block, suppressing every diff. So that
+/// chain keys the diff by block hash and fetches one for every block.
+///
+/// Every other chain keeps the layout documented in `docs/DataSpec.md`: keyed
+/// by state root, and written only when the state root actually changes.
+pub fn state_diff_keyed_by_block_hash(s3_chain_id: &str) -> bool {
+    s3_chain_id == HYPEREVM_S3_CHAIN_ID
+}
+
+/// The `H256` addressing a block's stateDiff object under this chain's layout.
+fn state_diff_key(s3_chain_id: &str, block_info: &BlockInfo) -> H256 {
+    if state_diff_keyed_by_block_hash(s3_chain_id) {
+        block_info.header.hash
+    } else {
+        block_info.header.state_root
+    }
+}
+
+/// Read one block's [`BlockStorageDiff`] source object from S3, addressed by
+/// `diff_key`: the block hash on block-hash-keyed chains, the state root
+/// everywhere else. See [`state_diff_keyed_by_block_hash`].
 pub async fn s3_get_block_diff(
     s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
-    block_root: H256,
+    diff_key: H256,
 ) -> Result<BlockStorageDiff> {
     let s3_key = if version.is_empty() {
-        format!("{}/{}/stateDiff", s3_chain_id, block_root)
+        format!("{}/{}/stateDiff", s3_chain_id, diff_key)
     } else {
-        format!("{}/{}/{}/stateDiff", s3_chain_id, version, block_root)
+        format!("{}/{}/{}/stateDiff", s3_chain_id, version, diff_key)
     };
     let s3_obj = s3_client
         .get_object()
@@ -50,6 +123,36 @@ pub async fn s3_get_block_diff(
         .await?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
     let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
+    // Correlate with the commit-side logs in StateDBWrapper::update_block via
+    // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
+    // per-account / per-slot detail).
+    debug!(target: "state_diff",
+        "fetched stateDiff: key {}, root {}, parent_root {}, new_accounts {}, deleted_accounts {}, storage_accounts {}, storage_slots {}, new_codes {}",
+        diff_key,
+        block_storage_diff.hash,
+        block_storage_diff.parent_hash,
+        block_storage_diff.new_accounts.len(),
+        block_storage_diff.deleted_accounts.len(),
+        block_storage_diff.storage_diffs.len(),
+        block_storage_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum::<usize>(),
+        block_storage_diff.new_codes.len(),
+    );
+    for account in &block_storage_diff.new_accounts {
+        trace!(target: "state_diff",
+            "fetched account: root {}, address {}, balance {}, nonce {}, code_hash {}",
+            block_storage_diff.hash, account.address, account.balance, account.nonce, account.code_hash);
+    }
+    for address in &block_storage_diff.deleted_accounts {
+        trace!(target: "state_diff",
+            "fetched deleted account: root {}, address {}", block_storage_diff.hash, address);
+    }
+    for account_diff in &block_storage_diff.storage_diffs {
+        for pair in &account_diff.diffs {
+            trace!(target: "state_diff",
+                "fetched storage: root {}, address {}, index {}, value {}",
+                block_storage_diff.hash, account_diff.address, pair.index, pair.value);
+        }
+    }
     Ok(block_storage_diff)
 }
 
@@ -136,8 +239,7 @@ pub async fn s3_get_block_transactions_by_number(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: BlockInfo = serde_json::from_value(block.unwrap())
-                .context("rpc get block by hash parse failed")?;
+            let block: BlockInfo = parse_block_info(block.unwrap())?;
             s3_get_block_transactions(
                 s3_client,
                 outer_bucket_name,
@@ -237,7 +339,9 @@ pub async fn s3_get_block_hash_by_number(
     ))
 }
 
-pub async fn s3_get_block_info_and_diff_by_number(
+/// Resolve a block number to its [`BlockInfo`], preferring the RPC client
+/// when available and falling back to the S3 outer-bucket number index.
+pub async fn s3_get_block_info_by_number(
     rpc_client: &Option<HttpClient>,
     s3_client: &Client,
     bucket_name: &str,
@@ -245,8 +349,8 @@ pub async fn s3_get_block_info_and_diff_by_number(
     s3_chain_id: &str,
     version: &str,
     number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = match rpc_client {
+) -> Result<BlockInfo> {
+    match rpc_client {
         Some(rpc) => {
             let block = rpc
                 .get_block_by_number(number.into(), false)
@@ -257,9 +361,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
                     "rpc get block by hash returned none, {number}"
                 ));
             }
-            let block: BlockInfo = serde_json::from_value(block.unwrap())
-                .context("rpc get block by hash parse failed")?;
-            block
+            parse_block_info(block.unwrap())
         }
         None => {
             let block_hash = s3_get_block_hash_by_number(
@@ -272,10 +374,50 @@ pub async fn s3_get_block_info_and_diff_by_number(
             .await?;
             s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
                 .await
-                .context(format!("s3 get block info failed, {block_hash}"))?
+                .context(format!("s3 get block info failed, {block_hash}"))
         }
-    };
+    }
+}
 
+/// Read the stateDiff object for an already-resolved [`BlockInfo`].
+async fn s3_fetch_block_diff(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    block_info: &BlockInfo,
+) -> Result<BlockStorageDiff> {
+    s3_get_block_diff(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        state_diff_key(s3_chain_id, block_info),
+    )
+    .await
+    .context(format!(
+        "s3 get block diff failed, hash: {}, root: {}, number: {}",
+        block_info.header.hash, block_info.header.state_root, block_info.header.number
+    ))
+}
+
+/// Compute the [`BlockStorageDiff`] for an already-resolved [`BlockInfo`].
+///
+/// On block-hash-keyed chains the diff is always read from S3. Everywhere else
+/// the parent is fetched (by hash) and the state roots compared: an unchanged
+/// root yields an empty diff, otherwise the diff is read from S3.
+async fn s3_resolve_block_diff(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    block_info: &BlockInfo,
+) -> Result<BlockStorageDiff> {
+    // Every block has its own object here, so there is nothing to infer from
+    // the parent and no reason to read its Header.
+    if state_diff_keyed_by_block_hash(s3_chain_id) {
+        return s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await;
+    }
     let parent_block_info = s3_get_block_info(
         s3_client,
         bucket_name,
@@ -288,25 +430,115 @@ pub async fn s3_get_block_info_and_diff_by_number(
         "s3 get parent block info failed, {}",
         block_info.header.parent_hash
     ))?;
-    let block_diff = if parent_block_info.header.state_root != block_info.header.state_root {
-        s3_get_block_diff(
-            s3_client,
-            bucket_name,
-            s3_chain_id,
-            version,
-            block_info.header.state_root,
-        )
-        .await
-        .context(format!(
-            "s3 get block diff failed, root: {}, number: {}",
-            block_info.header.state_root, number
-        ))?
+    s3_resolve_block_diff_with_parent_state_root(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        block_info,
+        parent_block_info.header.state_root,
+    )
+    .await
+}
+
+async fn s3_resolve_block_diff_with_parent_state_root(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    block_info: &BlockInfo,
+    parent_state_root: H256,
+) -> Result<BlockStorageDiff> {
+    if state_diff_keyed_by_block_hash(s3_chain_id) {
+        return s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await;
+    }
+    if parent_state_root != block_info.header.state_root {
+        s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await
     } else {
-        let mut diff = BlockStorageDiff::default();
-        diff.hash = block_info.header.state_root;
-        diff.parent_hash = parent_block_info.header.state_root;
-        diff
-    };
+        Ok(BlockStorageDiff {
+            hash: block_info.header.state_root,
+            parent_hash: parent_state_root,
+            ..Default::default()
+        })
+    }
+}
+
+pub async fn s3_get_block_info_and_diff_by_number(
+    rpc_client: &Option<HttpClient>,
+    s3_client: &Client,
+    bucket_name: &str,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    number: u64,
+) -> Result<(BlockInfo, BlockStorageDiff)> {
+    let block_info = s3_get_block_info_by_number(
+        rpc_client,
+        s3_client,
+        bucket_name,
+        outer_bucket_name,
+        s3_chain_id,
+        version,
+        number,
+    )
+    .await?;
+
+    let block_diff =
+        s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
+    Ok((block_info, block_diff))
+}
+
+/// Resolve a block by number when the caller already has its parent's state
+/// root. This avoids reading the parent Header source object, which may have
+/// been deleted after its bundle was compacted.
+#[allow(clippy::too_many_arguments)]
+pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
+    rpc_client: &Option<HttpClient>,
+    s3_client: &Client,
+    bucket_name: &str,
+    outer_bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    number: u64,
+    parent_state_root: H256,
+) -> Result<(BlockInfo, BlockStorageDiff)> {
+    let block_info = s3_get_block_info_by_number(
+        rpc_client,
+        s3_client,
+        bucket_name,
+        outer_bucket_name,
+        s3_chain_id,
+        version,
+        number,
+    )
+    .await?;
+    let block_diff = s3_resolve_block_diff_with_parent_state_root(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        &block_info,
+        parent_state_root,
+    )
+    .await?;
+    Ok((block_info, block_diff))
+}
+
+/// Resolve a block to its [`BlockInfo`] and [`BlockStorageDiff`] strictly by
+/// hash, following the by-hash S3 layout instead of the by-number index. Used
+/// to backfill the chain tip along the exact parent-hash links carried by
+/// Kafka, so a reorg near the tip cannot make the by-number index resolve a
+/// sibling on the wrong branch.
+pub async fn s3_get_block_info_and_diff_by_hash(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    hash: H256,
+) -> Result<(BlockInfo, BlockStorageDiff)> {
+    let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, hash).await?;
+    let block_diff =
+        s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
     Ok((block_info, block_diff))
 }
 
@@ -319,47 +551,18 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     version: &str,
     number: u64,
 ) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = match rpc_client {
-        Some(rpc) => {
-            let block = rpc
-                .get_block_by_number(number.into(), false)
-                .await
-                .context(format!("rpc get block by hash failed, {number}"))?;
-            if block.is_none() {
-                return Err(anyhow::anyhow!(
-                    "rpc get block by hash returned none, {number}"
-                ));
-            }
-            let block: BlockInfo = serde_json::from_value(block.unwrap())
-                .context("rpc get block by hash parse failed")?;
-            block
-        }
-        None => {
-            let block_hash = s3_get_block_hash_by_number(
-                s3_client,
-                outer_bucket_name,
-                s3_chain_id,
-                version,
-                number,
-            )
-            .await?;
-            s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
-                .await
-                .context(format!("s3 get block info failed, {block_hash}"))?
-        }
-    };
-    let block_diff = s3_get_block_diff(
+    let block_info = s3_get_block_info_by_number(
+        rpc_client,
         s3_client,
         bucket_name,
+        outer_bucket_name,
         s3_chain_id,
         version,
-        block_info.header.state_root,
+        number,
     )
-    .await
-    .context(format!(
-        "s3 get block diff failed, root: {}, number: {}",
-        block_info.header.state_root, number
-    ))?;
+    .await?;
+    let block_diff =
+        s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
     Ok((block_info, block_diff))
 }
 
@@ -390,9 +593,248 @@ pub enum StateType {
     Offline = 3,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u64)]
 pub enum NodeType {
     State = 1,
     Archive = 2,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rlp::Encodable;
+    use aws_sdk_s3::config::{Credentials, Region};
+    use axum::{
+        body::Body,
+        extract::State,
+        http::{Request, Response},
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    type DiffServerState = (Vec<u8>, Arc<Mutex<Vec<String>>>);
+
+    fn test_hash(value: u8) -> H256 {
+        H256::from([value; 32])
+    }
+
+    async fn serve_diff(
+        State((body, requests)): State<DiffServerState>,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        requests
+            .lock()
+            .unwrap()
+            .push(request.uri().path().to_owned());
+        Response::builder()
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Drive `s3_resolve_block_diff_with_parent_state_root` against a stub S3
+    /// serving `diff`, returning the resolved diff and the request paths.
+    /// Stand up a stub S3 serving `body` for every key, returning a client
+    /// pointed at it, the recorded request paths, and the server handle.
+    async fn diff_stub(
+        body: Vec<u8>,
+    ) -> (Client, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(serve_diff)
+            .with_state((body, requests.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .build();
+        (Client::from_conf(config), requests, server)
+    }
+
+    async fn resolve_against_stub(
+        s3_chain_id: &str,
+        block_info: &BlockInfo,
+        parent_state_root: H256,
+        diff: &BlockStorageDiff,
+    ) -> (BlockStorageDiff, Vec<String>) {
+        let mut body = Vec::new();
+        diff.encode(&mut body);
+        let (client, requests, server) = diff_stub(body).await;
+
+        let actual = s3_resolve_block_diff_with_parent_state_root(
+            &client,
+            "source",
+            s3_chain_id,
+            "",
+            block_info,
+            parent_state_root,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let paths = requests.lock().unwrap().clone();
+        (actual, paths)
+    }
+
+    /// Only chain 999 switches layout. Everything else — including ids that
+    /// merely resemble it — keeps the state root.
+    #[test]
+    fn only_chain_999_is_keyed_by_block_hash() {
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = test_hash(2);
+        block_info.header.hash = test_hash(3);
+
+        for s3_chain_id in ["1", "56", "137", "9999", "99", "0999", " 999", "999a", ""] {
+            assert!(
+                !state_diff_keyed_by_block_hash(s3_chain_id),
+                "{s3_chain_id:?} must keep the state-root layout"
+            );
+            assert_eq!(
+                state_diff_key(s3_chain_id, &block_info),
+                block_info.header.state_root,
+                "{s3_chain_id:?} must key the diff by state root"
+            );
+        }
+
+        assert!(state_diff_keyed_by_block_hash("999"));
+        assert_eq!(
+            state_diff_key("999", &block_info),
+            block_info.header.hash,
+            "chain 999 must key the diff by block hash"
+        );
+    }
+
+    /// The genesis path has no parent to compare against, so it always
+    /// fetches — but on a legacy chain still under the state-root key. This is
+    /// the read that a cold start performs first.
+    #[tokio::test]
+    async fn legacy_chain_keys_the_genesis_diff_by_state_root() {
+        let block_root = test_hash(2);
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = block_root;
+        block_info.header.hash = test_hash(3);
+        let expected = BlockStorageDiff {
+            hash: block_root,
+            ..Default::default()
+        };
+        let mut body = Vec::new();
+        expected.encode(&mut body);
+        let (client, requests, server) = diff_stub(body).await;
+
+        let actual = s3_fetch_block_diff(&client, "source", "1", "", &block_info)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![format!("/source/1/{block_root}/stateDiff")]
+        );
+    }
+
+    /// Chains other than HyperEVM keep the legacy layout: the object is keyed
+    /// by state root, and a known parent root avoids reading the parent Header.
+    #[tokio::test]
+    async fn legacy_chain_keys_the_diff_by_state_root() {
+        let parent_root = test_hash(1);
+        let block_root = test_hash(2);
+        // Distinct from the state roots, so a by-hash key would be visible.
+        let block_hash = test_hash(3);
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = block_root;
+        block_info.header.hash = block_hash;
+        let expected = BlockStorageDiff {
+            hash: block_root,
+            parent_hash: parent_root,
+            ..Default::default()
+        };
+
+        let (actual, paths) = resolve_against_stub("1", &block_info, parent_root, &expected).await;
+
+        assert_eq!(actual, expected);
+        assert_eq!(paths, vec![format!("/source/1/{block_root}/stateDiff")]);
+    }
+
+    /// And they still skip the fetch entirely when the root has not moved.
+    #[tokio::test]
+    async fn legacy_chain_skips_the_fetch_when_the_state_root_is_unchanged() {
+        let block_root = test_hash(2);
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = block_root;
+        block_info.header.hash = test_hash(3);
+
+        let (actual, paths) =
+            resolve_against_stub("1", &block_info, block_root, &BlockStorageDiff::default()).await;
+
+        assert_eq!(
+            actual,
+            BlockStorageDiff {
+                hash: block_root,
+                parent_hash: block_root,
+                ..Default::default()
+            }
+        );
+        assert!(paths.is_empty(), "expected no S3 request, got {paths:?}");
+    }
+
+    /// HyperEVM reports a zero state root on every block, so an equal-root test
+    /// would match every one of them. Its diffs are keyed by block hash and
+    /// fetched unconditionally.
+    #[tokio::test]
+    async fn hyperevm_fetches_the_diff_by_hash_even_when_the_state_root_is_unchanged() {
+        let block_root = H256::ZERO;
+        let block_hash = test_hash(3);
+        let mut block_info = BlockInfo::default();
+        block_info.header.state_root = block_root;
+        block_info.header.hash = block_hash;
+        let expected = BlockStorageDiff {
+            hash: block_root,
+            parent_hash: block_root,
+            ..Default::default()
+        };
+
+        let (actual, paths) =
+            resolve_against_stub(HYPEREVM_S3_CHAIN_ID, &block_info, block_root, &expected).await;
+
+        assert_eq!(actual, expected);
+        // Exactly one request, for the diff: no parent Header read.
+        assert_eq!(paths, vec![format!("/source/999/{block_hash}/stateDiff")]);
+    }
+}
+
+/// CLI selector for the node type registered to etcd. `Auto` (the default)
+/// preserves the historical behavior of deriving the type from `--archive`;
+/// `State`/`Archive` override it explicitly.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum NodeTypeArg {
+    /// Derive from `--archive`: archive nodes register as archive, all
+    /// others as state.
+    #[default]
+    Auto,
+    /// Register as a state node (node_type = 1) regardless of `--archive`.
+    State,
+    /// Register as an archive node (node_type = 2) regardless of `--archive`.
+    Archive,
+}
+
+impl NodeTypeArg {
+    /// Resolve to the concrete [`NodeType`] written to etcd, falling back to
+    /// `is_archive` when `Auto`.
+    pub fn resolve(self, is_archive: bool) -> NodeType {
+        match self {
+            NodeTypeArg::Auto if is_archive => NodeType::Archive,
+            NodeTypeArg::Auto => NodeType::State,
+            NodeTypeArg::State => NodeType::State,
+            NodeTypeArg::Archive => NodeType::Archive,
+        }
+    }
 }

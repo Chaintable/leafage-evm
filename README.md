@@ -2,7 +2,7 @@
 
 [中文文档](README_cn.md)
 
-leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_estimateGas`, etc.) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
+leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/alloy-rs/alloy) and [revm](https://github.com/bluealloy/revm). It focuses on **state queries** (`eth_call`, `eth_getBalance`, and the custom `estimateGas` method) and does **not store transaction data**. State updates are received via Kafka + S3, rather than P2P synchronization.
 
 ## Features
 
@@ -11,32 +11,55 @@ leafage-evm is a lightweight EVM executor built with [alloy](https://github.com/
   - **Archive Node**: Retains complete historical state, ~360GB for ETH mainnet (as of 2025.1)
 - **Multi-chain Support**: Ethereum mainnet, Optimism, BSC, Cosmos EVM
 - **Multiple Database Backends**: RocksDB (default), MDBX
-- **Data Migration**: Import initial state from Geth snapshots
+- **Database Tooling**: Bulk archive initialization, RocksDB/MDBX migration, compaction and rewind
 
 ## Supported Write Node Repositories
 
 Any EVM-compatible chain can potentially be supported. The following chains are currently supported:
 
-| Chain                     | Repository                                                                    |
-|---------------------------|-------------------------------------------------------------------------------|
-| ETH                       | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)           |
-| AVAX                      | [Chaintable/coreth](https://github.com/Chaintable/coreth)                     |
-| OP Stack (OP, Base, etc.) | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                   |
-| Arb                       | [Chaintable/nitro](https://github.com/Chaintable/nitro)                       |
-| Gnosis                    | [Chaintable/erigon](https://github.com/Chaintable/erigon)                     |
-| Tempo                     | [Chaintable/tempo](https://github.com/Chaintable/tempo)                       |
-| Bitlayer                  | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)           |
-| Oasys                     | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)   |
-| Kava                      | [Chaintable/kava](https://github.com/Chaintable/kava)                         |
-| IoTeX                     | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)         |
-| Scrl                      | [Chaintable/go-ethereum-scrl](https://github.com/chaintable/go-ethereum-scrl) |
-| Bera                      | [Chaintable/bera-geth](https://github.com/chaintable/bera-geth)               |
-| Story                     | [Chaintable/story-geth](https://github.com/chaintable/story-geth)             |
-| Tac                       | [Chaintable/tacchain](https://github.com/chaintable/tacchain)                 |
-| Mitosis                   | [Chaintable/reth-mitosis](https://github.com/chaintable/reth-mitosis)         |
-| Megaeth                   | [Chaintable/mega-reth](https://github.com/chaintable/mega-reth)               |
-| XDC                       | [Chaintable/XDPoSChain](https://github.com/chaintable/XDPoSChain)             |
-| Citrea                    | [Chaintable/citrea](https://github.com/chaintable/citrea)                     |
+| Chain                                         | Repository                                                                                       |
+|-----------------------------------------------|--------------------------------------------------------------------------------------------------|
+| ETH, Linea                                    | [Chaintable/go-ethereum](https://github.com/Chaintable/go-ethereum)                              |
+| AVAX                                          | [Chaintable/coreth](https://github.com/Chaintable/coreth)                                        |
+| OP Stack op-geth: OP, opBNB, Celo, B2, BOB, DBK, Hemi, Katana, Manta, Mantle, Mode, Orderly, Soneium, Unichain, X Layer, Swell | [Chaintable/op-geth](https://github.com/Chaintable/op-geth)                                      |
+| Base                                          | [Chaintable/base-reth](https://github.com/Chaintable/base-reth)                                  |
+| OP Stack op-reth: HSK, Ink, Lisk, Zora, Cyber | [Chaintable/optimism](https://github.com/Chaintable/optimism)                                    |
+| Arb, Gravity, Plume, Hood                     | [Chaintable/nitro](https://github.com/Chaintable/nitro)                                          |
+| Gnosis                                        | [Chaintable/erigon](https://github.com/Chaintable/erigon)                                        |
+| Bitlayer                                      | [Chaintable/bitlayer-l2](https://github.com/Chaintable/bitlayer-l2)                              |
+| Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
+| Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
+| IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
+| Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
+| Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
+| Tac                                           | [Chaintable/tacchain](https://github.com/Chaintable/tacchain)                                    |
+| Mitosis                                       | [Chaintable/reth-mitosis](https://github.com/Chaintable/reth-mitosis)                            |
+| XDC                                           | [Chaintable/XDPoSChain](https://github.com/Chaintable/XDPoSChain)                                |
+| Citrea                                        | [Chaintable/citrea](https://github.com/Chaintable/citrea)                                        |
+| ZKsync: Lens, Era, Abstract, Sophon           | [Chaintable/zksync-era @ debank](https://github.com/Chaintable/zksync-era/tree/debank)           |
+| Cronos zkEVM (Croze)                          | [Chaintable/zksync-era @ chain/croze](https://github.com/Chaintable/zksync-era/tree/chain/croze) |
+| Fraxtal                                       | [Chaintable/frax-op-reth](https://github.com/Chaintable/frax-op-reth)                            |
+| Ronin                                         | [Chaintable/conduit-op-reth](https://github.com/Chaintable/conduit-op-reth)                      |
+| World Chain                                   | [Chaintable/world-chain](https://github.com/Chaintable/world-chain)                              |
+| Plasma, Botanix                               | [Chaintable/reth-x](https://github.com/Chaintable/reth-x)                                        |
+| BSC                                           | [Chaintable/bsc-x](https://github.com/Chaintable/bsc-x)                                          |
+| Core                                          | [Chaintable/core](https://github.com/Chaintable/core)                                            |
+| Chiliz                                        | [Chaintable/chiliz-chain-v2](https://github.com/Chaintable/chiliz-chain-v2)                      |
+| Morph                                         | [Chaintable/go-ethereum-morph-x](https://github.com/Chaintable/go-ethereum-morph-x)              |
+| Taiko                                         | [Chaintable/taiko-geth](https://github.com/Chaintable/taiko-geth)                                |
+| Metis                                         | [Chaintable/mvm-x](https://github.com/Chaintable/mvm-x)                                          |
+| 0G                                            | [Chaintable/0g-geth](https://github.com/Chaintable/0g-geth)                                      |
+| Immutable zkEVM                               | [Chaintable/immutable-geth](https://github.com/Chaintable/immutable-geth)                        |
+| Kite                                          | [Chaintable/subnet-evm-kite](https://github.com/Chaintable/subnet-evm-kite)                      |
+| Merlin                                        | [Chaintable/cdk-erigon](https://github.com/Chaintable/cdk-erigon)                                |
+| Flare                                         | [Chaintable/go-flare-x](https://github.com/Chaintable/go-flare-x)                                |
+| Moonbeam / Moonriver                          | [Chaintable/moonbeam-x](https://github.com/Chaintable/moonbeam-x)                                |
+| Conflux                                       | [Chaintable/conflux-rust-x](https://github.com/Chaintable/conflux-rust-x)                        |
+| Kaia (Klaytn)                                 | [Chaintable/kaia](https://github.com/Chaintable/kaia)                                            |
+| WEMIX                                         | [Chaintable/go-wemix](https://github.com/Chaintable/go-wemix)                                    |
+| Polygon PoS                                   | [Chaintable/bor](https://github.com/Chaintable/bor)                                              |
+| Sonic                                         | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                          |
 
 ## Supported JSON-RPC Methods
 
@@ -74,6 +97,99 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | `blockIsValid` | Validate block |
 
 > **Note**: Block query methods (`eth_getBlockByNumber`, `eth_getBlockByHash`, `getLatestBlock`, `getBlockByHeight`, `getBlockById`) return **header only** - `transactions` and `uncles` are always empty. leafage-evm does not store transaction data.
+
+### Arc query verification
+
+`scripts/test-arc.sh` is the reusable Arc test entry point. `unit` runs the
+offline parser, schema, and normalization tests; `rpc` runs deterministic
+differential checks against a fixed Arc archive block; `all` runs both.
+
+The three execution APIs use different writer oracles:
+
+- `contractMultiCall` is expanded into independent writer `eth_call` and
+  `debug_traceCall` requests with the same block/state overrides.
+- `simulateTransactions` uses `eth_simulateV1(validation=false,
+  traceTransfers=false)` for output, transaction gas, logs, and ordered state,
+  with `pre_traceMany` as a successful-frame trace oracle where it has matching
+  pre-execution semantics.
+- `estimateGas` is compared exactly with writer `eth_estimateGas`; requests
+  with block overrides reproduce the Arc/Reth binary search with writer
+  `eth_call` probes and replay the returned Leafage limit.
+
+The fixed corpus covers number and hash block selectors, empty/large batches,
+fast-fail, state and block overrides, EIP-1559/EIP-2930/EIP-7702, standard and
+Arc precompiles, NCA/NCC/system contracts, EIP-2935/EIP-7708/EIP-6780,
+CREATE/CREATE2/SELFDESTRUCT/revert rollback, and historical balance/nonce/code/
+storage boundaries. Asset checks include Arc native USDC plus USDC, AWORP,
+AUSD, AGBP, and Permit2 reads. Producer-captured Header/StateDiff/BlockFile
+loader fixtures remain a separate test layer.
+
+```bash
+./scripts/test-arc.sh unit
+```
+
+Validate only the writer oracle and fixed corpus, without claiming Leafage
+equivalence:
+
+```bash
+ARC_REFERENCE_RPC=http://127.0.0.1:38545 \
+ARC_BLOCK=15818173 \
+./scripts/test-arc.sh rpc --reference-only
+```
+
+```bash
+LEAFAGE_RPC=http://127.0.0.1:8545 \
+ARC_REFERENCE_RPC=http://127.0.0.1:38545 \
+ARC_BLOCK=15818173 \
+ARC_QUERY_REPORT=/tmp/arc-query-report.json \
+./scripts/test-arc.sh all
+```
+
+The selected block must have a canonical successor: the script uses the fixed
+block's post-state and pins both simulators to the real next-block environment.
+Both endpoints should be synchronized before stable-latest checks are interpreted.
+RPC URLs are read from environment variables so credentials do not appear in
+the Python process arguments.
+
+Set `LEAFAGE_NODECTL_ENDPOINT=http://127.0.0.1:8545/5042` to run the existing
+randomized `nodectl node verify` suite after the fixed fixtures. Exit code `0`
+means every comparison passed, `1` means a deterministic difference was found,
+and `2` means the run was incomplete because an anchor or RPC dependency was
+unavailable. RPC URLs are never written to the JSON report.
+Only a run with both `LEAFAGE_RPC` and `ARC_REFERENCE_RPC` is evidence of API
+equivalence. A `--reference-only` result proves only that the writer oracle and
+fixtures are executable at the selected anchor. The JSON report covers only the deterministic Python suite; when `nodectl` is
+enabled, the process exit code covers both phases and is authoritative.
+`nodectl` accepts both endpoints as command-line arguments, so the wrapper
+requires uncredentialed loopback URLs for that optional phase. Use a local
+tunnel rather than a credential-bearing public URL.
+
+The breadth suite complements the deep fixed fixtures with a data-driven Arc
+mainnet matrix. It counts a case only when target, semantic scenario, block
+context, actor, or endpoint differs; output, gas, status, and events remain
+assertion dimensions inside that case. The frozen matrix contains 3,042 unique
+endpoint/block cases derived from 565 base vectors, across 42 target labels
+(41 on-chain addresses) and 89 historical heights. It covers important
+contracts and deployed assets, four successful historical business
+transactions, P256/PQ, NCA/NCC, SystemAccounting, EIP-2935, CREATE2, proxy/code
+history, access-control failures, and stateful ERC-20 sequences. The endpoint
+case count is 13.284 times the audited 229-case A8 baseline; 3,042 must not be
+described as 3,042 independent semantic vectors. It does not access public
+RPCs or testnet.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+LEAFAGE_RPC=http://127.0.0.1:48548 \
+ARC_REFERENCE_RPC=http://127.0.0.1:38545 \
+python3 -B scripts/verify_arc_breadth.py \
+  --block 15818173 \
+  --funded-address 0x7e8f45d07f1a182fa59aa5b62012459c15309791 \
+  --output /tmp/arc-mainnet-breadth-15818173.json
+```
+
+Use `--plan-only` to inspect the case inventory without calling either RPC.
+The breadth suite has the same exit convention: `0` means every planned case
+passed, `1` means the run completed with differences, and `2` means incomplete.
 
 ### pre_*
 
@@ -121,6 +237,8 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-type` | rocksdb | Database type: rocksdb/mdbx |
 | `--db-cache` | 2048 | Database cache size (MB) |
 | `--diff-depth-limit` | 64 | Block diff depth retained in memory |
+| `--catchup-safe-depth` | 0 | S3 catch-up reorg buffer: blocks below the Kafka head backfilled via the exact parent-hash chain instead of the by-number index. 0 disables it (legacy behavior); set above the chain's max reorg depth (e.g. 64 for Moonriver) |
+| `--bundle-range-size` | 32 MiB | Target size for combining multiple StateDiff entries into one S3 Range request. A larger single entry is still read alone. Also available on `archive-init` |
 | `--archive` | false | Enable archive mode |
 | `--prometheus-addr` | - | Prometheus metrics address |
 | `--kafka-s3-config` | - | Path to Kafka + S3 config JSON file |
@@ -140,6 +258,7 @@ When using Kafka + S3 mode, provide a JSON config file:
   "brokers": "kafka1:9092,kafka2:9092",
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
+  "bundle_bucket_name": "compacted-state-diffs-bucket",
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
@@ -147,18 +266,32 @@ When using Kafka + S3 mode, provide a JSON config file:
 }
 ```
 
-### Data Migration
+`bundle_bucket_name` is optional; omit it or leave it empty to keep the legacy per-block S3 path.
 
-Migrate initial data from Geth snapshot:
+Both `standalone` and `archive-init` accept `--bundle-range-size <MIB>` to tune the compacted StateDiff request size. The limit applies only when grouping multiple entries; a single entry larger than the configured value is fetched by itself.
+
+### CLI Subcommands
+
+| Subcommand | Purpose |
+|------------|---------|
+| `standalone` | Start the node |
+| `archive-init` | Initialize an archive database in bulk from S3 and RPC |
+| `db-migrate` | Migrate between databases (RocksDB ↔ MDBX, archive → state) |
+| `compact` | Compact the database to reclaim space |
+| `force-compact` | Force bottommost compaction so bulk-loaded SSTs regenerate the prefix bloom / partitioned index |
+| `rewind` | Reset the committed head to an earlier block and resync from S3 |
+| `archive-scan` | Read-only scan of an archive column family (forensics/debugging) |
+
+Run `leafage-evm <subcommand> --help` for the full parameter list.
 
 ```bash
-# 1. Export snapshot from Geth
-./geth snapshot dump2 --dumpdb /nodex_backup --datadir /eth/state/geth/
+# Initialize an archive database
+RUST_LOG=info ./target/release/leafage-evm archive-init --help
 
-# 2. Import to leafage-evm
-RUST_LOG=info ./target/release/leafage-evm file-migrate \
-  --source-path /nodex_backup \
-  --db-path /path/to/leafage/db
+# Migrate a database (e.g. archive → state)
+RUST_LOG=info ./target/release/leafage-evm db-migrate \
+  --src /path/to/source/db \
+  --dst /path/to/leafage/db
 ```
 
 ## Benchmark

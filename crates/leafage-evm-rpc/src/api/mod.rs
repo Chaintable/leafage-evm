@@ -9,3 +9,6 @@ pub use pre::PreApiServer;
 
 mod debank;
 pub use debank::{DebankApiClient, DebankApiServer};
+
+mod blockx;
+pub use blockx::{BlockxApiClient, BlockxApiServer};

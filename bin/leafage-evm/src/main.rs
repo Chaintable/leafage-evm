@@ -1,15 +1,22 @@
 // cache-verify round 2: validating Plan C (layer-cache via cargo-chef, no cache mounts)
 mod archive_init;
+mod archive_scan;
+mod bundle;
 mod compact;
 mod db_migrate;
+mod force_compact;
 mod initializer;
 mod register;
+mod rewind;
 mod runner;
 mod standalone;
 mod updater;
 mod utils;
 mod pprof;
 mod warm;
+
+#[cfg(test)]
+mod arc_fixture_tests;
 
 use clap::Parser;
 use runner::Cli;

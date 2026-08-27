@@ -3,9 +3,11 @@ name: build
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
@@ -19,8 +21,11 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu2404-linux-x86-64-16c
             arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu2204-arm64-16c
+            arch: arm64
     runs-on: ${{ matrix.runner }}
 
     permissions:
@@ -28,16 +33,6 @@ jobs:
       id-token: write
 
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: false
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -49,14 +44,12 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Configure AWS credentials (OIDC)
-        if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
       - name: Login to Public ECR
-        if: github.event_name != 'pull_request'
         uses: aws-actions/amazon-ecr-login@v2
         with:
           registry-type: public
@@ -67,7 +60,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REVISION }}-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
@@ -77,8 +70,7 @@ jobs:
   manifest:
     name: merge-manifest
     needs: build
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu2404-linux-x86-64-16c
 
     permissions:
       contents: read
@@ -109,5 +101,5 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
-            -t ${REGISTRY}/${IMAGE_NAME}:latest \
-            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64 \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64

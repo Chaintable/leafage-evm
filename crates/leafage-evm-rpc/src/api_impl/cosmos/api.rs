@@ -3,7 +3,7 @@ use crate::api_impl::{ApiCore, ApiImpl, EvmExecutor, GasFeeHandler};
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::cosmos::{CosmosEvm, CosmosEvmConfig, CosmosHardfork};
-use leafage_evm_types::{BlockEnv, CallRequest};
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context::TxEnv;
 use revm::database::WrapDatabaseRef;
@@ -31,6 +31,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
+        _block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,

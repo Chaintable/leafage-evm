@@ -6,6 +6,7 @@ use leafage_evm_types::{
     AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
 use std::fmt::Debug;
+use tracing::{debug, trace};
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockIterator: Send + Sync + 'static {
@@ -36,6 +37,43 @@ pub trait StateDBRead {
 
     /// account address | storage index -> storage value
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, StorageError>;
+
+    /// Batched [`StateDBRead::read_account`]: one result per input, same
+    /// order. The scalar default keeps archive/MDBX/mock backends correct;
+    /// exact-key backends (non-archive RocksDB) override it with MultiGet.
+    fn read_account_many(
+        &self,
+        addresses: &[H256],
+    ) -> Result<Vec<Option<NewAccount>>, StorageError> {
+        addresses
+            .iter()
+            .map(|address| self.read_account(*address))
+            .collect()
+    }
+
+    /// Batched [`StateDBRead::read_code`]: one result per input, same order.
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, StorageError> {
+        code_hashes
+            .iter()
+            .map(|code_hash| self.read_code(*code_hash))
+            .collect()
+    }
+
+    /// Batched [`StateDBRead::read_storage`] over `(address, key)` pairs:
+    /// one result per input, same order.
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, StorageError> {
+        keys.iter()
+            .map(|(address, key)| self.read_storage(*address, *key))
+            .collect()
+    }
+
+    /// Whether the `*_many` reads above are served by a real batched
+    /// storage primitive (RocksDB MultiGet) instead of the scalar
+    /// defaults. A performance hint for callers deciding whether eager
+    /// batched reads are worth issuing; correctness never depends on it.
+    fn supports_batched_reads(&self) -> bool {
+        false
+    }
 }
 
 #[auto_impl(&, Box, Arc)]
@@ -168,6 +206,35 @@ where
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error> {
         Ok(self.0.read_block_hash(number)?.into())
     }
+
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
+        Ok(self
+            .0
+            .read_account_many(addresses)?
+            .into_iter()
+            .map(|raw| raw.map(Into::into))
+            .collect())
+    }
+
+    fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, Self::Error> {
+        Ok(self
+            .0
+            .read_code_many(code_hashes)?
+            .into_iter()
+            .map(|code| match code {
+                Some(code) => Bytecode::new_raw(code.0.into()),
+                None => Bytecode::default(),
+            })
+            .collect())
+    }
+
+    fn storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Self::Error> {
+        self.0.read_storage_many(keys)
+    }
+
+    fn supports_batched_reads(&self) -> bool {
+        self.0.supports_batched_reads()
+    }
 }
 
 impl<T> EvmStorageWrite for StateDBWrapper<T>
@@ -184,20 +251,42 @@ where
         let start = std::time::Instant::now();
         let mut batch = self.0.prepare_write_batch()?;
         let block_number = block_info.header.number;
+        // Correlate with the fetch-side logs in s3_get_block_diff via the
+        // state root. Enable with RUST_LOG=state_diff=debug (or =trace for
+        // per-account / per-slot detail).
+        debug!(target: "state_diff",
+            "commit block {} ({}): root {}, new_accounts {}, deleted_accounts {}, storage_accounts {}, storage_slots {}, new_codes {}",
+            block_number,
+            block_info.header.hash,
+            block_info.header.state_root,
+            block_diff.new_accounts.len(),
+            block_diff.deleted_accounts.len(),
+            block_diff.storage_diffs.len(),
+            block_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum::<usize>(),
+            block_diff.new_codes.len(),
+        );
         self.0
             .write_block_hash(&mut batch, block_info.header.number, block_info.header.hash)?;
         let hash = block_info.header.hash;
         self.0.write_block_info(&mut batch, block_info)?;
         for account in block_diff.deleted_accounts {
+            trace!(target: "state_diff",
+                "commit delete account: block {}, address {}", block_number, account);
             self.0
                 .write_account(&mut batch, account, block_number, None)?;
         }
         for account in block_diff.new_accounts {
+            trace!(target: "state_diff",
+                "commit account: block {}, address {}, balance {}, nonce {}, code_hash {}",
+                block_number, account.address, account.balance, account.nonce, account.code_hash);
             self.0
                 .write_account(&mut batch, account.address, block_number, Some(account))?;
         }
         for account_diff in block_diff.storage_diffs {
             for index_value_pair in account_diff.diffs {
+                trace!(target: "state_diff",
+                    "commit storage: block {}, address {}, index {}, value {}",
+                    block_number, account_diff.address, index_value_pair.index, index_value_pair.value);
                 self.0.write_storage(
                     &mut batch,
                     account_diff.address,
@@ -208,6 +297,9 @@ where
             }
         }
         for new_code in block_diff.new_codes {
+            trace!(target: "state_diff",
+                "commit code: block {}, code_hash {}, len {}",
+                block_number, new_code.code_hash, new_code.code.len());
             self.0
                 .write_code(&mut batch, new_code.code_hash, new_code.code)?;
         }

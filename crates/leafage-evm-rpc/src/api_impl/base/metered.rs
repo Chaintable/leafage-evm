@@ -1,0 +1,235 @@
+//! Gas-metered [`B20Port`] backed by the live revm journal.
+//!
+//! Port of Base reth's `EvmPrecompileStorageProvider`
+//! (`base/crates/common/precompile-storage/src/evm.rs`) onto revm 36's `JournalTr` — the
+//! only structural difference is that Base reaches state through `alloy_evm::EvmInternals`
+//! while leafage holds the journal directly.
+//!
+//! All costs come from revm's own [`GasParams`] table for the active spec, driven by the
+//! journal's cold/warm flags and original/present/new slot values. Nothing here hardcodes a
+//! gas number, which is what makes the result track Base across hardforks rather than
+//! matching it only at the fork it was written against.
+
+use leafage_evm_types::{Address, U256};
+use leafage_evm_chains::base::b20::{B20Error, B20Port, Result as B20Result};
+use revm::context::JournalTr;
+use revm::context_interface::cfg::GasParams;
+use revm::interpreter::gas::Gas;
+use revm::primitives::{Log, LogData};
+
+/// Wraps the EVM journal so B20 logic reads and writes real state, paying real gas.
+pub struct MeteredB20Port<'a, J: JournalTr> {
+    journal: &'a mut J,
+    gas: Gas,
+    gas_params: GasParams,
+    caller: Address,
+    call_value: U256,
+    chain_id: u64,
+    timestamp: U256,
+    is_static: bool,
+}
+
+impl<'a, J: JournalTr> MeteredB20Port<'a, J> {
+    /// Builds a port over `journal` for a call with `gas_limit`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        journal: &'a mut J,
+        gas_limit: u64,
+        gas_params: GasParams,
+        caller: Address,
+        call_value: U256,
+        chain_id: u64,
+        timestamp: U256,
+        is_static: bool,
+    ) -> Self {
+        Self {
+            journal,
+            gas: Gas::new(gas_limit),
+            gas_params,
+            caller,
+            call_value,
+            chain_id,
+            timestamp,
+            is_static,
+        }
+    }
+
+    /// Gas consumed so far.
+    pub fn gas_spent(&self) -> u64 {
+        self.gas.spent()
+    }
+
+    /// Accumulated EIP-3529 refund, for revm to apply under the transaction-level cap.
+    pub fn gas_refunded(&self) -> i64 {
+        self.gas.refunded()
+    }
+
+    fn charge(&mut self, cost: u64) -> B20Result<()> {
+        if self.gas.record_cost(cost) {
+            Ok(())
+        } else {
+            Err(B20Error::OutOfGas)
+        }
+    }
+
+    /// Ensures `address` is present in the journal before its storage is touched.
+    ///
+    /// revm's `sload`/`sstore` assume the account is already loaded and return
+    /// `ColdLoadSkipped` otherwise (`revm-context/src/journal/inner.rs`), which the default
+    /// `JournalTr` wrappers hand to `unwrap_db_error` -- a panic, not an error. The token's
+    /// own account always arrives loaded via the initialization check, but the PolicyRegistry
+    /// does not: nothing touches it until a token whose policy ID is not ALWAYS_ALLOW consults
+    /// it mid-transfer, so the gap only opens on policy-gated tokens.
+    ///
+    /// Charges no gas, deliberately. Base reaches state through `alloy_evm::EvmInternals`,
+    /// which loads the account implicitly, and measurement against Base mainnet confirms only
+    /// the storage read is billed: a policy-gated `transfer` costs exactly two cold SLOADs for
+    /// the registry and nothing for the account itself.
+    fn ensure_loaded(&mut self, address: Address) -> B20Result<()> {
+        self.journal
+            .load_account(address)
+            .map(|_| ())
+            .map_err(|_| B20Error::Fatal("load_account failed".to_string()))
+    }
+}
+
+impl<J: JournalTr> B20Port for MeteredB20Port<'_, J> {
+    fn sload(&mut self, address: Address, key: U256) -> B20Result<U256> {
+        self.ensure_loaded(address)?;
+        let loaded = self
+            .journal
+            .sload(address, key)
+            .map_err(|_| B20Error::Fatal("sload failed".to_string()))?;
+
+        // EIP-2929: the warm cost is always paid; a cold slot pays the extra penalty on top.
+        self.charge(self.gas_params.warm_storage_read_cost())?;
+        if loaded.is_cold {
+            self.charge(self.gas_params.cold_storage_additional_cost())?;
+        }
+        Ok(loaded.data)
+    }
+
+    fn sstore(&mut self, address: Address, key: U256, value: U256) -> B20Result<()> {
+        if self.is_static {
+            return Err(B20Error::StaticCallViolation);
+        }
+        // EIP-2200 reentrancy sentry: a frame left with only the 2300 call stipend must not
+        // be able to write. Without this, a warm no-op rewrite (~100 gas) would succeed
+        // where the SSTORE opcode would have halted.
+        if self.gas.remaining() <= self.gas_params.call_stipend() {
+            return Err(B20Error::OutOfGas);
+        }
+        self.ensure_loaded(address)?;
+
+        let stored = self
+            .journal
+            .sstore(address, key, value)
+            .map_err(|_| B20Error::Fatal("sstore failed".to_string()))?;
+
+        self.charge(self.gas_params.sstore_static_gas())?;
+        self.charge(self.gas_params.sstore_dynamic_gas(true, &stored.data, stored.is_cold))?;
+        self.gas.record_refund(self.gas_params.sstore_refund(true, &stored.data));
+        Ok(())
+    }
+
+    fn emit_event(&mut self, address: Address, log: LogData) -> B20Result<()> {
+        if self.is_static {
+            return Err(B20Error::StaticCallViolation);
+        }
+        let cost = revm::interpreter::gas::LOG
+            + self.gas_params.log_cost(log.topics().len() as u8, log.data.len() as u64);
+        self.charge(cost)?;
+        self.journal.log(Log { address, data: log });
+        Ok(())
+    }
+
+    fn has_code(&mut self, address: Address) -> B20Result<bool> {
+        // `load_account` is enough: only the code hash is needed, and it is always
+        // populated eagerly, so this avoids pulling bytecode out of the database.
+        let (is_empty_code, is_cold) = {
+            let loaded = self
+                .journal
+                .load_account(address)
+                .map_err(|_| B20Error::Fatal("load_account failed".to_string()))?;
+            (loaded.data.info.is_empty_code_hash(), loaded.is_cold)
+        };
+
+        self.charge(self.gas_params.warm_storage_read_cost())?;
+        if is_cold {
+            self.charge(self.gas_params.cold_account_additional_cost())?;
+        }
+        Ok(!is_empty_code)
+    }
+
+    fn deduct_gas(&mut self, gas: u64) -> B20Result<()> {
+        self.charge(gas)
+    }
+
+    fn caller(&self) -> Address {
+        self.caller
+    }
+
+    fn call_value(&self) -> U256 {
+        self.call_value
+    }
+
+    fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    fn timestamp(&self) -> U256 {
+        self.timestamp
+    }
+
+    fn is_static(&self) -> bool {
+        self.is_static
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context::JournalTr;
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::primitives::address;
+
+    /// Reading a second account's storage must not panic when that account has not been
+    /// loaded into the journal.
+    ///
+    /// This is the production failure: a policy-gated B20 transfer reads the PolicyRegistry
+    /// at `0x8453…0002`, an account nothing has touched. revm's `sload` assumes the account
+    /// is present and returns `ColdLoadSkipped` when it is not, which the default `JournalTr`
+    /// wrapper turns into `panic!("Expected DBError")` — surfacing as a -32603 internal error
+    /// rather than a normal RPC failure. A mock port cannot reproduce this; it needs a real
+    /// journal.
+    #[test]
+    fn sload_on_an_unloaded_account_does_not_panic() {
+        const REGISTRY: Address = address!("0x8453000000000000000000000000000000000002");
+
+        let mut journal: revm::Journal<CacheDB<EmptyDB>> =
+            revm::Journal::new(CacheDB::new(EmptyDB::default()));
+        let mut port = MeteredB20Port::new(
+            &mut journal,
+            1_000_000,
+            GasParams::default(),
+            Address::ZERO,
+            U256::ZERO,
+            8453,
+            U256::ZERO,
+            false,
+        );
+
+        // Never loaded, and read straight away — exactly the production path.
+        let value = port.sload(REGISTRY, U256::from(1u64));
+        assert!(value.is_ok(), "sload on an unloaded account must not panic or error");
+        assert_eq!(value.unwrap(), U256::ZERO, "an unwritten slot reads zero");
+
+        // Only the storage read is billed: the account load itself is free, matching Base.
+        let params = GasParams::default();
+        assert_eq!(
+            port.gas_spent(),
+            params.warm_storage_read_cost() + params.cold_storage_additional_cost(),
+            "a cold SLOAD costs exactly one cold storage read, with nothing for the account"
+        );
+    }
+}

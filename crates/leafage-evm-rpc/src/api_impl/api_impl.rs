@@ -5,6 +5,7 @@ use jsonrpsee::http_client::HttpClient;
 use leafage_evm_types::{Address, DebankErrorCode};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::CfgEnv;
+use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm::primitives::keccak256;
 use std::str::FromStr;
 
@@ -30,6 +31,8 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
         version: String,
         estimate_gas_buffer: u64,
         token_collector: Option<TokenCollector>,
+        exec_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        state_read_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         Self {
             db,
@@ -41,6 +44,8 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 version,
                 estimate_gas_buffer,
                 custom_cfg,
+                exec_limiter,
+                state_read_limiter,
             },
             historical_client,
             historical_height,
@@ -52,7 +57,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
 impl<DB, SpecId, CustomCfg> ApiBase for ApiImpl<DB, SpecId, CustomCfg>
 where
     DB: Sync + Send + 'static,
-    SpecId: Send + Sync + 'static,
+    SpecId: Send + Sync + 'static + Into<EthSpecId> + Clone,
     CustomCfg: Send + Sync + 'static,
 {
     type DB = DB;
