@@ -72,9 +72,9 @@ pub struct Command {
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
-    /// If omitted, use the evm-type's built-in spec.
-    #[arg(long)]
-    spec_id: Option<u8>,
+    /// if not specified, the default spec_id is u8::MAX
+    #[arg(long, default_value = "255")]
+    spec_id: u8,
 
     /// Maximum gas limit for RPC methods
     /// [default: 100000000]
@@ -460,11 +460,8 @@ fn parse_ovm_address(arg: &str) -> Result<Address> {
     Ok(address)
 }
 
-/// Resolve `--spec-id` to a typed EVM spec; omitted or `u8::MAX` keeps the built-in spec.
-fn resolve_spec<T: TryFrom<u8>>(spec_id: Option<u8>, default: T, type_label: &str) -> Result<T> {
-    let Some(spec_id) = spec_id else {
-        return Ok(default);
-    };
+/// Resolve `--spec-id` to a typed EVM spec; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
+fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Result<T> {
     if spec_id == u8::MAX {
         return Ok(default);
     }
@@ -497,7 +494,7 @@ impl Command {
                 if chain_id != ARC_MAINNET_CHAIN_ID {
                     bail!("Arc EVM requires chain ID 5042");
                 }
-                if self.spec_id.is_some() {
+                if self.spec_id != u8::MAX {
                     bail!("Arc EVM uses its network hardfork schedule; --spec-id is unsupported");
                 }
                 if custom_evm_cfg.is_some() {
@@ -1002,7 +999,7 @@ mod tests {
                     "--chain-cfg",
                     "arc",
                     "--spec-id",
-                    "255",
+                    "254",
                 ],
                 "--spec-id is unsupported",
             ),
@@ -1041,6 +1038,19 @@ mod tests {
         ] {
             assert_arc_config_error(&args, expected);
         }
+    }
+
+    #[test]
+    fn arc_accepts_legacy_spec_sentinel() {
+        let command = parse_command(&[
+            "--evm-type",
+            "arc",
+            "--chain-cfg",
+            "arc",
+            "--spec-id",
+            "255",
+        ]);
+        assert!(command.build_chain_cfg_env().is_ok());
     }
 
     #[test]
