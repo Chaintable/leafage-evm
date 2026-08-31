@@ -1,10 +1,14 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, PreparedQueryEnvironment};
+use crate::api_impl::core::{
+    ApiCore, EvmExecutor, GasFeeHandler, PreparedSimulationEnvironment, SimulationExecutionOutput,
+    StateOverrideEndpoint,
+};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_err, rpc_error_with_code};
 use alloy::consensus::BlockHeader;
 use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use alloy::primitives::{Address, Log};
+use alloy::rpc::types::state::StateOverride;
 use alloy::signers::Either;
 use alloy::sol_types::{ContractError, GenericRevertReason, RevertReason};
 use alloy_evm::{
@@ -19,6 +23,7 @@ use leafage_evm_types::{
     BlockEnv, BlockInfo, BlockOverrides, Bytes, CallRequest, DebankErrorCode, MainnetSpecId, U256,
 };
 use revm::{
+    bytecode::OpCode,
     context::{
         result::{
             EVMError, ExecutionResult, HaltReason, InvalidHeader, InvalidTransaction, OutOfGasError,
@@ -31,7 +36,7 @@ use revm::{
     interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
     DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm, SystemCallEvm,
 };
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 
 type ArcApiImpl<DB> = ApiImpl<DB, MainnetSpecId, ArcChainConfig>;
@@ -690,21 +695,17 @@ where
     type TransactionError = InvalidTransaction;
     type EvmHaltReason = HaltReason;
 
-    fn arc_chain_config(&self) -> Option<ArcChainConfig> {
-        self.evm_cfg.custom_cfg
-    }
-
-    fn prepare_query_environment<StateDB>(
+    fn prepare_simulation_environment<StateDB>(
         &self,
         block: &BlockInfo,
         overrides: Option<BlockOverrides>,
         db: &mut CacheDB<StateDB>,
-    ) -> RpcResult<PreparedQueryEnvironment> {
+    ) -> RpcResult<PreparedSimulationEnvironment> {
         let Some(overrides) = overrides else {
-            return Ok(PreparedQueryEnvironment::generic(block, None, db));
+            return Ok(PreparedSimulationEnvironment::generic(block, None, db));
         };
         if overrides.number.is_none() {
-            return Ok(PreparedQueryEnvironment::generic(
+            return Ok(PreparedSimulationEnvironment::generic(
                 block,
                 Some(overrides),
                 db,
@@ -722,10 +723,22 @@ where
             db,
         )
         .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
-        Ok(PreparedQueryEnvironment {
+        Ok(PreparedSimulationEnvironment {
             block_env: environment.block_env,
             pre_execution_header: Some(environment.synthetic_next_header),
         })
+    }
+
+    fn apply_state_overrides<StateDB>(
+        &self,
+        endpoint: StateOverrideEndpoint,
+        overrides: StateOverride,
+        db: &mut CacheDB<StateDB>,
+    ) -> RpcResult<()>
+    where
+        StateDB: DatabaseRef,
+    {
+        super::state_override::apply(endpoint, overrides, db)
     }
 
     fn call_error<DBError>(
@@ -921,21 +934,19 @@ where
         Ok((result, inspector_collect(inspector.into_inner())))
     }
 
-    fn inspect_tx_commit_for_simulation<StateDB, R, F>(
+    fn execute_simulation<StateDB>(
         &self,
         block_env: &BlockEnv,
         state: StateDB,
-        inspector_cfg: TracingInspectorConfig,
-        inspector_collect: F,
+        tx_hash: leafage_evm_types::H256,
         tx: Self::Tx,
     ) -> Result<
-        (ExecutionResult<Self::EvmHaltReason>, R, Vec<Address>),
+        SimulationExecutionOutput<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     >
     where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
-        F: FnOnce(TracingInspector) -> R,
     {
         let factory = self.arc_factory().map_err(EVMError::Custom)?;
         let mut cfg = self.evm_cfg.cfg.clone();
@@ -948,6 +959,11 @@ where
                 .filter(|cap| *cap != 0)
                 .unwrap_or(u64::MAX),
         );
+        let mut inspector_cfg = TracingInspectorConfig::default_parity()
+            .set_record_logs(true)
+            .set_steps(true)
+            .set_exclude_precompile_calls(false);
+        inspector_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
         let env = EvmEnv::new(cfg, block_env.clone());
         let mut inspector = ArcTracingInspector::new(inspector_cfg);
         let mut evm = factory
@@ -956,7 +972,17 @@ where
         let result = evm.inspect_tx_commit(tx)?;
         drop(evm);
         let (inspector, log_emitters) = inspector.into_parts();
-        Ok((result, inspector_collect(inspector), log_emitters))
+        let (traces, mut events) =
+            super::simulation::build_debank_traces(tx_hash, inspector.into_traces(), &log_emitters);
+        if !result.is_success() {
+            events.clear();
+        }
+
+        Ok(SimulationExecutionOutput {
+            result,
+            traces,
+            events,
+        })
     }
 }
 

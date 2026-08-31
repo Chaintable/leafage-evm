@@ -475,9 +475,6 @@ impl Command {
         let evm_type = self.evm_type.clone();
         let custom_evm_cfg = self.evm_custom_config.clone();
         let gas_cap = self.rpc_gas_cap;
-        if chain_id == ARC_MAINNET_CHAIN_ID && evm_type != "arc" {
-            bail!("chain ID 5042 requires --evm-type arc");
-        }
         match evm_type.as_str() {
             "mainnet" => {
                 let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
@@ -890,10 +887,10 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let chain_cfg = self.build_chain_cfg_env()?;
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
-        let (updater_handle, rpc_handle, resgitry_handle) = self.start(chain_cfg).await?;
+        let (updater_handle, rpc_handle, resgitry_handle) =
+            self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
@@ -929,17 +926,6 @@ mod tests {
         Command::try_parse_from(argv).expect("command should parse")
     }
 
-    fn assert_arc_config_error(args: &[&str], expected: &str) {
-        let command = parse_command(args);
-        let error = command
-            .build_chain_cfg_env()
-            .expect_err("Arc configuration should be rejected");
-        assert!(
-            error.to_string().contains(expected),
-            "expected error containing {expected:?}, got {error}"
-        );
-    }
-
     #[test]
     fn arc_alias_and_numeric_chain_id_build_mainnet_config() {
         for chain_cfg_arg in ["arc", "5042"] {
@@ -958,38 +944,6 @@ mod tests {
             assert!(!cfg.disable_block_gas_limit);
             assert!(!cfg.disable_base_fee);
             assert_eq!(arc_config, ArcChainConfig::mainnet());
-        }
-    }
-
-    #[test]
-    fn arc_chain_id_requires_arc_evm_type() {
-        assert_arc_config_error(
-            &["--evm-type", "mainnet", "--chain-cfg", "5042"],
-            "chain ID 5042 requires --evm-type arc",
-        );
-    }
-
-    #[test]
-    fn non_arc_spec_id_keeps_legacy_default_and_sentinel_behavior() {
-        for args in [
-            vec!["--evm-type", "mainnet", "--chain-cfg", "1"],
-            vec![
-                "--evm-type",
-                "mainnet",
-                "--chain-cfg",
-                "1",
-                "--spec-id",
-                "255",
-            ],
-        ] {
-            let command = parse_command(&args);
-            let MultiChainCfgEnv::Mainnet(cfg) = command
-                .build_chain_cfg_env()
-                .expect("mainnet config should build")
-            else {
-                panic!("expected mainnet chain config");
-            };
-            assert_eq!(cfg.spec, MainnetSpecId::AMSTERDAM);
         }
     }
 

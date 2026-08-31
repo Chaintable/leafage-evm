@@ -1,6 +1,7 @@
 use crate::api_impl::token_collector::TokenCollector;
 use crate::error::internal_rpc_err;
 use alloy::consensus::BlockHeader;
+use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::decode_revert_reason;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
@@ -17,16 +18,17 @@ use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{
-    block_env_from_block, BlockEnv, BlockInfo, BlockOverrides, Bytes, CallRequest, CfgEnv, Header,
-    MainnetSpecId, OpSpecId, H256,
+    block_env_from_block, BlockEnv, BlockInfo, BlockOverrides, Bytes, CallRequest, CfgEnv,
+    DebankEvent, DebankTrace, Header, MainnetSpecId, OpSpecId, H256,
 };
+use revm::bytecode::OpCode;
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
 use revm::database::CacheDB;
-use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId, Address};
+use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm::{DatabaseCommit, DatabaseRef};
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -50,12 +52,24 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
-pub(crate) struct PreparedQueryEnvironment {
+pub(crate) struct PreparedSimulationEnvironment {
     pub(crate) block_env: BlockEnv,
     pub(crate) pre_execution_header: Option<Header>,
 }
 
-impl PreparedQueryEnvironment {
+pub(crate) struct SimulationExecutionOutput<R> {
+    pub(crate) result: ExecutionResult<R>,
+    pub(crate) traces: Vec<DebankTrace>,
+    pub(crate) events: Vec<DebankEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateOverrideEndpoint {
+    EthCall,
+    DebankCall,
+}
+
+impl PreparedSimulationEnvironment {
     pub(crate) fn generic<DB>(
         block: &BlockInfo,
         overrides: Option<BlockOverrides>,
@@ -175,19 +189,26 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 
     type EvmHaltReason: std::fmt::Debug + Clone;
 
-    /// Returns Arc's typed chain configuration for Arc-only RPC preparation.
-    /// All other executors keep the default generic path.
-    fn arc_chain_config(&self) -> Option<ArcChainConfig> {
-        None
-    }
-
-    fn prepare_query_environment<DB>(
+    fn prepare_simulation_environment<DB>(
         &self,
         block: &BlockInfo,
         overrides: Option<BlockOverrides>,
         db: &mut CacheDB<DB>,
-    ) -> RpcResult<PreparedQueryEnvironment> {
-        Ok(PreparedQueryEnvironment::generic(block, overrides, db))
+    ) -> RpcResult<PreparedSimulationEnvironment> {
+        Ok(PreparedSimulationEnvironment::generic(block, overrides, db))
+    }
+
+    fn apply_state_overrides<DB>(
+        &self,
+        endpoint: StateOverrideEndpoint,
+        overrides: StateOverride,
+        db: &mut CacheDB<DB>,
+    ) -> RpcResult<()>
+    where
+        DB: DatabaseRef,
+    {
+        let _ = endpoint;
+        super::utils::apply_state_overrides(overrides, db)
     }
 
     fn create_txn_env<StateDB: DatabaseRef>(
@@ -315,27 +336,39 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 
-    #[allow(clippy::type_complexity)]
-    /// The third return value maps each global `CallLog::index` to its
-    /// canonical emitter. Non-Arc implementations leave it empty.
-    fn inspect_tx_commit_for_simulation<StateDB, R, F>(
+    fn execute_simulation<StateDB>(
         &self,
         block_env: &BlockEnv,
         state: StateDB,
-        inspector_cfg: TracingInspectorConfig,
-        inspector_collect: F,
+        tx_hash: H256,
         tx: Self::Tx,
     ) -> Result<
-        (ExecutionResult<Self::EvmHaltReason>, R, Vec<Address>),
+        SimulationExecutionOutput<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     >
     where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
-        F: FnOnce(TracingInspector) -> R,
     {
-        self.inspect_tx_commit(block_env, state, inspector_cfg, inspector_collect, tx)
-            .map(|(result, collected)| (result, collected, Vec::new()))
+        let mut inspector_cfg = TracingInspectorConfig::default_parity()
+            .set_record_logs(true)
+            .set_steps(true);
+        inspector_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+
+        let (result, traces) = self.inspect_tx_commit(
+            block_env,
+            state,
+            inspector_cfg,
+            |inspector| inspector.into_traces(),
+            tx,
+        )?;
+        let (traces, events) = super::utils::build_debank_traces(tx_hash, traces);
+
+        Ok(SimulationExecutionOutput {
+            result,
+            traces,
+            events,
+        })
     }
 }
 
