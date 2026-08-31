@@ -500,9 +500,6 @@ impl Command {
                 if custom_evm_cfg.is_some() {
                     bail!("Arc EVM does not accept --evm-custom-config");
                 }
-                if self.ovm_address.is_some() {
-                    bail!("Arc EVM does not accept --ovm-address");
-                }
                 if self.normalize_state_key {
                     bail!("Arc EVM requires --normalize-state-key=false");
                 }
@@ -1013,17 +1010,6 @@ mod tests {
                     "{}",
                 ],
                 "does not accept --evm-custom-config",
-            ),
-            (
-                vec![
-                    "--evm-type",
-                    "arc",
-                    "--chain-cfg",
-                    "arc",
-                    "--ovm-address",
-                    "0x0000000000000000000000000000000000000001",
-                ],
-                "does not accept --ovm-address",
             ),
             (
                 vec![
