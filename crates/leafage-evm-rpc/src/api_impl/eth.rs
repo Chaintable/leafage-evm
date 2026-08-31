@@ -5,7 +5,6 @@ use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::SolValue;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::arc::{build_arc_query_environment, ArcQueryKind};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
@@ -108,18 +107,7 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        let is_arc = self.inner.arc_chain_config().is_some();
-        if let Some(arc_config) = self.inner.arc_chain_config() {
-            block_env = build_arc_query_environment(
-                block.header.clone(),
-                block_overrides,
-                ArcQueryKind::CallLike,
-                Some(arc_config.fallback_next_base_fee(&block.header)),
-                &mut db,
-            )
-            .map_err(|error| invalid_params_rpc_err(error.to_string()))?
-            .block_env;
-        } else if let Some(overrides) = block_overrides {
+        if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
                 &mut db,
@@ -128,7 +116,7 @@ where
             );
         }
         if let Some(state_override) = state_override {
-            if is_arc {
+            if self.inner.arc_chain_config().is_some() {
                 super::utils::apply_state_overrides_reth(state_override, &mut db)?;
             } else {
                 super::utils::apply_state_overrides(state_override, &mut db)?;
@@ -403,37 +391,15 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
-        if let Some(arc_config) = self.inner.arc_chain_config() {
-            let mut cache_db = CacheDB::new(state);
-            let block_env = build_arc_query_environment(
-                block.header.clone(),
-                None,
-                ArcQueryKind::CallLike,
-                Some(arc_config.fallback_next_base_fee(&block.header)),
-                &mut cache_db,
-            )
-            .map_err(|error| invalid_params_rpc_err(error.to_string()))?
-            .block_env;
-            let state = utils::RequestCacheDB::new(cache_db);
-            self.execute_multi_call_requests(
-                requests,
-                &block,
-                &block_env,
-                &state,
-                fast_fail,
-                cancellation_token,
-            )
-        } else {
-            let block_env = block_env_from_block(&block);
-            self.execute_multi_call_requests(
-                requests,
-                &block,
-                &block_env,
-                &state,
-                fast_fail,
-                cancellation_token,
-            )
-        }
+        let block_env = block_env_from_block(&block);
+        self.execute_multi_call_requests(
+            requests,
+            &block,
+            &block_env,
+            &state,
+            fast_fail,
+            cancellation_token,
+        )
     }
 
     fn block_number_inner(&self) -> RpcResult<U256> {

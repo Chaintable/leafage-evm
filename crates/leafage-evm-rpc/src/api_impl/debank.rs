@@ -1,19 +1,17 @@
 use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
-    Api, ApiCore, EstimateGasPolicy, EvmExecutor, GetHaltReason, GetTransactionError,
-    ToJsonRpcError, TxSetter,
+    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
 };
 use crate::api_impl::utils::{build_arc_debank_traces, build_debank_traces};
-use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
+use crate::error::{internal_rpc_err, rpc_error_with_code};
 
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
-use leafage_evm_chains::arc::{build_arc_query_environment, ArcQueryKind};
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, Address, BlockEnv, BlockId, BlockInfo, BlockNumberOrTag, BlockOverrides,
@@ -42,96 +40,6 @@ fn estimate_gas_limit_cap(
         .filter(|&cap| cap != 0)
         .unwrap_or(u64::MAX);
     consensus_cap.min(rpc_cap).min(block_gas_limit)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EstimateGasLimits {
-    /// Block/RPC/protocol cap. Arc uses this for EVM validation and for the
-    /// one error-classification retry that may exceed an explicit request cap.
-    execution_hard_cap: u64,
-    /// Request-local search and return cap.
-    search_cap: u64,
-}
-
-impl EstimateGasPolicy {
-    fn limits(self, request_gas_limit: Option<u64>, maximum_gas_limit: u64) -> EstimateGasLimits {
-        match self {
-            // Preserve the legacy behavior exactly: a request gas value above
-            // the configured maximum expands the initial search ceiling.
-            Self::Default(_) => EstimateGasLimits {
-                execution_hard_cap: maximum_gas_limit,
-                search_cap: request_gas_limit
-                    .map(|request_limit| request_limit.max(maximum_gas_limit))
-                    .unwrap_or(maximum_gas_limit),
-            },
-            Self::Arc(_) => {
-                let search_cap = request_gas_limit.unwrap_or(u64::MAX).min(maximum_gas_limit);
-                EstimateGasLimits {
-                    execution_hard_cap: maximum_gas_limit,
-                    search_cap,
-                }
-            }
-        }
-    }
-
-    fn cap_buffered_estimate(self, buffered: u64, search_cap: u64) -> u64 {
-        if self.is_arc() {
-            buffered.min(search_cap)
-        } else {
-            buffered
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GasLimitErrorClass {
-    TooHigh,
-    TooLow,
-    Other,
-}
-
-fn classify_gas_limit_error(error: &InvalidTransaction) -> GasLimitErrorClass {
-    match error {
-        InvalidTransaction::CallerGasLimitMoreThanBlock
-        | InvalidTransaction::TxGasLimitGreaterThanCap { .. } => GasLimitErrorClass::TooHigh,
-        InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
-        | InvalidTransaction::GasFloorMoreThanGasLimit { .. } => GasLimitErrorClass::TooLow,
-        _ => GasLimitErrorClass::Other,
-    }
-}
-
-fn gas_required_exceeds_allowance_error() -> jsonrpsee::types::ErrorObjectOwned {
-    rpc_error_with_code(
-        DebankErrorCode::GasExhausted as i32,
-        "Invalid gas limit".to_string(),
-    )
-}
-
-fn arc_gas_allowance<T, StateDB>(tx: &T, db: &StateDB, search_cap: u64) -> RpcResult<u64>
-where
-    T: TransactionTrait,
-    StateDB: DatabaseRef,
-{
-    let caller = db.basic_ref(tx.caller()).map_err(|error| {
-        rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, error.to_string())
-    })?;
-    let balance = caller.map(|account| account.balance).unwrap_or_default();
-    let spendable = balance.checked_sub(tx.value()).ok_or_else(|| {
-        rpc_error_with_code(
-            DebankErrorCode::BalanceExhausted as i32,
-            "Insufficient funds".to_string(),
-        )
-    })?;
-
-    if tx.gas_price() == 0 {
-        return Ok(search_cap);
-    }
-
-    let allowance = spendable
-        .checked_div(U256::from(tx.gas_price()))
-        .unwrap_or_default()
-        .min(U256::from(search_cap));
-    u64::try_from(allowance).map_err(|_| internal_rpc_err("Arc gas allowance does not fit in u64"))
 }
 
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
@@ -762,17 +670,7 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        if let Some(arc_config) = self.inner.arc_chain_config() {
-            block_env = build_arc_query_environment(
-                block.header.clone(),
-                block_overrides,
-                ArcQueryKind::CallLike,
-                Some(arc_config.fallback_next_base_fee(&block.header)),
-                &mut cache_db,
-            )
-            .map_err(|error| invalid_params_rpc_err(error.to_string()))?
-            .block_env;
-        } else if let Some(overrides) = block_overrides {
+        if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
                 &mut cache_db,
@@ -881,7 +779,6 @@ where
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-        let mut block_env = block_env_from_block(&block);
         let mut stats = DebankSimulateStats {
             block_num: block.header.number,
             block_time: block.header.timestamp,
@@ -893,33 +790,14 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        let arc_config = self.inner.arc_chain_config();
-        let is_arc = arc_config.is_some();
-        if let Some(arc_config) = arc_config {
-            let environment = build_arc_query_environment(
-                block.header.clone(),
-                block_overrides,
-                ArcQueryKind::SimulateTransactions,
-                Some(arc_config.fallback_next_base_fee(&block.header)),
-                &mut memory_db,
-            )
-            .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
-            block_env = environment.block_env;
-            if let Some(header) = environment.synthetic_next_header {
-                self.inner
-                    .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
-            }
-        } else if let Some(overrides) = block_overrides {
-            let header = super::utils::apply_block_overrides(
-                overrides,
-                &mut memory_db,
-                &mut block_env,
-                block.header.clone(),
-            );
-            if let Some(header) = header {
-                self.inner
-                    .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
-            }
+        let is_arc = self.inner.arc_chain_config().is_some();
+        let environment =
+            self.inner
+                .prepare_query_environment(&block, block_overrides, &mut memory_db)?;
+        let block_env = environment.block_env;
+        if let Some(header) = environment.pre_execution_header {
+            self.inner
+                .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
         }
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
         for (tx_index, tx) in (0_u64..).zip(txs) {
@@ -988,43 +866,6 @@ where
         Ok(DebankSimulateResp { stats, results })
     }
 
-    fn arc_estimate_retry_at_hard_cap<StateDB>(
-        &self,
-        block_env: &BlockEnv,
-        state: &StateDB,
-        mut tx: <C as EvmExecutor>::Tx,
-        execution_hard_cap: u64,
-    ) -> RpcResult<U256>
-    where
-        StateDB: DatabaseRef + std::fmt::Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        tx.set_gas_limit(execution_hard_cap);
-        let retry = self
-            .inner
-            .transact_for_estimate(block_env, state, tx, execution_hard_cap)
-            .map_err(|error| error.to_rpc_error())?;
-
-        match retry {
-            ExecutionResult::Success { .. } => Err(gas_required_exceeds_allowance_error()),
-            ExecutionResult::Revert { output, .. } => {
-                let reason =
-                    decode_revert_reason(&output).unwrap_or("execution revert".to_string());
-                Err(rpc_error_with_code(
-                    DebankErrorCode::EvmRevert as i32,
-                    reason,
-                ))
-            }
-            ExecutionResult::Halt { reason, .. } => {
-                let code = DebankErrorCode::from(reason.clone());
-                Err(rpc_error_with_code(
-                    code as i32,
-                    format!("Halted: {:?}", reason),
-                ))
-            }
-        }
-    }
-
     fn debank_estimate_gas_inner(
         &self,
         mut request: CallRequest,
@@ -1036,7 +877,6 @@ where
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-        let estimate_policy = self.inner.estimate_gas_policy();
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
@@ -1045,17 +885,7 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        if let Some(arc_config) = self.inner.arc_chain_config() {
-            block_env = build_arc_query_environment(
-                block.header.clone(),
-                block_overrides.clone(),
-                ArcQueryKind::CallLike,
-                Some(arc_config.fallback_next_base_fee(&block.header)),
-                &mut cache_db,
-            )
-            .map_err(|error| invalid_params_rpc_err(error.to_string()))?
-            .block_env;
-        } else if let Some(overrides) = block_overrides.clone() {
+        if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(
                 overrides,
                 &mut cache_db,
@@ -1069,7 +899,6 @@ where
         let memory_db = utils::RequestCacheDB::new(cache_db);
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
-        let tx_request_gas_price = request.gas_price;
         // the gas limit of the corresponding block
         let block_env_gas_limit = block_env.gas_limit;
         let cfg = &self.inner.evm_cfg().cfg;
@@ -1081,11 +910,16 @@ where
         let consensus_cap = self.inner.consensus_tx_gas_limit_cap(chain_spec);
         let max_gas_limit =
             estimate_gas_limit_cap(cfg.tx_gas_limit_cap, consensus_cap, block_env_gas_limit);
-        let limits = estimate_policy.limits(tx_request_gas_limit, max_gas_limit);
-        let execution_hard_cap = limits.execution_hard_cap;
-        let search_cap = limits.search_cap;
-        let mut highest_gas_limit = search_cap;
-        let mut tx = self.inner.create_txn_env_for_estimate(
+        let mut highest_gas_limit = tx_request_gas_limit
+            .map(|tx_gas_limit| {
+                if tx_gas_limit > max_gas_limit {
+                    tx_gas_limit
+                } else {
+                    max_gas_limit
+                }
+            })
+            .unwrap_or(max_gas_limit);
+        let mut tx = self.inner.create_txn_env(
             &block,
             &block_env,
             request.clone(),
@@ -1093,10 +927,6 @@ where
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         tx.set_gas_estimation();
-        if estimate_policy.is_arc() {
-            highest_gas_limit =
-                highest_gas_limit.min(arc_gas_allowance(&tx, &memory_db, search_cap)?);
-        }
         // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
@@ -1111,15 +941,10 @@ where
                         .unwrap_or(true);
                     if no_code_callee {
                         let mut tx = tx.clone();
-                        // Match Reth's basic-transfer shortcut exactly: the 21,000-gas
-                        // probe intentionally ignores a lower gas value in the request.
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
-                        if let Ok(exec_res) = self.inner.transact_for_estimate(
-                            &block_env,
-                            &memory_db,
-                            tx.clone(),
-                            execution_hard_cap,
-                        ) {
+                        if let Ok(exec_res) =
+                            self.inner.transact(&block_env, &memory_db, tx.clone())
+                        {
                             if exec_res.is_success() {
                                 let l1_overhead = self
                                     .inner
@@ -1133,7 +958,7 @@ where
                 }
             }
         }
-        if !estimate_policy.is_arc() && tx.gas_price() > 0 {
+        if tx.gas_price() > 0 {
             let gas_limit = self
                 .inner
                 .gas_allowance(&request, &tx, &memory_db, &block_env)?;
@@ -1141,38 +966,10 @@ where
         }
         tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));
 
-        let res = match self.inner.transact_for_estimate(
-            &block_env,
-            &memory_db,
-            tx.clone(),
-            execution_hard_cap,
-        ) {
-            Ok(result) => result,
-            Err(error) if estimate_policy.is_arc() => {
-                let error_class = error
-                    .get_transaction_error()
-                    .as_ref()
-                    .map(classify_gas_limit_error)
-                    .unwrap_or(GasLimitErrorClass::Other);
-                match error_class {
-                    GasLimitErrorClass::TooHigh
-                        if tx_request_gas_limit.is_some() || tx_request_gas_price.is_some() =>
-                    {
-                        return self.arc_estimate_retry_at_hard_cap(
-                            &block_env,
-                            &memory_db,
-                            tx,
-                            execution_hard_cap,
-                        );
-                    }
-                    GasLimitErrorClass::TooLow => {
-                        return Err(gas_required_exceeds_allowance_error());
-                    }
-                    _ => return Err(error.to_rpc_error()),
-                }
-            }
-            Err(error) => return Err(error.to_rpc_error()),
-        };
+        let res = self
+            .inner
+            .transact(&block_env, &memory_db, tx.clone())
+            .map_err(|error| error.to_rpc_error())?;
 
         let gas_refund = match res {
             ExecutionResult::Success { gas, .. } => gas.inner_refunded(),
@@ -1184,16 +981,6 @@ where
                 ));
             }
             ExecutionResult::Revert { output, .. } => {
-                if estimate_policy.is_arc()
-                    && (tx_request_gas_limit.is_some() || tx_request_gas_price.is_some())
-                {
-                    return self.arc_estimate_retry_at_hard_cap(
-                        &block_env,
-                        &memory_db,
-                        tx,
-                        execution_hard_cap,
-                    );
-                }
                 let reason =
                     decode_revert_reason(&output).unwrap_or("execution revert".to_string());
                 return Err(rpc_error_with_code(
@@ -1213,11 +1000,10 @@ where
             tx.set_gas_limit(optimistic_gas_limit);
             let res = self
                 .inner
-                .transact_for_estimate(&block_env, &memory_db, tx.clone(), execution_hard_cap)
+                .transact(&block_env, &memory_db, tx.clone())
                 .map_err(|e| e.to_rpc_error())?;
             gas_used = res.gas_used();
-            update_estimated_gas_range_for_policy(
-                estimate_policy,
+            update_estimated_gas_range(
                 &res,
                 optimistic_gas_limit,
                 &mut highest_gas_limit,
@@ -1246,27 +1032,21 @@ where
 
             tx.set_gas_limit(mid_gas_limit);
 
-            let res = self.inner.transact_for_estimate(
-                &block_env,
-                &memory_db,
-                tx.clone(),
-                execution_hard_cap,
-            );
+            let res = self.inner.transact(&block_env, &memory_db, tx.clone());
 
             match res {
                 Err(e) => {
                     if let Some(invalid_tx_err) = e.get_transaction_error() {
-                        match classify_gas_limit_error(&invalid_tx_err) {
-                            GasLimitErrorClass::TooHigh => {
+                        match invalid_tx_err {
+                            InvalidTransaction::CallerGasLimitMoreThanBlock
+                            | InvalidTransaction::TxGasLimitGreaterThanCap { .. } => {
                                 highest_gas_limit = mid_gas_limit;
                             }
-                            GasLimitErrorClass::TooLow => {
+                            InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+                            | InvalidTransaction::GasFloorMoreThanGasLimit { .. } => {
                                 lowest_gas_limit = mid_gas_limit;
                             }
-                            GasLimitErrorClass::Other => {
-                                if estimate_policy.is_arc() {
-                                    return Err(e.to_rpc_error());
-                                }
+                            invalid_tx_err => {
                                 return Err(rpc_error_with_code(
                                     DebankErrorCode::EvmFailed as i32,
                                     format!("Invalid transaction: {:?}", invalid_tx_err),
@@ -1278,8 +1058,7 @@ where
                     }
                 }
                 Ok(res) => {
-                    update_estimated_gas_range_for_policy(
-                        estimate_policy,
+                    update_estimated_gas_range(
                         &res,
                         mid_gas_limit,
                         &mut highest_gas_limit,
@@ -1294,7 +1073,7 @@ where
         let buffer = self.inner.evm_cfg().estimate_gas_buffer;
         let final_gas = if buffer > 100 {
             let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
-            estimate_policy.cap_buffered_estimate(buffered.min(u64::MAX as u128) as u64, search_cap)
+            buffered.min(u64::MAX as u128) as u64
         } else {
             highest_gas_limit
         };
@@ -1386,7 +1165,6 @@ mod tests {
         AccountStorageDiff, Block, BlockStorageDiff, CfgEnv, DebankID, IndexValuePair,
         MainnetSpecId, NewAccount, NewCode,
     };
-    use revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1398,8 +1176,6 @@ mod tests {
     const ANCHOR_NUMBER: u64 = 1;
     const ANCHOR_BASE_FEE: u64 = 3;
     const NEXT_BASE_FEE: u64 = 7;
-    const EIP7825_SUCCESS_CALLDATA_BYTES: usize = 418_905;
-    const EIP7825_FAILURE_CALLDATA_BYTES: usize = 418_906;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1958,19 +1734,19 @@ mod tests {
             ovm_address: None,
             normalize_state_key: false,
         });
-        let block_env = build_arc_query_environment(
-            block.header.clone(),
-            overrides,
-            ArcQueryKind::CallLike,
-            None,
-            &mut cache_db,
-        )
-        .unwrap()
-        .block_env;
+        let mut block_env = block_env_from_block(&block);
+        if let Some(overrides) = overrides {
+            utils::apply_block_overrides(
+                overrides,
+                &mut cache_db,
+                &mut block_env,
+                block.header.clone(),
+            );
+        }
         let memory_db = utils::RequestCacheDB::new(cache_db);
         let mut tx = api
             .inner
-            .create_txn_env_for_estimate(
+            .create_txn_env(
                 &block,
                 &block_env,
                 request,
@@ -1980,9 +1756,7 @@ mod tests {
             .unwrap();
         tx.set_gas_estimation();
         tx.set_gas_limit(gas_limit);
-        api.inner
-            .transact_for_estimate(&block_env, &memory_db, tx, gas_limit)
-            .unwrap()
+        api.inner.transact(&block_env, &memory_db, tx).unwrap()
     }
 
     fn success_output(result: ExecutionResult<HaltReason>) -> Bytes {
@@ -2101,7 +1875,13 @@ mod tests {
         );
         assert_eq!(words[3], U256::ZERO);
 
-        let next = BlockOverrides::default().with_number(U256::from(ANCHOR_NUMBER + 1));
+        let overridden_hash = H256::repeat_byte(0xcc);
+        let next = BlockOverrides {
+            number: Some(U256::from(ANCHOR_NUMBER + 1)),
+            base_fee: Some(U256::from(NEXT_BASE_FEE)),
+            block_hash: Some(BTreeMap::from([(ANCHOR_NUMBER, overridden_hash)])),
+            ..Default::default()
+        };
         let next_request = CallRequest {
             inner: TransactionRequest::default()
                 .from(addresses.funded)
@@ -2117,10 +1897,7 @@ mod tests {
         let words = output_words(&output);
         assert_eq!(words[0], U256::from(ANCHOR_NUMBER + 1));
         assert_eq!(words[1], U256::from(NEXT_BASE_FEE));
-        assert_eq!(
-            words[3],
-            U256::from_be_slice(H256::repeat_byte(0xbb).as_slice())
-        );
+        assert_eq!(words[3], U256::from_be_slice(overridden_hash.as_slice()));
 
         let zero_price = CallRequest {
             inner: TransactionRequest::default()
@@ -2135,33 +1912,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output_words(&output)[1], U256::ZERO);
-
-        let fallback = BlockOverrides::default().with_number(U256::ONE);
-        let fallback_request = CallRequest {
-            inner: TransactionRequest::default()
-                .from(addresses.funded)
-                .to(addresses.environment)
-                .gas_limit(1_000_000)
-                .gas_price(980_000_000),
-            tempo: None,
-        };
-        let output = fixture
-            .api
-            .call(
-                fallback_request,
-                BlockId::Number(BlockNumberOrTag::Number(0)),
-                None,
-                Some(fallback),
-            )
-            .await
-            .unwrap();
-        let words = output_words(&output);
-        assert_eq!(words[0], U256::ONE);
-        assert_eq!(words[1], U256::from(980_000_000u64));
-        assert_eq!(
-            words[2],
-            U256::from_be_slice(H256::repeat_byte(0xaa).as_slice())
-        );
 
         let low_allowance = CallRequest {
             inner: TransactionRequest::default()
@@ -3103,6 +2853,7 @@ mod tests {
             HISTORY_STORAGE_ADDRESS,
             U256::from(ANCHOR_NUMBER).to_be_bytes::<32>().into(),
         );
+        let environment_request = call_request(addresses.funded, addresses.environment);
         let next = BlockOverrides::default().with_number(U256::from(ANCHOR_NUMBER + 1));
 
         let direct = fixture
@@ -3112,15 +2863,68 @@ mod tests {
             .unwrap();
         assert_eq!(output_words(&direct), vec![U256::ZERO]);
 
+        let at_anchor = fixture
+            .api
+            .simulate_transactions(vec![request.clone()], anchor_context(), None)
+            .await
+            .unwrap();
+        assert!(root_trace_output(&at_anchor.results[0]).is_empty());
+        let at_anchor_environment = fixture
+            .api
+            .simulate_transactions(vec![environment_request.clone()], anchor_context(), None)
+            .await
+            .unwrap();
+        let words = output_words(&root_trace_output(&at_anchor_environment.results[0]));
+        assert_eq!(words[0], U256::from(ANCHOR_NUMBER));
+        assert_eq!(words[1], U256::from(ANCHOR_BASE_FEE));
+
+        let base_fee_override = BlockOverrides {
+            base_fee: Some(U256::from(99)),
+            ..Default::default()
+        };
+        let base_fee_only = fixture
+            .api
+            .simulate_transactions(
+                vec![request.clone()],
+                anchor_context(),
+                Some(base_fee_override.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(root_trace_output(&base_fee_only.results[0]).is_empty());
+        let base_fee_environment = fixture
+            .api
+            .simulate_transactions(
+                vec![environment_request.clone()],
+                anchor_context(),
+                Some(base_fee_override),
+            )
+            .await
+            .unwrap();
+        let words = output_words(&root_trace_output(&base_fee_environment.results[0]));
+        assert_eq!(words[0], U256::from(ANCHOR_NUMBER));
+        assert_eq!(words[1], U256::from(99));
+
         let simulated = fixture
             .api
-            .simulate_transactions(vec![request.clone()], anchor_context(), Some(next))
+            .simulate_transactions(
+                vec![request.clone(), environment_request],
+                anchor_context(),
+                Some(next),
+            )
             .await
             .unwrap();
         assert_eq!(simulated.stats.block_num, ANCHOR_NUMBER);
         assert_eq!(
             root_trace_output(&simulated.results[0]),
             Bytes::copy_from_slice(H256::repeat_byte(0xbb).as_slice())
+        );
+        let words = output_words(&root_trace_output(&simulated.results[1]));
+        assert_eq!(words[0], U256::from(ANCHOR_NUMBER + 1));
+        assert_eq!(words[1], U256::from(NEXT_BASE_FEE));
+        assert_eq!(
+            words[3],
+            U256::from_be_slice(H256::repeat_byte(0xbb).as_slice())
         );
 
         let wrong = BlockOverrides::default().with_number(U256::from(ANCHOR_NUMBER + 2));
@@ -3604,28 +3408,7 @@ mod tests {
     }
 
     #[test]
-    fn policies_keep_default_behavior_and_arc_hard_cap() {
-        let default = EstimateGasPolicy::default();
-        let default_limits = default.limits(Some(40_000_000), 30_000_000);
-        assert_eq!(default_limits.execution_hard_cap, 30_000_000);
-        assert_eq!(default_limits.search_cap, 40_000_000);
-        assert_eq!(
-            default.cap_buffered_estimate(60_000_000, 30_000_000),
-            60_000_000
-        );
-
-        let arc = EstimateGasPolicy::Arc(crate::api_impl::core::ArcEstimateGasPolicy);
-        let arc_limits = arc.limits(Some(100_000), TX_GAS_LIMIT_CAP);
-        assert_eq!(arc_limits.execution_hard_cap, TX_GAS_LIMIT_CAP);
-        assert_eq!(arc_limits.search_cap, 100_000);
-        assert_eq!(
-            arc.cap_buffered_estimate(200_000, arc_limits.search_cap),
-            arc_limits.search_cap
-        );
-    }
-
-    #[test]
-    fn arc_estimate_handles_transfer_value_fee_and_large_balance() {
+    fn arc_estimate_handles_transfer_value_and_fee_errors() {
         let fixture = build_arc_fixture(100);
         let addresses = fixture.addresses;
 
@@ -3672,69 +3455,20 @@ mod tests {
         let large_balance_allowance = CallRequest {
             inner: TransactionRequest::default()
                 .from(addresses.funded)
-                .to(addresses.empty)
+                .to(addresses.environment)
                 .gas_price(1),
             tempo: None,
         };
-        assert_eq!(
-            estimate(&fixture.api, large_balance_allowance, None).unwrap(),
-            U256::from(MIN_TRANSACTION_GAS)
+        assert!(
+            estimate(&fixture.api, large_balance_allowance, None).unwrap()
+                > U256::from(MIN_TRANSACTION_GAS)
         );
 
-        let effective_fee_allowance = CallRequest {
-            inner: TransactionRequest::default()
-                .from(addresses.fee_limited)
-                .to(addresses.gas_guard)
-                .max_fee_per_gas(1_000)
-                .max_priority_fee_per_gas(1),
-            tempo: None,
-        };
-        let estimated = estimate(&fixture.api, effective_fee_allowance.clone(), None).unwrap();
-        assert!(estimated > U256::from(300_000));
-        assert!(estimated <= U256::from(500_000));
-        assert!(matches!(
-            execute_arc_estimate_probe(
-                &fixture.api,
-                effective_fee_allowance,
-                None,
-                estimated.to::<u64>()
-            ),
-            ExecutionResult::Success { .. }
-        ));
-
-        fixture.close();
-    }
-
-    #[test]
-    fn arc_estimate_enforces_eip7825_boundaries_and_recaps_buffer() {
-        let fixture = build_arc_fixture(200);
-        let addresses = fixture.addresses;
-        let request = |calldata_bytes| CallRequest {
-            inner: TransactionRequest::default()
-                .from(addresses.funded)
-                .to(addresses.empty)
-                .gas_limit(ARC_RPC_GAS_CAP)
-                .input(TransactionInput::new(Bytes::from(vec![1; calldata_bytes]))),
-            tempo: None,
-        };
-
-        let estimate_at_cap =
-            estimate(&fixture.api, request(EIP7825_SUCCESS_CALLDATA_BYTES), None).unwrap();
-        assert_eq!(estimate_at_cap, U256::from(TX_GAS_LIMIT_CAP));
-        assert!(matches!(
-            execute_arc_estimate_probe(
-                &fixture.api,
-                request(EIP7825_SUCCESS_CALLDATA_BYTES),
-                None,
-                TX_GAS_LIMIT_CAP,
-            ),
-            ExecutionResult::Success { .. }
-        ));
-
-        let error =
-            estimate(&fixture.api, request(EIP7825_FAILURE_CALLDATA_BYTES), None).unwrap_err();
-        assert_eq!(error.code(), DebankErrorCode::GasExhausted as i32);
-        assert_eq!(error.message(), "Invalid gas limit");
+        let contract_sender = call_request(addresses.environment, addresses.empty);
+        assert_eq!(
+            estimate(&fixture.api, contract_sender, None).unwrap(),
+            U256::from(MIN_TRANSACTION_GAS)
+        );
 
         fixture.close();
     }
@@ -3744,33 +3478,11 @@ mod tests {
         let fixture = build_arc_fixture(100);
         let request = call_request(fixture.addresses.funded, fixture.addresses.gas_guard);
 
-        let explicitly_too_low = CallRequest {
-            inner: TransactionRequest::default()
-                .from(fixture.addresses.funded)
-                .to(fixture.addresses.gas_guard)
-                .gas_limit(250_000),
-            tempo: None,
-        };
-        let error = estimate(&fixture.api, explicitly_too_low, None).unwrap_err();
-        assert_eq!(error.code(), DebankErrorCode::GasExhausted as i32);
-        assert_eq!(error.message(), "Invalid gas limit");
-
-        let fee_limited = CallRequest {
-            inner: TransactionRequest::default()
-                .from(fixture.addresses.limited)
-                .to(fixture.addresses.gas_guard)
-                .gas_price(1),
-            tempo: None,
-        };
-        let error = estimate(&fixture.api, fee_limited, None).unwrap_err();
-        assert_eq!(error.code(), DebankErrorCode::BalanceExhausted as i32);
-        assert_eq!(error.message(), "Insufficient funds");
-
         let estimated: u64 = estimate(&fixture.api, request.clone(), None)
             .unwrap()
             .try_into()
             .unwrap();
-        assert!(estimated < TX_GAS_LIMIT_CAP);
+        assert!(estimated < ARC_RPC_GAS_CAP);
         assert!(matches!(
             execute_arc_estimate_probe(&fixture.api, request.clone(), None, estimated),
             ExecutionResult::Success { .. }
@@ -3789,7 +3501,7 @@ mod tests {
     }
 
     #[test]
-    fn arc_estimate_uses_h_and_h_plus_one_query_environment_and_overrides() {
+    fn arc_estimate_uses_generic_block_overrides() {
         let fixture = build_arc_fixture(100);
         let request = call_request(fixture.addresses.funded, fixture.addresses.environment);
 
@@ -3809,25 +3521,6 @@ mod tests {
         assert_eq!(
             h_words[2],
             U256::from_be_slice(H256::repeat_byte(0xaa).as_slice())
-        );
-
-        let next = BlockOverrides::default().with_number(U256::from(ANCHOR_NUMBER + 1));
-        let next_gas: u64 = estimate(&fixture.api, request.clone(), Some(next.clone()))
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let next_output = success_output(execute_arc_estimate_probe(
-            &fixture.api,
-            request.clone(),
-            Some(next),
-            next_gas,
-        ));
-        let next_words = output_words(&next_output);
-        assert_eq!(next_words[0], U256::from(ANCHOR_NUMBER + 1));
-        assert_eq!(next_words[1], U256::from(NEXT_BASE_FEE));
-        assert_eq!(
-            next_words[3],
-            U256::from_be_slice(H256::repeat_byte(0xbb).as_slice())
         );
 
         let overridden_hash = H256::repeat_byte(0xcc);
@@ -3918,30 +3611,6 @@ mod tests {
             .contains("authorization"));
 
         fixture.close();
-    }
-}
-
-#[inline]
-fn update_estimated_gas_range_for_policy<R: GetHaltReason + Clone>(
-    policy: EstimateGasPolicy,
-    result: &ExecutionResult<R>,
-    tx_gas_limit: u64,
-    highest_gas_limit: &mut u64,
-    lowest_gas_limit: &mut u64,
-) -> RpcResult<()> {
-    if policy.is_arc() {
-        match result {
-            ExecutionResult::Success { .. } => *highest_gas_limit = tx_gas_limit,
-            // Reth treats every failed lower-gas probe as evidence that the
-            // lower bound must increase. Some contracts use REVERT or INVALID
-            // for gas-dependent failure instead of an OOG halt.
-            ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. } => {
-                *lowest_gas_limit = tx_gas_limit
-            }
-        }
-        Ok(())
-    } else {
-        update_estimated_gas_range(result, tx_gas_limit, highest_gas_limit, lowest_gas_limit)
     }
 }
 

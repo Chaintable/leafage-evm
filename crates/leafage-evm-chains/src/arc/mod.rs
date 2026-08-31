@@ -12,6 +12,6 @@ pub use config::{ArcBaseFeeConfig, ArcChainConfig, ArcExecutionSpec, ARC_MAINNET
 pub use evm::{ArcContext, ArcEvm, ArcEvmFactory, ArcEvmFactoryError};
 pub use hardforks::{ArcForkActivation, ArcHardfork, ArcHardforkFlags, ArcHardforkSchedule};
 pub use query_env::{
-    build_arc_query_environment, decode_arc_next_base_fee, ArcQueryEnvError, ArcQueryEnvironment,
-    ArcQueryKind, INVALID_SIMULATION_BLOCK_NUMBER_MESSAGE,
+    build_arc_next_block_simulation_environment, decode_arc_next_base_fee, ArcNextBlockEnvironment,
+    ArcQueryEnvError, INVALID_SIMULATION_BLOCK_NUMBER_MESSAGE,
 };

@@ -1,6 +1,4 @@
-use crate::api_impl::core::{
-    ApiCore, ArcEstimateGasPolicy, EstimateGasPolicy, EvmExecutor, GasFeeHandler,
-};
+use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, PreparedQueryEnvironment};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_err, rpc_error_with_code};
@@ -14,9 +12,11 @@ use alloy_evm::{
     EvmEnv,
 };
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::arc::{ArcChainConfig, ArcContext, ArcEvmFactory};
+use leafage_evm_chains::arc::{
+    build_arc_next_block_simulation_environment, ArcChainConfig, ArcContext, ArcEvmFactory,
+};
 use leafage_evm_types::{
-    BlockEnv, BlockInfo, Bytes, CallRequest, DebankErrorCode, MainnetSpecId, U256,
+    BlockEnv, BlockInfo, BlockOverrides, Bytes, CallRequest, DebankErrorCode, MainnetSpecId, U256,
 };
 use revm::{
     context::{
@@ -26,7 +26,7 @@ use revm::{
         ContextTr, JournalTr, TxEnv,
     },
     context_interface::Block as _,
-    database::WrapDatabaseRef,
+    database::{CacheDB, WrapDatabaseRef},
     inspector::{Inspector, NoOpInspector},
     interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
     DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm, SystemCallEvm,
@@ -653,8 +653,32 @@ where
 {
     type Tx = TxEnv;
 
-    fn estimate_gas_policy(&self) -> EstimateGasPolicy {
-        EstimateGasPolicy::Arc(ArcEstimateGasPolicy)
+    fn gas_allowance<StateDB: DatabaseRef>(
+        &self,
+        _request: &CallRequest,
+        tx: &Self::Tx,
+        db: &StateDB,
+        _block_env: &BlockEnv,
+    ) -> RpcResult<u64> {
+        let balance = db
+            .basic_ref(tx.caller)
+            .map_err(|error| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, error.to_string())
+            })?
+            .map(|account| account.balance)
+            .unwrap_or_default();
+        let spendable = balance.checked_sub(tx.value).ok_or_else(|| {
+            rpc_error_with_code(
+                DebankErrorCode::BalanceExhausted as i32,
+                "Insufficient funds".to_string(),
+            )
+        })?;
+        let allowance = spendable
+            .checked_div(U256::from(tx.gas_price))
+            .unwrap_or_default()
+            .min(U256::from(u64::MAX));
+        u64::try_from(allowance)
+            .map_err(|_| internal_rpc_err("Arc gas allowance does not fit in u64"))
     }
 }
 
@@ -668,6 +692,40 @@ where
 
     fn arc_chain_config(&self) -> Option<ArcChainConfig> {
         self.evm_cfg.custom_cfg
+    }
+
+    fn prepare_query_environment<StateDB>(
+        &self,
+        block: &BlockInfo,
+        overrides: Option<BlockOverrides>,
+        db: &mut CacheDB<StateDB>,
+    ) -> RpcResult<PreparedQueryEnvironment> {
+        let Some(overrides) = overrides else {
+            return Ok(PreparedQueryEnvironment::generic(block, None, db));
+        };
+        if overrides.number.is_none() {
+            return Ok(PreparedQueryEnvironment::generic(
+                block,
+                Some(overrides),
+                db,
+            ));
+        }
+
+        let arc_config = self
+            .evm_cfg
+            .custom_cfg
+            .ok_or_else(|| internal_rpc_err("Arc EVM chain configuration is missing"))?;
+        let environment = build_arc_next_block_simulation_environment(
+            block.header.clone(),
+            overrides,
+            Some(arc_config.fallback_next_base_fee(&block.header)),
+            db,
+        )
+        .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
+        Ok(PreparedQueryEnvironment {
+            block_env: environment.block_env,
+            pre_execution_header: Some(environment.synthetic_next_header),
+        })
     }
 
     fn call_error<DBError>(
@@ -708,24 +766,6 @@ where
     ) -> RpcResult<(BlockEnv, Self::Tx)> {
         self.prepare_call_tx(
             block_env,
-            request,
-            db,
-            chain_id,
-            ArcCallPreparationErrorPolicy::Debank,
-        )
-    }
-
-    fn create_txn_env_for_estimate<StateDB: DatabaseRef>(
-        &self,
-        _block: &BlockInfo,
-        block_env: &BlockEnv,
-        request: CallRequest,
-        db: StateDB,
-        chain_id: u64,
-    ) -> RpcResult<Self::Tx> {
-        self.create_arc_call_txn_env(
-            block_env,
-            self.evm_cfg.cfg.clone(),
             request,
             db,
             chain_id,
@@ -818,7 +858,10 @@ where
         StateDB::Error: Sync + Send + 'static,
     {
         let factory = self.arc_factory().map_err(EVMError::Custom)?;
-        let env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
+        let mut cfg = self.evm_cfg.cfg.clone();
+        cfg.disable_eip3607 = true;
+        cfg.disable_base_fee = true;
+        let env = EvmEnv::new(cfg, block_env.clone());
         let mut evm = factory
             .create(env, WrapDatabaseRef(state), NoOpInspector {})
             .map_err(|err| EVMError::Custom(err.to_string()))?;
@@ -844,32 +887,6 @@ where
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.tx_gas_limit_cap = Some(u64::MAX);
-        let env = EvmEnv::new(cfg, block_env.clone());
-        let mut evm = factory
-            .create(env, WrapDatabaseRef(state), NoOpInspector {})
-            .map_err(|err| EVMError::Custom(err.to_string()))?;
-        evm.transact(tx).map(|result| result.result)
-    }
-
-    fn transact_for_estimate<StateDB>(
-        &self,
-        block_env: &BlockEnv,
-        state: StateDB,
-        tx: Self::Tx,
-        hard_gas_cap: u64,
-    ) -> Result<
-        ExecutionResult<Self::EvmHaltReason>,
-        EVMError<StateDB::Error, Self::TransactionError>,
-    >
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        let factory = self.arc_factory().map_err(EVMError::Custom)?;
-        let mut cfg = self.evm_cfg.cfg.clone();
-        cfg.disable_eip3607 = true;
-        cfg.disable_base_fee = true;
-        cfg.tx_gas_limit_cap = Some(hard_gas_cap);
         let env = EvmEnv::new(cfg, block_env.clone());
         let mut evm = factory
             .create(env, WrapDatabaseRef(state), NoOpInspector {})

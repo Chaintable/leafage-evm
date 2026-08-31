@@ -17,11 +17,13 @@ use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{
-    BlockEnv, BlockInfo, Bytes, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
+    block_env_from_block, BlockEnv, BlockInfo, BlockOverrides, Bytes, CallRequest, CfgEnv, Header,
+    MainnetSpecId, OpSpecId, H256,
 };
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
+use revm::database::CacheDB;
 use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId, Address};
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
@@ -48,29 +50,25 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
-/// Keeps the legacy estimator semantics for every non-Arc API implementation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DefaultEstimateGasPolicy;
-
-/// Enables the Reth-compatible estimator semantics required by Arc.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ArcEstimateGasPolicy;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EstimateGasPolicy {
-    Default(DefaultEstimateGasPolicy),
-    Arc(ArcEstimateGasPolicy),
+pub(crate) struct PreparedQueryEnvironment {
+    pub(crate) block_env: BlockEnv,
+    pub(crate) pre_execution_header: Option<Header>,
 }
 
-impl Default for EstimateGasPolicy {
-    fn default() -> Self {
-        Self::Default(DefaultEstimateGasPolicy)
-    }
-}
-
-impl EstimateGasPolicy {
-    pub(crate) const fn is_arc(self) -> bool {
-        matches!(self, Self::Arc(_))
+impl PreparedQueryEnvironment {
+    pub(crate) fn generic<DB>(
+        block: &BlockInfo,
+        overrides: Option<BlockOverrides>,
+        db: &mut CacheDB<DB>,
+    ) -> Self {
+        let mut block_env = block_env_from_block(block);
+        let pre_execution_header = overrides.and_then(|overrides| {
+            super::utils::apply_block_overrides(overrides, db, &mut block_env, block.header.clone())
+        });
+        Self {
+            block_env,
+            pre_execution_header,
+        }
     }
 }
 
@@ -112,10 +110,6 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
-
-    fn estimate_gas_policy(&self) -> EstimateGasPolicy {
-        EstimateGasPolicy::default()
-    }
 
     fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
         if spec.is_enabled_in(EthSpecId::OSAKA) {
@@ -187,6 +181,15 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         None
     }
 
+    fn prepare_query_environment<DB>(
+        &self,
+        block: &BlockInfo,
+        overrides: Option<BlockOverrides>,
+        db: &mut CacheDB<DB>,
+    ) -> RpcResult<PreparedQueryEnvironment> {
+        Ok(PreparedQueryEnvironment::generic(block, overrides, db))
+    }
+
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
         block: &BlockInfo,
@@ -223,20 +226,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
     }
 
     fn create_txn_env_for_simulation<StateDB: DatabaseRef>(
-        &self,
-        block: &BlockInfo,
-        block_env: &BlockEnv,
-        request: CallRequest,
-        db: StateDB,
-        chain_id: u64,
-    ) -> RpcResult<Self::Tx> {
-        self.create_txn_env(block, block_env, request, db, chain_id)
-    }
-
-    /// Prepares a transaction for gas estimation. Generic executors preserve
-    /// their existing transaction builder; Arc overrides this with the
-    /// Reth-compatible call-fee conversion used by its estimator.
-    fn create_txn_env_for_estimate<StateDB: DatabaseRef>(
         &self,
         block: &BlockInfo,
         block_env: &BlockEnv,
@@ -299,25 +288,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         block_env: &BlockEnv,
         state: StateDB,
         tx: Self::Tx,
-    ) -> Result<
-        ExecutionResult<Self::EvmHaltReason>,
-        EVMError<StateDB::Error, Self::TransactionError>,
-    >
-    where
-        StateDB: DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        self.transact(block_env, state, tx)
-    }
-
-    /// Executes one estimator probe. Arc overrides this to apply the same
-    /// account-check relaxations and protocol/RPC execution cap as Reth.
-    fn transact_for_estimate<StateDB>(
-        &self,
-        block_env: &BlockEnv,
-        state: StateDB,
-        tx: Self::Tx,
-        _hard_gas_cap: u64,
     ) -> Result<
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
