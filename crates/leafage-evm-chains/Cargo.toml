@@ -37,6 +37,7 @@ brotlic.workspace = true # L1 poster-gas fake-tx compression, byte-identical to 
 libloading.workspace = true
 moka.workspace = true
 tracing.workspace = true
+slh-dsa.workspace = true
 
 #only use in bsc precompile
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
