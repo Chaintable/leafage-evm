@@ -491,19 +491,6 @@ impl Command {
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
             "arc" => {
-                if chain_id != ARC_MAINNET_CHAIN_ID {
-                    bail!("Arc EVM requires chain ID 5042");
-                }
-                if self.spec_id != u8::MAX {
-                    bail!("Arc EVM uses its network hardfork schedule; --spec-id is unsupported");
-                }
-                if custom_evm_cfg.is_some() {
-                    bail!("Arc EVM does not accept --evm-custom-config");
-                }
-                if self.normalize_state_key {
-                    bail!("Arc EVM requires --normalize-state-key=false");
-                }
-
                 let arc_config = ArcChainConfig::mainnet();
                 let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
                 chain_cfg.chain_id = arc_config.chain_id();
@@ -975,68 +962,11 @@ mod tests {
     }
 
     #[test]
-    fn arc_rejects_mismatched_chain_and_evm_type() {
-        assert_arc_config_error(
-            &["--evm-type", "arc", "--chain-cfg", "1"],
-            "Arc EVM requires chain ID 5042",
-        );
+    fn arc_chain_id_requires_arc_evm_type() {
         assert_arc_config_error(
             &["--evm-type", "mainnet", "--chain-cfg", "5042"],
             "chain ID 5042 requires --evm-type arc",
         );
-    }
-
-    #[test]
-    fn arc_rejects_explicit_execution_overrides() {
-        for (args, expected) in [
-            (
-                vec![
-                    "--evm-type",
-                    "arc",
-                    "--chain-cfg",
-                    "arc",
-                    "--spec-id",
-                    "254",
-                ],
-                "--spec-id is unsupported",
-            ),
-            (
-                vec![
-                    "--evm-type",
-                    "arc",
-                    "--chain-cfg",
-                    "arc",
-                    "--evm-custom-config",
-                    "{}",
-                ],
-                "does not accept --evm-custom-config",
-            ),
-            (
-                vec![
-                    "--evm-type",
-                    "arc",
-                    "--chain-cfg",
-                    "arc",
-                    "--normalize-state-key",
-                ],
-                "requires --normalize-state-key=false",
-            ),
-        ] {
-            assert_arc_config_error(&args, expected);
-        }
-    }
-
-    #[test]
-    fn arc_accepts_legacy_spec_sentinel() {
-        let command = parse_command(&[
-            "--evm-type",
-            "arc",
-            "--chain-cfg",
-            "arc",
-            "--spec-id",
-            "255",
-        ]);
-        assert!(command.build_chain_cfg_env().is_ok());
     }
 
     #[test]
