@@ -5,8 +5,6 @@
 bench-result/
 .claude/
 .sisyphus/
-__pycache__/
-*.py[cod]
 
 # macOS
 .DS_Store
