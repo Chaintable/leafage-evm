@@ -1,7 +1,5 @@
 use crate::api::EthApiServer;
-use crate::api_impl::core::{
-    Api, ApiCore, GetHaltReason, GetTransactionError, StateOverrideEndpoint, ToJsonRpcError,
-};
+use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError};
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
@@ -118,11 +116,7 @@ where
             );
         }
         if let Some(state_override) = state_override {
-            self.inner.apply_state_overrides(
-                StateOverrideEndpoint::EthCall,
-                state_override,
-                &mut db,
-            )?;
+            super::utils::apply_state_overrides(state_override, &mut db)?;
         }
         let (block_env, tx) = self.inner.create_txn_env_for_eth_call(
             &block,

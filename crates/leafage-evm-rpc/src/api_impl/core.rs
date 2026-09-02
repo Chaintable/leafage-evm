@@ -1,7 +1,6 @@
 use crate::api_impl::token_collector::TokenCollector;
 use crate::error::internal_rpc_err;
 use alloy::consensus::BlockHeader;
-use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::decode_revert_reason;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
@@ -61,12 +60,6 @@ pub(crate) struct SimulationExecutionOutput<R> {
     pub(crate) result: ExecutionResult<R>,
     pub(crate) traces: Vec<DebankTrace>,
     pub(crate) events: Vec<DebankEvent>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StateOverrideEndpoint {
-    EthCall,
-    DebankCall,
 }
 
 impl PreparedSimulationEnvironment {
@@ -196,19 +189,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         db: &mut CacheDB<DB>,
     ) -> RpcResult<PreparedSimulationEnvironment> {
         Ok(PreparedSimulationEnvironment::generic(block, overrides, db))
-    }
-
-    fn apply_state_overrides<DB>(
-        &self,
-        endpoint: StateOverrideEndpoint,
-        overrides: StateOverride,
-        db: &mut CacheDB<DB>,
-    ) -> RpcResult<()>
-    where
-        DB: DatabaseRef,
-    {
-        let _ = endpoint;
-        super::utils::apply_state_overrides(overrides, db)
     }
 
     fn create_txn_env<StateDB: DatabaseRef>(

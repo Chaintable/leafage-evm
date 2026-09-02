@@ -840,43 +840,6 @@ async fn arc_call_uses_typed_environment_call_policy_and_existing_overrides() {
         .unwrap();
     assert_eq!(output_words(&overridden), vec![U256::from(42)]);
 
-    let code_hash_reader = Bytes::from_static(&[
-        // return EXTCODEHASH(ADDRESS).
-        0x30, 0x3f, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
-    ]);
-    let expected_code_hash = U256::from_be_slice(keccak256(&code_hash_reader).as_slice());
-    let state_override = code_override(addresses.environment, code_hash_reader);
-    let code_hash_request = call_request(addresses.funded, addresses.environment);
-    let overridden = fixture
-        .api
-        .call(
-            code_hash_request.clone(),
-            anchor,
-            Some(state_override.clone()),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(output_words(&overridden), vec![expected_code_hash]);
-
-    let contract = fixture
-        .api
-        .contract_multi_call_impl(
-            vec![code_hash_request],
-            anchor_context(),
-            None,
-            Some(state_override),
-            Some(false),
-            Some(false),
-            Some(false),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        output_words(&contract.results[0].result),
-        vec![expected_code_hash]
-    );
-
     fixture.close();
 }
 
@@ -1138,25 +1101,6 @@ async fn arc_call_returns_reth_compatible_execution_and_validation_errors() {
     assert_eq!(blocked.code(), -32603);
     assert!(blocked.message().contains("Blocked address"));
     assert!(blocked.data().is_none());
-
-    let invalid_override = fixture
-        .api
-        .call(
-            call(),
-            anchor,
-            Some(code_override(
-                addresses.environment,
-                Bytes::from_static(&[0xef, 0x01]),
-            )),
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(
-        invalid_override.code(),
-        jsonrpsee::types::error::INVALID_PARAMS_CODE
-    );
-    assert!(invalid_override.message().starts_with("Invalid bytecode: "));
 
     let insufficient = CallRequest {
         inner: TransactionRequest::default()
@@ -2292,20 +2236,6 @@ async fn arc_estimate_handles_transfer_value_and_fee_errors() {
         .unwrap_err();
     assert_eq!(error.code(), DebankErrorCode::GasExhausted as i32);
     assert_eq!(error.message(), "Invalid gas limit");
-
-    let large_balance_allowance = CallRequest {
-        inner: TransactionRequest::default()
-            .from(addresses.funded)
-            .to(addresses.environment)
-            .gas_price(1),
-        tempo: None,
-    };
-    assert!(
-        estimate(&fixture.api, large_balance_allowance, None)
-            .await
-            .unwrap()
-            > U256::from(MIN_TRANSACTION_GAS)
-    );
 
     let contract_sender = call_request(addresses.environment, addresses.empty);
     assert_eq!(

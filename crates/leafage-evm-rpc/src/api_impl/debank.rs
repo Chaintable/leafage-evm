@@ -1,8 +1,7 @@
 use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
-    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, StateOverrideEndpoint,
-    ToJsonRpcError, TxSetter,
+    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
@@ -677,11 +676,7 @@ where
             );
         }
         if let Some(state_override) = state_override {
-            self.inner.apply_state_overrides(
-                StateOverrideEndpoint::DebankCall,
-                state_override,
-                &mut cache_db,
-            )?;
+            super::utils::apply_state_overrides(state_override, &mut cache_db)?;
         }
         // Prefetch only where the batched reads are real: archive and
         // MDBX backends fall back to scalar loops, and OVM chains force

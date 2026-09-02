@@ -1,6 +1,5 @@
 use crate::api_impl::core::{
     ApiCore, EvmExecutor, GasFeeHandler, PreparedSimulationEnvironment, SimulationExecutionOutput,
-    StateOverrideEndpoint,
 };
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
@@ -8,7 +7,6 @@ use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_err, rpc_error_
 use alloy::consensus::BlockHeader;
 use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use alloy::primitives::{Address, Log};
-use alloy::rpc::types::state::StateOverride;
 use alloy::signers::Either;
 use alloy::sol_types::{ContractError, GenericRevertReason, RevertReason};
 use alloy_evm::{
@@ -300,6 +298,11 @@ fn arc_call_result(result: ExecutionResult<HaltReason>) -> RpcResult<Bytes> {
 
 /// Adds callbacks for Arc logs written directly to the journal while keeping
 /// the normal `TracingInspector` callbacks exactly once.
+// TODO: Remove this Arc-local journal cursor and emitter sidecar after upgrading to
+// `revm-inspector >= 42.0.0` and a compatible `revm-inspectors >= 0.37.0`. Upstream
+// `bluealloy/revm#3816` forwards journal-log deltas, and
+// `paradigmxyz/revm-inspectors#413` preserves `CallLog.address`; run cross-chain trace
+// regressions before deleting this compatibility layer.
 struct ArcTracingInspector {
     inner: TracingInspector,
     journal_log_count: usize,
@@ -657,34 +660,6 @@ where
     DB: Sync + Send + 'static,
 {
     type Tx = TxEnv;
-
-    fn gas_allowance<StateDB: DatabaseRef>(
-        &self,
-        _request: &CallRequest,
-        tx: &Self::Tx,
-        db: &StateDB,
-        _block_env: &BlockEnv,
-    ) -> RpcResult<u64> {
-        let balance = db
-            .basic_ref(tx.caller)
-            .map_err(|error| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, error.to_string())
-            })?
-            .map(|account| account.balance)
-            .unwrap_or_default();
-        let spendable = balance.checked_sub(tx.value).ok_or_else(|| {
-            rpc_error_with_code(
-                DebankErrorCode::BalanceExhausted as i32,
-                "Insufficient funds".to_string(),
-            )
-        })?;
-        let allowance = spendable
-            .checked_div(U256::from(tx.gas_price))
-            .unwrap_or_default()
-            .min(U256::from(u64::MAX));
-        u64::try_from(allowance)
-            .map_err(|_| internal_rpc_err("Arc gas allowance does not fit in u64"))
-    }
 }
 
 impl<DB> EvmExecutor for ArcApiImpl<DB>
@@ -727,18 +702,6 @@ where
             block_env: environment.block_env,
             pre_execution_header: Some(environment.synthetic_next_header),
         })
-    }
-
-    fn apply_state_overrides<StateDB>(
-        &self,
-        endpoint: StateOverrideEndpoint,
-        overrides: StateOverride,
-        db: &mut CacheDB<StateDB>,
-    ) -> RpcResult<()>
-    where
-        StateDB: DatabaseRef,
-    {
-        super::state_override::apply(endpoint, overrides, db)
     }
 
     fn call_error<DBError>(
