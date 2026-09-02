@@ -796,7 +796,7 @@ impl AccountKeychain {
 
         // T0+: Expiry must be in the future
         // leafage always runs latest spec, so this is always enforced
-        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
         if call.expiry <= current_timestamp {
             return Err(err_expiry_in_past());
         }
@@ -898,7 +898,7 @@ impl AccountKeychain {
             return Err(err_invalid_key_id());
         }
 
-        let now = self.storage.timestamp().to::<u64>();
+        let now = self.storage.timestamp().saturating_to::<u64>();
         if config.expiry <= now {
             return Err(err_expiry_in_past());
         }
@@ -1097,7 +1097,7 @@ impl AccountKeychain {
     ) -> Result<()> {
         self.ensure_admin_caller(msg_sender)?;
 
-        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
         let mut key = self.load_active_key(msg_sender, call.keyId, current_timestamp)?;
         if key.is_admin {
             return Err(err_invalid_key_id());
@@ -1207,7 +1207,7 @@ impl AccountKeychain {
             return Ok((U256::ZERO, 0));
         }
 
-        let current_timestamp = self.storage.timestamp().to::<u64>();
+        let current_timestamp = self.storage.timestamp().saturating_to::<u64>();
         if self.storage.spec().is_t3() && current_timestamp >= key.expiry {
             return Ok((U256::ZERO, 0));
         }
@@ -1314,7 +1314,7 @@ impl AccountKeychain {
             return Ok(true);
         }
 
-        let current_timestamp = self.storage.timestamp().to::<u64>();
+        let current_timestamp = self.storage.timestamp().saturating_to::<u64>();
         let key = match self.load_active_key(account, key_id, current_timestamp) {
             Ok(key) => key,
             Err(error) if error.is_system_error() => return Err(error),
@@ -1328,7 +1328,7 @@ impl AccountKeychain {
         match self.validate_keychain_authorization(
             account,
             key_id,
-            self.storage.timestamp().to::<u64>(),
+            self.storage.timestamp().saturating_to::<u64>(),
             None,
         ) {
             Ok(()) => Ok(true),
@@ -1349,7 +1349,7 @@ impl AccountKeychain {
             return Ok(());
         }
 
-        let current_timestamp = self.storage.timestamp().to::<u64>();
+        let current_timestamp = self.storage.timestamp().saturating_to::<u64>();
         let key = self.load_active_key(account, key_id, current_timestamp)?;
 
         if !key.enforce_limits {
@@ -1438,7 +1438,7 @@ impl AccountKeychain {
             return Ok(());
         }
 
-        let current_timestamp = self.storage.timestamp().to::<u64>();
+        let current_timestamp = self.storage.timestamp().saturating_to::<u64>();
         let key = match self.load_active_key(account, transaction_key, current_timestamp) {
             Ok(key) => key,
             Err(error) if error.is_system_error() => return Err(error),
@@ -1651,7 +1651,7 @@ impl AccountKeychain {
         }
         self.ensure_admin_caller(msg_sender)?;
 
-        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
         let key = self.load_active_key(msg_sender, key_id, current_timestamp)?;
         if key.is_admin {
             return Err(err_invalid_key_id());
@@ -1680,7 +1680,7 @@ impl AccountKeychain {
     ) -> Result<()> {
         self.ensure_admin_caller(msg_sender)?;
 
-        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
         let key = self.load_active_key(msg_sender, call.keyId, current_timestamp)?;
         if key.is_admin {
             return Err(err_invalid_key_id());
@@ -1707,7 +1707,7 @@ impl AccountKeychain {
             });
         }
 
-        let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
+        let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
         let key = self.keys[call.account][call.keyId].read()?;
         if key.expiry == 0 || key.is_revoked || current_timestamp >= key.expiry {
             return Ok(IAccountKeychain::getAllowedCallsReturn {
@@ -2440,7 +2440,7 @@ mod tests {
     }
 
     #[test]
-    fn t11_disables_direct_authorization_selectors() {
+    fn direct_authorization_selector_schedule_switches_at_t11() {
         let key_id = Address::repeat_byte(0x61);
         let config = unrestricted_restrictions();
         let calls = [
@@ -2472,13 +2472,50 @@ mod tests {
             }
             .abi_encode(),
         ];
+
+        let mut t10_provider = TestStorageProvider::new(TempoHardfork::T10);
+        StorageCtx::enter(&mut t10_provider, || {
+            let mut keychain = AccountKeychain::new();
+            let legacy_output = keychain
+                .call(&calls[0], Address::repeat_byte(0x62))
+                .unwrap();
+            let legacy_error =
+                IAccountKeychain::LegacyAuthorizeKeySelectorChanged::abi_decode(
+                    &legacy_output.bytes,
+                )
+                .unwrap();
+            assert_eq!(
+                legacy_error.newSelector,
+                FixedBytes::new(IAccountKeychain::authorizeKey_1Call::SELECTOR),
+            );
+
+            for calldata in &calls {
+                for trailing in [None, Some(0xff)] {
+                    let mut malformed = calldata[..4].to_vec();
+                    malformed.extend(trailing);
+                    let output = keychain
+                        .call(&malformed, Address::repeat_byte(0x62))
+                        .unwrap();
+                    assert!(output.reverted);
+                    assert!(output.bytes.is_empty(), "selector must reach ABI decoding");
+                }
+            }
+        });
+
         let mut provider = TestStorageProvider::new(TempoHardfork::T11);
         StorageCtx::enter(&mut provider, || {
             let mut keychain = AccountKeychain::new();
             for calldata in calls {
+                let selector = calldata[..4].try_into().unwrap();
                 let output = keychain.call(&calldata, Address::repeat_byte(0x62)).unwrap();
                 assert!(output.reverted);
-                assert_unknown_selector(&output.bytes, calldata[..4].try_into().unwrap());
+                assert_unknown_selector(&output.bytes, selector);
+
+                let mut malformed = calldata[..4].to_vec();
+                malformed.push(0xff);
+                let output = keychain.call(&malformed, Address::repeat_byte(0x62)).unwrap();
+                assert!(output.reverted);
+                assert_unknown_selector(&output.bytes, selector);
             }
         });
     }
@@ -2540,12 +2577,13 @@ mod tests {
     fn t11_set_allowed_calls_uses_canonical_rlp() {
         let account = Address::repeat_byte(0x81);
         let key_id = Address::repeat_byte(0x82);
-        let target = Address::repeat_byte(0x83);
+        let target = tip20_addr();
+        let recipient = Address::repeat_byte(0x83);
         let scopes = vec![RlpCallScope {
             target,
             selector_rules: vec![RlpSelectorRule {
-                selector: FixedBytes::new([0xaa, 0xbb, 0xcc, 0xdd]),
-                recipients: Vec::new(),
+                selector: FixedBytes::new(TIP20_TRANSFER_SELECTOR),
+                recipients: vec![recipient],
             }],
         }];
         let encoded_scopes = alloy_rlp::encode(&scopes);
@@ -2591,7 +2629,11 @@ mod tests {
             assert_eq!(stored.scopes[0].selectorRules.len(), 1);
             assert_eq!(
                 stored.scopes[0].selectorRules[0].selector,
-                FixedBytes::new([0xaa, 0xbb, 0xcc, 0xdd]),
+                FixedBytes::new(TIP20_TRANSFER_SELECTOR),
+            );
+            assert_eq!(
+                stored.scopes[0].selectorRules[0].recipients,
+                vec![recipient],
             );
             Ok(())
         })
@@ -2623,9 +2665,20 @@ mod tests {
             target: Address::repeat_byte(0xa1),
             selector_rules: Vec::new(),
         }]);
-        let mut valid_with_trailing = valid;
+        assert!((0xc0..=0xf7).contains(&valid[0]));
+        let payload_len = valid[0] - 0xc0;
+        let mut noncanonical_long_list = vec![0xf8, payload_len];
+        noncanonical_long_list.extend_from_slice(&valid[1..]);
+
+        let mut valid_with_trailing = valid.clone();
         valid_with_trailing.push(0x80);
-        let invalid_inputs = [Vec::new(), vec![0xc0], vec![0x80], valid_with_trailing];
+        let invalid_inputs = [
+            Vec::new(),
+            vec![0xc0],
+            vec![0x80],
+            noncanonical_long_list,
+            valid_with_trailing,
+        ];
         let mut provider = TestStorageProvider::new(TempoHardfork::T11);
 
         StorageCtx::enter(&mut provider, || {
