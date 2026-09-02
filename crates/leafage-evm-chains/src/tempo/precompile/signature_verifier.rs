@@ -255,8 +255,9 @@ mod tests {
     use crate::tempo::precompile::storage::with_read_only_storage_ctx;
     use crate::tempo::precompile::storage_types::Handler;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
-    use alloy::primitives::Signature;
-    use alloy::sol_types::SolCall;
+    use crate::tempo::precompile::UnknownFunctionSelector;
+    use alloy::primitives::{FixedBytes, Signature};
+    use alloy::sol_types::{SolCall, SolError};
     use revm::database::EmptyDB;
 
     fn run_with_spec<F: FnOnce() -> R, R>(spec: TempoHardfork, f: F) -> R {
@@ -327,7 +328,11 @@ mod tests {
         })
         .unwrap();
         assert!(result.reverted);
-        assert_eq!(result.bytes.as_ref(), ISignatureVerifier::verifyKeychainCall::SELECTOR);
+        let error = UnknownFunctionSelector::abi_decode(&result.bytes).unwrap();
+        assert_eq!(
+            error.selector,
+            FixedBytes::new(ISignatureVerifier::verifyKeychainCall::SELECTOR)
+        );
     }
 
     #[test]

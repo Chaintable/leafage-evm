@@ -1383,7 +1383,9 @@ mod tests {
     use crate::tempo::precompile::PATH_USD_ADDRESS;
     use crate::tempo::precompile::storage_types::StorageKey;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
-    use alloy::sol_types::SolCall;
+    use crate::tempo::precompile::UnknownFunctionSelector;
+    use alloy::primitives::FixedBytes;
+    use alloy::sol_types::{SolCall, SolError};
 
     fn initialize_test_token(token: Address, admin: Address) -> Result<()> {
         TIP20Token::from_address_unchecked(token).initialize(
@@ -1691,9 +1693,10 @@ mod tests {
         })
         .unwrap();
         assert!(output.reverted);
+        let error = UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
         assert_eq!(
-            output.bytes.as_ref(),
-            ITIP403Registry::receivePolicyCall::SELECTOR
+            error.selector,
+            FixedBytes::new(ITIP403Registry::receivePolicyCall::SELECTOR)
         );
     }
 }

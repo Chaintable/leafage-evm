@@ -47,6 +47,11 @@ use alloy::sol_types::{SolCall, SolError};
 use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
 use revm::precompile::{PrecompileOutput, PrecompileResult};
 
+alloy::sol! {
+    /// Common Tempo precompile error for an unknown or hardfork-disabled selector.
+    error UnknownFunctionSelector(bytes4 selector);
+}
+
 // ===========================================================================
 // Address constants (from tempo-contracts)
 // ===========================================================================

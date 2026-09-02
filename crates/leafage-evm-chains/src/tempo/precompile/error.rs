@@ -8,7 +8,10 @@
 //! essential error plumbing for storage operations.
 
 use alloy::primitives::{Bytes, FixedBytes};
+use alloy::sol_types::SolError;
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+
+use super::UnknownFunctionSelector;
 
 /// Top-level error type for Tempo precompile operations in leafage-evm.
 ///
@@ -90,10 +93,13 @@ impl TempoPrecompileError {
             Self::OutOfGas => Err(PrecompileError::OutOfGas),
             Self::Fatal(msg) => Err(PrecompileError::Fatal(msg)),
             Self::UnknownFunctionSelector(selector) => {
-                // Encode as a simple 4-byte revert
                 Ok(PrecompileOutput::new_reverted(
                     gas_used,
-                    Bytes::copy_from_slice(&selector),
+                    UnknownFunctionSelector {
+                        selector: FixedBytes::new(selector),
+                    }
+                    .abi_encode()
+                    .into(),
                 ))
             }
             Self::Revert(data) => Ok(PrecompileOutput::new_reverted(gas_used, data)),
