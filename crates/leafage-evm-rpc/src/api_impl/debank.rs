@@ -16,8 +16,8 @@ use leafage_evm_types::{
     block_env_from_block, Address, BlockEnv, BlockId, BlockInfo, BlockNumberOrTag, BlockOverrides,
     BlockType, Bytes, CallRequest, DebankBlock, DebankBlockContext, DebankErrorCode,
     DebankMultiCallResp, DebankMultiCallStats, DebankSimulateResp, DebankSimulateStats,
-    DebankSingleCallResult, DebankSingleSimulateResult, Header, JsonStorageKey, H256,
-    KECCAK256_EMPTY, U256,
+    DebankSingleCallResult, DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo,
+    H256, KECCAK256_EMPTY, U256,
 };
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -544,16 +544,16 @@ where
                 }
             }
         }
-        let (call_block_env, tx) = self.inner.create_txn_env_for_call(
+        let tx = self.inner.create_txn_env(
             block,
-            block_env.clone(),
+            block_env,
             request,
             db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         let mut res: DebankSingleCallResult = self
             .inner
-            .transact_for_call(&call_block_env, db, tx)
+            .transact(block_env, db, tx)
             .map_err(|e| e.to_rpc_error())?
             .into();
         res.time_cost = start.elapsed().as_secs_f64();
@@ -776,6 +776,7 @@ where
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
+        let mut block_env = block_env_from_block(&block);
         let mut stats = DebankSimulateStats {
             block_num: block.header.number,
             block_time: block.header.timestamp,
@@ -787,14 +788,19 @@ where
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         });
-        let environment =
-            self.inner
-                .prepare_simulation_environment(&block, block_overrides, &mut memory_db)?;
-        let block_env = environment.block_env;
-        if let Some(header) = environment.pre_execution_header {
-            self.inner
-                .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
+        if let Some(overrides) = block_overrides {
+            let header = super::utils::apply_block_overrides(
+                overrides,
+                &mut memory_db,
+                &mut block_env,
+                block.header.clone(),
+            );
+            if let Some(header) = header {
+                self.inner
+                    .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
+            }
         }
+        let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
         for tx in txs {
             if cancel_token.is_cancelled() {
@@ -802,13 +808,21 @@ where
                     "simulate transactions cancelled by caller".to_string(),
                 ));
             }
+            let tx_info = TransactionInfo {
+                hash: Some(H256::random()),
+                index: Some(tx_index),
+                block_hash: Some(block.header.hash),
+                block_number: Some(block.header.number),
+                base_fee: block.header.base_fee_per_gas,
+            };
+            tx_index += 1;
             if let Some(last_res) = results.last() {
                 if last_res.code != 0 {
                     results.push(last_res.clone());
                     continue;
                 }
             }
-            let tx = self.inner.create_txn_env_for_simulation(
+            let tx = self.inner.create_txn_env(
                 &block,
                 &block_env,
                 tx,
@@ -817,7 +831,7 @@ where
             )?;
             let output = self
                 .inner
-                .execute_simulation(&block_env, &mut memory_db, H256::random(), tx)
+                .execute_simulation(&block_env, &mut memory_db, tx_info.hash.unwrap(), tx)
                 .map_err(|e| e.to_rpc_error())?;
             let mut pre_res: DebankSingleSimulateResult = output.result.into();
             pre_res.traces = output.traces;

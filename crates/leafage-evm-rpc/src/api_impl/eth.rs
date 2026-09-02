@@ -3,7 +3,7 @@ use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, To
 use crate::api_impl::utils;
 use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
-use alloy::sol_types::SolValue;
+use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
@@ -12,6 +12,7 @@ use leafage_evm_types::{
     MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, H256, KECCAK256_EMPTY,
     U256,
 };
+use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
 use serde_json::Value;
 use std::error::Error;
@@ -118,18 +119,29 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
         }
-        let (block_env, tx) = self.inner.create_txn_env_for_eth_call(
+        let tx = self.inner.create_txn_env(
             &block,
-            block_env,
+            &block_env,
             request,
             &db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         let res = self
             .inner
-            .transact_for_call(&block_env, &db, tx)
-            .map_err(|error| self.inner.call_error(&error))?;
-        self.inner.call_result(res)
+            .transact(&block_env, &db, tx)
+            .map_err(|e| e.to_rpc_error())?
+            .into();
+        match res {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
+            ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
+                "Reverted: {:?}",
+                decode_revert_reason(&output).unwrap_or("execution revert".to_string())
+            ))
+            .into()),
+            ExecutionResult::Halt { reason, gas, .. } => {
+                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.used())).into())
+            }
+        }
     }
 
     async fn call_impl(
@@ -354,9 +366,9 @@ where
                     }
                 }
             }
-            let (call_block_env, tx) = self.inner.create_txn_env_for_call(
+            let tx = self.inner.create_txn_env(
                 &block,
-                block_env.clone(),
+                &block_env,
                 request,
                 state.clone(),
                 self.inner.evm_cfg().cfg.chain_id,
@@ -364,7 +376,7 @@ where
 
             let mut res: SingleCallResult = self
                 .inner
-                .transact_for_call(&call_block_env, state.clone(), tx)
+                .transact(&block_env, state.clone(), tx)
                 .map_err(|e| e.to_rpc_error())?
                 .into();
             res.time_cost = start.elapsed().as_secs_f64();

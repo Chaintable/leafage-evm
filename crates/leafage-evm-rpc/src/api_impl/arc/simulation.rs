@@ -1,6 +1,6 @@
 use leafage_evm_types::{DebankEvent, DebankID, DebankTrace, H256};
 use revm::primitives::Address;
-use revm_inspectors::tracing::types::{CallKind, CallTraceNode, TraceMemberOrder};
+use revm_inspectors::tracing::types::{CallTraceNode, TraceMemberOrder};
 use revm_inspectors::tracing::CallTraceArena;
 
 enum DebankTraceOrLog {
@@ -25,17 +25,6 @@ fn build_trace_node(
         trace: node.into(),
         children: Vec::new(),
     };
-
-    if node.is_selfdestruct() {
-        debank_node.trace.call_create_type = match node.trace.kind {
-            CallKind::Call
-            | CallKind::StaticCall
-            | CallKind::CallCode
-            | CallKind::DelegateCall
-            | CallKind::AuthCall => "call".to_string(),
-            CallKind::Create | CallKind::Create2 => "create".to_string(),
-        };
-    }
 
     debank_node.trace.parent_trace_id = parent_trace_id;
     debank_node.trace.pos_in_parent_trace = pos_in_parent_trace;
@@ -93,29 +82,6 @@ fn build_trace_node(
             }
             _ => {}
         }
-    }
-
-    if node.is_selfdestruct() {
-        let mut trace = DebankTrace {
-            from_addr: node.trace.selfdestruct_address.unwrap_or_default(),
-            to_addr: node.trace.selfdestruct_refund_target.unwrap_or_default(),
-            value: node
-                .trace
-                .selfdestruct_transferred_value
-                .unwrap_or_default(),
-            parent_trace_id: id,
-            pos_in_parent_trace: debank_node.children.len(),
-            tx_id,
-            call_create_type: "suicide".to_string(),
-            ..Default::default()
-        };
-        trace.id = trace.debank_id();
-        debank_node
-            .children
-            .push(DebankTraceOrLog::Trace(DebankTraceNode {
-                trace,
-                children: Vec::new(),
-            }));
     }
 
     debank_node

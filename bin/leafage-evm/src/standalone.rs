@@ -490,6 +490,10 @@ impl Command {
             "arc" => {
                 let arc_config = ArcChainConfig::mainnet();
                 let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = arc_config.chain_id();
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
@@ -939,10 +943,10 @@ mod tests {
             };
             assert_eq!(cfg.chain_id, ARC_MAINNET_CHAIN_ID);
             assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
-            assert!(!cfg.disable_balance_check);
-            assert!(!cfg.disable_eip3607);
-            assert!(!cfg.disable_block_gas_limit);
-            assert!(!cfg.disable_base_fee);
+            assert!(cfg.disable_balance_check);
+            assert!(cfg.disable_eip3607);
+            assert!(cfg.disable_block_gas_limit);
+            assert!(cfg.disable_base_fee);
             assert_eq!(arc_config, ArcChainConfig::mainnet());
         }
     }
