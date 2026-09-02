@@ -107,8 +107,11 @@ pub const ZONE_MESSENGER_ADDRESS: Address =
 // Gas constants
 // ===========================================================================
 
-/// Input per word cost. Covers ABI decoding and cloning of input into call data.
-pub const INPUT_PER_WORD_COST: u64 = 6;
+/// Input per word cost before T11. Covers ABI decoding and cloning of input into call data.
+const PRE_T11_INPUT_PER_WORD_COST: u64 = 6;
+
+/// Input per word cost starting at T11 (TIP-1100).
+const POST_T11_INPUT_PER_WORD_COST: u64 = 30;
 
 /// Gas cost for `ecrecover` signature verification.
 pub const ECRECOVER_GAS: u64 = 3_000;
@@ -126,9 +129,15 @@ pub const fn abi_decoder_config() -> alloy::sol_types::abi::AbiDecoderConfig {
 /// Returns the gas cost for decoding calldata of the given length, rounded up to word boundaries.
 #[inline]
 pub fn input_cost(calldata_len: usize) -> u64 {
+    let per_word_cost = if StorageCtx.spec().is_t11() {
+        POST_T11_INPUT_PER_WORD_COST
+    } else {
+        PRE_T11_INPUT_PER_WORD_COST
+    };
+
     calldata_len
         .div_ceil(32)
-        .saturating_mul(INPUT_PER_WORD_COST as usize) as u64
+        .saturating_mul(per_word_cost as usize) as u64
 }
 
 // ===========================================================================
@@ -553,6 +562,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::primitives::U256;
     use alloy::sol_types::{SolCall, SolInterface};
     use revm::precompile::{PrecompileSpecId, Precompiles};
@@ -574,6 +584,35 @@ mod tests {
             abi_decoder_config(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn input_cost_increases_at_t11() {
+        for (spec, one_word, two_words) in [
+            (crate::tempo::hardfork::TempoHardfork::T10, 6, 12),
+            (crate::tempo::hardfork::TempoHardfork::T11, 30, 60),
+        ] {
+            let mut storage = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut storage, || {
+                assert_eq!(input_cost(0), 0);
+                assert_eq!(input_cost(1), one_word);
+                assert_eq!(input_cost(32), one_word);
+                assert_eq!(input_cost(33), two_words);
+            });
+        }
+    }
+
+    #[test]
+    fn t11_input_cost_is_charged_before_decode() {
+        let mut storage = TestStorageProvider::new(crate::tempo::hardfork::TempoHardfork::T11);
+        storage.set_gas_limit(29);
+        StorageCtx::enter(&mut storage, || {
+            let result = nonce::NonceManager::new().call(&[0], Address::ZERO);
+            assert!(matches!(
+                result,
+                Err(revm::precompile::PrecompileError::OutOfGas)
+            ));
+        });
     }
 
     #[test]
