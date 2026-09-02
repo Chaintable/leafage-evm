@@ -845,18 +845,22 @@ mod tests {
     /// AA tx with expiring nonce key (U256::MAX) on T1+ should add EXPIRING_NONCE_GAS (13k).
     #[test]
     fn test_aa_gas_expiring_nonce() {
+        use crate::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER;
         use revm::primitives::U256;
 
+        let timestamp = 1_770_908_400 + 100;
         let calls = vec![make_call(0x01, &[])];
 
         // Normal nonce_key (nonce > 0)
         let tx_normal = make_aa_tx(calls.clone(), 1, U256::from(1), 10_000_000);
         // Expiring nonce_key (U256::MAX) — requires valid_before to be set.
         let mut tx_expiring = make_aa_tx(calls, 1, U256::MAX, 10_000_000);
-        tx_expiring.tempo_fields.as_mut().unwrap().valid_before = Some(u64::MAX);
+        tx_expiring.base.nonce = 0;
+        tx_expiring.tempo_fields.as_mut().unwrap().valid_before = Some(timestamp + 30);
+        tx_expiring.unique_tx_identifier = Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
 
         let mut evm_normal = TempoEvm::new(
-            make_env_aa(1_770_908_400 + 100),
+            make_env_aa(timestamp),
             EmptyDB::default(),
             NoOpInspector,
             false,
@@ -868,7 +872,7 @@ mod tests {
             .gas_used();
 
         let mut evm_exp = TempoEvm::new(
-            make_env_aa(1_770_908_400 + 100),
+            make_env_aa(timestamp),
             EmptyDB::default(),
             NoOpInspector,
             false,

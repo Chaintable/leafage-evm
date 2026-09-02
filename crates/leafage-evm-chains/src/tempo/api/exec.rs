@@ -309,6 +309,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         // Writer does this in validate_against_state_and_deduct_caller (handler.rs:854-860).
         // Without this, multi-tx batches (pre_traceMany) don't accumulate nonce state,
         // causing every tx to see nonce=0 and trigger 250k new_account_cost.
+        check_and_mark_expiring_nonce_if_needed(evm)?;
         increment_2d_nonce_if_needed(evm);
 
         // Set tx_origin in AccountKeychain transient storage for spending limit checks.
@@ -589,6 +590,77 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         .sload(fee_token, balance_slot.into())?;
 
     Ok(())
+}
+
+/// Validates and records an AA transaction that uses the expiring nonce key.
+///
+/// Writer performs this state transition in `validate_against_state_and_deduct_caller`.
+/// It must run before call execution so the replay marker persists even if the AA batch reverts.
+fn check_and_mark_expiring_nonce_if_needed<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+) -> Result<(), EVMError<DB::Error>> {
+    use crate::tempo::precompile::nonce::{INonce, NonceManager};
+    use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx};
+    use alloy::sol_types::SolError;
+
+    let Some(fields) = evm.ctx().tx.tempo_fields.as_ref() else {
+        return Ok(());
+    };
+    if fields.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
+        return Ok(());
+    }
+
+    if evm.ctx().tx.base.nonce != 0 {
+        return Err(EVMError::Custom(
+            "expiring nonce transaction must use nonce 0".into(),
+        ));
+    }
+
+    let valid_before = fields.valid_before.ok_or_else(|| {
+        EVMError::Custom("expiring nonce transaction requires valid_before to be set".into())
+    })?;
+    let hardfork = evm.ctx().cfg.spec;
+    let replay_hash = if hardfork.is_t1b() {
+        evm.ctx().tx.unique_tx_identifier.ok_or_else(|| {
+            EVMError::Custom("expiring nonce transaction requires a transaction identifier".into())
+        })?
+    } else {
+        // Official RPC simulations use zero as the pre-T1B transaction hash.
+        revm::primitives::B256::ZERO
+    };
+    let timestamp = evm.ctx().block.timestamp.saturating_to::<u64>();
+    let max_expiry_secs = hardfork.expiring_nonce_max_expiry_secs();
+    let chain_id = evm.ctx().cfg.chain_id;
+
+    let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+    let mut storage =
+        LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
+    StorageCtx::enter(&mut storage, || {
+        // Writer excludes nonce-manager bookkeeping from TIP-1060 storage credits.
+        StorageCtx.set_tip1060_storage_credits(false);
+        NonceManager::new().check_and_mark_expiring_nonce(replay_hash, valid_before)
+    })
+    .map_err(|error| {
+        let selector = error.selector();
+        if selector == INonce::InvalidExpiringNonceExpiry::SELECTOR {
+            let max_allowed = timestamp.saturating_add(max_expiry_secs);
+            if valid_before <= timestamp {
+                EVMError::Custom(format!(
+                    "expiring nonce transaction expired: valid_before ({valid_before}) <= block timestamp ({timestamp})"
+                ))
+            } else {
+                EVMError::Custom(format!(
+                    "expiring nonce valid_before ({valid_before}) too far in the future: must be within {max_expiry_secs}s of block timestamp ({timestamp}), max allowed is {max_allowed}"
+                ))
+            }
+        } else if selector == INonce::ExpiringNonceReplay::SELECTOR {
+            EVMError::Custom("expiring nonce transaction has already been used".into())
+        } else if selector == INonce::ExpiringNonceSetFull::SELECTOR {
+            EVMError::Custom("expiring nonce set is full".into())
+        } else {
+            EVMError::Custom(format!("expiring nonce validation failed: {error}"))
+        }
+    })
 }
 
 /// Increments the 2D nonce in NonceManager for AA txs with nonceKey > 0.
@@ -1604,6 +1676,52 @@ mod tests {
         make_evm_with_spec(TempoHardfork::default())
     }
 
+    fn make_cached_evm_with_spec(
+        spec: TempoHardfork,
+    ) -> TempoEvm<revm::database::CacheDB<EmptyDB>, NoOpInspector> {
+        let mut cfg = CfgEnv::new_with_spec(spec);
+        cfg.chain_id = 4217;
+        cfg.disable_balance_check = true;
+        cfg.disable_nonce_check = true;
+        cfg.disable_eip3607 = true;
+        cfg.disable_block_gas_limit = true;
+        cfg.disable_base_fee = true;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = revm::primitives::U256::from(1_770_908_500u64);
+        block_env.gas_limit = 100_000_000;
+        let env = EvmEnv::new(cfg, block_env);
+        let db = revm::database::CacheDB::new(EmptyDB::default());
+        let mut evm = TempoEvm::new(env, db, NoOpInspector, false);
+        evm.inner.ctx.cfg.spec = spec;
+        evm
+    }
+
+    fn expiring_nonce_tx(valid_before: u64, replay_hash: revm::primitives::B256) -> TempoTxEnv {
+        use crate::tempo::tx::{TempoCall, TempoTxFields};
+        use revm::primitives::{Bytes, TxKind};
+
+        TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0x91),
+                gas_limit: 10_000_000,
+                nonce: 0,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: vec![TempoCall {
+                    to: TxKind::Call(Address::with_last_byte(0x92)),
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                }],
+                nonce_key: U256::MAX,
+                valid_before: Some(valid_before),
+                ..Default::default()
+            }),
+            unique_tx_identifier: Some(replay_hash),
+        }
+    }
+
     fn p256_address(signing_key: &p256::ecdsa::SigningKey) -> Address {
         let encoded = signing_key.verifying_key().to_encoded_point(false);
         let x = encoded.x().expect("P256 public key has x");
@@ -2224,6 +2342,59 @@ mod tests {
             err.contains("expiring nonce transaction requires valid_before"),
             "expected 'expiring nonce transaction requires valid_before', got: {err}"
         );
+    }
+
+    #[test]
+    fn expiring_nonce_execution_uses_t11_window_and_writes_replay_state() {
+        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use revm::primitives::B256;
+
+        let timestamp = 1_770_908_500u64;
+        let replay_hash = B256::repeat_byte(0x93);
+
+        let mut t10 = make_cached_evm_with_spec(TempoHardfork::T10);
+        let error = t10
+            .transact(expiring_nonce_tx(timestamp + 31, replay_hash))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be within 30s"), "{error}");
+
+        let mut t11 = make_cached_evm_with_spec(TempoHardfork::T11);
+        let valid_before = timestamp + 300;
+        let result = t11
+            .transact(expiring_nonce_tx(valid_before, replay_hash))
+            .unwrap();
+        assert!(result.result.is_success(), "{:?}", result.result);
+
+        let nonce_state = &result.state[&NONCE_PRECOMPILE_ADDRESS];
+        let seen_slot = replay_hash.mapping_slot(U256::ONE);
+        let ring_slot = U256::ZERO.mapping_slot(U256::from(2));
+        assert_eq!(
+            nonce_state.storage[&seen_slot].present_value,
+            U256::from(valid_before),
+        );
+        assert_eq!(
+            nonce_state.storage[&ring_slot].present_value,
+            U256::from_be_bytes(replay_hash.0),
+        );
+        assert_eq!(
+            nonce_state.storage[&U256::from(3)].present_value,
+            U256::ONE,
+        );
+    }
+
+    #[test]
+    fn expiring_nonce_execution_rejects_replay_after_commit() {
+        use revm::primitives::B256;
+
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        let tx = expiring_nonce_tx(1_770_908_500 + 300, B256::repeat_byte(0x94));
+        let first = evm.transact_commit(tx.clone()).unwrap();
+        assert!(first.is_success(), "{first:?}");
+
+        let error = evm.transact(tx).unwrap_err().to_string();
+        assert!(error.contains("already been used"), "{error}");
     }
 
     #[test]

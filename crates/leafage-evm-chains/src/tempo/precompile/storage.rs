@@ -279,6 +279,17 @@ impl<'a> LeafageStorageProvider<'a> {
         // Derive hardfork from block timestamp for archive mode support.
         let timestamp: u64 = internals.block_timestamp().saturating_to();
         let spec = TempoHardfork::from_timestamp(timestamp);
+        Self::new_with_spec(internals, gas_limit, chain_id, is_static, spec)
+    }
+
+    /// Creates a storage provider with an explicitly selected Tempo hardfork.
+    pub fn new_with_spec(
+        internals: EvmInternals<'a>,
+        gas_limit: u64,
+        chain_id: u64,
+        is_static: bool,
+        spec: TempoHardfork,
+    ) -> Self {
         Self {
             internals,
             gas_remaining: gas_limit,
@@ -295,6 +306,15 @@ impl<'a> LeafageStorageProvider<'a> {
     /// Creates a new storage provider with maximum gas limit and non-static context.
     pub fn new_max_gas(internals: EvmInternals<'a>, chain_id: u64) -> Self {
         Self::new(internals, u64::MAX, chain_id, false)
+    }
+
+    /// Creates a maximum-gas storage provider with an explicit Tempo hardfork.
+    pub fn new_max_gas_with_spec(
+        internals: EvmInternals<'a>,
+        chain_id: u64,
+        spec: TempoHardfork,
+    ) -> Self {
+        Self::new_with_spec(internals, u64::MAX, chain_id, false, spec)
     }
 
     /// SSTORE set cost (0 → non-zero), hardfork-aware.

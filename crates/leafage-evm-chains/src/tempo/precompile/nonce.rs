@@ -252,6 +252,12 @@ mod tests {
             storage.set_timestamp(U256::from(1_000));
             StorageCtx::enter(&mut storage, || {
                 let mut manager = NonceManager::new();
+                assert!(
+                    manager
+                        .check_and_mark_expiring_nonce(B256::repeat_byte(0), 1_000)
+                        .is_err(),
+                    "expiry at the current timestamp must be rejected"
+                );
                 manager
                     .check_and_mark_expiring_nonce(B256::repeat_byte(1), accepted)
                     .expect("expiry at the fork limit must be accepted");
@@ -266,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_pointer_wraps_at_each_fork_capacity() {
+    fn ring_pointer_advances_and_wraps_at_each_fork_capacity() {
         for spec in [TempoHardfork::T10, TempoHardfork::T11] {
             let mut storage = TestStorageProvider::new(spec);
             storage.set_timestamp(U256::from(1_000));
@@ -280,6 +286,12 @@ mod tests {
                     .check_and_mark_expiring_nonce(B256::repeat_byte(3), 1_020)
                     .unwrap();
                 assert_eq!(manager.expiring_nonce_ring_ptr.read().unwrap(), 0);
+
+                manager.expiring_nonce_ring_ptr.write(41).unwrap();
+                manager
+                    .check_and_mark_expiring_nonce(B256::repeat_byte(4), 1_020)
+                    .unwrap();
+                assert_eq!(manager.expiring_nonce_ring_ptr.read().unwrap(), 42);
             });
         }
     }
