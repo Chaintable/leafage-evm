@@ -35,6 +35,8 @@ pub enum TempoHardfork {
     T9,
     #[default]
     T10,
+    /// Defined by the protocol, but not scheduled on Tempo mainnet yet.
+    T11,
 }
 
 /// Tempo mainnet activation timestamps (from `presto.json` genesis config).
@@ -142,6 +144,27 @@ impl TempoHardfork {
     pub const fn is_t10(&self) -> bool {
         *self as u8 >= Self::T10 as u8
     }
+    pub const fn is_t11(&self) -> bool {
+        *self as u8 >= Self::T11 as u8
+    }
+
+    /// Capacity of the expiring-nonce replay-protection ring.
+    pub const fn expiring_nonce_set_capacity(&self) -> u32 {
+        if self.is_t11() {
+            3_000_000
+        } else {
+            300_000
+        }
+    }
+
+    /// Maximum number of seconds an expiring nonce may remain valid.
+    pub const fn expiring_nonce_max_expiry_secs(&self) -> u64 {
+        if self.is_t11() {
+            300
+        } else {
+            30
+        }
+    }
 
     /// Gas cost for using an existing 2D nonce key (cold SLOAD + warm SSTORE reset).
     /// Ported from Tempo writer: crates/chainspec/src/spec.rs
@@ -161,7 +184,8 @@ impl TempoHardfork {
             | Self::T7
             | Self::T8
             | Self::T9
-            | Self::T10 => {
+            | Self::T10
+            | Self::T11 => {
                 // T2 adds 2 warm SLOADs; later forks inherit the same schedule.
                 5_200
             }
@@ -186,7 +210,8 @@ impl TempoHardfork {
             | Self::T7
             | Self::T8
             | Self::T9
-            | Self::T10 => {
+            | Self::T10
+            | Self::T11 => {
                 // T2 adds 2 warm SLOADs; later forks inherit the same schedule.
                 22_300
             }
@@ -319,6 +344,9 @@ mod tests {
             assert_eq!(TempoHardfork::from_timestamp(timestamp), active);
             assert_eq!(TempoHardfork::from_timestamp(timestamp + 1), active);
         }
+
+        // T11 has no mainnet activation timestamp yet.
+        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T10);
     }
 
     #[test]
@@ -338,6 +366,7 @@ mod tests {
         assert!(!hf.is_t8());
         assert!(!hf.is_t9());
         assert!(!hf.is_t10());
+        assert!(!hf.is_t11());
     }
 
     #[test]
@@ -353,6 +382,7 @@ mod tests {
         assert!(!hf.is_t4());
         assert!(!hf.is_t5());
         assert!(!hf.is_t10());
+        assert!(!hf.is_t11());
     }
 
     #[test]
@@ -368,6 +398,7 @@ mod tests {
         assert!(!hf.is_t4());
         assert!(!hf.is_t5());
         assert!(!hf.is_t10());
+        assert!(!hf.is_t11());
     }
 
     #[test]
@@ -383,6 +414,7 @@ mod tests {
         assert!(hf.is_t4());
         assert!(!hf.is_t5());
         assert!(!hf.is_t10());
+        assert!(!hf.is_t11());
     }
 
     #[test]
@@ -399,6 +431,24 @@ mod tests {
         assert!(hf.is_t8());
         assert!(hf.is_t9());
         assert!(hf.is_t10());
+        assert!(!hf.is_t11());
+    }
+
+    #[test]
+    fn is_methods_on_t11() {
+        let hf = TempoHardfork::T11;
+        assert!(hf.is_t0());
+        assert!(hf.is_t1());
+        assert!(hf.is_t2());
+        assert!(hf.is_t3());
+        assert!(hf.is_t4());
+        assert!(hf.is_t5());
+        assert!(hf.is_t6());
+        assert!(hf.is_t7());
+        assert!(hf.is_t8());
+        assert!(hf.is_t9());
+        assert!(hf.is_t10());
+        assert!(hf.is_t11());
     }
 
     #[test]
@@ -406,11 +456,12 @@ mod tests {
         let hf = TempoHardfork::default();
         assert_eq!(hf, TempoHardfork::T10);
         assert!(hf.is_t10());
+        assert!(!hf.is_t11());
     }
 
     #[test]
-    fn t3_gas_matches_t2() {
-        // T3-T10 inherit T2 nonce gas (no schedule change).
+    fn t3_through_t11_gas_matches_t2() {
+        // T3-T11 inherit T2 nonce gas (no schedule change).
         for hardfork in [
             TempoHardfork::T3,
             TempoHardfork::T4,
@@ -420,6 +471,7 @@ mod tests {
             TempoHardfork::T8,
             TempoHardfork::T9,
             TempoHardfork::T10,
+            TempoHardfork::T11,
         ] {
             assert_eq!(
                 hardfork.gas_existing_nonce_key(),
@@ -451,8 +503,17 @@ mod tests {
             TempoHardfork::T8,
             TempoHardfork::T9,
             TempoHardfork::T10,
+            TempoHardfork::T11,
         ] {
             assert_eq!(SpecId::from(hardfork), SpecId::OSAKA);
         }
+    }
+
+    #[test]
+    fn expiring_nonce_parameters_activate_at_t11() {
+        assert_eq!(TempoHardfork::T10.expiring_nonce_set_capacity(), 300_000);
+        assert_eq!(TempoHardfork::T10.expiring_nonce_max_expiry_secs(), 30);
+        assert_eq!(TempoHardfork::T11.expiring_nonce_set_capacity(), 3_000_000);
+        assert_eq!(TempoHardfork::T11.expiring_nonce_max_expiry_secs(), 300);
     }
 }

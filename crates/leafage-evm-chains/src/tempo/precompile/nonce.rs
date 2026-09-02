@@ -23,16 +23,6 @@ use super::storage_types::{Handler, Mapping, Slot};
 use super::{dispatch_call, input_cost, view, Precompile, NONCE_PRECOMPILE_ADDRESS};
 
 // ===========================================================================
-// Constants
-// ===========================================================================
-
-/// Capacity of the expiring nonce seen set (supports 10k TPS for 30 seconds).
-pub const EXPIRING_NONCE_SET_CAPACITY: u32 = 300_000;
-
-/// Maximum allowed skew for expiring nonce transactions (30 seconds).
-pub const EXPIRING_NONCE_MAX_EXPIRY_SECS: u64 = 30;
-
-// ===========================================================================
 // Solidity ABI types
 // ===========================================================================
 
@@ -153,9 +143,11 @@ impl NonceManager {
         valid_before: u64,
     ) -> Result<()> {
         let now: u64 = self.storage.timestamp().saturating_to();
+        let spec = self.storage.spec();
 
         // 1. Validate expiry window: must be in (now, now + max_skew]
-        if valid_before <= now || valid_before > now.saturating_add(EXPIRING_NONCE_MAX_EXPIRY_SECS)
+        if valid_before <= now
+            || valid_before > now.saturating_add(spec.expiring_nonce_max_expiry_secs())
         {
             return Err(TempoPrecompileError::Revert(
                 INonce::InvalidExpiringNonceExpiry {}.abi_encode().into(),
@@ -192,7 +184,7 @@ impl NonceManager {
         self.expiring_nonce_seen[expiring_nonce_hash].write(valid_before)?;
 
         // 6. Advance pointer (wraps at CAPACITY, not u32::MAX)
-        let next = if ptr + 1 >= EXPIRING_NONCE_SET_CAPACITY {
+        let next = if ptr + 1 >= spec.expiring_nonce_set_capacity() {
             0
         } else {
             ptr + 1
@@ -242,5 +234,53 @@ impl Precompile for NonceManager {
                 INonce::INonceCalls::getNonce(call) => view(call, |c| self.get_nonce(c)),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::{hardfork::TempoHardfork, precompile::test_utils::TestStorageProvider};
+
+    #[test]
+    fn expiry_window_changes_at_t11() {
+        for (spec, accepted, rejected) in [
+            (TempoHardfork::T10, 1_030, 1_031),
+            (TempoHardfork::T11, 1_300, 1_301),
+        ] {
+            let mut storage = TestStorageProvider::new(spec);
+            storage.set_timestamp(U256::from(1_000));
+            StorageCtx::enter(&mut storage, || {
+                let mut manager = NonceManager::new();
+                manager
+                    .check_and_mark_expiring_nonce(B256::repeat_byte(1), accepted)
+                    .expect("expiry at the fork limit must be accepted");
+                assert!(
+                    manager
+                        .check_and_mark_expiring_nonce(B256::repeat_byte(2), rejected)
+                        .is_err(),
+                    "expiry above the fork limit must be rejected"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ring_pointer_wraps_at_each_fork_capacity() {
+        for spec in [TempoHardfork::T10, TempoHardfork::T11] {
+            let mut storage = TestStorageProvider::new(spec);
+            storage.set_timestamp(U256::from(1_000));
+            StorageCtx::enter(&mut storage, || {
+                let mut manager = NonceManager::new();
+                manager
+                    .expiring_nonce_ring_ptr
+                    .write(spec.expiring_nonce_set_capacity() - 1)
+                    .unwrap();
+                manager
+                    .check_and_mark_expiring_nonce(B256::repeat_byte(3), 1_020)
+                    .unwrap();
+                assert_eq!(manager.expiring_nonce_ring_ptr.read().unwrap(), 0);
+            });
+        }
     }
 }
