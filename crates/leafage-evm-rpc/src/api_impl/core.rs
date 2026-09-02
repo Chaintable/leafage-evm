@@ -186,6 +186,9 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 pub(crate) trait TxSetter {
     fn set_gas_limit(&mut self, gas_limit: u64);
 
+    /// Assign chain-specific replay context to one entry in a stateful RPC batch.
+    fn set_stateful_simulation_context(&mut self, _block_hash: H256, _index: u64) {}
+
     /// Mark this transaction as a gas-estimation run. Chains whose gas
     /// accounting depends on the run mode (Arbitrum's L1 poster padding)
     /// override this; the default is a no-op.

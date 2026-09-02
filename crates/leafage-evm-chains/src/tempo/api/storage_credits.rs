@@ -10,7 +10,7 @@ use revm::{
     },
 };
 
-use super::{TempoContext, TempoEvm};
+use super::{TempoContext, TempoEvm, TempoEvmError};
 use crate::tempo::precompile::{
     storage_credits::{
         account_opcode_storage_write, AccountingError, TransientState, STORAGE_CREDIT_VALUE,
@@ -83,7 +83,7 @@ pub(crate) fn sstore<DB: Database>(
 pub(crate) fn apply_refund<DB: Database, I>(
     evm: &mut TempoEvm<DB, I>,
     gas: &mut revm::interpreter::Gas,
-) -> Result<(), revm::context_interface::result::EVMError<DB::Error>> {
+) -> Result<(), TempoEvmError<DB::Error>> {
     use revm::context_interface::{ContextTr, JournalTr};
 
     let transient_entries: Vec<_> = evm
@@ -192,6 +192,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         }
     }
@@ -304,6 +305,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
         TempoEvm::new(env(), db, NoOpInspector, false)

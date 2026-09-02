@@ -1,3 +1,4 @@
+use alloy::primitives::keccak256;
 use revm::{
     context::TxEnv,
     context_interface::transaction::Transaction,
@@ -54,6 +55,8 @@ pub struct ScopeCounts {
     pub has_allowed_calls: bool,
     pub scopes: u32,
     pub selectors: u32,
+    /// Number of target scopes that contain at least one selector rule.
+    pub selector_sets: u32,
     pub constrained_selectors: u32,
     pub recipients: u32,
 }
@@ -148,8 +151,31 @@ pub struct TempoTxEnv {
     pub base: TxEnv,
     /// Present only for type-0x76 batch transactions.
     pub tempo_fields: Option<TempoTxFields>,
+    /// Transaction hash used by pre-T1B expiring nonce replay protection.
+    pub tx_hash: B256,
     /// Sender-scoped transaction identifier used by ChannelReserve.open().
     pub unique_tx_identifier: Option<B256>,
+}
+
+impl TempoTxEnv {
+    /// Assigns a deterministic per-entry identifier for a stateful RPC batch.
+    ///
+    /// Single-call simulations retain Tempo's official fixed sentinel and zero
+    /// transaction hash. Stateful batches must distinguish entries because nonce
+    /// replay state is committed between calls.
+    pub fn set_stateful_simulation_context(&mut self, block_hash: B256, index: u64) {
+        const DOMAIN: &[u8] = b"leafage-tempo-stateful-simulation-v1";
+
+        let mut preimage = Vec::with_capacity(DOMAIN.len() + 32 + 8 + 20);
+        preimage.extend_from_slice(DOMAIN);
+        preimage.extend_from_slice(block_hash.as_slice());
+        preimage.extend_from_slice(&index.to_be_bytes());
+        preimage.extend_from_slice(self.base.caller.as_slice());
+
+        let identifier = keccak256(preimage);
+        self.tx_hash = identifier;
+        self.unique_tx_identifier = Some(identifier);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +263,7 @@ mod tests {
     fn test_tempo_tx_env_default() {
         let tx = TempoTxEnv::default();
         assert!(tx.tempo_fields.is_none());
+        assert_eq!(tx.tx_hash, B256::ZERO);
         assert!(tx.unique_tx_identifier.is_none());
         // TxEnv defaults gas_limit to TX_GAS_LIMIT_CAP (EIP-7825).
         assert!(tx.gas_limit() > 0);
@@ -259,10 +286,37 @@ mod tests {
                 nonce_key: U256::ZERO,
                 ..Default::default()
             }),
+            tx_hash: B256::ZERO,
             unique_tx_identifier: Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER),
         };
         assert_eq!(tx.tx_type(), 0x76);
         assert_eq!(tx.gas_limit(), 1_000_000);
         assert_eq!(tx.tempo_fields.as_ref().unwrap().aa_calls.len(), 1);
+    }
+
+    #[test]
+    fn stateful_simulation_context_is_stable_and_entry_scoped() {
+        let block_hash = B256::repeat_byte(0x11);
+        let caller = Address::repeat_byte(0x22);
+        let mut first = TempoTxEnv::default();
+        first.base.caller = caller;
+        first.set_stateful_simulation_context(block_hash, 7);
+
+        let mut same = TempoTxEnv::default();
+        same.base.caller = caller;
+        same.set_stateful_simulation_context(block_hash, 7);
+        assert_eq!(same.tx_hash, first.tx_hash);
+        assert_eq!(same.unique_tx_identifier, Some(first.tx_hash));
+
+        let mut next = TempoTxEnv::default();
+        next.base.caller = caller;
+        next.set_stateful_simulation_context(block_hash, 8);
+        assert_ne!(next.tx_hash, first.tx_hash);
+
+        let mut other_caller = TempoTxEnv::default();
+        other_caller.base.caller = Address::repeat_byte(0x23);
+        other_caller.set_stateful_simulation_context(block_hash, 7);
+        assert_ne!(other_caller.tx_hash, first.tx_hash);
+        assert_ne!(first.tx_hash, B256::ZERO);
     }
 }

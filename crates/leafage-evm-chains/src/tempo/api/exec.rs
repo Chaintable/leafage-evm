@@ -1,4 +1,6 @@
-use crate::tempo::api::{TempoContext, TempoEvm};
+use crate::tempo::api::{
+    TempoContext, TempoEvm, TempoEvmError, TempoInvalidTransaction,
+};
 use crate::tempo::hardfork::TempoHardfork;
 use crate::tempo::tx::{ScopeCounts, TempoCall, TempoSigType, TempoTxEnv, TempoTxFields};
 use alloy_evm::Database;
@@ -10,7 +12,7 @@ use revm::{
         result::{EVMError, ExecutionResult, ResultAndState, ResultGas},
         Cfg, ContextTr, JournalTr,
     },
-    handler::{post_execution, EthFrame, FrameResult, Handler, MainnetHandler},
+    handler::{post_execution, pre_execution, EthFrame, FrameResult, Handler, MainnetHandler},
     inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Gas, InitialAndFloorGas},
     primitives::U256,
@@ -92,7 +94,11 @@ impl revm::context_interface::transaction::eip7702::AuthorizationTr for TempoAut
 /// For Tempo batch transactions (type 0x76 with `aa_calls`), executes each
 /// call atomically using journal checkpoints.
 pub struct TempoHandler<DB: revm::database::Database, INSP> {
-    _phantom: core::marker::PhantomData<(TempoEvm<DB, INSP>, EVMError<DB::Error>, EthFrame)>,
+    _phantom: core::marker::PhantomData<(
+        TempoEvm<DB, INSP>,
+        TempoEvmError<DB::Error>,
+        EthFrame,
+    )>,
 }
 
 impl<DB: revm::database::Database, INSP> TempoHandler<DB, INSP> {
@@ -109,10 +115,91 @@ impl<DB: revm::database::Database, INSP> Default for TempoHandler<DB, INSP> {
     }
 }
 
+impl<DB: Database, INSP> TempoHandler<DB, INSP> {
+    fn pre_execution_with_initial_gas(
+        &self,
+        evm: &mut TempoEvm<DB, INSP>,
+        init_gas: Option<&mut InitialAndFloorGas>,
+    ) -> Result<u64, TempoEvmError<DB::Error>> {
+        if evm
+            .ctx()
+            .tx
+            .tempo_fields
+            .as_ref()
+            .is_some_and(|fields| !fields.nonce_key.is_zero())
+        {
+            evm.ctx_mut().cfg.disable_nonce_check = true;
+        }
+
+        self.validate_against_state_and_deduct_caller(evm)?;
+        self.load_accounts(evm)?;
+        let gas = self.apply_eip7702_auth_list(evm)?;
+
+        // Match writer's fee-token reads so subsequent precompile storage reads
+        // observe the same warm/cold state.
+        let _ = warm_fee_token_balance(evm);
+
+        check_and_mark_expiring_nonce_if_needed(evm)?;
+        increment_2d_nonce_if_needed(evm)?;
+        set_keychain_tx_origin(evm);
+        set_channel_open_context_hash(evm);
+
+        let transaction_key = evm
+            .ctx()
+            .tx
+            .tempo_fields
+            .as_ref()
+            .and_then(|fields| fields.key_id);
+        let same_tx_key_authorization_use = evm
+            .ctx()
+            .tx
+            .tempo_fields
+            .as_ref()
+            .and_then(|fields| {
+                Some(
+                    fields.key_id?
+                        == fields
+                            .key_auth
+                            .as_ref()?
+                            .signed_authorization
+                            .as_ref()?
+                            .authorization
+                            .key_id,
+                )
+            })
+            .unwrap_or(false);
+
+        if let Some(key_id) = transaction_key.filter(|_| !same_tx_key_authorization_use) {
+            set_keychain_transaction_key(evm, key_id);
+        }
+
+        apply_signed_key_authorization(evm, init_gas)?;
+
+        if let Some(key_id) = transaction_key.filter(|_| same_tx_key_authorization_use) {
+            set_keychain_transaction_key(evm, key_id);
+        }
+
+        Ok(gas)
+    }
+}
+
 impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     type Evm = TempoEvm<DB, INSP>;
-    type Error = EVMError<DB::Error>;
+    type Error = TempoEvmError<DB::Error>;
     type HaltReason = revm::context::result::HaltReason;
+
+    fn run_without_catch_error(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        let mut init_gas = self.validate(evm)?;
+        let eip7702_refund =
+            self.pre_execution_with_initial_gas(evm, Some(&mut init_gas))? as i64;
+        let mut exec_result = self.execution(evm, &init_gas)?;
+        let result_gas =
+            self.post_execution(evm, &mut exec_result, init_gas, eip7702_refund)?;
+        self.execution_result(evm, exec_result, result_gas)
+    }
 
     /// Validates the transaction environment for Tempo.
     ///
@@ -171,9 +258,12 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
 
             // Expiring nonce (nonceKey=MAX) requires validBefore to be set.
             // Ported from writer: handler.rs validate_env expiring nonce check.
-            if fields.nonce_key == U256::MAX && fields.valid_before.is_none() {
-                return Err(EVMError::Custom(
-                    "expiring nonce transaction requires valid_before to be set".into(),
+            if evm.ctx().cfg.spec.is_t1()
+                && fields.nonce_key == U256::MAX
+                && fields.valid_before.is_none()
+            {
+                return Err(EVMError::Transaction(
+                    TempoInvalidTransaction::ExpiringNonceMissingValidBefore,
                 ));
             }
 
@@ -253,9 +343,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             }
 
             // TIP-1000: nonce == 0 requires additional new_account_cost (250k gas).
-            let hardfork = TempoHardfork::from_timestamp(
-                evm.ctx().block.timestamp.saturating_to::<u64>(),
-            );
+            let hardfork = evm.ctx().cfg.spec;
             if hardfork.is_t1() && evm.ctx().tx.base.nonce == 0 {
                 init_gas.initial_gas += evm.ctx().cfg.gas_params.get(GasId::new_account_cost());
             }
@@ -283,89 +371,41 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     /// warm the slot and match writer's gas behavior exactly.
     #[inline]
     fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
-        // For 2D nonce AA (nonceKey > 0), disable protocol nonce check.
-        // Writer bypasses it in validate_against_state_and_deduct_caller.
-        // Without this, tx.nonce (from NonceManager, may be 0) != account.nonce → NonceTooLow.
-        if evm.ctx().tx.tempo_fields.as_ref().is_some_and(|f| !f.nonce_key.is_zero()) {
-            evm.ctx_mut().cfg.disable_nonce_check = true;
-        }
+        self.pre_execution_with_initial_gas(evm, None)
+    }
 
-        // Standard pre_execution (load accounts, warm coinbase, etc.).
-        let gas = MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-            .pre_execution(evm)?;
+    /// Tempo keeps the account protocol nonce unchanged for CALL transactions
+    /// that use a non-zero 2D nonce key. CREATE increments it in frame creation.
+    #[inline]
+    fn validate_against_state_and_deduct_caller(
+        &self,
+        evm: &mut Self::Evm,
+    ) -> Result<(), Self::Error> {
+        use revm::context_interface::transaction::Transaction;
 
-        // Warm the caller's TIP-20 fee token balance slot via journal sload.
-        // Mirrors writer's load_fee_fields + validate_against_state_and_deduct_caller.
-        //
-        // Writer reads get_fee_token (FeeManager.user_tokens[caller]) and
-        // get_token_balance (TIP20.balances[caller]) through the journal before
-        // execution. These sloads warm the storage slots, making subsequent
-        // precompile sloads warm (100 gas) instead of cold (2100 gas).
-        //
-        // Errors are ignored — warm-up is best-effort (EmptyDB in tests, etc.).
-        let _ = warm_fee_token_balance(evm);
-
-        // Increment 2D nonce in NonceManager for AA txs with nonceKey > 0.
-        // Writer does this in validate_against_state_and_deduct_caller (handler.rs:854-860).
-        // Without this, multi-tx batches (pre_traceMany) don't accumulate nonce state,
-        // causing every tx to see nonce=0 and trigger 250k new_account_cost.
-        check_and_mark_expiring_nonce_if_needed(evm)?;
-        increment_2d_nonce_if_needed(evm);
-
-        // Set tx_origin in AccountKeychain transient storage for spending limit checks.
-        // Writer does this in validate_against_state_and_deduct_caller (handler.rs:677-683)
-        // for ALL transactions. Without it, tx_origin stays Address::ZERO and
-        // authorize_transfer/authorize_approve/refund_spending_limit skip enforcement.
-        set_keychain_tx_origin(evm);
-
-        // Seed TIP-1034's transaction-scoped channel-open context. RPC simulations
-        // use Tempo's official fixed non-zero sentinel; real transaction replay can
-        // supply the sender-scoped signing-payload hash in the transaction env.
-        set_channel_open_context_hash(evm);
-
-        // Set transaction_key if this is an access key (keychain) transaction.
-        // Writer: handler.rs:1128-1133 — sets transaction_key when signature is Keychain.
-        // Without this, transaction_key stays ZERO and TIP20 authorize_transfer/
-        // authorize_approve/refund_spending_limit skip spending limit enforcement.
-        let transaction_key = evm
+        let uses_2d_nonce = evm
             .ctx()
             .tx
             .tempo_fields
             .as_ref()
-            .and_then(|f| f.key_id);
-        let same_tx_key_authorization_use = evm
-            .ctx()
-            .tx
-            .tempo_fields
-            .as_ref()
-            .and_then(|fields| {
-                Some(
-                    fields.key_id?
-                        == fields
-                            .key_auth
-                            .as_ref()?
-                            .signed_authorization
-                            .as_ref()?
-                            .authorization
-                            .key_id,
-                )
-            })
-            .unwrap_or(false);
-
-        // Same-transaction authorize-and-use registers the key before setting
-        // `transaction_key`; otherwise AccountKeychain would treat the not-yet-
-        // registered child as the administrator of its own authorization.
-        if let Some(key_id) = transaction_key.filter(|_| !same_tx_key_authorization_use) {
-            set_keychain_transaction_key(evm, key_id);
+            .is_some_and(|fields| !fields.nonce_key.is_zero());
+        if !uses_2d_nonce {
+            return MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
+                .validate_against_state_and_deduct_caller(evm);
         }
 
-        apply_signed_key_authorization(evm)?;
-
-        if let Some(key_id) = transaction_key.filter(|_| same_tx_key_authorization_use) {
-            set_keychain_transaction_key(evm, key_id);
-        }
-
-        Ok(gas)
+        let (block, tx, cfg, journal, _, _) = evm.ctx_mut().all_mut();
+        let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
+        pre_execution::validate_account_nonce_and_code_with_components(
+            &caller.account().info,
+            tx,
+            cfg,
+        )?;
+        let new_balance =
+            pre_execution::calculate_caller_fee(*caller.balance(), tx, block, cfg)?;
+        caller.touch();
+        caller.set_balance(new_balance);
+        Ok(())
     }
 
     /// Applies EIP-7702 delegations from AA authorization list.
@@ -425,9 +465,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         )?;
 
         // TIP-1000: no refund on T1+ (matching writer handler.rs:660).
-        let hardfork = crate::tempo::hardfork::TempoHardfork::from_timestamp(
-            evm.ctx().block.timestamp.saturating_to::<u64>(),
-        );
+        let hardfork = evm.ctx().cfg.spec;
         if hardfork.is_t1() {
             return Ok(0);
         }
@@ -451,7 +489,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
 
         if let Some(calls) = calls {
             execute_multi_call(evm, init_and_floor_gas, calls, |evm, zero_init| {
-                MainnetHandler::<TempoEvm<DB, INSP>, EVMError<DB::Error>, EthFrame>::default()
+                MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
                     .execution(evm, zero_init)
             })
         } else {
@@ -501,7 +539,7 @@ fn validate_time_window<E: core::fmt::Debug>(
     valid_after: Option<u64>,
     valid_before: Option<u64>,
     block_timestamp: u64,
-) -> Result<(), EVMError<E>> {
+) -> Result<(), TempoEvmError<E>> {
     if let Some(after) = valid_after {
         if block_timestamp < after {
             return Err(EVMError::Custom(format!(
@@ -534,7 +572,7 @@ fn validate_time_window<E: core::fmt::Debug>(
 /// ignore errors (warm-up is best-effort).
 fn warm_fee_token_balance<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
-) -> Result<(), EVMError<DB::Error>> {
+) -> Result<(), TempoEvmError<DB::Error>> {
     use crate::tempo::precompile::{DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS};
     use revm::context_interface::JournalTr;
 
@@ -598,35 +636,36 @@ fn warm_fee_token_balance<DB: Database, INSP>(
 /// It must run before call execution so the replay marker persists even if the AA batch reverts.
 fn check_and_mark_expiring_nonce_if_needed<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
-) -> Result<(), EVMError<DB::Error>> {
+) -> Result<(), TempoEvmError<DB::Error>> {
     use crate::tempo::precompile::nonce::{INonce, NonceManager};
-    use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx};
+    use crate::tempo::precompile::{
+        LeafageStorageProvider, StorageCtx, TempoPrecompileError,
+    };
     use alloy::sol_types::SolError;
 
     let Some(fields) = evm.ctx().tx.tempo_fields.as_ref() else {
         return Ok(());
     };
-    if fields.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
+    let hardfork = evm.ctx().cfg.spec;
+    if !hardfork.is_t1() || fields.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
         return Ok(());
     }
 
     if evm.ctx().tx.base.nonce != 0 {
-        return Err(EVMError::Custom(
-            "expiring nonce transaction must use nonce 0".into(),
+        return Err(EVMError::Transaction(
+            TempoInvalidTransaction::ExpiringNonceNonceNotZero,
         ));
     }
 
     let valid_before = fields.valid_before.ok_or_else(|| {
-        EVMError::Custom("expiring nonce transaction requires valid_before to be set".into())
+        EVMError::Transaction(TempoInvalidTransaction::ExpiringNonceMissingValidBefore)
     })?;
-    let hardfork = evm.ctx().cfg.spec;
     let replay_hash = if hardfork.is_t1b() {
         evm.ctx().tx.unique_tx_identifier.ok_or_else(|| {
             EVMError::Custom("expiring nonce transaction requires a transaction identifier".into())
         })?
     } else {
-        // Official RPC simulations use zero as the pre-T1B transaction hash.
-        revm::primitives::B256::ZERO
+        evm.ctx().tx.tx_hash
     };
     let timestamp = evm.ctx().block.timestamp.saturating_to::<u64>();
     let max_expiry_secs = hardfork.expiring_nonce_max_expiry_secs();
@@ -641,43 +680,48 @@ fn check_and_mark_expiring_nonce_if_needed<DB: Database, INSP>(
         NonceManager::new().check_and_mark_expiring_nonce(replay_hash, valid_before)
     })
     .map_err(|error| {
+        if let TempoPrecompileError::Fatal(reason) = &error {
+            return EVMError::Custom(reason.clone());
+        }
+
         let selector = error.selector();
-        if selector == INonce::InvalidExpiringNonceExpiry::SELECTOR {
+        let reason = if selector == INonce::InvalidExpiringNonceExpiry::SELECTOR {
             let max_allowed = timestamp.saturating_add(max_expiry_secs);
             if valid_before <= timestamp {
-                EVMError::Custom(format!(
+                format!(
                     "expiring nonce transaction expired: valid_before ({valid_before}) <= block timestamp ({timestamp})"
-                ))
+                )
             } else {
-                EVMError::Custom(format!(
+                format!(
                     "expiring nonce valid_before ({valid_before}) too far in the future: must be within {max_expiry_secs}s of block timestamp ({timestamp}), max allowed is {max_allowed}"
-                ))
+                )
             }
         } else if selector == INonce::ExpiringNonceReplay::SELECTOR {
-            EVMError::Custom("expiring nonce transaction has already been used".into())
+            "Tempo Transaction nonce error: ExpiringNonceReplay(ExpiringNonceReplay)".into()
         } else if selector == INonce::ExpiringNonceSetFull::SELECTOR {
-            EVMError::Custom("expiring nonce set is full".into())
+            "Tempo Transaction nonce error: ExpiringNonceSetFull(ExpiringNonceSetFull)".into()
         } else {
-            EVMError::Custom(format!("expiring nonce validation failed: {error}"))
-        }
+            error.to_string()
+        };
+        EVMError::Transaction(TempoInvalidTransaction::NonceManagerError(reason))
     })
 }
 
 /// Increments the 2D nonce in NonceManager for AA txs with nonceKey > 0.
 ///
-/// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:854-860)
-/// via `StorageCtx::enter_evm`. Leafage uses direct journal sload/sstore.
-///
-/// This is critical for multi-tx batches (pre_traceMany): without it, every tx
-/// sees nonce=0 in NonceManager and triggers the 250k new_account_cost surcharge.
-/// With it, the first tx increments nonce to 1, subsequent txs see nonce=1 and
-/// only pay the 5k existing_nonce_key cost.
+/// Uses the NonceManager implementation so overflow, storage errors, and the
+/// `NonceIncremented` event match writer behavior.
 #[inline]
-fn increment_2d_nonce_if_needed<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
-    use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
-    use crate::tempo::precompile::storage_types::StorageKey;
-    use revm::context_interface::JournalTr;
+fn increment_2d_nonce_if_needed<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+) -> Result<(), TempoEvmError<DB::Error>> {
+    use crate::tempo::precompile::nonce::{INonce, NonceManager};
+    use crate::tempo::precompile::{
+        LeafageStorageProvider, StorageCtx, TempoPrecompileError,
+    };
+    use alloy::sol_types::SolError;
 
+    let hardfork = evm.ctx().cfg.spec;
     let nonce_key = evm
         .ctx()
         .tx
@@ -686,35 +730,33 @@ fn increment_2d_nonce_if_needed<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>
         .map(|f| f.nonce_key)
         .unwrap_or_default();
 
-    // Only for 2D nonce (nonceKey > 0, not expiring nonce MAX)
-    if nonce_key.is_zero() || nonce_key == U256::MAX {
-        return;
+    // MAX becomes the expiring nonce sentinel at T1. Before T1 it is a regular
+    // 2D nonce key and must increment the NonceManager mapping.
+    if nonce_key.is_zero() || (hardfork.is_t1() && nonce_key == U256::MAX) {
+        return Ok(());
     }
 
     let caller = evm.ctx().tx.base.caller;
-    let slot = caller.mapping_slot(U256::ZERO);
-    let slot = nonce_key.mapping_slot(slot);
-
-    // load_account first to ensure NonceManager is in journal
-    let _ = evm
-        .ctx_mut()
-        .journal_mut()
-        .load_account(NONCE_PRECOMPILE_ADDRESS);
-
-    // sload current nonce
-    let current = evm
-        .ctx_mut()
-        .journal_mut()
-        .sload(NONCE_PRECOMPILE_ADDRESS, slot)
-        .map(|r| r.data.saturating_to::<u64>())
-        .unwrap_or(0);
-
-    // sstore incremented nonce
-    let _ = evm.ctx_mut().journal_mut().sstore(
-        NONCE_PRECOMPILE_ADDRESS,
-        slot,
-        U256::from(current + 1),
-    );
+    let chain_id = evm.ctx().cfg.chain_id;
+    let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+    let mut storage =
+        LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
+    StorageCtx::enter(&mut storage, || {
+        StorageCtx.set_tip1060_storage_credits(false);
+        NonceManager::new().increment_nonce(caller, nonce_key)
+    })
+    .map(|_| ())
+    .map_err(|error| match error {
+        TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
+        error => {
+            let reason = if error.selector() == INonce::NonceOverflow::SELECTOR {
+                "Tempo Transaction nonce error: NonceOverflow(NonceOverflow)".into()
+            } else {
+                error.to_string()
+            };
+            EVMError::Transaction(TempoInvalidTransaction::NonceManagerError(reason))
+        }
+    })
 }
 
 fn set_keychain_tx_origin<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP>) {
@@ -772,10 +814,13 @@ fn set_keychain_transaction_key<DB: Database, INSP>(
 /// intentionally ignored here.
 fn apply_signed_key_authorization<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
-) -> Result<(), EVMError<DB::Error>> {
+    mut init_gas: Option<&mut InitialAndFloorGas>,
+) -> Result<(), TempoEvmError<DB::Error>> {
     use crate::tempo::fee_payer::SignatureType;
     use crate::tempo::precompile::account_keychain::{AccountKeychain, IAccountKeychain};
-    use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx};
+    use crate::tempo::precompile::{
+        LeafageStorageProvider, PrecompileStorageProvider, StorageCtx, TempoPrecompileError,
+    };
 
     let Some((signed, transaction_key, transaction_sig_type, is_keychain)) = evm
         .ctx()
@@ -943,9 +988,48 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
         })
         .unwrap_or_default();
 
+    let meter_t1_authorization =
+        init_gas.is_some() && hardfork.is_t1() && !hardfork.is_t1b();
+    let gas_limit = if meter_t1_authorization {
+        evm.ctx()
+            .tx
+            .base
+            .gas_limit
+            .saturating_sub(init_gas.as_deref().unwrap().initial_gas)
+    } else {
+        u64::MAX
+    };
+    let checkpoint = meter_t1_authorization
+        .then(|| evm.ctx_mut().journal_mut().checkpoint());
+
+    let provider_gas_params = if meter_t1_authorization {
+        let mut table = [0u64; 256];
+        table[GasId::sstore_set_without_load_cost().as_usize()] = evm
+            .ctx()
+            .cfg
+            .gas_params
+            .get(GasId::sstore_set_without_load_cost());
+        table[GasId::warm_storage_read_cost().as_usize()] = evm
+            .ctx()
+            .cfg
+            .gas_params
+            .get(GasId::warm_storage_read_cost());
+        GasParams::new(std::sync::Arc::new(table))
+    } else {
+        evm.ctx().cfg.gas_params.clone()
+    };
+
     let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
-    let mut storage = LeafageStorageProvider::new_max_gas(internals, chain_id);
-    StorageCtx::enter(&mut storage, || -> Result<(), String> {
+    let mut storage = LeafageStorageProvider::new_with_spec_and_gas_params(
+        internals,
+        gas_limit,
+        chain_id,
+        false,
+        hardfork,
+        provider_gas_params,
+    );
+    storage.set_tip1060_storage_credits(false);
+    let result = StorageCtx::enter(&mut storage, || -> crate::tempo::precompile::Result<()> {
         let mut keychain = AccountKeychain::new();
 
         if signer != caller {
@@ -955,13 +1039,11 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
                     signer,
                     timestamp,
                     Some(authorization_sig_type as u8),
-                )
-                .map_err(|error| error.to_string())?;
-            if !keychain
-                .is_admin_key(caller, signer)
-                .map_err(|error| error.to_string())?
-            {
-                return Err("key authorization signer is not an active admin key".into());
+                )?;
+            if !keychain.is_admin_key(caller, signer)? {
+                return Err(TempoPrecompileError::Fatal(
+                    "key authorization signer is not an active admin key".into(),
+                ));
             }
         }
 
@@ -973,7 +1055,6 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
                     signature_type,
                     authorization.witness,
                 )
-                .map_err(|error| error.to_string())
         } else if hardfork.is_t3() {
             keychain
                 .authorize_key_with_restrictions(
@@ -989,7 +1070,6 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
                     },
                     authorization.witness,
                 )
-                .map_err(|error| error.to_string())
         } else {
             keychain
                 .authorize_key(
@@ -1008,10 +1088,36 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
                             .collect(),
                     },
                 )
-                .map_err(|error| error.to_string())
         }
-    })
-    .map_err(|error| EVMError::Custom(format!("key authorization failed: {error}")))
+    });
+    let gas_used = storage.gas_used();
+    drop(storage);
+
+    match result {
+        Ok(()) => {
+            if checkpoint.is_some() {
+                let init_gas = init_gas.as_deref_mut().unwrap();
+                init_gas.initial_gas = init_gas.initial_gas.saturating_add(gas_used);
+                evm.ctx_mut().journal_mut().checkpoint_commit();
+            }
+            Ok(())
+        }
+        Err(TempoPrecompileError::OutOfGas) if meter_t1_authorization => {
+            evm.ctx_mut()
+                .journal_mut()
+                .checkpoint_revert(checkpoint.unwrap());
+            init_gas.unwrap().initial_gas = u64::MAX;
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(checkpoint) = checkpoint {
+                evm.ctx_mut().journal_mut().checkpoint_revert(checkpoint);
+            }
+            Err(EVMError::Custom(format!(
+                "key authorization failed: {error}"
+            )))
+        }
+    }
 }
 
 const fn signature_type_to_tempo(
@@ -1037,8 +1143,8 @@ fn execute_multi_call<DB: Database, INSP>(
     exec_single: impl Fn(
         &mut TempoEvm<DB, INSP>,
         &InitialAndFloorGas,
-    ) -> Result<FrameResult, EVMError<DB::Error>>,
-) -> Result<FrameResult, EVMError<DB::Error>> {
+    ) -> Result<FrameResult, TempoEvmError<DB::Error>>,
+) -> Result<FrameResult, TempoEvmError<DB::Error>> {
     let checkpoint = evm.ctx_mut().journal_mut().checkpoint();
 
     let gas_limit = evm.ctx().tx.base.gas_limit;
@@ -1137,12 +1243,10 @@ fn execute_multi_call<DB: Database, INSP>(
 /// Ported from Tempo writer: crates/revm/src/handler.rs `validate_aa_initial_tx_gas`.
 fn validate_aa_initial_tx_gas<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
-) -> Result<InitialAndFloorGas, EVMError<DB::Error>> {
-    let hardfork = TempoHardfork::from_timestamp(
-        evm.ctx().block.timestamp.saturating_to::<u64>(),
-    );
+) -> Result<InitialAndFloorGas, TempoEvmError<DB::Error>> {
+    let hardfork = evm.ctx().cfg.spec;
 
-    let gas_params = &evm.ctx().cfg.gas_params;
+    let gas_params = evm.ctx().cfg.gas_params.clone();
     let gas_limit = evm.ctx().tx.base.gas_limit;
     let nonce = evm.ctx().tx.base.nonce;
 
@@ -1199,6 +1303,28 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
 
     if hardfork.is_t0() {
         batch_gas.initial_gas += nonce_2d_gas;
+    }
+
+    // A CREATE using a non-zero nonce key does not consume the protocol nonce
+    // until frame creation. A caller whose protocol nonce is still zero therefore
+    // incurs the fresh-account surcharge in addition to the 2D nonce charge.
+    if !nonce_key.is_zero()
+        && tempo_fields
+            .aa_calls
+            .first()
+            .is_some_and(|call| call.to.is_create())
+    {
+        let caller = evm.ctx().tx.base.caller;
+        let protocol_nonce = evm
+            .ctx_mut()
+            .journal_mut()
+            .load_account(caller)?
+            .data
+            .info
+            .nonce;
+        if protocol_nonce == 0 {
+            batch_gas.initial_gas += gas_params.get(GasId::new_account_cost());
+        }
     }
 
     if gas_limit < batch_gas.initial_gas {
@@ -1313,14 +1439,11 @@ fn call_scope_storage_slots(s: &ScopeCounts, spec: TempoHardfork) -> u64 {
     }
     let scopes = s.scopes as u64;
     let selectors = s.selectors as u64;
+    let selector_sets = s.selector_sets as u64;
     let constrained = s.constrained_selectors as u64;
     let recipients = s.recipients as u64;
 
     if spec.is_t4() {
-        // selector_sets = number of scopes that have at least one selector_rule.
-        // Without per-scope detail we conservatively use the number of scopes
-        // that contain any selector (== scopes when selectors > 0).
-        let selector_sets = if selectors > 0 { scopes } else { 0 };
         1 + scopes * 2 + 1 + selectors * 2 + selector_sets + constrained + recipients * 2
     } else {
         // T3
@@ -1439,7 +1562,7 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
     gas_params: &GasParams,
     evm: &TempoEvm<DB, INSP>,
     hardfork: TempoHardfork,
-) -> Result<InitialAndFloorGas, EVMError<DB::Error>> {
+) -> Result<InitialAndFloorGas, TempoEvmError<DB::Error>> {
     use revm::context_interface::cfg::gas::get_tokens_in_calldata_istanbul;
     use revm::context_interface::transaction::{AccessListItemTr, Transaction};
 
@@ -1527,6 +1650,19 @@ where
 {
     type IT = EthInterpreter;
 
+    fn inspect_run_without_catch_error(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        let mut init_gas = self.validate(evm)?;
+        let eip7702_refund =
+            self.pre_execution_with_initial_gas(evm, Some(&mut init_gas))? as i64;
+        let mut frame_result = self.inspect_execution(evm, &init_gas)?;
+        let result_gas =
+            self.post_execution(evm, &mut frame_result, init_gas, eip7702_refund)?;
+        self.execution_result(evm, frame_result, result_gas)
+    }
+
     /// Inspector-aware execution for AA batch tracing.
     ///
     /// Overrides the default `inspect_execution` to dispatch AA batch calls
@@ -1555,11 +1691,11 @@ where
                 // Use inspect_execution (inspector-aware) for each sub-call.
                 let gas_limit = evm.ctx().tx.base.gas_limit - zero_init.initial_gas;
                 let first_frame_input =
-                    MainnetHandler::<TempoEvm<DB, INSP>, EVMError<DB::Error>, EthFrame>::default()
+                    MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
                         .first_frame_input(evm, gas_limit)?;
                 let mut frame_result =
                     TempoHandler::<DB, INSP>::new().inspect_run_exec_loop(evm, first_frame_input)?;
-                MainnetHandler::<TempoEvm<DB, INSP>, EVMError<DB::Error>, EthFrame>::default()
+                MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
                     .last_frame_result(evm, &mut frame_result)?;
                 Ok(frame_result)
             })
@@ -1583,7 +1719,7 @@ where
 {
     type ExecutionResult = ExecutionResult;
     type State = EvmState;
-    type Error = EVMError<DB::Error>;
+    type Error = TempoEvmError<DB::Error>;
     type Tx = TempoTxEnv;
     type Block = BlockEnv;
 
@@ -1718,6 +1854,7 @@ mod tests {
                 valid_before: Some(valid_before),
                 ..Default::default()
             }),
+            tx_hash: replay_hash,
             unique_tx_identifier: Some(replay_hash),
         }
     }
@@ -1768,8 +1905,10 @@ mod tests {
         use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx};
 
         let chain_id = evm.ctx().cfg.chain_id;
+        let spec = evm.ctx().cfg.spec;
         let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
-        let mut storage = LeafageStorageProvider::new_max_gas(internals, chain_id);
+        let mut storage =
+            LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, spec);
         StorageCtx::enter(&mut storage, || {
             let keychain = AccountKeychain::new();
             (
@@ -1821,7 +1960,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        apply_signed_key_authorization(&mut evm).expect("root authorizes admin");
+        apply_signed_key_authorization(&mut evm, None).expect("root authorizes admin");
         assert_eq!(key_status(&mut evm, root, admin), (true, true));
 
         let child_authorization = sign_key_authorization(
@@ -1850,8 +1989,95 @@ mod tests {
             ..Default::default()
         });
         set_keychain_transaction_key(&mut evm, admin);
-        apply_signed_key_authorization(&mut evm).expect("admin authorizes child");
+        apply_signed_key_authorization(&mut evm, None).expect("admin authorizes child");
         assert_eq!(key_status(&mut evm, root, child), (true, false));
+    }
+
+    #[test]
+    fn t1_key_authorization_adds_actual_precompile_gas() {
+        use crate::tempo::fee_payer::{KeyAuthorization, SignatureType};
+        use crate::tempo::tx::TempoKeyAuthGas;
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+
+        let root_key = SigningKey::random(&mut OsRng);
+        let root = p256_address(&root_key);
+        let child = Address::repeat_byte(0x43);
+        let signed = sign_key_authorization(
+            KeyAuthorization {
+                chain_id: 4217,
+                key_type: SignatureType::Secp256k1,
+                key_id: child,
+                expiry: None,
+                limits: None,
+                allowed_calls: None,
+                witness: None,
+                is_admin: false,
+                account: None,
+            },
+            &root_key,
+        );
+
+        for spec in [TempoHardfork::T1, TempoHardfork::T1A] {
+            let mut evm = make_evm_with_spec(spec);
+            evm.inner.ctx.tx.base.caller = root;
+            evm.inner.ctx.tx.base.gas_limit = 10_000_000;
+            evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+                key_auth: Some(TempoKeyAuthGas {
+                    signed_authorization: Some(signed.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+            let initial = 100_000;
+            let mut init_gas = InitialAndFloorGas::new(initial, 0);
+            apply_signed_key_authorization(&mut evm, Some(&mut init_gas)).unwrap();
+            assert_eq!(init_gas.initial_gas - initial, 250_575);
+            assert_eq!(key_status(&mut evm, root, child), (true, false));
+        }
+    }
+
+    #[test]
+    fn t1_key_authorization_out_of_gas_reverts_only_authorization() {
+        use crate::tempo::fee_payer::{KeyAuthorization, SignatureType};
+        use crate::tempo::tx::TempoKeyAuthGas;
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+
+        let root_key = SigningKey::random(&mut OsRng);
+        let root = p256_address(&root_key);
+        let child = Address::repeat_byte(0x44);
+        let signed = sign_key_authorization(
+            KeyAuthorization {
+                chain_id: 4217,
+                key_type: SignatureType::Secp256k1,
+                key_id: child,
+                expiry: None,
+                limits: None,
+                allowed_calls: None,
+                witness: None,
+                is_admin: false,
+                account: None,
+            },
+            &root_key,
+        );
+
+        let mut evm = make_evm_with_spec(TempoHardfork::T1A);
+        evm.inner.ctx.tx.base.caller = root;
+        evm.inner.ctx.tx.base.gas_limit = 100_001;
+        evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+            key_auth: Some(TempoKeyAuthGas {
+                signed_authorization: Some(signed),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut init_gas = InitialAndFloorGas::new(100_000, 0);
+        apply_signed_key_authorization(&mut evm, Some(&mut init_gas)).unwrap();
+        assert_eq!(init_gas.initial_gas, u64::MAX);
+        assert_eq!(key_status(&mut evm, root, child), (false, false));
     }
 
     #[test]
@@ -2206,6 +2432,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         }
     }
@@ -2224,6 +2451,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
@@ -2300,6 +2528,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
@@ -2334,13 +2563,18 @@ mod tests {
                 valid_before: None,         // missing valid_before
                 ..Default::default()
             }),
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
-        let result = evm.transact(tx);
-        let err = result.unwrap_err().to_string();
+        let error = evm.transact(tx).unwrap_err();
         assert!(
-            err.contains("expiring nonce transaction requires valid_before"),
-            "expected 'expiring nonce transaction requires valid_before', got: {err}"
+            matches!(
+                &error,
+                EVMError::Transaction(
+                    TempoInvalidTransaction::ExpiringNonceMissingValidBefore
+                )
+            ),
+            "unexpected error: {error}"
         );
     }
 
@@ -2395,6 +2629,7 @@ mod tests {
                 .is_none_or(|slot| slot.present_value.is_zero()),
             "nonce-manager bookkeeping must not mint TIP-1060 storage credits",
         );
+        assert_eq!(result.state[&Address::with_last_byte(0x91)].info.nonce, 0);
     }
 
     #[test]
@@ -2406,8 +2641,301 @@ mod tests {
         let first = evm.transact_commit(tx.clone()).unwrap();
         assert!(first.is_success(), "{first:?}");
 
+        let error = evm.transact(tx).unwrap_err();
+        assert!(matches!(
+            &error,
+            EVMError::Transaction(TempoInvalidTransaction::NonceManagerError(reason))
+                if reason == "Tempo Transaction nonce error: ExpiringNonceReplay(ExpiringNonceReplay)"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "transaction validation error: nonce manager error: Tempo Transaction nonce error: ExpiringNonceReplay(ExpiringNonceReplay)"
+        );
+    }
+
+    #[test]
+    fn expiring_nonce_execution_reports_set_full_as_transaction_error() {
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use revm::primitives::B256;
+
+        let old_hash = B256::repeat_byte(0x98);
+        let ring_slot = U256::ZERO.mapping_slot(U256::from(2));
+        let seen_slot = old_hash.mapping_slot(U256::ONE);
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        evm.inner
+            .ctx
+            .db_mut()
+            .insert_account_storage(
+                NONCE_PRECOMPILE_ADDRESS,
+                ring_slot,
+                U256::from_be_bytes(old_hash.0),
+            )
+            .unwrap();
+        evm.inner
+            .ctx
+            .db_mut()
+            .insert_account_storage(
+                NONCE_PRECOMPILE_ADDRESS,
+                seen_slot,
+                U256::from(1_770_908_600u64),
+            )
+            .unwrap();
+
+        let error = evm
+            .transact(expiring_nonce_tx(
+                1_770_908_500 + 300,
+                B256::repeat_byte(0x99),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EVMError::Transaction(TempoInvalidTransaction::NonceManagerError(reason))
+                if reason == "Tempo Transaction nonce error: ExpiringNonceSetFull(ExpiringNonceSetFull)"
+        ));
+    }
+
+    #[test]
+    fn pre_t1_max_nonce_key_is_a_regular_2d_nonce() {
+        use crate::tempo::precompile::nonce::INonce;
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use alloy::sol_types::SolEvent;
+
+        let caller = Address::with_last_byte(0x91);
+        let mut tx = expiring_nonce_tx(0, revm::primitives::B256::ZERO);
+        tx.tempo_fields.as_mut().unwrap().valid_before = None;
+        tx.unique_tx_identifier = None;
+
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::Genesis);
+        let result = evm.transact(tx).expect("pre-T1 MAX key is valid");
+        assert!(result.result.is_success(), "{:?}", result.result);
+
+        let slot = U256::MAX.mapping_slot(caller.mapping_slot(U256::ZERO));
+        assert_eq!(
+            result.state[&NONCE_PRECOMPILE_ADDRESS].storage[&slot].present_value,
+            U256::ONE,
+        );
+        assert!(result.result.logs().iter().any(|log| {
+            log.address == NONCE_PRECOMPILE_ADDRESS
+                && log.topics()[0] == INonce::NonceIncremented::SIGNATURE_HASH
+        }));
+    }
+
+    #[test]
+    fn pre_t1b_expiring_nonce_uses_per_transaction_hash() {
+        use revm::primitives::B256;
+
+        let timestamp = 1_770_908_500u64;
+        let fixed_identifier = B256::repeat_byte(0x55);
+        let mut first = expiring_nonce_tx(timestamp + 30, B256::repeat_byte(0x01));
+        first.unique_tx_identifier = Some(fixed_identifier);
+        let mut second = expiring_nonce_tx(timestamp + 30, B256::repeat_byte(0x02));
+        second.unique_tx_identifier = Some(fixed_identifier);
+
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T1A);
+        assert!(evm.transact_commit(first.clone()).unwrap().is_success());
+        assert!(evm.transact_commit(second).unwrap().is_success());
+
+        let error = evm.transact(first).unwrap_err().to_string();
+        assert!(error.contains("ExpiringNonceReplay"), "{error}");
+    }
+
+    #[test]
+    fn stateful_batch_context_distinguishes_entries_but_rejects_replay() {
+        use revm::primitives::B256;
+
+        let block_hash = B256::repeat_byte(0x71);
+        let valid_before = 1_770_908_500 + 300;
+        let mut first = expiring_nonce_tx(valid_before, B256::ZERO);
+        first.set_stateful_simulation_context(block_hash, 0);
+        let mut second = expiring_nonce_tx(valid_before, B256::ZERO);
+        second.set_stateful_simulation_context(block_hash, 1);
+        assert_ne!(first.unique_tx_identifier, second.unique_tx_identifier);
+
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        assert!(evm.transact_commit(first.clone()).unwrap().is_success());
+        assert!(evm.transact_commit(second).unwrap().is_success());
+
+        let error = evm.transact(first).unwrap_err().to_string();
+        assert!(error.contains("ExpiringNonceReplay"), "{error}");
+    }
+
+    #[test]
+    fn expiring_nonce_marker_survives_execution_revert() {
+        use revm::bytecode::Bytecode;
+        use revm::primitives::{B256, Bytes};
+        use revm::state::AccountInfo;
+
+        let target = Address::with_last_byte(0x92);
+        let code = Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x5f, 0xfd]));
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        evm.inner.ctx.db_mut().insert_account_info(
+            target,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+
+        let tx = expiring_nonce_tx(1_770_908_500 + 300, B256::repeat_byte(0x96));
+        assert!(matches!(
+            evm.transact_commit(tx.clone()).unwrap(),
+            ExecutionResult::Revert { .. }
+        ));
+
         let error = evm.transact(tx).unwrap_err().to_string();
-        assert!(error.contains("already been used"), "{error}");
+        assert!(error.contains("ExpiringNonceReplay"), "{error}");
+    }
+
+    fn regular_2d_nonce_tx(kind: revm::primitives::TxKind) -> TempoTxEnv {
+        use crate::tempo::tx::{TempoCall, TempoTxFields};
+        use revm::primitives::Bytes;
+
+        TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: Address::with_last_byte(0xa1),
+                kind,
+                gas_limit: 10_000_000,
+                nonce: 0,
+                chain_id: Some(4217),
+                ..Default::default()
+            },
+            tempo_fields: Some(TempoTxFields {
+                aa_calls: vec![TempoCall {
+                    to: kind,
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                }],
+                nonce_key: U256::from(7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nonzero_nonce_key_call_preserves_protocol_nonce_and_emits_event() {
+        use crate::tempo::precompile::nonce::INonce;
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use alloy::sol_types::SolEvent;
+        use revm::primitives::TxKind;
+
+        let caller = Address::with_last_byte(0xa1);
+        let nonce_key = U256::from(7);
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        let result = evm
+            .transact(regular_2d_nonce_tx(TxKind::Call(Address::with_last_byte(0xa2))))
+            .unwrap();
+        assert!(result.result.is_success(), "{:?}", result.result);
+        assert_eq!(result.state[&caller].info.nonce, 0);
+
+        let slot = nonce_key.mapping_slot(caller.mapping_slot(U256::ZERO));
+        assert_eq!(
+            result.state[&NONCE_PRECOMPILE_ADDRESS].storage[&slot].present_value,
+            U256::ONE,
+        );
+        assert!(result.result.logs().iter().any(|log| {
+            log.address == NONCE_PRECOMPILE_ADDRESS
+                && log.topics()[0] == INonce::NonceIncremented::SIGNATURE_HASH
+        }));
+    }
+
+    #[test]
+    fn nonzero_nonce_key_create_increments_protocol_nonce_once() {
+        use revm::primitives::TxKind;
+
+        let caller = Address::with_last_byte(0xa1);
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        let result = evm.transact(regular_2d_nonce_tx(TxKind::Create)).unwrap();
+        assert!(result.result.is_success(), "{:?}", result.result);
+        assert_eq!(result.state[&caller].info.nonce, 1);
+    }
+
+    #[test]
+    fn fresh_account_2d_create_adds_new_account_intrinsic_gas() {
+        use revm::primitives::TxKind;
+        use revm::state::AccountInfo;
+
+        let caller = Address::with_last_byte(0xa1);
+        let mut fresh = make_cached_evm_with_spec(TempoHardfork::T11);
+        let mut existing = make_cached_evm_with_spec(TempoHardfork::T11);
+        existing.inner.ctx.db_mut().insert_account_info(
+            caller,
+            AccountInfo {
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut tx = regular_2d_nonce_tx(TxKind::Create);
+        tx.base.nonce = 1;
+        fresh.inner.ctx.tx = tx.clone();
+        existing.inner.ctx.tx = tx;
+
+        let handler = TempoHandler::<_, NoOpInspector>::new();
+        let fresh_gas = handler.validate_initial_tx_gas(&mut fresh).unwrap();
+        let existing_gas = handler.validate_initial_tx_gas(&mut existing).unwrap();
+        assert_eq!(
+            fresh_gas.initial_gas - existing_gas.initial_gas,
+            fresh.ctx().cfg.gas_params.get(GasId::new_account_cost()),
+        );
+    }
+
+    #[test]
+    fn fresh_account_expiring_create_adds_new_account_intrinsic_gas() {
+        use revm::primitives::TxKind;
+        use revm::state::AccountInfo;
+
+        let caller = Address::with_last_byte(0xa1);
+        let mut fresh = make_cached_evm_with_spec(TempoHardfork::T11);
+        let mut existing = make_cached_evm_with_spec(TempoHardfork::T11);
+        existing.inner.ctx.db_mut().insert_account_info(
+            caller,
+            AccountInfo {
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut tx = regular_2d_nonce_tx(TxKind::Create);
+        let fields = tx.tempo_fields.as_mut().unwrap();
+        fields.nonce_key = U256::MAX;
+        fields.valid_before = Some(1_770_908_500 + 300);
+        fresh.inner.ctx.tx = tx.clone();
+        existing.inner.ctx.tx = tx;
+
+        let handler = TempoHandler::<_, NoOpInspector>::new();
+        let fresh_gas = handler.validate_initial_tx_gas(&mut fresh).unwrap();
+        let existing_gas = handler.validate_initial_tx_gas(&mut existing).unwrap();
+        assert_eq!(
+            fresh_gas.initial_gas - existing_gas.initial_gas,
+            fresh.ctx().cfg.gas_params.get(GasId::new_account_cost()),
+        );
+    }
+
+    #[test]
+    fn expiring_nonce_adds_exact_intrinsic_gas() {
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        evm.inner.ctx.tx = expiring_nonce_tx(
+            1_770_908_500 + 300,
+            revm::primitives::B256::repeat_byte(0x97),
+        );
+        let fields = evm.ctx().tx.tempo_fields.clone().unwrap();
+        let gas_params = evm.ctx().cfg.gas_params.clone();
+        let base = calculate_aa_batch_intrinsic_gas(
+            &fields,
+            &gas_params,
+            &evm,
+            TempoHardfork::T11,
+        )
+        .unwrap();
+
+        let handler = TempoHandler::<_, NoOpInspector>::new();
+        let actual = handler.validate_initial_tx_gas(&mut evm).unwrap();
+        assert_eq!(actual.initial_gas - base.initial_gas, EXPIRING_NONCE_GAS);
     }
 
     #[test]
@@ -2424,6 +2952,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
         // System tx should pass validate_env (though execution may fail later)
@@ -2590,7 +3119,7 @@ mod tests {
         assert_eq!(before, 0, "nonce should be 0 before increment");
 
         // Act
-        increment_2d_nonce_if_needed(&mut evm);
+        increment_2d_nonce_if_needed(&mut evm).unwrap();
 
         // After: nonce should be 1
         let after = evm
@@ -2611,7 +3140,7 @@ mod tests {
             ..Default::default()
         });
         // Should not panic or modify anything
-        increment_2d_nonce_if_needed(&mut evm);
+        increment_2d_nonce_if_needed(&mut evm).unwrap();
     }
 
     #[test]
@@ -2622,15 +3151,62 @@ mod tests {
             ..Default::default()
         });
         // Should not panic or modify anything
-        increment_2d_nonce_if_needed(&mut evm);
+        increment_2d_nonce_if_needed(&mut evm).unwrap();
     }
 
     #[test]
     fn test_increment_2d_nonce_no_tempo_fields() {
         let mut evm = make_evm();
         // No tempo_fields at all (standard tx)
-        increment_2d_nonce_if_needed(&mut evm);
+        increment_2d_nonce_if_needed(&mut evm).unwrap();
         // Should not panic
+    }
+
+    #[test]
+    fn test_increment_2d_nonce_propagates_overflow() {
+        use crate::tempo::precompile::storage_types::StorageKey;
+        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use revm::context_interface::JournalTr;
+
+        let caller = Address::with_last_byte(0xaa);
+        let nonce_key = U256::from(9);
+        let slot = nonce_key.mapping_slot(caller.mapping_slot(U256::ZERO));
+        let mut evm = make_evm();
+        evm.inner.ctx.tx.base.caller = caller;
+        evm.inner.ctx.tx.tempo_fields = Some(crate::tempo::tx::TempoTxFields {
+            nonce_key,
+            ..Default::default()
+        });
+        evm.inner
+            .ctx
+            .journal_mut()
+            .load_account(NONCE_PRECOMPILE_ADDRESS)
+            .unwrap();
+        evm.inner
+            .ctx
+            .journal_mut()
+            .sstore(
+                NONCE_PRECOMPILE_ADDRESS,
+                slot,
+                U256::from(u64::MAX),
+            )
+            .unwrap();
+
+        let error = increment_2d_nonce_if_needed(&mut evm).unwrap_err();
+        assert!(matches!(
+            error,
+            EVMError::Transaction(TempoInvalidTransaction::NonceManagerError(reason))
+                if reason == "Tempo Transaction nonce error: NonceOverflow(NonceOverflow)"
+        ));
+        assert_eq!(
+            evm.inner
+                .ctx
+                .journal_mut()
+                .sload(NONCE_PRECOMPILE_ADDRESS, slot)
+                .unwrap()
+                .data,
+            U256::from(u64::MAX),
+        );
     }
 
     // ========================================================================
@@ -2838,6 +3414,7 @@ mod tests {
             has_allowed_calls: true,
             scopes: 1,
             selectors: 1,
+            selector_sets: 1,
             constrained_selectors: 1,
             recipients: 1,
         };
@@ -2851,6 +3428,7 @@ mod tests {
             has_allowed_calls: true,
             scopes: 1,
             selectors: 1,
+            selector_sets: 1,
             constrained_selectors: 1,
             recipients: 1,
         };
@@ -2864,10 +3442,23 @@ mod tests {
             has_allowed_calls: true,
             scopes: 2,
             selectors: 3,
+            selector_sets: 2,
             constrained_selectors: 2,
             recipients: 5,
         };
         assert_eq!(call_scope_storage_slots(&s, TempoHardfork::T4), 26);
+
+        // 2 targets, but only one has selector rules. The empty target does not
+        // create a selector-set length row.
+        let mixed = ScopeCounts {
+            has_allowed_calls: true,
+            scopes: 2,
+            selectors: 1,
+            selector_sets: 1,
+            constrained_selectors: 0,
+            recipients: 0,
+        };
+        assert_eq!(call_scope_storage_slots(&mixed, TempoHardfork::T4), 9);
     }
 
     #[test]
@@ -2884,6 +3475,7 @@ mod tests {
             has_allowed_calls: true,
             scopes: 2,
             selectors: 3,
+            selector_sets: 2,
             constrained_selectors: 2,
             recipients: 5,
         };
@@ -2898,6 +3490,7 @@ mod tests {
             has_allowed_calls: true,
             scopes: 1,
             selectors: 1,
+            selector_sets: 1,
             constrained_selectors: 1,
             recipients: 1,
         };

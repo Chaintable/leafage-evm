@@ -295,4 +295,61 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn ring_evicts_expired_entry_and_clears_seen_marker() {
+        let old_hash = B256::repeat_byte(0x41);
+        let new_hash = B256::repeat_byte(0x42);
+        let mut storage = TestStorageProvider::new(TempoHardfork::T11);
+        storage.set_timestamp(U256::from(1_000));
+
+        StorageCtx::enter(&mut storage, || {
+            let mut manager = NonceManager::new();
+            manager.expiring_nonce_ring[U256::ZERO]
+                .write(old_hash)
+                .unwrap();
+            manager.expiring_nonce_seen[old_hash].write(999).unwrap();
+
+            manager
+                .check_and_mark_expiring_nonce(new_hash, 1_300)
+                .unwrap();
+            assert_eq!(
+                manager.expiring_nonce_ring[U256::ZERO].read().unwrap(),
+                new_hash,
+            );
+            assert_eq!(manager.expiring_nonce_seen[old_hash].read().unwrap(), 0);
+            assert_eq!(
+                manager.expiring_nonce_seen[new_hash].read().unwrap(),
+                1_300,
+            );
+            assert_eq!(manager.expiring_nonce_ring_ptr.read().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn ring_rejects_eviction_of_unexpired_entry_without_mutation() {
+        let old_hash = B256::repeat_byte(0x51);
+        let new_hash = B256::repeat_byte(0x52);
+        let mut storage = TestStorageProvider::new(TempoHardfork::T11);
+        storage.set_timestamp(U256::from(1_000));
+
+        StorageCtx::enter(&mut storage, || {
+            let mut manager = NonceManager::new();
+            manager.expiring_nonce_ring[U256::ZERO]
+                .write(old_hash)
+                .unwrap();
+            manager.expiring_nonce_seen[old_hash].write(1_200).unwrap();
+
+            let error = manager
+                .check_and_mark_expiring_nonce(new_hash, 1_300)
+                .unwrap_err();
+            assert_eq!(error.selector(), INonce::ExpiringNonceSetFull::SELECTOR);
+            assert_eq!(
+                manager.expiring_nonce_ring[U256::ZERO].read().unwrap(),
+                old_hash,
+            );
+            assert_eq!(manager.expiring_nonce_seen[new_hash].read().unwrap(), 0);
+            assert_eq!(manager.expiring_nonce_ring_ptr.read().unwrap(), 0);
+        });
+    }
 }

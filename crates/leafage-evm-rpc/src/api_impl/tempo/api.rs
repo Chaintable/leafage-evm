@@ -1,15 +1,18 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
-use crate::error::invalid_params_rpc_err;
+use crate::api_impl::core::{
+    ApiCore, EvmExecutor, GasFeeHandler, GetTransactionError, ToJsonRpcError, TxSetter,
+};
+use crate::error::{invalid_params_rpc_err, rpc_error_with_code};
 use revm::context::Transaction as TransactionTrait;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::tempo::tx::TempoTxEnv;
-use leafage_evm_chains::tempo::TempoEvm;
+use leafage_evm_chains::tempo::{TempoEvm, TempoInvalidTransaction};
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{
-    BlockEnv, BlockInfo, CallRequest, TempoKeyAuthGasInfo, TempoPrimitiveSignatureInfo,
+    BlockEnv, BlockInfo, CallRequest, DebankErrorCode, TempoKeyAuthGasInfo,
+    TempoPrimitiveSignatureInfo,
 };
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
@@ -95,6 +98,29 @@ pub struct TempoEvmCustomConfig;
 
 type TempoApiImpl<DB> = ApiImpl<DB, TempoHardfork, TempoEvmCustomConfig>;
 
+impl ToJsonRpcError for TempoInvalidTransaction {
+    fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
+        match self {
+            TempoInvalidTransaction::EthInvalidTransaction(error) => error.to_rpc_error(),
+            TempoInvalidTransaction::NonceManagerError(_)
+            | TempoInvalidTransaction::ExpiringNonceMissingValidBefore
+            | TempoInvalidTransaction::ExpiringNonceNonceNotZero => rpc_error_with_code(
+                DebankErrorCode::NonceError as i32,
+                self.to_string(),
+            ),
+        }
+    }
+}
+
+impl GetTransactionError for TempoInvalidTransaction {
+    fn get_transaction_error(&self) -> Option<InvalidTransaction> {
+        match self {
+            Self::EthInvalidTransaction(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Derive `ScopeCounts` from a TIP-1011 `allowedCalls` wire value.
 ///
 /// `None` → all zero, `has_allowed_calls = false`, which selects the gas
@@ -113,6 +139,10 @@ fn derive_scope_counts(
         Some(scopes) => {
             let selectors_total: usize =
                 scopes.iter().map(|s| s.selector_rules.len()).sum();
+            let selector_sets = scopes
+                .iter()
+                .filter(|scope| !scope.selector_rules.is_empty())
+                .count();
             let constrained_selectors: usize = scopes
                 .iter()
                 .flat_map(|s| &s.selector_rules)
@@ -127,6 +157,7 @@ fn derive_scope_counts(
                 has_allowed_calls: true,
                 scopes: scopes.len() as u32,
                 selectors: selectors_total as u32,
+                selector_sets: selector_sets as u32,
                 constrained_selectors: constrained_selectors as u32,
                 recipients: recipients_total as u32,
             }
@@ -237,7 +268,7 @@ where
     DB: Sync + Send + 'static,
 {
     type Tx = TempoTxEnv;
-    type TransactionError = InvalidTransaction;
+    type TransactionError = TempoInvalidTransaction;
     type EvmHaltReason = HaltReason;
 
     fn create_txn_env<StateDB: DatabaseRef>(
@@ -432,6 +463,7 @@ where
         Ok(TempoTxEnv {
             base,
             tempo_fields,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
             ),
@@ -608,6 +640,14 @@ impl TxSetter for TempoTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.gas_limit = gas_limit;
     }
+
+    fn set_stateful_simulation_context(
+        &mut self,
+        block_hash: leafage_evm_types::H256,
+        index: u64,
+    ) {
+        TempoTxEnv::set_stateful_simulation_context(self, block_hash, index);
+    }
 }
 
 impl<DB> ApiCore for TempoApiImpl<DB> where DB: Sync + Send + 'static {}
@@ -638,6 +678,13 @@ mod tests {
     use super::*;
     use leafage_evm_chains::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS;
     use revm::database::EmptyDB;
+
+    #[test]
+    fn expiring_nonce_transaction_error_maps_to_nonce_rpc_error() {
+        let error = TempoInvalidTransaction::NonceManagerError("replay".into()).to_rpc_error();
+        assert_eq!(error.code(), DebankErrorCode::NonceError as i32);
+        assert_eq!(error.message(), "nonce manager error: replay");
+    }
 
     #[test]
     fn test_vcv2_injector_t2_injects_code_for_missing_account() {
@@ -729,6 +776,7 @@ mod tests {
         assert!(!counts.has_allowed_calls);
         assert_eq!(counts.scopes, 0);
         assert_eq!(counts.selectors, 0);
+        assert_eq!(counts.selector_sets, 0);
         assert_eq!(counts.constrained_selectors, 0);
         assert_eq!(counts.recipients, 0);
     }
@@ -739,6 +787,7 @@ mod tests {
         assert!(counts.has_allowed_calls);
         assert_eq!(counts.scopes, 0);
         assert_eq!(counts.selectors, 0);
+        assert_eq!(counts.selector_sets, 0);
         assert_eq!(counts.constrained_selectors, 0);
         assert_eq!(counts.recipients, 0);
     }
@@ -773,12 +822,18 @@ mod tests {
                     ),
                 ],
             ),
+            // A target with no selector rules must not create a selector-set row.
+            make_scope(
+                address!("0x20C0000000000000000000000000000000000003"),
+                Vec::new(),
+            ),
         ];
 
         let counts = derive_scope_counts(Some(&scopes));
         assert!(counts.has_allowed_calls);
-        assert_eq!(counts.scopes, 2, "2 targets");
+        assert_eq!(counts.scopes, 3, "3 targets");
         assert_eq!(counts.selectors, 3, "2 + 1 selectors");
+        assert_eq!(counts.selector_sets, 2, "only 2 targets have selectors");
         assert_eq!(counts.constrained_selectors, 2, "1 + 1 with non-empty recipients");
         assert_eq!(counts.recipients, 3, "2 + 1 recipients total");
     }

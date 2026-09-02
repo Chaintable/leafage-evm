@@ -45,7 +45,7 @@ pub use storage_types::{
 use alloy::primitives::{address, Address, Bytes};
 use alloy::sol_types::{SolCall, SolError};
 use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
-use revm::precompile::{PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 
 alloy::sol! {
     /// Common Tempo precompile error for an unknown or hardfork-disabled selector.
@@ -302,6 +302,11 @@ pub fn dispatch_call<T>(
     let storage = StorageCtx::default();
 
     if calldata.len() < 4 {
+        if !storage.spec().is_t1() {
+            return Err(PrecompileError::other_static(
+                "Invalid input: missing function selector",
+            ));
+        }
         return Ok(fill_precompile_output(
             PrecompileOutput::new_reverted(0, Bytes::new()),
             &storage,

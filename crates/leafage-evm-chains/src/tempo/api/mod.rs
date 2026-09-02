@@ -135,6 +135,46 @@ mod storage_credits;
 /// Type alias for the default context type of the TempoEvm.
 pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<TempoHardfork>, DB>;
 
+/// Tempo-specific transaction validation errors used by [`TempoEvm`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TempoInvalidTransaction {
+    /// Standard Ethereum transaction validation error.
+    EthInvalidTransaction(revm::context::result::InvalidTransaction),
+    /// Nonce-manager validation failed.
+    NonceManagerError(String),
+    /// Expiring nonce transaction omitted `valid_before`.
+    ExpiringNonceMissingValidBefore,
+    /// Expiring nonce transaction used a non-zero transaction nonce.
+    ExpiringNonceNonceNotZero,
+}
+
+impl From<revm::context::result::InvalidTransaction> for TempoInvalidTransaction {
+    fn from(value: revm::context::result::InvalidTransaction) -> Self {
+        Self::EthInvalidTransaction(value)
+    }
+}
+
+impl core::fmt::Display for TempoInvalidTransaction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EthInvalidTransaction(error) => error.fmt(f),
+            Self::NonceManagerError(reason) => write!(f, "nonce manager error: {reason}"),
+            Self::ExpiringNonceMissingValidBefore => {
+                f.write_str("expiring nonce transaction requires valid_before to be set")
+            }
+            Self::ExpiringNonceNonceNotZero => {
+                f.write_str("expiring nonce transaction must have nonce == 0")
+            }
+        }
+    }
+}
+
+impl core::error::Error for TempoInvalidTransaction {}
+
+/// EVM error type carrying Tempo transaction validation errors.
+pub type TempoEvmError<DBError> =
+    revm::context::result::EVMError<DBError, TempoInvalidTransaction>;
+
 /// Tempo EVM implementation.
 ///
 /// This is a wrapper type around the `revm` evm with optional [`Inspector`] (tracing)
@@ -664,6 +704,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
 
@@ -729,6 +770,7 @@ mod tests {
                 nonce_key,
                 ..Default::default()
             }),
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         }
     }
@@ -1063,6 +1105,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
 
@@ -1513,6 +1556,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
 
@@ -1596,6 +1640,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
 
@@ -1653,6 +1698,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
 

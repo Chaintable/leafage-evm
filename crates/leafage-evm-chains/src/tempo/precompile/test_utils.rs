@@ -71,6 +71,14 @@ impl TestStorageProvider {
             .unwrap_or(U256::ZERO)
     }
 
+    pub(crate) fn has_storage_entry(&self, address: Address, slot: U256) -> bool {
+        self.storage.contains_key(&(address, slot))
+    }
+
+    pub(crate) fn storage_len(&self) -> usize {
+        self.storage.len()
+    }
+
     pub(crate) fn transient(&self, address: Address, slot: U256) -> U256 {
         self.transient
             .get(&(address, slot))
