@@ -14,6 +14,7 @@ use std::ops::{Deref, DerefMut};
 #[derive(
     Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
     alloy_rlp_derive::RlpEncodable,
+    alloy_rlp_derive::RlpDecodable,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct CallScope {
@@ -29,6 +30,7 @@ pub struct CallScope {
 #[derive(
     Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
     alloy_rlp_derive::RlpEncodable,
+    alloy_rlp_derive::RlpDecodable,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SelectorRule {

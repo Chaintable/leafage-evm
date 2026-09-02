@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
+use leafage_evm_types::CallScope as RlpCallScope;
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -148,6 +149,9 @@ alloy::sol! {
             CallScope[] calldata scopes
         ) external;
 
+        /// (TIP-1099, T11+) Set or replace RLP-encoded allowed calls.
+        function setAllowedCalls(address keyId, bytes calldata scopes) external;
+
         /// (TIP-1011, T3+) Remove any configured call scope for a key+target pair.
         function removeAllowedCalls(address keyId, address target) external;
 
@@ -166,6 +170,12 @@ alloy::sol! {
             address keyId,
             address token
         ) external view returns (uint256);
+
+        function getRemainingLimitWithPeriod(
+            address account,
+            address keyId,
+            address token
+        ) external view returns (uint256 remaining, uint64 periodEnd);
 
         function getTransactionKey() external view returns (address);
 
@@ -293,6 +303,19 @@ const TIP20_TRANSFER_SELECTOR: [u8; 4] = ITIP20::transferCall::SELECTOR;
 const TIP20_APPROVE_SELECTOR: [u8; 4] = ITIP20::approveCall::SELECTOR;
 const TIP20_TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = ITIP20::transferWithMemoCall::SELECTOR;
 
+/// Additional T11 cost for each 32-byte word decoded as RLP by `setAllowedCalls`.
+const RLP_INPUT_PER_WORD_COST: u64 = 50;
+
+/// T7+ storage representation for zero remaining in a periodic spending limit.
+const ZERO_PERIODIC_REMAINING_SENTINEL: U256 = U256::MAX;
+
+#[inline]
+fn rlp_input_cost(input_len: usize) -> u64 {
+    input_len
+        .div_ceil(32)
+        .saturating_mul(RLP_INPUT_PER_WORD_COST as usize) as u64
+}
+
 /// Returns true if `selector` is one of TIP-20's recipient-bearing selectors
 /// (`transfer`, `approve`, `transferWithMemo`). Mirrors writer
 /// `account_keychain/mod.rs::is_constrained_tip20_selector`.
@@ -302,6 +325,38 @@ fn is_constrained_tip20_selector(selector: [u8; 4]) -> bool {
         selector,
         TIP20_TRANSFER_SELECTOR | TIP20_APPROVE_SELECTOR | TIP20_TRANSFER_WITH_MEMO_SELECTOR
     )
+}
+
+fn has_duplicates_sorted<T: Ord>(values: impl IntoIterator<Item = T>) -> bool {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values.windows(2).any(|pair| pair[0] == pair[1])
+}
+
+fn selector_is_disabled(
+    spec: crate::tempo::hardfork::TempoHardfork,
+    selector: [u8; 4],
+) -> bool {
+    (selector == IAccountKeychain::authorizeKey_0Call::SELECTOR && spec.is_t11())
+        || (selector == IAccountKeychain::authorizeKey_1Call::SELECTOR
+            && (!spec.is_t3() || spec.is_t11()))
+        || (selector == IAccountKeychain::authorizeKey_2Call::SELECTOR
+            && (!spec.is_t5() || spec.is_t11()))
+        || (selector == IAccountKeychain::authorizeAdminKeyCall::SELECTOR
+            && (!spec.is_t6() || spec.is_t11()))
+        || (selector == IAccountKeychain::burnKeyAuthorizationWitnessCall::SELECTOR
+            && !spec.is_t5())
+        || (selector == IAccountKeychain::setAllowedCalls_0Call::SELECTOR
+            && (!spec.is_t3() || spec.is_t11()))
+        || (selector == IAccountKeychain::setAllowedCalls_1Call::SELECTOR && !spec.is_t11())
+        || (selector == IAccountKeychain::removeAllowedCallsCall::SELECTOR && !spec.is_t3())
+        || (selector == IAccountKeychain::getRemainingLimitCall::SELECTOR && spec.is_t3())
+        || (selector == IAccountKeychain::getRemainingLimitWithPeriodCall::SELECTOR
+            && !spec.is_t3())
+        || (selector == IAccountKeychain::getAllowedCallsCall::SELECTOR && !spec.is_t3())
+        || (selector == IAccountKeychain::isKeyAuthorizationWitnessBurnedCall::SELECTOR
+            && !spec.is_t5())
+        || (selector == IAccountKeychain::isAdminKeyCall::SELECTOR && !spec.is_t6())
 }
 
 // ===========================================================================
@@ -1113,22 +1168,83 @@ impl AccountKeychain {
         })
     }
 
-    /// Returns the remaining spending limit for a key-token pair, or zero if the key
-    /// doesn't exist or has been revoked (T2+).
+    /// Returns the remaining spending limit using the legacy pre-T3 return shape.
     pub fn get_remaining_limit(
         &self,
         call: IAccountKeychain::getRemainingLimitCall,
     ) -> Result<U256> {
-        // T2+: return zero if key doesn't exist or has been revoked
-        if self.storage.spec().is_t2() {
-            let key = self.keys[call.account][call.keyId].read()?;
-            if key.expiry == 0 || key.is_revoked {
-                return Ok(U256::ZERO);
-            }
+        if !self.storage.spec().is_t2() {
+            let limit_key = Self::spending_limit_key(call.account, call.keyId);
+            return self.spending_limits[limit_key][call.token].remaining.read();
         }
 
-        let limit_key = Self::spending_limit_key(call.account, call.keyId);
-        self.spending_limits[limit_key][call.token].remaining.read()
+        self.effective_limit_state(call.account, call.keyId, call.token)
+            .map(|(remaining, _)| remaining)
+    }
+
+    /// Returns the effective remaining limit and active period end without mutating storage.
+    pub fn get_remaining_limit_with_period(
+        &self,
+        call: IAccountKeychain::getRemainingLimitWithPeriodCall,
+    ) -> Result<IAccountKeychain::getRemainingLimitWithPeriodReturn> {
+        let (remaining, period_end) =
+            self.effective_limit_state(call.account, call.keyId, call.token)?;
+        Ok(IAccountKeychain::getRemainingLimitWithPeriodReturn {
+            remaining,
+            periodEnd: period_end,
+        })
+    }
+
+    fn effective_limit_state(
+        &self,
+        account: Address,
+        key_id: Address,
+        token: Address,
+    ) -> Result<(U256, u64)> {
+        if key_id.is_zero() && self.storage.spec().is_t3() {
+            return Ok((U256::ZERO, 0));
+        }
+
+        let key = self.keys[account][key_id].read()?;
+        if key.expiry == 0 || key.is_revoked {
+            return Ok((U256::ZERO, 0));
+        }
+
+        let current_timestamp = self.storage.timestamp().to::<u64>();
+        if self.storage.spec().is_t3() && current_timestamp >= key.expiry {
+            return Ok((U256::ZERO, 0));
+        }
+
+        let limit_key = Self::spending_limit_key(account, key_id);
+        let limit = &self.spending_limits[limit_key][token];
+        let remaining = limit.remaining.read()?;
+        if !self.storage.spec().is_t3() {
+            return Ok((remaining, 0));
+        }
+        let period = limit.period.read()?;
+        if period == 0 {
+            return Ok((remaining, 0));
+        }
+
+        let remaining = if self.storage.spec().is_t7()
+            && remaining == ZERO_PERIODIC_REMAINING_SENTINEL
+        {
+            U256::ZERO
+        } else {
+            remaining
+        };
+        let period_end = limit.period_end.read()?;
+        if current_timestamp < period_end {
+            return Ok((remaining, period_end));
+        }
+
+        let elapsed = current_timestamp.saturating_sub(period_end);
+        let periods_elapsed = (elapsed / period).saturating_add(1);
+        let next_end = period_end.saturating_add(period.saturating_mul(periods_elapsed));
+        Ok((
+            U256::from(limit.max.read()?),
+            next_end,
+        ))
     }
 
     /// Returns the access key used to authorize the current transaction.
@@ -1258,21 +1374,34 @@ impl AccountKeychain {
         // rolled-over window and the deducted `remaining` are committed in a
         // single SSTORE per slot (matches writer L1171-1173).
         let mut state = self.spending_limits[limit_key][token].read()?;
+        let mut remaining = state.remaining;
         let now: u64 = self.storage.timestamp().to::<u64>();
         let is_periodic = state.period != 0;
 
-        if is_periodic && now >= state.period_end {
-            state.period_end = state.compute_next_period_end(now);
-            state.remaining = U256::from(state.max);
+        if is_periodic {
+            if self.storage.spec().is_t7()
+                && remaining == ZERO_PERIODIC_REMAINING_SENTINEL
+            {
+                remaining = U256::ZERO;
+            }
+            if now >= state.period_end {
+                state.period_end = state.compute_next_period_end(now);
+                remaining = U256::from(state.max);
+                state.remaining = remaining;
+            }
         }
 
-        if amount > state.remaining {
+        if amount > remaining {
             return Err(err_spending_limit_exceeded());
         }
 
-        let new_remaining = state.remaining - amount;
+        let new_remaining = remaining - amount;
         if is_periodic {
-            state.remaining = new_remaining;
+            state.remaining = if self.storage.spec().is_t7() && new_remaining.is_zero() {
+                ZERO_PERIODIC_REMAINING_SENTINEL
+            } else {
+                new_remaining
+            };
             self.spending_limits[limit_key][token].write(state)
         } else {
             self.spending_limits[limit_key][token]
@@ -1317,7 +1446,14 @@ impl AccountKeychain {
         let new_remaining = if self.storage.spec().is_t3() {
             let handler = &self.spending_limits[limit_key][token];
             let state = handler.read()?;
-            let refunded = state.remaining.saturating_add(amount);
+            let refunded = if self.storage.spec().is_t7()
+                && state.period != 0
+                && state.remaining == ZERO_PERIODIC_REMAINING_SENTINEL
+            {
+                amount
+            } else {
+                state.remaining.saturating_add(amount)
+            };
             if state.max == 0 {
                 refunded
             } else {
@@ -1452,12 +1588,51 @@ impl AccountKeychain {
     // CallScope — public dispatch entries
     // -----------------------------------------------------------------------
 
-    /// (T3+) Set or replace allowed calls for one or more (key, target) pairs.
-    /// Mirrors writer `account_keychain/mod.rs:462-487 set_allowed_calls`.
+    /// (T11+) Set or replace allowed calls from canonical RLP input.
+    pub fn set_allowed_calls_rlp(
+        &mut self,
+        msg_sender: Address,
+        call: IAccountKeychain::setAllowedCalls_1Call,
+    ) -> Result<()> {
+        self.storage.deduct_gas(rlp_input_cost(call.scopes.len()))?;
+
+        let scopes: Vec<RlpCallScope> = alloy_rlp::decode_exact(call.scopes.as_ref())
+            .map_err(|_| err_invalid_call_scope())?;
+        if scopes.is_empty() {
+            return Err(err_invalid_call_scope());
+        }
+
+        let scopes = scopes
+            .into_iter()
+            .map(|scope| IAccountKeychain::CallScope {
+                target: scope.target,
+                selectorRules: scope
+                    .selector_rules
+                    .into_iter()
+                    .map(|rule| IAccountKeychain::SelectorRule {
+                        selector: rule.selector,
+                        recipients: rule.recipients,
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.set_allowed_calls_decoded(msg_sender, call.keyId, scopes)
+    }
+
+    /// (T3-T10) Set or replace ABI-encoded allowed calls.
     pub fn set_allowed_calls(
         &mut self,
         msg_sender: Address,
-        call: IAccountKeychain::setAllowedCallsCall,
+        call: IAccountKeychain::setAllowedCalls_0Call,
+    ) -> Result<()> {
+        self.set_allowed_calls_decoded(msg_sender, call.keyId, call.scopes)
+    }
+
+    fn set_allowed_calls_decoded(
+        &mut self,
+        msg_sender: Address,
+        key_id: Address,
+        scopes: Vec<IAccountKeychain::CallScope>,
     ) -> Result<()> {
         if !self.storage.spec().is_t3() {
             return Err(err_invalid_call_scope());
@@ -1465,7 +1640,7 @@ impl AccountKeychain {
         self.ensure_admin_caller(msg_sender)?;
 
         let current_timestamp: u64 = self.storage.timestamp().to::<u64>();
-        let key = self.load_active_key(msg_sender, call.keyId)?;
+        let key = self.load_active_key(msg_sender, key_id)?;
         if current_timestamp >= key.expiry {
             return Err(err_key_expired());
         }
@@ -1473,8 +1648,7 @@ impl AccountKeychain {
             return Err(err_invalid_key_id());
         }
 
-        let key_hash = Self::spending_limit_key(msg_sender, call.keyId);
-        let scopes = call.scopes;
+        let key_hash = Self::spending_limit_key(msg_sender, key_id);
         if scopes.is_empty() {
             return Err(err_invalid_call_scope());
         }
@@ -1652,6 +1826,16 @@ impl AccountKeychain {
     /// targets and (post-T4) runs per-scope validation up front. Mirrors writer
     /// `account_keychain/mod.rs:871-885 validate_call_scopes`.
     fn validate_call_scopes(&self, scopes: &[IAccountKeychain::CallScope]) -> Result<()> {
+        if self.storage.spec().is_t11() {
+            if has_duplicates_sorted(scopes.iter().map(|scope| scope.target)) {
+                return Err(err_invalid_call_scope());
+            }
+            for scope in scopes {
+                self.validate_call_scope(scope)?;
+            }
+            return Ok(());
+        }
+
         let mut seen_targets = HashSet::new();
         for scope in scopes {
             if !seen_targets.insert(scope.target) {
@@ -1704,9 +1888,14 @@ impl AccountKeychain {
             Ok(v)
         };
 
+        let sort_duplicates = self.storage.spec().is_t11();
+        if sort_duplicates && has_duplicates_sorted(rules.iter().map(|rule| rule.selector)) {
+            return Err(err_invalid_call_scope());
+        }
+
         let mut selectors = HashSet::new();
         for rule in rules {
-            if !selectors.insert(rule.selector) {
+            if !sort_duplicates && !selectors.insert(rule.selector) {
                 return Err(err_invalid_call_scope());
             }
 
@@ -1718,9 +1907,20 @@ impl AccountKeychain {
                 return Err(err_invalid_call_scope());
             }
 
-            let mut unique_recipients = HashSet::new();
-            for recipient in &rule.recipients {
-                if recipient.is_zero() || !unique_recipients.insert(*recipient) {
+            if rule.recipients.iter().any(|recipient| recipient.is_zero()) {
+                return Err(err_invalid_call_scope());
+            }
+            if sort_duplicates {
+                if has_duplicates_sorted(rule.recipients.iter().copied()) {
+                    return Err(err_invalid_call_scope());
+                }
+            } else {
+                let mut unique_recipients = HashSet::new();
+                if rule
+                    .recipients
+                    .iter()
+                    .any(|recipient| !unique_recipients.insert(*recipient))
+                {
                     return Err(err_invalid_call_scope());
                 }
             }
@@ -1761,6 +1961,9 @@ impl Precompile for AccountKeychain {
             .get(..4)
             .and_then(|bytes| bytes.try_into().ok())
             .unwrap_or_default();
+        if selector_is_disabled(self.storage.spec(), selector) {
+            return unknown_selector(selector, self.storage.gas_used());
+        }
 
         dispatch_call(
             calldata,
@@ -1775,9 +1978,6 @@ impl Precompile for AccountKeychain {
                     mutate_void(call, msg_sender, |sender, c| self.authorize_key(sender, c))
                 }
                 IAccountKeychain::IAccountKeychainCalls::authorizeKey_1(call) => {
-                    if !self.storage.spec().is_t3() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate_void(call, msg_sender, |sender, c| {
                         self.authorize_key_with_restrictions(
                             sender,
@@ -1789,9 +1989,6 @@ impl Precompile for AccountKeychain {
                     })
                 }
                 IAccountKeychain::IAccountKeychainCalls::authorizeKey_2(call) => {
-                    if !self.storage.spec().is_t5() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate_void(call, msg_sender, |sender, c| {
                         self.authorize_key_with_restrictions(
                             sender,
@@ -1803,17 +2000,11 @@ impl Precompile for AccountKeychain {
                     })
                 }
                 IAccountKeychain::IAccountKeychainCalls::authorizeAdminKey(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate_void(call, msg_sender, |sender, call| {
                         self.authorize_admin_key(sender, call)
                     })
                 }
                 IAccountKeychain::IAccountKeychainCalls::burnKeyAuthorizationWitness(call) => {
-                    if !self.storage.spec().is_t5() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate_void(call, msg_sender, |sender, c| {
                         self.burn_key_authorization_witness(sender, c)
                     })
@@ -1832,23 +2023,25 @@ impl Precompile for AccountKeychain {
                 IAccountKeychain::IAccountKeychainCalls::getRemainingLimit(call) => {
                     view(call, |c| self.get_remaining_limit(c))
                 }
+                IAccountKeychain::IAccountKeychainCalls::getRemainingLimitWithPeriod(call) => {
+                    view(call, |c| self.get_remaining_limit_with_period(c))
+                }
                 IAccountKeychain::IAccountKeychainCalls::getTransactionKey(call) => {
                     view(call, |c| self.get_transaction_key(c, msg_sender))
                 }
                 IAccountKeychain::IAccountKeychainCalls::isKeyAuthorizationWitnessBurned(call) => {
-                    if !self.storage.spec().is_t5() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| self.is_key_authorization_witness_burned(c))
                 }
                 IAccountKeychain::IAccountKeychainCalls::isAdminKey(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |call| self.is_admin_key(call.account, call.keyId))
                 }
-                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls(call) => {
+                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls_0(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.set_allowed_calls(sender, c))
+                }
+                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls_1(call) => {
+                    mutate_void(call, msg_sender, |sender, c| {
+                        self.set_allowed_calls_rlp(sender, c)
+                    })
                 }
                 IAccountKeychain::IAccountKeychainCalls::removeAllowedCalls(call) => {
                     mutate_void(call, msg_sender, |sender, c| {
@@ -1871,6 +2064,7 @@ mod tests {
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::primitives::address;
     use alloy::sol_types::SolEvent;
+    use leafage_evm_types::SelectorRule as RlpSelectorRule;
     use revm::database::EmptyDB;
 
     fn unrestricted_restrictions() -> IAccountKeychain::KeyRestrictions {
@@ -1909,7 +2103,7 @@ mod tests {
 
         fn aliased_calldata(width: usize) -> Vec<u8> {
             let mut data = Vec::new();
-            data.extend(IAccountKeychain::setAllowedCallsCall::SELECTOR);
+            data.extend(IAccountKeychain::setAllowedCalls_0Call::SELECTOR);
             data.extend(word(0));
             data.extend(word(64));
 
@@ -1947,6 +2141,522 @@ mod tests {
         .unwrap();
         assert!(output.reverted);
         assert!(output.bytes.is_empty());
+    }
+
+    #[test]
+    fn remaining_limit_selectors_switch_at_t3() {
+        let account = Address::repeat_byte(0x11);
+        let key_id = Address::repeat_byte(0x22);
+        let token = Address::repeat_byte(0x33);
+        let legacy = IAccountKeychain::getRemainingLimitCall {
+            account,
+            keyId: key_id,
+            token,
+        }
+        .abi_encode();
+        let with_period = IAccountKeychain::getRemainingLimitWithPeriodCall {
+            account,
+            keyId: key_id,
+            token,
+        }
+        .abi_encode();
+
+        let mut t2 = TestStorageProvider::new(TempoHardfork::T2);
+        StorageCtx::enter(&mut t2, || {
+            let mut keychain = AccountKeychain::new();
+            let output = keychain.call(&legacy, account).unwrap();
+            assert!(!output.reverted);
+            assert_eq!(
+                IAccountKeychain::getRemainingLimitCall::abi_decode_returns(&output.bytes)
+                    .unwrap(),
+                U256::ZERO,
+            );
+
+            let output = keychain.call(&with_period, account).unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                IAccountKeychain::getRemainingLimitWithPeriodCall::SELECTOR,
+            );
+        });
+
+        let mut t3 = TestStorageProvider::new(TempoHardfork::T3);
+        StorageCtx::enter(&mut t3, || {
+            let mut keychain = AccountKeychain::new();
+            let output = keychain.call(&legacy, account).unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                IAccountKeychain::getRemainingLimitCall::SELECTOR,
+            );
+
+            let output = keychain.call(&with_period, account).unwrap();
+            assert!(!output.reverted);
+            let result =
+                IAccountKeychain::getRemainingLimitWithPeriodCall::abi_decode_returns(
+                    &output.bytes,
+                )
+                .unwrap();
+            assert_eq!(result.remaining, U256::ZERO);
+            assert_eq!(result.periodEnd, 0);
+        });
+    }
+
+    #[test]
+    fn remaining_limit_with_period_is_effective_and_read_only() {
+        let account = Address::repeat_byte(0x41);
+        let key_id = Address::repeat_byte(0x42);
+        let token = Address::repeat_byte(0x43);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        provider.set_timestamp(U256::from(125));
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let mut keychain = AccountKeychain::new();
+            keychain.keys[account][key_id].write(AuthorizedKey {
+                expiry: 1_000,
+                ..Default::default()
+            })?;
+            let limit_key = AccountKeychain::spending_limit_key(account, key_id);
+            let stored = SpendingLimitState {
+                remaining: U256::from(2),
+                max: 10,
+                period: 20,
+                period_end: 100,
+            };
+            keychain.spending_limits[limit_key][token].write(stored.clone())?;
+
+            let result = keychain.get_remaining_limit_with_period(
+                IAccountKeychain::getRemainingLimitWithPeriodCall {
+                    account,
+                    keyId: key_id,
+                    token,
+                },
+            )?;
+            assert_eq!(result.remaining, U256::from(10));
+            assert_eq!(result.periodEnd, 140);
+            assert_eq!(keychain.spending_limits[limit_key][token].read()?, stored);
+
+            let expired_key = Address::repeat_byte(0x44);
+            keychain.keys[account][expired_key].write(AuthorizedKey {
+                expiry: 125,
+                ..Default::default()
+            })?;
+            let expired = keychain.get_remaining_limit_with_period(
+                IAccountKeychain::getRemainingLimitWithPeriodCall {
+                    account,
+                    keyId: expired_key,
+                    token,
+                },
+            )?;
+            assert_eq!((expired.remaining, expired.periodEnd), (U256::ZERO, 0));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn remaining_limit_with_period_decodes_t7_zero_sentinel() {
+        let account = Address::repeat_byte(0x51);
+        let key_id = Address::repeat_byte(0x52);
+        let token = Address::repeat_byte(0x53);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        provider.set_timestamp(U256::from(90));
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let mut keychain = AccountKeychain::new();
+            keychain.keys[account][key_id].write(AuthorizedKey {
+                expiry: 1_000,
+                ..Default::default()
+            })?;
+            let limit_key = AccountKeychain::spending_limit_key(account, key_id);
+            keychain.spending_limits[limit_key][token].write(SpendingLimitState {
+                remaining: ZERO_PERIODIC_REMAINING_SENTINEL,
+                max: 10,
+                period: 20,
+                period_end: 100,
+            })?;
+
+            let result = keychain.get_remaining_limit_with_period(
+                IAccountKeychain::getRemainingLimitWithPeriodCall {
+                    account,
+                    keyId: key_id,
+                    token,
+                },
+            )?;
+            assert_eq!(result.remaining, U256::ZERO);
+            assert_eq!(result.periodEnd, 100);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn periodic_spending_uses_zero_sentinel_from_t7() {
+        let account = Address::repeat_byte(0x54);
+        let key_id = Address::repeat_byte(0x55);
+        let token = Address::repeat_byte(0x56);
+
+        for (spec, stored_zero) in [
+            (TempoHardfork::T6, U256::ZERO),
+            (TempoHardfork::T7, ZERO_PERIODIC_REMAINING_SENTINEL),
+            (TempoHardfork::T11, ZERO_PERIODIC_REMAINING_SENTINEL),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            provider.set_timestamp(U256::from(90));
+            StorageCtx::enter(&mut provider, || -> Result<()> {
+                let mut keychain = AccountKeychain::new();
+                keychain.keys[account][key_id].write(AuthorizedKey {
+                    expiry: 1_000,
+                    enforce_limits: true,
+                    ..Default::default()
+                })?;
+                let limit_key = AccountKeychain::spending_limit_key(account, key_id);
+                keychain.spending_limits[limit_key][token].write(SpendingLimitState {
+                    remaining: U256::from(5),
+                    max: 5,
+                    period: 20,
+                    period_end: 100,
+                })?;
+
+                keychain.verify_and_update_spending(
+                    account,
+                    key_id,
+                    token,
+                    U256::from(5),
+                )?;
+                assert_eq!(
+                    keychain.spending_limits[limit_key][token]
+                        .remaining
+                        .read()?,
+                    stored_zero,
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn t11_zero_sentinel_blocks_spend_and_refunds_from_zero() {
+        let account = Address::repeat_byte(0x57);
+        let key_id = Address::repeat_byte(0x58);
+        let token = Address::repeat_byte(0x59);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        provider.set_timestamp(U256::from(90));
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_transaction_key(key_id)?;
+            keychain.set_tx_origin(account)?;
+            keychain.keys[account][key_id].write(AuthorizedKey {
+                expiry: 1_000,
+                enforce_limits: true,
+                ..Default::default()
+            })?;
+            let limit_key = AccountKeychain::spending_limit_key(account, key_id);
+            keychain.spending_limits[limit_key][token].write(SpendingLimitState {
+                remaining: ZERO_PERIODIC_REMAINING_SENTINEL,
+                max: 10,
+                period: 20,
+                period_end: 100,
+            })?;
+
+            let error = keychain
+                .verify_and_update_spending(account, key_id, token, U256::ONE)
+                .unwrap_err();
+            assert_eq!(
+                error.selector(),
+                IAccountKeychain::SpendingLimitExceeded::SELECTOR,
+            );
+            assert_eq!(
+                keychain.spending_limits[limit_key][token]
+                    .remaining
+                    .read()?,
+                ZERO_PERIODIC_REMAINING_SENTINEL,
+            );
+
+            keychain.refund_spending_limit(account, token, U256::from(3))?;
+            assert_eq!(
+                keychain.spending_limits[limit_key][token]
+                    .remaining
+                    .read()?,
+                U256::from(3),
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t11_disables_direct_authorization_selectors() {
+        let key_id = Address::repeat_byte(0x61);
+        let config = unrestricted_restrictions();
+        let calls = [
+            IAccountKeychain::authorizeKey_0Call {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                expiry: 100,
+                enforceLimits: false,
+                limits: Vec::new(),
+            }
+            .abi_encode(),
+            IAccountKeychain::authorizeKey_1Call {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                config: config.clone(),
+            }
+            .abi_encode(),
+            IAccountKeychain::authorizeKey_2Call {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                config,
+                witness: B256::ZERO,
+            }
+            .abi_encode(),
+            IAccountKeychain::authorizeAdminKeyCall {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                witness: B256::ZERO,
+            }
+            .abi_encode(),
+        ];
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        StorageCtx::enter(&mut provider, || {
+            let mut keychain = AccountKeychain::new();
+            for calldata in calls {
+                let output = keychain.call(&calldata, Address::repeat_byte(0x62)).unwrap();
+                assert!(output.reverted);
+                assert_eq!(output.bytes.as_ref(), &calldata[..4]);
+            }
+        });
+    }
+
+    #[test]
+    fn disabled_selectors_are_rejected_before_abi_decode() {
+        for (spec, selector) in [
+            (
+                TempoHardfork::T11,
+                IAccountKeychain::authorizeKey_2Call::SELECTOR,
+            ),
+            (
+                TempoHardfork::T11,
+                IAccountKeychain::setAllowedCalls_0Call::SELECTOR,
+            ),
+            (
+                TempoHardfork::T10,
+                IAccountKeychain::setAllowedCalls_1Call::SELECTOR,
+            ),
+            (
+                TempoHardfork::T2,
+                IAccountKeychain::getRemainingLimitWithPeriodCall::SELECTOR,
+            ),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            let output = StorageCtx::enter(&mut provider, || {
+                AccountKeychain::new().call(&selector, Address::ZERO)
+            })
+            .unwrap();
+            assert!(output.reverted);
+            assert_eq!(output.bytes.as_ref(), selector);
+        }
+    }
+
+    #[test]
+    fn direct_authorization_remains_enabled_at_t10() {
+        let account = Address::repeat_byte(0x71);
+        let key_id = Address::repeat_byte(0x72);
+        let calldata = IAccountKeychain::authorizeKey_2Call {
+            keyId: key_id,
+            signatureType: IAccountKeychain::SignatureType::Secp256k1,
+            config: unrestricted_restrictions(),
+            witness: B256::ZERO,
+        }
+        .abi_encode();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_tx_origin(account)?;
+            let output = keychain.call(&calldata, account).unwrap();
+            assert!(!output.reverted);
+            assert_eq!(keychain.keys[account][key_id].read()?.expiry, 100);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t11_set_allowed_calls_uses_canonical_rlp() {
+        let account = Address::repeat_byte(0x81);
+        let key_id = Address::repeat_byte(0x82);
+        let target = Address::repeat_byte(0x83);
+        let scopes = vec![RlpCallScope {
+            target,
+            selector_rules: vec![RlpSelectorRule {
+                selector: FixedBytes::new([0xaa, 0xbb, 0xcc, 0xdd]),
+                recipients: Vec::new(),
+            }],
+        }];
+        let encoded_scopes = alloy_rlp::encode(&scopes);
+        let old_calldata = IAccountKeychain::setAllowedCalls_0Call {
+            keyId: key_id,
+            scopes: Vec::new(),
+        }
+        .abi_encode();
+        let new_calldata = IAccountKeychain::setAllowedCalls_1Call {
+            keyId: key_id,
+            scopes: encoded_scopes.into(),
+        }
+        .abi_encode();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_tx_origin(account)?;
+            keychain.authorize_key_with_restrictions(
+                account,
+                key_id,
+                IAccountKeychain::SignatureType::Secp256k1,
+                unrestricted_restrictions(),
+                None,
+            )?;
+
+            let old_output = keychain.call(&old_calldata, account).unwrap();
+            assert!(old_output.reverted);
+            assert_eq!(
+                old_output.bytes.as_ref(),
+                IAccountKeychain::setAllowedCalls_0Call::SELECTOR,
+            );
+
+            let output = keychain.call(&new_calldata, account).unwrap();
+            assert!(!output.reverted);
+            let stored = keychain.get_allowed_calls(IAccountKeychain::getAllowedCallsCall {
+                account,
+                keyId: key_id,
+            })?;
+            assert!(stored.isScoped);
+            assert_eq!(stored.scopes.len(), 1);
+            assert_eq!(stored.scopes[0].target, target);
+            assert_eq!(stored.scopes[0].selectorRules.len(), 1);
+            assert_eq!(
+                stored.scopes[0].selectorRules[0].selector,
+                FixedBytes::new([0xaa, 0xbb, 0xcc, 0xdd]),
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rlp_set_allowed_calls_is_disabled_before_t11() {
+        let calldata = IAccountKeychain::setAllowedCalls_1Call {
+            keyId: Address::repeat_byte(0x91),
+            scopes: Bytes::from_static(&[0xc0]),
+        }
+        .abi_encode();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+        let output = StorageCtx::enter(&mut provider, || {
+            AccountKeychain::new().call(&calldata, Address::repeat_byte(0x92))
+        })
+        .unwrap();
+        assert!(output.reverted);
+        assert_eq!(
+            output.bytes.as_ref(),
+            IAccountKeychain::setAllowedCalls_1Call::SELECTOR,
+        );
+    }
+
+    #[test]
+    fn t11_set_allowed_calls_rejects_noncanonical_rlp() {
+        let valid = alloy_rlp::encode(&vec![RlpCallScope {
+            target: Address::repeat_byte(0xa1),
+            selector_rules: Vec::new(),
+        }]);
+        let mut valid_with_trailing = valid;
+        valid_with_trailing.push(0x80);
+        let invalid_inputs = [Vec::new(), vec![0xc0], vec![0x80], valid_with_trailing];
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut keychain = AccountKeychain::new();
+            for scopes in invalid_inputs {
+                let calldata = IAccountKeychain::setAllowedCalls_1Call {
+                    keyId: Address::repeat_byte(0xa2),
+                    scopes: scopes.into(),
+                }
+                .abi_encode();
+                let output = keychain
+                    .call(&calldata, Address::repeat_byte(0xa3))
+                    .unwrap();
+                assert!(output.reverted);
+                assert_eq!(
+                    output.bytes.as_ref(),
+                    IAccountKeychain::InvalidCallScope::SELECTOR,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn t11_set_allowed_calls_charges_rlp_gas_before_decode() {
+        let calldata = IAccountKeychain::setAllowedCalls_1Call {
+            keyId: Address::repeat_byte(0xb1),
+            scopes: Bytes::from_static(&[0x80]),
+        }
+        .abi_encode();
+        let global_input_gas = calldata.len().div_ceil(32) as u64 * 30;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        provider.set_gas_limit(global_input_gas + RLP_INPUT_PER_WORD_COST - 1);
+        let result = StorageCtx::enter(&mut provider, || {
+            AccountKeychain::new().call(&calldata, Address::repeat_byte(0xb2))
+        });
+        assert!(matches!(result, Err(PrecompileError::OutOfGas)));
+    }
+
+    #[test]
+    fn t11_sorted_scope_validation_rejects_duplicates() {
+        let keychain = AccountKeychain::new();
+        let target = tip20_addr();
+        let selector = FixedBytes::from(TIP20_TRANSFER_SELECTOR);
+        let recipient = Address::repeat_byte(0xc1);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        StorageCtx::enter(&mut provider, || {
+            assert!(keychain
+                .validate_call_scopes(&[
+                    IAccountKeychain::CallScope {
+                        target,
+                        selectorRules: Vec::new(),
+                    },
+                    IAccountKeychain::CallScope {
+                        target,
+                        selectorRules: Vec::new(),
+                    },
+                ])
+                .is_err());
+            assert!(keychain
+                .validate_selector_rules(
+                    target,
+                    &[
+                        IAccountKeychain::SelectorRule {
+                            selector,
+                            recipients: Vec::new(),
+                        },
+                        IAccountKeychain::SelectorRule {
+                            selector,
+                            recipients: Vec::new(),
+                        },
+                    ],
+                )
+                .is_err());
+            assert!(keychain
+                .validate_selector_rules(
+                    target,
+                    &[IAccountKeychain::SelectorRule {
+                        selector,
+                        recipients: vec![recipient, recipient],
+                    }],
+                )
+                .is_err());
+        });
     }
 
     #[test]
