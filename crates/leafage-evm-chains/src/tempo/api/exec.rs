@@ -2346,8 +2346,9 @@ mod tests {
 
     #[test]
     fn expiring_nonce_execution_uses_t11_window_and_writes_replay_state() {
-        use crate::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+        use crate::tempo::precompile::storage_credits::StorageCredits;
         use crate::tempo::precompile::storage_types::StorageKey;
+        use crate::tempo::precompile::{NONCE_PRECOMPILE_ADDRESS, STORAGE_CREDITS_ADDRESS};
         use revm::primitives::B256;
 
         let timestamp = 1_770_908_500u64;
@@ -2381,6 +2382,18 @@ mod tests {
         assert_eq!(
             nonce_state.storage[&U256::from(3)].present_value,
             U256::ONE,
+        );
+        assert!(
+            result
+                .state
+                .get(&STORAGE_CREDITS_ADDRESS)
+                .and_then(|account| {
+                    account
+                        .storage
+                        .get(&StorageCredits::slot(NONCE_PRECOMPILE_ADDRESS))
+                })
+                .is_none_or(|slot| slot.present_value.is_zero()),
+            "nonce-manager bookkeeping must not mint TIP-1060 storage credits",
         );
     }
 
