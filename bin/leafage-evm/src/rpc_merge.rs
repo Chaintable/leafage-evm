@@ -3,8 +3,9 @@
 //! The command is deliberately an offline, single-flow operation:
 //!
 //! 1. Open the old and new RocksDB RPC databases read-only.
-//! 2. Merge their sorted account/storage/code streams into bounded-memory
-//!    spool files.
+//! 2. Reconstruct each archive at H-1/H, then merge the sorted account and
+//!    storage streams into bounded-memory spool files. Contract code is emitted
+//!    only for code hashes referenced by changed target-state accounts.
 //! 3. Assemble the final RLP in a second pass, once every list length is known.
 //! 4. Re-scan the sources and verify the final RLP without materializing the
 //!    complete diff in memory.
@@ -15,7 +16,7 @@
 //! of scope. This command only produces and publishes the bridge artifact.
 
 use crate::utils::{parse_kafka_s3_config, state_diff_keyed_by_block_hash, KafkaS3Config};
-use alloy::primitives::B64;
+use alloy::primitives::{keccak256, B64};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use anyhow::{anyhow, bail, Context, Result};
 use aws_sdk_s3::primitives::{ByteStream, Length};
@@ -33,12 +34,14 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
 const COLUMN_FAMILIES: [&str; 6] = ["1", "2", "3", "4", "5", "6"];
 const LATEST_BLOCK_HASH_CF: &str = "1";
 const BLOCK_INFO_CF: &str = "2";
+const BLOCK_HASH_CF: &str = "3";
 const ACCOUNT_CF: &str = "4";
 const STORAGE_CF: &str = "5";
 const CODE_CF: &str = "6";
@@ -49,6 +52,7 @@ const ACCOUNT_SPOOL: &str = "accounts.rlp";
 const DELETED_ACCOUNT_SPOOL: &str = "deleted-accounts.rlp";
 const STORAGE_SPOOL: &str = "storage.records";
 const STORAGE_GROUP_SPOOL: &str = "storage.groups";
+const CODE_REFERENCE_DB: &str = "code-references.rocksdb";
 const CODE_SPOOL: &str = "codes.rlp";
 const ARTIFACT_FILE: &str = "stateDiff.rlp";
 const REPORT_FILE: &str = "report.json";
@@ -62,15 +66,15 @@ const MAX_MULTIPART_PARTS: u64 = 10_000;
 
 #[derive(Debug, Parser)]
 pub struct Command {
-    /// RocksDB directory for the last state served by the old RPC.
+    /// RocksDB directory containing the old RPC state at H-1.
     #[arg(long, value_name = "PATH")]
     old_db: PathBuf,
 
-    /// RocksDB directory for the first state served by the new RPC.
+    /// RocksDB directory containing the new RPC state at H.
     #[arg(long, value_name = "PATH")]
     new_db: PathBuf,
 
-    /// First block height served by the new RPC. The old RPC must be at H-1.
+    /// First block height served by the new RPC. Archive heads may be above H.
     #[arg(long)]
     fork_height: u64,
 
@@ -95,20 +99,31 @@ impl Command {
         fs::create_dir_all(&work_dir)
             .with_context(|| format!("create work directory {}", work_dir.display()))?;
 
+        let old_height = self
+            .fork_height
+            .checked_sub(1)
+            .context("fork height underflow")?;
+        let new_height = self.fork_height;
         info!(target: "rpc_merge", "opening source RPC databases read-only");
-        let old_db = RpcDatabase::open(&self.old_db)?;
-        let new_db = RpcDatabase::open(&self.new_db)?;
-        let old_anchor = old_db.head()?;
-        let new_anchor = new_db.head()?;
+        let old_db = RpcDatabase::open(&self.old_db, old_height)?;
+        let new_db = RpcDatabase::open(&self.new_db, new_height)?;
+        let old_head = old_db.head()?;
+        let new_head = new_db.head()?;
+        validate_coverage("old", old_db.mode, old_height, &old_head)?;
+        validate_coverage("new", new_db.mode, new_height, &new_head)?;
+        let old_anchor = old_db.anchor_at_target()?;
+        let new_anchor = new_db.anchor_at_target()?;
         validate_boundary(self.fork_height, &old_anchor, &new_anchor)?;
 
         info!(
             target: "rpc_merge",
-            "boundary accepted: old block={} hash={} state_root={}, new block={} hash={} state_root={}",
+            "boundary accepted: old target={} (head={}) hash={} state_root={}, new target={} (head={}) hash={} state_root={}",
             old_anchor.number,
+            old_head.number,
             old_anchor.block_hash,
             old_anchor.state_root,
             new_anchor.number,
+            new_head.number,
             new_anchor.block_hash,
             new_anchor.state_root,
         );
@@ -132,7 +147,7 @@ impl Command {
         )?;
 
         // A second head read catches accidental use of a live/moving source.
-        if old_db.head()? != old_anchor || new_db.head()? != new_anchor {
+        if old_db.head()? != old_head || new_db.head()? != new_head {
             bail!("source RPC database head changed while the bridge was being built");
         }
 
@@ -173,11 +188,14 @@ impl Command {
             new_db: self.new_db.clone(),
             old_mode: old_db.mode,
             new_mode: new_db.mode,
+            old_head,
+            new_head,
             old_anchor,
             new_anchor,
             accounts: artifacts.accounts.stats.clone(),
             deleted_accounts: artifacts.deleted_accounts.stats.clone(),
             storage: artifacts.storage.stats.clone(),
+            code_references: artifacts.code_references.stats.clone(),
             codes: artifacts.codes.stats.clone(),
             artifact_path: artifact_path.clone(),
             artifact_bytes: assembled_size,
@@ -262,10 +280,11 @@ struct RpcDatabase {
     db: DB,
     mode: DatabaseMode,
     path: PathBuf,
+    target_height: u64,
 }
 
 impl RpcDatabase {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, target_height: u64) -> Result<Self> {
         let mut options = Options::default();
         options.set_max_open_files(512);
         let db = DB::open_cf_for_read_only(&options, path, COLUMN_FAMILIES, false)
@@ -276,6 +295,7 @@ impl RpcDatabase {
             db,
             mode,
             path: path.to_path_buf(),
+            target_height,
         })
     }
 
@@ -320,6 +340,74 @@ impl RpcDatabase {
         }
     }
 
+    fn anchor_at_target(&self) -> Result<Anchor> {
+        if self.mode == DatabaseMode::Snapshot {
+            let head = self.head()?;
+            if head.number != self.target_height {
+                bail!(
+                    "snapshot database {} only contains head {}, cannot read target height {}",
+                    self.path.display(),
+                    head.number,
+                    self.target_height,
+                );
+            }
+            return Ok(head);
+        }
+
+        let block_hash_cf = self.cf(BLOCK_HASH_CF)?;
+        let block_hash_bytes = self
+            .db
+            .get_cf(block_hash_cf, encode_block_number(self.target_height))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "archive database {} has no block hash at target height {}",
+                    self.path.display(),
+                    self.target_height,
+                )
+            })?;
+        if block_hash_bytes.len() != 32 {
+            bail!(
+                "invalid block hash length at height {} in {}",
+                self.target_height,
+                self.path.display(),
+            );
+        }
+        let block_hash = H256::from_slice(&block_hash_bytes);
+        let block_info_cf = self.cf(BLOCK_INFO_CF)?;
+        let raw = self
+            .db
+            .get_cf(block_info_cf, block_hash.as_slice())?
+            .ok_or_else(|| {
+                anyhow!(
+                    "archive database {} has no block info for target {} ({})",
+                    self.path.display(),
+                    self.target_height,
+                    block_hash,
+                )
+            })?;
+        let header = decode_archive_header(&raw).with_context(|| {
+            format!(
+                "decode archive block info at height {} in {}",
+                self.target_height,
+                self.path.display(),
+            )
+        })?;
+        if header.number != self.target_height {
+            bail!(
+                "archive block index mismatch in {}: target {} resolved to header {}",
+                self.path.display(),
+                self.target_height,
+                header.number,
+            );
+        }
+        Ok(Anchor {
+            number: header.number,
+            block_hash,
+            parent_hash: header.parent_hash,
+            state_root: header.state_root,
+        })
+    }
+
     fn account_iter(&self) -> Result<Box<dyn Iterator<Item = Result<(H256, NewAccount)>> + '_>> {
         let cf = self.cf(ACCOUNT_CF)?;
         let iter = self
@@ -337,6 +425,7 @@ impl RpcDatabase {
         }
 
         let inverted = self.mode.is_inverted();
+        let target_height = self.target_height;
         let mut iter = iter.peekable();
         let mut consumed_prefix: Option<[u8; 32]> = None;
         Ok(Box::new(std::iter::from_fn(move || loop {
@@ -352,15 +441,38 @@ impl RpcDatabase {
                 )));
             }
             let prefix: [u8; 32] = key[..32].try_into().expect("checked key length");
+            if consumed_prefix == Some(prefix) {
+                continue;
+            }
             let sentinel = !inverted && is_legacy_sentinel(&key[32..64]);
-            let newest = if inverted {
-                let newest = consumed_prefix != Some(prefix);
+            if sentinel {
+                continue;
+            }
+            let height = match decode_version_height(&key[32..64], inverted) {
+                Ok(height) => height,
+                Err(error) => return Some(Err(error)),
+            };
+            let selected = if inverted {
+                if height > target_height {
+                    continue;
+                }
                 consumed_prefix = Some(prefix);
-                newest
+                true
             } else {
-                match iter.peek() {
+                if height > target_height {
+                    consumed_prefix = Some(prefix);
+                    continue;
+                }
+                let later_at_or_before_target = match iter.peek() {
                     Some(Ok((next_key, _))) if next_key.len() == 64 => {
-                        next_key[..32] != prefix || is_legacy_sentinel(&next_key[32..64])
+                        if next_key[..32] != prefix || is_legacy_sentinel(&next_key[32..64]) {
+                            false
+                        } else {
+                            match decode_version_height(&next_key[32..64], false) {
+                                Ok(next_height) => next_height <= target_height,
+                                Err(error) => return Some(Err(error)),
+                            }
+                        }
                     }
                     Some(Ok((next_key, _))) => {
                         return Some(Err(anyhow!(
@@ -368,10 +480,18 @@ impl RpcDatabase {
                             next_key.len()
                         )))
                     }
-                    Some(Err(_)) | None => true,
+                    Some(Err(error)) => {
+                        return Some(Err(anyhow!("RocksDB account iterator failed: {error}")))
+                    }
+                    None => false,
+                };
+                if later_at_or_before_target {
+                    continue;
                 }
+                consumed_prefix = Some(prefix);
+                true
             };
-            if sentinel || !newest || value.is_empty() {
+            if !selected || value.is_empty() {
                 continue;
             }
             let address = H256::from(prefix);
@@ -398,6 +518,7 @@ impl RpcDatabase {
         }
 
         let inverted = self.mode.is_inverted();
+        let target_height = self.target_height;
         let mut iter = iter.peekable();
         let mut consumed_prefix: Option<[u8; 64]> = None;
         Ok(Box::new(std::iter::from_fn(move || loop {
@@ -413,15 +534,38 @@ impl RpcDatabase {
                 )));
             }
             let prefix: [u8; 64] = key[..64].try_into().expect("checked key length");
+            if consumed_prefix == Some(prefix) {
+                continue;
+            }
             let sentinel = !inverted && is_legacy_sentinel(&key[64..96]);
-            let newest = if inverted {
-                let newest = consumed_prefix != Some(prefix);
+            if sentinel {
+                continue;
+            }
+            let height = match decode_version_height(&key[64..96], inverted) {
+                Ok(height) => height,
+                Err(error) => return Some(Err(error)),
+            };
+            let selected = if inverted {
+                if height > target_height {
+                    continue;
+                }
                 consumed_prefix = Some(prefix);
-                newest
+                true
             } else {
-                match iter.peek() {
+                if height > target_height {
+                    consumed_prefix = Some(prefix);
+                    continue;
+                }
+                let later_at_or_before_target = match iter.peek() {
                     Some(Ok((next_key, _))) if next_key.len() == 96 => {
-                        next_key[..64] != prefix || is_legacy_sentinel(&next_key[64..96])
+                        if next_key[..64] != prefix || is_legacy_sentinel(&next_key[64..96]) {
+                            false
+                        } else {
+                            match decode_version_height(&next_key[64..96], false) {
+                                Ok(next_height) => next_height <= target_height,
+                                Err(error) => return Some(Err(error)),
+                            }
+                        }
                     }
                     Some(Ok((next_key, _))) => {
                         return Some(Err(anyhow!(
@@ -429,10 +573,18 @@ impl RpcDatabase {
                             next_key.len()
                         )))
                     }
-                    Some(Err(_)) | None => true,
+                    Some(Err(error)) => {
+                        return Some(Err(anyhow!("RocksDB storage iterator failed: {error}")))
+                    }
+                    None => false,
+                };
+                if later_at_or_before_target {
+                    continue;
                 }
+                consumed_prefix = Some(prefix);
+                true
             };
-            if sentinel || !newest {
+            if !selected {
                 continue;
             }
             let storage_value = U256::from_be_slice(&value);
@@ -551,11 +703,50 @@ fn is_legacy_sentinel(tail: &[u8]) -> bool {
     tail.len() == 32 && tail[24..32] == u64::MAX.to_be_bytes()
 }
 
+fn encode_block_number(number: u64) -> [u8; 32] {
+    let mut encoded = [0u8; 32];
+    encoded[24..].copy_from_slice(&number.to_be_bytes());
+    encoded
+}
+
+fn decode_version_height(tail: &[u8], inverted: bool) -> Result<u64> {
+    if tail.len() != 32 || tail[..24].iter().any(|byte| *byte != 0) {
+        bail!("archive version tail is not a canonical 32-byte block number");
+    }
+    let raw = u64::from_be_bytes(tail[24..].try_into().expect("checked tail length"));
+    Ok(if inverted { u64::MAX - raw } else { raw })
+}
+
 fn read_options() -> ReadOptions {
     let mut options = ReadOptions::default();
     options.set_verify_checksums(false);
     options.set_total_order_seek(true);
     options
+}
+
+fn validate_coverage(
+    label: &str,
+    mode: DatabaseMode,
+    target_height: u64,
+    head: &Anchor,
+) -> Result<()> {
+    match mode {
+        DatabaseMode::Snapshot if head.number != target_height => bail!(
+            "{label} snapshot database only contains head {}, target height is {}",
+            head.number,
+            target_height,
+        ),
+        DatabaseMode::ArchiveLegacy | DatabaseMode::ArchiveInverted
+            if head.number < target_height =>
+        {
+            bail!(
+                "{label} archive head {} is below target height {}",
+                head.number,
+                target_height,
+            )
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_boundary(fork_height: u64, old: &Anchor, new: &Anchor) -> Result<()> {
@@ -564,14 +755,14 @@ fn validate_boundary(fork_height: u64, old: &Anchor, new: &Anchor) -> Result<()>
         .ok_or_else(|| anyhow!("fork height underflow"))?;
     if old.number != expected_old {
         bail!(
-            "old RPC head must be block {}, found {}",
+            "old RPC target must be block {}, found {}",
             expected_old,
             old.number
         );
     }
     if new.number != fork_height {
         bail!(
-            "new RPC head must be block {}, found {}",
+            "new RPC target must be block {}, found {}",
             fork_height,
             new.number
         );
@@ -590,6 +781,13 @@ fn validate_boundary(fork_height: u64, old: &Anchor, new: &Anchor) -> Result<()>
 struct SectionStats {
     records: u64,
     encoded_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CodeReferenceStats {
+    observations: u64,
+    unique_records: u64,
     sha256: String,
 }
 
@@ -619,6 +817,7 @@ struct Artifacts {
     accounts: EncodedArtifact,
     deleted_accounts: EncodedArtifact,
     storage: StorageArtifact,
+    code_references: CodeReferences,
     codes: EncodedArtifact,
 }
 
@@ -669,6 +868,113 @@ impl EncodedSpool {
                 sha256: digest_hex(self.hasher),
             },
         })
+    }
+}
+
+struct CodeReferenceDigest {
+    hasher: Sha256,
+    observations: u64,
+}
+
+impl CodeReferenceDigest {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            observations: 0,
+        }
+    }
+
+    fn append(&mut self, code_hash: H256) -> Result<()> {
+        let empty_code_hash: H256 = KECCAK256_EMPTY.0.into();
+        if code_hash == empty_code_hash {
+            return Ok(());
+        }
+        self.hasher.update(code_hash.as_slice());
+        self.observations = self
+            .observations
+            .checked_add(1)
+            .context("code reference count overflow")?;
+        Ok(())
+    }
+
+    fn finish(self, unique_records: u64) -> CodeReferenceStats {
+        CodeReferenceStats {
+            observations: self.observations,
+            unique_records,
+            sha256: digest_hex(self.hasher),
+        }
+    }
+}
+
+struct CodeReferenceBuilder {
+    db: DB,
+    digest: CodeReferenceDigest,
+}
+
+impl CodeReferenceBuilder {
+    fn create(work_dir: &Path) -> Result<Self> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_nanos();
+        let path = work_dir.join(format!(
+            "{CODE_REFERENCE_DB}-{}-{unique}",
+            std::process::id()
+        ));
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_max_open_files(64);
+        options.set_write_buffer_size(8 * 1024 * 1024);
+        let db = DB::open(&options, &path)
+            .with_context(|| format!("create code-reference database {}", path.display()))?;
+        Ok(Self {
+            db,
+            digest: CodeReferenceDigest::new(),
+        })
+    }
+
+    fn append(&mut self, code_hash: H256) -> Result<()> {
+        let empty_code_hash: H256 = KECCAK256_EMPTY.0.into();
+        if code_hash == empty_code_hash {
+            return Ok(());
+        }
+        self.db.put(code_hash.as_slice(), b"")?;
+        self.digest.append(code_hash)
+    }
+
+    fn finish(self) -> Result<CodeReferences> {
+        self.db.flush()?;
+        let mut unique_records = 0u64;
+        for item in self.db.iterator(IteratorMode::Start) {
+            let (key, _) = item?;
+            if key.len() != 32 {
+                bail!("code reference key must be 32 bytes, got {}", key.len());
+            }
+            unique_records = unique_records
+                .checked_add(1)
+                .context("unique code reference count overflow")?;
+        }
+        Ok(CodeReferences {
+            db: self.db,
+            stats: self.digest.finish(unique_records),
+        })
+    }
+}
+
+struct CodeReferences {
+    db: DB,
+    stats: CodeReferenceStats,
+}
+
+impl CodeReferences {
+    fn iter(&self) -> Box<dyn Iterator<Item = Result<H256>> + '_> {
+        Box::new(self.db.iterator(IteratorMode::Start).map(|item| {
+            let (key, _) = item?;
+            if key.len() != 32 {
+                bail!("code reference key must be 32 bytes, got {}", key.len());
+            }
+            Ok(H256::from_slice(&key))
+        }))
     }
 }
 
@@ -804,12 +1110,22 @@ fn build_spools(old: &RpcDatabase, new: &RpcDatabase, work_dir: &Path) -> Result
     info!(target: "rpc_merge", "streaming account differences");
     let mut accounts = EncodedSpool::create(work_dir.join(ACCOUNT_SPOOL))?;
     let mut deleted = EncodedSpool::create(work_dir.join(DELETED_ACCOUNT_SPOOL))?;
+    let mut code_references = CodeReferenceBuilder::create(work_dir)?;
     scan_accounts(
         old.account_iter()?,
         new.account_iter()?,
-        |account| accounts.append(account),
+        |account, code_changed| {
+            accounts.append(account)?;
+            if code_changed {
+                code_references.append(account.code_hash)?;
+            }
+            Ok(())
+        },
         |address| deleted.append(address),
     )?;
+    let accounts = accounts.finish()?;
+    let deleted = deleted.finish()?;
+    let code_references = code_references.finish()?;
 
     info!(target: "rpc_merge", "streaming storage differences");
     let mut storage = StorageSpool::create(
@@ -822,25 +1138,27 @@ fn build_spools(old: &RpcDatabase, new: &RpcDatabase, work_dir: &Path) -> Result
         |address, index, value| storage.append(address, index, value),
     )?;
 
-    info!(target: "rpc_merge", "streaming code differences");
+    info!(target: "rpc_merge", "streaming target-height referenced codes");
     let mut codes = EncodedSpool::create(work_dir.join(CODE_SPOOL))?;
-    scan_codes(old.code_iter()?, new.code_iter()?, |code| {
+    scan_referenced_codes(new.code_iter()?, code_references.iter(), |code| {
         codes.append(code)
     })?;
 
     let artifacts = Artifacts {
-        accounts: accounts.finish()?,
-        deleted_accounts: deleted.finish()?,
+        accounts,
+        deleted_accounts: deleted,
         storage: storage.finish()?,
+        code_references,
         codes: codes.finish()?,
     };
     info!(
         target: "rpc_merge",
-        "spools complete: accounts={} deleted={} storage_slots={} storage_accounts={} codes={}",
+        "spools complete: accounts={} deleted={} storage_slots={} storage_accounts={} code_refs={} codes={}",
         artifacts.accounts.stats.records,
         artifacts.deleted_accounts.stats.records,
         artifacts.storage.stats.records,
         artifacts.storage.stats.groups,
+        artifacts.code_references.stats.unique_records,
         artifacts.codes.stats.records,
     );
     Ok(artifacts)
@@ -855,7 +1173,7 @@ fn scan_accounts<IO, IN, FU, FD>(
 where
     IO: Iterator<Item = Result<(H256, NewAccount)>>,
     IN: Iterator<Item = Result<(H256, NewAccount)>>,
-    FU: FnMut(&NewAccount) -> Result<()>,
+    FU: FnMut(&NewAccount, bool) -> Result<()>,
     FD: FnMut(&H256) -> Result<()>,
 {
     let mut old_value = next_item(&mut old)?;
@@ -868,7 +1186,7 @@ where
                 old_value = next_item(&mut old)?;
             }
             (None, Some((_, new_account))) => {
-                update(new_account)?;
+                update(new_account, true)?;
                 new_value = next_item(&mut new)?;
             }
             (Some((old_address, old_account)), Some((new_address, new_account))) => {
@@ -878,12 +1196,12 @@ where
                         old_value = next_item(&mut old)?;
                     }
                     Ordering::Greater => {
-                        update(new_account)?;
+                        update(new_account, true)?;
                         new_value = next_item(&mut new)?;
                     }
                     Ordering::Equal => {
                         if old_account != new_account {
-                            update(new_account)?;
+                            update(new_account, old_account.code_hash != new_account.code_hash)?;
                         }
                         old_value = next_item(&mut old)?;
                         new_value = next_item(&mut new)?;
@@ -939,45 +1257,38 @@ where
     Ok(())
 }
 
-fn scan_codes<IO, IN, F>(mut old: IO, mut new: IN, mut added: F) -> Result<()>
+fn scan_referenced_codes<IN, IR, F>(mut new: IN, mut references: IR, mut added: F) -> Result<()>
 where
-    IO: Iterator<Item = Result<(H256, Bytes)>>,
     IN: Iterator<Item = Result<(H256, Bytes)>>,
+    IR: Iterator<Item = Result<H256>>,
     F: FnMut(&NewCode) -> Result<()>,
 {
-    let mut old_value = next_item(&mut old)?;
     let mut new_value = next_item(&mut new)?;
-    loop {
-        match (&old_value, &new_value) {
-            (None, None) => break,
-            (Some(_), None) => old_value = next_item(&mut old)?,
-            (None, Some((hash, code))) => {
-                added(&NewCode {
-                    code_hash: *hash,
-                    code: code.clone(),
-                })?;
-                new_value = next_item(&mut new)?;
-            }
-            (Some((old_hash, old_code)), Some((new_hash, new_code))) => {
-                match old_hash.cmp(new_hash) {
-                    Ordering::Less => old_value = next_item(&mut old)?,
-                    Ordering::Greater => {
-                        added(&NewCode {
-                            code_hash: *new_hash,
-                            code: new_code.clone(),
-                        })?;
-                        new_value = next_item(&mut new)?;
-                    }
-                    Ordering::Equal => {
-                        if old_code != new_code {
-                            bail!("code bytes differ for the same hash {}", old_hash);
-                        }
-                        old_value = next_item(&mut old)?;
-                        new_value = next_item(&mut new)?;
-                    }
-                }
-            }
+    while let Some(reference) = next_item(&mut references)? {
+        while new_value
+            .as_ref()
+            .is_some_and(|(code_hash, _)| *code_hash < reference)
+        {
+            new_value = next_item(&mut new)?;
         }
+        let Some((code_hash, code)) = &new_value else {
+            bail!("target state references missing code {}", reference);
+        };
+        if *code_hash != reference {
+            bail!("target state references missing code {}", reference);
+        }
+        let actual_hash: H256 = keccak256(code.as_ref()).into();
+        if actual_hash != reference {
+            bail!(
+                "code bytes hash {} does not match database key {}",
+                actual_hash,
+                reference,
+            );
+        }
+        added(&NewCode {
+            code_hash: reference,
+            code: code.clone(),
+        })?;
     }
     Ok(())
 }
@@ -1131,10 +1442,17 @@ fn verify_sources(old: &RpcDatabase, new: &RpcDatabase, artifacts: &Artifacts) -
     info!(target: "rpc_merge", "re-scanning sources for streaming verification");
     let mut accounts = EncodedDigest::new();
     let mut deleted = EncodedDigest::new();
+    let mut code_references = CodeReferenceDigest::new();
     scan_accounts(
         old.account_iter()?,
         new.account_iter()?,
-        |account| accounts.append(account),
+        |account, code_changed| {
+            accounts.append(account)?;
+            if code_changed {
+                code_references.append(account.code_hash)?;
+            }
+            Ok(())
+        },
         |address| deleted.append(address),
     )?;
     if accounts.finish() != artifacts.accounts.stats {
@@ -1142,6 +1460,11 @@ fn verify_sources(old: &RpcDatabase, new: &RpcDatabase, artifacts: &Artifacts) -
     }
     if deleted.finish() != artifacts.deleted_accounts.stats {
         bail!("deleted-account spool verification failed");
+    }
+    if code_references.finish(artifacts.code_references.stats.unique_records)
+        != artifacts.code_references.stats
+    {
+        bail!("code-reference verification failed");
     }
 
     let mut storage = StorageDigest::new();
@@ -1155,7 +1478,7 @@ fn verify_sources(old: &RpcDatabase, new: &RpcDatabase, artifacts: &Artifacts) -
     }
 
     let mut codes = EncodedDigest::new();
-    scan_codes(old.code_iter()?, new.code_iter()?, |code| {
+    scan_referenced_codes(new.code_iter()?, artifacts.code_references.iter(), |code| {
         codes.append(code)
     })?;
     if codes.finish() != artifacts.codes.stats {
@@ -1776,11 +2099,14 @@ struct MergeReport {
     new_db: PathBuf,
     old_mode: DatabaseMode,
     new_mode: DatabaseMode,
+    old_head: Anchor,
+    new_head: Anchor,
     old_anchor: Anchor,
     new_anchor: Anchor,
     accounts: SectionStats,
     deleted_accounts: SectionStats,
     storage: StorageStats,
+    code_references: CodeReferenceStats,
     codes: SectionStats,
     artifact_path: PathBuf,
     artifact_bytes: u64,
