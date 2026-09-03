@@ -15,9 +15,6 @@ mod utils;
 mod pprof;
 mod warm;
 
-#[cfg(test)]
-mod arc_fixture_tests;
-
 use clap::Parser;
 use runner::Cli;
 use tikv_jemallocator;
