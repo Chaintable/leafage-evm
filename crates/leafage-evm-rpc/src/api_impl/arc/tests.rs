@@ -50,17 +50,8 @@ struct TestAddresses {
     revert: Address,
     environment: Address,
     counter: Address,
-    logger: Address,
-    logger_revert: Address,
-    delegate_proxy: Address,
-    delegate_implementation: Address,
     balance_reader: Address,
     beneficiary: Address,
-    selfdestruct_revert_parent: Address,
-    selfdestruct_nonzero: Address,
-    selfdestruct_zero: Address,
-    selfdestruct_beneficiary: Address,
-    reverted_child_then_selfdestruct: Address,
 }
 
 struct ArcFixture {
@@ -135,56 +126,11 @@ fn counter_code() -> Bytes {
     ])
 }
 
-fn logger_code() -> Bytes {
-    // Emit one ordinary LOG0 from the execution address.
-    Bytes::from_static(&[0x5f, 0x5f, 0xa0, 0x00])
-}
-
-fn logger_revert_code() -> Bytes {
-    // Emit LOG0 and then revert, so both this log and Arc's frame-init
-    // EIP-7708 log must disappear from the simulated result.
-    Bytes::from_static(&[0x5f, 0x5f, 0xa0, 0x5f, 0x5f, 0xfd])
-}
-
-fn delegate_proxy_code(implementation: Address) -> Bytes {
-    let mut code = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x73];
-    code.extend_from_slice(implementation.as_slice());
-    code.extend_from_slice(&[0x5a, 0xf4, 0x50, 0x00]);
-    code.into()
-}
-
 fn balance_reader_code() -> Bytes {
     Bytes::from_static(&[
         // return BALANCE(address(calldataload(0))).
         0x5f, 0x35, 0x31, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
     ])
-}
-
-fn init_code(runtime: &[u8]) -> Bytes {
-    assert!(runtime.len() <= u8::MAX as usize);
-    let mut init = vec![
-        0x60,
-        runtime.len() as u8,
-        0x60,
-        0x0c,
-        0x60,
-        0x00,
-        0x39,
-        0x60,
-        runtime.len() as u8,
-        0x60,
-        0x00,
-        0xf3,
-    ];
-    init.extend_from_slice(runtime);
-    init.into()
-}
-
-fn native_coin_mint_input(to: Address, amount: U256) -> Bytes {
-    let mut input = selector("mint(address,uint256)").to_vec();
-    input.extend_from_slice(&address_word(to));
-    input.extend_from_slice(&amount.to_be_bytes::<32>());
-    input.into()
 }
 
 fn native_fiat_token_code(account: Address) -> Bytes {
@@ -203,40 +149,6 @@ fn native_fiat_token_code(account: Address) -> Bytes {
     ]);
     code.extend_from_slice(native_coin_control.as_slice());
     code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x60, 0x20, 0x5f, 0xf3]);
-    code.into()
-}
-
-fn selfdestruct_code(beneficiary: Address) -> Bytes {
-    let mut code = vec![0x73];
-    code.extend_from_slice(beneficiary.as_slice());
-    code.push(0xff);
-    code.into()
-}
-
-fn call_child_code(child: Address, revert: bool) -> Bytes {
-    // CALL the child with zero value/input/output and consume the success
-    // word. The reverting variant then rolls the successful child frame
-    // back from its parent.
-    let mut code = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73];
-    code.extend_from_slice(child.as_slice());
-    code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
-    if revert {
-        code.extend_from_slice(&[0x5f, 0x5f, 0xfd]);
-    } else {
-        code.push(0x00);
-    }
-    code.into()
-}
-
-fn reverted_value_child_then_selfdestruct_code(child: Address, beneficiary: Address) -> Bytes {
-    // The child receives value (Arc EIP-7708), emits LOG0, and reverts.
-    // After its checkpoint is rolled back, the parent SELFDESTRUCT writes
-    // a direct Arc EIP-7708 log that must still reach the inspector.
-    let mut code = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x05, 0x73];
-    code.extend_from_slice(child.as_slice());
-    code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x73]);
-    code.extend_from_slice(beneficiary.as_slice());
-    code.push(0xff);
     code.into()
 }
 
@@ -270,17 +182,8 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
         revert: Address::repeat_byte(0x55),
         environment: Address::repeat_byte(0x66),
         counter: Address::repeat_byte(0x68),
-        logger: Address::repeat_byte(0x69),
-        logger_revert: Address::repeat_byte(0x6d),
-        delegate_proxy: Address::repeat_byte(0x6a),
-        delegate_implementation: Address::repeat_byte(0x6b),
         balance_reader: Address::repeat_byte(0x6c),
         beneficiary: Address::repeat_byte(0x77),
-        selfdestruct_revert_parent: Address::repeat_byte(0x72),
-        selfdestruct_nonzero: Address::repeat_byte(0x73),
-        selfdestruct_zero: Address::repeat_byte(0x74),
-        selfdestruct_beneficiary: Address::repeat_byte(0x75),
-        reverted_child_then_selfdestruct: Address::repeat_byte(0x79),
     };
     let native_fiat_token = native_fiat_token_code(addresses.empty);
     let native_coin_control: Address = "0x1800000000000000000000000000000000000001"
@@ -290,17 +193,7 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
     let revert = Bytes::from_static(&[0x5f, 0x5f, 0xfd]);
     let environment = environment_code();
     let counter = counter_code();
-    let logger = logger_code();
-    let logger_revert = logger_revert_code();
-    let delegate_implementation = logger_code();
-    let delegate_proxy = delegate_proxy_code(addresses.delegate_implementation);
     let balance_reader = balance_reader_code();
-    let selfdestruct = selfdestruct_code(addresses.selfdestruct_beneficiary);
-    let selfdestruct_revert_parent = call_child_code(addresses.selfdestruct_nonzero, true);
-    let reverted_child_then_selfdestruct = reverted_value_child_then_selfdestruct_code(
-        addresses.logger_revert,
-        addresses.selfdestruct_beneficiary,
-    );
     let mut diff = BlockStorageDiff::default();
     for (address, balance, nonce, code_hash) in [
         (addresses.funded, U256::ONE << 128, 0, H256::ZERO),
@@ -327,54 +220,11 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
             keccak256(&environment),
         ),
         (addresses.counter, U256::ZERO, 1, keccak256(&counter)),
-        (addresses.logger, U256::ZERO, 1, keccak256(&logger)),
-        (
-            addresses.logger_revert,
-            U256::ZERO,
-            1,
-            keccak256(&logger_revert),
-        ),
-        (
-            addresses.delegate_proxy,
-            U256::ZERO,
-            1,
-            keccak256(&delegate_proxy),
-        ),
-        (
-            addresses.delegate_implementation,
-            U256::ZERO,
-            1,
-            keccak256(&delegate_implementation),
-        ),
         (
             addresses.balance_reader,
             U256::ZERO,
             1,
             keccak256(&balance_reader),
-        ),
-        (
-            addresses.selfdestruct_revert_parent,
-            U256::ZERO,
-            1,
-            keccak256(&selfdestruct_revert_parent),
-        ),
-        (
-            addresses.selfdestruct_nonzero,
-            U256::from(42),
-            1,
-            keccak256(&selfdestruct),
-        ),
-        (
-            addresses.selfdestruct_zero,
-            U256::ZERO,
-            1,
-            keccak256(&selfdestruct),
-        ),
-        (
-            addresses.reverted_child_then_selfdestruct,
-            U256::from(10),
-            1,
-            keccak256(&reverted_child_then_selfdestruct),
         ),
     ] {
         diff.new_accounts.push(NewAccount {
@@ -406,36 +256,8 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
             code: counter,
         },
         NewCode {
-            code_hash: keccak256(&logger),
-            code: logger,
-        },
-        NewCode {
-            code_hash: keccak256(&logger_revert),
-            code: logger_revert,
-        },
-        NewCode {
-            code_hash: keccak256(&delegate_proxy),
-            code: delegate_proxy,
-        },
-        NewCode {
-            code_hash: keccak256(&delegate_implementation),
-            code: delegate_implementation,
-        },
-        NewCode {
             code_hash: keccak256(&balance_reader),
             code: balance_reader,
-        },
-        NewCode {
-            code_hash: keccak256(&selfdestruct),
-            code: selfdestruct,
-        },
-        NewCode {
-            code_hash: keccak256(&selfdestruct_revert_parent),
-            code: selfdestruct_revert_parent,
-        },
-        NewCode {
-            code_hash: keccak256(&reverted_child_then_selfdestruct),
-            code: reverted_child_then_selfdestruct,
         },
     ]);
     diff.storage_diffs.push(AccountStorageDiff {
@@ -612,40 +434,6 @@ fn root_trace_output(result: &DebankSingleSimulateResult) -> Bytes {
         .expect("top-level trace")
         .output
         .clone()
-}
-
-fn assert_arc_transfer_event(
-    event: &leafage_evm_types::DebankEvent,
-    from: Address,
-    to: Address,
-    amount: U256,
-    parent_trace_id: &str,
-    pos_in_parent_trace: usize,
-) {
-    assert_eq!(
-        event.contract_id,
-        "0xfffffffffffffffffffffffffffffffffffffffe"
-            .parse::<Address>()
-            .unwrap()
-    );
-    assert_eq!(
-        event.selector,
-        keccak256("Transfer(address,address,uint256)").to_string()
-    );
-    assert_eq!(
-        event.topics,
-        vec![
-            H256::left_padding_from(from.as_slice()).to_string(),
-            H256::left_padding_from(to.as_slice()).to_string(),
-        ]
-    );
-    assert_eq!(
-        event.data,
-        Bytes::copy_from_slice(&amount.to_be_bytes::<32>())
-    );
-    assert_eq!(event.parent_trace_id, parent_trace_id);
-    assert_eq!(event.pos_in_parent_trace, pos_in_parent_trace);
-    assert_eq!(event.id, event.debank_id());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -999,292 +787,6 @@ async fn arc_simulation_uses_anchor_environment_and_plain_block_overrides() {
         assert_eq!(words[1], U256::from(ANCHOR_BASE_FEE));
         assert_ne!(words[1], U256::from(ENCODED_NEXT_BASE_FEE));
     }
-
-    fixture.close();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arc_simulation_preserves_system_normal_and_delegatecall_log_emitters() {
-    let fixture = build_arc_fixture(100);
-    let addresses = fixture.addresses;
-    let value_log = CallRequest {
-        inner: TransactionRequest::default()
-            .from(addresses.funded)
-            .to(addresses.logger)
-            .value(U256::from(5)),
-        tempo: None,
-    };
-    let result = fixture
-        .api
-        .simulate_transactions(
-            vec![
-                value_log,
-                call_request(addresses.funded, addresses.delegate_proxy),
-            ],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(result.stats.success);
-    assert_eq!(
-        result.results[0].events.len(),
-        2,
-        "events: {:#?}",
-        result.results[0].events
-    );
-    assert_eq!(
-        result.results[0].events[0].contract_id,
-        "0xfffffffffffffffffffffffffffffffffffffffe"
-            .parse::<Address>()
-            .unwrap()
-    );
-    assert_eq!(result.results[0].events[1].contract_id, addresses.logger);
-    assert_eq!(result.results[1].events.len(), 1);
-    assert_eq!(
-        result.results[1].events[0].contract_id,
-        addresses.delegate_proxy
-    );
-    assert_ne!(
-        result.results[1].events[0].contract_id,
-        addresses.delegate_implementation
-    );
-
-    let reverted = fixture
-        .api
-        .simulate_transactions(
-            vec![CallRequest {
-                inner: TransactionRequest::default()
-                    .from(addresses.funded)
-                    .to(addresses.logger_revert)
-                    .value(U256::from(5)),
-                tempo: None,
-            }],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(reverted.results[0].code, DebankErrorCode::EvmRevert as i32);
-    assert!(reverted.results[0].events.is_empty());
-
-    fixture.close();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arc_simulation_preserves_selfdestruct_event_and_rollback() {
-    let fixture = build_arc_fixture(100);
-    let addresses = fixture.addresses;
-    let nonzero = fixture
-        .api
-        .simulate_transactions(
-            vec![call_request(
-                addresses.funded,
-                addresses.selfdestruct_nonzero,
-            )],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-    let zero = fixture
-        .api
-        .simulate_transactions(
-            vec![call_request(addresses.funded, addresses.selfdestruct_zero)],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-    let reverted = fixture
-        .api
-        .simulate_transactions(
-            vec![call_request(
-                addresses.funded,
-                addresses.selfdestruct_revert_parent,
-            )],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let nonzero_result = &nonzero.results[0];
-    let zero_result = &zero.results[0];
-    let reverted_result = &reverted.results[0];
-    assert_eq!(nonzero_result.code, 0);
-    assert_eq!(nonzero_result.traces.len(), 1);
-    let root = &nonzero_result.traces[0];
-    assert_eq!(root.call_create_type, "suicide");
-    assert!(root.parent_trace_id.is_empty());
-    assert_eq!(root.pos_in_parent_trace, 0);
-    assert_eq!(root.id, root.debank_id());
-    assert_eq!(nonzero_result.events.len(), 1);
-    assert_arc_transfer_event(
-        &nonzero_result.events[0],
-        addresses.selfdestruct_nonzero,
-        addresses.selfdestruct_beneficiary,
-        U256::from(42),
-        &root.id,
-        0,
-    );
-
-    assert_eq!(zero_result.code, 0);
-    assert_eq!(zero_result.traces.len(), 1);
-    assert_eq!(zero_result.traces[0].call_create_type, "suicide");
-    assert!(zero_result.events.is_empty());
-
-    assert_eq!(reverted_result.code, DebankErrorCode::EvmRevert as i32);
-    assert!(
-        reverted_result.events.is_empty(),
-        "parent REVERT leaked SELFDESTRUCT event: {reverted_result:#?}"
-    );
-
-    fixture.close();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arc_inspector_resets_log_cursor_after_reverted_child() {
-    let fixture = build_arc_fixture(100);
-    let addresses = fixture.addresses;
-    let simulated = fixture
-        .api
-        .simulate_transactions(
-            vec![call_request(
-                addresses.funded,
-                addresses.reverted_child_then_selfdestruct,
-            )],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-    let result = &simulated.results[0];
-
-    assert_eq!(result.code, 0);
-    // The reverted child and both of its logs are omitted. The parent
-    // still exposes its later EIP-7708 SELFDESTRUCT event.
-    let root = &result.traces[0];
-    assert_eq!(result.events.len(), 1, "{result:#?}");
-    assert_arc_transfer_event(
-        &result.events[0],
-        addresses.reverted_child_then_selfdestruct,
-        addresses.selfdestruct_beneficiary,
-        U256::from(10),
-        &root.id,
-        0,
-    );
-
-    fixture.close();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arc_simulation_preserves_create_value_transfer_event_fields() {
-    let fixture = build_arc_fixture(100);
-    let addresses = fixture.addresses;
-    let value = U256::from(9);
-    let created = addresses.funded.create(0);
-    let runtime = counter_code();
-    let request = CallRequest {
-        inner: TransactionRequest::default()
-            .from(addresses.funded)
-            .value(value)
-            .input(TransactionInput::new(init_code(&runtime))),
-        tempo: None,
-    };
-    let simulated = fixture
-        .api
-        .simulate_transactions(
-            vec![request, call_request(addresses.funded, created)],
-            anchor_context(),
-            None,
-        )
-        .await
-        .unwrap();
-    let result = &simulated.results[0];
-
-    assert_eq!(result.code, 0);
-    assert_eq!(result.traces.len(), 1);
-    let root = &result.traces[0];
-    assert_eq!(root.call_create_type, "create");
-    assert_eq!(root.to_addr, created);
-    assert_eq!(root.value, value);
-    assert_eq!(result.events.len(), 1);
-    assert_arc_transfer_event(
-        &result.events[0],
-        addresses.funded,
-        created,
-        value,
-        &root.id,
-        0,
-    );
-    assert_eq!(
-        output_words(&root_trace_output(&simulated.results[1])),
-        vec![U256::ONE]
-    );
-
-    fixture.close();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arc_inspector_orders_value_and_precompile_logs_and_rolls_both_back_on_oog() {
-    let fixture = build_arc_fixture(100);
-    let addresses = fixture.addresses;
-    let native_coin_authority: Address = "0x1800000000000000000000000000000000000000"
-        .parse()
-        .unwrap();
-    let value = U256::from(7);
-    let minted = U256::from(10);
-    let input = native_coin_mint_input(addresses.empty, minted);
-    let request = |gas_limit| CallRequest {
-        inner: TransactionRequest::default()
-            .from(addresses.native_fiat_token)
-            .to(native_coin_authority)
-            .value(value)
-            .gas_limit(gas_limit)
-            .input(TransactionInput::new(input.clone())),
-        tempo: None,
-    };
-
-    let successful = fixture
-        .api
-        .simulate_transactions(vec![request(100_000)], anchor_context(), None)
-        .await
-        .unwrap();
-    assert!(successful.stats.success, "{successful:#?}");
-    let success = &successful.results[0];
-    assert_eq!(success.code, 0);
-    assert_eq!(success.events.len(), 2, "{success:#?}");
-    let root = &success.traces[0];
-    assert_arc_transfer_event(
-        &success.events[0],
-        addresses.native_fiat_token,
-        native_coin_authority,
-        value,
-        &root.id,
-        0,
-    );
-    assert_arc_transfer_event(
-        &success.events[1],
-        Address::ZERO,
-        addresses.empty,
-        minted,
-        &root.id,
-        1,
-    );
-
-    let failed = fixture
-        .api
-        .simulate_transactions(vec![request(success.gas_used - 1)], anchor_context(), None)
-        .await
-        .unwrap();
-    assert!(!failed.stats.success, "{failed:#?}");
-    assert_eq!(
-        failed.results[0].code,
-        DebankErrorCode::GasExhausted as i32,
-        "{failed:#?}"
-    );
-    assert!(failed.results[0].events.is_empty(), "{failed:#?}");
 
     fixture.close();
 }

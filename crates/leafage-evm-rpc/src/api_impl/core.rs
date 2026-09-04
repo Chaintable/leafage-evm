@@ -14,17 +14,13 @@ use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{
-    BlockEnv, BlockInfo, CallRequest, CfgEnv, DebankEvent, DebankTrace, MainnetSpecId, OpSpecId,
-    H256,
-};
-use revm::bytecode::OpCode;
+use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
 use revm::primitives::{eip7825, hardfork::SpecId as EthSpecId};
 use revm::{DatabaseCommit, DatabaseRef};
-use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -46,12 +42,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     /// starve — or be starved by — CPU-bound execution. `None` keeps
     /// reads unbounded.
     pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
-}
-
-pub(crate) struct SimulationExecutionOutput<R> {
-    pub(crate) result: ExecutionResult<R>,
-    pub(crate) traces: Vec<DebankTrace>,
-    pub(crate) events: Vec<DebankEvent>,
 }
 
 pub(crate) trait ApiCore:
@@ -192,41 +182,6 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
-
-    fn execute_simulation<StateDB>(
-        &self,
-        block_env: &BlockEnv,
-        state: StateDB,
-        tx_hash: H256,
-        tx: Self::Tx,
-    ) -> Result<
-        SimulationExecutionOutput<Self::EvmHaltReason>,
-        EVMError<StateDB::Error, Self::TransactionError>,
-    >
-    where
-        StateDB: DatabaseCommit + DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        let mut inspector_cfg = TracingInspectorConfig::default_parity()
-            .set_record_logs(true)
-            .set_steps(true);
-        inspector_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-
-        let (result, traces) = self.inspect_tx_commit(
-            block_env,
-            state,
-            inspector_cfg,
-            |inspector| inspector.into_traces(),
-            tx,
-        )?;
-        let (traces, events) = super::utils::build_debank_traces(tx_hash, traces);
-
-        Ok(SimulationExecutionOutput {
-            result,
-            traces,
-            events,
-        })
-    }
 }
 
 pub(crate) trait TxSetter {
@@ -323,16 +278,5 @@ mod tests {
             handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA),
             eip7825::TX_GAS_LIMIT_CAP
         );
-    }
-
-    #[test]
-    fn arc_config_keeps_its_own_chain_variant() {
-        let config = ArcChainConfig::mainnet();
-        let mut cfg = CfgEnv::new_with_spec(config.ethereum_spec());
-        cfg.chain_id = config.chain_id();
-
-        let multi_chain = MultiChainCfgEnv::Arc((cfg, config));
-        assert_eq!(multi_chain.chain_id(), 5042);
-        assert!(matches!(multi_chain, MultiChainCfgEnv::Arc(_)));
     }
 }

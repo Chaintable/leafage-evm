@@ -6,6 +6,7 @@ use crate::api_impl::core::{
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
 };
+use crate::api_impl::utils::build_debank_traces;
 use crate::error::{internal_rpc_err, rpc_error_with_code};
 
 use alloy::rpc::types::state::StateOverride;
@@ -19,11 +20,13 @@ use leafage_evm_types::{
     DebankSingleCallResult, DebankSingleSimulateResult, Header, JsonStorageKey, TransactionInfo,
     H256, KECCAK256_EMPTY, U256,
 };
+use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
+use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -822,6 +825,10 @@ where
                     continue;
                 }
             }
+            let mut trace_cfg = TracingInspectorConfig::default_parity()
+                .set_record_logs(true)
+                .set_steps(true);
+            trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
             let tx = self.inner.create_txn_env(
                 &block,
                 &block_env,
@@ -829,13 +836,19 @@ where
                 &memory_db,
                 self.inner.evm_cfg().cfg.chain_id,
             )?;
-            let output = self
+            let (exec_res, (traces, events)) = self
                 .inner
-                .execute_simulation(&block_env, &mut memory_db, tx_info.hash.unwrap(), tx)
+                .inspect_tx_commit(
+                    &block_env,
+                    &mut memory_db,
+                    trace_cfg,
+                    |inspector| build_debank_traces(tx_info.hash.unwrap(), inspector.into_traces()),
+                    tx,
+                )
                 .map_err(|e| e.to_rpc_error())?;
-            let mut pre_res: DebankSingleSimulateResult = output.result.into();
-            pre_res.traces = output.traces;
-            pre_res.events = output.events;
+            let mut pre_res: DebankSingleSimulateResult = exec_res.into();
+            pre_res.traces = traces;
+            pre_res.events = events;
             if pre_res.code != 0 {
                 stats.success = false;
             }
