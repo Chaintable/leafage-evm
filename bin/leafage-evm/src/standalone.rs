@@ -9,6 +9,7 @@ use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
@@ -42,6 +43,7 @@ pub struct Command {
         long,
         value_parser = [
             "mainnet",
+            "arc",
             "arbitrum",
             "op",
             "base",
@@ -417,6 +419,9 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "tempo" {
         return Ok(4217);
     }
+    if arg == "arc" {
+        return Ok(ARC_MAINNET_CHAIN_ID);
+    }
     if arg.parse::<u64>().is_ok() {
         return Ok(arg.parse().unwrap());
     } else {
@@ -481,6 +486,17 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "arc" => {
+                let arc_config = ArcChainConfig::mainnet();
+                let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = arc_config.chain_id();
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
             }
             "arbitrum" => {
                 // RPC execution replaces this fallback with the target block's
@@ -897,5 +913,58 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_command(args: &[&str]) -> Command {
+        let mut argv = vec![
+            "standalone-test",
+            "--db-path",
+            "/dev/null/leafage-arc-must-not-open",
+        ];
+        argv.extend_from_slice(args);
+        Command::try_parse_from(argv).expect("command should parse")
+    }
+
+    #[test]
+    fn arc_alias_and_numeric_chain_id_build_mainnet_config() {
+        for chain_cfg_arg in ["arc", "5042"] {
+            let command = parse_command(&["--evm-type", "arc", "--chain-cfg", chain_cfg_arg]);
+            let chain_cfg = command
+                .build_chain_cfg_env()
+                .expect("Arc mainnet config should build");
+
+            let MultiChainCfgEnv::Arc((cfg, arc_config)) = chain_cfg else {
+                panic!("expected Arc chain config");
+            };
+            assert_eq!(cfg.chain_id, ARC_MAINNET_CHAIN_ID);
+            assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+            assert!(cfg.disable_balance_check);
+            assert!(cfg.disable_eip3607);
+            assert!(cfg.disable_block_gas_limit);
+            assert!(cfg.disable_base_fee);
+            assert_eq!(arc_config, ArcChainConfig::mainnet());
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_startup_reaches_runtime_initialization() {
+        let mut command = parse_command(&[
+            "--evm-type",
+            "arc",
+            "--chain-cfg",
+            "arc",
+            "--prometheus-addr",
+            "not-a-socket-address",
+        ]);
+        let error = command
+            .run()
+            .await
+            .expect_err("invalid metrics address should stop startup");
+        assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
     }
 }

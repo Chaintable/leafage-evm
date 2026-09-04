@@ -3,6 +3,7 @@ use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
+use leafage_evm_chains::arc::ArcChainConfig;
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
@@ -219,6 +220,7 @@ impl<C> Clone for Api<C> {
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    Arc((CfgEnv<MainnetSpecId>, ArcChainConfig)),
     Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
     Base(CfgEnv<BaseHardfork>),
@@ -237,6 +239,7 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Arc(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Base(cfg) => cfg.chain_id,

@@ -227,6 +227,9 @@ where
             MultiChainCfgEnv::Mainnet(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
+            MultiChainCfgEnv::Arc((env, custom_evm_cfg)) => {
+                run_chain_setup!(env, Some(custom_evm_cfg))
+            }
             MultiChainCfgEnv::Arbitrum((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
