@@ -1,13 +1,19 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
+use crate::api_impl::core::{
+    ApiCore, EvmExecutor, GasFeeHandler, GetTransactionError, ToJsonRpcError, TxSetter,
+};
+use crate::error::{invalid_params_rpc_err, rpc_error_with_code};
 use revm::context::Transaction as TransactionTrait;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::tempo::tx::TempoTxEnv;
-use leafage_evm_chains::tempo::TempoEvm;
+use leafage_evm_chains::tempo::{TempoEvm, TempoInvalidTransaction};
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
+use leafage_evm_types::{
+    BlockEnv, BlockInfo, CallRequest, DebankErrorCode, TempoKeyAuthGasInfo,
+    TempoPrimitiveSignatureInfo,
+};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
 use revm::inspector::NoOpInspector;
@@ -92,12 +98,177 @@ pub struct TempoEvmCustomConfig;
 
 type TempoApiImpl<DB> = ApiImpl<DB, TempoHardfork, TempoEvmCustomConfig>;
 
+impl ToJsonRpcError for TempoInvalidTransaction {
+    fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
+        match self {
+            TempoInvalidTransaction::EthInvalidTransaction(error) => error.to_rpc_error(),
+            TempoInvalidTransaction::NonceManagerError(_)
+            | TempoInvalidTransaction::ExpiringNonceMissingValidBefore
+            | TempoInvalidTransaction::ExpiringNonceNonceNotZero => rpc_error_with_code(
+                DebankErrorCode::NonceError as i32,
+                self.to_string(),
+            ),
+        }
+    }
+}
+
+impl GetTransactionError for TempoInvalidTransaction {
+    fn get_transaction_error(&self) -> Option<InvalidTransaction> {
+        match self {
+            Self::EthInvalidTransaction(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Derive `ScopeCounts` from a TIP-1011 `allowedCalls` wire value.
+///
+/// `None` → all zero, `has_allowed_calls = false`, which selects the gas
+/// formula's pre-T3 branch.
+/// `Some(&[])` → `has_allowed_calls = true` with all counts zero (scoped
+/// deny-all; gas reflects the `BASE_SCOPE_GAS` + storage-slot reservation).
+/// `Some(scopes)` → counts of targets, selectors, recipient-bearing selectors,
+/// and total recipients. Matches writer's per-field accounting in
+/// `crates/revm/src/handler.rs:203-244`.
+fn derive_scope_counts(
+    allowed_calls: Option<&[leafage_evm_types::CallScope]>,
+) -> leafage_evm_chains::tempo::tx::ScopeCounts {
+    use leafage_evm_chains::tempo::tx::ScopeCounts;
+    match allowed_calls {
+        None => ScopeCounts::default(),
+        Some(scopes) => {
+            let selectors_total: usize =
+                scopes.iter().map(|s| s.selector_rules.len()).sum();
+            let selector_sets = scopes
+                .iter()
+                .filter(|scope| !scope.selector_rules.is_empty())
+                .count();
+            let constrained_selectors: usize = scopes
+                .iter()
+                .flat_map(|s| &s.selector_rules)
+                .filter(|r| !r.recipients.is_empty())
+                .count();
+            let recipients_total: usize = scopes
+                .iter()
+                .flat_map(|s| &s.selector_rules)
+                .map(|r| r.recipients.len())
+                .sum();
+            ScopeCounts {
+                has_allowed_calls: true,
+                scopes: scopes.len() as u32,
+                selectors: selectors_total as u32,
+                selector_sets: selector_sets as u32,
+                constrained_selectors: constrained_selectors as u32,
+                recipients: recipients_total as u32,
+            }
+        }
+    }
+}
+
+fn parse_key_authorization_signature_type(
+    value: Option<&str>,
+) -> Result<leafage_evm_chains::tempo::fee_payer::SignatureType, String> {
+    use leafage_evm_chains::tempo::fee_payer::SignatureType;
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("secp256k1") => Ok(SignatureType::Secp256k1),
+        Some("p256") => Ok(SignatureType::P256),
+        Some("webauthn") => Ok(SignatureType::WebAuthn),
+        Some(value) => Err(format!("unsupported key authorization keyType: {value}")),
+        None => Err("full key authorization requires keyType".into()),
+    }
+}
+
+const fn tempo_sig_type_from_authorization(
+    value: leafage_evm_chains::tempo::fee_payer::SignatureType,
+) -> leafage_evm_chains::tempo::tx::TempoSigType {
+    use leafage_evm_chains::tempo::fee_payer::SignatureType;
+    use leafage_evm_chains::tempo::tx::TempoSigType;
+    match value {
+        SignatureType::Secp256k1 => TempoSigType::Secp256k1,
+        SignatureType::P256 => TempoSigType::P256,
+        SignatureType::WebAuthn => TempoSigType::WebAuthn,
+    }
+}
+
+/// Converts the official signed `keyAuthorization` RPC shape into the chains-layer
+/// transaction primitive. A signature-less object retains the original Leafage
+/// gas-only behavior and therefore returns `None`.
+fn parse_signed_key_authorization(
+    value: &TempoKeyAuthGasInfo,
+) -> Result<Option<leafage_evm_chains::tempo::fee_payer::SignedKeyAuthorization>, String> {
+    use leafage_evm_chains::tempo::fee_payer::{
+        KeyAuthorization, P256SignatureWithPreHash, PrimitiveSignature,
+        SignedKeyAuthorization, TokenLimit, WebAuthnSignature,
+    };
+
+    let Some(signature) = value.signature.clone() else {
+        return Ok(None);
+    };
+    let chain_id = value
+        .chain_id
+        .ok_or_else(|| "full key authorization requires chainId".to_string())?;
+    let key_id = value
+        .key_id
+        .ok_or_else(|| "full key authorization requires keyId".to_string())?;
+    if value.expiry == Some(0) {
+        return Err("key authorization expiry must be non-zero".into());
+    }
+
+    let signature = match signature {
+        TempoPrimitiveSignatureInfo::Secp256k1(signature) => {
+            PrimitiveSignature::Secp256k1(signature)
+        }
+        TempoPrimitiveSignatureInfo::P256(signature) => {
+            PrimitiveSignature::P256(P256SignatureWithPreHash {
+                r: signature.r,
+                s: signature.s,
+                pub_key_x: signature.pub_key_x,
+                pub_key_y: signature.pub_key_y,
+                pre_hash: signature.pre_hash,
+            })
+        }
+        TempoPrimitiveSignatureInfo::WebAuthn(signature) => {
+            PrimitiveSignature::WebAuthn(WebAuthnSignature {
+                r: signature.r,
+                s: signature.s,
+                pub_key_x: signature.pub_key_x,
+                pub_key_y: signature.pub_key_y,
+                webauthn_data: signature.webauthn_data,
+            })
+        }
+    };
+
+    Ok(Some(SignedKeyAuthorization {
+        authorization: KeyAuthorization {
+            chain_id,
+            key_type: parse_key_authorization_signature_type(value.sig_type.as_deref())?,
+            key_id,
+            expiry: value.expiry,
+            limits: value.limits.as_ref().map(|limits| {
+                limits
+                    .iter()
+                    .map(|limit| TokenLimit {
+                        token: limit.token,
+                        limit: limit.limit,
+                        period: limit.period,
+                    })
+                    .collect()
+            }),
+            allowed_calls: value.allowed_calls.clone(),
+            witness: value.witness,
+            is_admin: value.is_admin,
+            account: value.account,
+        },
+        signature,
+    }))
+}
+
 impl<DB> EvmExecutor for TempoApiImpl<DB>
 where
     DB: Sync + Send + 'static,
 {
     type Tx = TempoTxEnv;
-    type TransactionError = InvalidTransaction;
+    type TransactionError = TempoInvalidTransaction;
     type EvmHaltReason = HaltReason;
 
     fn create_txn_env<StateDB: DatabaseRef>(
@@ -126,6 +297,17 @@ where
         let fee_payer = te.fee_payer;
         let valid_after = te.valid_after;
         let valid_before = te.valid_before;
+
+        let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
+        if key_authorization
+            .as_ref()
+            .is_some_and(|authorization| authorization.witness.is_some())
+            && !hardfork.is_t5()
+        {
+            return Err(invalid_params_rpc_err(
+                "key authorization witnesses are not active before T5",
+            ));
+        }
 
         // Auto-fill 2D nonce from NonceManager storage when not provided.
         // Ported from writer compat.rs:309-324.
@@ -187,15 +369,40 @@ where
                 0
             };
 
-            // Key authorization gas info.
-            let key_auth = key_authorization.map(|ka| TempoKeyAuthGas {
-                sig_type: ka
-                    .sig_type
-                    .as_deref()
-                    .map(TempoSigType::from_str_lossy)
-                    .unwrap_or_default(),
-                num_limits: ka.num_limits,
-            });
+            // Key authorization gas info. `scope_counts` is derived from the
+            // TIP-1011 `allowedCalls` list on the wire if present; otherwise
+            // ScopeCounts::default() (has_allowed_calls = false) and the gas
+            // formula's pre-T3 branch fires.
+            let key_auth = key_authorization
+                .map(|ka| {
+                    let signed_authorization = parse_signed_key_authorization(&ka)
+                        .map_err(invalid_params_rpc_err)?;
+                    let authorization_sig_type = signed_authorization
+                        .as_ref()
+                        .map(|authorization| {
+                            tempo_sig_type_from_authorization(
+                                authorization.signature.signature_type(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            ka.sig_type
+                                .as_deref()
+                                .map(TempoSigType::from_str_lossy)
+                                .unwrap_or_default()
+                        });
+                    Ok::<_, jsonrpsee::types::error::ErrorObject<'static>>(TempoKeyAuthGas {
+                        sig_type: authorization_sig_type,
+                        num_limits: ka
+                            .limits
+                            .as_ref()
+                            .map_or(ka.num_limits, |limits| limits.len() as u32),
+                        scope_counts: derive_scope_counts(ka.allowed_calls.as_deref()),
+                        has_witness: ka.witness.is_some(),
+                        is_admin: ka.is_admin,
+                        signed_authorization,
+                    })
+                })
+                .transpose()?;
 
             // Tempo authorization list: gas info + optional delegation fields.
             let auth_list = tempo_authorization_list
@@ -256,6 +463,10 @@ where
         Ok(TempoTxEnv {
             base,
             tempo_fields,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: Some(
+                leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
+            ),
         })
     }
 
@@ -429,6 +640,14 @@ impl TxSetter for TempoTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.gas_limit = gas_limit;
     }
+
+    fn set_stateful_simulation_context(
+        &mut self,
+        block_hash: leafage_evm_types::H256,
+        index: u64,
+    ) {
+        TempoTxEnv::set_stateful_simulation_context(self, block_hash, index);
+    }
 }
 
 impl<DB> ApiCore for TempoApiImpl<DB> where DB: Sync + Send + 'static {}
@@ -459,6 +678,13 @@ mod tests {
     use super::*;
     use leafage_evm_chains::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS;
     use revm::database::EmptyDB;
+
+    #[test]
+    fn expiring_nonce_transaction_error_maps_to_nonce_rpc_error() {
+        let error = TempoInvalidTransaction::NonceManagerError("replay".into()).to_rpc_error();
+        assert_eq!(error.code(), DebankErrorCode::NonceError as i32);
+        assert_eq!(error.message(), "nonce manager error: replay");
+    }
 
     #[test]
     fn test_vcv2_injector_t2_injects_code_for_missing_account() {
@@ -524,6 +750,92 @@ mod tests {
             Some(&[0xfe][..]),
             "existing code should NOT be overwritten"
         );
+    }
+
+    // -- derive_scope_counts (FU-2) -----------------------------------------
+
+    fn make_scope(
+        target: alloy::primitives::Address,
+        rules: Vec<(alloy::primitives::FixedBytes<4>, Vec<alloy::primitives::Address>)>,
+    ) -> leafage_evm_types::CallScope {
+        leafage_evm_types::CallScope {
+            target,
+            selector_rules: rules
+                .into_iter()
+                .map(|(selector, recipients)| leafage_evm_types::SelectorRule {
+                    selector,
+                    recipients,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn derive_scope_counts_none_returns_default() {
+        let counts = derive_scope_counts(None);
+        assert!(!counts.has_allowed_calls);
+        assert_eq!(counts.scopes, 0);
+        assert_eq!(counts.selectors, 0);
+        assert_eq!(counts.selector_sets, 0);
+        assert_eq!(counts.constrained_selectors, 0);
+        assert_eq!(counts.recipients, 0);
+    }
+
+    #[test]
+    fn derive_scope_counts_empty_marks_has_allowed_calls() {
+        let counts = derive_scope_counts(Some(&[]));
+        assert!(counts.has_allowed_calls);
+        assert_eq!(counts.scopes, 0);
+        assert_eq!(counts.selectors, 0);
+        assert_eq!(counts.selector_sets, 0);
+        assert_eq!(counts.constrained_selectors, 0);
+        assert_eq!(counts.recipients, 0);
+    }
+
+    #[test]
+    fn derive_scope_counts_aggregates_across_nested_rules() {
+        use alloy::primitives::{address, FixedBytes};
+
+        let scopes = vec![
+            make_scope(
+                address!("0x20C0000000000000000000000000000000000001"),
+                vec![
+                    // 1 selector with 2 recipients (constrained)
+                    (
+                        FixedBytes::from([0xa9, 0x05, 0x9c, 0xbb]),
+                        vec![
+                            address!("0x1111111111111111111111111111111111111111"),
+                            address!("0x2222222222222222222222222222222222222222"),
+                        ],
+                    ),
+                    // 1 selector with 0 recipients (unconstrained)
+                    (FixedBytes::from([0x09, 0x5e, 0xa7, 0xb3]), Vec::new()),
+                ],
+            ),
+            make_scope(
+                address!("0x20C0000000000000000000000000000000000002"),
+                vec![
+                    // 1 selector with 1 recipient (constrained)
+                    (
+                        FixedBytes::from([0xa9, 0x05, 0x9c, 0xbb]),
+                        vec![address!("0x3333333333333333333333333333333333333333")],
+                    ),
+                ],
+            ),
+            // A target with no selector rules must not create a selector-set row.
+            make_scope(
+                address!("0x20C0000000000000000000000000000000000003"),
+                Vec::new(),
+            ),
+        ];
+
+        let counts = derive_scope_counts(Some(&scopes));
+        assert!(counts.has_allowed_calls);
+        assert_eq!(counts.scopes, 3, "3 targets");
+        assert_eq!(counts.selectors, 3, "2 + 1 selectors");
+        assert_eq!(counts.selector_sets, 2, "only 2 targets have selectors");
+        assert_eq!(counts.constrained_selectors, 2, "1 + 1 with non-empty recipients");
+        assert_eq!(counts.recipients, 3, "2 + 1 recipients total");
     }
 
     #[test]

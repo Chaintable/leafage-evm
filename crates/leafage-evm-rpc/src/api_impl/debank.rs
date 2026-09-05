@@ -829,13 +829,14 @@ where
                 .set_record_logs(true)
                 .set_steps(true);
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-            let tx = self.inner.create_txn_env(
+            let mut tx = self.inner.create_txn_env(
                 &block,
                 &block_env,
                 tx,
                 &memory_db,
                 self.inner.evm_cfg().cfg.chain_id,
             )?;
+            tx.set_stateful_simulation_context(block.header.hash, tx_info.index.unwrap());
             let (exec_res, (traces, events)) = self
                 .inner
                 .inspect_tx_commit(

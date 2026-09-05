@@ -557,7 +557,13 @@ impl Precompile for ValidatorConfig {
 
         dispatch_call(
             calldata,
-            IValidatorConfig::IValidatorConfigCalls::abi_decode,
+            IValidatorConfig::IValidatorConfigCalls::valid_selector,
+            |data| {
+                IValidatorConfig::IValidatorConfigCalls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(),
+                )
+            },
             |call| match call {
                 // View functions
                 IValidatorConfig::IValidatorConfigCalls::owner(call) => {

@@ -10,9 +10,11 @@
 //! Decodable, Compact, arbitrary impls are intentionally omitted.
 
 use alloy::eips::{eip2930::AccessList, eip7702::Authorization};
-use alloy::primitives::{Address, Bytes, Signature, B256, U256, keccak256};
+use alloy::primitives::{Address, Bytes, Signature, B256, U256, keccak256, uint};
 use alloy_rlp::{BufMut, Encodable, Header, EMPTY_STRING_CODE, encode_list, length_of_length, list_length};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -27,11 +29,30 @@ const SECP256K1_SIGNATURE_LENGTH: usize = 65;
 /// P256 signature wire length (excluding the 1-byte type prefix).
 const P256_SIGNATURE_LENGTH: usize = 129;
 
+/// Max WebAuthn signature length (2 KB ceiling on `webauthn_data` + trailing 128 bytes of
+/// r/s/x/y; see Tempo writer `tempo_transaction.rs`).
+const MAX_WEBAUTHN_SIGNATURE_LENGTH: usize = 2048;
+
 /// Signature type prefix bytes.
 const SIGNATURE_TYPE_P256: u8 = 0x01;
 const SIGNATURE_TYPE_WEBAUTHN: u8 = 0x02;
 const SIGNATURE_TYPE_KEYCHAIN: u8 = 0x03;
 const SIGNATURE_TYPE_KEYCHAIN_V2: u8 = 0x04;
+
+/// Half of the P256 curve order (n/2). ECDSA signatures require `s <= n/2` (low-s) to
+/// prevent malleability.
+const P256N_HALF: U256 =
+    uint!(0x7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8_U256);
+
+/// Minimum WebAuthn authenticatorData length: 32 rpIdHash + 1 flags + 4 signCount.
+const MIN_AUTH_DATA_LEN: usize = 37;
+
+// WebAuthn authenticatorData flags (byte 32).
+// ref: https://www.w3.org/TR/webauthn-2/#sctn-authenticator-data
+const WA_UP: u8 = 0x01; // User Presence (bit 0)
+const WA_UV: u8 = 0x04; // User Verified (bit 2)
+const WA_AT: u8 = 0x40; // Attested credential data (bit 6)
+const WA_ED: u8 = 0x80; // Extension data present (bit 7)
 
 // ---------------------------------------------------------------------------
 // SignatureType
@@ -110,6 +131,14 @@ pub enum PrimitiveSignature {
 }
 
 impl PrimitiveSignature {
+    pub const fn signature_type(&self) -> SignatureType {
+        match self {
+            Self::Secp256k1(_) => SignatureType::Secp256k1,
+            Self::P256(_) => SignatureType::P256,
+            Self::WebAuthn(_) => SignatureType::WebAuthn,
+        }
+    }
+
     /// Encode signature to bytes.
     ///
     /// Wire format:
@@ -145,6 +174,228 @@ impl PrimitiveSignature {
             }
         }
     }
+
+    /// Parse a signature from wire bytes (inverse of `to_bytes`).
+    ///
+    /// Wire format:
+    /// - 65 bytes (no type prefix) -> Secp256k1 (backward compat)
+    /// - `0x01 || r(32) || s(32) || x(32) || y(32) || pre_hash(1)` -> P256
+    /// - `0x02 || webauthn_data || r(32) || s(32) || x(32) || y(32)` -> WebAuthn
+    ///
+    /// Ported from Tempo writer `tt_signature.rs::PrimitiveSignature::from_bytes`.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("Signature data is empty");
+        }
+
+        // Backward compat: exactly 65 bytes => secp256k1 without type identifier.
+        if data.len() == SECP256K1_SIGNATURE_LENGTH {
+            let sig = Signature::try_from(data)
+                .map_err(|_| "Failed to parse secp256k1 signature: invalid signature values")?;
+            return Ok(Self::Secp256k1(sig));
+        }
+
+        if data.len() < 2 {
+            return Err("Signature data too short: expected type identifier + signature data");
+        }
+
+        let type_id = data[0];
+        let sig_data = &data[1..];
+
+        match type_id {
+            SIGNATURE_TYPE_P256 => {
+                if sig_data.len() != P256_SIGNATURE_LENGTH {
+                    return Err("Invalid P256 signature length");
+                }
+                Ok(Self::P256(P256SignatureWithPreHash {
+                    r: B256::from_slice(&sig_data[0..32]),
+                    s: B256::from_slice(&sig_data[32..64]),
+                    pub_key_x: B256::from_slice(&sig_data[64..96]),
+                    pub_key_y: B256::from_slice(&sig_data[96..128]),
+                    pre_hash: sig_data[128] != 0,
+                }))
+            }
+            SIGNATURE_TYPE_WEBAUTHN => {
+                let len = sig_data.len();
+                if !(128..=MAX_WEBAUTHN_SIGNATURE_LENGTH).contains(&len) {
+                    return Err("Invalid WebAuthn signature length");
+                }
+                Ok(Self::WebAuthn(WebAuthnSignature {
+                    r: B256::from_slice(&sig_data[len - 128..len - 96]),
+                    s: B256::from_slice(&sig_data[len - 96..len - 64]),
+                    pub_key_x: B256::from_slice(&sig_data[len - 64..len - 32]),
+                    pub_key_y: B256::from_slice(&sig_data[len - 32..]),
+                    webauthn_data: Bytes::copy_from_slice(&sig_data[..len - 128]),
+                }))
+            }
+            _ => Err("Unknown signature type identifier"),
+        }
+    }
+
+    /// Recover the signer address from this signature over `sig_hash`.
+    ///
+    /// - Secp256k1: standard ecrecover (alloy `Signature::recover_address_from_prehash`).
+    /// - P256: verifies the signature (with low-s malleability check) and derives
+    ///   the address from the embedded public key.
+    /// - WebAuthn: parses authenticatorData + clientDataJSON, validates the challenge
+    ///   matches `sig_hash`, then verifies the P256 signature over
+    ///   `sha256(authenticatorData || sha256(clientDataJSON))`.
+    ///
+    /// Ported from Tempo writer `tt_signature.rs::PrimitiveSignature::recover_signer`.
+    pub fn recover_signer(&self, sig_hash: &B256) -> Result<Address, &'static str> {
+        match self {
+            Self::Secp256k1(sig) => sig
+                .recover_address_from_prehash(sig_hash)
+                .map_err(|_| "secp256k1 recovery failed"),
+            Self::P256(p256_sig) => {
+                let message_hash = if p256_sig.pre_hash {
+                    // Some P256 implementations (e.g. Web Crypto) pre-hash the digest.
+                    B256::from_slice(Sha256::digest(sig_hash.as_slice()).as_ref())
+                } else {
+                    *sig_hash
+                };
+
+                verify_p256_signature_internal(
+                    p256_sig.r.as_slice(),
+                    p256_sig.s.as_slice(),
+                    p256_sig.pub_key_x.as_slice(),
+                    p256_sig.pub_key_y.as_slice(),
+                    &message_hash,
+                )?;
+
+                Ok(derive_p256_address(
+                    &p256_sig.pub_key_x,
+                    &p256_sig.pub_key_y,
+                ))
+            }
+            Self::WebAuthn(webauthn_sig) => {
+                let message_hash =
+                    verify_webauthn_data_internal(&webauthn_sig.webauthn_data, sig_hash)?;
+
+                verify_p256_signature_internal(
+                    webauthn_sig.r.as_slice(),
+                    webauthn_sig.s.as_slice(),
+                    webauthn_sig.pub_key_x.as_slice(),
+                    webauthn_sig.pub_key_y.as_slice(),
+                    &message_hash,
+                )?;
+
+                Ok(derive_p256_address(
+                    &webauthn_sig.pub_key_x,
+                    &webauthn_sig.pub_key_y,
+                ))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signature verification helpers (P256 + WebAuthn)
+// ---------------------------------------------------------------------------
+
+/// Derive a P256 address from the public key coordinates.
+///
+/// `address = keccak256(x || y)[12..]` (last 20 bytes), matching Tempo writer.
+fn derive_p256_address(pub_key_x: &B256, pub_key_y: &B256) -> Address {
+    let hash = keccak256([pub_key_x.as_slice(), pub_key_y.as_slice()].concat());
+    Address::from_slice(&hash[12..])
+}
+
+/// Verify a P256 ECDSA signature with low-s malleability guard.
+///
+/// `message_hash` is the already-hashed 32-byte digest (no further hashing inside).
+fn verify_p256_signature_internal(
+    r: &[u8],
+    s: &[u8],
+    pub_key_x: &[u8],
+    pub_key_y: &[u8],
+    message_hash: &B256,
+) -> Result<(), &'static str> {
+    // Low-s check (reject s > n/2 to prevent malleability).
+    if U256::from_be_slice(s) > P256N_HALF {
+        return Err("P256 signature has high s value");
+    }
+
+    use p256::{
+        ecdsa::{signature::hazmat::PrehashVerifier, Signature as P256Signature, VerifyingKey},
+        EncodedPoint,
+    };
+
+    let encoded_point =
+        EncodedPoint::from_affine_coordinates(pub_key_x.into(), pub_key_y.into(), false);
+    let verifying_key =
+        VerifyingKey::from_encoded_point(&encoded_point).map_err(|_| "Invalid P256 public key")?;
+
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(r);
+    sig_bytes[32..].copy_from_slice(s);
+    let signature = P256Signature::from_slice(&sig_bytes)
+        .map_err(|_| "Invalid P256 signature encoding")?;
+
+    verifying_key
+        .verify_prehash(message_hash.as_slice(), &signature)
+        .map_err(|_| "P256 signature verification failed")
+}
+
+/// Minimal `clientDataJSON` shape — only the fields we validate.
+/// `serde_json` ignores unknown fields, so additional keys (origin, crossOrigin, …) are tolerated.
+#[derive(Deserialize)]
+struct WebAuthnClientDataJson<'a> {
+    #[serde(rename = "type")]
+    type_field: &'a str,
+    challenge: &'a str,
+}
+
+/// Parse + validate WebAuthn `authenticatorData || clientDataJSON`, returning the
+/// message hash that the P256 signature signs:
+/// `messageHash = sha256(authenticatorData || sha256(clientDataJSON))`.
+fn verify_webauthn_data_internal(
+    webauthn_data: &[u8],
+    tx_hash: &B256,
+) -> Result<B256, &'static str> {
+    if webauthn_data.len() < MIN_AUTH_DATA_LEN + 32 {
+        return Err("WebAuthn data too short");
+    }
+
+    let flags = webauthn_data[32];
+    let up_flag = flags & WA_UP;
+    let uv_flag = flags & WA_UV;
+    let at_flag = flags & WA_AT;
+    let ed_flag = flags & WA_ED;
+
+    // UP or UV MUST be set (UV implies user presence per WebAuthn spec).
+    if up_flag == 0 && uv_flag == 0 {
+        return Err("neither UP, nor UV flag set");
+    }
+    // AT must NOT be set for assertion signatures (webauthn.get).
+    if at_flag != 0 {
+        return Err("AT flag must not be set for assertion signatures");
+    }
+    // ED must NOT be set — Tempo AA does not support extensions (would require CBOR).
+    if ed_flag != 0 {
+        return Err("ED flag must not be set, as Tempo doesn't support extensions");
+    }
+
+    let auth_data_len = MIN_AUTH_DATA_LEN;
+    let authenticator_data = &webauthn_data[..auth_data_len];
+    let client_data_json = &webauthn_data[auth_data_len..];
+
+    let client_data: WebAuthnClientDataJson<'_> = serde_json::from_slice(client_data_json)
+        .map_err(|_| "clientDataJSON is not valid JSON")?;
+
+    if client_data.type_field != "webauthn.get" {
+        return Err("clientDataJSON type must be webauthn.get");
+    }
+
+    if client_data.challenge != URL_SAFE_NO_PAD.encode(tx_hash.as_slice()) {
+        return Err("clientDataJSON challenge does not match transaction hash");
+    }
+
+    let client_data_hash = Sha256::digest(client_data_json);
+    let mut hasher = Sha256::new();
+    hasher.update(authenticator_data);
+    hasher.update(client_data_hash);
+    Ok(B256::from_slice(&hasher.finalize()))
 }
 
 impl Encodable for PrimitiveSignature {
@@ -208,6 +459,30 @@ impl core::hash::Hash for KeychainSignature {
     }
 }
 
+impl KeychainSignature {
+    /// Creates a V2 keychain signature whose inner signature commits to the root account.
+    pub fn new(user_address: Address, signature: PrimitiveSignature) -> Self {
+        Self {
+            user_address,
+            signature,
+            version: KeychainVersion::V2,
+        }
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.version == KeychainVersion::V1
+    }
+
+    /// `keccak256(0x04 || hash || user_address)`.
+    pub fn signing_hash(hash: B256, user_address: Address) -> B256 {
+        let mut input = [0u8; 53];
+        input[0] = SIGNATURE_TYPE_KEYCHAIN_V2;
+        input[1..33].copy_from_slice(hash.as_slice());
+        input[33..].copy_from_slice(user_address.as_slice());
+        keccak256(input)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TempoSignature
 // ---------------------------------------------------------------------------
@@ -223,6 +498,45 @@ pub enum TempoSignature {
 }
 
 impl TempoSignature {
+    /// Parses a primitive or V1/V2 keychain signature from its transaction wire bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("Signature data is empty");
+        }
+
+        if data.len() != SECP256K1_SIGNATURE_LENGTH
+            && matches!(
+                data.first().copied(),
+                Some(SIGNATURE_TYPE_KEYCHAIN | SIGNATURE_TYPE_KEYCHAIN_V2)
+            )
+        {
+            if data.len() < 22 {
+                return Err("Invalid Keychain signature: too short for user_address");
+            }
+            let version = if data[0] == SIGNATURE_TYPE_KEYCHAIN {
+                KeychainVersion::V1
+            } else {
+                KeychainVersion::V2
+            };
+            let user_address = Address::from_slice(&data[1..21]);
+            let signature = PrimitiveSignature::from_bytes(&data[21..])?;
+            return Ok(Self::Keychain(KeychainSignature {
+                user_address,
+                signature,
+                version,
+            }));
+        }
+
+        PrimitiveSignature::from_bytes(data).map(Self::Primitive)
+    }
+
+    pub fn as_keychain(&self) -> Option<&KeychainSignature> {
+        match self {
+            Self::Keychain(signature) => Some(signature),
+            Self::Primitive(_) => None,
+        }
+    }
+
     /// Encode signature to bytes.
     ///
     /// Wire format:
@@ -263,24 +577,53 @@ impl Encodable for TempoSignature {
 // ---------------------------------------------------------------------------
 
 /// TIP20 per-token spending limit for access keys.
-#[derive(
-    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize,
-    alloy::rlp::RlpEncodable,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenLimit {
     pub token: Address,
     pub limit: U256,
+    /// Period duration in seconds. Zero means a one-time limit.
+    #[serde(default, with = "alloy::serde::quantity")]
+    pub period: u64,
+}
+
+impl Encodable for TokenLimit {
+    fn encode(&self, out: &mut dyn BufMut) {
+        let payload = self.token.length()
+            + self.limit.length()
+            + if self.period == 0 { 0 } else { self.period.length() };
+        Header { list: true, payload_length: payload }.encode(out);
+        self.token.encode(out);
+        self.limit.encode(out);
+        if self.period != 0 {
+            self.period.encode(out);
+        }
+    }
+
+    fn length(&self) -> usize {
+        let payload = self.token.length()
+            + self.limit.length()
+            + if self.period == 0 { 0 } else { self.period.length() };
+        payload + length_of_length(payload)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // KeyAuthorization
 // ---------------------------------------------------------------------------
 
+// `CallScope` / `SelectorRule` live in `leafage-evm-types` (re-exported via
+// the `rpc::call` module) so the RPC layer can deserialize them directly
+// from JSON. We re-import them here for use inside `KeyAuthorization`.
+pub use leafage_evm_types::{CallScope, SelectorRule};
+
 /// Key authorization for provisioning access keys.
 ///
-/// RLP encoding: `[chain_id, key_type, key_id, expiry?, limits?]`
-/// Uses `#[rlp(trailing)]` semantics: optional trailing fields omitted when `None`.
+/// RLP encoding:
+/// `[chain_id, key_type, key_id, expiry?, limits?, allowed_calls?, witness?, is_admin?, account?]`
+/// Uses `#[rlp(trailing(canonical))]` semantics: trailing optionals are omitted
+/// when `None` (canonical) and any `None` preceding a `Some` is encoded as the
+/// empty bytestring `0x80` for positional correctness.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyAuthorization {
@@ -292,10 +635,25 @@ pub struct KeyAuthorization {
     pub expiry: Option<u64>,
     #[serde(default)]
     pub limits: Option<Vec<TokenLimit>>,
+    /// TIP-1011 (T3+) per-target call scopes. `None` = unrestricted; `Some([])`
+    /// = scoped deny-all; `Some([scope, ...])` = the listed scopes.
+    #[serde(default)]
+    pub allowed_calls: Option<Vec<CallScope>>,
+    /// TIP-1053 witness. Presence is significant, including `B256::ZERO`.
+    #[serde(default)]
+    pub witness: Option<B256>,
+    /// T6 admin-key marker. Encoded as integer `1` when set and omitted otherwise.
+    #[serde(default)]
+    pub is_admin: bool,
+    /// T6 target account binding, required for admin-signed authorizations.
+    #[serde(default)]
+    pub account: Option<Address>,
 }
 
-/// Manual RLP Encodable to match the writer's `#[rlp(trailing)]` behavior:
-/// optional trailing fields are only encoded when present.
+/// Manual RLP Encodable to match the writer's `#[rlp(trailing(canonical))]`
+/// behavior: trailing optionals are omitted when `None`, but a `None`
+/// preceding any later `Some` is encoded positionally as the empty bytestring
+/// `0x80`.
 impl Encodable for KeyAuthorization {
     fn encode(&self, out: &mut dyn BufMut) {
         let payload = self.fields_len();
@@ -303,20 +661,43 @@ impl Encodable for KeyAuthorization {
         self.chain_id.encode(out);
         self.key_type.encode(out);
         self.key_id.encode(out);
-        // Trailing optional fields: only encoded if present (or if a later field is present)
-        match (&self.expiry, &self.limits) {
-            (None, None) => { /* nothing */ }
-            (Some(expiry), None) => {
-                expiry.encode(out);
+
+        let last_present = self.last_trailing_present();
+        if last_present >= 1 {
+            match &self.expiry {
+                Some(expiry) => expiry.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
             }
-            (expiry, Some(limits)) => {
-                // If limits is present, expiry must be encoded (even if None -> empty string)
-                if let Some(expiry) = expiry {
-                    expiry.encode(out);
-                } else {
-                    out.put_u8(EMPTY_STRING_CODE);
-                }
-                limits.encode(out);
+        }
+        if last_present >= 2 {
+            match &self.limits {
+                Some(limits) => limits.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
+            }
+        }
+        if last_present >= 3 {
+            match &self.allowed_calls {
+                Some(scopes) => scopes.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
+            }
+        }
+        if last_present >= 4 {
+            match self.witness {
+                Some(witness) => witness.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
+            }
+        }
+        if last_present >= 5 {
+            if self.is_admin {
+                1u64.encode(out);
+            } else {
+                out.put_u8(EMPTY_STRING_CODE);
+            }
+        }
+        if last_present >= 6 {
+            match self.account {
+                Some(account) => account.encode(out),
+                None => out.put_u8(EMPTY_STRING_CODE),
             }
         }
     }
@@ -328,19 +709,56 @@ impl Encodable for KeyAuthorization {
 }
 
 impl KeyAuthorization {
+    pub fn signature_hash(&self) -> B256 {
+        let mut encoded = Vec::new();
+        self.encode(&mut encoded);
+        keccak256(encoded)
+    }
+
+    /// Returns the 1-indexed position of the latest `Some` trailing field
+    /// (1=expiry, 2=limits, 3=allowed_calls, 4=witness, 5=is_admin, 6=account),
+    /// or 0 if all trailing fields are absent. Used to decide which preceding
+    /// fields require positional 0x80 encoding.
+    fn last_trailing_present(&self) -> u8 {
+        if self.account.is_some() {
+            6
+        } else if self.is_admin {
+            5
+        } else if self.witness.is_some() {
+            4
+        } else if self.allowed_calls.is_some() {
+            3
+        } else if self.limits.is_some() {
+            2
+        } else if self.expiry.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
     fn fields_len(&self) -> usize {
         let mut len = self.chain_id.length()
             + self.key_type.length()
             + self.key_id.length();
-        match (&self.expiry, &self.limits) {
-            (None, None) => {}
-            (Some(expiry), None) => {
-                len += expiry.length();
-            }
-            (expiry, Some(limits)) => {
-                len += expiry.map_or(1, |e| e.length());
-                len += limits.length();
-            }
+        let last_present = self.last_trailing_present();
+        if last_present >= 1 {
+            len += self.expiry.map_or(1, |e| e.length());
+        }
+        if last_present >= 2 {
+            len += self.limits.as_ref().map_or(1, |l| l.length());
+        }
+        if last_present >= 3 {
+            len += self.allowed_calls.as_ref().map_or(1, |s| s.length());
+        }
+        if last_present >= 4 {
+            len += self.witness.map_or(1, |w| w.length());
+        }
+        if last_present >= 5 {
+            len += if self.is_admin { 1u64.length() } else { 1 };
+        }
+        if last_present >= 6 {
+            len += self.account.map_or(1, |account| account.length());
         }
         len
     }
@@ -352,9 +770,8 @@ impl KeyAuthorization {
 
 /// Signed key authorization (key authorization + root key signature).
 ///
-/// RLP: `[chain_id, key_type, key_id, expiry?, limits?, signature?]`
-/// The `#[rlp(trailing)]` in the writer means `signature` is trailing after
-/// KeyAuthorization's own trailing fields. We match this exactly.
+/// RLP: `[authorization, signature]`, where `authorization` is its own nested
+/// canonical RLP list. This matches the writer's derived `RlpEncodable` layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedKeyAuthorization {
@@ -367,23 +784,7 @@ impl Encodable for SignedKeyAuthorization {
     fn encode(&self, out: &mut dyn BufMut) {
         let payload = self.fields_len();
         Header { list: true, payload_length: payload }.encode(out);
-        // Encode all KeyAuthorization fields inline (not as a nested list)
-        self.authorization.chain_id.encode(out);
-        self.authorization.key_type.encode(out);
-        self.authorization.key_id.encode(out);
-        // Trailing: expiry, limits, signature
-        // Since signature is always present, we must encode expiry and limits too
-        // (even if None -> empty string) to maintain positional correctness.
-        if let Some(expiry) = self.authorization.expiry {
-            expiry.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
-        if let Some(ref limits) = self.authorization.limits {
-            limits.encode(out);
-        } else {
-            out.put_u8(EMPTY_STRING_CODE);
-        }
+        self.authorization.encode(out);
         self.signature.encode(out);
     }
 
@@ -394,13 +795,13 @@ impl Encodable for SignedKeyAuthorization {
 }
 
 impl SignedKeyAuthorization {
+    pub fn recover_signer(&self) -> Result<Address, &'static str> {
+        self.signature
+            .recover_signer(&self.authorization.signature_hash())
+    }
+
     fn fields_len(&self) -> usize {
-        self.authorization.chain_id.length()
-            + self.authorization.key_type.length()
-            + self.authorization.key_id.length()
-            + self.authorization.expiry.map_or(1, |e| e.length())
-            + self.authorization.limits.as_ref().map_or(1, |l| l.length())
-            + self.signature.length()
+        self.authorization.length() + self.signature.length()
     }
 }
 
@@ -863,14 +1264,55 @@ mod tests {
                 chain_id: 1,
                 key_type: SignatureType::Secp256k1,
                 key_id: Address::ZERO,
-                expiry: Some(1000),
+                expiry: None,
                 limits: None,
+                allowed_calls: None,
+                witness: None,
+                is_admin: false,
+                account: None,
             },
-            signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
+            signature: PrimitiveSignature::Secp256k1(Signature::new(
+                U256::from(1u64),
+                U256::from(2u64),
+                false,
+            )),
         };
         let mut buf = Vec::new();
         signed.encode(&mut buf);
         assert_eq!(buf.len(), signed.length());
+
+        let expected = alloy::primitives::hex!(
+            "f85bd70180940000000000000000000000000000000000000000b841000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000021b"
+        );
+        assert_eq!(buf, expected, "nested signed authorization must match writer RLP");
+    }
+
+    #[test]
+    fn token_limit_period_uses_canonical_trailing_rlp() {
+        let one_time = TokenLimit {
+            token: Address::ZERO,
+            limit: U256::from(100u64),
+            period: 0,
+        };
+        let mut one_time_encoded = Vec::new();
+        one_time.encode(&mut one_time_encoded);
+        let mut one_time_expected = vec![0xd6, 0x94];
+        one_time_expected.extend_from_slice(Address::ZERO.as_slice());
+        one_time_expected.push(0x64);
+        assert_eq!(one_time_encoded, one_time_expected);
+        assert_eq!(one_time_encoded.len(), one_time.length());
+
+        let periodic = TokenLimit {
+            period: 60,
+            ..one_time
+        };
+        let mut periodic_encoded = Vec::new();
+        periodic.encode(&mut periodic_encoded);
+        let mut periodic_expected = vec![0xd7, 0x94];
+        periodic_expected.extend_from_slice(Address::ZERO.as_slice());
+        periodic_expected.extend_from_slice(&[0x64, 0x3c]);
+        assert_eq!(periodic_encoded, periodic_expected);
+        assert_eq!(periodic_encoded.len(), periodic.length());
     }
 
     #[test]
@@ -882,6 +1324,10 @@ mod tests {
             key_id: Address::ZERO,
             expiry: None,
             limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf1 = Vec::new();
         auth1.encode(&mut buf1);
@@ -893,6 +1339,10 @@ mod tests {
             key_id: Address::ZERO,
             expiry: Some(1000),
             limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf2 = Vec::new();
         auth2.encode(&mut buf2);
@@ -906,7 +1356,12 @@ mod tests {
             limits: Some(vec![TokenLimit {
                 token: Address::ZERO,
                 limit: U256::from(100u64),
+                period: 0,
             }]),
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
         };
         let mut buf3 = Vec::new();
         auth3.encode(&mut buf3);
@@ -919,5 +1374,565 @@ mod tests {
         // Trailing fields make it longer
         assert!(buf2.len() > buf1.len());
         assert!(buf3.len() > buf2.len());
+    }
+
+    #[test]
+    fn key_authorization_with_allowed_calls_grows_encoding() {
+        use alloy::primitives::address;
+
+        let scope = CallScope {
+            target: address!("0x20C0000000000000000000000000000000000042"),
+            selector_rules: vec![SelectorRule {
+                selector: alloy::primitives::FixedBytes::from([0xa9, 0x05, 0x9c, 0xbb]),
+                recipients: vec![address!("0x1111111111111111111111111111111111111111")],
+            }],
+        };
+
+        let base = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: Some(1000),
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let mut base_buf = Vec::new();
+        base.encode(&mut base_buf);
+
+        let with_scopes = KeyAuthorization {
+            allowed_calls: Some(vec![scope.clone()]),
+            ..base.clone()
+        };
+        let mut scopes_buf = Vec::new();
+        with_scopes.encode(&mut scopes_buf);
+
+        assert_eq!(scopes_buf.len(), with_scopes.length());
+        // Adding allowed_calls forces both `limits` (None -> 0x80) and the new
+        // field to be encoded positionally, so the buffer must grow.
+        assert!(
+            scopes_buf.len() > base_buf.len(),
+            "with_scopes ({}) should be longer than base ({})",
+            scopes_buf.len(),
+            base_buf.len(),
+        );
+    }
+
+    #[test]
+    fn key_authorization_deny_all_allowed_calls_round_trips_in_length() {
+        // `Some(vec![])` encodes as the empty list `0xc0`, not as `None`.
+        let deny_all = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: Some(1000),
+            limits: None,
+            allowed_calls: Some(Vec::new()),
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let mut buf = Vec::new();
+        deny_all.encode(&mut buf);
+        assert_eq!(buf.len(), deny_all.length());
+        // Sanity: contains an explicit empty-list byte after the limits 0x80.
+        assert!(
+            buf.contains(&0xc0),
+            "deny-all allowed_calls should be encoded as empty list 0xc0",
+        );
+    }
+
+    #[test]
+    fn key_authorization_trailing_only_limits_byte_fixture() {
+        // (expiry=None, limits=Some([]), allowed_calls=None): limits is the
+        // last `Some`, so expiry positions as 0x80 and allowed_calls is
+        // truncated entirely.
+        let auth = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: Some(Vec::new()),
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let mut buf = Vec::new();
+        auth.encode(&mut buf);
+
+        // body = 1 (chain_id) + 1 (key_type) + 21 (key_id) + 1 (expiry placeholder)
+        //      + 1 (limits empty list 0xc0)
+        //      = 25 bytes → list header = 0xc0 + 25 = 0xd9
+        let expected: Vec<u8> = vec![
+            0xd9, // list header
+            0x01, // chain_id
+            0x80, // key_type
+            0x94, // address header
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x80, // expiry = None positional placeholder
+            0xc0, // limits = Some([])
+                  // allowed_calls truncated (no bytes)
+        ];
+        assert_eq!(buf, expected, "(None, Some([]), None) trailing-canonical layout");
+    }
+
+    #[test]
+    fn key_authorization_trailing_only_allowed_calls_byte_fixture() {
+        // (expiry=None, limits=None, allowed_calls=Some([])): both expiry and
+        // limits become 0x80 positional placeholders before the deny-all 0xc0.
+        let auth = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: Some(Vec::new()),
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let mut buf = Vec::new();
+        auth.encode(&mut buf);
+
+        // body = 1 + 1 + 21 + 1 (expiry) + 1 (limits) + 1 (0xc0) = 26 → header 0xda
+        let expected: Vec<u8> = vec![
+            0xda, // list header
+            0x01, 0x80, 0x94,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x80, // expiry None positional
+            0x80, // limits None positional
+            0xc0, // allowed_calls = Some([])
+        ];
+        assert_eq!(buf, expected, "(None, None, Some([])) trailing-canonical layout");
+    }
+
+    #[test]
+    fn key_authorization_witness_is_a_distinct_trailing_field() {
+        let witness = B256::repeat_byte(0x53);
+        let auth = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: Some(witness),
+            is_admin: false,
+            account: None,
+        };
+        let mut buf = Vec::new();
+        auth.encode(&mut buf);
+
+        let mut expected = vec![0xf8, 0x3b, 0x01, 0x80, 0x94];
+        expected.extend_from_slice(Address::ZERO.as_slice());
+        expected.extend_from_slice(&[0x80, 0x80, 0x80, 0xa0]);
+        expected.extend_from_slice(witness.as_slice());
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), auth.length());
+
+        let zero_witness = KeyAuthorization {
+            witness: Some(B256::ZERO),
+            ..auth
+        };
+        let mut zero_buf = Vec::new();
+        zero_witness.encode(&mut zero_buf);
+        assert_eq!(zero_buf.len(), buf.len(), "zero is present, not omitted");
+    }
+
+    #[test]
+    fn key_authorization_t6_admin_fields_are_positionally_encoded() {
+        let account = Address::repeat_byte(0x11);
+        let admin = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: true,
+            account: Some(account),
+        };
+        let mut encoded = Vec::new();
+        admin.encode(&mut encoded);
+
+        let mut expected = vec![0xf1, 0x01, 0x80, 0x94];
+        expected.extend_from_slice(Address::ZERO.as_slice());
+        expected.extend_from_slice(&[
+            0x80, // expiry
+            0x80, // limits
+            0x80, // allowed_calls
+            0x80, // witness
+            0x01, // is_admin
+            0x94, // account address header
+        ]);
+        expected.extend_from_slice(account.as_slice());
+
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.len(), admin.length());
+    }
+
+    #[test]
+    fn key_authorization_t6_account_keeps_empty_admin_marker() {
+        let account_bound = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::ZERO,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: Some(Address::repeat_byte(0x22)),
+        };
+        let unbound = KeyAuthorization {
+            account: None,
+            ..account_bound.clone()
+        };
+
+        let mut encoded = Vec::new();
+        account_bound.encode(&mut encoded);
+        assert_eq!(encoded[28], 0x80, "is_admin must retain its empty slot");
+
+        let mut unbound_encoded = Vec::new();
+        unbound.encode(&mut unbound_encoded);
+        assert_ne!(encoded, unbound_encoded);
+        assert_ne!(keccak256(encoded), keccak256(unbound_encoded));
+    }
+
+    #[test]
+    fn key_authorization_deny_all_rlp_byte_fixture() {
+        // Pins the exact wire bytes for the deny-all envelope so the manual
+        // RLP impl can't drift away from writer's `#[derive(Encodable)]`
+        // output. Fields and trailing-canonical positioning must match
+        // writer `crates/primitives/src/transaction/key_authorization.rs`
+        // (`#[rlp(trailing(canonical))]`).
+        let deny_all = KeyAuthorization {
+            chain_id: 1,
+            key_type: SignatureType::Secp256k1, // discriminant 0 → RLP 0x80
+            key_id: Address::ZERO,              // 0x94 + 20×0x00
+            expiry: Some(1000),                 // 0x82 0x03 0xe8
+            limits: None,                       // positional placeholder 0x80
+            allowed_calls: Some(Vec::new()),    // empty list 0xc0
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let mut buf = Vec::new();
+        deny_all.encode(&mut buf);
+
+        // body = 1 (chain_id) + 1 (key_type) + 21 (key_id) + 3 (expiry) + 1 (limits 0x80) + 1 (0xc0)
+        //      = 28 bytes → list header = 0xc0 + 28 = 0xdc
+        let expected: Vec<u8> = vec![
+            0xdc, // list header (list, payload=28)
+            0x01, // chain_id = 1
+            0x80, // key_type = Secp256k1 (0u8 → empty string)
+            0x94, // address header (string, len 20)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x82, 0x03, 0xe8, // expiry = 1000
+            0x80,             // limits = None positional placeholder
+            0xc0,             // allowed_calls = empty list
+        ];
+        assert_eq!(buf, expected, "deny-all envelope RLP bytes must match the writer canonical form");
+    }
+
+    #[test]
+    fn signed_key_authorization_nests_canonical_allowed_calls() {
+        // The nested authorization retains its own canonical trailing layout;
+        // the outer signature does not force absent authorization fields into it.
+        let signed = SignedKeyAuthorization {
+            authorization: KeyAuthorization {
+                chain_id: 1,
+                key_type: SignatureType::Secp256k1,
+                key_id: Address::ZERO,
+                expiry: Some(1000),
+                limits: None,
+                allowed_calls: Some(Vec::new()),
+                witness: None,
+                is_admin: false,
+                account: None,
+            },
+            signature: PrimitiveSignature::Secp256k1(Signature::test_signature()),
+        };
+        let mut buf = Vec::new();
+        signed.encode(&mut buf);
+        assert_eq!(buf.len(), signed.length());
+    }
+
+    // ========================================================================
+    // from_bytes / recover_signer (T3 signature_verifier prerequisites)
+    // ========================================================================
+
+    #[test]
+    fn from_bytes_empty_rejected() {
+        assert!(PrimitiveSignature::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn from_bytes_secp256k1_round_trip() {
+        let sig = Signature::test_signature();
+        let bytes = PrimitiveSignature::Secp256k1(sig).to_bytes();
+        assert_eq!(bytes.len(), 65);
+        let parsed = PrimitiveSignature::from_bytes(&bytes).expect("65-byte secp256k1 parses");
+        assert!(matches!(parsed, PrimitiveSignature::Secp256k1(_)));
+    }
+
+    #[test]
+    fn from_bytes_unknown_type_rejected() {
+        let mut data = vec![0x05u8]; // unknown type byte
+        data.extend_from_slice(&[0u8; 129]);
+        assert!(PrimitiveSignature::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn from_bytes_p256_wrong_length_rejected() {
+        let mut data = vec![SIGNATURE_TYPE_P256];
+        data.extend_from_slice(&[0u8; 128]); // 128 not P256_SIGNATURE_LENGTH (129)
+        assert!(PrimitiveSignature::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn from_bytes_webauthn_too_short_rejected() {
+        let mut data = vec![SIGNATURE_TYPE_WEBAUTHN];
+        data.extend_from_slice(&[0u8; 127]); // min payload is 128
+        assert!(PrimitiveSignature::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn from_bytes_webauthn_too_long_rejected() {
+        let mut data = vec![SIGNATURE_TYPE_WEBAUTHN];
+        data.extend_from_slice(&[0u8; MAX_WEBAUTHN_SIGNATURE_LENGTH + 1]);
+        assert!(PrimitiveSignature::from_bytes(&data).is_err());
+    }
+
+    /// Build a `(PrimitiveSignature::P256, expected_address, message_hash)` triple by
+    /// generating a fresh P256 keypair, signing a fixed message, and normalising s.
+    fn make_p256_test_sig(msg_hash: B256) -> (PrimitiveSignature, Address) {
+        use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature as P256Signature, SigningKey};
+        use p256::elliptic_curve::rand_core::OsRng;
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let encoded = verifying_key.to_encoded_point(false);
+        let pub_key_x = B256::from_slice(encoded.x().expect("p256 encoded point has x"));
+        let pub_key_y = B256::from_slice(encoded.y().expect("p256 encoded point has y"));
+
+        let sig: P256Signature = signing_key
+            .sign_prehash(msg_hash.as_slice())
+            .expect("p256 prehash sign");
+        let normalized = sig.normalize_s().unwrap_or(sig);
+        let r = B256::from_slice(&normalized.r().to_bytes());
+        let s = B256::from_slice(&normalized.s().to_bytes());
+
+        let prim = PrimitiveSignature::P256(P256SignatureWithPreHash {
+            r,
+            s,
+            pub_key_x,
+            pub_key_y,
+            pre_hash: false,
+        });
+        let addr = derive_p256_address(&pub_key_x, &pub_key_y);
+        (prim, addr)
+    }
+
+    #[test]
+    fn p256_recover_round_trip() {
+        let msg = B256::from([0xBB; 32]);
+        let (prim, expected) = make_p256_test_sig(msg);
+        let recovered = prim.recover_signer(&msg).expect("P256 recover");
+        assert_eq!(recovered, expected);
+
+        // Round-trip the wire encoding.
+        let wire = prim.to_bytes();
+        let parsed = PrimitiveSignature::from_bytes(&wire).expect("P256 parses");
+        let recovered2 = parsed.recover_signer(&msg).expect("P256 recover after round-trip");
+        assert_eq!(recovered2, expected);
+    }
+
+    #[test]
+    fn p256_recover_with_wrong_hash_fails() {
+        let msg = B256::from([0xBB; 32]);
+        let (prim, _expected) = make_p256_test_sig(msg);
+        let wrong_msg = B256::from([0xCC; 32]);
+        assert!(prim.recover_signer(&wrong_msg).is_err());
+    }
+
+    #[test]
+    fn p256_high_s_rejected() {
+        // s = P256N_HALF + 1 is the smallest high-s value.
+        let high_s_u256 = P256N_HALF.saturating_add(U256::from(1u64));
+        let prim = PrimitiveSignature::P256(P256SignatureWithPreHash {
+            r: B256::ZERO,
+            s: B256::from(high_s_u256.to_be_bytes::<32>()),
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            pre_hash: false,
+        });
+        assert!(prim.recover_signer(&B256::ZERO).is_err());
+    }
+
+    #[test]
+    fn webauthn_too_short_data_rejected() {
+        // Less than MIN_AUTH_DATA_LEN + 32 (need at least 37 + 32 = 69 bytes).
+        let sig = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r: B256::ZERO,
+            s: B256::ZERO,
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            webauthn_data: Bytes::from(vec![0u8; MIN_AUTH_DATA_LEN + 31]),
+        });
+        assert!(sig.recover_signer(&B256::ZERO).is_err());
+    }
+
+    #[test]
+    fn webauthn_no_up_uv_flag_rejected() {
+        let mut data = vec![0u8; MIN_AUTH_DATA_LEN + 64];
+        data[32] = 0; // neither UP nor UV
+        let sig = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r: B256::ZERO,
+            s: B256::ZERO,
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            webauthn_data: Bytes::from(data),
+        });
+        assert!(sig.recover_signer(&B256::ZERO).is_err());
+    }
+
+    #[test]
+    fn webauthn_at_flag_rejected() {
+        let mut data = vec![0u8; MIN_AUTH_DATA_LEN + 64];
+        data[32] = WA_UP | WA_AT; // attestation flag not allowed for assertion
+        let sig = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r: B256::ZERO,
+            s: B256::ZERO,
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            webauthn_data: Bytes::from(data),
+        });
+        assert!(sig.recover_signer(&B256::ZERO).is_err());
+    }
+
+    #[test]
+    fn webauthn_ed_flag_rejected() {
+        let mut data = vec![0u8; MIN_AUTH_DATA_LEN + 64];
+        data[32] = WA_UP | WA_ED; // extensions not supported
+        let sig = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r: B256::ZERO,
+            s: B256::ZERO,
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            webauthn_data: Bytes::from(data),
+        });
+        assert!(sig.recover_signer(&B256::ZERO).is_err());
+    }
+
+    #[test]
+    fn webauthn_round_trip_end_to_end() {
+        use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature as P256Signature, SigningKey};
+        use p256::elliptic_curve::rand_core::OsRng;
+
+        // 1. clientDataJSON with challenge == base64url(tx_hash).
+        let tx_hash = B256::from([0xCC; 32]);
+        let challenge_b64 = URL_SAFE_NO_PAD.encode(tx_hash.as_slice());
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://example.com"}}"#,
+            challenge_b64
+        );
+
+        // 2. authenticatorData (37 bytes, UP only).
+        let mut auth_data = vec![0u8; MIN_AUTH_DATA_LEN];
+        auth_data[32] = WA_UP;
+
+        // 3. webauthn_data = authData || clientDataJSON.
+        let mut webauthn_data = auth_data.clone();
+        webauthn_data.extend_from_slice(client_data_json.as_bytes());
+
+        // 4. messageHash = sha256(authData || sha256(clientDataJSON)).
+        let client_hash = Sha256::digest(client_data_json.as_bytes());
+        let mut hasher = Sha256::new();
+        hasher.update(&auth_data);
+        hasher.update(client_hash);
+        let message_hash = B256::from_slice(&hasher.finalize());
+
+        // 5. Sign with a P256 key.
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let encoded = verifying_key.to_encoded_point(false);
+        let pub_key_x = B256::from_slice(encoded.x().unwrap());
+        let pub_key_y = B256::from_slice(encoded.y().unwrap());
+
+        let sig: P256Signature = signing_key.sign_prehash(message_hash.as_slice()).unwrap();
+        let normalized = sig.normalize_s().unwrap_or(sig);
+        let r = B256::from_slice(&normalized.r().to_bytes());
+        let s = B256::from_slice(&normalized.s().to_bytes());
+
+        let prim = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r,
+            s,
+            pub_key_x,
+            pub_key_y,
+            webauthn_data: Bytes::from(webauthn_data),
+        });
+
+        let expected = derive_p256_address(&pub_key_x, &pub_key_y);
+        let recovered = prim.recover_signer(&tx_hash).expect("WebAuthn recover");
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn webauthn_challenge_mismatch_rejected() {
+        // Build a WebAuthn payload whose challenge does NOT match tx_hash.
+        let tx_hash = B256::from([0xCC; 32]);
+        let wrong_challenge = URL_SAFE_NO_PAD.encode(B256::from([0xDD; 32]).as_slice());
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}"}}"#,
+            wrong_challenge
+        );
+
+        let mut auth_data = vec![0u8; MIN_AUTH_DATA_LEN];
+        auth_data[32] = WA_UP;
+        let mut webauthn_data = auth_data;
+        webauthn_data.extend_from_slice(client_data_json.as_bytes());
+
+        let sig = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r: B256::ZERO,
+            s: B256::ZERO,
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            webauthn_data: Bytes::from(webauthn_data),
+        });
+        // Should bail at challenge check, before signature verification.
+        assert!(sig.recover_signer(&tx_hash).is_err());
+    }
+
+    #[test]
+    fn webauthn_wrong_type_field_rejected() {
+        let tx_hash = B256::from([0xCC; 32]);
+        let challenge_b64 = URL_SAFE_NO_PAD.encode(tx_hash.as_slice());
+        // type = "webauthn.create" instead of "webauthn.get"
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.create","challenge":"{}"}}"#,
+            challenge_b64
+        );
+
+        let mut auth_data = vec![0u8; MIN_AUTH_DATA_LEN];
+        auth_data[32] = WA_UP;
+        let mut webauthn_data = auth_data;
+        webauthn_data.extend_from_slice(client_data_json.as_bytes());
+
+        let sig = PrimitiveSignature::WebAuthn(WebAuthnSignature {
+            r: B256::ZERO,
+            s: B256::ZERO,
+            pub_key_x: B256::ZERO,
+            pub_key_y: B256::ZERO,
+            webauthn_data: Bytes::from(webauthn_data),
+        });
+        assert!(sig.recover_signer(&tx_hash).is_err());
     }
 }

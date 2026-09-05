@@ -1,7 +1,43 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, Signature, B256, U256};
 use alloy::rpc::types::TransactionRequest;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
+
+// ---------------------------------------------------------------------------
+// CallScope / SelectorRule (TIP-1011, T3+)
+// ---------------------------------------------------------------------------
+
+/// Per-target call scope. Used in [`TempoKeyAuthGasInfo::allowed_calls`] and
+/// (re-exported) in the chains-layer `KeyAuthorization` RLP encoding.
+///
+/// `selector_rules` semantics: `[]` allows any selector on this target.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+    alloy_rlp_derive::RlpEncodable,
+    alloy_rlp_derive::RlpDecodable,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct CallScope {
+    pub target: Address,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selector_rules: Vec<SelectorRule>,
+}
+
+/// Selector-level rule within a `CallScope`.
+///
+/// `recipients` semantics: `[]` imposes no recipient constraint; otherwise the
+/// first ABI address argument must be in the allowlist.
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+    alloy_rlp_derive::RlpEncodable,
+    alloy_rlp_derive::RlpDecodable,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectorRule {
+    pub selector: FixedBytes<4>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipients: Vec<Address>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,11 +96,94 @@ pub struct TempoCallExtension {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoKeyAuthGasInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Signature type of the key being authorized. `sigType` remains accepted
+    /// for backward compatibility with the original gas-only RPC shape.
+    #[serde(
+        default,
+        rename = "keyType",
+        alias = "sigType",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sig_type: Option<String>,
 
+    /// Legacy gas-only limit count. A full authorization derives this from
+    /// `limits` instead.
     #[serde(default)]
     pub num_limits: u32,
+
+    #[serde(default, with = "alloy::serde::quantity::opt", skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<Address>,
+
+    #[serde(default, with = "alloy::serde::quantity::opt", skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<u64>,
+
+    /// `None` means unlimited spending; `Some([])` denies all spending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Vec<TempoTokenLimitInfo>>,
+
+    /// (T3+, TIP-1011) Per-target call scopes carried on the key authorization.
+    /// `None` = unrestricted; `Some([])` = scoped deny-all; `Some([...])` =
+    /// listed scopes. Used to derive `ScopeCounts` for `key_auth_gas`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_calls: Option<Vec<CallScope>>,
+
+    /// (T5+, TIP-1053) Optional key-authorization witness. Presence matters;
+    /// `bytes32(0)` is still a witness and incurs witness gas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<B256>,
+
+    /// T6 admin-key authorization marker.
+    #[serde(default)]
+    pub is_admin: bool,
+
+    /// T6 target account binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Address>,
+
+    /// Full authorization signature. When omitted, the object remains a
+    /// gas-only compatibility input and does not mutate AccountKeychain state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<TempoPrimitiveSignatureInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoTokenLimitInfo {
+    pub token: Address,
+    pub limit: U256,
+    #[serde(default, with = "alloy::serde::quantity")]
+    pub period: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum TempoPrimitiveSignatureInfo {
+    Secp256k1(Signature),
+    P256(TempoP256SignatureInfo),
+    WebAuthn(TempoWebAuthnSignatureInfo),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoP256SignatureInfo {
+    pub r: B256,
+    pub s: B256,
+    pub pub_key_x: B256,
+    pub pub_key_y: B256,
+    pub pre_hash: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoWebAuthnSignatureInfo {
+    pub r: B256,
+    pub s: B256,
+    pub pub_key_x: B256,
+    pub pub_key_y: B256,
+    pub webauthn_data: Bytes,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -224,12 +343,49 @@ mod tests {
     fn test_tempo_key_auth_gas_info_deserialization() {
         let json = serde_json::json!({
             "sigType": "webauthn",
-            "numLimits": 3
+            "numLimits": 3,
+            "witness": "0x0000000000000000000000000000000000000000000000000000000000000000"
         });
 
         let info: TempoKeyAuthGasInfo = serde_json::from_value(json).expect("should deserialize");
         assert_eq!(info.sig_type, Some("webauthn".to_string()));
         assert_eq!(info.num_limits, 3);
+        assert_eq!(info.witness, Some(B256::ZERO));
+    }
+
+    #[test]
+    fn test_tempo_full_key_authorization_deserialization() {
+        let json = serde_json::json!({
+            "chainId": "0x1079",
+            "keyType": "p256",
+            "keyId": "0x0000000000000000000000000000000000000042",
+            "limits": [{
+                "token": "0x0000000000000000000000000000000000000001",
+                "limit": "0x2a",
+                "period": "0x3c"
+            }],
+            "isAdmin": false,
+            "account": "0x0000000000000000000000000000000000000007",
+            "signature": {
+                "type": "p256",
+                "r": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "s": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                "pubKeyX": "0x0000000000000000000000000000000000000000000000000000000000000003",
+                "pubKeyY": "0x0000000000000000000000000000000000000000000000000000000000000004",
+                "preHash": false
+            }
+        });
+
+        let info: TempoKeyAuthGasInfo = serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(info.chain_id, Some(4217));
+        assert_eq!(info.sig_type.as_deref(), Some("p256"));
+        assert_eq!(info.key_id, Some(Address::with_last_byte(0x42)));
+        assert_eq!(info.account, Some(Address::with_last_byte(0x07)));
+        assert_eq!(info.limits.as_ref().unwrap()[0].period, 60);
+        assert!(matches!(
+            info.signature,
+            Some(TempoPrimitiveSignatureInfo::P256(_))
+        ));
     }
 
     /// TempoKeyAuthGasInfo defaults when fields are missing.
@@ -240,6 +396,9 @@ mod tests {
         let info: TempoKeyAuthGasInfo = serde_json::from_value(json).expect("should deserialize empty");
         assert!(info.sig_type.is_none());
         assert_eq!(info.num_limits, 0);
+        assert!(info.witness.is_none());
+        assert!(info.signature.is_none());
+        assert!(!info.is_admin);
     }
 
     /// CallRequest serialization round-trip: serialize then deserialize.
