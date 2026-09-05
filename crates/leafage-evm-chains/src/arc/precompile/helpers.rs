@@ -82,6 +82,8 @@ pub fn revert_message_to_bytes(msg: &str) -> Bytes {
 /// caller, blocklist, zero address, zero amount, overflow) via
 /// [`new_reverted_with_early_penalty`].
 ///
+/// Zero8+: also applied to delegatecall rejections via [`check_delegatecall`].
+///
 pub(crate) const PRECOMPILE_EARLY_REVERT_GAS_PENALTY: u64 = 200;
 
 /// Enum to represent either a reverted precompile output or an error
@@ -405,7 +407,12 @@ pub(crate) fn transfer(
     )?;
 
     // Check that the account can be decremented by the amount
-    check_can_decr_account(&loaded_from_account.info, amount, gas_counter)?;
+    check_can_decr_account(
+        &loaded_from_account.info,
+        amount,
+        gas_counter,
+        hardfork_flags,
+    )?;
 
     // Mirrors prior balance_decr + balance_incr; Zero6+ uses cold/warm via account_load_cost.
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
@@ -512,7 +519,12 @@ pub(crate) fn balance_decr(
     )?;
 
     // Check that the account can be decremented by the amount
-    check_can_decr_account(&loaded_from_account.info, amount, gas_counter)?;
+    check_can_decr_account(
+        &loaded_from_account.info,
+        amount,
+        gas_counter,
+        hardfork_flags,
+    )?;
 
     // Perform the decrement
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
@@ -552,30 +564,40 @@ pub(crate) fn check_delegatecall(
     precompile_address: Address,
     precompile_input: &PrecompileInput,
     gas_counter: &Gas,
-    _hardfork_flags: ArcHardforkFlags,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
     if precompile_input.target_address != precompile_address
         || precompile_input.bytecode_address != precompile_address
     {
-        return Err(PrecompileErrorOrRevert::new_reverted(
-            *gas_counter,
-            ERR_DELEGATE_CALL_NOT_ALLOWED,
-        ));
+        return Err(if hardfork_flags.is_active(ArcHardfork::Zero8) {
+            PrecompileErrorOrRevert::new_reverted_with_penalty(
+                *gas_counter,
+                PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+                ERR_DELEGATE_CALL_NOT_ALLOWED,
+            )
+        } else {
+            PrecompileErrorOrRevert::new_reverted(*gas_counter, ERR_DELEGATE_CALL_NOT_ALLOWED)
+        });
     }
     Ok(())
 }
 
-/// Helper to determine if an account can be decremented by an amount
-/// Decrements gas counter if account would be emptied
+/// Helper to determine if an account can be decremented by an amount.
+/// Pre-Zero8 rejects decrements that empty an account; Zero8 permits them.
 pub(crate) fn check_can_decr_account(
     loaded_account_info: &AccountInfo,
     amount: U256,
     gas_counter: &mut Gas,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
     // Check that the account has sufficient balance
     let from_account_balance = loaded_account_info.balance.checked_sub(amount).ok_or(
         PrecompileErrorOrRevert::new_reverted(*gas_counter, ERR_INSUFFICIENT_FUNDS),
     )?;
+
+    if hardfork_flags.is_active(ArcHardfork::Zero8) {
+        return Ok(());
+    }
 
     // Check that the account would not be emptied if this transfer goes through
     let from_account_is_empty = from_account_balance.is_zero()

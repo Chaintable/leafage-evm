@@ -1,14 +1,17 @@
-use crate::api::{DebankApiServer, EthApiServer};
+use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{Api, EvmExecutor, TxSetter};
 use crate::api_impl::debank::MIN_TRANSACTION_GAS;
 use crate::api_impl::{utils, ApiImpl};
 use alloy::eips::eip7702::Authorization;
-use alloy::primitives::{hex, keccak256};
+use alloy::primitives::{address, hex, keccak256};
 use alloy::rpc::types::state::{AccountOverride, StateOverride};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::signers::{local::PrivateKeySigner, SignerSync};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
+use leafage_evm_chains::arc::{
+    ArcChainConfig, ARC_MAINNET_CHAIN_ID, ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+    ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+};
 use leafage_evm_storage::{
     BlockContext, EvmStorageWrapper, EvmStorageWrite, MultiStorage, StateDBProvider,
     StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
@@ -19,6 +22,7 @@ use leafage_evm_types::{
     DebankErrorCode, DebankID, DebankSingleSimulateResult, IndexValuePair, MainnetSpecId,
     NewAccount, NewCode, H256, U256,
 };
+use revm::bytecode::opcode;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::database::CacheDB;
 use std::collections::BTreeMap;
@@ -36,6 +40,8 @@ const ANCHOR_NUMBER: u64 = 1;
 const ANCHOR_BASE_FEE: u64 = 3;
 const ENCODED_NEXT_BASE_FEE: u64 = 7;
 const OVERRIDDEN_BASE_FEE: u64 = 11;
+const CALL_FROM_ADDRESS: Address = address!("1800000000000000000000000000000000000003");
+const MEMO_ADDRESS: Address = address!("5294E9927c3306DcBaDb03fe70b92e01cCede505");
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -51,6 +57,8 @@ struct TestAddresses {
     environment: Address,
     counter: Address,
     balance_reader: Address,
+    account_probe: Address,
+    drain_target: Address,
     beneficiary: Address,
 }
 
@@ -133,6 +141,77 @@ fn balance_reader_code() -> Bytes {
     ])
 }
 
+fn account_probe_code() -> Bytes {
+    Bytes::from_static(&[
+        // Return BALANCE and EXTCODEHASH for address(calldataload(0)).
+        opcode::PUSH0,
+        opcode::CALLDATALOAD,
+        opcode::DUP1,
+        opcode::BALANCE,
+        opcode::PUSH0,
+        opcode::MSTORE,
+        opcode::EXTCODEHASH,
+        opcode::PUSH1,
+        0x20,
+        opcode::MSTORE,
+        opcode::PUSH1,
+        0x40,
+        opcode::PUSH0,
+        opcode::RETURN,
+    ])
+}
+
+fn forwarding_call_code(target: Address) -> Bytes {
+    let mut code = vec![
+        opcode::CALLDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::CALLDATACOPY,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::CALLDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH20,
+    ];
+    code.extend_from_slice(target.as_slice());
+    code.extend_from_slice(&[
+        opcode::GAS,
+        opcode::CALL,
+        opcode::POP,
+        opcode::RETURNDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::RETURNDATACOPY,
+        opcode::RETURNDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::RETURN,
+    ]);
+    code.into()
+}
+
+fn call_from_input(sender: Address, target: Address, data: Bytes) -> Bytes {
+    let padded_len = data.len().div_ceil(32) * 32;
+    let mut encoded = Vec::with_capacity(4 + 128 + padded_len);
+    encoded.extend_from_slice(&selector("callFrom(address,address,bytes)"));
+    encoded.extend_from_slice(H256::left_padding_from(sender.as_slice()).as_slice());
+    encoded.extend_from_slice(H256::left_padding_from(target.as_slice()).as_slice());
+    encoded.extend_from_slice(&U256::from(96).to_be_bytes::<32>());
+    encoded.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+    encoded.extend_from_slice(&data);
+    encoded.resize(encoded.len() + padded_len - data.len(), 0);
+    encoded.into()
+}
+
 fn native_fiat_token_code(account: Address) -> Bytes {
     let native_coin_control: Address = "0x1800000000000000000000000000000000000001"
         .parse()
@@ -164,6 +243,18 @@ fn build_arc_fixture(estimate_gas_buffer: u64) -> ArcFixture {
 }
 
 fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64) -> ArcFixture {
+    build_arc_fixture_with_timestamp(estimate_gas_buffer, rpc_gas_cap, 1_000 + ANCHOR_NUMBER)
+}
+
+fn build_arc_fixture_at_timestamp(estimate_gas_buffer: u64, timestamp: u64) -> ArcFixture {
+    build_arc_fixture_with_timestamp(estimate_gas_buffer, ARC_RPC_GAS_CAP, timestamp)
+}
+
+fn build_arc_fixture_with_timestamp(
+    estimate_gas_buffer: u64,
+    rpc_gas_cap: u64,
+    anchor_timestamp: u64,
+) -> ArcFixture {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let path =
         std::env::temp_dir().join(format!("leafage-arc-estimate-{}-{id}", std::process::id()));
@@ -183,6 +274,8 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
         environment: Address::repeat_byte(0x66),
         counter: Address::repeat_byte(0x68),
         balance_reader: Address::repeat_byte(0x6c),
+        account_probe: Address::repeat_byte(0x6d),
+        drain_target: Address::repeat_byte(0x6e),
         beneficiary: Address::repeat_byte(0x77),
     };
     let native_fiat_token = native_fiat_token_code(addresses.empty);
@@ -194,6 +287,8 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
     let environment = environment_code();
     let counter = counter_code();
     let balance_reader = balance_reader_code();
+    let account_probe = account_probe_code();
+    let memo = forwarding_call_code(CALL_FROM_ADDRESS);
     let mut diff = BlockStorageDiff::default();
     for (address, balance, nonce, code_hash) in [
         (addresses.funded, U256::ONE << 128, 0, H256::ZERO),
@@ -226,6 +321,14 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
             1,
             keccak256(&balance_reader),
         ),
+        (
+            addresses.account_probe,
+            U256::ZERO,
+            1,
+            keccak256(&account_probe),
+        ),
+        (addresses.drain_target, U256::from(10), 0, H256::ZERO),
+        (MEMO_ADDRESS, U256::ZERO, 1, keccak256(&memo)),
     ] {
         diff.new_accounts.push(NewAccount {
             address: keccak256(address.as_slice()),
@@ -259,6 +362,14 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
             code_hash: keccak256(&balance_reader),
             code: balance_reader,
         },
+        NewCode {
+            code_hash: keccak256(&account_probe),
+            code: account_probe,
+        },
+        NewCode {
+            code_hash: keccak256(&memo),
+            code: memo,
+        },
     ]);
     diff.storage_diffs.push(AccountStorageDiff {
         address: keccak256(native_coin_control.as_slice()),
@@ -285,16 +396,15 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
 
     let tree =
         Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
-    tree.update_block(
-        test_block(
-            ANCHOR_NUMBER,
-            H256::repeat_byte(0xbb),
-            H256::repeat_byte(0xaa),
-            ENCODED_NEXT_BASE_FEE,
-        ),
-        BlockStorageDiff::default(),
-    )
-    .unwrap();
+    let mut anchor = test_block(
+        ANCHOR_NUMBER,
+        H256::repeat_byte(0xbb),
+        H256::repeat_byte(0xaa),
+        ENCODED_NEXT_BASE_FEE,
+    );
+    anchor.inner.header.inner.timestamp = anchor_timestamp;
+    tree.update_block(anchor, BlockStorageDiff::default())
+        .unwrap();
 
     let arc_config = ArcChainConfig::mainnet();
     let mut cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
@@ -418,6 +528,14 @@ fn address_word(address: Address) -> Bytes {
     let mut word = [0u8; 32];
     word[12..].copy_from_slice(address.as_slice());
     Bytes::copy_from_slice(&word)
+}
+
+fn burn_input(from: Address, amount: U256) -> Bytes {
+    let mut input = Vec::with_capacity(4 + 64);
+    input.extend_from_slice(&selector("burn(address,uint256)"));
+    input.extend_from_slice(&address_word(from));
+    input.extend_from_slice(&amount.to_be_bytes::<32>());
+    input.into()
 }
 
 fn p256_valid_input() -> Bytes {
@@ -688,6 +806,212 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
         output_words(&root_trace_output(&explicit_nonce.results[1])),
         vec![U256::from(2)]
     );
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_zero8_commits_drain_cleanup_and_value_recreation() {
+    let fixture =
+        build_arc_fixture_at_timestamp(100, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+    let addresses = fixture.addresses;
+    let native_coin_authority: Address = "0x1800000000000000000000000000000000000000"
+        .parse()
+        .unwrap();
+    let drained_balance = U256::from(10);
+    let recredited_balance = U256::from(17);
+    let probe = || {
+        request_with_input(
+            addresses.observer,
+            addresses.account_probe,
+            address_word(addresses.drain_target),
+        )
+    };
+
+    let burn = request_with_input(
+        addresses.native_fiat_token,
+        native_coin_authority,
+        burn_input(addresses.drain_target, drained_balance),
+    );
+    let recredit = CallRequest {
+        inner: TransactionRequest::default()
+            .from(addresses.funded)
+            .to(addresses.drain_target)
+            .value(recredited_balance),
+        tempo: None,
+    };
+    let simulated = fixture
+        .api
+        .simulate_transactions(
+            vec![burn, probe(), recredit, probe()],
+            anchor_context(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(simulated.stats.success, "{simulated:#?}");
+    assert_eq!(simulated.results.len(), 4);
+    assert_eq!(
+        output_words(&root_trace_output(&simulated.results[0])),
+        vec![U256::ONE]
+    );
+    assert_eq!(
+        output_words(&root_trace_output(&simulated.results[1])),
+        vec![U256::ZERO, U256::ZERO]
+    );
+    assert_eq!(simulated.results[2].traces[0].value, recredited_balance);
+    assert_eq!(
+        output_words(&root_trace_output(&simulated.results[3])),
+        vec![
+            recredited_balance,
+            U256::from_be_slice(keccak256([]).as_slice()),
+        ]
+    );
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_activates_zero7_callfrom_and_commits_child_state() {
+    let fixture = build_arc_fixture(100);
+    let addresses = fixture.addresses;
+    let input = call_from_input(addresses.funded, addresses.counter, Bytes::new());
+    let request = || request_with_input(addresses.funded, MEMO_ADDRESS, input.clone());
+
+    let simulated = fixture
+        .api
+        .simulate_transactions(
+            vec![request(), request()],
+            anchor_context(),
+            Some(BlockOverrides {
+                time: Some(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(simulated.stats.success, "{simulated:#?}");
+    assert_eq!(simulated.results.len(), 2);
+    for (index, result) in simulated.results.iter().enumerate() {
+        assert_eq!(result.code, 0, "{result:#?}");
+        assert!(result.events.is_empty(), "{result:#?}");
+        assert_eq!(result.traces.len(), 2, "{result:#?}");
+
+        let root = &result.traces[0];
+        let child = &result.traces[1];
+        assert_eq!(root.from_addr, addresses.funded);
+        assert_eq!(root.to_addr, MEMO_ADDRESS);
+        assert_eq!(root.input, input);
+        assert_eq!(child.parent_trace_id, root.id);
+        assert_eq!(child.from_addr, addresses.funded);
+        assert_eq!(child.to_addr, addresses.counter);
+        assert_eq!(child.pos_in_parent_trace, 0);
+        assert_eq!(child.call_create_type, "call");
+        assert!(result.traces.iter().all(|trace| {
+            trace.from_addr != CALL_FROM_ADDRESS && trace.to_addr != CALL_FROM_ADDRESS
+        }));
+
+        let expected = U256::from(index + 1);
+        assert_eq!(output_words(&child.output), vec![expected]);
+        assert!(child.gas_used > 0, "{child:#?}");
+        assert!(child.gas_limit > child.gas_used, "{child:#?}");
+        assert_eq!(
+            output_words(&root.output),
+            vec![U256::ONE, U256::from(64), U256::from(32), expected]
+        );
+    }
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_uses_raw_immediate_callfrom_child_output_and_gas() {
+    let fixture = build_arc_fixture(100);
+    let addresses = fixture.addresses;
+    let child_input = Bytes::from_static(b"immediate-eoa");
+    let input = call_from_input(addresses.funded, addresses.empty, child_input.clone());
+
+    let simulated = fixture
+        .api
+        .simulate_transactions(
+            vec![request_with_input(addresses.funded, MEMO_ADDRESS, input)],
+            anchor_context(),
+            Some(BlockOverrides {
+                time: Some(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(simulated.stats.success, "{simulated:#?}");
+    let result = &simulated.results[0];
+    assert_eq!(result.traces.len(), 2, "{result:#?}");
+    let child = &result.traces[1];
+    assert_eq!(child.from_addr, addresses.funded);
+    assert_eq!(child.to_addr, addresses.empty);
+    assert_eq!(child.input, child_input);
+    assert!(child.output.is_empty(), "{child:#?}");
+    assert_eq!(child.gas_used, 0, "{child:#?}");
+    assert!(child.gas_limit > 0, "{child:#?}");
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_pre_traces_expose_post_zero7_callfrom_as_the_logical_child() {
+    let fixture =
+        build_arc_fixture_at_timestamp(100, ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+    let addresses = fixture.addresses;
+    let child_input = Bytes::new();
+    let input = call_from_input(addresses.funded, addresses.counter, child_input.clone());
+    let request = CallRequest {
+        inner: TransactionRequest::default()
+            .from(addresses.funded)
+            .to(MEMO_ADDRESS)
+            .gas_limit(500_000)
+            .input(TransactionInput::new(input)),
+        tempo: None,
+    };
+    let anchor = Some(BlockId::Number(BlockNumberOrTag::Number(ANCHOR_NUMBER)));
+
+    let traced = fixture
+        .api
+        .trace_many(vec![request.clone()], anchor)
+        .await
+        .unwrap();
+    assert_eq!(traced.len(), 1, "{traced:#?}");
+    let result = &traced[0];
+    assert_eq!(result.error.code, 0, "{result:#?}");
+    assert_eq!(result.trace.len(), 2, "{result:#?}");
+
+    let root = &result.trace[0].trace;
+    let child = &result.trace[1].trace;
+    let root_call = root.action.as_call().expect("root call trace");
+    let child_call = child.action.as_call().expect("logical child call trace");
+    assert_eq!(root_call.from, addresses.funded);
+    assert_eq!(root_call.to, MEMO_ADDRESS);
+    assert_eq!(child_call.from, addresses.funded);
+    assert_eq!(child_call.to, addresses.counter);
+    assert_eq!(child_call.input, child_input);
+    assert!(result.trace.iter().all(|trace| {
+        trace
+            .trace
+            .action
+            .as_call()
+            .is_none_or(|call| call.from != CALL_FROM_ADDRESS && call.to != CALL_FROM_ADDRESS)
+    }));
+
+    let child_result = child.result.as_ref().expect("logical child result");
+    assert_eq!(output_words(child_result.output()), vec![U256::ONE]);
+    assert_eq!(child_result.gas_used(), 22_126, "{child:#?}");
+    assert_eq!(child_call.gas, 457_879, "{child:#?}");
+
+    let geth = fixture.api.trace_call(request, anchor).await.unwrap();
+    assert!(!geth.failed, "{geth:#?}");
+    assert!(!geth.struct_logs.is_empty(), "{geth:#?}");
 
     fixture.close();
 }
