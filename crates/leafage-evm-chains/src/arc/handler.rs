@@ -2,9 +2,9 @@ use super::{
     evm::{ArcContext, ArcEvm},
     native::{
         blocklist_storage_slot, is_blocklisted_status, ERR_BLOCKED_ADDRESS,
-        NATIVE_COIN_CONTROL_ADDRESS,
+        ERR_SELFDESTRUCTED_BALANCE_INCREASED, NATIVE_COIN_CONTROL_ADDRESS,
     },
-    ArcHardforkFlags,
+    ArcHardfork, ArcHardforkFlags,
 };
 use alloy_evm::Database;
 use leafage_evm_types::{Address, U256};
@@ -21,14 +21,14 @@ use revm::{
 /// Arc transaction handler shared by normal and inspected execution.
 pub struct ArcHandler<DB: revm::Database, I> {
     mainnet: MainnetHandler<ArcEvm<DB, I>, EVMError<DB::Error>, EthFrame>,
-    _hardfork_flags: ArcHardforkFlags,
+    hardfork_flags: ArcHardforkFlags,
 }
 
 impl<DB: Database, I> ArcHandler<DB, I> {
     pub fn new(hardfork_flags: ArcHardforkFlags) -> Self {
         Self {
             mainnet: MainnetHandler::default(),
-            _hardfork_flags: hardfork_flags,
+            hardfork_flags,
         }
     }
 
@@ -97,6 +97,15 @@ impl<DB: Database, I> Handler for ArcHandler<DB, I> {
         };
         let total_fee = U256::from(effective_gas_price) * U256::from(exec_result.gas().used());
 
+        if self.hardfork_flags.is_active(ArcHardfork::Zero8) {
+            let account = evm.ctx_mut().journal_mut().load_account(beneficiary)?;
+            if account.is_selfdestructed() {
+                return Err(
+                    InvalidTransaction::Str(ERR_SELFDESTRUCTED_BALANCE_INCREASED.into()).into(),
+                );
+            }
+        }
+
         evm.ctx_mut()
             .journal_mut()
             .balance_incr(beneficiary, total_fee)
@@ -115,7 +124,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arc::{ArcChainConfig, ArcEvmFactory, ARC_MAINNET_CHAIN_ID};
+    use crate::arc::{
+        ArcChainConfig, ArcEvmFactory, ArcForkActivation, ArcHardforkSchedule, ARC_MAINNET_CHAIN_ID,
+    };
     use alloy::primitives::{Address, B256};
     use alloy_evm::EvmEnv;
     use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};
@@ -185,6 +196,25 @@ mod tests {
                 U256::ONE,
             )
             .unwrap();
+    }
+
+    fn hardfork_flags(zero7: bool, zero8: bool) -> ArcHardforkFlags {
+        let activation = |active| {
+            if active {
+                ArcForkActivation::Block(0)
+            } else {
+                ArcForkActivation::Never
+            }
+        };
+        ArcHardforkSchedule::new(
+            ArcForkActivation::Never,
+            ArcForkActivation::Never,
+            ArcForkActivation::Never,
+            ArcForkActivation::Never,
+            activation(zero7),
+            activation(zero8),
+        )
+        .flags_at(0, 0)
     }
 
     #[test]
@@ -294,5 +324,104 @@ mod tests {
             U256::from(10 * 21_000)
         );
         assert!(evm.ctx().journaled_state.logs.is_empty());
+    }
+
+    #[test]
+    fn zero8_rejects_reward_for_beneficiary_selfdestructed_in_this_transaction() {
+        let caller = Address::with_last_byte(1);
+        let beneficiary = Address::with_last_byte(9);
+        let mut evm = evm_with_balance(caller, U256::from(1_000_000));
+        evm.ctx_mut().block.beneficiary = beneficiary;
+        evm.ctx_mut()
+            .set_tx(value_call(caller, Address::with_last_byte(2), U256::ZERO));
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(beneficiary)
+            .unwrap();
+        evm.ctx_mut()
+            .journaled_state
+            .state
+            .get_mut(&beneficiary)
+            .unwrap()
+            .mark_selfdestruct();
+        let initial_balance = evm
+            .ctx_mut()
+            .journal_mut()
+            .load_account(beneficiary)
+            .unwrap()
+            .info
+            .balance;
+        let mut result = FrameResult::Call(CallOutcome::new(
+            InterpreterResult::new(
+                InstructionResult::Return,
+                Default::default(),
+                Gas::new_spent(21_000),
+            ),
+            0..0,
+        ));
+
+        let error = ArcHandler::new(hardfork_flags(false, true))
+            .reward_beneficiary(&mut evm, &mut result)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EVMError::Transaction(InvalidTransaction::Str(message))
+                if message == ERR_SELFDESTRUCTED_BALANCE_INCREASED
+        ));
+        assert_eq!(
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(beneficiary)
+                .unwrap()
+                .info
+                .balance,
+            initial_balance
+        );
+    }
+
+    #[test]
+    fn beneficiary_selfdestruct_check_is_gated_only_by_zero8() {
+        let caller = Address::with_last_byte(1);
+        let beneficiary = Address::with_last_byte(9);
+
+        for flags in [hardfork_flags(false, false), hardfork_flags(true, false)] {
+            let mut evm = evm_with_balance(caller, U256::from(1_000_000));
+            evm.ctx_mut().block.beneficiary = beneficiary;
+            evm.ctx_mut()
+                .set_tx(value_call(caller, Address::with_last_byte(2), U256::ZERO));
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(beneficiary)
+                .unwrap();
+            evm.ctx_mut()
+                .journaled_state
+                .state
+                .get_mut(&beneficiary)
+                .unwrap()
+                .mark_selfdestruct();
+            let mut result = FrameResult::Call(CallOutcome::new(
+                InterpreterResult::new(
+                    InstructionResult::Return,
+                    Default::default(),
+                    Gas::new_spent(21_000),
+                ),
+                0..0,
+            ));
+
+            ArcHandler::new(flags)
+                .reward_beneficiary(&mut evm, &mut result)
+                .unwrap();
+
+            assert_eq!(
+                evm.ctx_mut()
+                    .journal_mut()
+                    .load_account(beneficiary)
+                    .unwrap()
+                    .info
+                    .balance,
+                U256::from(10 * 21_000)
+            );
+        }
     }
 }

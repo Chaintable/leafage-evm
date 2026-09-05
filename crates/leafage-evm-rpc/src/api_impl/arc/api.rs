@@ -1,3 +1,4 @@
+use super::trace::{record_subcall_trace_completion, ArcSubcallTraceSidecar};
 use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
@@ -94,12 +95,18 @@ where
     {
         let factory = self.arc_factory().map_err(EVMError::Custom)?;
         let env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
-        let mut inspector = TracingInspector::new(inspector_cfg);
+        let mut inspectors = (
+            TracingInspector::new(inspector_cfg),
+            ArcSubcallTraceSidecar::new(),
+        );
         let mut evm = factory
-            .create(env, WrapDatabaseRef(state), &mut inspector)
+            .create(env, WrapDatabaseRef(state), &mut inspectors)
             .map_err(|err| EVMError::Custom(err.to_string()))?;
+        evm.set_subcall_trace_completion_hook(record_subcall_trace_completion);
         let result = evm.inspect_tx_commit(tx)?;
         drop(evm);
+        let (mut inspector, sidecar) = inspectors;
+        sidecar.apply(&mut inspector).map_err(EVMError::Custom)?;
         Ok((result, inspector_collect(inspector)))
     }
 }
