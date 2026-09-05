@@ -199,6 +199,8 @@ alloy::sol! {
         error SignatureTypeMismatch(uint8 expected, uint8 actual);
         /// (TIP-1011, T3+) Raised by setCallScopes / validate_call_scopes.
         error InvalidCallScope();
+        /// (TIP-1011, T3+) Raised when an AA call is outside an access key's stored scope.
+        error CallNotAllowed();
         /// (T3+) Spending limit value exceeds the TIP-20 `u128` supply range.
         error InvalidSpendingLimit();
         error KeyAuthorizationWitnessAlreadyBurned();
@@ -266,6 +268,10 @@ fn err_signature_type_mismatch(expected: u8, actual: u8) -> TempoPrecompileError
 
 fn err_invalid_call_scope() -> TempoPrecompileError {
     TempoPrecompileError::Revert(IAccountKeychain::InvalidCallScope {}.abi_encode().into())
+}
+
+fn err_call_not_allowed() -> TempoPrecompileError {
+    TempoPrecompileError::Revert(IAccountKeychain::CallNotAllowed {}.abi_encode().into())
 }
 
 fn err_invalid_spending_limit() -> TempoPrecompileError {
@@ -1294,13 +1300,13 @@ impl AccountKeychain {
     /// Validate keychain authorization (existence, revocation, expiry, and optionally signature type).
     ///
     /// This is called by the transaction validation logic, not directly via ABI dispatch.
-    pub fn validate_keychain_authorization(
+    pub(crate) fn validate_keychain_authorization(
         &self,
         account: Address,
         key_id: Address,
         current_timestamp: u64,
         expected_sig_type: Option<u8>,
-    ) -> Result<()> {
+    ) -> Result<AuthorizedKey> {
         let key = self.load_active_key(account, key_id, current_timestamp)?;
 
         if let Some(sig_type) = expected_sig_type {
@@ -1309,7 +1315,62 @@ impl AccountKeychain {
             }
         }
 
-        Ok(())
+        Ok(key)
+    }
+
+    /// Validates one top-level AA call against the access key's stored scope tree.
+    pub(crate) fn validate_call_scope_for_transaction(
+        &self,
+        account: Address,
+        key_id: Address,
+        to: &revm::primitives::TxKind,
+        input: &[u8],
+    ) -> Result<()> {
+        if key_id.is_zero() || !self.storage.spec().is_t3() {
+            return Ok(());
+        }
+
+        let target = match to {
+            revm::primitives::TxKind::Call(target) => *target,
+            revm::primitives::TxKind::Create => return Err(err_call_not_allowed()),
+        };
+        let key_hash = Self::spending_limit_key(account, key_id);
+
+        if !self.is_scoped_slot(key_hash).read()? {
+            return Ok(());
+        }
+        if !self.targets_handler(key_hash).contains(&target)? {
+            return Err(err_call_not_allowed());
+        }
+
+        let selectors = self.selectors_handler(key_hash, target);
+        if selectors.is_empty()? {
+            return Ok(());
+        }
+        let selector = input
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(FixedBytes::<4>::new)
+            .ok_or_else(err_call_not_allowed)?;
+        if !selectors.contains(&selector)? {
+            return Err(err_call_not_allowed());
+        }
+
+        let recipients = self.recipients_handler(key_hash, target, selector);
+        if recipients.is_empty()? {
+            return Ok(());
+        }
+        let recipient_word = input.get(4..36).ok_or_else(err_call_not_allowed)?;
+        if recipient_word[..12].iter().any(|byte| *byte != 0) {
+            return Err(err_call_not_allowed());
+        }
+
+        let recipient = Address::from_slice(&recipient_word[12..]);
+        if recipients.contains(&recipient)? {
+            Ok(())
+        } else {
+            Err(err_call_not_allowed())
+        }
     }
 
     /// Returns true for the account's implicit root key or an active T6 admin access key.
@@ -1335,7 +1396,7 @@ impl AccountKeychain {
             self.storage.timestamp().saturating_to::<u64>(),
             None,
         ) {
-            Ok(()) => Ok(true),
+            Ok(_) => Ok(true),
             Err(error) if error.is_system_error() => Err(error),
             Err(_) => Ok(false),
         }
@@ -3525,5 +3586,83 @@ mod tests {
             );
             assert!(result.is_ok(), "{:?} recipientless rule should pass", hardfork);
         }
+    }
+
+    #[test]
+    fn transaction_call_scope_checks_target_selector_and_recipient() {
+        use revm::primitives::TxKind;
+
+        let account = Address::repeat_byte(0xd1);
+        let key_id = Address::repeat_byte(0xd2);
+        let target = tip20_addr();
+        let recipient = Address::repeat_byte(0xd3);
+        let selector = FixedBytes::new(TIP20_TRANSFER_SELECTOR);
+        let key_hash = AccountKeychain::spending_limit_key(account, key_id);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T3);
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            let keychain = AccountKeychain::new();
+            keychain.is_scoped_slot(key_hash).write(true)?;
+            keychain.targets_handler(key_hash).insert(target)?;
+            keychain.selectors_handler(key_hash, target).insert(selector)?;
+            keychain
+                .recipients_handler(key_hash, target, selector)
+                .insert(recipient)?;
+
+            let mut allowed = Vec::from(TIP20_TRANSFER_SELECTOR);
+            allowed.extend_from_slice(&[0u8; 12]);
+            allowed.extend_from_slice(recipient.as_slice());
+            assert_eq!(allowed.len(), 36);
+            keychain.validate_call_scope_for_transaction(
+                account,
+                key_id,
+                &TxKind::Call(target),
+                &allowed,
+            )?;
+
+            let mut wrong_recipient = allowed.clone();
+            wrong_recipient[35] ^= 1;
+            assert_eq!(
+                keychain
+                    .validate_call_scope_for_transaction(
+                        account,
+                        key_id,
+                        &TxKind::Call(target),
+                        &wrong_recipient,
+                    )
+                    .unwrap_err(),
+                err_call_not_allowed(),
+            );
+            assert_eq!(
+                keychain
+                    .validate_call_scope_for_transaction(
+                        account,
+                        key_id,
+                        &TxKind::Call(Address::repeat_byte(0xd4)),
+                        &allowed,
+                    )
+                    .unwrap_err(),
+                err_call_not_allowed(),
+            );
+            assert_eq!(
+                keychain
+                    .validate_call_scope_for_transaction(
+                        account,
+                        key_id,
+                        &TxKind::Call(target),
+                        &[0xff; 4],
+                    )
+                    .unwrap_err(),
+                err_call_not_allowed(),
+            );
+            assert_eq!(
+                keychain
+                    .validate_call_scope_for_transaction(account, key_id, &TxKind::Create, &[])
+                    .unwrap_err(),
+                err_call_not_allowed(),
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }

@@ -135,6 +135,8 @@ impl<DB: Database, INSP> TempoHandler<DB, INSP> {
         self.load_accounts(evm)?;
         let gas = self.apply_eip7702_auth_list(evm)?;
 
+        validate_existing_keychain_transaction(evm)?;
+
         // Match writer's fee-token reads so subsequent precompile storage reads
         // observe the same warm/cold state.
         let _ = warm_fee_token_balance(evm);
@@ -168,10 +170,6 @@ impl<DB: Database, INSP> TempoHandler<DB, INSP> {
                 )
             })
             .unwrap_or(false);
-
-        if let Some(key_id) = transaction_key.filter(|_| !same_tx_key_authorization_use) {
-            set_keychain_transaction_key(evm, key_id);
-        }
 
         apply_signed_key_authorization(evm, init_gas)?;
 
@@ -787,6 +785,89 @@ fn set_channel_open_context_hash<DB: Database, INSP>(evm: &mut TempoEvm<DB, INSP
     );
 }
 
+/// Validates an existing access key before exposing it through transient storage.
+fn validate_existing_keychain_transaction<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+) -> Result<(), TempoEvmError<DB::Error>> {
+    use crate::tempo::precompile::account_keychain::AccountKeychain;
+    use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx, TempoPrecompileError};
+
+    let Some((caller, key_id, expected_sig_type, requires_admin)) = evm
+        .ctx()
+        .tx
+        .tempo_fields
+        .as_ref()
+        .and_then(|fields| {
+            if !fields.is_keychain {
+                return None;
+            }
+            let key_id = fields.key_id?;
+            let signed_authorization = fields
+                .key_auth
+                .as_ref()
+                .and_then(|auth| auth.signed_authorization.as_ref());
+            if signed_authorization.is_some_and(|signed| signed.authorization.key_id == key_id) {
+                return None;
+            }
+
+            let expected_sig_type = (evm.ctx().cfg.spec.is_t1() || fields.key_auth.is_some())
+                .then_some(tempo_sig_type_u8(fields.sig_type));
+            Some((
+                evm.ctx().tx.base.caller,
+                key_id,
+                expected_sig_type,
+                signed_authorization.is_some(),
+            ))
+        })
+    else {
+        return Ok(());
+    };
+
+    let timestamp = evm.ctx().block.timestamp.saturating_to::<u64>();
+    let chain_id = evm.ctx().cfg.chain_id;
+    let hardfork = evm.ctx().cfg.spec;
+    let gas_params = evm.ctx().cfg.gas_params.clone();
+    let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+    let mut storage = LeafageStorageProvider::new_with_spec_and_gas_params(
+        internals,
+        u64::MAX,
+        chain_id,
+        false,
+        hardfork,
+        gas_params,
+    );
+    let validation = StorageCtx::enter(&mut storage, || {
+        AccountKeychain::new().validate_keychain_authorization(
+            caller,
+            key_id,
+            timestamp,
+            expected_sig_type,
+        )
+    });
+    drop(storage);
+
+    let key = validation.map_err(|error| match error {
+        TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
+        error => EVMError::Custom(format!("keychain validation failed: {error}")),
+    })?;
+    if requires_admin && !key.is_admin {
+        return Err(EVMError::Custom(
+            "access key cannot authorize another key unless it is an active admin key".into(),
+        ));
+    }
+
+    set_keychain_transaction_key(evm, key_id);
+    Ok(())
+}
+
+const fn tempo_sig_type_u8(signature_type: TempoSigType) -> u8 {
+    match signature_type {
+        TempoSigType::Secp256k1 => 0,
+        TempoSigType::P256 => 1,
+        TempoSigType::WebAuthn => 2,
+    }
+}
+
 /// Sets `transaction_key` in AccountKeychain's fork-dependent transient slot.
 ///
 /// Writer does this in `validate_against_state_and_deduct_caller` (handler.rs:1128-1133)
@@ -1145,11 +1226,15 @@ fn execute_multi_call<DB: Database, INSP>(
         &InitialAndFloorGas,
     ) -> Result<FrameResult, TempoEvmError<DB::Error>>,
 ) -> Result<FrameResult, TempoEvmError<DB::Error>> {
-    let checkpoint = evm.ctx_mut().journal_mut().checkpoint();
-
     let gas_limit = evm.ctx().tx.base.gas_limit;
     let mut remaining_gas = gas_limit.saturating_sub(init_and_floor_gas.initial_gas);
     let mut accumulated_gas_refund: i64 = 0;
+
+    if let Some(frame_result) = prevalidate_keychain_call_scopes(evm, &calls, &mut remaining_gas)? {
+        return Ok(frame_result);
+    }
+
+    let checkpoint = evm.ctx_mut().journal_mut().checkpoint();
 
     let original_kind = evm.ctx().tx.base.kind;
     let original_value = evm.ctx().tx.base.value;
@@ -1233,6 +1318,96 @@ fn execute_multi_call<DB: Database, INSP>(
     *result.gas_mut() = corrected_gas;
 
     Ok(result)
+}
+
+/// Validates every AA call against the acting access key's T3+ scope tree.
+fn prevalidate_keychain_call_scopes<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+    calls: &[TempoCall],
+    remaining_gas: &mut u64,
+) -> Result<Option<FrameResult>, TempoEvmError<DB::Error>> {
+    use crate::tempo::precompile::account_keychain::AccountKeychain;
+    use crate::tempo::precompile::{LeafageStorageProvider, PrecompileStorageProvider, StorageCtx};
+    use revm::interpreter::{
+        interpreter_action::{CallOutcome, CreateOutcome},
+        InstructionResult, InterpreterResult,
+    };
+    use revm::precompile::PrecompileError;
+
+    let hardfork = evm.ctx().cfg.spec;
+    let Some((account, key_id)) = evm
+        .ctx()
+        .tx
+        .tempo_fields
+        .as_ref()
+        .filter(|fields| hardfork.is_t3() && fields.is_keychain)
+        .and_then(|fields| Some((evm.ctx().tx.base.caller, fields.key_id?)))
+    else {
+        return Ok(None);
+    };
+    let Some(first_kind) = calls.first().map(|call| call.to) else {
+        return Err(EVMError::Custom("AA calls list cannot be empty".into()));
+    };
+
+    let chain_id = evm.ctx().cfg.chain_id;
+    let gas_params = evm.ctx().cfg.gas_params.clone();
+    let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+    let mut storage = LeafageStorageProvider::new_with_spec_and_gas_params(
+        internals,
+        *remaining_gas,
+        chain_id,
+        false,
+        hardfork,
+        gas_params,
+    );
+    let validation = StorageCtx::enter(&mut storage, || {
+        let keychain = AccountKeychain::new();
+        for call in calls {
+            keychain.validate_call_scope_for_transaction(
+                account,
+                key_id,
+                &call.to,
+                call.input.as_ref(),
+            )?;
+        }
+        crate::tempo::precompile::Result::<()>::Ok(())
+    });
+    let gas_used = storage.gas_used();
+    drop(storage);
+
+    match validation {
+        Ok(()) => {
+            *remaining_gas = remaining_gas.saturating_sub(gas_used);
+            Ok(None)
+        }
+        Err(error) => {
+            let interpreter_result = match error.into_precompile_result(gas_used) {
+                Ok(output) => {
+                    *remaining_gas = remaining_gas.saturating_sub(output.gas_used);
+                    let mut gas = Gas::new(evm.ctx().tx.base.gas_limit);
+                    gas.set_spent(evm.ctx().tx.base.gas_limit - *remaining_gas);
+                    InterpreterResult::new(InstructionResult::Revert, output.bytes, gas)
+                }
+                Err(PrecompileError::OutOfGas) => {
+                    InterpreterResult::new_oog(evm.ctx().tx.base.gas_limit)
+                }
+                Err(PrecompileError::Fatal(reason)) => return Err(EVMError::Custom(reason)),
+                Err(error) => return Err(EVMError::Custom(error.to_string())),
+            };
+
+            if first_kind.is_call() {
+                Ok(Some(FrameResult::Call(CallOutcome::new(
+                    interpreter_result,
+                    0..0,
+                ))))
+            } else {
+                Ok(Some(FrameResult::Create(CreateOutcome::new(
+                    interpreter_result,
+                    None,
+                ))))
+            }
+        }
+    }
 }
 
 /// Validates and calculates initial transaction gas for AA transactions.
@@ -1988,7 +2163,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        set_keychain_transaction_key(&mut evm, admin);
+        validate_existing_keychain_transaction(&mut evm)
+            .expect("existing admin transaction key validates");
         apply_signed_key_authorization(&mut evm, None).expect("admin authorizes child");
         assert_eq!(key_status(&mut evm, root, child), (true, false));
     }
@@ -2185,6 +2361,207 @@ mod tests {
             .tload(ACCOUNT_KEYCHAIN_ADDRESS, U256::from(transaction_key_slot));
         let expected: U256 = key_id.into_word().into();
         assert_eq!(after, expected, "transaction_key should equal key_id after set");
+    }
+
+    #[test]
+    fn existing_keychain_transaction_validates_key_before_setting_transient_key() {
+        use crate::tempo::precompile::account_keychain::{AccountKeychain, AuthorizedKey};
+        use crate::tempo::precompile::storage_types::Handler as _;
+        use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx};
+
+        let caller = Address::repeat_byte(0xc1);
+        let key_id = Address::repeat_byte(0xc2);
+        let timestamp = 100u64;
+        let cases = [
+            ("missing", None, false),
+            (
+                "revoked",
+                Some(AuthorizedKey {
+                    expiry: u64::MAX,
+                    is_revoked: true,
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (
+                "expired",
+                Some(AuthorizedKey {
+                    expiry: timestamp,
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (
+                "signature type mismatch",
+                Some(AuthorizedKey {
+                    signature_type: 1,
+                    expiry: u64::MAX,
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (
+                "active",
+                Some(AuthorizedKey {
+                    expiry: u64::MAX,
+                    ..Default::default()
+                }),
+                true,
+            ),
+        ];
+
+        for (name, key, should_accept) in cases {
+            let mut evm = make_cached_evm_with_spec(TempoHardfork::T6);
+            evm.inner.ctx.block.timestamp = U256::from(timestamp);
+            evm.inner.ctx.tx.base.caller = caller;
+            evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+                is_keychain: true,
+                key_id: Some(key_id),
+                sig_type: TempoSigType::Secp256k1,
+                ..Default::default()
+            });
+
+            if let Some(key) = key {
+                let chain_id = evm.inner.ctx.cfg.chain_id;
+                let gas_params = evm.inner.ctx.cfg.gas_params.clone();
+                let internals = alloy_evm::EvmInternals::from_context(&mut evm.inner.ctx);
+                let mut storage = LeafageStorageProvider::new_with_spec_and_gas_params(
+                    internals,
+                    u64::MAX,
+                    chain_id,
+                    false,
+                    TempoHardfork::T6,
+                    gas_params,
+                );
+                StorageCtx::enter(&mut storage, || {
+                    let mut keychain = AccountKeychain::new();
+                    keychain.keys[caller][key_id].write(key)
+                })
+                .unwrap();
+                drop(storage);
+            }
+
+            let result = validate_existing_keychain_transaction(&mut evm);
+            assert_eq!(result.is_ok(), should_accept, "{name}: {result:?}");
+
+            let (transaction_key_slot, _) = transient_slots(TempoHardfork::T6);
+            let transaction_key = evm.inner.ctx.journal_mut().tload(
+                ACCOUNT_KEYCHAIN_ADDRESS,
+                U256::from(transaction_key_slot),
+            );
+            assert_eq!(
+                transaction_key,
+                if should_accept {
+                    U256::from_be_bytes(key_id.into_word().0)
+                } else {
+                    U256::ZERO
+                },
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn batch_prevalidation_enforces_call_scope_and_charges_storage_gas() {
+        use crate::tempo::precompile::account_keychain::{
+            AccountKeychain, IAccountKeychain,
+        };
+        use crate::tempo::precompile::tip20::ITIP20;
+        use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx, PATH_USD_ADDRESS};
+        use alloy::sol_types::{SolCall, SolError};
+        use revm::primitives::TxKind;
+
+        let caller = Address::repeat_byte(0xd1);
+        let key_id = Address::repeat_byte(0xd2);
+        let allowed_recipient = Address::repeat_byte(0xd3);
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T4);
+        evm.inner.ctx.tx.base.gas_limit = 1_000_000;
+        evm.inner.ctx.tx.base.caller = caller;
+        evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+            is_keychain: true,
+            key_id: Some(key_id),
+            sig_type: TempoSigType::Secp256k1,
+            ..Default::default()
+        });
+
+        let chain_id = evm.inner.ctx.cfg.chain_id;
+        let gas_params = evm.inner.ctx.cfg.gas_params.clone();
+        let internals = alloy_evm::EvmInternals::from_context(&mut evm.inner.ctx);
+        let mut storage = LeafageStorageProvider::new_with_spec_and_gas_params(
+            internals,
+            u64::MAX,
+            chain_id,
+            false,
+            TempoHardfork::T4,
+            gas_params,
+        );
+        StorageCtx::enter(&mut storage, || {
+            let mut keychain = AccountKeychain::new();
+            keychain.set_tx_origin(caller)?;
+            keychain.authorize_key_with_restrictions(
+                caller,
+                key_id,
+                IAccountKeychain::SignatureType::Secp256k1,
+                IAccountKeychain::KeyRestrictions {
+                    expiry: u64::MAX,
+                    enforceLimits: false,
+                    limits: Vec::new(),
+                    allowAnyCalls: false,
+                    allowedCalls: vec![IAccountKeychain::CallScope {
+                        target: PATH_USD_ADDRESS,
+                        selectorRules: vec![IAccountKeychain::SelectorRule {
+                            selector: ITIP20::transferCall::SELECTOR.into(),
+                            recipients: vec![allowed_recipient],
+                        }],
+                    }],
+                },
+                None,
+            )
+        })
+        .unwrap();
+        drop(storage);
+
+        let allowed = TempoCall {
+            to: TxKind::Call(PATH_USD_ADDRESS),
+            value: U256::ZERO,
+            input: ITIP20::transferCall {
+                to: allowed_recipient,
+                amount: U256::ONE,
+            }
+            .abi_encode()
+            .into(),
+        };
+        let mut remaining_gas = 1_000_000;
+        let result = prevalidate_keychain_call_scopes(
+            &mut evm,
+            std::slice::from_ref(&allowed),
+            &mut remaining_gas,
+        )
+        .unwrap();
+        assert!(result.is_none());
+        assert!(remaining_gas < 1_000_000);
+
+        let denied = TempoCall {
+            input: ITIP20::transferCall {
+                to: Address::repeat_byte(0xd4),
+                amount: U256::ONE,
+            }
+            .abi_encode()
+            .into(),
+            ..allowed
+        };
+        let mut remaining_gas = 1_000_000;
+        let result = prevalidate_keychain_call_scopes(
+            &mut evm,
+            std::slice::from_ref(&denied),
+            &mut remaining_gas,
+        )
+        .unwrap()
+        .expect("out-of-scope call must return a failed frame");
+        assert_eq!(result.instruction_result(), revm::interpreter::InstructionResult::Revert);
+        IAccountKeychain::CallNotAllowed::abi_decode(&result.interpreter_result().output)
+            .expect("failed frame must contain CallNotAllowed");
+        assert!(remaining_gas < 1_000_000);
     }
 
     #[test]
