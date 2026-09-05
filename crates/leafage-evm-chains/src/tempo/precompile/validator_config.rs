@@ -557,6 +557,7 @@ impl Precompile for ValidatorConfig {
 
         dispatch_call(
             calldata,
+            IValidatorConfig::IValidatorConfigCalls::valid_selector,
             |data| {
                 IValidatorConfig::IValidatorConfigCalls::abi_decode_with_config(
                     data,

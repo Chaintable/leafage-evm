@@ -312,6 +312,7 @@ impl Precompile for AddressRegistry {
 
         dispatch_call(
             calldata,
+            IAddressRegistry::IAddressRegistryCalls::valid_selector,
             |data| {
                 IAddressRegistry::IAddressRegistryCalls::abi_decode_with_config(
                     data,

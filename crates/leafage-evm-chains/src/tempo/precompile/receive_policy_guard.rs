@@ -355,6 +355,7 @@ impl Precompile for ReceivePolicyGuard {
 
         dispatch_call(
             calldata,
+            IReceivePolicyGuard::IReceivePolicyGuardCalls::valid_selector,
             |data| {
                 IReceivePolicyGuard::IReceivePolicyGuardCalls::abi_decode_with_config(
                     data,
@@ -385,11 +386,13 @@ mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::UnknownFunctionSelector;
     use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
     use crate::tempo::precompile::tip403_registry::{
         ITIP403Registry, TIP403Registry, ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID,
     };
-    use alloy::sol_types::SolCall;
+    use alloy::primitives::FixedBytes;
+    use alloy::sol_types::{SolCall, SolError};
 
     #[test]
     fn receipt_hash_covers_every_field() {
@@ -426,6 +429,26 @@ mod tests {
         })
         .unwrap();
         assert!(output.reverted);
+    }
+
+    #[test]
+    fn unknown_selector_is_rejected_before_abi_decode() {
+        let selector = [0x12, 0x34, 0x56, 0x78];
+        assert!(!IReceivePolicyGuard::IReceivePolicyGuardCalls::valid_selector(selector));
+
+        for len in [4, 13, 67, 68] {
+            let mut calldata = vec![0; len];
+            calldata[..4].copy_from_slice(&selector);
+            let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+            let output = StorageCtx::enter(&mut provider, || {
+                ReceivePolicyGuard::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+
+            assert!(output.reverted);
+            let error = UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
+            assert_eq!(error.selector, FixedBytes::new(selector));
+        }
     }
 
     #[test]

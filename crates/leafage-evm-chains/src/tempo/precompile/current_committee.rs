@@ -100,6 +100,7 @@ impl Precompile for CurrentCommittee {
 
         dispatch_call(
             calldata,
+            ICurrentCommittee::ICurrentCommitteeCalls::valid_selector,
             |data| {
                 ICurrentCommittee::ICurrentCommitteeCalls::abi_decode_with_config(
                     data,

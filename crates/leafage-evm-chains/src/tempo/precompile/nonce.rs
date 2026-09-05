@@ -224,6 +224,7 @@ impl Precompile for NonceManager {
 
         dispatch_call(
             calldata,
+            INonce::INonceCalls::valid_selector,
             |data| {
                 INonce::INonceCalls::abi_decode_with_config(
                     data,

@@ -2028,6 +2028,7 @@ impl Precompile for AccountKeychain {
 
         dispatch_call(
             calldata,
+            IAccountKeychain::IAccountKeychainCalls::valid_selector,
             |data| {
                 IAccountKeychain::IAccountKeychainCalls::abi_decode_with_config(
                     data,

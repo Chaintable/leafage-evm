@@ -2166,6 +2166,11 @@ enum TIP20Call {
 }
 
 impl TIP20Call {
+    fn valid_selector(selector: [u8; 4]) -> bool {
+        ITIP20::ITIP20Calls::valid_selector(selector)
+            || IRolesAuth::IRolesAuthCalls::valid_selector(selector)
+    }
+
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
         let config = crate::tempo::precompile::abi_decoder_config();
@@ -2191,7 +2196,7 @@ impl Precompile for TIP20Token {
                 .into_precompile_result(self.storage.gas_used());
         }
 
-        dispatch_call(calldata, TIP20Call::decode, |call| match call {
+        dispatch_call(calldata, TIP20Call::valid_selector, TIP20Call::decode, |call| match call {
             // Metadata functions (no calldata decoding needed)
             TIP20Call::TIP20(ITIP20::ITIP20Calls::name(_)) => {
                 metadata::<ITIP20::nameCall>(|| self.name())

@@ -757,6 +757,7 @@ impl Precompile for TIP20ChannelReserve {
 
         dispatch_call(
             calldata,
+            ITIP20ChannelReserve::ITIP20ChannelReserveCalls::valid_selector,
             |data| {
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::abi_decode_with_config(
                     data,

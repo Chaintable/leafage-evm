@@ -302,6 +302,7 @@ impl Precompile for TIP20Factory {
 
         dispatch_call(
             calldata,
+            ITIP20Factory::ITIP20FactoryCalls::valid_selector,
             |data| {
                 ITIP20Factory::ITIP20FactoryCalls::abi_decode_with_config(
                     data,

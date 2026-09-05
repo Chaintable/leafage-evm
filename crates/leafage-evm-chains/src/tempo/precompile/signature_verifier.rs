@@ -216,6 +216,7 @@ impl Precompile for SignatureVerifier {
 
         dispatch_call(
             calldata,
+            ISignatureVerifier::ISignatureVerifierCalls::valid_selector,
             |data| {
                 ISignatureVerifier::ISignatureVerifierCalls::abi_decode_with_config(
                     data,

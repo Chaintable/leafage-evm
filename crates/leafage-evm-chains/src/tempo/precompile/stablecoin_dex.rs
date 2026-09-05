@@ -2874,6 +2874,7 @@ impl Precompile for StablecoinDEX {
 
         dispatch_call(
             calldata,
+            IStablecoinDEX::IStablecoinDEXCalls::valid_selector,
             |data| {
                 IStablecoinDEX::IStablecoinDEXCalls::abi_decode_with_config(
                     data,

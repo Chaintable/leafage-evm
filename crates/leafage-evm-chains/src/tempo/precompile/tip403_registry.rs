@@ -1303,6 +1303,7 @@ impl Precompile for TIP403Registry {
             .unwrap_or_default();
         dispatch_call(
             calldata,
+            ITIP403Registry::ITIP403RegistryCalls::valid_selector,
             |data| {
                 ITIP403Registry::ITIP403RegistryCalls::abi_decode_with_config(
                     data,

@@ -551,6 +551,7 @@ impl Precompile for StorageCredits {
 
         dispatch_call(
             calldata,
+            IStorageCredits::IStorageCreditsCalls::valid_selector,
             |data| {
                 IStorageCredits::IStorageCreditsCalls::abi_decode_with_config(
                     data,
@@ -585,10 +586,12 @@ impl Precompile for StorageCredits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::sol_types::SolCall;
+    use alloy::primitives::FixedBytes;
+    use alloy::sol_types::{SolCall, SolError};
 
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::UnknownFunctionSelector;
 
     #[test]
     fn slot_is_left_padded_account_address() {
@@ -632,5 +635,40 @@ mod tests {
         })
         .unwrap();
         assert!(output.reverted);
+    }
+
+    #[test]
+    fn unknown_selector_is_rejected_before_abi_decode() {
+        let selector = [0x12, 0x34, 0x56, 0x78];
+        assert!(!IStorageCredits::IStorageCreditsCalls::valid_selector(selector));
+
+        for len in [4, 13, 35, 36] {
+            let mut calldata = vec![0; len];
+            calldata[..4].copy_from_slice(&selector);
+            let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+            let output = StorageCtx::enter(&mut provider, || {
+                StorageCredits::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+
+            assert!(output.reverted);
+            let error = UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
+            assert_eq!(error.selector, FixedBytes::new(selector));
+        }
+    }
+
+    #[test]
+    fn malformed_known_selector_keeps_empty_revert_data() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+        let output = StorageCtx::enter(&mut provider, || {
+            StorageCredits::new().call(
+                &IStorageCredits::balanceOfCall::SELECTOR,
+                Address::ZERO,
+            )
+        })
+        .unwrap();
+
+        assert!(output.reverted);
+        assert!(output.bytes.is_empty());
     }
 }

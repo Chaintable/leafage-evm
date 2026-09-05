@@ -300,6 +300,7 @@ pub fn fill_precompile_output(
 
 pub fn dispatch_call<T>(
     calldata: &[u8],
+    valid_selector: impl FnOnce([u8; 4]) -> bool,
     decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
     f: impl FnOnce(T) -> PrecompileResult,
 ) -> PrecompileResult {
@@ -315,6 +316,14 @@ pub fn dispatch_call<T>(
             PrecompileOutput::new_reverted(0, Bytes::new()),
             &storage,
         ));
+    }
+
+    let selector = calldata[..4]
+        .try_into()
+        .expect("calldata length checked above");
+    if !valid_selector(selector) {
+        return unknown_selector(selector, storage.gas_used())
+            .map(|res| fill_precompile_output(res, &storage));
     }
 
     let result = decode(calldata);

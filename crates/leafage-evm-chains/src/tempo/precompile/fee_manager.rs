@@ -943,6 +943,11 @@ enum TipFeeManagerCall {
 }
 
 impl TipFeeManagerCall {
+    fn valid_selector(selector: [u8; 4]) -> bool {
+        IFeeManager::IFeeManagerCalls::valid_selector(selector)
+            || ITIPFeeAMM::ITIPFeeAMMCalls::valid_selector(selector)
+    }
+
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
         let config = crate::tempo::precompile::abi_decoder_config();
@@ -964,7 +969,7 @@ impl Precompile for TipFeeManager {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
-        dispatch_call(calldata, TipFeeManagerCall::decode, |call| match call {
+        dispatch_call(calldata, TipFeeManagerCall::valid_selector, TipFeeManagerCall::decode, |call| match call {
             // IFeeManager view functions
             TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::userTokens(call)) => {
                 view(call, |c| self.user_tokens_view(c))

@@ -464,6 +464,7 @@ impl Precompile for ZoneFactory {
 
         dispatch_call(
             calldata,
+            IZoneFactory::IZoneFactoryCalls::valid_selector,
             |data| {
                 IZoneFactory::IZoneFactoryCalls::abi_decode_with_config(
                     data,
