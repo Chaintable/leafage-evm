@@ -10,7 +10,9 @@ use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
-use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
+use super::storage_types::{
+    packing, Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType,
+};
 use super::tip20::TIP20Token;
 use super::tip20_factory::TIP20Factory;
 use super::tip403_registry::TIP403Registry;
@@ -147,34 +149,55 @@ impl StorableType for ZoneInfoStorage {
 
 impl Storable for ZoneInfoStorage {
     fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let packed0 = packing::PackedSlot(storage.load(slot)?);
+        let zone_id = u32::load(&packed0, U256::ZERO, LayoutCtx::packed(0))?;
+        let portal = Address::load(&packed0, U256::ZERO, LayoutCtx::packed(4))?;
+        let access_mode = bool::load(&packed0, U256::ZERO, LayoutCtx::packed(24))?;
+        let gateway_mode = bool::load(&packed0, U256::ZERO, LayoutCtx::packed(25))?;
+        let admin = Address::load(storage, slot + U256::ONE, LayoutCtx::packed(0))?;
+        let sequencers = Vec::<Address>::load(storage, slot + U256::from(2), LayoutCtx::FULL)?;
+        let packed3 = packing::PackedSlot(storage.load(slot + U256::from(3))?);
+        let threshold = u8::load(&packed3, U256::ZERO, LayoutCtx::packed(0))?;
+        let verifier = Address::load(&packed3, U256::ZERO, LayoutCtx::packed(1))?;
+        let rpc_url = String::load(storage, slot + U256::from(4), LayoutCtx::FULL)?;
         Ok(Self {
-            zone_id: u32::load(storage, slot, LayoutCtx::packed(0))?,
-            portal: Address::load(storage, slot, LayoutCtx::packed(4))?,
-            access_mode: bool::load(storage, slot, LayoutCtx::packed(24))?,
-            gateway_mode: bool::load(storage, slot, LayoutCtx::packed(25))?,
-            admin: Address::load(storage, slot + U256::ONE, LayoutCtx::packed(0))?,
-            sequencers: Vec::<Address>::load(storage, slot + U256::from(2), LayoutCtx::FULL)?,
-            threshold: u8::load(storage, slot + U256::from(3), LayoutCtx::packed(0))?,
-            verifier: Address::load(storage, slot + U256::from(3), LayoutCtx::packed(1))?,
-            rpc_url: String::load(storage, slot + U256::from(4), LayoutCtx::FULL)?,
+            zone_id,
+            portal,
+            access_mode,
+            gateway_mode,
+            admin,
+            sequencers,
+            threshold,
+            verifier,
+            rpc_url,
         })
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        self.zone_id.store(storage, slot, LayoutCtx::packed(0))?;
-        self.portal.store(storage, slot, LayoutCtx::packed(4))?;
+        let mut packed0 = packing::PackedSlot(U256::ZERO);
+        self.zone_id.store(&mut packed0, U256::ZERO, LayoutCtx::packed(0))?;
+        self.portal.store(&mut packed0, U256::ZERO, LayoutCtx::packed(4))?;
         self.access_mode
-            .store(storage, slot, LayoutCtx::packed(24))?;
+            .store(&mut packed0, U256::ZERO, LayoutCtx::packed(24))?;
         self.gateway_mode
-            .store(storage, slot, LayoutCtx::packed(25))?;
+            .store(&mut packed0, U256::ZERO, LayoutCtx::packed(25))?;
+        storage.store(slot, packed0.0)?;
+
+        let mut packed1 = packing::PackedSlot(U256::ZERO);
         self.admin
-            .store(storage, slot + U256::ONE, LayoutCtx::packed(0))?;
+            .store(&mut packed1, U256::ZERO, LayoutCtx::packed(0))?;
+        storage.store(slot + U256::ONE, packed1.0)?;
+
         self.sequencers
             .store(storage, slot + U256::from(2), LayoutCtx::FULL)?;
+
+        let mut packed3 = packing::PackedSlot(U256::ZERO);
         self.threshold
-            .store(storage, slot + U256::from(3), LayoutCtx::packed(0))?;
+            .store(&mut packed3, U256::ZERO, LayoutCtx::packed(0))?;
         self.verifier
-            .store(storage, slot + U256::from(3), LayoutCtx::packed(1))?;
+            .store(&mut packed3, U256::ZERO, LayoutCtx::packed(1))?;
+        storage.store(slot + U256::from(3), packed3.0)?;
+
         self.rpc_url
             .store(storage, slot + U256::from(4), LayoutCtx::FULL)
     }
@@ -539,6 +562,7 @@ mod tests {
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::primitives::address;
     use alloy::sol_types::{SolCall, SolError};
+    use std::{cell::RefCell, collections::HashMap};
 
     const OWNER: Address = address!("0x0000000000000000000000000000000000000011");
     const ADMIN: Address = address!("0x0000000000000000000000000000000000000022");
@@ -548,6 +572,36 @@ mod tests {
     const ZONE_GATEWAY: Address = address!("0x0000000000000000000000000000000000000066");
     const TOKEN: Address = address!("0x20c0000000000000000000000000000000000077");
     const CREATION_BLOCK: u64 = 42;
+
+    #[derive(Default)]
+    struct CountingStorage {
+        words: HashMap<U256, U256>,
+        loads: RefCell<HashMap<U256, usize>>,
+        stores: HashMap<U256, usize>,
+    }
+
+    impl CountingStorage {
+        fn load_count(&self, slot: U256) -> usize {
+            self.loads.borrow().get(&slot).copied().unwrap_or_default()
+        }
+
+        fn store_count(&self, slot: U256) -> usize {
+            self.stores.get(&slot).copied().unwrap_or_default()
+        }
+    }
+
+    impl StorageOps for CountingStorage {
+        fn store(&mut self, slot: U256, value: U256) -> Result<()> {
+            self.words.insert(slot, value);
+            *self.stores.entry(slot).or_default() += 1;
+            Ok(())
+        }
+
+        fn load(&self, slot: U256) -> Result<U256> {
+            *self.loads.borrow_mut().entry(slot).or_default() += 1;
+            Ok(self.words.get(&slot).copied().unwrap_or_default())
+        }
+    }
 
     fn initialize_token(token: Address, name: &str, symbol: &str, currency: &str) -> Result<()> {
         TIP20Token::from_address_unchecked(token).initialize(
@@ -579,6 +633,44 @@ mod tests {
             threshold: 2,
             rpcUrl: "https://zone.example".to_string(),
         }
+    }
+
+    #[test]
+    fn zone_info_matches_writer_packed_slot_accesses() {
+        let base = U256::from(100);
+        let value = ZoneInfoStorage {
+            zone_id: 7,
+            portal: portal_address(7),
+            access_mode: true,
+            gateway_mode: false,
+            admin: ADMIN,
+            sequencers: vec![SEQUENCER_A, SEQUENCER_B],
+            threshold: 2,
+            verifier: ZONE_VERIFIER_ADDRESS,
+            rpc_url: "https://zone.example".to_string(),
+        };
+        let mut storage = CountingStorage::default();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+
+        StorageCtx::enter(&mut provider, || -> Result<()> {
+            value.store(&mut storage, base, LayoutCtx::FULL)?;
+            assert_eq!(storage.load_count(base), 0);
+            assert_eq!(storage.store_count(base), 1);
+            assert_eq!(storage.load_count(base + U256::ONE), 0);
+            assert_eq!(storage.store_count(base + U256::ONE), 1);
+            assert_eq!(storage.load_count(base + U256::from(3)), 0);
+            assert_eq!(storage.store_count(base + U256::from(3)), 1);
+
+            storage.loads.borrow_mut().clear();
+            storage.stores.clear();
+            let loaded = ZoneInfoStorage::load(&storage, base, LayoutCtx::FULL)?;
+            assert_eq!(loaded, value);
+            assert_eq!(storage.load_count(base), 1);
+            assert_eq!(storage.load_count(base + U256::ONE), 1);
+            assert_eq!(storage.load_count(base + U256::from(3)), 1);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

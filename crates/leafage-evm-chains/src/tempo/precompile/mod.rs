@@ -208,7 +208,11 @@ macro_rules! tempo_precompile {
                 $crate::tempo::precompile::StorageCtx::enter(&mut storage, || {
                     let result = $impl.call($input.data, $input.caller);
                     // Fill gas accounting from the storage context
-                    let refund = $crate::tempo::precompile::StorageCtx.gas_refunded();
+                    let refund = if $crate::tempo::precompile::StorageCtx.spec().is_t4() {
+                        $crate::tempo::precompile::StorageCtx.gas_refunded()
+                    } else {
+                        0
+                    };
                     // Persist refund for TempoPrecompiles::run() to propagate
                     // to the Gas struct (alloy-evm's PrecompilesMap discards it).
                     $crate::tempo::precompile::storage::set_last_precompile_refund(refund);

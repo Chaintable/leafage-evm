@@ -22,7 +22,7 @@ use revm::precompile::{PrecompileError, PrecompileResult};
 use super::super::address::TempoAddressExt;
 use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
-use super::storage::{ContractStorage, StorageCtx};
+use super::storage::{ContractStorage, ContractStorageReader, StorageCtx};
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::tip20::TIP20Token;
 use super::tip20_factory::TIP20Factory;
@@ -493,10 +493,9 @@ impl StorableType for ReceivePolicy {
     }
 }
 
-impl Storable for ReceivePolicy {
-    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+impl ReceivePolicy {
+    fn load_config<S: StorageOps>(storage: &S, slot: U256) -> Result<Self> {
         let bytes = storage.load(slot)?.to_be_bytes::<32>();
-        let recovery_word = storage.load(slot + U256::ONE)?.to_be_bytes::<32>();
         Ok(Self {
             has_receive_policy: bytes[31] != 0,
             sender_policy_id: u64::from_be_bytes(bytes[23..31].try_into().unwrap()),
@@ -504,8 +503,23 @@ impl Storable for ReceivePolicy {
             token_filter_id: u64::from_be_bytes(bytes[14..22].try_into().unwrap()),
             token_filter_type: bytes[13],
             recovery_mode: RecoveryMode::decode(bytes[12])?,
-            recovery_address: Address::from_slice(&recovery_word[12..32]),
+            recovery_address: Address::ZERO,
         })
+    }
+
+    fn load_recovery_address<S: StorageOps>(storage: &S, slot: U256) -> Result<Address> {
+        let word = storage.load(slot + U256::ONE)?.to_be_bytes::<32>();
+        Ok(Address::from_slice(&word[12..32]))
+    }
+}
+
+impl Storable for ReceivePolicy {
+    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let mut policy = Self::load_config(storage, slot)?;
+        if policy.recovery_mode == RecoveryMode::ThirdParty {
+            policy.recovery_address = Self::load_recovery_address(storage, slot)?;
+        }
+        Ok(policy)
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
@@ -968,7 +982,7 @@ impl TIP403Registry {
 
     /// Returns an account's T6 receive-policy configuration.
     pub fn receive_policy(&self, account: Address) -> Result<ITIP403Registry::receivePolicyReturn> {
-        let policy = self.receive_policies[account].read()?;
+        let policy = self.receive_policy_config(account)?;
         let sender_policy_type = policy
             .sender_policy_type
             .try_into()
@@ -983,7 +997,7 @@ impl TIP403Registry {
             senderPolicyType: sender_policy_type,
             tokenFilterId: policy.token_filter_id,
             tokenFilterType: token_filter_type,
-            recoveryAuthority: self.receive_policy_recovery(account, &policy),
+            recoveryAuthority: self.receive_policy_recovery(account, policy.recovery_mode)?,
         })
     }
 
@@ -1005,7 +1019,7 @@ impl TIP403Registry {
         sender: Address,
         receiver: Address,
     ) -> Result<Option<(ITIP403Registry::BlockedReason, Address)>> {
-        let policy = self.receive_policies[receiver].read()?;
+        let policy = self.receive_policy_config(receiver)?;
         if !policy.has_receive_policy {
             return Ok(None);
         }
@@ -1013,23 +1027,38 @@ impl TIP403Registry {
         if !self.is_authorized_simple(policy.token_filter_id, token)? {
             return Ok(Some((
                 ITIP403Registry::BlockedReason::TOKEN_FILTER,
-                self.receive_policy_recovery(receiver, &policy),
+                self.receive_policy_recovery(receiver, policy.recovery_mode)?,
             )));
         }
         if !self.is_authorized_simple(policy.sender_policy_id, sender)? {
             return Ok(Some((
                 ITIP403Registry::BlockedReason::RECEIVE_POLICY,
-                self.receive_policy_recovery(receiver, &policy),
+                self.receive_policy_recovery(receiver, policy.recovery_mode)?,
             )));
         }
         Ok(None)
     }
 
-    fn receive_policy_recovery(&self, account: Address, policy: &ReceivePolicy) -> Address {
-        match policy.recovery_mode {
-            RecoveryMode::Originator => Address::ZERO,
-            RecoveryMode::Receiver => account,
-            RecoveryMode::ThirdParty => policy.recovery_address,
+    fn receive_policy_config(&self, account: Address) -> Result<ReceivePolicy> {
+        let slot = self.receive_policies[account].slot();
+        ReceivePolicy::load_config(&ContractStorageReader::new(self.address), slot)
+    }
+
+    fn receive_policy_recovery(
+        &self,
+        account: Address,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Address> {
+        match recovery_mode {
+            RecoveryMode::Originator => Ok(Address::ZERO),
+            RecoveryMode::Receiver => Ok(account),
+            RecoveryMode::ThirdParty => {
+                let slot = self.receive_policies[account].slot();
+                ReceivePolicy::load_recovery_address(
+                    &ContractStorageReader::new(self.address),
+                    slot,
+                )
+            }
         }
     }
 
@@ -1386,6 +1415,25 @@ mod tests {
     use crate::tempo::precompile::UnknownFunctionSelector;
     use alloy::primitives::FixedBytes;
     use alloy::sol_types::{SolCall, SolError};
+    use std::{cell::Cell, collections::HashMap};
+
+    #[derive(Default)]
+    struct CountingStorage {
+        words: HashMap<U256, U256>,
+        loads: Cell<usize>,
+    }
+
+    impl StorageOps for CountingStorage {
+        fn store(&mut self, slot: U256, value: U256) -> Result<()> {
+            self.words.insert(slot, value);
+            Ok(())
+        }
+
+        fn load(&self, slot: U256) -> Result<U256> {
+            self.loads.set(self.loads.get() + 1);
+            Ok(self.words.get(&slot).copied().unwrap_or_default())
+        }
+    }
 
     fn initialize_test_token(token: Address, admin: Address) -> Result<()> {
         TIP20Token::from_address_unchecked(token).initialize(
@@ -1396,6 +1444,47 @@ mod tests {
             PATH_USD_ADDRESS,
             admin,
         )
+    }
+
+    #[test]
+    fn receive_policy_only_loads_recovery_slot_for_third_party_mode() {
+        let slot = U256::from(9);
+        let recovery = Address::repeat_byte(0x44);
+
+        for (mode, expected_loads) in [
+            (RecoveryMode::Originator, 1),
+            (RecoveryMode::Receiver, 1),
+            (RecoveryMode::ThirdParty, 2),
+        ] {
+            let mut storage = CountingStorage::default();
+            ReceivePolicy {
+                has_receive_policy: true,
+                recovery_mode: mode,
+                recovery_address: recovery,
+                ..Default::default()
+            }
+            .store(&mut storage, slot, LayoutCtx::FULL)
+            .unwrap();
+            storage.loads.set(0);
+
+            let config = ReceivePolicy::load_config(&storage, slot).unwrap();
+            assert_eq!(storage.loads.get(), 1);
+            assert_eq!(config.recovery_mode, mode);
+            assert_eq!(config.recovery_address, Address::ZERO);
+
+            storage.loads.set(0);
+            let loaded = ReceivePolicy::load(&storage, slot, LayoutCtx::FULL).unwrap();
+            assert_eq!(storage.loads.get(), expected_loads);
+            assert_eq!(loaded.recovery_mode, mode);
+            assert_eq!(
+                loaded.recovery_address,
+                if mode == RecoveryMode::ThirdParty {
+                    recovery
+                } else {
+                    Address::ZERO
+                }
+            );
+        }
     }
 
     #[test]

@@ -58,16 +58,20 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
         context: &mut TempoContext<DB>,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
+        // Clear a stale value left by a previous fatal precompile invocation.
+        let _ = take_last_precompile_refund();
         let non_creditable_slots = resolve_non_creditable_slots(context);
         let result = with_non_creditable_slots(&non_creditable_slots, || {
             self.0.run(context, inputs)
-        })?;
-        // Drain the thread-local refund set by the precompile macro.
-        // We intentionally do NOT call record_refund() here — the writer
-        // also uses PrecompilesMap which doesn't propagate precompile
-        // SSTORE refunds to the Gas struct. Matching writer behavior means
-        // used() == spent() for precompile calls.
-        let _ = take_last_precompile_refund();
+        });
+        // Drain after both success and error so the thread-local value cannot leak.
+        let refund = take_last_precompile_refund();
+        let mut result = result?;
+        if let Some(result) = result.as_mut() {
+            if context.cfg.spec.is_t4() && result.is_ok() {
+                result.gas.record_refund(refund);
+            }
+        }
         Ok(result)
     }
 
@@ -1109,13 +1113,30 @@ mod tests {
             unique_tx_identifier: None,
         };
 
-        let mut evm = TempoEvm::new(
-            make_env(1_770_908_400 + 100), // Post-T1A
+        let mut pre_t4_evm = TempoEvm::new(
+            make_env(1_779_112_800 - 1),
+            db.clone(),
+            NoOpInspector,
+            false,
+        );
+        let pre_t4_result = pre_t4_evm
+            .transact(tx.clone())
+            .expect("pre-T4 TIP20 transfer should succeed");
+        assert_eq!(
+            pre_t4_result.result.gas().inner_refunded(),
+            0,
+            "precompile refunds must not change historical pre-T4 gas accounting"
+        );
+
+        let mut t4_evm = TempoEvm::new(
+            make_env(1_779_112_800),
             db,
             NoOpInspector,
             false,
         );
-        let result = evm.transact(tx).expect("TIP20 transfer should succeed");
+        let result = t4_evm
+            .transact(tx)
+            .expect("T4 TIP20 transfer should succeed");
 
         assert!(
             result.result.is_success(),
@@ -1124,14 +1145,13 @@ mod tests {
         );
 
         let gas = result.result.gas();
-        // Precompile SSTORE refunds are intentionally NOT propagated to ResultGas
-        // (matching writer behavior — both use alloy-evm PrecompilesMap which
-        // doesn't call record_refund). So used() == spent() for precompile calls.
-        // The GasParams-based sstore gas calculation ensures spent() matches writer.
-        assert_eq!(
-            gas.used(),
-            gas.spent_sub_refunded(),
-            "precompile gas: used() should equal spent_sub_refunded() (no refund propagation)"
+        assert!(
+            gas.inner_refunded() > 0,
+            "successful storage clear must propagate a non-zero refund"
+        );
+        assert!(
+            gas.final_refunded() > 0,
+            "the propagated refund must reduce the effective gas charge"
         );
     }
 
