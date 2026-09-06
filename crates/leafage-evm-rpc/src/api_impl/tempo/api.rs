@@ -463,6 +463,7 @@ where
         Ok(TempoTxEnv {
             base,
             tempo_fields,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
@@ -624,15 +625,17 @@ where
         } else {
             te.and_then(|t| t.fee_payer).unwrap_or(tx.caller())
         };
-        Ok(leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
-            db,
-            payer,
-            tx.gas_price(),
-            block_env.timestamp.saturating_to::<u64>(),
-            self.evm_cfg.cfg.chain_id,
-            te.and_then(|t| t.fee_token),
+        Ok(
+            leafage_evm_chains::tempo::precompile::tempo_caller_gas_allowance(
+                db,
+                tx,
+                payer,
+                tx.gas_price(),
+                block_env.timestamp.saturating_to::<u64>(),
+                self.evm_cfg.cfg.chain_id,
+            )
+            .unwrap_or(u64::MAX),
         )
-        .unwrap_or(u64::MAX))
     }
 }
 

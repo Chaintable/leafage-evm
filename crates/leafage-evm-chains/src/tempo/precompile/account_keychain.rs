@@ -594,16 +594,16 @@ impl SpendingLimitStateHandler {
             address,
         }
     }
+
+    fn load_from<S: StorageOps>(&self, storage: &S) -> Result<SpendingLimitState> {
+        SpendingLimitState::load(storage, self.base_slot, LayoutCtx::FULL)
+    }
 }
 
 impl Handler<SpendingLimitState> for SpendingLimitStateHandler {
     fn read(&self) -> Result<SpendingLimitState> {
-        Ok(SpendingLimitState {
-            remaining: self.remaining.read()?,
-            max: self.max.read()?,
-            period: self.period.read()?,
-            period_end: self.period_end.read()?,
-        })
+        let storage = Slot::<U256>::new(self.base_slot, self.address);
+        self.load_from(&storage)
     }
 
     fn write(&mut self, value: SpendingLimitState) -> Result<()> {
@@ -3447,18 +3447,33 @@ mod tests {
     // -- SpendingLimitState round-trip (FU-3) -----------------------------------
 
     /// In-memory `StorageOps` for unit-testing the 2-slot pack layout.
-    struct MockStorage(std::collections::HashMap<U256, U256>);
+    struct MockStorage {
+        values: std::collections::HashMap<U256, U256>,
+        loads: std::cell::Cell<usize>,
+    }
     impl MockStorage {
         fn new() -> Self {
-            Self(std::collections::HashMap::new())
+            Self {
+                values: std::collections::HashMap::new(),
+                loads: std::cell::Cell::new(0),
+            }
+        }
+
+        fn reset_load_count(&self) {
+            self.loads.set(0);
+        }
+
+        fn load_count(&self) -> usize {
+            self.loads.get()
         }
     }
     impl StorageOps for MockStorage {
         fn load(&self, slot: U256) -> Result<U256> {
-            Ok(self.0.get(&slot).copied().unwrap_or(U256::ZERO))
+            self.loads.set(self.loads.get() + 1);
+            Ok(self.values.get(&slot).copied().unwrap_or(U256::ZERO))
         }
         fn store(&mut self, slot: U256, value: U256) -> Result<()> {
-            self.0.insert(slot, value);
+            self.values.insert(slot, value);
             Ok(())
         }
     }
@@ -3476,6 +3491,24 @@ mod tests {
         state.store(&mut mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
         let loaded = SpendingLimitState::load(&mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
         assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn spending_limit_handler_reads_two_physical_slots_once_each() {
+        let base_slot = U256::from(7u8);
+        let state = SpendingLimitState {
+            remaining: U256::from(123u64),
+            max: 456,
+            period: 789,
+            period_end: 1_012,
+        };
+        let mut mock = MockStorage::new();
+        state.store(&mut mock, base_slot, LayoutCtx::FULL).unwrap();
+        mock.reset_load_count();
+
+        let handler = SpendingLimitStateHandler::new(base_slot, Address::ZERO);
+        assert_eq!(handler.load_from(&mock).unwrap(), state);
+        assert_eq!(mock.load_count(), 2);
     }
 
     #[test]

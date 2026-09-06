@@ -24,7 +24,7 @@ use revm::{
         InterpreterResult,
     },
     precompile::{PrecompileSpecId, Precompiles},
-    primitives::{Address, U256},
+    primitives::Address,
     Context, Inspector, Journal,
 };
 
@@ -87,8 +87,7 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
 fn resolve_non_creditable_slots<DB: Database>(
     context: &mut TempoContext<DB>,
 ) -> NonCreditableSlots {
-    use crate::tempo::precompile::{DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS};
-    use crate::tempo::precompile::storage_types::StorageKey;
+    use crate::tempo::precompile::DEFAULT_FEE_TOKEN;
 
     if !context.cfg.spec.is_t7() {
         return NonCreditableSlots::default();
@@ -108,27 +107,11 @@ fn resolve_non_creditable_slots<DB: Database>(
         })
         .unwrap_or((caller, None, None));
 
-    let fee_token = fee_token_override.unwrap_or_else(|| {
-        let slot = fee_payer.mapping_slot(U256::ONE);
-        let account_loaded = context
-            .journaled_state
-            .load_account(TIP_FEE_MANAGER_ADDRESS)
-            .is_ok();
-        let stored = if account_loaded {
-            context
-                .journaled_state
-                .sload(TIP_FEE_MANAGER_ADDRESS, slot)
-                .map(|load| load.data)
-                .unwrap_or_default()
-        } else {
-            U256::ZERO
-        };
-        if stored.is_zero() {
-            DEFAULT_FEE_TOKEN
-        } else {
-            Address::from_word(stored.into())
-        }
-    });
+    let fee_token = context
+        .tx
+        .resolved_fee_token
+        .or(fee_token_override)
+        .unwrap_or(DEFAULT_FEE_TOKEN);
 
     NonCreditableSlots::new(fee_payer, fee_token, keychain_fee_key)
 }
@@ -708,6 +691,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -774,6 +758,7 @@ mod tests {
                 nonce_key,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         }
@@ -1109,6 +1094,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -1576,6 +1562,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -1660,6 +1647,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -1718,6 +1706,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };

@@ -213,13 +213,13 @@ alloy::sol! {
         event Burn(address indexed from, uint256 amount);
         event BurnBlocked(address indexed from, uint256 amount);
         event PauseStateUpdate(address indexed updater, bool isPaused);
-        event SupplyCapUpdate(address indexed updater, uint256 newSupplyCap);
-        event TransferPolicyUpdate(address indexed updater, uint64 newPolicyId);
-        event NextQuoteTokenSet(address indexed updater, address nextQuoteToken);
-        event QuoteTokenUpdate(address indexed updater, address newQuoteToken);
-        event TransferWithMemo(address indexed from, address indexed to, uint256 amount, bytes32 memo);
+        event SupplyCapUpdate(address indexed updater, uint256 indexed newSupplyCap);
+        event TransferPolicyUpdate(address indexed updater, uint64 indexed newPolicyId);
+        event NextQuoteTokenSet(address indexed updater, address indexed nextQuoteToken);
+        event QuoteTokenUpdate(address indexed updater, address indexed newQuoteToken);
+        event TransferWithMemo(address indexed from, address indexed to, uint256 amount, bytes32 indexed memo);
         event RewardDistributed(address indexed funder, uint256 amount);
-        event RewardRecipientSet(address indexed holder, address recipient);
+        event RewardRecipientSet(address indexed holder, address indexed recipient);
         event LogoURIUpdated(address indexed updater, string newLogoURI);
 
         // Errors
@@ -255,8 +255,8 @@ alloy::sol! {
         function renounceRole(bytes32 role) external;
         function setRoleAdmin(bytes32 role, bytes32 adminRole) external;
 
-        event RoleMembershipUpdated(bytes32 indexed role, address indexed account, address sender, bool hasRole);
-        event RoleAdminUpdated(bytes32 indexed role, bytes32 newAdminRole, address sender);
+        event RoleMembershipUpdated(bytes32 indexed role, address indexed account, address indexed sender, bool hasRole);
+        event RoleAdminUpdated(bytes32 indexed role, bytes32 indexed newAdminRole, address indexed sender);
 
         error Unauthorized();
     }

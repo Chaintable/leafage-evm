@@ -151,6 +151,11 @@ pub struct TempoTxEnv {
     pub base: TxEnv,
     /// Present only for type-0x76 batch transactions.
     pub tempo_fields: Option<TempoTxFields>,
+    /// Fee token resolved from the transaction and pre-state before execution.
+    ///
+    /// This is populated during pre-execution so TIP-1060 accounting uses the
+    /// same token even if an earlier AA call mutates FeeManager storage.
+    pub resolved_fee_token: Option<Address>,
     /// Transaction hash used by pre-T1B expiring nonce replay protection.
     pub tx_hash: B256,
     /// Sender-scoped transaction identifier used by ChannelReserve.open().
@@ -158,6 +163,33 @@ pub struct TempoTxEnv {
 }
 
 impl TempoTxEnv {
+    /// Returns whether this transaction uses Tempo's AA envelope.
+    pub(crate) fn is_aa(&self) -> bool {
+        self.tempo_fields.is_some()
+    }
+
+    /// Returns the transaction-level fee-token override, if present.
+    pub(crate) fn fee_token(&self) -> Option<Address> {
+        self.tempo_fields
+            .as_ref()
+            .and_then(|fields| fields.fee_token)
+    }
+
+    /// Iterates over the calls represented by this transaction.
+    pub(crate) fn calls(&self) -> impl Iterator<Item = (TxKind, &Bytes)> {
+        let aa_calls = self
+            .tempo_fields
+            .iter()
+            .flat_map(|fields| fields.aa_calls.iter())
+            .map(|call| (call.to, &call.input));
+        let base_call = self
+            .tempo_fields
+            .is_none()
+            .then(|| (self.kind(), self.input()))
+            .into_iter();
+        aa_calls.chain(base_call)
+    }
+
     /// Assigns a deterministic per-entry identifier for a stateful RPC batch.
     ///
     /// Single-call simulations retain Tempo's official fixed sentinel and zero
@@ -286,6 +318,7 @@ mod tests {
                 nonce_key: U256::ZERO,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: B256::ZERO,
             unique_tx_identifier: Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER),
         };

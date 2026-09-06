@@ -137,9 +137,9 @@ impl<DB: Database, INSP> TempoHandler<DB, INSP> {
 
         validate_existing_keychain_transaction(evm)?;
 
-        // Match writer's fee-token reads so subsequent precompile storage reads
-        // observe the same warm/cold state.
-        let _ = warm_fee_token_balance(evm);
+        // Resolve the writer-equivalent fee token once and warm its payer balance.
+        // The cached result also keeps TIP-1060 accounting stable across AA calls.
+        warm_fee_token_balance(evm)?;
 
         check_and_mark_expiring_nonce_if_needed(evm)?;
         increment_2d_nonce_if_needed(evm)?;
@@ -557,73 +557,57 @@ fn validate_time_window<E: core::fmt::Debug>(
     Ok(())
 }
 
-/// Warms the caller's TIP-20 fee token balance slot in the journal.
+/// Resolves the transaction fee token and warms the payer's balance slot.
 ///
-/// Mirrors writer's `load_fee_fields` + `validate_against_state_and_deduct_caller`:
-/// 1. Reads FeeManager.user_tokens[caller] (slot 1) → determines fee_token
-/// 2. Reads TIP20.balances[caller] (slot 9) of the fee_token
+/// Mirrors writer's `get_fee_token` followed by the balance read in
+/// `validate_against_state_and_deduct_caller`. Resolution includes the explicit
+/// override, same-transaction `setUserToken`, stored preference, TIP-20 call
+/// inference, single-call DEX inference, and the default token fallback.
 ///
-/// These sloads add entries to the journal's accessed_storage_keys, making
-/// subsequent precompile reads of the same slots warm (100 gas vs 2100 gas).
+/// The selected token is cached on [`TempoTxEnv`] before calls execute. This is
+/// required for AA batches: a prior call may update FeeManager storage, but the
+/// writer continues using the token resolved from the transaction pre-state.
 ///
-/// Returns Ok(()) on success, Err on any DB/journal error. Caller should
-/// ignore errors (warm-up is best-effort).
+/// Returns an error if resolution or the balance read fails, matching writer's
+/// pre-execution behavior instead of executing with an incorrect fallback.
 fn warm_fee_token_balance<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
 ) -> Result<(), TempoEvmError<DB::Error>> {
-    use crate::tempo::precompile::{DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS};
-    use revm::context_interface::JournalTr;
+    use crate::tempo::{
+        fee_token::{resolve_from_storage, FeeTokenCandidates},
+        precompile::{
+            tip20::TIP20Token, Handler, LeafageStorageProvider, StorageCtx, TempoPrecompileError,
+        },
+    };
+
+    evm.ctx_mut().tx.resolved_fee_token = None;
 
     let caller = evm.ctx().tx.base.caller;
-    let (fee_payer, fee_token_override) = evm
+    let fee_payer = evm
         .ctx()
         .tx
         .tempo_fields
         .as_ref()
-        .map(|fields| (fields.fee_payer.unwrap_or(caller), fields.fee_token))
-        .unwrap_or((caller, None));
+        .and_then(|fields| fields.fee_payer)
+        .unwrap_or(caller);
+    let hardfork = evm.ctx().cfg.spec;
+    let chain_id = evm.ctx().cfg.chain_id;
+    let candidates = FeeTokenCandidates::from_tx(&evm.ctx().tx, fee_payer, hardfork);
 
-    // 1. Read FeeManager.user_tokens[fee_payer] — Mapping<Address,Address> at slot 1
-    let fee_manager_slot = {
-        let mut data = [0u8; 64];
-        data[12..32].copy_from_slice(fee_payer.as_slice());
-        data[63] = 1;
-        revm::primitives::keccak256(&data)
-    };
-    // load_account first to avoid panic on fresh journal
-    let _ = evm
-        .ctx_mut()
-        .journal_mut()
-        .load_account(TIP_FEE_MANAGER_ADDRESS)?;
-    let user_token = evm
-        .ctx_mut()
-        .journal_mut()
-        .sload(TIP_FEE_MANAGER_ADDRESS, fee_manager_slot.into())
-        .map(|r| r.data)?;
-
-    let fee_token = fee_token_override.unwrap_or_else(|| {
-        if user_token.is_zero() {
-            DEFAULT_FEE_TOKEN
-        } else {
-            revm::primitives::Address::from_word(user_token.into())
-        }
+    let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+    let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
+    let resolved = StorageCtx::enter(&mut storage, || {
+        let fee_token = resolve_from_storage(candidates, fee_payer)?;
+        let _ = TIP20Token::from_address_unchecked(fee_token).balances[fee_payer].read()?;
+        Ok(fee_token)
     });
+    drop(storage);
 
-    // 2. Read TIP20.balances[fee_payer] — Mapping<Address,U256> at slot 9
-    let balance_slot = {
-        let mut data = [0u8; 64];
-        data[12..32].copy_from_slice(fee_payer.as_slice());
-        data[63] = 9;
-        revm::primitives::keccak256(&data)
-    };
-    let _ = evm
-        .ctx_mut()
-        .journal_mut()
-        .load_account(fee_token)?;
-    let _ = evm
-        .ctx_mut()
-        .journal_mut()
-        .sload(fee_token, balance_slot.into())?;
+    let fee_token = resolved.map_err(|error| match error {
+        TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
+        error => EVMError::Custom(error.to_string()),
+    })?;
+    evm.ctx_mut().tx.resolved_fee_token = Some(fee_token);
 
     Ok(())
 }
@@ -2007,6 +1991,71 @@ mod tests {
         evm
     }
 
+    #[test]
+    fn warm_fee_token_balance_resolves_tip20_transfer_and_warms_inferred_balance() {
+        use crate::tempo::{
+            precompile::{storage_types::StorageKey, DEFAULT_FEE_TOKEN},
+            tx::TempoTxEnv,
+        };
+        use alloy::sol_types::SolCall;
+        use revm::{context_interface::JournalTr, primitives::TxKind};
+
+        let payer = Address::repeat_byte(0x11);
+        let inferred = alloy::primitives::address!("0x20c0000000000000000000000000000000000011");
+        let balance_slot = payer.mapping_slot(U256::from(9));
+        let mut currency = [0u8; 32];
+        currency[..3].copy_from_slice(b"USD");
+        currency[31] = 6;
+
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
+        evm.inner
+            .ctx
+            .db_mut()
+            .insert_account_storage(inferred, U256::from(4), U256::from_be_bytes(currency))
+            .unwrap();
+        evm.inner
+            .ctx
+            .db_mut()
+            .insert_account_storage(inferred, balance_slot, U256::from(77))
+            .unwrap();
+        evm.inner.ctx.tx = TempoTxEnv {
+            base: revm::context::TxEnv {
+                caller: payer,
+                kind: TxKind::Call(inferred),
+                data: crate::tempo::precompile::tip20::ITIP20::transferCall {
+                    to: Address::repeat_byte(0x22),
+                    amount: U256::ONE,
+                }
+                .abi_encode()
+                .into(),
+                ..Default::default()
+            },
+            resolved_fee_token: Some(DEFAULT_FEE_TOKEN),
+            ..Default::default()
+        };
+
+        warm_fee_token_balance(&mut evm).unwrap();
+
+        assert_eq!(evm.inner.ctx.tx.resolved_fee_token, Some(inferred));
+        assert!(
+            !evm.inner
+                .ctx
+                .journal_mut()
+                .sload(inferred, balance_slot)
+                .unwrap()
+                .is_cold
+        );
+        let default_balance_is_cold = {
+            let journal = evm.inner.ctx.journal_mut();
+            journal.load_account(DEFAULT_FEE_TOKEN).unwrap();
+            journal
+                .sload(DEFAULT_FEE_TOKEN, balance_slot)
+                .unwrap()
+                .is_cold
+        };
+        assert!(default_balance_is_cold);
+    }
+
     fn expiring_nonce_tx(valid_before: u64, replay_hash: revm::primitives::B256) -> TempoTxEnv {
         use crate::tempo::tx::{TempoCall, TempoTxFields};
         use revm::primitives::{Bytes, TxKind};
@@ -2029,6 +2078,7 @@ mod tests {
                 valid_before: Some(valid_before),
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: replay_hash,
             unique_tx_identifier: Some(replay_hash),
         }
@@ -2809,6 +2859,7 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         }
@@ -2828,6 +2879,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -2905,6 +2957,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -2940,6 +2993,7 @@ mod tests {
                 valid_before: None,         // missing valid_before
                 ..Default::default()
             }),
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };
@@ -3329,6 +3383,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };

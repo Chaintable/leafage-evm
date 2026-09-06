@@ -60,9 +60,9 @@ alloy::sol! {
         function setUserToken(address token) external;
         function distributeFees(address validator, address token) external;
 
-        event ValidatorTokenSet(address indexed validator, address token);
-        event UserTokenSet(address indexed user, address token);
-        event FeesDistributed(address indexed validator, address token, uint256 amount);
+        event ValidatorTokenSet(address indexed validator, address indexed token);
+        event UserTokenSet(address indexed user, address indexed token);
+        event FeesDistributed(address indexed validator, address indexed token, uint256 amount);
 
         error InvalidToken();
         error CannotChangeWithinBlock();
@@ -91,9 +91,9 @@ alloy::sol! {
             uint128 reserveValidatorToken;
         }
 
-        event Mint(address indexed sender, address to, address userToken, address validatorToken, uint256 amountValidatorToken, uint256 liquidity);
-        event Burn(address indexed sender, address userToken, address validatorToken, uint256 amountUserToken, uint256 amountValidatorToken, uint256 liquidity, address to);
-        event RebalanceSwap(address indexed userToken, address indexed validatorToken, address swapper, uint256 amountIn, uint256 amountOut);
+        event Mint(address sender, address indexed to, address indexed userToken, address indexed validatorToken, uint256 amountValidatorToken, uint256 liquidity);
+        event Burn(address indexed sender, address indexed userToken, address indexed validatorToken, uint256 amountUserToken, uint256 amountValidatorToken, uint256 liquidity, address to);
+        event RebalanceSwap(address indexed userToken, address indexed validatorToken, address indexed swapper, uint256 amountIn, uint256 amountOut);
 
         error IdenticalAddresses();
         error InvalidAmount();

@@ -137,10 +137,10 @@ alloy::sol! {
             uint128 totalLiquidity;
         }
 
-        event OrderPlaced(uint128 orderId, address maker, address token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick);
-        event OrderFilled(uint128 orderId, address maker, address taker, uint128 amountFilled, bool partialFill);
-        event OrderCancelled(uint128 orderId);
-        event PairCreated(bytes32 key, address base, address quote);
+        event OrderPlaced(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick);
+        event OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill);
+        event OrderCancelled(uint128 indexed orderId);
+        event PairCreated(bytes32 indexed key, address indexed base, address indexed quote);
         event OrderFlipped(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, int16 flipTick);
         event FlipFailed(uint128 indexed orderId, address indexed maker, bytes4 reason);
 
@@ -2596,6 +2596,11 @@ impl StablecoinDEX {
 
             let (base, _quote) = {
                 let token_in_tip20 = TIP20Token::from_address(token_in)?;
+                // TIP-20 transfer checks do not run when the input is fully
+                // covered by the user's internal DEX balance.
+                if self.storage.spec().is_t3() {
+                    token_in_tip20.check_not_paused()?;
+                }
                 if token_in_tip20.quote_token()? == token_out {
                     (token_in, token_out)
                 } else {
@@ -3054,15 +3059,15 @@ impl Precompile for StablecoinDEX {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{FixedBytes, address, b256};
+    use alloy::primitives::{address, b256, FixedBytes};
     use alloy::sol_types::{SolCall, SolEvent};
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
-    use crate::tempo::precompile::PATH_USD_ADDRESS;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
-    use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
+    use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20, PAUSE_ROLE};
     use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
+    use crate::tempo::precompile::PATH_USD_ADDRESS;
 
     fn setup_dex_tokens(
         dex: &mut StablecoinDEX,
@@ -3111,6 +3116,139 @@ mod tests {
                 amount: U256::from(amount),
             },
         )
+    }
+
+    #[test]
+    fn paused_swap_input_is_allowed_before_t3_and_rejected_from_t3() {
+        for spec in [TempoHardfork::T2, TempoHardfork::T3] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xa1);
+                let maker = Address::repeat_byte(0xa2);
+                let taker = Address::repeat_byte(0xa3);
+                let base_token = address!("0x20c00000000000000000000000000000000000a1");
+                let amount_in = 500_000;
+
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base_token)?;
+                grant_and_mint(
+                    PATH_USD_ADDRESS,
+                    admin,
+                    STABLECOIN_DEX_ADDRESS,
+                    MIN_ORDER_AMOUNT * 4,
+                )?;
+                dex.set_balance(maker, PATH_USD_ADDRESS, u128::MAX)?;
+                dex.place(maker, base_token, MIN_ORDER_AMOUNT * 2, true, 10)?;
+                dex.set_balance(taker, base_token, amount_in * 2)?;
+
+                let mut base = TIP20Token::from_address_unchecked(base_token);
+                base.grant_role(
+                    admin,
+                    IRolesAuth::grantRoleCall {
+                        role: *PAUSE_ROLE,
+                        account: admin,
+                    },
+                )?;
+                base.pause(admin, ITIP20::pauseCall {})?;
+
+                let exact_in =
+                    dex.swap_exact_amount_in(taker, base_token, PATH_USD_ADDRESS, amount_in, 0);
+                let exact_out = dex.swap_exact_amount_out(
+                    taker,
+                    base_token,
+                    PATH_USD_ADDRESS,
+                    amount_in,
+                    u128::MAX,
+                );
+
+                if spec.is_t3() {
+                    let expected =
+                        TempoPrecompileError::Revert(ITIP20::ContractPaused {}.abi_encode().into());
+                    assert_eq!(exact_in, Err(expected.clone()));
+                    assert_eq!(exact_out, Err(expected));
+                } else {
+                    assert!(
+                        exact_in.is_ok(),
+                        "pre-T3 exact-in swap failed: {exact_in:?}"
+                    );
+                    assert!(
+                        exact_out.is_ok(),
+                        "pre-T3 exact-out swap failed: {exact_out:?}"
+                    );
+                }
+
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn paused_intermediate_swap_token_is_allowed_before_t3_and_rejected_from_t3() {
+        for spec in [TempoHardfork::T2, TempoHardfork::T3] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xb1);
+                let path_maker = Address::repeat_byte(0xb2);
+                let output_maker = Address::repeat_byte(0xb3);
+                let taker = Address::repeat_byte(0xb4);
+                let token_in = address!("0x20c00000000000000000000000000000000000b1");
+                let token_out = address!("0x20c00000000000000000000000000000000000b2");
+                let amount = MIN_ORDER_AMOUNT;
+
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, token_in)?;
+                TIP20Token::from_address_unchecked(token_out).initialize(
+                    Address::ZERO,
+                    "Output USD",
+                    "outUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )?;
+                dex.create_pair(token_out)?;
+
+                grant_and_mint(token_out, admin, STABLECOIN_DEX_ADDRESS, amount * 4)?;
+                dex.set_balance(path_maker, PATH_USD_ADDRESS, amount * 4)?;
+                dex.place(path_maker, token_in, amount * 4, true, 0)?;
+                dex.set_balance(output_maker, token_out, amount * 4)?;
+                dex.place(output_maker, token_out, amount * 4, false, 0)?;
+                dex.set_balance(taker, token_in, amount * 4)?;
+
+                let mut path = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                path.grant_role(
+                    admin,
+                    IRolesAuth::grantRoleCall {
+                        role: *PAUSE_ROLE,
+                        account: admin,
+                    },
+                )?;
+                path.pause(admin, ITIP20::pauseCall {})?;
+
+                let exact_in = dex.swap_exact_amount_in(taker, token_in, token_out, amount, 0);
+                let exact_out =
+                    dex.swap_exact_amount_out(taker, token_in, token_out, amount, u128::MAX);
+
+                if spec.is_t3() {
+                    let expected =
+                        TempoPrecompileError::Revert(ITIP20::ContractPaused {}.abi_encode().into());
+                    assert_eq!(exact_in, Err(expected.clone()));
+                    assert_eq!(exact_out, Err(expected));
+                } else {
+                    assert!(
+                        exact_in.is_ok(),
+                        "pre-T3 exact-in swap failed: {exact_in:?}"
+                    );
+                    assert!(
+                        exact_out.is_ok(),
+                        "pre-T3 exact-out swap failed: {exact_out:?}"
+                    );
+                }
+
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
     }
 
     #[test]

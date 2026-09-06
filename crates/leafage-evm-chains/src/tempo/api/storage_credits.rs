@@ -192,6 +192,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         }
@@ -305,6 +306,7 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
             unique_tx_identifier: None,
         };

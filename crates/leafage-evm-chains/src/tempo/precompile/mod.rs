@@ -31,6 +31,8 @@ pub mod zone_factory;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
+#[cfg(test)]
+mod event_abi_tests;
 
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};
 pub use storage::{
@@ -514,30 +516,27 @@ const TEMPO_GAS_PRICE_SCALING_FACTOR: alloy::primitives::U256 =
 ///
 /// Ported from Tempo writer: `crates/node/src/rpc/mod.rs::caller_gas_allowance`.
 ///
-/// Returns `fee_token_balance * SCALING_FACTOR / gas_price`.
-/// Returns `None` if gas_price is 0 or on any storage read error.
-/// Computes the maximum gas the caller can afford, based on TIP-20 fee token balance.
-///
-/// Ported from Tempo writer: `crates/node/src/rpc/mod.rs::caller_gas_allowance`.
-///
 /// # Arguments
+/// - `tx` -- full transaction used for writer-equivalent fee-token inference
 /// - `payer` -- address whose balance determines the gas cap (caller or sponsor)
-/// - `fee_token_override` -- explicit fee token; skips FeeManager lookup when Some
 ///
 /// Returns `fee_token_balance * SCALING_FACTOR / gas_price`.
 /// Returns `None` if gas_price is 0 or on any storage read error.
 pub fn tempo_caller_gas_allowance<DB: revm::DatabaseRef>(
     db: &DB,
+    tx: &crate::tempo::tx::TempoTxEnv,
     payer: alloy::primitives::Address,
     gas_price: u128,
     timestamp: u64,
     chain_id: u64,
-    fee_token_override: Option<alloy::primitives::Address>,
 ) -> Option<u64>
 where
     DB::Error: core::fmt::Debug,
 {
-    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::{
+        fee_token::{resolve_from_storage, FeeTokenCandidates},
+        hardfork::TempoHardfork,
+    };
 
     if gas_price == 0 {
         return None;
@@ -545,32 +544,17 @@ where
 
     let spec = TempoHardfork::from_timestamp(timestamp);
 
-    // Fee token resolution:
-    // If fee_token_override is provided (from tx.fee_token), use it directly.
-    // Otherwise, read stored preference from FeeManager, fallback to DEFAULT_FEE_TOKEN.
-    let fee_token = if let Some(override_token) = fee_token_override {
-        override_token
-    } else {
-        storage::with_read_only_storage_ctx(db, spec, chain_id, || {
-            let user_token = fee_manager::TipFeeManager::new()
-                .user_tokens[payer]
-                .read()
-                .ok()?;
-            if user_token.is_zero() {
-                Some(DEFAULT_FEE_TOKEN)
-            } else {
-                Some(user_token)
-            }
-        })?
-    };
-
-    // Read TIP-20 balance of fee token for payer.
-    let balance = storage::with_read_only_storage_ctx(db, spec, chain_id, || {
-        tip20::TIP20Token::from_address_unchecked(fee_token)
-            .balances[payer]
-            .read()
-            .ok()
-    })?;
+    let candidates = FeeTokenCandidates::from_tx(tx, payer, spec);
+    let balance = storage::with_read_only_storage_ctx(
+        db,
+        spec,
+        chain_id,
+        || -> Result<alloy::primitives::U256> {
+            let fee_token = resolve_from_storage(candidates, payer)?;
+            tip20::TIP20Token::from_address_unchecked(fee_token).balances[payer].read()
+        },
+    )
+    .ok()?;
 
     // caller_gas_allowance = balance * SCALING_FACTOR / gas_price
     Some(
@@ -586,7 +570,7 @@ where
 mod tests {
     use super::*;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
-    use alloy::primitives::U256;
+    use alloy::primitives::{address, U256};
     use alloy::sol_types::{SolCall, SolInterface};
     use revm::precompile::{PrecompileSpecId, Precompiles};
 
@@ -636,6 +620,65 @@ mod tests {
                 Err(revm::precompile::PrecompileError::OutOfGas)
             ));
         });
+    }
+
+    #[test]
+    fn caller_gas_allowance_uses_valid_inferred_tip20_balance() {
+        use crate::tempo::{
+            precompile::tip20::ITIP20,
+            tx::TempoTxEnv,
+        };
+        use revm::{
+            context::TxEnv,
+            database::{in_memory_db::CacheDB, EmptyDB},
+            primitives::TxKind,
+        };
+
+        fn short_currency(value: &[u8; 3]) -> U256 {
+            let mut word = [0u8; 32];
+            word[..3].copy_from_slice(value);
+            word[31] = 6;
+            U256::from_be_bytes(word)
+        }
+
+        let payer = Address::repeat_byte(0x11);
+        let inferred = address!("0x20c0000000000000000000000000000000000011");
+        let input = ITIP20::transferCall {
+            to: Address::repeat_byte(0x22),
+            amount: U256::ONE,
+        }
+        .abi_encode()
+        .into();
+        let tx = TempoTxEnv {
+            base: TxEnv {
+                caller: payer,
+                kind: TxKind::Call(inferred),
+                data: input,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(inferred, U256::from(4), short_currency(b"EUR"))
+            .unwrap();
+        db.insert_account_storage(inferred, payer.mapping_slot(U256::from(9)), U256::from(77))
+            .unwrap();
+        db.insert_account_storage(
+            DEFAULT_FEE_TOKEN,
+            payer.mapping_slot(U256::from(9)),
+            U256::from(9),
+        )
+        .unwrap();
+
+        let allowance = |db: &CacheDB<EmptyDB>| {
+            tempo_caller_gas_allowance(db, &tx, payer, 1_000_000_000_000, 1_782_223_200, 4217)
+        };
+        assert_eq!(allowance(&db), Some(9));
+
+        db.insert_account_storage(inferred, U256::from(4), short_currency(b"USD"))
+            .unwrap();
+        assert_eq!(allowance(&db), Some(77));
     }
 
     #[test]

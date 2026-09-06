@@ -9,6 +9,7 @@ pub use api::{TempoEvm, TempoEvmError, TempoInvalidTransaction};
 
 pub mod address;
 pub mod block;
+pub(crate) mod fee_token;
 pub mod fee_payer;
 pub mod gas_params;
 pub mod hardfork;
