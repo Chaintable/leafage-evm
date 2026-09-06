@@ -130,9 +130,9 @@ fn account_load_cost(is_cold: bool, hardfork_flags: ArcHardforkFlags) -> u64 {
 }
 
 fn storage_io_error(op: &str, e: impl core::fmt::Debug) -> PrecompileErrorOrRevert {
-    PrecompileErrorOrRevert::Error(PrecompileError::Other(
-        format!("Storage {op} failed: {e:?}").into(),
-    ))
+    PrecompileErrorOrRevert::Error(PrecompileError::Fatal(format!(
+        "Storage {op} failed: {e:?}"
+    )))
 }
 
 fn record_zero6_empty_account_creation_cost(
@@ -398,9 +398,9 @@ pub(crate) fn transfer(
     gas_counter: &mut Gas,
     hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    let loaded_from_account = internals.load_account(from).map_err(|_| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-    })?;
+    let loaded_from_account = internals
+        .load_account(from)
+        .map_err(|e| storage_io_error("account access", e))?;
     record_cost_or_out_of_gas(
         gas_counter,
         account_load_cost(loaded_from_account.is_cold, hardfork_flags),
@@ -417,9 +417,9 @@ pub(crate) fn transfer(
     // Mirrors prior balance_decr + balance_incr; Zero6+ uses cold/warm via account_load_cost.
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
 
-    let to_load = internals.load_account(to).map_err(|_| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-    })?;
+    let to_load = internals
+        .load_account(to)
+        .map_err(|e| storage_io_error("account access", e))?;
     record_cost_or_out_of_gas(
         gas_counter,
         account_load_cost(to_load.is_cold, hardfork_flags),
@@ -436,9 +436,9 @@ pub(crate) fn transfer(
 
     record_zero6_empty_account_creation_cost(gas_counter, &to_load.info, amount, hardfork_flags)?;
 
-    let transfer_result = internals.transfer(from, to, amount).map_err(|_e| {
-        PrecompileErrorOrRevert::new_reverted(*gas_counter, ERR_EXECUTION_REVERTED)
-    })?;
+    let transfer_result = internals
+        .transfer(from, to, amount)
+        .map_err(|e| storage_io_error("transfer", e))?;
 
     match transfer_result {
         None => Ok(()),
@@ -469,9 +469,9 @@ pub(crate) fn balance_incr(
     hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
     // Balance check, but doesn't touch state
-    let account = internals.load_account(to).map_err(|_| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-    })?;
+    let account = internals
+        .load_account(to)
+        .map_err(|e| storage_io_error("account access", e))?;
     record_cost_or_out_of_gas(
         gas_counter,
         account_load_cost(account.is_cold, hardfork_flags),
@@ -495,9 +495,9 @@ pub(crate) fn balance_incr(
     // Update state
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
     record_zero6_empty_account_creation_cost(gas_counter, &account.info, amount, hardfork_flags)?;
-    internals.balance_incr(to, amount).map_err(|_| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-    })?;
+    internals
+        .balance_incr(to, amount)
+        .map_err(|e| storage_io_error("account access", e))?;
 
     Ok(())
 }
@@ -510,9 +510,9 @@ pub(crate) fn balance_decr(
     gas_counter: &mut Gas,
     hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    let loaded_from_account = internals.load_account(from).map_err(|_| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-    })?;
+    let loaded_from_account = internals
+        .load_account(from)
+        .map_err(|e| storage_io_error("account access", e))?;
     record_cost_or_out_of_gas(
         gas_counter,
         account_load_cost(loaded_from_account.is_cold, hardfork_flags),
@@ -528,9 +528,9 @@ pub(crate) fn balance_decr(
 
     // Perform the decrement
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
-    let mut account = internals.load_account_mut(from).map_err(|_| {
-        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-    })?;
+    let mut account = internals
+        .load_account_mut(from)
+        .map_err(|e| storage_io_error("account access", e))?;
 
     // False is only returned if insufficient funds, which should theoretically anyways never be reached due to the prior check
     if !account.decr_balance(amount) {

@@ -28,10 +28,7 @@ use alloy_evm::{precompiles::PrecompilesMap, Database as AlloyDatabase, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};
 use revm::{
     bytecode::{opcode, Bytecode},
-    context::{
-        result::{ExecutionResult, HaltReason},
-        ContextTr, JournalTr, TxEnv,
-    },
+    context::{result::ExecutionResult, ContextTr, JournalTr, TxEnv},
     context_interface::block::BlobExcessGasAndPrice,
     database::InMemoryDB,
     database_interface::DBErrorMarker,
@@ -1320,7 +1317,7 @@ impl RevmDatabase for FailingRecipientDb {
 }
 
 #[test]
-fn blocklist_db_error_becomes_precompile_halt_and_leaks_no_custom_state_or_logs() {
+fn blocklist_db_error_aborts_execution_and_clears_state_and_logs() {
     let mut inner = InMemoryDB::default();
     inner.insert_account_info(USER, account_info(U256::from(5)));
     let db = FailingBlocklistDb {
@@ -1343,16 +1340,11 @@ fn blocklist_db_error_becomes_precompile_halt_and_leaks_no_custom_state_or_logs(
             100_000,
             0,
         ))
-        .expect("DB failure inside precompile is an EVM halt");
+        .expect_err("DB failure must abort the transaction");
 
-    assert!(matches!(
-        result.result,
-        ExecutionResult::Halt {
-            reason: HaltReason::PrecompileError,
-            ..
-        }
-    ));
-    assert!(result.result.logs().is_empty());
+    assert!(matches!(result, revm::context::result::EVMError::Custom(_)));
+    assert!(evm.ctx().journaled_state.state.is_empty());
+    assert!(evm.ctx().journaled_state.logs.is_empty());
     assert_eq!(
         evm.ctx().journaled_state.db().ncc_reads,
         [
@@ -1360,18 +1352,20 @@ fn blocklist_db_error_becomes_precompile_halt_and_leaks_no_custom_state_or_logs(
             blocklist_storage_slot(USER),
         ]
     );
-    let nca = result.state.get(&NATIVE_COIN_AUTHORITY_ADDRESS);
-    assert!(
-        nca.and_then(|account| account.storage.get(&TOTAL_SUPPLY_SLOT))
-            .is_none_or(|slot| slot.present_value().is_zero()),
-        "total supply write must not escape the failed precompile"
+    assert_eq!(
+        infallible(evm.ctx_mut().db_mut().inner.basic(USER))
+            .unwrap()
+            .balance,
+        U256::from(5)
     );
     assert_eq!(
-        result
-            .state
-            .get(&USER)
-            .map_or(U256::from(5), |account| account.info.balance),
-        U256::from(5)
+        infallible(
+            evm.ctx_mut()
+                .db_mut()
+                .inner
+                .storage(NATIVE_COIN_AUTHORITY_ADDRESS, TOTAL_SUPPLY_SLOT)
+        ),
+        U256::ZERO
     );
 }
 
@@ -1397,24 +1391,21 @@ fn recipient_db_error_after_total_supply_write_rolls_back_partial_mutation() {
             100_000,
             0,
         ))
-        .expect("recipient DB failure inside precompile is an EVM halt");
+        .expect_err("recipient DB failure must abort the transaction");
 
-    assert!(matches!(
-        result.result,
-        ExecutionResult::Halt {
-            reason: HaltReason::PrecompileError,
-            ..
-        }
-    ));
-    assert!(result.result.logs().is_empty());
+    assert!(matches!(result, revm::context::result::EVMError::Custom(_)));
+    assert!(evm.ctx().journaled_state.state.is_empty());
+    assert!(evm.ctx().journaled_state.logs.is_empty());
     assert_eq!(evm.ctx().journaled_state.db().failed_recipient_reads, 1);
-    assert!(
-        result
-            .state
-            .get(&NATIVE_COIN_AUTHORITY_ADDRESS)
-            .and_then(|account| account.storage.get(&TOTAL_SUPPLY_SLOT))
-            .is_none_or(|slot| slot.present_value().is_zero()),
-        "totalSupply was written before recipient load and must be rolled back"
+    assert_eq!(
+        infallible(
+            evm.ctx_mut()
+                .db_mut()
+                .inner
+                .storage(NATIVE_COIN_AUTHORITY_ADDRESS, TOTAL_SUPPLY_SLOT)
+        ),
+        U256::ZERO,
+        "totalSupply was written before recipient load and must be discarded"
     );
     assert_eq!(
         infallible(evm.ctx_mut().db_mut().inner.basic(USER))
