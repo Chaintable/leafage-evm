@@ -132,6 +132,21 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
   --chain-cfg 1
 ```
 
+### OP 执行配置
+
+`--evm-type=op` 支持现有 `--spec-id`：100 Bedrock、101 Regolith、102 Canyon、103 Ecotone、104 Fjord、105 Granite、106 Holocene、107 Isthmus、108 Jovian、109 Interop、110 Osaka。未指定或 255 保持 Osaka。数字采用 OP 枚举，不是 Ethereum SpecId；这是实例级固定配置，不按历史高度自动切换。
+
+RISE（Jovian / Prague）：
+
+```sh
+--evm-type=op --spec-id=108 \
+--evm-custom-config='{"limit_contract_code_size":262144,"limit_contract_initcode_size":524288}'
+```
+
+大小字段单位为 bytes，独立覆盖：缺省/null 保留原值（标准 OP 为 code 24576、initcode 49152），只改 code 不会隐式把 initcode 改成两倍。0 表示字面上的 0 字节上限。仅 initcode 支持字符串 `"unlimited"`；未知字段、非法类型或 spec 值会在启动时报错。
+
+Metis 的大小配置为 `--evm-custom-config='{"limit_contract_code_size":2457600,"limit_contract_initcode_size":"unlimited"}'`。它仅消除大小限制差异，不代表完整适配 Metis hardfork/gas 规则；unlimited 不关闭 EIP-3860 计费。大小覆盖不会启用所选 fork 尚未激活的规则，例如 Bedrock/Regolith 的 EIP-3860 检查。RPC gas cap 和请求体约束保持独立。
+
 ### 主要参数
 
 | 参数 | 默认值 | 说明 |

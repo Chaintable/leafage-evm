@@ -20,6 +20,8 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use metrics::gauge;
+use revm::context_interface::Cfg;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
@@ -60,7 +62,9 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
+    /// Custom EVM parameters for Cosmos, Arbitrum or OP.
+    /// OP supports independent limit_contract_code_size and limit_contract_initcode_size
+    /// overrides in bytes; initcode also accepts "unlimited".
     ///
     /// # Example
     /// --evm-type=cosmos
@@ -68,7 +72,8 @@ pub struct Command {
     #[arg(long)]
     evm_custom_config: Option<String>,
 
-    /// The Ethereum Execution Specification ID for the chain.
+    /// Execution specification ID, using the selected EVM type's numbering.
+    /// OP: 100 (Bedrock) through 110 (Osaka); 108 selects Jovian (Prague).
     ///
     /// if not specified, the default spec_id is u8::MAX
     #[arg(long, default_value = "255")]
@@ -464,6 +469,64 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Re
         .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
 }
 
+fn resolve_op_spec(spec_id: u8) -> Result<OpSpecId> {
+    use OpSpecId::*;
+    if spec_id == u8::MAX {
+        return Ok(OSAKA);
+    }
+    [
+        BEDROCK, REGOLITH, CANYON, ECOTONE, FJORD, GRANITE, HOLOCENE, ISTHMUS, JOVIAN, INTEROP,
+        OSAKA,
+    ]
+    .into_iter()
+    .find(|spec| *spec as u8 == spec_id)
+    .ok_or_else(|| {
+        anyhow!(
+            "invalid --spec-id {} for op evm-type (expected 100..=110 or 255)",
+            spec_id
+        )
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InitcodeLimit {
+    Bytes(usize),
+    Keyword(String),
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OpCustomConfig {
+    limit_contract_code_size: Option<usize>,
+    limit_contract_initcode_size: Option<InitcodeLimit>,
+}
+
+fn apply_op_custom_config(cfg: &mut CfgEnv<OpSpecId>, json: Option<&str>) -> Result<()> {
+    let Some(json) = json else { return Ok(()) };
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| anyhow!("cannot parse op custom evm config: {err}"))?;
+    if !value.is_object() {
+        bail!("op custom evm config must be a JSON object");
+    }
+    let custom: OpCustomConfig = serde_json::from_value(value)
+        .map_err(|err| anyhow!("cannot parse op custom evm config: {err}"))?;
+    // revm otherwise inherits 2 * code_size. These overrides are independent.
+    let original_initcode_limit = cfg.max_initcode_size();
+    if let Some(size) = custom.limit_contract_code_size {
+        cfg.limit_contract_code_size = Some(size);
+        cfg.limit_contract_initcode_size = Some(original_initcode_limit);
+    }
+    if let Some(limit) = custom.limit_contract_initcode_size {
+        cfg.limit_contract_initcode_size = Some(match limit {
+            InitcodeLimit::Bytes(size) => size,
+            InitcodeLimit::Keyword(value) if value == "unlimited" => usize::MAX,
+            InitcodeLimit::Keyword(_) => bail!("op initcode limit must be bytes or \"unlimited\""),
+        });
+    }
+    Ok(())
+}
+
 impl Command {
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
@@ -503,13 +566,14 @@ impl Command {
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                let mut chain_cfg = CfgEnv::new_with_spec(resolve_op_spec(self.spec_id)?);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                apply_op_custom_config(&mut chain_cfg, custom_evm_cfg.as_deref())?;
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
             }
             "base" => {
@@ -897,5 +961,126 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod op_config_tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Command {
+        Command::try_parse_from(
+            ["standalone", "--db-path=/unused", "--evm-type=op"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap()
+    }
+
+    fn config(args: &[&str]) -> CfgEnv<OpSpecId> {
+        let MultiChainCfgEnv::Op(cfg) = command(args).build_chain_cfg_env().unwrap() else {
+            panic!("expected OP configuration")
+        };
+        cfg
+    }
+
+    #[test]
+    fn all_op_spec_ids_are_checked() {
+        for id in 0..=u8::MAX {
+            let cmd = command(&["--spec-id", &id.to_string()]);
+            let result = cmd.build_chain_cfg_env();
+            if (100..=110).contains(&id) || id == 255 {
+                let MultiChainCfgEnv::Op(cfg) = result.unwrap() else {
+                    panic!()
+                };
+                assert_eq!(cfg.spec as u8, if id == 255 { 110 } else { id });
+                assert_eq!(cfg.gas_params, CfgEnv::new_with_spec(cfg.spec).gas_params);
+            } else {
+                assert!(result.is_err(), "accepted {id}");
+            }
+        }
+        assert_eq!(config(&[]).spec, OpSpecId::OSAKA);
+        for bad in ["256", "-1", "Jovian"] {
+            assert!(
+                Command::try_parse_from(["standalone", "--db-path=/unused", "--spec-id", bad])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn size_overrides_are_independent() {
+        for json in [
+            "{}",
+            r#"{"limit_contract_code_size":null,"limit_contract_initcode_size":null}"#,
+        ] {
+            let cfg = config(&["--evm-custom-config", json]);
+            assert_eq!(cfg.limit_contract_code_size, None);
+            assert_eq!(cfg.limit_contract_initcode_size, None);
+        }
+        let code = config(&[
+            "--evm-custom-config",
+            r#"{"limit_contract_code_size":262144}"#,
+        ]);
+        assert_eq!(
+            (code.max_code_size(), code.max_initcode_size()),
+            (262144, 49152)
+        );
+        let init = config(&[
+            "--evm-custom-config",
+            r#"{"limit_contract_initcode_size":524288}"#,
+        ]);
+        assert_eq!(
+            (init.max_code_size(), init.max_initcode_size()),
+            (24576, 524288)
+        );
+        let rise = config(&[
+            "--spec-id=108",
+            "--evm-custom-config",
+            r#"{"limit_contract_code_size":262144,"limit_contract_initcode_size":524288}"#,
+        ]);
+        assert_eq!(rise.spec, OpSpecId::JOVIAN);
+        assert_eq!(
+            (rise.max_code_size(), rise.max_initcode_size()),
+            (262144, 524288)
+        );
+        let metis = config(&[
+            "--evm-custom-config",
+            r#"{"limit_contract_code_size":2457600,"limit_contract_initcode_size":"unlimited"}"#,
+        ]);
+        assert_eq!(
+            (metis.max_code_size(), metis.max_initcode_size()),
+            (2457600, usize::MAX)
+        );
+        let zero = config(&[
+            "--evm-custom-config",
+            r#"{"limit_contract_code_size":0,"limit_contract_initcode_size":0}"#,
+        ]);
+        assert_eq!((zero.max_code_size(), zero.max_initcode_size()), (0, 0));
+        assert_eq!(rise.tx_gas_limit_cap, config(&[]).tx_gas_limit_cap);
+    }
+
+    #[test]
+    fn invalid_op_config_fails_before_startup() {
+        for json in [
+            "null",
+            "[]",
+            "42",
+            "{",
+            r#"{"typo":1}"#,
+            r#"{"limit_contract_code_size":-1}"#,
+            r#"{"limit_contract_code_size":1.5}"#,
+            r#"{"limit_contract_code_size":"unlimited"}"#,
+            r#"{"limit_contract_initcode_size":"infinite"}"#,
+            r#"{"limit_contract_initcode_size":{"unlimited":null}}"#,
+            r#"{"limit_contract_initcode_size":18446744073709551616}"#,
+        ] {
+            assert!(
+                command(&["--evm-custom-config", json])
+                    .build_chain_cfg_env()
+                    .is_err(),
+                "accepted {json}"
+            );
+        }
     }
 }

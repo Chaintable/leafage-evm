@@ -132,6 +132,21 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
   --chain-cfg 1
 ```
 
+### OP execution configuration
+
+`--evm-type=op` honors `--spec-id`: 100 Bedrock, 101 Regolith, 102 Canyon, 103 Ecotone, 104 Fjord, 105 Granite, 106 Holocene, 107 Isthmus, 108 Jovian, 109 Interop, 110 Osaka. Omitted or 255 retains Osaka. These are OP enum IDs, not Ethereum SpecId values. The selection is fixed for the instance, not a historical fork schedule.
+
+RISE (Jovian / Prague):
+
+```sh
+--evm-type=op --spec-id=108 \
+--evm-custom-config='{"limit_contract_code_size":262144,"limit_contract_initcode_size":524288}'
+```
+
+Size fields are independent overrides in bytes. Omitted/null fields keep their original limits (standard OP: code 24576, initcode 49152); setting code alone does not double the initcode limit. Zero means a literal zero-byte limit. Only initcode accepts `"unlimited"`. Unknown fields, invalid types and invalid spec IDs fail at startup.
+
+Metis size settings: `--evm-custom-config='{"limit_contract_code_size":2457600,"limit_contract_initcode_size":"unlimited"}'`. This only addresses size limits, not full Metis hardfork/gas compatibility; unlimited does not disable EIP-3860 metering. Overrides do not activate rules absent from the selected fork, such as EIP-3860 checks on Bedrock/Regolith. RPC gas and request-size caps remain independent.
+
 ### Main Parameters
 
 | Parameter | Default | Description |
