@@ -576,7 +576,8 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     use crate::tempo::{
         fee_token::{resolve_from_storage, FeeTokenCandidates},
         precompile::{
-            tip20::TIP20Token, Handler, LeafageStorageProvider, StorageCtx, TempoPrecompileError,
+            tip20::{is_tip20_prefix, TIP20Token},
+            Handler, LeafageStorageProvider, StorageCtx, TempoPrecompileError,
         },
     };
 
@@ -596,17 +597,24 @@ fn warm_fee_token_balance<DB: Database, INSP>(
 
     let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
     let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
-    let resolved = StorageCtx::enter(&mut storage, || {
-        let fee_token = resolve_from_storage(candidates, fee_payer)?;
-        let _ = TIP20Token::from_address_unchecked(fee_token).balances[fee_payer].read()?;
-        Ok(fee_token)
-    });
-    drop(storage);
-
-    let fee_token = resolved.map_err(|error| match error {
+    let map_error = |error: TempoPrecompileError| match error {
         TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
         error => EVMError::Custom(error.to_string()),
-    })?;
+    };
+    let fee_token = StorageCtx::enter(&mut storage, || resolve_from_storage(candidates, fee_payer))
+        .map_err(map_error)?;
+    // Writer validates the prefix even for free simulation, before reading
+    // the balance. Do not require currency or deployed state for a free call.
+    if !is_tip20_prefix(fee_token) {
+        return Err(EVMError::Transaction(
+            TempoInvalidTransaction::FeeTokenNotTip20 { address: fee_token },
+        ));
+    }
+    StorageCtx::enter(&mut storage, || {
+        TIP20Token::from_address_unchecked(fee_token).balances[fee_payer].read()
+    })
+    .map_err(map_error)?;
+    drop(storage);
     evm.ctx_mut().tx.resolved_fee_token = Some(fee_token);
 
     Ok(())
@@ -1776,6 +1784,11 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
     // 6. Per-call costs (calldata + CREATE).
     let mut total_tokens: u64 = 0;
     for call in calls {
+        if !call.value.is_zero() {
+            return Err(EVMError::Custom(
+                "value transfer in Tempo Transaction not allowed".into(),
+            ));
+        }
         let tokens = get_tokens_in_calldata_istanbul(&call.input);
         total_tokens += tokens;
 

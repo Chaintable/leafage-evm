@@ -127,6 +127,8 @@ pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<TempoHardf
 pub enum TempoInvalidTransaction {
     /// Standard Ethereum transaction validation error.
     EthInvalidTransaction(revm::context::result::InvalidTransaction),
+    /// The selected fee token does not have the required TIP-20 address prefix.
+    FeeTokenNotTip20 { address: Address },
     /// Nonce-manager validation failed.
     NonceManagerError(String),
     /// Expiring nonce transaction omitted `valid_before`.
@@ -145,6 +147,10 @@ impl core::fmt::Display for TempoInvalidTransaction {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EthInvalidTransaction(error) => error.fmt(f),
+            Self::FeeTokenNotTip20 { address } => write!(
+                f,
+                "fee token {address} is not a TIP-20 token; fee tokens must be TIP-20 tokens"
+            ),
             Self::NonceManagerError(reason) => write!(f, "nonce manager error: {reason}"),
             Self::ExpiringNonceMissingValidBefore => {
                 f.write_str("expiring nonce transaction requires valid_before to be set")
@@ -211,6 +217,9 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                 (GasId::new_account_cost_for_selfdestruct(), 250_000),
                 (GasId::code_deposit_cost(), 1_000),
                 (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                // T1 disables authorization refunds for both ordinary 0x04
+                // transactions and Tempo AA authorization lists.
+                (GasId::tx_eip7702_auth_refund(), 0),
                 // TIP-1000: Auth account creation cost (EIP-7702 auth with nonce==0).
                 // Custom GasId(255), same as Tempo writer: crates/revm/src/gas_params.rs
                 (GasId::new(255), 250_000),
@@ -771,6 +780,146 @@ mod tests {
             to: TxKind::Call(Address::with_last_byte(to_byte)),
             value: revm::primitives::U256::ZERO,
             input: Bytes::copy_from_slice(data),
+        }
+    }
+
+    #[test]
+    fn review_standard_and_aa_authorization_refunds_follow_t1() {
+        use crate::tempo::tx::{TempoAuthGas, TempoTxFields};
+        use alloy::eips::eip7702::{Authorization, SignedAuthorization};
+        use revm::{
+            database::CacheDB,
+            primitives::{Address, TxKind, U256},
+            state::AccountInfo,
+        };
+
+        let delegate = Address::repeat_byte(0x12);
+        let signed = SignedAuthorization::new_unchecked(
+            Authorization {
+                chain_id: U256::ZERO,
+                address: delegate,
+                nonce: 1,
+            },
+            0,
+            U256::ONE,
+            U256::ONE,
+        );
+        let authority = signed.recover_authority().unwrap();
+        for (timestamp, expected_refund) in [
+            (1_770_908_399, 9_200),
+            (1_770_908_400, 0),
+            (1_783_605_600, 0),
+            (1_787_320_800, 0),
+        ] {
+            for aa in [false, true] {
+                let mut db = CacheDB::new(EmptyDB::default());
+                db.insert_account_info(
+                    authority,
+                    AccountInfo {
+                        nonce: 1,
+                        ..Default::default()
+                    },
+                );
+                let mut tx = crate::tempo::tx::TempoTxEnv::default();
+                tx.base.caller = Address::repeat_byte(0x11);
+                tx.base.kind = TxKind::Call(delegate);
+                tx.base.gas_limit = 1_000_000;
+                tx.base.chain_id = Some(4217);
+                if aa {
+                    tx.tempo_fields = Some(TempoTxFields {
+                        aa_calls: vec![crate::tempo::tx::TempoCall {
+                            to: TxKind::Call(delegate),
+                            ..Default::default()
+                        }],
+                        auth_list: vec![TempoAuthGas {
+                            authority: Some(authority),
+                            delegate: Some(delegate),
+                            chain_id: Some(U256::ZERO),
+                            nonce: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    });
+                } else {
+                    tx.base.tx_type = 4;
+                    tx.base.set_signed_authorization(vec![signed.clone()]);
+                }
+                let mut evm = TempoEvm::new(make_env_aa(timestamp), db, NoOpInspector, false);
+                let result = evm.transact(tx).unwrap();
+                assert!(result.result.is_success());
+                assert_eq!(
+                    result.state[&authority].info.nonce, 2,
+                    "authorization must apply"
+                );
+                assert_eq!(
+                    result.result.gas().inner_refunded(),
+                    expected_refund,
+                    "timestamp={timestamp}, aa={aa}"
+                );
+                if timestamp >= 1_770_908_400 {
+                    assert_eq!(result.result.gas().used(), 283_500);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_aa_inner_value_is_rejected_before_execution() {
+        use revm::primitives::{TxKind, U256};
+        for timestamp in [1_770_908_399, 1_770_908_400, 1_783_605_600, 1_787_320_800] {
+            for create in [false, true] {
+                let mut call = make_call(0x99, &[]);
+                if create {
+                    call.to = TxKind::Create;
+                }
+                call.value = U256::ONE;
+                let tx = make_aa_tx(vec![call, make_call(0x98, &[])], 0, U256::ZERO, 10_000_000);
+                let mut evm = TempoEvm::new(
+                    make_env_aa(timestamp),
+                    EmptyDB::default(),
+                    NoOpInspector,
+                    false,
+                );
+                let error = evm.transact(tx).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("value transfer in Tempo Transaction not allowed"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_fee_token_prefix_is_checked_for_free_simulation() {
+        use crate::tempo::precompile::PATH_USD_ADDRESS;
+        use revm::primitives::{Address, U256};
+        let undeployed = alloy::primitives::address!("20c00000000000000000000000000000ffffffff");
+        for token in [
+            Address::ZERO,
+            Address::repeat_byte(0x11),
+            PATH_USD_ADDRESS,
+            undeployed,
+        ] {
+            let mut tx = make_aa_tx(vec![make_call(0x99, &[])], 0, U256::ZERO, 10_000_000);
+            tx.tempo_fields.as_mut().unwrap().fee_token = Some(token);
+            let mut evm = TempoEvm::new(
+                make_env_aa(1_787_320_800),
+                EmptyDB::default(),
+                NoOpInspector,
+                false,
+            );
+            let result = evm.transact(tx);
+            if token == PATH_USD_ADDRESS || token == undeployed {
+                assert!(result.unwrap().result.is_success());
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("is not a TIP-20 token"),
+                    "{error}"
+                );
+            }
         }
     }
 

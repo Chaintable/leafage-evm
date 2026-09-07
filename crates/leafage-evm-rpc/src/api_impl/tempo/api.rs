@@ -102,6 +102,13 @@ impl ToJsonRpcError for TempoInvalidTransaction {
     fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
         match self {
             TempoInvalidTransaction::EthInvalidTransaction(error) => error.to_rpc_error(),
+            TempoInvalidTransaction::FeeTokenNotTip20 { address } => {
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32003,
+                    self.to_string(),
+                    Some(serde_json::json!({"name": "FeeTokenNotTip20Error", "token": address})),
+                )
+            }
             TempoInvalidTransaction::NonceManagerError(_)
             | TempoInvalidTransaction::ExpiringNonceMissingValidBefore
             | TempoInvalidTransaction::ExpiringNonceNonceNotZero => rpc_error_with_code(
@@ -346,14 +353,22 @@ where
             base.nonce = nonce;
         }
 
-        // Determine if this is an AA transaction (same logic as writer compat.rs:136-144).
+        // Match TempoTransactionRequest::has_aa_fields, including fields that
+        // can select AA without an explicit calls list or nonce key.
         let has_aa_fields = tempo_calls.as_ref().is_some_and(|c| !c.is_empty())
             || tempo_authorization_list
                 .as_ref()
                 .is_some_and(|l| !l.is_empty())
             || nonce_key.is_some()
             || key_authorization.is_some()
-            || key_id.is_some();
+            || key_id.is_some()
+            || key_type.is_some()
+            || key_data.is_some()
+            || fee_token.is_some()
+            || fee_payer.is_some()
+            || te.fee_payer_signature.is_some()
+            || valid_after.is_some()
+            || valid_before.is_some();
 
         let tempo_fields = if has_aa_fields {
             // Parse signature type.
@@ -681,6 +696,119 @@ mod tests {
     use super::*;
     use leafage_evm_chains::tempo::precompile::VALIDATOR_CONFIG_V2_ADDRESS;
     use revm::database::EmptyDB;
+
+    fn review_api() -> TempoApiImpl<()> {
+        let mut cfg = revm::context::CfgEnv::new_with_spec(TempoHardfork::T10);
+        cfg.chain_id = 4217;
+        cfg.disable_balance_check = true;
+        cfg.disable_base_fee = true;
+        ApiImpl::new(
+            (),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            String::new(),
+            0,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn review_request(field: &str, value: serde_json::Value) -> CallRequest {
+        let mut json = serde_json::json!({
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x1111111111111111111111111111111111111112",
+            "gas": "0xf4240"
+        });
+        json[field] = value;
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn review_single_field_requests_preserve_aa_semantics() {
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: alloy::primitives::U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            ..Default::default()
+        };
+        for (field, value) in [
+            ("keyType", serde_json::json!("p256")),
+            ("keyData", serde_json::json!("0x01")),
+            (
+                "feeToken",
+                serde_json::json!("0x20c0000000000000000000000000000000000000"),
+            ),
+            (
+                "feePayer",
+                serde_json::json!("0x1111111111111111111111111111111111111113"),
+            ),
+            ("validAfter", serde_json::json!(1)),
+            ("validBefore", serde_json::json!(1_888_743_086u64)),
+        ] {
+            let tx = api
+                .create_txn_env(
+                    &Default::default(),
+                    &block,
+                    review_request(field, value),
+                    EmptyDB::default(),
+                    4217,
+                )
+                .unwrap();
+            assert!(tx.tempo_fields.is_some(), "{field} must select AA");
+            assert_eq!(tx.tempo_fields.as_ref().unwrap().aa_calls.len(), 1);
+            if field == "keyType" {
+                let result = api.transact(&block, EmptyDB::default(), tx).unwrap();
+                assert!(result.is_success());
+                assert_eq!(result.gas().used(), 276_000);
+            }
+        }
+        for (field, value, expected) in [
+            (
+                "validAfter",
+                serde_json::json!("0xffffffffff"),
+                "not yet valid",
+            ),
+            ("validBefore", serde_json::json!("0x1"), "expired"),
+        ] {
+            let tx = api
+                .create_txn_env(
+                    &Default::default(),
+                    &block,
+                    review_request(field, value),
+                    EmptyDB::default(),
+                    4217,
+                )
+                .unwrap();
+            let error = api.transact(&block, EmptyDB::default(), tx).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let token = "0x1111111111111111111111111111111111111112";
+        let tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                review_request("feeToken", serde_json::json!(token)),
+                EmptyDB::default(),
+                4217,
+            )
+            .unwrap();
+        let error = api
+            .transact(&block, EmptyDB::default(), tx)
+            .unwrap_err()
+            .to_rpc_error();
+        assert_eq!(error.code(), -32003);
+        let data: serde_json::Value = serde_json::from_str(error.data().unwrap().get()).unwrap();
+        assert_eq!(
+            data,
+            serde_json::json!({"name":"FeeTokenNotTip20Error", "token":token})
+        );
+    }
 
     #[test]
     fn expiring_nonce_transaction_error_maps_to_nonce_rpc_error() {

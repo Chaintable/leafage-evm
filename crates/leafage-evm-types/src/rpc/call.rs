@@ -45,8 +45,20 @@ pub struct CallRequest {
     #[serde(flatten)]
     pub inner: TransactionRequest,
 
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "deserialize_tempo_extension")]
     pub tempo: Option<TempoCallExtension>,
+}
+
+// Deserializing a flattened Option directly swallows malformed Tempo fields.
+// Keep the optional API shape, but propagate field errors instead of executing
+// the request as an ordinary Ethereum transaction.
+fn deserialize_tempo_extension<'de, D>(
+    deserializer: D,
+) -> Result<Option<TempoCallExtension>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    TempoCallExtension::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -86,10 +98,18 @@ pub struct TempoCallExtension {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_payer_signature: Option<alloy::primitives::Signature>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "alloy::serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub valid_after: Option<u64>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "alloy::serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub valid_before: Option<u64>,
 }
 
@@ -224,6 +244,29 @@ impl DerefMut for CallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_tempo_quantity_and_invalid_field_deserialization() {
+        for (after, before) in [
+            (serde_json::json!(100), serde_json::json!(200)),
+            (serde_json::json!("0x64"), serde_json::json!("0xc8")),
+        ] {
+            let request: CallRequest = serde_json::from_value(
+                serde_json::json!({"nonceKey":"0x0", "validAfter":after, "validBefore":before}),
+            )
+            .unwrap();
+            let tempo = request.tempo.expect("Tempo fields must not be discarded");
+            assert_eq!(tempo.valid_after, Some(100));
+            assert_eq!(tempo.valid_before, Some(200));
+        }
+        for invalid in [
+            serde_json::json!({"validAfter":"bad"}),
+            serde_json::json!({"nonceKey":"bad"}),
+            serde_json::json!({"feeToken":"bad"}),
+        ] {
+            assert!(serde_json::from_value::<CallRequest>(invalid).is_err());
+        }
+    }
 
     /// Verify camelCase deserialization of all Tempo-specific fields.
     #[test]
