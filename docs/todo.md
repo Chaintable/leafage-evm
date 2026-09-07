@@ -2,6 +2,7 @@
 
 - `[2026-09-07][decided] 实现可配置完整 S3 读取超时` — 用户确认方案并要求开始编码；分支 fix/s3-read-timeout 基于 origin/main e5a8e5052a4d3ed38a01e0b3bf20db016521e807，主 checkout 保持原状。
   **Decision:** Kafka/S3 JSON 新增正整数 s3_read_timeout_secs，省略默认 60；完整 GET/send+body 和 LIST 使用同一时限。复用现有 JoinSet 取消及批次重试，不修改状态/offset 顺序。
+  **Done:** 实现提交 5983f0de22d18debae602555d09028110a1fe36a，已推送并创建 [PR #228](https://github.com/Chaintable/leafage-evm/pull/228)；未合并或部署生产。
 - `[2026-09-07][decided] 最新 main 的 bundle 路径保持独立` — 最新 main 比事故版本多出 bundle/mod.rs 的分段下载及重试实现；已审方案覆盖 utils.rs 的四处 GET 和一处 LIST。
   **Decision:** 本次只保护逐对象读取。bundle 路径不改，不宣称所有下载均受新配置保护；后续单独评估范围请求的 deadline。
 - `[2026-09-07][done] 验证读取超时与取消` — 增加配置校验、GET 无响应、body 停滞、LIST 无响应、断连重试恢复和 Pending future 释放测试。
