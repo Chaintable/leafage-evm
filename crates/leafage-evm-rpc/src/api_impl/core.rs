@@ -67,6 +67,12 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
 
+    /// Select the state nonce for estimation unless the chain needs the
+    /// original request nonce as signed input to its transaction adapter.
+    fn prepare_estimate_request(&self, request: &mut CallRequest) {
+        request.nonce = None;
+    }
+
     fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
         if spec.is_enabled_in(EthSpecId::OSAKA) {
             eip7825::TX_GAS_LIMIT_CAP

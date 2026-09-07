@@ -869,8 +869,7 @@ where
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-        // set nonce to None so that the correct nonce is chosen by the EVM
-        request.nonce = None;
+        self.inner.prepare_estimate_request(&mut request);
         let mut block_env = block_env_from_block(&block);
         let mut cache_db = CacheDB::new(EvmStorageWrapper {
             db: state,

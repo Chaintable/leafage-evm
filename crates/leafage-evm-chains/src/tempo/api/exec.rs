@@ -2188,6 +2188,65 @@ mod tests {
     }
 
     #[test]
+    fn review_high_s_key_authorization_does_not_mutate_keychain() {
+        use crate::tempo::fee_payer::{
+            KeyAuthorization, PrimitiveSignature, SignatureType, SignedKeyAuthorization,
+        };
+        use crate::tempo::tx::TempoKeyAuthGas;
+        use alloy::primitives::Signature;
+        let key = Address::repeat_byte(0x42);
+        let authorization = KeyAuthorization {
+            chain_id: 4217,
+            key_type: SignatureType::Secp256k1,
+            key_id: key,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let low = Signature::new(U256::ONE, U256::ONE, false);
+        let root = PrimitiveSignature::Secp256k1(low)
+            .recover_signer(&authorization.signature_hash())
+            .unwrap();
+        let high_s: U256 = "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140"
+            .parse()
+            .unwrap();
+        for high in [true, false] {
+            let mut evm = make_evm_with_spec(TempoHardfork::T6);
+            evm.inner.ctx.block.timestamp = U256::from(1_782_223_200u64);
+            evm.inner.ctx.tx.base.caller = root;
+            set_keychain_tx_origin(&mut evm);
+            evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+                key_auth: Some(TempoKeyAuthGas {
+                    signed_authorization: Some(SignedKeyAuthorization {
+                        authorization: authorization.clone(),
+                        signature: PrimitiveSignature::Secp256k1(if high {
+                            Signature::new(U256::ONE, high_s, true)
+                        } else {
+                            low
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let result = apply_signed_key_authorization(&mut evm, None);
+            if high {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("signature recovery failed"));
+                assert_eq!(key_status(&mut evm, root, key), (false, false));
+            } else {
+                result.unwrap();
+                assert_eq!(key_status(&mut evm, root, key), (true, false));
+            }
+        }
+    }
+
+    #[test]
     fn t6_rpc_signed_key_authorization_mutates_keychain_state() {
         use crate::tempo::fee_payer::{KeyAuthorization, SignatureType};
         use crate::tempo::tx::TempoKeyAuthGas;

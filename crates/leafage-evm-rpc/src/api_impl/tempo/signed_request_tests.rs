@@ -29,6 +29,52 @@ fn signature() -> Value {
     json!({"r":"0x1","s":"0x1","yParity":"0x0"})
 }
 
+#[test]
+fn review_high_s_authorization_and_sponsor_are_not_accepted() {
+    let high_s = "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140";
+    let mut auth = authorization();
+    auth["signature"]["s"] = json!(high_s);
+    auth["signature"]["yParity"] = json!("0x1");
+    let mut db = InMemoryDB::default();
+    let code = Bytecode::new_legacy(bytes!("602a60005260206000f3"));
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::new(U256::ZERO, 1, code.hash_slow(), code),
+    );
+    let result = tests::review_api()
+        .transact(
+            &block(),
+            &db,
+            tx(
+                json!({
+                    "from":CALLER,"to":AUTHORITY,"gas":"0x1e8480","aaAuthorizationList":[auth]
+                }),
+                &db,
+            ),
+        )
+        .unwrap();
+    assert!(result.is_success());
+    assert!(
+        result.output().unwrap().is_empty(),
+        "high-S authorization must be skipped"
+    );
+
+    let mut json = request();
+    json["feePayerSignature"] = json!({"r":"0x1","s":high_s,"yParity":"0x1"});
+    let error = tests::review_api()
+        .create_txn_env(
+            &Default::default(),
+            &block(),
+            serde_json::from_value(json).unwrap(),
+            &db,
+            4217,
+        )
+        .unwrap_err();
+    assert!(error
+        .message()
+        .contains("fee payer signature recovery failed"));
+}
+
 fn authorization() -> Value {
     let mut signature = signature();
     signature["type"] = json!("secp256k1");

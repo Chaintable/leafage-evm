@@ -234,7 +234,7 @@ impl PrimitiveSignature {
 
     /// Recover the signer address from this signature over `sig_hash`.
     ///
-    /// - Secp256k1: standard ecrecover (alloy `Signature::recover_address_from_prehash`).
+    /// - Secp256k1: consensus signer recovery, including Tempo's low-S requirement.
     /// - P256: verifies the signature (with low-s malleability check) and derives
     ///   the address from the embedded public key.
     /// - WebAuthn: parses authenticatorData + clientDataJSON, validates the challenge
@@ -244,9 +244,10 @@ impl PrimitiveSignature {
     /// Ported from Tempo writer `tt_signature.rs::PrimitiveSignature::recover_signer`.
     pub fn recover_signer(&self, sig_hash: &B256) -> Result<Address, &'static str> {
         match self {
-            Self::Secp256k1(sig) => sig
-                .recover_address_from_prehash(sig_hash)
-                .map_err(|_| "secp256k1 recovery failed"),
+            Self::Secp256k1(sig) => {
+                alloy::consensus::crypto::secp256k1::recover_signer(sig, *sig_hash)
+                    .map_err(|_| "secp256k1 recovery failed")
+            }
             Self::P256(p256_sig) => {
                 let message_hash = if p256_sig.pre_hash {
                     // Some P256 implementations (e.g. Web Crypto) pre-hash the digest.
@@ -1186,9 +1187,7 @@ pub fn recover_fee_payer(
         key_authorization,
     );
 
-    fee_payer_signature
-        .recover_address_from_prehash(&hash)
-        .ok()
+    alloy::consensus::crypto::secp256k1::recover_signer(fee_payer_signature, hash).ok()
 }
 
 #[cfg(test)]

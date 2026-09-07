@@ -717,6 +717,18 @@ where
 
     type Tx = TempoTxEnv;
 
+    fn prepare_estimate_request(&self, request: &mut CallRequest) {
+        // The sponsor signs the original nonce. Account execution still uses
+        // the state nonce in create_mainnet_txn_env; 2D AA uses its own nonce.
+        let signed_sponsor = request
+            .tempo
+            .as_ref()
+            .is_some_and(|fields| fields.fee_payer_signature.is_some());
+        if !signed_sponsor {
+            request.nonce = None;
+        }
+    }
+
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         Some(leafage_evm_chains::tempo::VIRTUAL_BALANCE)
     }
@@ -783,6 +795,10 @@ fn parse_webauthn_size(key_data: Option<&alloy::primitives::Bytes>) -> usize {
     };
     size.clamp(MIN_WEBAUTHN_SIZE, MAX_WEBAUTHN_SIZE)
 }
+
+#[cfg(test)]
+#[path = "estimate_request_tests.rs"]
+mod estimate_request_tests;
 
 #[cfg(test)]
 #[path = "signed_request_tests.rs"]

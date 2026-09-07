@@ -283,6 +283,35 @@ mod tests {
     }
 
     #[test]
+    fn review_signature_verifier_rejects_high_s_with_invalid_signature() {
+        use alloy::primitives::U256;
+        let high_s: U256 = "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140"
+            .parse()
+            .unwrap();
+        for high in [false, true] {
+            let signature = Signature::new(U256::ONE, if high { high_s } else { U256::ONE }, high);
+            let calldata = ISignatureVerifier::recoverCall {
+                hash: B256::ZERO,
+                signature: PrimitiveSignature::Secp256k1(signature).to_bytes(),
+            }
+            .abi_encode();
+            let output = run_with_spec(TempoHardfork::T3, || {
+                SignatureVerifier::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert_eq!(output.reverted, high);
+            if high {
+                assert_eq!(
+                    output.bytes.as_ref(),
+                    ISignatureVerifier::InvalidSignature {}.abi_encode()
+                );
+            } else {
+                assert_eq!(output.bytes.len(), 32);
+            }
+        }
+    }
+
+    #[test]
     fn t3_recover_secp256k1_parses_test_signature() {
         // `Signature::test_signature()` is a placeholder with r=1, s=1, v=0 — it
         // parses as a well-formed secp256k1 signature but does not recover any
