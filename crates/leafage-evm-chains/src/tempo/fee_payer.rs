@@ -498,6 +498,37 @@ pub enum TempoSignature {
 }
 
 impl TempoSignature {
+    pub fn validate_version(&self, is_t1c: bool) -> Result<(), &'static str> {
+        if let Self::Keychain(signature) = self {
+            match (signature.version, is_t1c) {
+                (KeychainVersion::V1, true) => {
+                    return Err("legacy keychain signature is not allowed after T1C")
+                }
+                (KeychainVersion::V2, false) => {
+                    return Err("V2 keychain signature is not active before T1C")
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn recover_signer(&self, hash: &B256) -> Result<Address, &'static str> {
+        match self {
+            Self::Primitive(signature) => signature.recover_signer(hash),
+            Self::Keychain(signature) => {
+                let hash = match signature.version {
+                    KeychainVersion::V1 => *hash,
+                    KeychainVersion::V2 => {
+                        KeychainSignature::signing_hash(*hash, signature.user_address)
+                    }
+                };
+                signature.signature.recover_signer(&hash)?;
+                Ok(signature.user_address)
+            }
+        }
+    }
+
     /// Parses a primitive or V1/V2 keychain signature from its transaction wire bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
         if data.is_empty() {

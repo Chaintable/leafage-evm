@@ -102,7 +102,9 @@ fn resolve_non_creditable_slots<DB: Database>(
             (
                 fields.fee_payer.unwrap_or(caller),
                 fields.fee_token,
-                fields.is_keychain.then_some(fields.key_id).flatten(),
+                (fields.is_keychain && fields.fee_payer.unwrap_or(caller) == caller)
+                    .then_some(fields.key_id)
+                    .flatten(),
             )
         })
         .unwrap_or((caller, None, None));
@@ -780,6 +782,61 @@ mod tests {
             to: TxKind::Call(Address::with_last_byte(to_byte)),
             value: revm::primitives::U256::ZERO,
             input: Bytes::copy_from_slice(data),
+        }
+    }
+
+    #[test]
+    fn review_sponsored_keychain_credit_exclusions_follow_the_payer() {
+        use crate::tempo::{
+            precompile::{
+                account_keychain::AccountKeychain, storage_credits::is_non_creditable_slot,
+                storage_types::StorageKey, ACCOUNT_KEYCHAIN_ADDRESS, DEFAULT_FEE_TOKEN,
+            },
+            tx::TempoTxFields,
+        };
+        use revm::primitives::U256;
+        let caller = Address::repeat_byte(0x11);
+        let sponsor = Address::repeat_byte(0x22);
+        let key = Address::repeat_byte(0x33);
+        for (timestamp, sponsored) in [
+            (1_783_605_599, true),
+            (1_783_605_600, false),
+            (1_783_605_600, true),
+        ] {
+            let mut evm = TempoEvm::new(
+                make_env_aa(timestamp),
+                EmptyDB::default(),
+                NoOpInspector,
+                false,
+            );
+            evm.inner.ctx.tx.base.caller = caller;
+            evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+                is_keychain: true,
+                key_id: Some(key),
+                fee_payer: sponsored.then_some(sponsor),
+                ..Default::default()
+            });
+            let exclusions = resolve_non_creditable_slots(&mut evm.inner.ctx);
+            let active = timestamp >= 1_783_605_600;
+            with_non_creditable_slots(&exclusions, || {
+                for owner in [caller, sponsor] {
+                    assert_eq!(
+                        is_non_creditable_slot(
+                            DEFAULT_FEE_TOKEN,
+                            owner.mapping_slot(U256::from(9))
+                        ),
+                        active && owner == if sponsored { sponsor } else { caller },
+                    );
+                    let limit_key = AccountKeychain::spending_limit_key(owner, key);
+                    let slot = AccountKeychain::new().spending_limits[limit_key][DEFAULT_FEE_TOKEN]
+                        .remaining
+                        .slot();
+                    assert_eq!(
+                        is_non_creditable_slot(ACCOUNT_KEYCHAIN_ADDRESS, slot),
+                        active && !sponsored && owner == caller
+                    );
+                }
+            });
         }
     }
 

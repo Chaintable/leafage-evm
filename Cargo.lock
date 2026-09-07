@@ -4933,6 +4933,7 @@ dependencies = [
  "http-body 1.0.1",
  "hyper 1.6.0",
  "jsonrpsee",
+ "k256",
  "leafage-evm-chains",
  "leafage-evm-storage",
  "leafage-evm-types",

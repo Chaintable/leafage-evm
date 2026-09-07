@@ -61,6 +61,39 @@ where
     TempoCallExtension::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_signature_type<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        if !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "secp256k1" | "p256" | "webauthn"
+        ) {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported signature type: {value}"
+            )));
+        }
+    }
+    Ok(value)
+}
+
+mod nonzero_quantity_opt {
+    pub use alloy::serde::quantity::opt::serialize;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = alloy::serde::quantity::opt::deserialize(deserializer)?;
+        if value == Some(0) {
+            return Err(serde::de::Error::custom("expected non-zero quantity"));
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoCallExtension {
@@ -70,7 +103,11 @@ pub struct TempoCallExtension {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce_key: Option<U256>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_signature_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub key_type: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,14 +137,14 @@ pub struct TempoCallExtension {
 
     #[serde(
         default,
-        with = "alloy::serde::quantity::opt",
+        with = "nonzero_quantity_opt",
         skip_serializing_if = "Option::is_none"
     )]
     pub valid_after: Option<u64>,
 
     #[serde(
         default,
-        with = "alloy::serde::quantity::opt",
+        with = "nonzero_quantity_opt",
         skip_serializing_if = "Option::is_none"
     )]
     pub valid_before: Option<u64>,
@@ -122,6 +159,7 @@ pub struct TempoKeyAuthGasInfo {
         default,
         rename = "keyType",
         alias = "sigType",
+        deserialize_with = "deserialize_signature_type",
         skip_serializing_if = "Option::is_none"
     )]
     pub sig_type: Option<String>,
@@ -137,7 +175,11 @@ pub struct TempoKeyAuthGasInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<Address>,
 
-    #[serde(default, with = "alloy::serde::quantity::opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "nonzero_quantity_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expiry: Option<u64>,
 
     /// `None` means unlimited spending; `Some([])` denies all spending.
@@ -209,11 +251,24 @@ pub struct TempoWebAuthnSignatureInfo {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoAuthGasInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_signature_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sig_type: Option<String>,
 
-    #[serde(default)]
-    pub nonce: u64,
+    #[serde(
+        default,
+        with = "alloy::serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub nonce: Option<u64>,
+
+    /// Parsed as the chains-layer TempoSignature by the Tempo RPC adapter.
+    /// Kept here as JSON to avoid a types -> chains dependency cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<serde_json::Value>,
 
     #[serde(default)]
     pub is_keychain: bool,
@@ -244,6 +299,37 @@ impl DerefMut for CallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_zero_validity_and_unknown_signature_types_are_rejected() {
+        for field in ["validAfter", "validBefore"] {
+            for zero in [serde_json::json!(0), serde_json::json!("0x0")] {
+                assert!(
+                    serde_json::from_value::<CallRequest>(serde_json::json!({field: zero}))
+                        .is_err(),
+                    "{field} must be non-zero"
+                );
+            }
+        }
+        for request in [
+            serde_json::json!({"keyType":"garbage"}),
+            serde_json::json!({"keyAuthorization":{"keyType":"garbage"}}),
+            serde_json::json!({"aaAuthorizationList":[{"sigType":"garbage"}]}),
+            serde_json::json!({"keyAuthorization":{"expiry":"0x0"}}),
+            serde_json::json!({"keyAuthorization":{"expiry":0}}),
+        ] {
+            assert!(
+                serde_json::from_value::<CallRequest>(request.clone()).is_err(),
+                "{request}"
+            );
+        }
+        for key_type in ["secp256k1", "p256", "webAuthn", "P256"] {
+            assert!(serde_json::from_value::<CallRequest>(
+                serde_json::json!({"keyType":key_type,"validAfter":null})
+            )
+            .is_ok());
+        }
+    }
 
     #[test]
     fn review_tempo_quantity_and_invalid_field_deserialization() {
@@ -378,7 +464,7 @@ mod tests {
         assert_eq!(info.address, Some(Address::with_last_byte(0x02)));
         assert_eq!(info.chain_id, Some(U256::from(0x1077)));
         assert_eq!(info.sig_type, Some("p256".to_string()));
-        assert_eq!(info.nonce, 5);
+        assert_eq!(info.nonce, Some(5));
     }
 
     /// TempoKeyAuthGasInfo deserialization.

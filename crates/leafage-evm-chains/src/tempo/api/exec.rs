@@ -265,9 +265,18 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 ));
             }
 
-            // Note: keychain version, subblock, and priority fee validations are skipped —
-            // leafage eth_call mode has no real signatures, no subblock txs,
-            // and disable_base_fee=true. These checks are writer-only concerns.
+            for authorization in fields
+                .auth_list
+                .iter()
+                .filter_map(|auth| auth.signed_authorization.as_ref())
+            {
+                authorization
+                    .signature
+                    .validate_version(evm.ctx().cfg.spec.is_t1c())
+                    .map_err(|error| EVMError::Custom(error.into()))?;
+            }
+            // Outer signatures are mocked for RPC simulation; there are no
+            // subblock transactions, and disable_base_fee=true.
         }
 
         Ok(())
@@ -416,16 +425,16 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     /// T1+: no refund (matching writer behavior).
     #[inline]
     fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
-        let has_aa_delegations = evm
+        let has_aa_authorizations = evm
             .ctx()
             .tx
             .tempo_fields
             .as_ref()
-            .map(|f| f.auth_list.iter().any(|a| a.authority.is_some() && a.delegate.is_some()))
+            .map(|f| !f.auth_list.is_empty())
             .unwrap_or(false);
 
-        if !has_aa_delegations {
-            // No AA delegation entries — use default EIP-7702 path (handles type 0x04).
+        if !has_aa_authorizations {
+            // No AA authorization list — use the default path (handles type 0x04).
             return MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
                 .apply_eip7702_auth_list(evm);
         }
@@ -440,6 +449,11 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .auth_list
             .iter()
             .filter_map(|auth| {
+                // Tempo rejects keychain delegations from T0, but still charges
+                // their signature and authorization gas.
+                if evm.ctx().cfg.spec.is_t0() && auth.is_keychain {
+                    return None;
+                }
                 let authority = auth.authority?;
                 let delegate = auth.delegate?;
                 let chain_id = auth.chain_id.unwrap_or(U256::from(evm.ctx().cfg.chain_id));
@@ -1755,7 +1769,24 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
         auth_list.len() as u64 * gas_params.tx_eip7702_per_empty_account_cost();
 
     for auth in auth_list {
-        let auth_sig_gas = primitive_sig_gas(auth.sig_type, 0);
+        let auth_sig_gas = if let Some(signed) = &auth.signed_authorization {
+            use crate::tempo::fee_payer::{PrimitiveSignature, TempoSignature};
+            let primitive = match &signed.signature {
+                TempoSignature::Primitive(signature) => signature,
+                TempoSignature::Keychain(signature) => &signature.signature,
+            };
+            match primitive {
+                PrimitiveSignature::Secp256k1(_) => 0,
+                PrimitiveSignature::P256(_) => P256_VERIFY_GAS,
+                PrimitiveSignature::WebAuthn(signature) => {
+                    P256_VERIFY_GAS
+                        + get_tokens_in_calldata_istanbul(&signature.webauthn_data)
+                            * gas_params_tx_token_cost()
+                }
+            }
+        } else {
+            primitive_sig_gas(auth.sig_type, 0)
+        };
         gas.initial_gas += if auth.is_keychain {
             auth_sig_gas + KEYCHAIN_VALIDATION_GAS
         } else {

@@ -5,7 +5,7 @@ use revm::{
     primitives::{Address, Bytes, TxKind, B256, U256},
 };
 
-use crate::tempo::fee_payer::SignedKeyAuthorization;
+use crate::tempo::fee_payer::{SignedKeyAuthorization, TempoSignedAuthorization};
 
 /// Non-zero replay context used by Tempo's official RPC simulation path.
 pub const RPC_SIMULATION_UNIQUE_TX_IDENTIFIER: B256 =
@@ -30,12 +30,13 @@ pub enum TempoSigType {
 }
 
 impl TempoSigType {
-    /// Parse from string (case-insensitive). Returns Secp256k1 for unknown values.
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "p256" => Self::P256,
-            "webauthn" => Self::WebAuthn,
-            _ => Self::Secp256k1,
+    /// Parse a supported signature type, preserving the legacy case aliases.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "secp256k1" => Ok(Self::Secp256k1),
+            "p256" => Ok(Self::P256),
+            "webauthn" => Ok(Self::WebAuthn),
+            _ => Err(format!("unsupported signature type: {s}")),
         }
     }
 }
@@ -88,6 +89,8 @@ pub struct TempoKeyAuthGas {
 /// Per-authorization gas info with optional EIP-7702 delegation data.
 #[derive(Clone, Debug, Default)]
 pub struct TempoAuthGas {
+    /// Full signed input; signature-derived fields take precedence over legacy hints.
+    pub signed_authorization: Option<TempoSignedAuthorization>,
     /// Signature type of this authorization.
     pub sig_type: TempoSigType,
     /// Nonce (0 incurs TIP-1000 account creation cost).
