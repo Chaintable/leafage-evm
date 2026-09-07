@@ -1,4 +1,5 @@
 use crate::bundle::{bundle_end, s3_read_bundle};
+use crate::s3::S3Reader;
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
     s3_get_block_info_and_diff_by_number,
@@ -6,7 +7,6 @@ use crate::utils::{
     KafkaS3Config,
 };
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
@@ -43,7 +43,7 @@ pub struct Updater<Tree> {
     rpc_client: Option<HttpClient>,
     kafka_s3_cfg: KafkaS3Config,
     consumer: StreamConsumer,
-    s3_client: Client,
+    s3_client: S3Reader,
     tree: Tree,
     max_diff_depth: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
@@ -94,7 +94,10 @@ where
             .create()?;
 
         let s3_config = aws_config::load_from_env().await;
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+        let s3_client = S3Reader::new(
+            aws_sdk_s3::Client::new(&s3_config),
+            kafka_s3_cfg.s3_read_timeout_secs,
+        );
         let read_from_bundle = !kafka_s3_cfg.bundle_bucket_name.is_empty();
 
         Ok(Self {
@@ -328,7 +331,7 @@ where
         {
             let current_bundle_end = bundle_end(next_block_number).min(end_block_number);
             let last_bundle_block = s3_read_bundle(
-                &self.s3_client,
+                self.s3_client.client(),
                 &self.kafka_s3_cfg.bundle_bucket_name,
                 &self.kafka_s3_cfg.s3_chain_id,
                 &self.kafka_s3_cfg.version,

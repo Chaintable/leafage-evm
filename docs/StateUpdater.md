@@ -148,6 +148,7 @@ Kafka + S3 config file (`--kafka-s3-config`):
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
   "bundle_bucket_name": "compacted-state-diffs-bucket",
+  "s3_read_timeout_secs": 60,
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
@@ -161,6 +162,7 @@ Kafka + S3 config file (`--kafka-s3-config`):
 | `brokers` | Kafka broker addresses |
 | `partition` | Kafka partition to consume |
 | `bucket_name` | S3 bucket for state diffs |
+| `s3_read_timeout_secs` | Optional positive integer seconds (default 60) for each per-object GET including SDK retries/body, and LIST; restart to apply. Bundle range downloads are excluded. |
 | `bundle_bucket_name` | Optional S3 bucket for compacted Header and StateDiff bundles; empty disables bundle reads |
 | `outer_bucket_name` | S3 bucket for block info |
 | `offset_dir` | Directory to persist Kafka offset |

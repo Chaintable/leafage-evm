@@ -1,6 +1,6 @@
+use crate::s3::S3Reader;
 use crate::utils::{s3_get_block_transactions_by_number, KafkaS3Config};
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{ApiBuilder, TokenCollector};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrite};
@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 pub struct Warmup<Tree> {
     rpc_client: Option<HttpClient>,
-    s3_client: Client,
+    s3_client: S3Reader,
     kafka_s3_cfg: KafkaS3Config,
     tree: Tree,
     warmup_blocks: usize,
@@ -42,7 +42,10 @@ where
             rpc_client = Some(client);
         }
         let s3_config = aws_config::load_from_env().await;
-        let s3_client = Client::new(&s3_config);
+        let s3_client = S3Reader::new(
+            aws_sdk_s3::Client::new(&s3_config),
+            kafka_s3_cfg.s3_read_timeout_secs,
+        );
         Ok(Self {
             rpc_client,
             s3_client,
@@ -114,7 +117,7 @@ where
         }
         if self.warmup_tokens > 0 {
             let owner = Address::random();
-            let tokens:Vec<_> = self
+            let tokens: Vec<_> = self
                 .token_collector
                 .get_all()
                 .await

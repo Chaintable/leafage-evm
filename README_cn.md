@@ -166,12 +166,15 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
   "partition": 0,
   "bucket_name": "state-diffs-bucket",
   "bundle_bucket_name": "compacted-state-diffs-bucket",
+  "s3_read_timeout_secs": 60,
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
   "version": "v1"
 }
 ```
+
+`s3_read_timeout_secs` 为可选正整数秒数，默认 60；限制每次逐对象 S3 GET（含 SDK 重试及 body 读取）和 LIST 的总耗时，修改后重启生效。bundle 分段下载使用独立读取路径，不受此配置控制。`archive-init` 使用同名参数 `--s3-read-timeout-secs`。
 
 `bundle_bucket_name` 为可选项；省略或留空时继续使用原有的逐块 S3 读取逻辑。
 
