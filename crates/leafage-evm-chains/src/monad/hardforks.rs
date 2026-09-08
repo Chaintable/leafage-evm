@@ -2,6 +2,7 @@
 //! feature flags derived from it (`vm/evm/traits.hpp` `MonadTraits`).
 
 use crate::monad::gas::apply_gas_rules;
+use crate::monad::TFM_MAX_TX_GAS_LIMIT;
 use alloy_hardforks::{hardfork, ForkCondition};
 use leafage_evm_types::CfgEnv;
 use revm::primitives::hardfork::SpecId;
@@ -84,6 +85,12 @@ impl MonadHardfork {
         // opcode limit stayed at 48 KiB (`max_initcode_size`, enforced by the
         // CREATE wrapper).
         cfg.limit_contract_initcode_size = Some(2 * self.max_code_size());
+        // Monad never adopted EIP-7825 (revm derives the 2^24 cap from Osaka
+        // when the field is unset); the per-transaction limit is the
+        // consensus TFM limit.
+        if cfg.tx_gas_limit_cap.is_none() {
+            cfg.tx_gas_limit_cap = Some(TFM_MAX_TX_GAS_LIMIT);
+        }
         apply_gas_rules(self, cfg);
     }
 
@@ -219,6 +226,7 @@ impl From<MonadHardfork> for SpecId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::context::Cfg;
 
     #[test]
     fn resolves_hardfork_from_timestamp() {
@@ -293,6 +301,12 @@ mod tests {
         assert_eq!(cfg.limit_contract_code_size, Some(128 * 1024));
         assert_eq!(cfg.limit_contract_initcode_size, Some(256 * 1024));
         assert_eq!(cfg.spec, MonadHardfork::MonadTen);
+        // MONAD_NINE+ maps to Osaka but EIP-7825 (2^24) does not apply
+        assert_eq!(cfg.tx_gas_limit_cap(), TFM_MAX_TX_GAS_LIMIT);
+        let mut cfg = CfgEnv::new_with_spec(MonadHardfork::MonadTen);
+        cfg.tx_gas_limit_cap = Some(1_000_000);
+        MonadHardfork::MonadTen.apply_cfg(&mut cfg);
+        assert_eq!(cfg.tx_gas_limit_cap(), 1_000_000, "explicit cap is kept");
 
         let mut cfg = CfgEnv::new_with_spec(MonadHardfork::MonadThree);
         MonadHardfork::MonadThree.apply_cfg(&mut cfg);

@@ -464,6 +464,156 @@ fn reserve_balance_violation_reverts_transaction() {
     assert_eq!(out.state[&RECIPIENT].info.balance, mon(2));
 }
 
+/// `execute_create_message`: the sender nonce is bumped before the message
+/// frame is pushed, so a reserve balance violation of a top level CREATE
+/// rejects the frame but keeps the nonce increment.
+#[test]
+fn reserve_violation_of_top_level_create_keeps_sender_nonce() {
+    let mut db = CacheDB::new(EmptyDB::default());
+    let mut caller = account(mon(20), Bytecode::new_eip7702(DELEGATE));
+    caller.nonce = 0;
+    db.insert_account_info(CALLER, caller);
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+    );
+    let tx = TxEnv {
+        caller: CALLER,
+        gas_limit: GAS_LIMIT,
+        kind: TxKind::Create,
+        data: Bytes::from_static(&[0x00]),
+        value: mon(15),
+        chain_id: Some(crate::monad::MONAD_MAINNET_CHAIN_ID),
+        ..Default::default()
+    };
+    let out = run_with_state(MonadHardfork::MonadTen, db, tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    let caller = &out.state[&CALLER].info;
+    assert_eq!(caller.nonce, 1, "nonce consumed by the rejected CREATE");
+    assert_eq!(caller.balance, mon(20), "value transfer reverted");
+    let created = CALLER.create(0);
+    assert!(out
+        .state
+        .get(&created)
+        .is_none_or(|a| a.info.balance.is_zero() && a.info.is_empty_code_hash()));
+}
+
+/// `execute_call_message`: `revert_transaction` runs before `post_call`
+/// rejects a reverted frame, so a violation caused by a successful inner
+/// call is reported even when the top level message reverts afterwards.
+#[test]
+fn reserve_violation_is_detected_before_top_level_revert() {
+    const REVERTER: Address = address!("00000000000000000000000000000000000000f0");
+    // CALL CONTRACT (delegated EOA forwarding 5 of its 7 MON), then REVERT
+    let mut code = send_value_code(CONTRACT, 0);
+    code.pop(); // STOP
+    code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+    let mut db = delegated_recipient_db(five_mon_wei());
+    db.insert_account_info(
+        REVERTER,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from(code))),
+    );
+    let out = run_with_state(MonadHardfork::MonadTen, db, call_tx(REVERTER, &[]));
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.state[&CONTRACT].info.balance, mon(7));
+}
+
+/// The node checks the reserve after `deploy_contract_code`: from MONAD_EIGHT
+/// (recent code hash) a pre-funded address that becomes a contract in the
+/// transaction is not an EOA any more, before that the original (empty) code
+/// hash makes it one.
+#[test]
+fn created_contract_is_not_subject_to_reserve_from_monad_eight() {
+    let created = CALLER.create(0);
+    // init code: send the 5 MON pre-fund to RECIPIENT, return one byte of code
+    let mut init = send_value_code(RECIPIENT, five_mon_wei());
+    init.pop(); // STOP
+    init.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0xf3]);
+    let mut db = db_with_code(&[]);
+    db.insert_account_info(
+        created,
+        AccountInfo {
+            balance: mon(5),
+            ..Default::default()
+        },
+    );
+    let tx = TxEnv {
+        caller: CALLER,
+        gas_limit: GAS_LIMIT,
+        kind: TxKind::Create,
+        data: Bytes::from(init),
+        chain_id: Some(crate::monad::MONAD_MAINNET_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let out = run_with_state(MonadHardfork::MonadTen, db.clone(), tx.clone());
+    assert!(out.result.is_success(), "{:?}", out.result);
+    assert_eq!(out.state[&RECIPIENT].info.balance, mon(5));
+    assert_eq!(out.state[&created].info.balance, U256::ZERO);
+
+    let out = run_with_state(MonadHardfork::MonadSeven, db, tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+}
+
+/// The inspected execution path (`inspect_run_exec_loop`,
+/// `inspect_frame_run`) applies the rule too, for a running frame and for a
+/// top level message that finishes during its init.
+#[test]
+fn reserve_violation_is_reported_under_inspection() {
+    use revm::InspectEvm;
+
+    let inspect = |db: CacheDB<EmptyDB>, tx: TxEnv| {
+        let hardfork = MonadHardfork::MonadTen;
+        let mut cfg = CfgEnv::new_with_spec(hardfork);
+        hardfork.apply_cfg(&mut cfg);
+        cfg.chain_id = crate::monad::MONAD_MAINNET_CHAIN_ID;
+        cfg.disable_nonce_check = true;
+        let mut evm = MonadEvm::new(EvmEnv::new(cfg, BlockEnv::default()), db, NoOpInspector {});
+        evm.inspect_tx(tx).expect("transaction executes")
+    };
+
+    // running frame: delegated EOA forwards 5 of its 7 MON
+    let mut tx = call_tx(CONTRACT, &[]);
+    tx.value = mon(3);
+    let out = inspect(delegated_recipient_db(five_mon_wei()), tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.state[&CONTRACT].info.balance, mon(7));
+
+    // no frame: delegated sender transfers 95 of its 100 MON to an EOA
+    let mut tx = call_tx(RECIPIENT, &[]);
+    tx.value = mon(95);
+    let mut db = db_with_code(&[]);
+    db.insert_account_info(CALLER, account(mon(100), Bytecode::new_eip7702(DELEGATE)));
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+    );
+    let out = inspect(db, tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert!(out
+        .state
+        .get(&RECIPIENT)
+        .is_none_or(|a| a.info.balance.is_zero()));
+}
+
 #[test]
 fn reserve_balance_rule_is_inactive_before_monad_four() {
     let mut tx = call_tx(CONTRACT, &[]);

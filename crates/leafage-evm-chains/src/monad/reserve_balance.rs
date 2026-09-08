@@ -8,7 +8,9 @@
 //! authorities of the transaction. A violation reverts the whole transaction
 //! (`EVMC_MONAD_RESERVE_BALANCE_VIOLATION`, all gas consumed).
 //!
-//! The node evaluates the rule at the end of the top level message, the
+//! The node evaluates the rule on the result of the top level message,
+//! *before* the message frame is accepted or rejected
+//! (`execute_message.cpp`, [`apply_reserve_balance_rule`]); the
 //! `dippedIntoReserve()` precompile reports the same predicate at the time of
 //! the call. Both share [`dipped_into_reserve`].
 //!
@@ -24,7 +26,9 @@ use revm::bytecode::Bytecode;
 use revm::context::{ContextTr, JournalTr, Transaction};
 use revm::context_interface::transaction::AuthorizationTr;
 use revm::context_interface::Block;
-use revm::primitives::{Address, B256, U256};
+use revm::handler::{EthFrame, FrameData};
+use revm::interpreter::{Gas, InstructionResult, InterpreterAction, InterpreterResult};
+use revm::primitives::{Address, Bytes, B256, U256};
 
 /// `monad_default_max_reserve_balance_mon`: 10 MON.
 pub(crate) const MAX_RESERVE_BALANCE: U256 = U256::from_limbs([MON.as_limbs()[0] * 10, 0, 0, 0]);
@@ -42,8 +46,13 @@ fn is_empty_code_hash(hash: B256) -> bool {
 
 /// `dipped_into_reserve`: does the current state violate the reserve balance
 /// of any EOA touched by the transaction?
+///
+/// `pending_contract` is the address of a top level CREATE whose init code
+/// succeeded: the node runs the check after `deploy_contract_code`, so from
+/// MONAD_EIGHT (recent code hash) that account is a contract, not an EOA.
 pub(crate) fn dipped_into_reserve<DB: Database>(
     ctx: &mut MonadContext<DB>,
+    pending_contract: Option<Address>,
 ) -> Result<bool, DB::Error> {
     let hardfork = ctx.cfg().spec();
     let basefee = ctx.block().basefee() as u128;
@@ -65,7 +74,9 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
         .filter(|(address, account)| {
             // the staking contract balance may decrease (withdrawals) and it
             // never sends transactions
-            **address != STAKING_CONTRACT_ADDRESS && account.transaction_id == transaction_id
+            **address != STAKING_CONTRACT_ADDRESS
+                && account.transaction_id == transaction_id
+                && !(use_recent_code && Some(**address) == pending_contract)
         })
         .filter_map(|(address, account)| {
             let code_hash = if use_recent_code {
@@ -143,6 +154,50 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
 
 fn is_delegation_designator(code: &Bytecode) -> bool {
     code.eip7702_address().is_some()
+}
+
+/// `execute_message.cpp` depth 0: `revert_transaction` runs on the result of
+/// the top level message before `post_call` accepts or rejects the frame.
+/// A violation turns the result into `EVMC_MONAD_RESERVE_BALANCE_VIOLATION`
+/// with all gas consumed; the frame is then rejected like any other failure,
+/// which keeps everything recorded outside the frame (sender nonce of a
+/// CREATE, EIP-7702 authorizations, gas payment).
+///
+/// Returns whether the rule was violated.
+pub(crate) fn apply_reserve_balance_rule<DB: Database>(
+    ctx: &mut MonadContext<DB>,
+    frame: &EthFrame,
+    action: &mut InterpreterAction,
+) -> Result<bool, DB::Error> {
+    if frame.depth != 0 || !ctx.cfg().spec().is_reserve_balance_check_enabled() {
+        return Ok(false);
+    }
+    let InterpreterAction::Return(result) = action else {
+        return Ok(false);
+    };
+    let pending_contract = match &frame.data {
+        FrameData::Create(create) if result.result.is_ok() && !result.output.is_empty() => {
+            Some(create.created_address)
+        }
+        _ => None,
+    };
+    reject_on_reserve_violation(ctx, pending_contract, result)
+}
+
+/// Turns `result` into the reserve balance violation outcome (failure, all
+/// gas consumed, no output) when [`dipped_into_reserve`] holds.
+pub(crate) fn reject_on_reserve_violation<DB: Database>(
+    ctx: &mut MonadContext<DB>,
+    pending_contract: Option<Address>,
+    result: &mut InterpreterResult,
+) -> Result<bool, DB::Error> {
+    if !dipped_into_reserve(ctx, pending_contract)? {
+        return Ok(false);
+    }
+    result.result = InstructionResult::OutOfFunds;
+    result.gas = Gas::new_spent(result.gas.limit());
+    result.output = Bytes::new();
+    Ok(true)
 }
 
 #[cfg(test)]
