@@ -9,7 +9,6 @@ mod initializer;
 mod register;
 mod rewind;
 mod runner;
-mod s3;
 mod standalone;
 mod updater;
 mod utils;

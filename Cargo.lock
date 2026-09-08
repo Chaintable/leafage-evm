@@ -4815,7 +4815,6 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
- "bytes 1.10.1",
  "clap",
  "etcd-client",
  "flate2",

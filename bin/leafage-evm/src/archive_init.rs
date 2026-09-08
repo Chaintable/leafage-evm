@@ -1,10 +1,10 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
-use crate::s3::S3Reader;
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
     s3_get_block_info_and_diff_by_number_with_parent_state_root,
 };
 use anyhow::Result;
+use aws_sdk_s3::Client;
 use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -89,10 +89,6 @@ pub struct Command {
     /// S3 chain ID
     #[arg(long)]
     s3_chain_id: String,
-
-    /// Total timeout in seconds for each per-object S3 read (including body).
-    #[arg(long, default_value = "60")]
-    s3_read_timeout_secs: std::num::NonZeroU64,
 
     /// S3 version (optional)
     #[arg(long, default_value = "")]
@@ -879,10 +875,7 @@ impl Command {
 
         // Initialize S3 client
         let s3_config = aws_config::load_from_env().await;
-        let s3_client = S3Reader::new(
-            aws_sdk_s3::Client::new(&s3_config),
-            self.s3_read_timeout_secs,
-        );
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
         // Initialize RPC client
         let rpc_client = HttpClientBuilder::default().build(&self.rpc_addr)?;
@@ -1321,7 +1314,7 @@ impl Command {
     async fn fetch_blocks(
         tx: mpsc::Sender<EncodedBlockData>,
         rpc_client: Option<HttpClient>,
-        s3_client: S3Reader,
+        s3_client: Client,
         bucket: String,
         bundle_bucket: String,
         bundle_range_size_mib: u32,
@@ -1339,7 +1332,7 @@ impl Command {
         while read_bundle && next_block <= end_block {
             let current_bundle_end = bundle_end(next_block).min(end_block);
             let last_bundle_block = s3_read_bundle(
-                s3_client.client(),
+                &s3_client,
                 &bundle_bucket,
                 &chain_id,
                 &version,
@@ -1447,7 +1440,7 @@ impl Command {
     #[allow(clippy::too_many_arguments)]
     async fn fetch_block_with_retry(
         rpc_client: Option<HttpClient>,
-        s3_client: S3Reader,
+        s3_client: Client,
         bucket: String,
         outer_bucket: String,
         chain_id: String,
@@ -1500,7 +1493,7 @@ impl Command {
     #[allow(clippy::too_many_arguments)]
     async fn fetch_block(
         rpc_client: Option<HttpClient>,
-        s3_client: S3Reader,
+        s3_client: Client,
         bucket: String,
         outer_bucket: String,
         chain_id: String,
@@ -1518,6 +1511,7 @@ impl Command {
                 &chain_id,
                 &version,
                 block_num,
+                Duration::from_secs(60),
             )
             .await?
         } else if let Some(parent_state_root) = parent_state_root {
@@ -1530,6 +1524,7 @@ impl Command {
                 &version,
                 block_num,
                 parent_state_root,
+                Duration::from_secs(60),
             )
             .await?
         } else {
@@ -1541,6 +1536,7 @@ impl Command {
                 &chain_id,
                 &version,
                 block_num,
+                Duration::from_secs(60),
             )
             .await?
         };

@@ -1,5 +1,4 @@
 use crate::bundle::{bundle_end, s3_read_bundle};
-use crate::s3::S3Reader;
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
     s3_get_block_info_and_diff_by_number,
@@ -7,6 +6,7 @@ use crate::utils::{
     KafkaS3Config,
 };
 use anyhow::{Context, Result};
+use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
@@ -43,7 +43,7 @@ pub struct Updater<Tree> {
     rpc_client: Option<HttpClient>,
     kafka_s3_cfg: KafkaS3Config,
     consumer: StreamConsumer,
-    s3_client: S3Reader,
+    s3_client: Client,
     tree: Tree,
     max_diff_depth: usize,
     hash_to_blockctx: Mutex<HashMap<H256, BlockContextWithOffset>>,
@@ -94,10 +94,7 @@ where
             .create()?;
 
         let s3_config = aws_config::load_from_env().await;
-        let s3_client = S3Reader::new(
-            aws_sdk_s3::Client::new(&s3_config),
-            kafka_s3_cfg.s3_read_timeout_secs,
-        );
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
         let read_from_bundle = !kafka_s3_cfg.bundle_bucket_name.is_empty();
 
         Ok(Self {
@@ -144,6 +141,7 @@ where
             &self.kafka_s3_cfg.s3_chain_id,
             &self.kafka_s3_cfg.version,
             block_hash,
+            Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get()),
         )
         .await
         .context(format!("s3 get block info failed, {block_hash}"))
@@ -165,6 +163,7 @@ where
         &self,
         messages: &Vec<BorrowedMessage<'_>>,
     ) -> Result<Vec<KafkaBlockContext>> {
+        let read_timeout = Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get());
         let mut msgs: Vec<(i64, KafkaBlockChangeNotification)> = vec![];
         let mut new_blocks = vec![];
         let mut get_block_info_join_set = JoinSet::new();
@@ -182,7 +181,15 @@ where
                 let version = self.kafka_s3_cfg.version.clone();
                 let hash = new_block.hash;
                 get_block_info_join_set.spawn(async move {
-                    s3_get_block_info(&client, &bucket_name, &s3_chain_id, &version, hash).await
+                    s3_get_block_info(
+                        &client,
+                        &bucket_name,
+                        &s3_chain_id,
+                        &version,
+                        hash,
+                        read_timeout,
+                    )
+                    .await
                 });
             }
             msgs.push((offset, block_change_notification));
@@ -224,9 +231,15 @@ where
                 let s3_chain_id = self.kafka_s3_cfg.s3_chain_id.clone();
                 let version = self.kafka_s3_cfg.version.clone();
                 get_block_diff_join_set.spawn(async move {
-                    let diff =
-                        s3_get_block_diff(&client, &bucket_name, &s3_chain_id, &version, diff_key)
-                            .await?;
+                    let diff = s3_get_block_diff(
+                        &client,
+                        &bucket_name,
+                        &s3_chain_id,
+                        &version,
+                        diff_key,
+                        read_timeout,
+                    )
+                    .await?;
                     anyhow::Ok((block_hash, diff))
                 });
             }
@@ -274,6 +287,7 @@ where
         start_block_number: u64,
         end_block_number: u64,
     ) -> Result<()> {
+        let read_timeout = Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get());
         let mut get_block_info_diff_join_set = JoinSet::new();
         for block_number in start_block_number..=end_block_number {
             let rpc_client = self.rpc_client.clone();
@@ -293,6 +307,7 @@ where
                         &s3_chain_id,
                         &version,
                         block_number,
+                        read_timeout,
                     )
                     .await,
                 )
@@ -331,7 +346,7 @@ where
         {
             let current_bundle_end = bundle_end(next_block_number).min(end_block_number);
             let last_bundle_block = s3_read_bundle(
-                self.s3_client.client(),
+                &self.s3_client,
                 &self.kafka_s3_cfg.bundle_bucket_name,
                 &self.kafka_s3_cfg.s3_chain_id,
                 &self.kafka_s3_cfg.version,
@@ -378,6 +393,7 @@ where
                     &self.kafka_s3_cfg.version,
                     next_block_number,
                     parent_state_root,
+                    Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get()),
                 )
                 .await?;
             info!(target:"updater", "update first per-block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
@@ -473,6 +489,7 @@ where
                     &self.kafka_s3_cfg.s3_chain_id,
                     &self.kafka_s3_cfg.version,
                     parent_hash,
+                    Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get()),
                 )
                 .await?;
                 if block_info.header.number <= by_number_target {

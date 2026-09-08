@@ -14,7 +14,6 @@ leafage-evm-types.workspace = true
 leafage-evm-rpc.workspace = true
 leafage-evm-chains.workspace = true
 anyhow.workspace = true
-bytes.workspace = true
 jsonrpsee.workspace = true
 tokio.workspace = true
 tracing.workspace = true

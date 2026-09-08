@@ -1,6 +1,6 @@
-use crate::s3::S3Reader;
 use alloy_rlp::Decodable;
 use anyhow::{Context, Result};
+use aws_sdk_s3::{primitives::AggregatedBytes, Client};
 use flate2::read;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_rpc::EthApiClient;
@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::LazyLock;
 use std::sync::RwLock;
+use std::{future::Future, time::Duration};
 use std::{io::Read, str::FromStr};
 use tracing::{debug, trace};
 
@@ -124,22 +125,51 @@ fn state_diff_key(s3_chain_id: &str, block_info: &BlockInfo) -> H256 {
     }
 }
 
+async fn s3_read_with_timeout<T>(
+    read_timeout: Duration,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    // Own the future so a timeout drops the request, rather than detaching a task.
+    tokio::time::timeout(read_timeout, read)
+        .await
+        .with_context(|| format!("S3 read timed out (limit {read_timeout:?})"))?
+}
+
+async fn s3_get_bytes(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    read_timeout: Duration,
+) -> Result<AggregatedBytes> {
+    let mut stage = "send";
+    s3_read_with_timeout(read_timeout, async {
+        let object = client.get_object().bucket(bucket).key(key).send().await?;
+        stage = "body";
+        Ok(object.body.collect().await?)
+    })
+    .await
+    .with_context(|| format!("S3 GET s3://{bucket}/{key}, stage={stage}"))
+}
+
 /// Read one block's [`BlockStorageDiff`] source object from S3, addressed by
 /// `diff_key`: the block hash on block-hash-keyed chains, the state root
 /// everywhere else. See [`state_diff_keyed_by_block_hash`].
 pub async fn s3_get_block_diff(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     diff_key: H256,
+    read_timeout: Duration,
 ) -> Result<BlockStorageDiff> {
     let s3_key = if version.is_empty() {
         format!("{}/{}/stateDiff", s3_chain_id, diff_key)
     } else {
         format!("{}/{}/{}/stateDiff", s3_chain_id, version, diff_key)
     };
-    let bytes = s3_client.get_bytes(bucket_name, &s3_key).await?;
+    let bytes = s3_get_bytes(s3_client, bucket_name, &s3_key, read_timeout)
+        .await?
+        .into_bytes();
     let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
     // Correlate with the commit-side logs in StateDBWrapper::update_block via
     // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
@@ -175,11 +205,12 @@ pub async fn s3_get_block_diff(
 }
 
 pub async fn s3_get_block_info(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     block_hash: H256,
+    read_timeout: Duration,
 ) -> Result<BlockInfo> {
     if let Some(block) = S3_BLOCK_CACHE.read().unwrap().peek(&block_hash) {
         return Ok(block.clone());
@@ -189,7 +220,9 @@ pub async fn s3_get_block_info(
     } else {
         format!("{}/{}/{}/block", s3_chain_id, version, block_hash)
     };
-    let bytes = s3_client.get_bytes(bucket_name, &s3_key).await?;
+    let bytes = s3_get_bytes(s3_client, bucket_name, &s3_key, read_timeout)
+        .await?
+        .into_bytes();
     let mut gz = read::GzDecoder::new(&bytes[..]);
     let mut bytes = Vec::new();
     gz.read_to_end(&mut bytes)?;
@@ -202,18 +235,21 @@ pub async fn s3_get_block_info(
 }
 
 pub async fn s3_get_block_transactions(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     block_hash: H256,
+    read_timeout: Duration,
 ) -> Result<Vec<DebankTransaction>> {
     let s3_key = if version.is_empty() {
         format!("{}/{}", s3_chain_id, block_hash)
     } else {
         format!("{}/{}/{}", s3_chain_id, version, block_hash)
     };
-    let bytes = s3_client.get_bytes(bucket_name, &s3_key).await?;
+    let bytes = s3_get_bytes(s3_client, bucket_name, &s3_key, read_timeout)
+        .await?
+        .into_bytes();
     let mut gz = read::GzDecoder::new(&bytes[..]);
     let mut bytes = Vec::new();
     gz.read_to_end(&mut bytes)?;
@@ -226,11 +262,12 @@ pub async fn s3_get_block_transactions(
 
 pub async fn s3_get_block_transactions_by_number(
     rpc_client: &Option<HttpClient>,
-    s3_client: &S3Reader,
+    s3_client: &Client,
     outer_bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     number: u64,
+    read_timeout: Duration,
 ) -> Result<Vec<DebankTransaction>> {
     let transactions = match rpc_client {
         Some(rpc) => {
@@ -250,6 +287,7 @@ pub async fn s3_get_block_transactions_by_number(
                 s3_chain_id,
                 version,
                 block.header.hash,
+                read_timeout,
             )
             .await
             .context(format!("s3 get transactions failed, {}", block.header.hash))?
@@ -261,6 +299,7 @@ pub async fn s3_get_block_transactions_by_number(
                 s3_chain_id,
                 version,
                 number,
+                read_timeout,
             )
             .await?;
             s3_get_block_transactions(
@@ -269,6 +308,7 @@ pub async fn s3_get_block_transactions_by_number(
                 s3_chain_id,
                 version,
                 block_hash,
+                read_timeout,
             )
             .await
             .context(format!("s3 get transactions failed, {block_hash}"))?
@@ -278,11 +318,12 @@ pub async fn s3_get_block_transactions_by_number(
 }
 
 pub async fn s3_get_block_hash_by_number(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     number: u64,
+    read_timeout: Duration,
 ) -> Result<H256> {
     #[derive(Clone, Debug, Default, Deserialize, Serialize)]
     #[serde(rename_all = "snake_case")]
@@ -295,7 +336,16 @@ pub async fn s3_get_block_hash_by_number(
     } else {
         format!("{}/{}/{}/", s3_chain_id, version, number)
     };
-    let list_output = s3_client.list_objects(bucket_name, &prefix).await?;
+    let list_output = s3_read_with_timeout(read_timeout, async {
+        Ok(s3_client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix(&prefix)
+            .send()
+            .await?)
+    })
+    .await
+    .with_context(|| format!("S3 LIST s3://{bucket_name}/{prefix}"))?;
     // 只有一个对象，肯定没有fork，直接返回
     if list_output.contents().len() == 1 {
         let hash_str = list_output.contents()[0]
@@ -308,7 +358,9 @@ pub async fn s3_get_block_hash_by_number(
     }
     for object in list_output.contents() {
         if let Some(key) = object.key() {
-            let bytes = s3_client.get_bytes(bucket_name, key).await?;
+            let bytes = s3_get_bytes(s3_client, bucket_name, key, read_timeout)
+                .await?
+                .into_bytes();
             let mut gz = read::GzDecoder::new(&bytes[..]);
             let mut bytes = Vec::new();
             gz.read_to_end(&mut bytes)?;
@@ -332,12 +384,13 @@ pub async fn s3_get_block_hash_by_number(
 /// when available and falling back to the S3 outer-bucket number index.
 pub async fn s3_get_block_info_by_number(
     rpc_client: &Option<HttpClient>,
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     outer_bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     number: u64,
+    read_timeout: Duration,
 ) -> Result<BlockInfo> {
     match rpc_client {
         Some(rpc) => {
@@ -359,22 +412,31 @@ pub async fn s3_get_block_info_by_number(
                 s3_chain_id,
                 version,
                 number,
+                read_timeout,
             )
             .await?;
-            s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, block_hash)
-                .await
-                .context(format!("s3 get block info failed, {block_hash}"))
+            s3_get_block_info(
+                s3_client,
+                bucket_name,
+                s3_chain_id,
+                version,
+                block_hash,
+                read_timeout,
+            )
+            .await
+            .context(format!("s3 get block info failed, {block_hash}"))
         }
     }
 }
 
 /// Read the stateDiff object for an already-resolved [`BlockInfo`].
 async fn s3_fetch_block_diff(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     block_info: &BlockInfo,
+    read_timeout: Duration,
 ) -> Result<BlockStorageDiff> {
     s3_get_block_diff(
         s3_client,
@@ -382,6 +444,7 @@ async fn s3_fetch_block_diff(
         s3_chain_id,
         version,
         state_diff_key(s3_chain_id, block_info),
+        read_timeout,
     )
     .await
     .context(format!(
@@ -396,16 +459,25 @@ async fn s3_fetch_block_diff(
 /// the parent is fetched (by hash) and the state roots compared: an unchanged
 /// root yields an empty diff, otherwise the diff is read from S3.
 async fn s3_resolve_block_diff(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     block_info: &BlockInfo,
+    read_timeout: Duration,
 ) -> Result<BlockStorageDiff> {
     // Every block has its own object here, so there is nothing to infer from
     // the parent and no reason to read its Header.
     if state_diff_keyed_by_block_hash(s3_chain_id) {
-        return s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await;
+        return s3_fetch_block_diff(
+            s3_client,
+            bucket_name,
+            s3_chain_id,
+            version,
+            block_info,
+            read_timeout,
+        )
+        .await;
     }
     let parent_block_info = s3_get_block_info(
         s3_client,
@@ -413,6 +485,7 @@ async fn s3_resolve_block_diff(
         s3_chain_id,
         version,
         block_info.header.parent_hash,
+        read_timeout,
     )
     .await
     .context(format!(
@@ -426,23 +499,41 @@ async fn s3_resolve_block_diff(
         version,
         block_info,
         parent_block_info.header.state_root,
+        read_timeout,
     )
     .await
 }
 
 async fn s3_resolve_block_diff_with_parent_state_root(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     block_info: &BlockInfo,
     parent_state_root: H256,
+    read_timeout: Duration,
 ) -> Result<BlockStorageDiff> {
     if state_diff_keyed_by_block_hash(s3_chain_id) {
-        return s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await;
+        return s3_fetch_block_diff(
+            s3_client,
+            bucket_name,
+            s3_chain_id,
+            version,
+            block_info,
+            read_timeout,
+        )
+        .await;
     }
     if parent_state_root != block_info.header.state_root {
-        s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await
+        s3_fetch_block_diff(
+            s3_client,
+            bucket_name,
+            s3_chain_id,
+            version,
+            block_info,
+            read_timeout,
+        )
+        .await
     } else {
         Ok(BlockStorageDiff {
             hash: block_info.header.state_root,
@@ -454,12 +545,13 @@ async fn s3_resolve_block_diff_with_parent_state_root(
 
 pub async fn s3_get_block_info_and_diff_by_number(
     rpc_client: &Option<HttpClient>,
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     outer_bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     number: u64,
+    read_timeout: Duration,
 ) -> Result<(BlockInfo, BlockStorageDiff)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
@@ -469,11 +561,19 @@ pub async fn s3_get_block_info_and_diff_by_number(
         s3_chain_id,
         version,
         number,
+        read_timeout,
     )
     .await?;
 
-    let block_diff =
-        s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
+    let block_diff = s3_resolve_block_diff(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        &block_info,
+        read_timeout,
+    )
+    .await?;
     Ok((block_info, block_diff))
 }
 
@@ -483,13 +583,14 @@ pub async fn s3_get_block_info_and_diff_by_number(
 #[allow(clippy::too_many_arguments)]
 pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
     rpc_client: &Option<HttpClient>,
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     outer_bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     number: u64,
     parent_state_root: H256,
+    read_timeout: Duration,
 ) -> Result<(BlockInfo, BlockStorageDiff)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
@@ -499,6 +600,7 @@ pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
         s3_chain_id,
         version,
         number,
+        read_timeout,
     )
     .await?;
     let block_diff = s3_resolve_block_diff_with_parent_state_root(
@@ -508,6 +610,7 @@ pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
         version,
         &block_info,
         parent_state_root,
+        read_timeout,
     )
     .await?;
     Ok((block_info, block_diff))
@@ -519,26 +622,43 @@ pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
 /// Kafka, so a reorg near the tip cannot make the by-number index resolve a
 /// sibling on the wrong branch.
 pub async fn s3_get_block_info_and_diff_by_hash(
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     hash: H256,
+    read_timeout: Duration,
 ) -> Result<(BlockInfo, BlockStorageDiff)> {
-    let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, hash).await?;
-    let block_diff =
-        s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
+    let block_info = s3_get_block_info(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        hash,
+        read_timeout,
+    )
+    .await?;
+    let block_diff = s3_resolve_block_diff(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        &block_info,
+        read_timeout,
+    )
+    .await?;
     Ok((block_info, block_diff))
 }
 
 pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     rpc_client: &Option<HttpClient>,
-    s3_client: &S3Reader,
+    s3_client: &Client,
     bucket_name: &str,
     outer_bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
     number: u64,
+    read_timeout: Duration,
 ) -> Result<(BlockInfo, BlockStorageDiff)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
@@ -548,10 +668,18 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
         s3_chain_id,
         version,
         number,
+        read_timeout,
     )
     .await?;
-    let block_diff =
-        s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
+    let block_diff = s3_fetch_block_diff(
+        s3_client,
+        bucket_name,
+        s3_chain_id,
+        version,
+        &block_info,
+        read_timeout,
+    )
+    .await?;
     Ok((block_info, block_diff))
 }
 
@@ -600,6 +728,7 @@ mod tests {
         http::{Request, Response},
         Router,
     };
+    use futures::StreamExt;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -640,10 +769,40 @@ mod tests {
         State((body, requests)): State<DiffServerState>,
         request: Request<Body>,
     ) -> Response<Body> {
-        requests
-            .lock()
-            .unwrap()
-            .push(request.uri().path().to_owned());
+        let first = {
+            let mut requests = requests.lock().unwrap();
+            let path = request.uri().path().to_owned();
+            let first = !requests.contains(&path);
+            requests.push(path);
+            first
+        };
+        if request
+            .uri()
+            .query()
+            .is_some_and(|q| q.contains("prefix=timeout"))
+        {
+            return std::future::pending().await;
+        }
+        if first {
+            match request.uri().path() {
+                "/source/pending" => return std::future::pending().await,
+                "/source/body" => {
+                    return Response::new(Body::from_stream(
+                        futures::stream::iter([Ok::<_, std::io::Error>(vec![0u8])])
+                            .chain(futures::stream::pending()),
+                    ))
+                }
+                "/source/closed" => {
+                    return Response::new(Body::from_stream(futures::stream::iter([Err::<
+                        Vec<u8>,
+                        _,
+                    >(
+                        std::io::Error::other("closed"),
+                    )])))
+                }
+                _ => {}
+            }
+        }
         Response::builder()
             .header("content-length", body.len())
             .body(Body::from(body))
@@ -656,11 +815,7 @@ mod tests {
     /// pointed at it, the recorded request paths, and the server handle.
     async fn diff_stub(
         body: Vec<u8>,
-    ) -> (
-        S3Reader,
-        Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (Client, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -677,14 +832,63 @@ mod tests {
             .endpoint_url(format!("http://{address}"))
             .force_path_style(true)
             .build();
-        (
-            S3Reader::new(
-                aws_sdk_s3::Client::from_conf(config),
-                default_s3_read_timeout_secs(),
-            ),
-            requests,
-            server,
-        )
+        (Client::from_conf(config), requests, server)
+    }
+
+    #[tokio::test]
+    async fn s3_stalled_get_and_list_time_out_and_get_can_retry() {
+        let (client, _, server) = diff_stub(b"data".to_vec()).await;
+        let limit = Duration::from_secs(1);
+        for (key, stage) in [("pending", "send"), ("body", "body")] {
+            let error = s3_get_bytes(&client, "source", key, limit)
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("S3 read timed out"), "{error}");
+            assert!(error.contains(&format!("stage={stage}")), "{error}");
+            assert_eq!(
+                s3_get_bytes(&client, "source", key, limit)
+                    .await
+                    .unwrap()
+                    .into_bytes(),
+                b"data"[..]
+            );
+        }
+        // The caller can retry the same object after a disconnect.
+        assert!(s3_get_bytes(&client, "source", "closed", limit)
+            .await
+            .is_err());
+        assert_eq!(
+            s3_get_bytes(&client, "source", "closed", limit)
+                .await
+                .unwrap()
+                .into_bytes(),
+            b"data"[..]
+        );
+        let error = s3_get_block_hash_by_number(&client, "source", "timeout", "", 0, limit)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("S3 read timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn s3_timeout_drops_the_owned_request() {
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let guard = OnDrop(Some(tx));
+        assert!(s3_read_with_timeout(Duration::from_millis(10), async move {
+            let _guard = guard;
+            std::future::pending::<Result<()>>().await
+        })
+        .await
+        .is_err());
+        assert!(rx.try_recv().is_ok());
     }
 
     async fn resolve_against_stub(
@@ -704,6 +908,7 @@ mod tests {
             "",
             block_info,
             parent_state_root,
+            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -757,9 +962,16 @@ mod tests {
         expected.encode(&mut body);
         let (client, requests, server) = diff_stub(body).await;
 
-        let actual = s3_fetch_block_diff(&client, "source", "1", "", &block_info)
-            .await
-            .unwrap();
+        let actual = s3_fetch_block_diff(
+            &client,
+            "source",
+            "1",
+            "",
+            &block_info,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         server.abort();
         assert_eq!(actual, expected);
