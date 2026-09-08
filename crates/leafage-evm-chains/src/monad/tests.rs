@@ -545,7 +545,7 @@ fn created_contract_is_not_subject_to_reserve_from_monad_eight() {
             ..Default::default()
         },
     );
-    let tx = TxEnv {
+    let mut tx = TxEnv {
         caller: CALLER,
         gas_limit: GAS_LIMIT,
         kind: TxKind::Create,
@@ -559,10 +559,61 @@ fn created_contract_is_not_subject_to_reserve_from_monad_eight() {
     assert_eq!(out.state[&RECIPIENT].info.balance, mon(5));
     assert_eq!(out.state[&created].info.balance, U256::ZERO);
 
-    let out = run_with_state(MonadHardfork::MonadSeven, db, tx);
+    let out = run_with_state(MonadHardfork::MonadSeven, db.clone(), tx.clone());
     assert_eq!(
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
+    );
+
+    // `deploy_contract_code` refuses the code (EIP-3541 0xEF prefix): the
+    // address stays an EOA and the reserve rule, not the code check, is
+    // reported.
+    let mut init = send_value_code(RECIPIENT, five_mon_wei());
+    init.pop();
+    init.extend_from_slice(&[0x60, 0xef, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3]);
+    tx.data = Bytes::from(init);
+    let out = run_with_state(MonadHardfork::MonadTen, db, tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.state[&created].info.balance, mon(5));
+}
+
+/// `execute_call_message` checks the reserve with the value transfer in
+/// place even when the precompile failed; revm reverts the frame first, so
+/// the transfer is replayed for the check.
+#[test]
+fn failed_precompile_call_still_reports_reserve_violation() {
+    const BLAKE2F: Address = address!("0000000000000000000000000000000000000009");
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.insert_account_info(CALLER, account(mon(20), Bytecode::new_eip7702(DELEGATE)));
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+    );
+    // empty input: blake2f wrong length
+    let mut tx = call_tx(BLAKE2F, &[]);
+    tx.value = mon(15);
+    let out = run_with_state(MonadHardfork::MonadTen, db.clone(), tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.state[&CALLER].info.balance, mon(20));
+
+    // Without the value the precompile failure is reported with its
+    // context: the wrapping checkpoint must not change the journal depth.
+    let out = run_with_state(MonadHardfork::MonadTen, db, call_tx(BLAKE2F, &[]));
+    assert!(
+        matches!(
+            halt_reason(&out.result),
+            MonadHaltReason::Base(HaltReason::PrecompileErrorWithContext(_))
+        ),
+        "{:?}",
+        out.result
     );
 }
 

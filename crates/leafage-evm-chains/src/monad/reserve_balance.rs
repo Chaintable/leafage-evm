@@ -20,14 +20,16 @@
 //! executor of the node.
 
 use crate::monad::hardforks::MON;
-use crate::monad::{MonadContext, STAKING_CONTRACT_ADDRESS};
+use crate::monad::{MonadContext, MonadHardfork, STAKING_CONTRACT_ADDRESS};
 use alloy_evm::Database;
+use leafage_evm_types::CfgEnv;
 use revm::bytecode::Bytecode;
-use revm::context::{ContextTr, JournalTr, Transaction};
+use revm::context::{Cfg, ContextTr, JournalTr, Transaction};
 use revm::context_interface::transaction::AuthorizationTr;
 use revm::context_interface::Block;
 use revm::handler::{EthFrame, FrameData};
 use revm::interpreter::{Gas, InstructionResult, InterpreterAction, InterpreterResult};
+use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes, B256, U256};
 
 /// `monad_default_max_reserve_balance_mon`: 10 MON.
@@ -46,13 +48,8 @@ fn is_empty_code_hash(hash: B256) -> bool {
 
 /// `dipped_into_reserve`: does the current state violate the reserve balance
 /// of any EOA touched by the transaction?
-///
-/// `pending_contract` is the address of a top level CREATE whose init code
-/// succeeded: the node runs the check after `deploy_contract_code`, so from
-/// MONAD_EIGHT (recent code hash) that account is a contract, not an EOA.
 pub(crate) fn dipped_into_reserve<DB: Database>(
     ctx: &mut MonadContext<DB>,
-    pending_contract: Option<Address>,
 ) -> Result<bool, DB::Error> {
     let hardfork = ctx.cfg().spec();
     let basefee = ctx.block().basefee() as u128;
@@ -74,9 +71,7 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
         .filter(|(address, account)| {
             // the staking contract balance may decrease (withdrawals) and it
             // never sends transactions
-            **address != STAKING_CONTRACT_ADDRESS
-                && account.transaction_id == transaction_id
-                && !(use_recent_code && Some(**address) == pending_contract)
+            **address != STAKING_CONTRACT_ADDRESS && account.transaction_id == transaction_id
         })
         .filter_map(|(address, account)| {
             let code_hash = if use_recent_code {
@@ -156,48 +151,104 @@ fn is_delegation_designator(code: &Bytecode) -> bool {
     code.eip7702_address().is_some()
 }
 
+/// Outcome of [`apply_reserve_balance_rule`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReserveRuleOutcome {
+    /// Not the top level message, rule inactive, or no violation.
+    Passed,
+    /// The result was turned into the reserve balance violation.
+    Violated,
+    /// Top level CREATE whose init code succeeded: the node runs the check
+    /// after `deploy_contract_code`, so it has to wait until revm's
+    /// `return_create` deployed (or refused) the code, see
+    /// [`apply_reserve_balance_rule_after_create`].
+    CheckAfterDeploy,
+}
+
 /// `execute_message.cpp` depth 0: `revert_transaction` runs on the result of
 /// the top level message before `post_call` accepts or rejects the frame.
 /// A violation turns the result into `EVMC_MONAD_RESERVE_BALANCE_VIOLATION`
 /// with all gas consumed; the frame is then rejected like any other failure,
 /// which keeps everything recorded outside the frame (sender nonce of a
 /// CREATE, EIP-7702 authorizations, gas payment).
-///
-/// Returns whether the rule was violated.
 pub(crate) fn apply_reserve_balance_rule<DB: Database>(
     ctx: &mut MonadContext<DB>,
     frame: &EthFrame,
     action: &mut InterpreterAction,
-) -> Result<bool, DB::Error> {
+) -> Result<ReserveRuleOutcome, DB::Error> {
     if frame.depth != 0 || !ctx.cfg().spec().is_reserve_balance_check_enabled() {
-        return Ok(false);
+        return Ok(ReserveRuleOutcome::Passed);
     }
     let InterpreterAction::Return(result) = action else {
+        return Ok(ReserveRuleOutcome::Passed);
+    };
+    if matches!(frame.data, FrameData::Create(_))
+        && result.result.is_ok()
+        && !deploy_would_fail(ctx.cfg(), result)
+    {
+        return Ok(ReserveRuleOutcome::CheckAfterDeploy);
+    }
+    Ok(if reject_on_reserve_violation(ctx, result)? {
+        ReserveRuleOutcome::Violated
+    } else {
+        ReserveRuleOutcome::Passed
+    })
+}
+
+/// Will revm's `return_create` refuse the returned code (EIP-3541 prefix,
+/// EIP-170 size, code deposit gas)? Then `deploy_contract_code` fails in the
+/// node as well and the reserve check runs on the un-reverted state, with
+/// the address still an EOA.
+fn deploy_would_fail(cfg: &CfgEnv<MonadHardfork>, result: &InterpreterResult) -> bool {
+    let spec: SpecId = (*cfg.spec()).into();
+    let output = &result.output;
+    (!cfg.is_eip3541_disabled()
+        && spec.is_enabled_in(SpecId::LONDON)
+        && output.first() == Some(&0xEF))
+        || (spec.is_enabled_in(SpecId::SPURIOUS_DRAGON) && output.len() > cfg.max_code_size())
+        || result.gas.remaining() < cfg.gas_params().code_deposit_cost(output.len())
+}
+
+/// Second half of [`apply_reserve_balance_rule`] for a top level CREATE whose
+/// init code succeeded, run after revm settled the frame: with the code
+/// deployed the new account is a contract (MONAD_EIGHT+, recent code hash),
+/// when `return_create` refused the code the account stays an EOA like in
+/// `deploy_contract_code`. A violation of a deployed contract reverts the
+/// frame that revm already committed.
+pub(crate) fn apply_reserve_balance_rule_after_create<DB: Database>(
+    ctx: &mut MonadContext<DB>,
+    frame: &EthFrame,
+    result: &mut InterpreterResult,
+) -> Result<bool, DB::Error> {
+    let deployed = result.result.is_ok();
+    if !reject_on_reserve_violation(ctx, result)? {
         return Ok(false);
-    };
-    let pending_contract = match &frame.data {
-        FrameData::Create(create) if result.result.is_ok() && !result.output.is_empty() => {
-            Some(create.created_address)
-        }
-        _ => None,
-    };
-    reject_on_reserve_violation(ctx, pending_contract, result)
+    }
+    if deployed {
+        ctx.journal_mut().checkpoint_revert(frame.checkpoint);
+    }
+    Ok(true)
 }
 
 /// Turns `result` into the reserve balance violation outcome (failure, all
 /// gas consumed, no output) when [`dipped_into_reserve`] holds.
 pub(crate) fn reject_on_reserve_violation<DB: Database>(
     ctx: &mut MonadContext<DB>,
-    pending_contract: Option<Address>,
     result: &mut InterpreterResult,
 ) -> Result<bool, DB::Error> {
-    if !dipped_into_reserve(ctx, pending_contract)? {
+    if !dipped_into_reserve(ctx)? {
         return Ok(false);
     }
+    mark_reserve_violation(result);
+    Ok(true)
+}
+
+/// `EVMC_MONAD_RESERVE_BALANCE_VIOLATION`: failure, all gas consumed, no
+/// output.
+pub(crate) fn mark_reserve_violation(result: &mut InterpreterResult) {
     result.result = InstructionResult::OutOfFunds;
     result.gas = Gas::new_spent(result.gas.limit());
     result.output = Bytes::new();
-    Ok(true)
 }
 
 #[cfg(test)]

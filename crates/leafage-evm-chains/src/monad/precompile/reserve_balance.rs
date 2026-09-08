@@ -53,7 +53,7 @@ pub(crate) fn run<DB: Database>(
     // the method body. The predicate has no side effects.
     let dipped = match method {
         Some(()) if value_and_input_ok(inputs, input) => {
-            Some(dipped_into_reserve(context, None).map_err(|e| e.to_string())?)
+            Some(dipped_into_reserve(context).map_err(|e| e.to_string())?)
         }
         _ => None,
     };

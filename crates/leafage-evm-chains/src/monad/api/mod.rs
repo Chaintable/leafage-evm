@@ -1,11 +1,14 @@
 use crate::monad::evm::instructions::monad_instructions;
 use crate::monad::precompile::MonadPrecompiles;
-use crate::monad::reserve_balance::{apply_reserve_balance_rule, reject_on_reserve_violation};
+use crate::monad::reserve_balance::{
+    apply_reserve_balance_rule, apply_reserve_balance_rule_after_create, dipped_into_reserve,
+    mark_reserve_violation, reject_on_reserve_violation, ReserveRuleOutcome,
+};
 use crate::monad::MonadHardfork;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv};
 use revm::context::{Context, FrameStack};
-use revm::context::{ContextTr, Evm, JournalTr, TxEnv};
+use revm::context::{ContextTr, Evm, JournalTr, Transaction, TxEnv};
 use revm::context_interface::journaled_state::JournalCheckpoint;
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::{EthInstructions, InstructionProvider};
@@ -76,31 +79,31 @@ impl<DB: Database, I> MonadEvm<DB, I> {
         self.inner.frame_stack.index().is_none()
     }
 
-    /// Checkpoint wrapping the init of the top level message, see
-    /// [`Self::settle_first_frame_result`].
+    /// Journal position before the init of the top level message, see
+    /// [`Self::settle_first_frame_result`]. The call depth is left untouched
+    /// so precompiles still see depth 1 (error details are only kept there).
     fn first_frame_checkpoint(&mut self) -> Option<JournalCheckpoint> {
         let ctx = &mut self.inner.ctx;
         ctx.cfg()
             .spec()
             .is_reserve_balance_check_enabled()
-            .then(|| ctx.journal_mut().checkpoint())
-    }
-
-    /// The top level message is running: its own frame checkpoint takes
-    /// over from the wrapping one.
-    fn commit_first_frame_checkpoint(&mut self, checkpoint: Option<JournalCheckpoint>) {
-        if checkpoint.is_some() {
-            self.inner.ctx.journal_mut().checkpoint_commit();
-        }
+            .then(|| {
+                let journal = ctx.journal_mut();
+                let checkpoint = journal.checkpoint();
+                journal.checkpoint_commit();
+                checkpoint
+            })
     }
 
     /// The top level message finished during its init: a call to a
     /// precompile or to an account without code (revm never runs a frame
     /// for those). `execute_call_message` applies the reserve balance rule
-    /// after `check_call_precompile`, so it covers the value transfer; the
-    /// wrapping checkpoint plays the role of the frame revm already
-    /// committed. CREATE messages that fail to start (`sender_has_balance`,
-    /// EIP-684 collision) return before the check in the node too.
+    /// after `check_call_precompile` with the value transfer in place, so a
+    /// failed precompile (frame already reverted by revm) is checked with
+    /// the transfer replayed. The checkpoint taken before the init plays the
+    /// role of the frame revm already committed. CREATE messages that fail
+    /// to start (`sender_has_balance`, EIP-684 collision) return before the
+    /// check in the node too.
     fn settle_first_frame_result(
         &mut self,
         checkpoint: Option<JournalCheckpoint>,
@@ -109,18 +112,47 @@ impl<DB: Database, I> MonadEvm<DB, I> {
         let Some(checkpoint) = checkpoint else {
             return Ok(());
         };
-        let violated = match frame_result {
-            FrameResult::Call(outcome) => {
-                reject_on_reserve_violation(&mut self.inner.ctx, None, &mut outcome.result)?
-            }
-            FrameResult::Create(_) => false,
+        let FrameResult::Call(outcome) = frame_result else {
+            return Ok(());
         };
-        let journal = self.inner.ctx.journal_mut();
-        if violated {
-            journal.checkpoint_revert(checkpoint);
-            self.reserve_balance_violation = true;
+        let ctx = &mut self.inner.ctx;
+        let violated = if outcome.result.result.is_ok() {
+            reject_on_reserve_violation(ctx, &mut outcome.result)?
         } else {
-            journal.checkpoint_commit();
+            let (tx, journal) = ctx.tx_journal_mut();
+            let (caller, value) = (tx.caller(), tx.value());
+            let to = tx.kind().to().copied();
+            let scope = journal.checkpoint();
+            if let Some(to) = to.filter(|_| !value.is_zero()) {
+                journal.transfer(caller, to, value)?;
+            }
+            let violated = dipped_into_reserve(ctx)?;
+            self.inner.ctx.journal_mut().checkpoint_revert(scope);
+            if violated {
+                mark_reserve_violation(&mut outcome.result);
+            }
+            violated
+        };
+        if violated {
+            self.inner.ctx.journal_mut().checkpoint_revert(checkpoint);
+            self.reserve_balance_violation = true;
+        }
+        Ok(())
+    }
+
+    /// Top level CREATE whose init code succeeded, checked once revm
+    /// settled the frame (see [`ReserveRuleOutcome::CheckAfterDeploy`]).
+    fn settle_create_after_deploy(
+        &mut self,
+        result: &mut Result<FrameInitOrResult<EthFrame>, ContextDbError<MonadContext<DB>>>,
+    ) -> Result<(), DB::Error> {
+        let Ok(ItemOrResult::Result(FrameResult::Create(outcome))) = result else {
+            return Ok(());
+        };
+        let frame = self.inner.frame_stack.get();
+        if apply_reserve_balance_rule_after_create(&mut self.inner.ctx, frame, &mut outcome.result)?
+        {
+            self.reserve_balance_violation = true;
         }
         Ok(())
     }
@@ -185,7 +217,6 @@ where
             self.settle_first_frame_result(checkpoint, &mut output)?;
             return Ok(ItemOrResult::Result(output));
         }
-        self.commit_first_frame_checkpoint(checkpoint);
         Ok(ItemOrResult::Item(self.inner.frame_stack.get()))
     }
 
@@ -206,15 +237,21 @@ where
         let mut action = frame
             .interpreter
             .run_plain(instruction.instruction_table(), ctx);
-        if apply_reserve_balance_rule(ctx, frame, &mut action)? {
-            self.reserve_balance_violation = true;
-        }
+        let outcome = apply_reserve_balance_rule(ctx, frame, &mut action)?;
+        self.reserve_balance_violation |= outcome == ReserveRuleOutcome::Violated;
 
-        frame.process_next_action(ctx, action).inspect(|i| {
-            if i.is_result() {
-                frame.set_finished(true);
-            }
-        })
+        let mut result = self
+            .inner
+            .frame_stack
+            .get()
+            .process_next_action(&mut self.inner.ctx, action);
+        if outcome == ReserveRuleOutcome::CheckAfterDeploy {
+            self.settle_create_after_deploy(&mut result)?;
+        }
+        if let Ok(ItemOrResult::Result(_)) = &result {
+            self.inner.frame_stack.get().set_finished(true);
+        }
+        result
     }
 
     fn frame_return_result(
@@ -270,16 +307,13 @@ where
 
         let frame_input = frame_init.frame_input.clone();
         let logs_i = ctx.journal().logs().len();
-        let is_first_frame = self.is_first_frame();
-        let checkpoint = if is_first_frame {
+        let checkpoint = if self.is_first_frame() {
             self.first_frame_checkpoint()
         } else {
             None
         };
         if let ItemOrResult::Result(mut output) = self.inner.frame_init(frame_init)? {
-            if is_first_frame {
-                self.settle_first_frame_result(checkpoint, &mut output)?;
-            }
+            self.settle_first_frame_result(checkpoint, &mut output)?;
             let (ctx, inspector) = self.ctx_inspector();
             // for precompiles send logs to inspector.
             if let FrameResult::Call(CallOutcome {
@@ -298,7 +332,6 @@ where
             frame_end(ctx, inspector, &frame_input, &mut output);
             return Ok(ItemOrResult::Result(output));
         }
-        self.commit_first_frame_checkpoint(checkpoint);
 
         // if it is new frame, initialize the interpreter.
         let (ctx, inspector, frame) = self.ctx_inspector_frame();
@@ -326,12 +359,19 @@ where
             &mut *inspector,
             instruction.instruction_table(),
         );
-        if apply_reserve_balance_rule(ctx, frame, &mut action)? {
-            self.reserve_balance_violation = true;
-        }
+        let outcome = apply_reserve_balance_rule(ctx, frame, &mut action)?;
+        self.reserve_balance_violation |= outcome == ReserveRuleOutcome::Violated;
 
-        let mut result = frame.process_next_action(ctx, action);
+        let mut result = self
+            .inner
+            .frame_stack
+            .get()
+            .process_next_action(&mut self.inner.ctx, action);
+        if outcome == ReserveRuleOutcome::CheckAfterDeploy {
+            self.settle_create_after_deploy(&mut result)?;
+        }
         if let Ok(ItemOrResult::Result(frame_result)) = &mut result {
+            let (ctx, inspector, frame) = self.ctx_inspector_frame();
             frame_end(ctx, inspector, &frame.input, frame_result);
             frame.set_finished(true);
         }
