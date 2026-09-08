@@ -49,59 +49,7 @@ pub const ALLOW_ALL_POLICY_ID: u64 = 1;
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    interface ITIP403Registry {
-        enum PolicyType {
-            WHITELIST,
-            BLACKLIST,
-            COMPOUND,
-        }
-
-        enum BlockedReason {
-            NONE,
-            TOKEN_FILTER,
-            RECEIVE_POLICY,
-        }
-
-        function policyIdCounter() external view returns (uint64);
-        function policyExists(uint64 policyId) external view returns (bool);
-        function policyData(uint64 policyId) external view returns (PolicyType policyType, address admin);
-        function isAuthorized(uint64 policyId, address user) external view returns (bool);
-        function isAuthorizedSender(uint64 policyId, address user) external view returns (bool);
-        function isAuthorizedRecipient(uint64 policyId, address user) external view returns (bool);
-        function isAuthorizedMintRecipient(uint64 policyId, address user) external view returns (bool);
-        function compoundPolicyData(uint64 policyId) external view returns (uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId);
-        function receivePolicy(address account) external view returns (bool hasReceivePolicy, uint64 senderPolicyId, PolicyType senderPolicyType, uint64 tokenFilterId, PolicyType tokenFilterType, address recoveryAuthority);
-        function validateReceivePolicy(address token, address sender, address receiver) external view returns (bool authorized, BlockedReason blockedReason);
-        function tokenTransferPolicyId(address token) external view returns (bool isSet, uint64 policyId);
-
-        function createPolicy(address admin, PolicyType policyType) external returns (uint64);
-        function createPolicyWithAccounts(address admin, PolicyType policyType, address[] calldata accounts) external returns (uint64);
-        function setPolicyAdmin(uint64 policyId, address admin) external;
-        function modifyPolicyWhitelist(uint64 policyId, address account, bool allowed) external;
-        function modifyPolicyBlacklist(uint64 policyId, address account, bool restricted) external;
-        function createCompoundPolicy(uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId) external returns (uint64);
-        function setReceivePolicy(uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority) external;
-        function migrateTransferPolicyIds(address[] calldata tokens) external returns (uint256 migrated);
-
-        event PolicyAdminUpdated(uint64 indexed policyId, address indexed updater, address indexed admin);
-        event PolicyCreated(uint64 indexed policyId, address indexed updater, PolicyType policyType);
-        event WhitelistUpdated(uint64 indexed policyId, address indexed updater, address indexed account, bool allowed);
-        event BlacklistUpdated(uint64 indexed policyId, address indexed updater, address indexed account, bool restricted);
-        event CompoundPolicyCreated(uint64 indexed policyId, address indexed creator, uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId);
-        event ReceivePolicyUpdated(address indexed account, uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority);
-
-        error Unauthorized();
-        error PolicyNotFound();
-        error PolicyNotSimple();
-        error InvalidPolicyType();
-        error IncompatiblePolicyType();
-        error VirtualAddressNotAllowed();
-        error InvalidReceivePolicyType();
-        error InvalidRecoveryAuthority();
-    }
-}
+pub use tempo_contracts::precompiles::ITIP403Registry;
 
 // ===========================================================================
 // Error helpers

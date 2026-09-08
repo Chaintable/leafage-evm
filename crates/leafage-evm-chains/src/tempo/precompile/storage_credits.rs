@@ -19,25 +19,7 @@ use super::{
     STORAGE_CREDITS_ADDRESS,
 };
 
-alloy::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    interface IStorageCredits {
-        enum Mode {
-            Refund,
-            Preserve,
-            Direct
-        }
-
-        error InvalidMode();
-
-        function balanceOf(address account) external view returns (uint64);
-        function modeOf(address account) external view returns (Mode);
-        function budgetOf(address account) external view returns (uint64);
-
-        function setMode(Mode newMode) external;
-        function setBudget(uint64 credits) external;
-    }
-}
+pub use tempo_contracts::precompiles::IStorageCredits;
 
 /// Transaction-local policy for storage creations.
 #[repr(u8)]

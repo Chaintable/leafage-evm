@@ -26,20 +26,7 @@ use super::{dispatch_call, input_cost, view, Precompile, NONCE_PRECOMPILE_ADDRES
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface INonce {
-        function getNonce(address account, uint256 nonceKey) external view returns (uint64);
-
-        event NonceIncremented(address indexed account, uint256 indexed nonceKey, uint64 newNonce);
-
-        error ProtocolNonceNotSupported();
-        error InvalidNonceKey();
-        error NonceOverflow();
-        error InvalidExpiringNonceExpiry();
-        error ExpiringNonceReplay();
-        error ExpiringNonceSetFull();
-    }
-}
+pub use tempo_contracts::precompiles::INonce;
 
 // ===========================================================================
 // NonceManager struct (manual macro expansion)

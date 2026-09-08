@@ -36,68 +36,7 @@ static DOMAIN_SEPARATOR_MAINNET: LazyLock<B256> =
 static DOMAIN_SEPARATOR_MODERATO: LazyLock<B256> =
     LazyLock::new(|| domain_separator_inner(MODERATO_CHAIN_ID));
 
-alloy::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    interface ITIP20ChannelReserve {
-        struct ChannelDescriptor {
-            address payer;
-            address payee;
-            address operator;
-            address token;
-            bytes32 salt;
-            address authorizedSigner;
-            bytes32 expiringNonceHash;
-        }
-
-        struct ChannelState {
-            uint96 settled;
-            uint96 deposit;
-            uint32 closeRequestedAt;
-        }
-
-        struct Channel {
-            ChannelDescriptor descriptor;
-            ChannelState state;
-        }
-
-        function CLOSE_GRACE_PERIOD() external view returns (uint64);
-        function VOUCHER_TYPEHASH() external view returns (bytes32);
-        function open(address payee, address operator, address token, uint96 deposit, bytes32 salt, address authorizedSigner) external returns (bytes32 channelId);
-        function settle(ChannelDescriptor descriptor, uint96 cumulativeAmount, bytes signature) external;
-        function topUp(ChannelDescriptor descriptor, uint96 additionalDeposit) external;
-        function close(ChannelDescriptor descriptor, uint96 cumulativeAmount, uint96 captureAmount, bytes signature) external;
-        function requestClose(ChannelDescriptor descriptor) external;
-        function withdraw(ChannelDescriptor descriptor) external;
-        function getChannel(ChannelDescriptor descriptor) external view returns (Channel);
-        function getChannelState(bytes32 channelId) external view returns (ChannelState);
-        function getChannelStatesBatch(bytes32[] channelIds) external view returns (ChannelState[]);
-        function computeChannelId(address payer, address payee, address operator, address token, bytes32 salt, address authorizedSigner, bytes32 expiringNonceHash) external view returns (bytes32);
-        function getVoucherDigest(bytes32 channelId, uint96 cumulativeAmount) external view returns (bytes32);
-        function domainSeparator() external view returns (bytes32);
-        function storageCredits(address payer) external view returns (uint64 credits);
-
-        event ChannelOpened(bytes32 indexed channelId, address indexed payer, address indexed payee, address operator, address token, address authorizedSigner, bytes32 salt, bytes32 expiringNonceHash, uint96 deposit);
-        event Settled(bytes32 indexed channelId, address indexed payer, address indexed payee, uint96 cumulativeAmount, uint96 deltaPaid, uint96 newSettled);
-        event TopUp(bytes32 indexed channelId, address indexed payer, address indexed payee, uint96 additionalDeposit, uint96 newDeposit);
-        event CloseRequested(bytes32 indexed channelId, address indexed payer, address indexed payee, uint256 closeGraceEnd);
-        event ChannelClosed(bytes32 indexed channelId, address indexed payer, address indexed payee, uint96 settledToPayee, uint96 refundedToPayer);
-        event CloseRequestCancelled(bytes32 indexed channelId, address indexed payer, address indexed payee);
-
-        error ChannelAlreadyExists();
-        error ChannelNotFound();
-        error NotPayer();
-        error NotPayeeOrOperator();
-        error InvalidPayee();
-        error ZeroDeposit();
-        error ExpiringNonceHashNotSet();
-        error InvalidSignature();
-        error AmountExceedsDeposit();
-        error AmountNotIncreasing();
-        error CaptureAmountInvalid();
-        error CloseNotReady();
-        error DepositOverflow();
-    }
-}
+pub use tempo_contracts::precompiles::ITIP20ChannelReserve;
 
 #[inline]
 fn revert(error: impl SolError) -> TempoPrecompileError {

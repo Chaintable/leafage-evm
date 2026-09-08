@@ -33,6 +33,8 @@ pub mod zone_factory;
 pub(crate) mod test_utils;
 #[cfg(test)]
 mod event_abi_tests;
+#[cfg(test)]
+mod official_abi_tests;
 
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};
 pub use storage::{
@@ -44,71 +46,36 @@ pub use storage_types::{
     Mapping, Packable, Slot, Storable, StorableType, StorageKey,
 };
 
-use alloy::primitives::{address, Address, Bytes};
+use alloy::primitives::{Address, Bytes};
 use alloy::sol_types::{SolCall, SolError};
 use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 
-alloy::sol! {
-    /// Common Tempo precompile error for an unknown or hardfork-disabled selector.
-    error UnknownFunctionSelector(bytes4 selector);
-}
-
-// ===========================================================================
-// Address constants (from tempo-contracts)
-// ===========================================================================
-
-pub const TIP_FEE_MANAGER_ADDRESS: Address =
-    address!("0xfeec000000000000000000000000000000000000");
-pub const PATH_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000000");
-pub const DEFAULT_FEE_TOKEN: Address = PATH_USD_ADDRESS;
-pub const TIP403_REGISTRY_ADDRESS: Address =
-    address!("0x403C000000000000000000000000000000000000");
-pub const TIP20_FACTORY_ADDRESS: Address =
-    address!("0x20FC000000000000000000000000000000000000");
-pub const STABLECOIN_DEX_ADDRESS: Address =
-    address!("0xdec0000000000000000000000000000000000000");
-/// T5+ TIP-1034 payment channel reserve.
-pub const TIP20_CHANNEL_RESERVE_ADDRESS: Address =
-    address!("0x4D50500000000000000000000000000000000000");
-pub const NONCE_PRECOMPILE_ADDRESS: Address =
-    address!("0x4E4F4E4345000000000000000000000000000000");
-pub const VALIDATOR_CONFIG_ADDRESS: Address =
-    address!("0xCCCCCCCC00000000000000000000000000000000");
-pub const ACCOUNT_KEYCHAIN_ADDRESS: Address =
-    address!("0xAAAAAAAA00000000000000000000000000000000");
-pub const VALIDATOR_CONFIG_V2_ADDRESS: Address =
-    address!("0xCCCCCCCC00000000000000000000000000000001");
-/// T3+ TIP-1020 signature verifier (secp256k1 / P256 / WebAuthn).
-pub const SIGNATURE_VERIFIER_ADDRESS: Address =
-    address!("0x5165300000000000000000000000000000000000");
-/// T3+ TIP-1022 virtual address registry.
-pub const ADDRESS_REGISTRY_ADDRESS: Address =
-    address!("0xFDC0000000000000000000000000000000000000");
-/// T6+ TIP-1028 custody for blocked inbound TIP-20 transfers and mints.
-pub const RECEIVE_POLICY_GUARD_ADDRESS: Address =
-    address!("0xB10C000000000000000000000000000000000000");
-/// T7+ TIP-1060 storage credits.
-pub const STORAGE_CREDITS_ADDRESS: Address =
-    address!("0x1060000000000000000000000000000000000000");
-/// T8+ TIP-1070 current consensus committee.
-pub const CURRENT_COMMITTEE_ADDRESS: Address =
-    address!("0xC077E00000000000000000000000000000000000");
-/// T10+ TIP-1091 native ZoneFactory.
-pub const ZONE_FACTORY_ADDRESS: Address =
-    address!("0x5AF2000000000000000000000000000000000000");
-/// Initial ZoneFactory owner written by the writer at the T10 activation boundary.
-pub const INITIAL_ZONE_FACTORY_OWNER: Address =
-    address!("0xaF571FD4B3AD43a5807A5E58bFb25ea1aB327A14");
-/// Protocol-managed shared ZonePortal implementation.
-pub const ZONE_PORTAL_IMPL_ADDRESS: Address =
-    address!("0x5AD1000000000000000000000000000000000000");
-/// Protocol-managed Zone proof verifier.
-pub const ZONE_VERIFIER_ADDRESS: Address =
-    address!("0x5A56000000000000000000000000000000000000");
-/// Protocol-managed shared ZoneMessenger.
-pub const ZONE_MESSENGER_ADDRESS: Address =
-    address!("0x5A4D000000000000000000000000000000000000");
+// Official address/error definitions only; activation and dispatch remain local.
+pub use tempo_contracts::precompiles::{
+    UnknownFunctionSelector,
+    TIP_FEE_MANAGER_ADDRESS,
+    PATH_USD_ADDRESS,
+    DEFAULT_FEE_TOKEN,
+    TIP403_REGISTRY_ADDRESS,
+    TIP20_FACTORY_ADDRESS,
+    STABLECOIN_DEX_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS,
+    NONCE_PRECOMPILE_ADDRESS,
+    VALIDATOR_CONFIG_ADDRESS,
+    ACCOUNT_KEYCHAIN_ADDRESS,
+    VALIDATOR_CONFIG_V2_ADDRESS,
+    SIGNATURE_VERIFIER_ADDRESS,
+    ADDRESS_REGISTRY_ADDRESS,
+    RECEIVE_POLICY_GUARD_ADDRESS,
+    STORAGE_CREDITS_ADDRESS,
+    CURRENT_COMMITTEE_ADDRESS,
+    ZONE_FACTORY_ADDRESS,
+    INITIAL_FACTORY_OWNER as INITIAL_ZONE_FACTORY_OWNER,
+    ZONE_PORTAL_IMPL_ADDRESS,
+    ZONE_VERIFIER_ADDRESS,
+    ZONE_MESSENGER_ADDRESS,
+};
 
 // ===========================================================================
 // Gas constants

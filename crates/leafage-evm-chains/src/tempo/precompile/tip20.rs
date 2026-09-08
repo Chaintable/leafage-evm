@@ -139,130 +139,7 @@ impl Recipient {
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    // ---- ITIP20 interface ----
-
-    interface ITIP20 {
-        // Metadata (view)
-        function name() external view returns (string memory);
-        function symbol() external view returns (string memory);
-        function decimals() external view returns (uint8);
-        function currency() external view returns (string memory);
-        function totalSupply() external view returns (uint256);
-        function supplyCap() external view returns (uint256);
-        function transferPolicyId() external view returns (uint64);
-        function paused() external view returns (bool);
-        function quoteToken() external view returns (address);
-        function nextQuoteToken() external view returns (address);
-        function logoURI() external view returns (string memory);
-
-        // Role constants (view)
-        function PAUSE_ROLE() external view returns (bytes32);
-        function UNPAUSE_ROLE() external view returns (bytes32);
-        function ISSUER_ROLE() external view returns (bytes32);
-        function BURN_BLOCKED_ROLE() external view returns (bytes32);
-
-        // View functions
-        function balanceOf(address account) external view returns (uint256);
-        function allowance(address owner, address spender) external view returns (uint256);
-        function nonces(address owner) external view returns (uint256);
-        function DOMAIN_SEPARATOR() external view returns (bytes32);
-
-        // Reward view functions
-        function globalRewardPerToken() external view returns (uint256);
-        function optedInSupply() external view returns (uint128);
-        function userRewardInfo(address account) external view returns (UserRewardInfo memory);
-        function getPendingRewards(address account) external view returns (uint128);
-
-        // State-changing functions
-        function transfer(address to, uint256 amount) external returns (bool);
-        function transferFrom(address from, address to, uint256 amount) external returns (bool);
-        function approve(address spender, uint256 amount) external returns (bool);
-        function mint(address to, uint256 amount) external;
-        function mintWithMemo(address to, uint256 amount, bytes32 memo) external;
-        function burn(uint256 amount) external;
-        function burnWithMemo(uint256 amount, bytes32 memo) external;
-        function burnBlocked(address from, uint256 amount) external;
-        function setLogoURI(string calldata newLogoURI) external;
-        function pause() external;
-        function unpause() external;
-        function setSupplyCap(uint256 newSupplyCap) external;
-        function changeTransferPolicyId(uint64 newPolicyId) external;
-        function setNextQuoteToken(address newQuoteToken) external;
-        function completeQuoteTokenUpdate() external;
-        function transferWithMemo(address to, uint256 amount, bytes32 memo) external;
-        function transferFromWithMemo(address from, address to, uint256 amount, bytes32 memo) external returns (bool);
-        function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
-
-        // Reward state-changing functions
-        function distributeReward(uint256 amount) external;
-        function setRewardRecipient(address recipient) external;
-        function claimRewards() external returns (uint256);
-
-        // Reward info struct
-        struct UserRewardInfo {
-            address rewardRecipient;
-            uint256 rewardPerToken;
-            uint256 rewardBalance;
-        }
-
-        // Events
-        event Transfer(address indexed from, address indexed to, uint256 amount);
-        event Approval(address indexed owner, address indexed spender, uint256 amount);
-        event Mint(address indexed to, uint256 amount);
-        event Burn(address indexed from, uint256 amount);
-        event BurnBlocked(address indexed from, uint256 amount);
-        event PauseStateUpdate(address indexed updater, bool isPaused);
-        event SupplyCapUpdate(address indexed updater, uint256 indexed newSupplyCap);
-        event TransferPolicyUpdate(address indexed updater, uint64 indexed newPolicyId);
-        event NextQuoteTokenSet(address indexed updater, address indexed nextQuoteToken);
-        event QuoteTokenUpdate(address indexed updater, address indexed newQuoteToken);
-        event TransferWithMemo(address indexed from, address indexed to, uint256 amount, bytes32 indexed memo);
-        event RewardDistributed(address indexed funder, uint256 amount);
-        event RewardRecipientSet(address indexed holder, address indexed recipient);
-        event LogoURIUpdated(address indexed updater, string newLogoURI);
-
-        // Errors
-        error InsufficientBalance(uint256 balance, uint256 amount, address token);
-        error InsufficientAllowance();
-        error InvalidRecipient();
-        error ContractPaused();
-        error InvalidAmount();
-        error PolicyForbids();
-        error SupplyCapExceeded();
-        error InvalidSupplyCap();
-        error InvalidTransferPolicyId();
-        error InvalidQuoteToken();
-        error InvalidToken();
-        error InvalidCurrency();
-        error NoOptedInSupply();
-        error ProtectedAddress();
-        error PermitExpired();
-        error InvalidSignature();
-        error SpendingLimitExceeded();
-        error Uninitialized();
-        error LogoURITooLong();
-        error InvalidLogoURI();
-    }
-
-    // ---- IRolesAuth interface ----
-
-    interface IRolesAuth {
-        function hasRole(bytes32 role, address account) external view returns (bool);
-        function getRoleAdmin(bytes32 role) external view returns (bytes32);
-        function grantRole(bytes32 role, address account) external;
-        function revokeRole(bytes32 role, address account) external;
-        function renounceRole(bytes32 role) external;
-        function setRoleAdmin(bytes32 role, bytes32 adminRole) external;
-
-        event RoleMembershipUpdated(bytes32 indexed role, address indexed account, address indexed sender, bool hasRole);
-        event RoleAdminUpdated(bytes32 indexed role, bytes32 indexed newAdminRole, address indexed sender);
-
-        error Unauthorized();
-    }
-
-    error UnknownFunctionSelector(bytes4 selector);
-}
+pub use tempo_contracts::precompiles::{ITIP20, IRolesAuth};
 
 // ===========================================================================
 // UserRewardInfo Storable type
@@ -907,7 +784,7 @@ impl TIP20Token {
     pub const ALLOWED_LOGO_URI_SCHEMES: &'static [&'static str] =
         &["https", "http", "ipfs", "data"];
 
-    fn validate_logo_uri(uri: &str) -> Result<()> {
+    pub(super) fn validate_logo_uri(uri: &str) -> Result<()> {
         if uri.len() > Self::MAX_LOGO_URI_BYTES {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::LogoURITooLong {}.abi_encode().into(),
@@ -946,10 +823,15 @@ impl TIP20Token {
     ) -> Result<()> {
         self.check_role(msg_sender, DEFAULT_ADMIN_ROLE)?;
         Self::validate_logo_uri(&call.newLogoURI)?;
-        self.logo_uri.write(call.newLogoURI.clone())?;
+        self.write_logo_uri(msg_sender, call.newLogoURI)
+    }
+
+    /// Shared with factory initialization after URI validation, without requiring admin == creator.
+    pub(super) fn write_logo_uri(&mut self, msg_sender: Address, uri: String) -> Result<()> {
+        self.logo_uri.write(uri.clone())?;
         self.emit_event(ITIP20::LogoURIUpdated {
             updater: msg_sender,
-            newLogoURI: call.newLogoURI,
+            newLogoURI: uri,
         })
     }
 
@@ -1282,8 +1164,8 @@ impl TIP20Token {
         if amount > from_balance {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
-                    balance: from_balance,
-                    amount,
+                    available: from_balance,
+                    required: amount,
                     token: self.address,
                 }
                 .abi_encode()
@@ -1303,8 +1185,8 @@ impl TIP20Token {
         let new_from_balance = from_balance.checked_sub(amount).ok_or_else(|| {
             TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
-                    balance: from_balance,
-                    amount,
+                    available: from_balance,
+                    required: amount,
                     token: self.address,
                 }
                 .abi_encode()
@@ -1355,8 +1237,8 @@ impl TIP20Token {
         let new_from_balance = from_balance.checked_sub(refund).ok_or_else(|| {
             TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
-                    balance: from_balance,
-                    amount: refund,
+                    available: from_balance,
+                    required: refund,
                     token: self.address,
                 }
                 .abi_encode()
@@ -1528,8 +1410,8 @@ impl TIP20Token {
         if amount > from_balance {
             return Err(TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
-                    balance: from_balance,
-                    amount,
+                    available: from_balance,
+                    required: amount,
                     token: self.address,
                 }
                 .abi_encode()
@@ -1722,8 +1604,8 @@ impl TIP20Token {
         let new_supply = total_supply.checked_sub(amount).ok_or_else(|| {
             TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
-                    balance: total_supply,
-                    amount,
+                    available: total_supply,
+                    required: amount,
                     token: self.address,
                 }
                 .abi_encode()
@@ -1796,8 +1678,8 @@ impl TIP20Token {
         let new_supply = total_supply.checked_sub(amount).ok_or_else(|| {
             TempoPrecompileError::Revert(
                 ITIP20::InsufficientBalance {
-                    balance: total_supply,
-                    amount,
+                    available: total_supply,
+                    required: amount,
                     token: self.address,
                 }
                 .abi_encode()
