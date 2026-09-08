@@ -64,6 +64,88 @@ impl EvmStorageRead for EstimateState {
 }
 
 #[tokio::test]
+async fn formal_t11_rpc_uses_requested_timestamp_for_strict_abi() {
+    use alloy::sol_types::SolCall;
+    use leafage_evm_chains::tempo::precompile::{
+        address_registry::IAddressRegistry, ADDRESS_REGISTRY_ADDRESS,
+    };
+
+    let canonical = IAddressRegistry::isVirtualAddressCall {
+        addr: Address::repeat_byte(0x11),
+    }
+    .abi_encode();
+    let mut trailing = canonical.clone();
+    trailing.extend([0; 32]);
+    // Deliberately return to a historical timestamp after testing the active fork.
+    for timestamp in [
+        1_789_048_799u64,
+        1_789_048_800,
+        1_789_048_801,
+        1_789_048_799,
+    ] {
+        for use_override in [false, true] {
+            let mut db = EstimateState::default();
+            db.block.header.number = 100;
+            db.block.header.timestamp = if use_override {
+                1_789_048_801
+            } else {
+                timestamp
+            };
+            db.block.header.gas_limit = 100_000_000;
+            let core = ApiImpl {
+                db,
+                evm_cfg: tests::review_api().evm_cfg,
+                historical_client: None,
+                historical_height: None,
+                token_collector: None,
+            };
+            let api = Api::new(core);
+            let mut module = crate::EthApiServer::into_rpc(api.clone());
+            module.merge(DebankApiServer::into_rpc(api)).unwrap();
+            let overrides = use_override.then(|| json!({"time": format!("0x{timestamp:x}")}));
+            for (data, malformed) in [(&canonical, false), (&trailing, true)] {
+                let request = json!({
+                    "from": Address::repeat_byte(0x11), "to": ADDRESS_REGISTRY_ADDRESS,
+                    "gas": "0xf4240", "data": alloy::primitives::Bytes::copy_from_slice(data),
+                });
+                for (method, params) in [
+                    ("eth_call", json!([request, "0x64", null, overrides])),
+                    (
+                        "estimateGas",
+                        json!([request, {"block_id":"0x64","type":"Equals"}, overrides]),
+                    ),
+                ] {
+                    let raw = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params})
+                        .to_string();
+                    let (response, _) = module.raw_json_request(&raw, 1).await.unwrap();
+                    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                    let must_revert = malformed && timestamp >= 1_789_048_800;
+                    assert_eq!(
+                        response.get("error").is_some(),
+                        must_revert,
+                        "{method} timestamp={timestamp} override={use_override}: {response}"
+                    );
+                    if !must_revert && method == "eth_call" {
+                        assert_eq!(response["result"], json!(format!("0x{}", "00".repeat(32))));
+                    }
+                    if must_revert {
+                        // These RPCs intentionally expose different legacy error formats.
+                        if method == "estimateGas" {
+                            assert_eq!(response["error"], json!({"code": -39000, "message": ""}));
+                        } else {
+                            assert_eq!(
+                                response["error"],
+                                json!({"code": -32603, "message": "Reverted: \"\""})
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallback() {
     let caller = address!("1111111111111111111111111111111111111111");
     let to = Address::repeat_byte(0x22);

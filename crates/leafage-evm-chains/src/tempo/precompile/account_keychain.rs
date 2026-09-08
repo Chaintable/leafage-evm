@@ -27,7 +27,6 @@ use std::collections::HashSet;
 
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
-use leafage_evm_types::CallScope as RlpCallScope;
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -149,9 +148,6 @@ alloy::sol! {
             address keyId,
             CallScope[] calldata scopes
         ) external;
-
-        /// (TIP-1099, T11+) Set or replace RLP-encoded allowed calls.
-        function setAllowedCalls(address keyId, bytes calldata scopes) external;
 
         /// (TIP-1011, T3+) Remove any configured call scope for a key+target pair.
         function removeAllowedCalls(address keyId, address target) external;
@@ -310,18 +306,8 @@ const TIP20_TRANSFER_SELECTOR: [u8; 4] = ITIP20::transferCall::SELECTOR;
 const TIP20_APPROVE_SELECTOR: [u8; 4] = ITIP20::approveCall::SELECTOR;
 const TIP20_TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = ITIP20::transferWithMemoCall::SELECTOR;
 
-/// Additional T11 cost for each 32-byte word decoded as RLP by `setAllowedCalls`.
-const RLP_INPUT_PER_WORD_COST: u64 = 50;
-
 /// T7+ storage representation for zero remaining in a periodic spending limit.
 const ZERO_PERIODIC_REMAINING_SENTINEL: U256 = U256::MAX;
-
-#[inline]
-fn rlp_input_cost(input_len: usize) -> u64 {
-    input_len
-        .div_ceil(32)
-        .saturating_mul(RLP_INPUT_PER_WORD_COST as usize) as u64
-}
 
 /// Returns true if `selector` is one of TIP-20's recipient-bearing selectors
 /// (`transfer`, `approve`, `transferWithMemo`). Mirrors writer
@@ -334,28 +320,16 @@ fn is_constrained_tip20_selector(selector: [u8; 4]) -> bool {
     )
 }
 
-fn has_duplicates_sorted<T: Ord>(values: impl IntoIterator<Item = T>) -> bool {
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    values.sort_unstable();
-    values.windows(2).any(|pair| pair[0] == pair[1])
-}
-
-fn selector_is_disabled(
-    spec: crate::tempo::hardfork::TempoHardfork,
-    selector: [u8; 4],
-) -> bool {
-    (selector == IAccountKeychain::authorizeKey_0Call::SELECTOR && spec.is_t11())
-        || (selector == IAccountKeychain::authorizeKey_1Call::SELECTOR
-            && (!spec.is_t3() || spec.is_t11()))
+fn selector_is_disabled(spec: crate::tempo::hardfork::TempoHardfork, selector: [u8; 4]) -> bool {
+    (selector == IAccountKeychain::authorizeKey_1Call::SELECTOR && !spec.is_t3())
         || (selector == IAccountKeychain::authorizeKey_2Call::SELECTOR
-            && (!spec.is_t5() || spec.is_t11()))
+            && !spec.is_t5())
         || (selector == IAccountKeychain::authorizeAdminKeyCall::SELECTOR
-            && (!spec.is_t6() || spec.is_t11()))
+            && !spec.is_t6())
         || (selector == IAccountKeychain::burnKeyAuthorizationWitnessCall::SELECTOR
             && !spec.is_t5())
-        || (selector == IAccountKeychain::setAllowedCalls_0Call::SELECTOR
-            && (!spec.is_t3() || spec.is_t11()))
-        || (selector == IAccountKeychain::setAllowedCalls_1Call::SELECTOR && !spec.is_t11())
+        || (selector == IAccountKeychain::setAllowedCallsCall::SELECTOR
+            && !spec.is_t3())
         || (selector == IAccountKeychain::removeAllowedCallsCall::SELECTOR && !spec.is_t3())
         || (selector == IAccountKeychain::getRemainingLimitCall::SELECTOR && spec.is_t3())
         || (selector == IAccountKeychain::getRemainingLimitWithPeriodCall::SELECTOR
@@ -1665,42 +1639,11 @@ impl AccountKeychain {
     // CallScope — public dispatch entries
     // -----------------------------------------------------------------------
 
-    /// (T11+) Set or replace allowed calls from canonical RLP input.
-    pub fn set_allowed_calls_rlp(
-        &mut self,
-        msg_sender: Address,
-        call: IAccountKeychain::setAllowedCalls_1Call,
-    ) -> Result<()> {
-        self.storage.deduct_gas(rlp_input_cost(call.scopes.len()))?;
-
-        let scopes: Vec<RlpCallScope> = alloy_rlp::decode_exact(call.scopes.as_ref())
-            .map_err(|_| err_invalid_call_scope())?;
-        if scopes.is_empty() {
-            return Err(err_invalid_call_scope());
-        }
-
-        let scopes = scopes
-            .into_iter()
-            .map(|scope| IAccountKeychain::CallScope {
-                target: scope.target,
-                selectorRules: scope
-                    .selector_rules
-                    .into_iter()
-                    .map(|rule| IAccountKeychain::SelectorRule {
-                        selector: rule.selector,
-                        recipients: rule.recipients,
-                    })
-                    .collect(),
-            })
-            .collect();
-        self.set_allowed_calls_decoded(msg_sender, call.keyId, scopes)
-    }
-
-    /// (T3-T10) Set or replace ABI-encoded allowed calls.
+    /// (T3+) Set or replace ABI-encoded allowed calls.
     pub fn set_allowed_calls(
         &mut self,
         msg_sender: Address,
-        call: IAccountKeychain::setAllowedCalls_0Call,
+        call: IAccountKeychain::setAllowedCallsCall,
     ) -> Result<()> {
         self.set_allowed_calls_decoded(msg_sender, call.keyId, call.scopes)
     }
@@ -1898,9 +1841,9 @@ impl AccountKeychain {
     /// Validates a list of `CallScope`s before persistence. Rejects duplicate
     /// targets and (post-T4) runs per-scope validation up front. Mirrors writer
     /// `account_keychain/mod.rs:871-885 validate_call_scopes`.
-    fn validate_call_scopes(&self, scopes: &[IAccountKeychain::CallScope]) -> Result<()> {
+    fn validate_call_scopes(&mut self, scopes: &[IAccountKeychain::CallScope]) -> Result<()> {
         if self.storage.spec().is_t11() {
-            if has_duplicates_sorted(scopes.iter().map(|scope| scope.target)) {
+            if super::has_duplicates_metered(&mut self.storage, scopes.iter().map(|scope| scope.target))? {
                 return Err(err_invalid_call_scope());
             }
             for scope in scopes {
@@ -1923,7 +1866,7 @@ impl AccountKeychain {
 
     /// Validates a single `CallScope`: zero-target rejected, then per-selector
     /// rules. Mirrors writer `account_keychain/mod.rs:887-900 validate_call_scope`.
-    fn validate_call_scope(&self, scope: &IAccountKeychain::CallScope) -> Result<()> {
+    fn validate_call_scope(&mut self, scope: &IAccountKeychain::CallScope) -> Result<()> {
         if scope.target.is_zero() {
             return Err(err_invalid_call_scope());
         }
@@ -1943,16 +1886,17 @@ impl AccountKeychain {
     ///   confirm the target is a deployed TIP-20.
     /// - T4+: stateless `target.is_tip20()` — only checks the address prefix.
     fn validate_selector_rules(
-        &self,
+        &mut self,
         target: Address,
         rules: &[IAccountKeychain::SelectorRule],
     ) -> Result<()> {
+        let spec = self.storage.spec();
         let mut cached_is_tip20: Option<bool> = None;
         let mut is_tip20 = || -> Result<bool> {
             if let Some(v) = cached_is_tip20 {
                 return Ok(v);
             }
-            let v = if !self.storage.spec().is_t4() {
+            let v = if !spec.is_t4() {
                 TIP20Factory::new().is_tip20(target)?
             } else {
                 target.is_tip20()
@@ -1961,8 +1905,13 @@ impl AccountKeychain {
             Ok(v)
         };
 
-        let sort_duplicates = self.storage.spec().is_t11();
-        if sort_duplicates && has_duplicates_sorted(rules.iter().map(|rule| rule.selector)) {
+        let sort_duplicates = spec.is_t11();
+        if sort_duplicates
+            && super::has_duplicates_metered(
+                &mut self.storage,
+                rules.iter().map(|rule| rule.selector),
+            )?
+        {
             return Err(err_invalid_call_scope());
         }
 
@@ -1981,7 +1930,7 @@ impl AccountKeychain {
             }
 
             if rule.recipients.iter().any(|recipient| recipient.is_zero())
-                || has_duplicates_sorted(rule.recipients.iter().copied())
+                || super::has_duplicates_metered(&mut self.storage, rule.recipients.iter().copied())?
             {
                 return Err(err_invalid_call_scope());
             }
@@ -2032,7 +1981,7 @@ impl Precompile for AccountKeychain {
             |data| {
                 IAccountKeychain::IAccountKeychainCalls::abi_decode_with_config(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(),
+                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {
@@ -2103,13 +2052,8 @@ impl Precompile for AccountKeychain {
                 IAccountKeychain::IAccountKeychainCalls::isAdminKey(call) => {
                     view(call, |call| self.is_admin_key(call.account, call.keyId))
                 }
-                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls_0(call) => {
+                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls(call) => {
                     mutate_void(call, msg_sender, |sender, c| self.set_allowed_calls(sender, c))
-                }
-                IAccountKeychain::IAccountKeychainCalls::setAllowedCalls_1(call) => {
-                    mutate_void(call, msg_sender, |sender, c| {
-                        self.set_allowed_calls_rlp(sender, c)
-                    })
                 }
                 IAccountKeychain::IAccountKeychainCalls::removeAllowedCalls(call) => {
                     mutate_void(call, msg_sender, |sender, c| {
@@ -2133,7 +2077,14 @@ mod tests {
     use crate::tempo::precompile::UnknownFunctionSelector;
     use alloy::primitives::address;
     use alloy::sol_types::{SolError, SolEvent};
-    use leafage_evm_types::SelectorRule as RlpSelectorRule;
+    use leafage_evm_types::CallScope as RlpCallScope;
+
+    alloy::sol! {
+        // TIP-1099 was withdrawn before formal T11; retain its wire shape only as a negative fixture.
+        interface IWithdrawnKeychain {
+            function setAllowedCalls(address keyId, bytes calldata scopes) external;
+        }
+    }
     use revm::database::EmptyDB;
 
     fn unrestricted_restrictions() -> IAccountKeychain::KeyRestrictions {
@@ -2177,7 +2128,7 @@ mod tests {
 
         fn aliased_calldata(width: usize) -> Vec<u8> {
             let mut data = Vec::new();
-            data.extend(IAccountKeychain::setAllowedCalls_0Call::SELECTOR);
+            data.extend(IAccountKeychain::setAllowedCallsCall::SELECTOR);
             data.extend(word(0));
             data.extend(word(64));
 
@@ -2587,7 +2538,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_authorization_selector_schedule_switches_at_t11() {
+    fn direct_authorization_selectors_remain_enabled_through_t11() {
         let key_id = Address::repeat_byte(0x61);
         let config = unrestricted_restrictions();
         let calls = [
@@ -2620,51 +2571,42 @@ mod tests {
             .abi_encode(),
         ];
 
-        let mut t10_provider = TestStorageProvider::new(TempoHardfork::T10);
-        StorageCtx::enter(&mut t10_provider, || {
-            let mut keychain = AccountKeychain::new();
-            let legacy_output = keychain
-                .call(&calls[0], Address::repeat_byte(0x62))
+        let account = Address::repeat_byte(0x62);
+        for spec in [TempoHardfork::T10, TempoHardfork::T11] {
+            for (index, calldata) in calls.iter().enumerate() {
+                let mut provider = TestStorageProvider::new(spec);
+                StorageCtx::enter(&mut provider, || -> Result<()> {
+                    let mut keychain = AccountKeychain::new();
+                    keychain.set_tx_origin(account)?;
+                    let output = keychain.call(calldata, account).unwrap();
+                    if index == 0 {
+                        assert!(output.reverted);
+                        let error =
+                            IAccountKeychain::LegacyAuthorizeKeySelectorChanged::abi_decode(
+                                &output.bytes,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            error.newSelector,
+                            FixedBytes::new(IAccountKeychain::authorizeKey_1Call::SELECTOR)
+                        );
+                    } else {
+                        assert!(!output.reverted, "{spec:?}: {index}");
+                        assert!(keychain.keys[account][key_id].read()?.expiry > 0);
+                    }
+
+                    for trailing in [None, Some(0xff)] {
+                        let mut malformed = calldata[..4].to_vec();
+                        malformed.extend(trailing);
+                        let output = keychain.call(&malformed, account).unwrap();
+                        assert!(output.reverted);
+                        assert!(output.bytes.is_empty(), "selector must reach ABI decoding");
+                    }
+                    Ok(())
+                })
                 .unwrap();
-            let legacy_error =
-                IAccountKeychain::LegacyAuthorizeKeySelectorChanged::abi_decode(
-                    &legacy_output.bytes,
-                )
-                .unwrap();
-            assert_eq!(
-                legacy_error.newSelector,
-                FixedBytes::new(IAccountKeychain::authorizeKey_1Call::SELECTOR),
-            );
-
-            for calldata in &calls {
-                for trailing in [None, Some(0xff)] {
-                    let mut malformed = calldata[..4].to_vec();
-                    malformed.extend(trailing);
-                    let output = keychain
-                        .call(&malformed, Address::repeat_byte(0x62))
-                        .unwrap();
-                    assert!(output.reverted);
-                    assert!(output.bytes.is_empty(), "selector must reach ABI decoding");
-                }
             }
-        });
-
-        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
-        StorageCtx::enter(&mut provider, || {
-            let mut keychain = AccountKeychain::new();
-            for calldata in calls {
-                let selector = calldata[..4].try_into().unwrap();
-                let output = keychain.call(&calldata, Address::repeat_byte(0x62)).unwrap();
-                assert!(output.reverted);
-                assert_unknown_selector(&output.bytes, selector);
-
-                let mut malformed = calldata[..4].to_vec();
-                malformed.push(0xff);
-                let output = keychain.call(&malformed, Address::repeat_byte(0x62)).unwrap();
-                assert!(output.reverted);
-                assert_unknown_selector(&output.bytes, selector);
-            }
-        });
+        }
     }
 
     #[test]
@@ -2720,16 +2662,20 @@ mod tests {
     fn disabled_selectors_are_rejected_before_abi_decode() {
         for (spec, selector) in [
             (
-                TempoHardfork::T11,
+                TempoHardfork::T4,
                 IAccountKeychain::authorizeKey_2Call::SELECTOR,
             ),
             (
-                TempoHardfork::T11,
-                IAccountKeychain::setAllowedCalls_0Call::SELECTOR,
+                TempoHardfork::T2,
+                IAccountKeychain::setAllowedCallsCall::SELECTOR,
             ),
             (
                 TempoHardfork::T10,
-                IAccountKeychain::setAllowedCalls_1Call::SELECTOR,
+                IWithdrawnKeychain::setAllowedCallsCall::SELECTOR,
+            ),
+            (
+                TempoHardfork::T11,
+                IWithdrawnKeychain::setAllowedCallsCall::SELECTOR,
             ),
             (
                 TempoHardfork::T2,
@@ -2739,8 +2685,7 @@ mod tests {
             let mut provider = TestStorageProvider::new(spec);
             let output = StorageCtx::enter(&mut provider, || {
                 AccountKeychain::new().call(&selector, Address::ZERO)
-            })
-            .unwrap();
+            }).unwrap();
             assert!(output.reverted);
             assert_unknown_selector(&output.bytes, selector);
         }
@@ -2770,75 +2715,57 @@ mod tests {
     }
 
     #[test]
-    fn t11_set_allowed_calls_uses_canonical_rlp() {
+    fn t11_set_allowed_calls_keeps_abi_and_rejects_withdrawn_rlp() {
         let account = Address::repeat_byte(0x81);
         let key_id = Address::repeat_byte(0x82);
         let target = tip20_addr();
         let recipient = Address::repeat_byte(0x83);
-        let scopes = vec![RlpCallScope {
-            target,
-            selector_rules: vec![RlpSelectorRule {
-                selector: FixedBytes::new(TIP20_TRANSFER_SELECTOR),
-                recipients: vec![recipient],
+        let calldata = IAccountKeychain::setAllowedCallsCall {
+            keyId: key_id,
+            scopes: vec![IAccountKeychain::CallScope {
+                target,
+                selectorRules: vec![IAccountKeychain::SelectorRule {
+                    selector: FixedBytes::new(TIP20_TRANSFER_SELECTOR),
+                    recipients: vec![recipient],
+                }],
             }],
-        }];
-        let encoded_scopes = alloy_rlp::encode(&scopes);
-        let old_calldata = IAccountKeychain::setAllowedCalls_0Call {
+        }.abi_encode();
+        let withdrawn = IWithdrawnKeychain::setAllowedCallsCall {
             keyId: key_id,
-            scopes: Vec::new(),
-        }
-        .abi_encode();
-        let new_calldata = IAccountKeychain::setAllowedCalls_1Call {
-            keyId: key_id,
-            scopes: encoded_scopes.into(),
-        }
-        .abi_encode();
+            scopes: alloy_rlp::encode(vec![RlpCallScope {
+                target, selector_rules: Vec::new(),
+            }]).into(),
+        }.abi_encode();
         let mut provider = TestStorageProvider::new(TempoHardfork::T11);
-
         StorageCtx::enter(&mut provider, || -> Result<()> {
             let mut keychain = AccountKeychain::new();
             keychain.set_tx_origin(account)?;
             keychain.authorize_key_with_restrictions(
-                account,
-                key_id,
-                IAccountKeychain::SignatureType::Secp256k1,
-                unrestricted_restrictions(),
-                None,
+                account, key_id, IAccountKeychain::SignatureType::Secp256k1,
+                unrestricted_restrictions(), None,
             )?;
+            let rejected = keychain.call(&withdrawn, account).unwrap();
+            assert!(rejected.reverted);
+            assert_unknown_selector(&rejected.bytes, IWithdrawnKeychain::setAllowedCallsCall::SELECTOR);
+            let before = keychain.get_allowed_calls(IAccountKeychain::getAllowedCallsCall { account, keyId: key_id })?;
+            assert!(!before.isScoped);
 
-            let old_output = keychain.call(&old_calldata, account).unwrap();
-            assert!(old_output.reverted);
-            assert_unknown_selector(
-                &old_output.bytes,
-                IAccountKeychain::setAllowedCalls_0Call::SELECTOR,
-            );
-
-            let output = keychain.call(&new_calldata, account).unwrap();
+            let output = keychain.call(&calldata, account).unwrap();
             assert!(!output.reverted);
-            let stored = keychain.get_allowed_calls(IAccountKeychain::getAllowedCallsCall {
-                account,
-                keyId: key_id,
-            })?;
+            let stored = keychain.get_allowed_calls(IAccountKeychain::getAllowedCallsCall { account, keyId: key_id })?;
             assert!(stored.isScoped);
             assert_eq!(stored.scopes.len(), 1);
             assert_eq!(stored.scopes[0].target, target);
             assert_eq!(stored.scopes[0].selectorRules.len(), 1);
-            assert_eq!(
-                stored.scopes[0].selectorRules[0].selector,
-                FixedBytes::new(TIP20_TRANSFER_SELECTOR),
-            );
-            assert_eq!(
-                stored.scopes[0].selectorRules[0].recipients,
-                vec![recipient],
-            );
+            assert_eq!(stored.scopes[0].selectorRules[0].selector, FixedBytes::new(TIP20_TRANSFER_SELECTOR));
+            assert_eq!(stored.scopes[0].selectorRules[0].recipients, vec![recipient]);
             Ok(())
-        })
-        .unwrap();
+        }).unwrap();
     }
 
     #[test]
     fn rlp_set_allowed_calls_is_disabled_before_t11() {
-        let calldata = IAccountKeychain::setAllowedCalls_1Call {
+        let calldata = IWithdrawnKeychain::setAllowedCallsCall {
             keyId: Address::repeat_byte(0x91),
             scopes: Bytes::from_static(&[0xc0]),
         }
@@ -2851,12 +2778,12 @@ mod tests {
         assert!(output.reverted);
         assert_unknown_selector(
             &output.bytes,
-            IAccountKeychain::setAllowedCalls_1Call::SELECTOR,
+            IWithdrawnKeychain::setAllowedCallsCall::SELECTOR,
         );
     }
 
     #[test]
-    fn t11_set_allowed_calls_rejects_noncanonical_rlp() {
+    fn withdrawn_rlp_selector_rejects_every_payload_at_t11() {
         let valid = alloy_rlp::encode(vec![RlpCallScope {
             target: Address::repeat_byte(0xa1),
             selector_rules: Vec::new(),
@@ -2880,7 +2807,7 @@ mod tests {
         StorageCtx::enter(&mut provider, || {
             let mut keychain = AccountKeychain::new();
             for scopes in invalid_inputs {
-                let calldata = IAccountKeychain::setAllowedCalls_1Call {
+                let calldata = IWithdrawnKeychain::setAllowedCallsCall {
                     keyId: Address::repeat_byte(0xa2),
                     scopes: scopes.into(),
                 }
@@ -2889,33 +2816,96 @@ mod tests {
                     .call(&calldata, Address::repeat_byte(0xa3))
                     .unwrap();
                 assert!(output.reverted);
-                assert_eq!(
-                    output.bytes.as_ref(),
-                    IAccountKeychain::InvalidCallScope::SELECTOR,
-                );
+                assert_unknown_selector(&output.bytes, IWithdrawnKeychain::setAllowedCallsCall::SELECTOR);
             }
         });
     }
 
     #[test]
-    fn t11_set_allowed_calls_charges_rlp_gas_before_decode() {
-        let calldata = IAccountKeychain::setAllowedCalls_1Call {
+    fn withdrawn_rlp_selector_charges_only_calldata_gas() {
+        let calldata = IWithdrawnKeychain::setAllowedCallsCall {
             keyId: Address::repeat_byte(0xb1),
             scopes: Bytes::from_static(&[0x80]),
+        }.abi_encode();
+        let input_gas = calldata.len().div_ceil(32) as u64 * 30;
+        for (limit, out_of_gas) in [(input_gas - 1, true), (input_gas, false)] {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+            provider.set_gas_limit(limit);
+            let result = StorageCtx::enter(&mut provider, || {
+                AccountKeychain::new().call(&calldata, Address::repeat_byte(0xb2))
+            });
+            if out_of_gas {
+                assert!(matches!(result, Err(PrecompileError::OutOfGas)));
+            } else {
+                let output = result.unwrap();
+                assert!(output.reverted);
+                assert_eq!(output.gas_used, input_gas);
+                assert_unknown_selector(
+                    &output.bytes,
+                    IWithdrawnKeychain::setAllowedCallsCall::SELECTOR,
+                );
+            }
         }
-        .abi_encode();
-        let global_input_gas = calldata.len().div_ceil(32) as u64 * 30;
+    }
+
+    #[test]
+    fn t11_dedup_meters_each_checked_list_and_preserves_error_order() {
+        let target = tip20_addr();
+        let recipient = Address::repeat_byte(0xc1);
+        let scopes = vec![IAccountKeychain::CallScope {
+            target,
+            selectorRules: vec![IAccountKeychain::SelectorRule {
+                selector: FixedBytes::new(TIP20_TRANSFER_SELECTOR),
+                recipients: vec![recipient, Address::repeat_byte(0xc2)],
+            }],
+        }];
+        for (spec, gas) in [(TempoHardfork::T10, 0), (TempoHardfork::T11, 80)] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut keychain = AccountKeychain::new();
+                keychain.validate_call_scopes(&scopes).unwrap();
+                assert_eq!(keychain.storage.gas_used(), gas);
+            });
+        }
+        for (limit, expected) in [
+            (39, TempoPrecompileError::OutOfGas),
+            (40, err_invalid_call_scope()),
+        ] {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+            provider.set_gas_limit(limit);
+            StorageCtx::enter(&mut provider, || {
+                let mut keychain = AccountKeychain::new();
+                let duplicate = IAccountKeychain::CallScope {
+                    target,
+                    selectorRules: Vec::new(),
+                };
+                assert_eq!(
+                    keychain.validate_call_scopes(&[duplicate.clone(), duplicate]),
+                    Err(expected)
+                );
+            });
+        }
         let mut provider = TestStorageProvider::new(TempoHardfork::T11);
-        provider.set_gas_limit(global_input_gas + RLP_INPUT_PER_WORD_COST - 1);
-        let result = StorageCtx::enter(&mut provider, || {
-            AccountKeychain::new().call(&calldata, Address::repeat_byte(0xb2))
+        provider.set_gas_limit(40);
+        StorageCtx::enter(&mut provider, || {
+            let mut keychain = AccountKeychain::new();
+            let mut invalid = scopes;
+            invalid[0].selectorRules[0].recipients = vec![Address::ZERO];
+            assert_eq!(
+                keychain.validate_call_scopes(&invalid),
+                Err(err_invalid_call_scope())
+            );
+            assert_eq!(
+                keychain.storage.gas_used(),
+                40,
+                "zero recipient fails before recipient dedup"
+            );
         });
-        assert!(matches!(result, Err(PrecompileError::OutOfGas)));
     }
 
     #[test]
     fn t11_sorted_scope_validation_rejects_duplicates() {
-        let keychain = AccountKeychain::new();
+        let mut keychain = AccountKeychain::new();
         let target = tip20_addr();
         let other_target = Address::repeat_byte(0xc0);
         let selector = FixedBytes::from(TIP20_TRANSFER_SELECTOR);
@@ -2972,7 +2962,7 @@ mod tests {
 
         let mut t10_provider = TestStorageProvider::new(TempoHardfork::T10);
         StorageCtx::enter(&mut t10_provider, || {
-            let keychain = AccountKeychain::new();
+            let mut keychain = AccountKeychain::new();
             let recipient = Address::repeat_byte(0xd2);
             let other_recipient = Address::repeat_byte(0xd3);
             assert!(keychain
@@ -3403,7 +3393,7 @@ mod tests {
     fn validate_selector_rules_t4_rejects_non_tip20_prefix_target() {
         // T4 stateless path: target without the TIP-20 prefix is rejected even
         // before any storage probe.
-        let kc = AccountKeychain::new();
+        let mut kc = AccountKeychain::new();
         let rules = one_transfer_rule_with_recipient();
         let result = with_read_only_storage_ctx(
             &EmptyDB::default(),
@@ -3418,7 +3408,7 @@ mod tests {
     fn validate_selector_rules_t4_accepts_tip20_prefix_with_no_bytecode() {
         // T4 stateless: prefix alone is sufficient — EmptyDB has no deployed
         // TIP-20 token, but the format check still passes.
-        let kc = AccountKeychain::new();
+        let mut kc = AccountKeychain::new();
         let rules = one_transfer_rule_with_recipient();
         let result = with_read_only_storage_ctx(
             &EmptyDB::default(),
@@ -3433,7 +3423,7 @@ mod tests {
     fn validate_selector_rules_t3_rejects_tip20_prefix_without_bytecode() {
         // T3 stateful: prefix passes the format check but the storage probe
         // (`TIP20Factory::is_tip20`) sees no code at `tip20_addr` → rejected.
-        let kc = AccountKeychain::new();
+        let mut kc = AccountKeychain::new();
         let rules = one_transfer_rule_with_recipient();
         let result = with_read_only_storage_ctx(
             &EmptyDB::default(),
@@ -3605,7 +3595,7 @@ mod tests {
     fn validate_selector_rules_skips_tip20_check_for_recipientless_rules() {
         // Both T3 and T4: a rule with empty recipients doesn't trigger the
         // TIP-20 probe (skipped before `is_tip20()`), so it passes regardless.
-        let kc = AccountKeychain::new();
+        let mut kc = AccountKeychain::new();
         let rules = vec![IAccountKeychain::SelectorRule {
             selector: FixedBytes::from(TIP20_TRANSFER_SELECTOR),
             recipients: Vec::new(),

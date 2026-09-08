@@ -90,7 +90,7 @@ alloy-rlp = "0.3"
 alloy-rlp-derive = "0.3"
 alloy-hardforks = "0.4"
 alloy-evm = "0.29.2"
-alloy-sol-types = "1.3"
+alloy-sol-types = "=1.7.2"
 # alloy-contract 的 Rust 代码没直接 use，但 `sol!` 宏展开会生成 alloy_contract::* 的引用。
 alloy-contract = "1.1.3"
 
@@ -131,19 +131,6 @@ arc-swap = "1.7"
 
 # for test
 metrics-util = "0.19"
-
-[patch.crates-io]
-# Tempo v1.13.1 decoder memory-limit backport. Keep the full Alloy Core set on
-# one revision so sol! macro output and runtime decoding types remain aligned.
-alloy-dyn-abi = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-json-abi = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-primitives = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-sol-macro = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-sol-macro-expander = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-sol-macro-input = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-alloy-sol-types = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
-syn-solidity = { git = "https://github.com/alloy-rs/core", rev = "2d5870c3d62b8b9229d33160cbcc431aeb2cdc21" }
 
 [profile.release]
 opt-level = 3

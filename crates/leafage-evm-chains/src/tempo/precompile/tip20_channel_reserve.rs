@@ -761,7 +761,7 @@ impl Precompile for TIP20ChannelReserve {
             |data| {
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::abi_decode_with_config(
                     data,
-                    super::abi_decoder_config(),
+                    super::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {

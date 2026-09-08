@@ -18,6 +18,7 @@
 /// - T8: 1785420000 (Jul 30, 2026 14:00 UTC)
 /// - T9: 1786024800 (Aug 6, 2026 14:00 UTC)
 /// - T10: 1787320800 (Aug 21, 2026 14:00 UTC)
+/// - T11: 1789048800 (Sep 10, 2026 14:00 UTC)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TempoHardfork {
     Genesis,
@@ -35,7 +36,7 @@ pub enum TempoHardfork {
     T9,
     #[default]
     T10,
-    /// Defined by the protocol, but not scheduled on Tempo mainnet yet.
+    /// Formal T11 rules from Tempo v1.14.0.
     T11,
 }
 
@@ -60,6 +61,7 @@ const MAINNET_T7_TIME: u64 = 1_783_605_600;
 const MAINNET_T8_TIME: u64 = 1_785_420_000;
 const MAINNET_T9_TIME: u64 = 1_786_024_800;
 const MAINNET_T10_TIME: u64 = 1_787_320_800;
+const MAINNET_T11_TIME: u64 = 1_789_048_800;
 
 impl TempoHardfork {
     /// Determine the active hardfork for a given block timestamp.
@@ -68,7 +70,9 @@ impl TempoHardfork {
     /// timestamp 0 (same as Genesis), so the `Genesis` variant covers both
     /// the Genesis and T0 eras.
     pub fn from_timestamp(timestamp: u64) -> Self {
-        if timestamp >= MAINNET_T10_TIME {
+        if timestamp >= MAINNET_T11_TIME {
+            Self::T11
+        } else if timestamp >= MAINNET_T10_TIME {
             Self::T10
         } else if timestamp >= MAINNET_T9_TIME {
             Self::T9
@@ -329,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn from_timestamp_t5_through_t10_boundaries() {
+    fn from_timestamp_t5_through_t11_boundaries() {
         let boundaries = [
             (MAINNET_T5_TIME, TempoHardfork::T4, TempoHardfork::T5),
             (MAINNET_T6_TIME, TempoHardfork::T5, TempoHardfork::T6),
@@ -337,6 +341,7 @@ mod tests {
             (MAINNET_T8_TIME, TempoHardfork::T7, TempoHardfork::T8),
             (MAINNET_T9_TIME, TempoHardfork::T8, TempoHardfork::T9),
             (MAINNET_T10_TIME, TempoHardfork::T9, TempoHardfork::T10),
+            (MAINNET_T11_TIME, TempoHardfork::T10, TempoHardfork::T11),
         ];
 
         for (timestamp, before, active) in boundaries {
@@ -345,8 +350,8 @@ mod tests {
             assert_eq!(TempoHardfork::from_timestamp(timestamp + 1), active);
         }
 
-        // T11 has no mainnet activation timestamp yet.
-        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T10);
+        // Future timestamps select the latest scheduled fork, never an unscheduled one.
+        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T11);
     }
 
     #[test]

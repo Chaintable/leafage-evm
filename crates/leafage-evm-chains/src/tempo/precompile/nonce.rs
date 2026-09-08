@@ -228,7 +228,7 @@ impl Precompile for NonceManager {
             |data| {
                 INonce::INonceCalls::abi_decode_with_config(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(),
+                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {
@@ -242,6 +242,89 @@ impl Precompile for NonceManager {
 mod tests {
     use super::*;
     use crate::tempo::{hardfork::TempoHardfork, precompile::test_utils::TestStorageProvider};
+
+    #[test]
+    fn t10_state_survives_t11_ring_growth_and_expiry() {
+        let activation = 1_789_048_800u64;
+        let old_hash = B256::repeat_byte(0x61);
+        let new_hash = B256::repeat_byte(0x62);
+        let old_capacity = TempoHardfork::T10.expiring_nonce_set_capacity();
+        let account = Address::repeat_byte(0x63);
+        let mut storage = TestStorageProvider::new(TempoHardfork::T10);
+        storage.set_timestamp(U256::from(activation - 1));
+        StorageCtx::enter(&mut storage, || {
+            let mut manager = NonceManager::new();
+            manager
+                .expiring_nonce_ring_ptr
+                .write(old_capacity - 2)
+                .unwrap();
+            manager
+                .check_and_mark_expiring_nonce(old_hash, activation + 29)
+                .unwrap();
+            assert_eq!(manager.increment_nonce(account, U256::ONE).unwrap(), 1);
+        });
+
+        // Reuse the same storage, not a fresh T11 fixture.
+        storage.set_spec(TempoHardfork::T11);
+        storage.set_timestamp(U256::from(activation));
+        StorageCtx::enter(&mut storage, || {
+            let mut manager = NonceManager::new();
+            assert_eq!(
+                manager
+                    .get_nonce(INonce::getNonceCall {
+                        account,
+                        nonceKey: U256::ONE
+                    })
+                    .unwrap(),
+                1
+            );
+            let error = manager
+                .check_and_mark_expiring_nonce(old_hash, activation + 300)
+                .unwrap_err();
+            assert_eq!(error.selector(), INonce::ExpiringNonceReplay::SELECTOR);
+            assert_eq!(
+                manager.expiring_nonce_ring_ptr.read().unwrap(),
+                old_capacity - 1
+            );
+            manager
+                .check_and_mark_expiring_nonce(new_hash, activation + 300)
+                .unwrap();
+            assert_eq!(
+                manager.expiring_nonce_ring_ptr.read().unwrap(),
+                old_capacity
+            );
+            assert!(manager
+                .is_expiring_nonce_seen(old_hash, activation)
+                .unwrap());
+            manager
+                .check_and_mark_expiring_nonce(B256::repeat_byte(0x64), activation + 300)
+                .unwrap();
+            assert_eq!(
+                manager.expiring_nonce_ring_ptr.read().unwrap(),
+                old_capacity + 1
+            );
+        });
+
+        storage.set_timestamp(U256::from(activation + 29));
+        StorageCtx::enter(&mut storage, || {
+            let mut manager = NonceManager::new();
+            assert!(!manager
+                .is_expiring_nonce_seen(old_hash, activation + 29)
+                .unwrap());
+            manager
+                .expiring_nonce_ring_ptr
+                .write(old_capacity - 2)
+                .unwrap();
+            manager
+                .check_and_mark_expiring_nonce(B256::repeat_byte(0x65), activation + 329)
+                .unwrap();
+            assert_eq!(manager.expiring_nonce_seen[old_hash].read().unwrap(), 0);
+            assert_eq!(
+                manager.expiring_nonce_seen[new_hash].read().unwrap(),
+                activation + 300
+            );
+        });
+    }
 
     #[test]
     fn expiry_window_changes_at_t11() {

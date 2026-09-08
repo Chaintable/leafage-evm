@@ -292,6 +292,7 @@ impl ZoneFactory {
             return Err(revert(IZoneFactory::TokenTransferPolicyNotSet {}));
         }
         validate_closed_loop_config(
+            &mut self.storage,
             &call.params.allowedAccounts,
             &call.params.zoneGateways,
             &call.params.sequencers,
@@ -468,7 +469,7 @@ impl Precompile for ZoneFactory {
             |data| {
                 IZoneFactory::IZoneFactoryCalls::abi_decode_with_config(
                     data,
-                    super::abi_decoder_config(),
+                    super::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {
@@ -508,12 +509,27 @@ fn validate_token_metadata(name: &str, symbol: &str, currency: &str) -> Result<(
 }
 
 fn validate_closed_loop_config(
+    storage: &mut StorageCtx,
     allowed_accounts: &[Address],
     zone_gateways: &[Address],
     sequencers: &[Address],
 ) -> Result<()> {
     if allowed_accounts.contains(&ZONE_MESSENGER_ADDRESS) {
         return Err(revert(IZoneFactory::InvalidClosedLoopConfig {}));
+    }
+
+    if storage.spec().is_t11() {
+        if super::has_duplicates_metered(
+            storage,
+            allowed_accounts
+                .iter()
+                .chain(zone_gateways)
+                .chain(sequencers)
+                .copied(),
+        )? {
+            return Err(revert(IZoneFactory::InvalidClosedLoopConfig {}));
+        }
+        return Ok(());
     }
 
     let mut seen =
@@ -989,6 +1005,54 @@ mod tests {
             Result::<()>::Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn t11_role_dedup_is_metered_within_and_across_lists() {
+        for (allowed, gateways, sequencers) in [
+            (
+                vec![ALLOWED_ACCOUNT, ALLOWED_ACCOUNT],
+                vec![],
+                vec![SEQUENCER_A],
+            ),
+            (vec![], vec![ZONE_GATEWAY, ZONE_GATEWAY], vec![SEQUENCER_A]),
+            (vec![], vec![], vec![SEQUENCER_A, SEQUENCER_A]),
+            (
+                vec![ALLOWED_ACCOUNT],
+                vec![ALLOWED_ACCOUNT],
+                vec![SEQUENCER_A],
+            ),
+            (vec![ALLOWED_ACCOUNT], vec![], vec![ALLOWED_ACCOUNT]),
+            (vec![], vec![ZONE_GATEWAY], vec![ZONE_GATEWAY]),
+        ] {
+            let gas = (allowed.len() + gateways.len() + sequencers.len()) as u64 * 20;
+            for (limit, expected) in [
+                (gas - 1, TempoPrecompileError::OutOfGas),
+                (gas, revert(IZoneFactory::InvalidClosedLoopConfig {})),
+            ] {
+                let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+                provider.set_gas_limit(limit);
+                StorageCtx::enter(&mut provider, || {
+                    assert_eq!(
+                        validate_closed_loop_config(
+                            &mut StorageCtx,
+                            &allowed,
+                            &gateways,
+                            &sequencers
+                        ),
+                        Err(expected)
+                    );
+                });
+            }
+        }
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+        provider.set_gas_limit(0);
+        StorageCtx::enter(&mut provider, || {
+            assert_eq!(
+                validate_closed_loop_config(&mut StorageCtx, &[ZONE_MESSENGER_ADDRESS], &[], &[]),
+                Err(revert(IZoneFactory::InvalidClosedLoopConfig {}))
+            );
+        });
     }
 
     #[test]

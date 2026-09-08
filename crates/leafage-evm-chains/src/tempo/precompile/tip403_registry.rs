@@ -1307,7 +1307,7 @@ impl Precompile for TIP403Registry {
             |data| {
                 ITIP403Registry::ITIP403RegistryCalls::abi_decode_with_config(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(),
+                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {

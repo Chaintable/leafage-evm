@@ -561,7 +561,7 @@ impl Precompile for ValidatorConfig {
             |data| {
                 IValidatorConfig::IValidatorConfigCalls::abi_decode_with_config(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(),
+                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {

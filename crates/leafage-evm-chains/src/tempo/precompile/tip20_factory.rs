@@ -306,7 +306,7 @@ impl Precompile for TIP20Factory {
             |data| {
                 ITIP20Factory::ITIP20FactoryCalls::abi_decode_with_config(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(),
+                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
                 )
             },
             |call| match call {

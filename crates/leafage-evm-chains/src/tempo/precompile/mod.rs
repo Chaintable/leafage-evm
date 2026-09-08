@@ -129,8 +129,31 @@ pub const ECRECOVER_GAS: u64 = 3_000;
 pub const ABI_DECODER_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
 
 #[inline]
-pub const fn abi_decoder_config() -> alloy::sol_types::abi::AbiDecoderConfig {
-    alloy::sol_types::abi::AbiDecoderConfig::new().memory_limit(ABI_DECODER_MEMORY_LIMIT)
+pub const fn abi_decoder_config(
+    spec: crate::tempo::hardfork::TempoHardfork,
+) -> alloy::sol_types::abi::AbiDecoderConfig {
+    alloy::sol_types::abi::AbiDecoderConfig::new()
+        .memory_limit(ABI_DECODER_MEMORY_LIMIT)
+        .strict(spec.is_t11())
+}
+
+/// Charges duplicate validation before sorting, preserving the pre-T11 zero-cost schedule.
+pub fn has_duplicates_metered<T: Ord>(
+    storage: &mut StorageCtx,
+    values: impl IntoIterator<Item = T>,
+) -> Result<bool> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    let cost = if storage.spec().is_t11() {
+        u64::try_from(values.len())
+            .ok()
+            .and_then(|len| len.checked_mul(20))
+            .ok_or(TempoPrecompileError::OutOfGas)?
+    } else {
+        0
+    };
+    storage.deduct_gas(cost)?;
+    values.sort_unstable();
+    Ok(values.windows(2).any(|pair| pair[0] == pair[1]))
 }
 
 /// Returns the gas cost for decoding calldata of the given length, rounded up to word boundaries.
@@ -577,6 +600,60 @@ mod tests {
     alloy::sol! {
         interface ITestMemoryDispatch {
             function setValues(uint256[] values) external;
+            function setPayloads(bytes first, bytes second) external;
+        }
+    }
+
+    #[test]
+    fn t11_strict_abi_rejects_gaps_overlap_trailing_and_padding() {
+        use crate::tempo::hardfork::TempoHardfork;
+        let canonical = ITestMemoryDispatch::setPayloadsCall {
+            first: Bytes::from_static(&[1]),
+            second: Bytes::from_static(&[2]),
+        }
+        .abi_encode();
+        let mut trailing = canonical.clone();
+        trailing.extend([0; 32]);
+        let mut overlap = canonical.clone();
+        overlap[36..68].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+        let mut padding = canonical.clone();
+        *padding.last_mut().unwrap() = 1;
+        let mut gap = canonical.clone();
+        gap.splice(68..68, [0; 32]);
+        gap[4..36].copy_from_slice(&U256::from(96).to_be_bytes::<32>());
+        gap[36..68].copy_from_slice(&U256::from(160).to_be_bytes::<32>());
+
+        for spec in [TempoHardfork::T10, TempoHardfork::T11] {
+            assert!(
+                ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+                    &canonical,
+                    abi_decoder_config(spec),
+                )
+                .is_ok()
+            );
+            for input in [&trailing, &overlap, &padding, &gap] {
+                let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+                    input,
+                    abi_decoder_config(spec),
+                );
+                assert_eq!(result.is_err(), spec.is_t11(), "{spec:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_validation_charges_before_checking_and_only_from_t11() {
+        use crate::tempo::hardfork::TempoHardfork;
+        for (spec, limit, expected) in [
+            (TempoHardfork::T10, 0, Ok(true)),
+            (TempoHardfork::T11, 59, Err(TempoPrecompileError::OutOfGas)),
+            (TempoHardfork::T11, 60, Ok(true)),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            provider.set_gas_limit(limit);
+            StorageCtx::enter(&mut provider, || {
+                assert_eq!(has_duplicates_metered(&mut StorageCtx, [2, 1, 2]), expected);
+            });
         }
     }
 
@@ -586,11 +663,16 @@ mod tests {
         calldata.extend(U256::from(32).to_be_bytes::<32>());
         calldata.extend(U256::from(ABI_DECODER_MEMORY_LIMIT as u64).to_be_bytes::<32>());
 
-        let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
-            &calldata,
-            abi_decoder_config(),
-        );
-        assert!(result.is_err());
+        for spec in [
+            crate::tempo::hardfork::TempoHardfork::T10,
+            crate::tempo::hardfork::TempoHardfork::T11,
+        ] {
+            let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+                &calldata,
+                abi_decoder_config(spec),
+            );
+            assert!(result.is_err());
+        }
     }
 
     #[test]
