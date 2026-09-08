@@ -63,8 +63,9 @@ pub struct Command {
     evm_type: String,
 
     /// Custom EVM parameters for Cosmos, Arbitrum or OP.
-    /// OP supports independent limit_contract_code_size and limit_contract_initcode_size
-    /// overrides in bytes; initcode also accepts "unlimited".
+    /// OP supports op_spec_id (100..=110; 108 is Jovian), plus independent
+    /// limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
+    /// initcode also accepts "unlimited". Omitted op_spec_id retains Osaka.
     ///
     /// # Example
     /// --evm-type=cosmos
@@ -73,7 +74,7 @@ pub struct Command {
     evm_custom_config: Option<String>,
 
     /// Execution specification ID, using the selected EVM type's numbering.
-    /// OP: 100 (Bedrock) through 110 (Osaka); 108 selects Jovian (Prague).
+    /// For OP, use op_spec_id in --evm-custom-config instead.
     ///
     /// if not specified, the default spec_id is u8::MAX
     #[arg(long, default_value = "255")]
@@ -471,9 +472,6 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Re
 
 fn resolve_op_spec(spec_id: u8) -> Result<OpSpecId> {
     use OpSpecId::*;
-    if spec_id == u8::MAX {
-        return Ok(OSAKA);
-    }
     [
         BEDROCK, REGOLITH, CANYON, ECOTONE, FJORD, GRANITE, HOLOCENE, ISTHMUS, JOVIAN, INTEROP,
         OSAKA,
@@ -482,7 +480,7 @@ fn resolve_op_spec(spec_id: u8) -> Result<OpSpecId> {
     .find(|spec| *spec as u8 == spec_id)
     .ok_or_else(|| {
         anyhow!(
-            "invalid --spec-id {} for op evm-type (expected 100..=110 or 255)",
+            "invalid op_spec_id {} in op custom evm config (expected 100..=110)",
             spec_id
         )
     })
@@ -498,12 +496,13 @@ enum InitcodeLimit {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct OpCustomConfig {
+    op_spec_id: Option<u8>,
     limit_contract_code_size: Option<usize>,
     limit_contract_initcode_size: Option<InitcodeLimit>,
 }
 
-fn apply_op_custom_config(cfg: &mut CfgEnv<OpSpecId>, json: Option<&str>) -> Result<()> {
-    let Some(json) = json else { return Ok(()) };
+fn build_op_custom_config(json: Option<&str>) -> Result<CfgEnv<OpSpecId>> {
+    let json = json.unwrap_or("{}");
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|err| anyhow!("cannot parse op custom evm config: {err}"))?;
     if !value.is_object() {
@@ -511,6 +510,12 @@ fn apply_op_custom_config(cfg: &mut CfgEnv<OpSpecId>, json: Option<&str>) -> Res
     }
     let custom: OpCustomConfig = serde_json::from_value(value)
         .map_err(|err| anyhow!("cannot parse op custom evm config: {err}"))?;
+    let spec = custom
+        .op_spec_id
+        .map(resolve_op_spec)
+        .transpose()?
+        .unwrap_or(OpSpecId::OSAKA);
+    let mut cfg = CfgEnv::new_with_spec(spec);
     // revm otherwise inherits 2 * code_size. These overrides are independent.
     let original_initcode_limit = cfg.max_initcode_size();
     if let Some(size) = custom.limit_contract_code_size {
@@ -524,7 +529,7 @@ fn apply_op_custom_config(cfg: &mut CfgEnv<OpSpecId>, json: Option<&str>) -> Res
             InitcodeLimit::Keyword(_) => bail!("op initcode limit must be bytes or \"unlimited\""),
         });
     }
-    Ok(())
+    Ok(cfg)
 }
 
 impl Command {
@@ -566,14 +571,18 @@ impl Command {
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(resolve_op_spec(self.spec_id)?);
+                if self.spec_id != u8::MAX {
+                    bail!(
+                        "--spec-id is not supported for op; use op_spec_id in --evm-custom-config"
+                    );
+                }
+                let mut chain_cfg = build_op_custom_config(custom_evm_cfg.as_deref())?;
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
-                apply_op_custom_config(&mut chain_cfg, custom_evm_cfg.as_deref())?;
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
             }
             "base" => {
@@ -987,24 +996,32 @@ mod op_config_tests {
     #[test]
     fn all_op_spec_ids_are_checked() {
         for id in 0..=u8::MAX {
-            let cmd = command(&["--spec-id", &id.to_string()]);
+            let json = format!(r#"{{"op_spec_id":{id}}}"#);
+            let cmd = command(&["--evm-custom-config", &json]);
             let result = cmd.build_chain_cfg_env();
-            if (100..=110).contains(&id) || id == 255 {
+            if (100..=110).contains(&id) {
                 let MultiChainCfgEnv::Op(cfg) = result.unwrap() else {
                     panic!()
                 };
-                assert_eq!(cfg.spec as u8, if id == 255 { 110 } else { id });
+                assert_eq!(cfg.spec as u8, id);
                 assert_eq!(cfg.gas_params, CfgEnv::new_with_spec(cfg.spec).gas_params);
             } else {
                 assert!(result.is_err(), "accepted {id}");
             }
         }
         assert_eq!(config(&[]).spec, OpSpecId::OSAKA);
-        for bad in ["256", "-1", "Jovian"] {
-            assert!(
-                Command::try_parse_from(["standalone", "--db-path=/unused", "--spec-id", bad])
-                    .is_err()
-            );
+        for json in ["{}", r#"{"op_spec_id":null}"#] {
+            assert_eq!(config(&["--evm-custom-config", json]).spec, OpSpecId::OSAKA);
+        }
+        // The global selector must not silently override or be ignored by OP config.
+        for id in ["18", "108"] {
+            for json in ["{}", r#"{"op_spec_id":108}"#] {
+                let err = command(&["--spec-id", id, "--evm-custom-config", json])
+                    .build_chain_cfg_env()
+                    .err()
+                    .unwrap();
+                assert!(err.to_string().contains("use op_spec_id"));
+            }
         }
     }
 
@@ -1035,9 +1052,8 @@ mod op_config_tests {
             (24576, 524288)
         );
         let rise = config(&[
-            "--spec-id=108",
             "--evm-custom-config",
-            r#"{"limit_contract_code_size":262144,"limit_contract_initcode_size":524288}"#,
+            r#"{"op_spec_id":108,"limit_contract_code_size":262144,"limit_contract_initcode_size":524288}"#,
         ]);
         assert_eq!(rise.spec, OpSpecId::JOVIAN);
         assert_eq!(
@@ -1068,6 +1084,12 @@ mod op_config_tests {
             "42",
             "{",
             r#"{"typo":1}"#,
+            r#"{"spec_id":108}"#,
+            r#"{"op_spec_id":256}"#,
+            r#"{"op_spec_id":-1}"#,
+            r#"{"op_spec_id":108.5}"#,
+            r#"{"op_spec_id":"108"}"#,
+            r#"{"op_spec_id":"Jovian"}"#,
             r#"{"limit_contract_code_size":-1}"#,
             r#"{"limit_contract_code_size":1.5}"#,
             r#"{"limit_contract_code_size":"unlimited"}"#,
