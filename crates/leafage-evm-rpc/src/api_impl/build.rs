@@ -240,6 +240,9 @@ where
             }
             MultiChainCfgEnv::Iotex(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Monad(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Moonbeam(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }

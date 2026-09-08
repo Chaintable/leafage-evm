@@ -37,6 +37,7 @@ mod mantle;
 mod warmup;
 mod cosmos;
 mod iotex;
+mod monad;
 mod moonbeam;
 mod polygon;
 mod tempo;
