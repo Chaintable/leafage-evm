@@ -12,7 +12,7 @@
 //! - Packing helpers: [`FieldLocation`], [`PackedSlot`], extract/insert/delete operations
 //! - Primitive implementations for `bool`, `Address`, `u8`..`u128`, `U256`
 
-use alloy::primitives::{keccak256, Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256, keccak256};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -82,20 +82,38 @@ impl LayoutCtx {
     /// Load/store the entire value at a given slot.
     pub const FULL: Self = Self(usize::MAX);
 
+    /// Load/store a full value into storage known to be zero-filled.
+    ///
+    /// Dynamic values skip the T5 stale-tail read and cleanup in this mode.
+    pub const INIT: Self = Self(usize::MAX - 1);
+
     /// Load/store a packed primitive at the given byte offset within a slot.
     pub const fn packed(offset: usize) -> Self {
         debug_assert!(offset < 32);
         Self(offset)
     }
 
-    /// Get the packed offset, returns `None` for `Full`.
+    /// Get the packed offset, returns `None` for [`FULL`](Self::FULL) and
+    /// [`INIT`](Self::INIT).
     #[inline]
     pub const fn packed_offset(&self) -> Option<usize> {
-        if self.0 == usize::MAX {
+        if self.0 >= usize::MAX - 1 {
             None
         } else {
             Some(self.0)
         }
+    }
+
+    /// Returns true when the caller guarantees the destination has no stale tail.
+    #[inline]
+    pub const fn skip_tail_cleanup(&self) -> bool {
+        self.0 == usize::MAX - 1
+    }
+
+    /// Returns true for a full-slot context (`FULL` or `INIT`).
+    #[inline]
+    pub const fn is_full(&self) -> bool {
+        self.0 >= usize::MAX - 1
     }
 }
 
@@ -649,13 +667,13 @@ where
 
 /// Cache for computed handlers with stable references.
 #[derive(Debug, Default)]
-struct HandlerCache<K, H> {
+pub(crate) struct HandlerCache<K, H> {
     inner: RefCell<HashMap<K, Box<H>>>,
 }
 
 impl<K, H> HandlerCache<K, H> {
     #[inline]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: RefCell::new(HashMap::new()),
         }
@@ -670,7 +688,7 @@ impl<K, H> Clone for HandlerCache<K, H> {
 
 impl<K: Hash + Eq + Clone, H> HandlerCache<K, H> {
     #[inline]
-    fn get_or_insert(&self, key: &K, f: impl FnOnce() -> H) -> &H {
+    pub(crate) fn get_or_insert(&self, key: &K, f: impl FnOnce() -> H) -> &H {
         let mut cache = self.inner.borrow_mut();
         if let Some(boxed) = cache.get(key) {
             // SAFETY: Box provides stable heap address. Cache is append-only.
@@ -682,7 +700,7 @@ impl<K: Hash + Eq + Clone, H> HandlerCache<K, H> {
     }
 
     #[inline]
-    fn get_or_insert_mut(&mut self, key: &K, f: impl FnOnce() -> H) -> &mut H {
+    pub(crate) fn get_or_insert_mut(&mut self, key: &K, f: impl FnOnce() -> H) -> &mut H {
         let mut cache = self.inner.borrow_mut();
         if let Some(boxed) = cache.get_mut(key) {
             // SAFETY: Box provides stable heap address. Cache is append-only. &mut self ensures exclusive.
@@ -727,7 +745,7 @@ impl<T: Storable> BytesLikeHandler<T> {
     pub fn len(&self) -> Result<usize> {
         let base_value = Slot::<U256>::new(self.base_slot, self.address).read()?;
         let is_long = is_long_string(base_value);
-        Ok(calc_string_length(base_value, is_long))
+        calc_string_length(base_value, is_long)
     }
 
     /// Returns whether the stored value is empty.
@@ -777,16 +795,24 @@ fn is_long_string(base_value: U256) -> bool {
 
 /// Calculates the string/bytes length from the base slot value.
 #[inline]
-fn calc_string_length(base_value: U256, is_long: bool) -> usize {
+fn calc_string_length(base_value: U256, is_long: bool) -> Result<usize> {
     if is_long {
         // Long: base_slot = length * 2 + 1
         let len_u256: U256 = (base_value - U256::from(1u64)) >> 1;
-        // Safe: string length fits in usize
-        len_u256.try_into().unwrap_or(usize::MAX)
+        if len_u256 > U256::from(u32::MAX) {
+            return Err(TempoPrecompileError::under_overflow());
+        }
+        Ok(len_u256.to::<usize>())
     } else {
         // Short: LSB byte = length * 2
         let lsb = base_value.byte(0); // least significant byte
-        (lsb / 2) as usize
+        let len = (lsb / 2) as usize;
+        if len > 31 {
+            return Err(TempoPrecompileError::Fatal(format!(
+                "short bytes length {len} exceeds maximum of 31 bytes"
+            )));
+        }
+        Ok(len)
     }
 }
 
@@ -811,11 +837,7 @@ impl StorableType for bool {
 impl FromWord for bool {
     #[inline]
     fn to_word(&self) -> U256 {
-        if *self {
-            U256::ONE
-        } else {
-            U256::ZERO
-        }
+        if *self { U256::ONE } else { U256::ZERO }
     }
 
     #[inline]
@@ -827,11 +849,7 @@ impl FromWord for bool {
 impl StorageKey for bool {
     #[inline]
     fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
-        if *self {
-            [1u8]
-        } else {
-            [0u8]
-        }
+        if *self { [1u8] } else { [0u8] }
     }
 }
 
@@ -947,6 +965,20 @@ impl_uint_storable! {
     u128, 16;
 }
 
+impl StorageKey for u8 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
+impl StorageKey for u32 {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.to_be_bytes()
+    }
+}
+
 impl StorageKey for u64 {
     #[inline]
     fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
@@ -962,6 +994,30 @@ impl StorageKey for u128 {
 }
 
 impl sealed::OnlyPrimitives for i16 {}
+impl Packable for i16 {}
+
+impl StorableType for i16 {
+    const LAYOUT: Layout = Layout::Bytes(2);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new_with_ctx(slot, ctx, address)
+    }
+}
+
+impl FromWord for i16 {
+    #[inline]
+    fn to_word(&self) -> U256 {
+        U256::from(*self as u16)
+    }
+
+    #[inline]
+    fn from_word(word: U256) -> Result<Self> {
+        u16::try_from(word)
+            .map(|value| value as i16)
+            .map_err(|_| TempoPrecompileError::Fatal("U256 value too large for i16".to_string()))
+    }
+}
 
 impl StorageKey for i16 {
     #[inline]
@@ -1003,6 +1059,55 @@ impl StorageKey for alloy::primitives::B256 {
     }
 }
 
+// -- alloy FixedBytes<4> --
+//
+// Mirrors writer `crates/precompiles-macros/src/storable_primitives.rs::FixedBytes`
+// pattern. Value lives in the LOWER N bytes of the U256 word (left-padded with
+// zeros in upper bytes), matching writer's uniform storage scheme rather than
+// Solidity ABI right-padded bytes4 semantics. The default `mapping_slot`
+// left-pads the key, which diverges from `abi.encode(bytes4)` but is what
+// writer's storage layer uses end-to-end (see writer
+// `storage/types/mod.rs:349-351` warning).
+//
+// Needed to instantiate `Set<FixedBytes<4>>` for account_keychain's
+// per-target selector set in CallScope.
+
+impl sealed::OnlyPrimitives for FixedBytes<4> {}
+impl Packable for FixedBytes<4> {}
+
+impl StorableType for FixedBytes<4> {
+    const LAYOUT: Layout = Layout::Bytes(4);
+    type Handler = Slot<Self>;
+
+    fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
+        Slot::new_with_ctx(slot, ctx, address)
+    }
+}
+
+impl FromWord for FixedBytes<4> {
+    #[inline]
+    fn to_word(&self) -> U256 {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&self.0);
+        U256::from_be_bytes(bytes)
+    }
+
+    #[inline]
+    fn from_word(word: U256) -> Result<Self> {
+        let bytes = word.to_be_bytes::<32>();
+        let mut fixed = [0u8; 4];
+        fixed.copy_from_slice(&bytes[28..32]);
+        Ok(Self::from(fixed))
+    }
+}
+
+impl StorageKey for FixedBytes<4> {
+    #[inline]
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.as_slice()
+    }
+}
+
 // -- Bytes (dynamic) --
 
 impl StorableType for Bytes {
@@ -1029,10 +1134,11 @@ impl StorableType for String {
 
 // Bytes Storable implementation (Solidity-compatible layout)
 impl Storable for Bytes {
-    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+    fn load<S: StorageOps>(storage: &S, slot: U256, ctx: LayoutCtx) -> Result<Self> {
+        debug_assert!(ctx.is_full(), "Bytes cannot be packed");
         let base_value = storage.load(slot)?;
         let is_long = is_long_string(base_value);
-        let len = calc_string_length(base_value, is_long);
+        let len = calc_string_length(base_value, is_long)?;
 
         if !is_long {
             // Short: data is in the high bytes of the base slot
@@ -1054,11 +1160,29 @@ impl Storable for Bytes {
         }
     }
 
-    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
+        debug_assert!(ctx.is_full(), "Bytes cannot be packed");
         let data = self.as_ref();
         let len = data.len();
+        let is_long = len >= 32;
+        let mut data_start = None;
 
-        if len < 32 {
+        if !ctx.skip_tail_cleanup() && StorageCtx.spec().is_t5() {
+            let previous = storage.load(slot)?;
+            if is_long_string(previous) {
+                let previous_slots = calc_string_length(previous, true)?.div_ceil(32);
+                let new_slots = if is_long { len.div_ceil(32) } else { 0 };
+                if previous_slots > new_slots {
+                    let start = calc_data_slot(slot);
+                    for index in new_slots..previous_slots {
+                        storage.store(start + U256::from(index), U256::ZERO)?;
+                    }
+                    data_start = Some(start);
+                }
+            }
+        }
+
+        if !is_long {
             // Short string: pack data + length into one slot
             let mut slot_bytes = [0u8; 32];
             slot_bytes[..len].copy_from_slice(data);
@@ -1070,7 +1194,7 @@ impl Storable for Bytes {
             storage.store(slot, length_value)?;
 
             // Data at keccak256(slot) + i
-            let data_start = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
+            let data_start = data_start.unwrap_or_else(|| calc_data_slot(slot));
             let num_slots = len.div_ceil(32);
 
             for i in 0..num_slots {
@@ -1085,13 +1209,14 @@ impl Storable for Bytes {
         }
     }
 
-    fn delete<S: StorageOps>(storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+    fn delete<S: StorageOps>(storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
+        debug_assert!(ctx.is_full(), "Bytes cannot be packed");
         let base_value = storage.load(slot)?;
         let is_long = is_long_string(base_value);
 
         if is_long {
-            let len = calc_string_length(base_value, true);
-            let data_start = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
+            let len = calc_string_length(base_value, true)?;
+            let data_start = calc_data_slot(slot);
             let num_slots = len.div_ceil(32);
             for i in 0..num_slots {
                 storage.store(data_start + U256::from(i), U256::ZERO)?;
@@ -1148,9 +1273,8 @@ where
     T: Storable,
 {
     fn load<S: StorageOps>(storage: &S, len_slot: U256, ctx: LayoutCtx) -> Result<Self> {
-        debug_assert_eq!(ctx, LayoutCtx::FULL, "Dynamic arrays cannot be packed");
-        let length_value = storage.load(len_slot)?;
-        let length = length_value.to::<usize>();
+        debug_assert!(ctx.is_full(), "Dynamic arrays cannot be packed");
+        let length = load_checked_len(storage, len_slot)?;
 
         if length == 0 {
             return Ok(Self::new());
@@ -1187,14 +1311,22 @@ where
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, len_slot: U256, ctx: LayoutCtx) -> Result<()> {
-        debug_assert_eq!(ctx, LayoutCtx::FULL, "Dynamic arrays cannot be packed");
+        debug_assert!(ctx.is_full(), "Dynamic arrays cannot be packed");
+        let data_start = calc_data_slot(len_slot);
+
+        if !ctx.skip_tail_cleanup() && StorageCtx.spec().is_t5() {
+            let previous_len = load_checked_len(storage, len_slot)?;
+            if previous_len > self.len() {
+                clear_elements::<T, S>(storage, data_start, self.len(), previous_len)?;
+            }
+        }
+
         storage.store(len_slot, U256::from(self.len()))?;
 
         if self.is_empty() {
             return Ok(());
         }
 
-        let data_start = calc_data_slot(len_slot);
         if T::BYTES <= 16 {
             let elems_per_slot = 32 / T::BYTES;
             let slots_needed = packing::calc_packed_slot_count(self.len(), T::BYTES);
@@ -1223,9 +1355,8 @@ where
     }
 
     fn delete<S: StorageOps>(storage: &mut S, len_slot: U256, ctx: LayoutCtx) -> Result<()> {
-        debug_assert_eq!(ctx, LayoutCtx::FULL, "Dynamic arrays cannot be packed");
-        let length_value = storage.load(len_slot)?;
-        let length = length_value.to::<usize>();
+        debug_assert!(ctx.is_full(), "Dynamic arrays cannot be packed");
+        let length = load_checked_len(storage, len_slot)?;
         storage.store(len_slot, U256::ZERO)?;
 
         if length == 0 {
@@ -1233,20 +1364,43 @@ where
         }
 
         let data_start = calc_data_slot(len_slot);
-        if T::BYTES <= 16 {
-            let slot_count = packing::calc_packed_slot_count(length, T::BYTES);
-            for slot_idx in 0..slot_count {
-                storage.store(data_start + U256::from(slot_idx), U256::ZERO)?;
-            }
-        } else {
-            for elem_idx in 0..length {
-                let elem_slot = data_start + U256::from(elem_idx * T::SLOTS);
-                T::delete(storage, elem_slot, LayoutCtx::FULL)?;
-            }
-        }
-
-        Ok(())
+        clear_elements::<T, S>(storage, data_start, 0, length)
     }
+}
+
+#[inline]
+fn load_checked_len<S: StorageOps>(storage: &S, slot: U256) -> Result<usize> {
+    let raw = storage.load(slot)?;
+    if raw > U256::from(u32::MAX) {
+        return Err(TempoPrecompileError::under_overflow());
+    }
+    Ok(raw.to::<usize>())
+}
+
+fn clear_elements<T: Storable, S: StorageOps>(
+    storage: &mut S,
+    data_start: U256,
+    from: usize,
+    to: usize,
+) -> Result<()> {
+    if from >= to {
+        return Ok(());
+    }
+
+    if T::BYTES <= 16 {
+        let first_slot = packing::calc_packed_slot_count(from, T::BYTES);
+        let end_slot = packing::calc_packed_slot_count(to, T::BYTES);
+        for slot_index in first_slot..end_slot {
+            storage.store(data_start + U256::from(slot_index), U256::ZERO)?;
+        }
+    } else {
+        for element_index in from..to {
+            let element_slot = data_start + U256::from(element_index * T::SLOTS);
+            T::delete(storage, element_slot, LayoutCtx::FULL)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Type-safe handler for accessing `Vec<T>` in storage.
@@ -1297,6 +1451,11 @@ where
         }
     }
 
+    /// Returns the slot storing the dynamic array length.
+    pub const fn len_slot(&self) -> U256 {
+        self.len_slot
+    }
+
     const fn max_index() -> usize {
         if T::BYTES <= 16 {
             u32::MAX as usize / T::BYTES
@@ -1317,7 +1476,7 @@ where
     /// Returns the length of the vector (reads from storage).
     pub fn len(&self) -> Result<usize> {
         let slot = Slot::<U256>::new(self.len_slot, self.address);
-        Ok(slot.read()?.to::<usize>())
+        load_checked_len(&slot, self.len_slot)
     }
 
     /// Returns whether the vector is empty.
@@ -1358,23 +1517,36 @@ where
         if length >= Self::max_index() {
             return Err(TempoPrecompileError::Fatal("Vec is at max capacity".into()));
         }
-        let mut elem_slot = Self::compute_handler(self.data_slot(), self.address, length);
-        elem_slot.write(value)?;
+        if T::BYTES <= 16 {
+            let mut elem_slot = Self::compute_handler(self.data_slot(), self.address, length);
+            elem_slot.write(value)?;
+        } else {
+            let elem_slot = self.data_slot() + U256::from(length * T::SLOTS);
+            let mut storage = Slot::<T>::new(elem_slot, self.address);
+            value.store(&mut storage, elem_slot, LayoutCtx::INIT)?;
+        }
         let mut length_slot = Slot::<U256>::new(self.len_slot, self.address);
         length_slot.write(U256::from(length + 1))
     }
 
-    /// Removes and discards the last element of the vector.
-    ///
-    /// Decrements the length by one. The storage slot of the removed element is NOT zeroed --
-    /// callers are responsible for clearing the element's data before calling `pop` if needed.
-    pub fn pop(&self) -> Result<()> {
+    /// Removes, clears, and returns the last element of the vector.
+    pub fn pop(&self) -> Result<Option<T>>
+    where
+        T::Handler: Handler<T>,
+    {
         let length = self.len()?;
         if length == 0 {
-            return Err(TempoPrecompileError::Fatal("Vec is empty".into()));
+            return Ok(None);
         }
+
+        let last_index = length - 1;
+        let mut elem_slot = Self::compute_handler(self.data_slot(), self.address, last_index);
+        let element = elem_slot.read()?;
+        elem_slot.delete()?;
+
         let mut length_slot = Slot::<U256>::new(self.len_slot, self.address);
-        length_slot.write(U256::from(length - 1))
+        length_slot.write(U256::from(last_index))?;
+        Ok(Some(element))
     }
 }
 
@@ -1386,9 +1558,8 @@ where
 
     fn index(&self, index: usize) -> &Self::Output {
         let (data_start, address) = (self.data_slot(), self.address);
-        self.cache.get_or_insert(&index, || {
-            Self::compute_handler(data_start, address, index)
-        })
+        self.cache
+            .get_or_insert(&index, || Self::compute_handler(data_start, address, index))
     }
 }
 
@@ -1398,8 +1569,550 @@ where
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         let (data_start, address) = (self.data_slot(), self.address);
-        self.cache.get_or_insert_mut(&index, || {
-            Self::compute_handler(data_start, address, index)
+        self.cache
+            .get_or_insert_mut(&index, || Self::compute_handler(data_start, address, index))
+    }
+}
+
+// ===========================================================================
+// Set<T> -- OpenZeppelin EnumerableSet for EVM storage
+// ===========================================================================
+//
+// Storage layout (mirrors writer crates/precompiles/src/storage/types/set.rs):
+//   base_slot: length (U256) + values array data at keccak256(base_slot)
+//   base_slot + 1: positions mapping (T -> u32, 1-indexed; 0 = not present)
+//
+// Read path is the leafage hot path (state diffs from writer populate storage,
+// eth_call reads). Write paths are simplified relative to writer:
+//   - `insert` and `remove` are implemented (used by setCallScopes full-replace)
+//   - swap-and-pop on remove follows OZ semantics
+
+/// Read-only in-memory snapshot of an [`SetHandler`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Set<T>(Vec<T>);
+
+impl<T> Set<T> {
+    #[inline]
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> From<Set<T>> for Vec<T> {
+    #[inline]
+    fn from(set: Set<T>) -> Self {
+        set.0
+    }
+}
+
+impl<T: Eq + Hash + Clone> From<Vec<T>> for Set<T> {
+    /// Creates a set from a vector, deduplicating while preserving first-occurrence order.
+    fn from(vec: Vec<T>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::with_capacity(vec.len());
+        for item in vec {
+            if seen.insert(item.clone()) {
+                deduped.push(item);
+            }
+        }
+        Self(deduped)
+    }
+}
+
+impl<T> IntoIterator for Set<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Handler for storage operations on a `Set<T>`.
+///
+/// Layout (`base_slot` is the U256 reserved for the set):
+/// - `base_slot`: vec length; values data at `keccak256(base_slot)` (via `VecHandler`)
+/// - `base_slot + 1`: `Mapping<T, u32>` for OZ EnumerableSet positions (1-indexed, 0 = absent)
+pub struct SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    values: VecHandler<T>,
+    positions: Mapping<T, u32>,
+    base_slot: U256,
+    address: Address,
+}
+
+/// Set occupies 2 reserved slots; values + positions are then placed at hashed
+/// derived slots. Layout-equivalent to writer `crates/precompiles/src/storage/types/set.rs`.
+impl<T> StorableType for Set<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    const LAYOUT: Layout = Layout::Slots(2);
+    const IS_DYNAMIC: bool = true;
+    type Handler = SetHandler<T>;
+
+    fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
+        SetHandler::new(slot, address)
+    }
+}
+
+impl<T> Storable for Set<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+    T::Handler: Handler<T>,
+{
+    fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+        let values: Vec<T> = Vec::load(storage, slot, LayoutCtx::FULL)?;
+        Ok(Self(values))
+    }
+
+    /// Writes the set's values vector and length. The positions mapping at
+    /// `slot + 1` is NOT updated here — it is only used by single-element
+    /// `contains` / `insert` / `remove` paths. Full-replace writes via this
+    /// `store` (e.g. nested via parent struct `Storable::store`) skip them;
+    /// callers that need `contains` correctness afterwards must use
+    /// `SetHandler::write` which keeps positions in sync.
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        Vec::store(&self.0, storage, slot, LayoutCtx::FULL)
+    }
+}
+
+#[inline]
+fn checked_position(index: usize) -> Result<u32> {
+    u32::try_from(index)
+        .ok()
+        .and_then(|i| i.checked_add(1))
+        .ok_or_else(|| TempoPrecompileError::Fatal("Set position overflow".into()))
+}
+
+impl<T> SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+{
+    pub fn new(base_slot: U256, address: Address) -> Self {
+        Self {
+            values: VecHandler::new(base_slot, address),
+            positions: Mapping::new(base_slot + U256::ONE, address),
+            base_slot,
+            address,
+        }
+    }
+
+    /// Returns the base storage slot.
+    #[inline]
+    pub fn base_slot(&self) -> U256 {
+        self.base_slot
+    }
+
+    /// Returns the number of elements in the set.
+    pub fn len(&self) -> Result<usize> {
+        self.values.len()
+    }
+
+    /// Returns whether the set is empty.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Returns true if `value` is in the set.
+    pub fn contains(&self, value: &T) -> Result<bool> {
+        Ok(self.positions.at(value).read()? != 0)
+    }
+
+    /// Returns the value at the given index, or `None` if OOB.
+    pub fn at(&self, index: usize) -> Result<Option<T>>
+    where
+        T::Handler: Handler<T>,
+    {
+        if index >= self.len()? {
+            return Ok(None);
+        }
+        Ok(Some(self.values[index].read()?))
+    }
+
+    /// Inserts `value`. Returns `true` if newly added, `false` if already present.
+    /// Mirrors writer single-element `Set::insert` behaviour (OZ EnumerableSet).
+    pub fn insert(&mut self, value: T) -> Result<bool>
+    where
+        T::Handler: Handler<T>,
+    {
+        if self.contains(&value)? {
+            return Ok(false);
+        }
+        let len = self.len()?;
+        self.values.push(value.clone())?;
+        self.positions
+            .at_mut(&value)
+            .write(checked_position(len)?)?;
+        Ok(true)
+    }
+
+    /// Removes `value` via OZ EnumerableSet swap-and-pop. Returns `true` if it
+    /// was present, `false` otherwise. Mirrors writer `Set::remove`.
+    pub fn remove(&mut self, value: &T) -> Result<bool>
+    where
+        T::Handler: Handler<T>,
+    {
+        let pos = self.positions.at(value).read()?;
+        if pos == 0 {
+            return Ok(false);
+        }
+        let to_remove_idx = (pos - 1) as usize;
+        let last_idx = self.len()?.saturating_sub(1);
+
+        if to_remove_idx != last_idx {
+            let last_value = self.values[last_idx].read()?;
+            self.values[to_remove_idx].write(last_value.clone())?;
+            self.positions
+                .at_mut(&last_value)
+                .write(checked_position(to_remove_idx)?)?;
+        }
+
+        self.values[last_idx].delete()?;
+        Slot::<U256>::new(self.values.len_slot(), self.address).write(U256::from(last_idx))?;
+        self.positions.at_mut(value).delete()?;
+        Ok(true)
+    }
+}
+
+impl<T> Handler<Set<T>> for SetHandler<T>
+where
+    T: Storable + StorageKey + Hash + Eq + Clone,
+    T::Handler: Handler<T>,
+{
+    fn read(&self) -> Result<Set<T>> {
+        let len = self.len()?;
+        let mut vec = Vec::with_capacity(len);
+        for i in 0..len {
+            vec.push(self.values[i].read()?);
+        }
+        Ok(Set(vec))
+    }
+
+    fn write(&mut self, value: Set<T>) -> Result<()> {
+        let old_len = self.values.len()?;
+        let new_vec: Vec<T> = value.into();
+        let new_len = new_vec.len();
+
+        // Clear old positions.
+        for i in 0..old_len {
+            let old_value = self.values[i].read()?;
+            self.positions.at_mut(&old_value).delete()?;
+        }
+
+        // Write new values + positions (1-indexed).
+        for (index, new_value) in new_vec.into_iter().enumerate() {
+            self.positions
+                .at_mut(&new_value)
+                .write(checked_position(index)?)?;
+            self.values[index].write(new_value)?;
+        }
+
+        // Update length.
+        Slot::<U256>::new(self.base_slot, self.address).write(U256::from(new_len))?;
+
+        // Clear leftover value slots if shrinking.
+        for i in new_len..old_len {
+            self.values[i].delete()?;
+        }
+
+        Ok(())
+    }
+
+    fn delete(&mut self) -> Result<()> {
+        let len = self.len()?;
+        for i in 0..len {
+            let value = self.values[i].read()?;
+            self.positions.at_mut(&value).delete()?;
+        }
+        self.values.delete()
+    }
+
+    fn t_read(&self) -> Result<Set<T>> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+    fn t_write(&mut self, _value: Set<T>) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+    fn t_delete(&mut self) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set does not support transient storage".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{B256, address};
+
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+
+    struct TestStorageOps(Address);
+
+    impl StorageOps for TestStorageOps {
+        fn store(&mut self, slot: U256, value: U256) -> Result<()> {
+            StorageCtx.sstore(self.0, slot, value)
+        }
+
+        fn load(&self, slot: U256) -> Result<U256> {
+            StorageCtx.sload(self.0, slot)
+        }
+    }
+
+    #[test]
+    fn fixed_bytes_4_word_roundtrip() {
+        let value = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+        let word = value.to_word();
+        assert_eq!(word, U256::from(0xdead_beefu32));
+        let recovered = FixedBytes::<4>::from_word(word).unwrap();
+        assert_eq!(recovered, value);
+    }
+
+    #[test]
+    fn fixed_bytes_4_packing_at_offset() {
+        let value = FixedBytes::<4>::from([0xab, 0xcd, 0xef, 0x01]);
+        let mut packed = packing::PackedSlot(U256::ZERO);
+
+        value
+            .store(&mut packed, U256::ZERO, LayoutCtx::packed(8))
+            .unwrap();
+        let expected = U256::from(0xabcd_ef01u32) << (8 * 8);
+        assert_eq!(packed.0, expected, "packed bytes at offset 8");
+
+        let recovered = FixedBytes::<4>::load(&packed, U256::ZERO, LayoutCtx::packed(8)).unwrap();
+        assert_eq!(recovered, value, "round-trip from packed offset");
+    }
+
+    #[test]
+    fn fixed_bytes_4_mapping_slot_matches_left_padded_keccak() {
+        let key = FixedBytes::<4>::from([0xde, 0xad, 0xbe, 0xef]);
+        let slot = U256::from(7u8);
+
+        let computed = key.mapping_slot(slot);
+
+        let mut buf = [0u8; 64];
+        buf[28..32].copy_from_slice(&key.0);
+        buf[32..].copy_from_slice(&slot.to_be_bytes::<32>());
+        let expected = U256::from_be_bytes(keccak256(buf).0);
+
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn i16_packed_storage_preserves_twos_complement_boundaries() {
+        for value in [i16::MIN, -1, 0, 1, i16::MAX] {
+            let mut packed = packing::PackedSlot(U256::MAX);
+            value
+                .store(&mut packed, U256::ZERO, LayoutCtx::packed(7))
+                .unwrap();
+            let recovered = i16::load(&packed, U256::ZERO, LayoutCtx::packed(7)).unwrap();
+            assert_eq!(recovered, value);
+            assert_eq!(
+                (packed.0 >> (7 * 8)) & U256::from(u16::MAX),
+                U256::from(value as u16)
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_shrink_clears_stale_tail_from_t5() {
+        let address = address!("0x1111111111111111111111111111111111111111");
+        let base_slot = U256::from(17);
+        let data_start = calc_data_slot(base_slot);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        StorageCtx::enter(&mut provider, || {
+            Bytes::from(vec![0xaa; 96]).store(
+                &mut TestStorageOps(address),
+                base_slot,
+                LayoutCtx::FULL,
+            )
         })
+        .unwrap();
+        provider.set_spec(TempoHardfork::T5);
+        StorageCtx::enter(&mut provider, || {
+            Bytes::from_static(b"short").store(
+                &mut TestStorageOps(address),
+                base_slot,
+                LayoutCtx::FULL,
+            )
+        })
+        .unwrap();
+
+        for offset in 0..3 {
+            assert_eq!(
+                provider.storage(address, data_start + U256::from(offset)),
+                U256::ZERO,
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_shrink_preserves_stale_tail_before_t5() {
+        let address = address!("0x2222222222222222222222222222222222222222");
+        let base_slot = U256::from(18);
+        let data_start = calc_data_slot(base_slot);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut storage = TestStorageOps(address);
+            Bytes::from(vec![0xbb; 64]).store(&mut storage, base_slot, LayoutCtx::FULL)?;
+            Bytes::from_static(b"short").store(&mut storage, base_slot, LayoutCtx::FULL)
+        })
+        .unwrap();
+
+        assert_ne!(provider.storage(address, data_start), U256::ZERO);
+        assert_ne!(
+            provider.storage(address, data_start + U256::ONE),
+            U256::ZERO,
+        );
+    }
+
+    #[test]
+    fn init_layout_skips_t5_tail_cleanup() {
+        let address = address!("0x3333333333333333333333333333333333333333");
+        let base_slot = U256::from(19);
+        let data_start = calc_data_slot(base_slot);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut storage = TestStorageOps(address);
+            Bytes::from(vec![0xcc; 64]).store(&mut storage, base_slot, LayoutCtx::INIT)?;
+            Bytes::from_static(b"short").store(&mut storage, base_slot, LayoutCtx::INIT)
+        })
+        .unwrap();
+
+        assert_ne!(provider.storage(address, data_start), U256::ZERO);
+        assert_ne!(
+            provider.storage(address, data_start + U256::ONE),
+            U256::ZERO,
+        );
+    }
+
+    #[test]
+    fn packed_vec_shrink_clears_boundary_lane_and_tail_slot_from_t5() {
+        let address = address!("0x4444444444444444444444444444444444444444");
+        let len_slot = U256::from(20);
+        let data_start = calc_data_slot(len_slot);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        StorageCtx::enter(&mut provider, || {
+            Vec::<u128>::from([1, 2, 3]).store(
+                &mut TestStorageOps(address),
+                len_slot,
+                LayoutCtx::FULL,
+            )
+        })
+        .unwrap();
+        provider.set_spec(TempoHardfork::T5);
+        StorageCtx::enter(&mut provider, || {
+            Vec::<u128>::from([9]).store(&mut TestStorageOps(address), len_slot, LayoutCtx::FULL)
+        })
+        .unwrap();
+
+        assert_eq!(provider.storage(address, data_start), U256::from(9));
+        assert_eq!(
+            provider.storage(address, data_start + U256::ONE),
+            U256::ZERO,
+        );
+    }
+
+    #[test]
+    fn unpacked_vec_shrink_clears_removed_elements_from_t5() {
+        let address = address!("0x5555555555555555555555555555555555555555");
+        let len_slot = U256::from(21);
+        let data_start = calc_data_slot(len_slot);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+
+        StorageCtx::enter(&mut provider, || {
+            Vec::<B256>::from([
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+                B256::repeat_byte(3),
+            ])
+            .store(&mut TestStorageOps(address), len_slot, LayoutCtx::FULL)
+        })
+        .unwrap();
+        provider.set_spec(TempoHardfork::T5);
+        StorageCtx::enter(&mut provider, || {
+            Vec::<B256>::from([B256::repeat_byte(9)]).store(
+                &mut TestStorageOps(address),
+                len_slot,
+                LayoutCtx::FULL,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            provider.storage(address, data_start),
+            U256::from_be_bytes([9; 32]),
+        );
+        assert_eq!(
+            provider.storage(address, data_start + U256::ONE),
+            U256::ZERO,
+        );
+        assert_eq!(
+            provider.storage(address, data_start + U256::from(2)),
+            U256::ZERO,
+        );
+    }
+
+    #[test]
+    fn dynamic_lengths_larger_than_u32_are_rejected() {
+        let address = address!("0x6666666666666666666666666666666666666666");
+        let slot = U256::from(22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+
+        let result = StorageCtx::enter(&mut provider, || {
+            let mut storage = StorageCtx;
+            storage.sstore(address, slot, U256::from(u32::MAX) + U256::ONE)?;
+            Vec::<B256>::load(&TestStorageOps(address), slot, LayoutCtx::FULL)
+        });
+
+        assert_eq!(result.unwrap_err(), TempoPrecompileError::under_overflow());
+    }
+
+    #[test]
+    fn vec_pop_returns_and_recursively_clears_dynamic_element() {
+        let address = address!("0x7777777777777777777777777777777777777777");
+        let len_slot = U256::from(23);
+        let element_slot = calc_data_slot(len_slot);
+        let element_data_slot = calc_data_slot(element_slot);
+        let value = Bytes::from(vec![0xdd; 64]);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+
+        let popped = StorageCtx::enter(&mut provider, || {
+            let values = VecHandler::<Bytes>::new(len_slot, address);
+            values.push(value.clone())?;
+            values.pop()
+        })
+        .unwrap();
+
+        assert_eq!(popped, Some(value));
+        assert_eq!(provider.storage(address, len_slot), U256::ZERO);
+        assert_eq!(provider.storage(address, element_slot), U256::ZERO);
+        assert_eq!(provider.storage(address, element_data_slot), U256::ZERO);
+        assert_eq!(
+            provider.storage(address, element_data_slot + U256::ONE),
+            U256::ZERO,
+        );
     }
 }

@@ -829,13 +829,14 @@ where
                 .set_record_logs(true)
                 .set_steps(true);
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-            let tx = self.inner.create_txn_env(
+            let mut tx = self.inner.create_txn_env(
                 &block,
                 &block_env,
                 tx,
                 &memory_db,
                 self.inner.evm_cfg().cfg.chain_id,
             )?;
+            tx.set_stateful_simulation_context(block.header.hash, tx_info.index.unwrap());
             let (exec_res, (traces, events)) = self
                 .inner
                 .inspect_tx_commit(
@@ -868,8 +869,7 @@ where
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-        // set nonce to None so that the correct nonce is chosen by the EVM
-        request.nonce = None;
+        self.inner.prepare_estimate_request(&mut request);
         let mut block_env = block_env_from_block(&block);
         let mut cache_db = CacheDB::new(EvmStorageWrapper {
             db: state,

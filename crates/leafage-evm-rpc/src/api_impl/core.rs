@@ -67,6 +67,12 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
 
+    /// Select the state nonce for estimation unless the chain needs the
+    /// original request nonce as signed input to its transaction adapter.
+    fn prepare_estimate_request(&self, request: &mut CallRequest) {
+        request.nonce = None;
+    }
+
     fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
         if spec.is_enabled_in(EthSpecId::OSAKA) {
             eip7825::TX_GAS_LIMIT_CAP
@@ -185,6 +191,9 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 
 pub(crate) trait TxSetter {
     fn set_gas_limit(&mut self, gas_limit: u64);
+
+    /// Assign chain-specific replay context to one entry in a stateful RPC batch.
+    fn set_stateful_simulation_context(&mut self, _block_hash: H256, _index: u64) {}
 
     /// Mark this transaction as a gas-estimation run. Chains whose gas
     /// accounting depends on the run mode (Arbitrum's L1 poster padding)

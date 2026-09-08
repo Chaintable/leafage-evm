@@ -96,16 +96,16 @@ alloy::sol! {
             uint64 deactivatedAtHeight;
         }
 
-        event ValidatorAdded(uint64 index, address validatorAddress, bytes32 publicKey, string ingress, string egress, address feeRecipient);
-        event ValidatorDeactivated(uint64 index, address validatorAddress);
-        event ValidatorRotated(uint64 index, uint64 deactivatedIndex, address validatorAddress, bytes32 oldPublicKey, bytes32 newPublicKey, string ingress, string egress, address caller);
-        event FeeRecipientUpdated(uint64 index, address feeRecipient, address caller);
-        event IpAddressesUpdated(uint64 index, string ingress, string egress, address caller);
-        event ValidatorOwnershipTransferred(uint64 index, address oldAddress, address newAddress, address caller);
-        event OwnershipTransferred(address oldOwner, address newOwner);
-        event NetworkIdentityRotationEpochSet(uint64 previousEpoch, uint64 nextEpoch);
-        event ValidatorMigrated(uint64 index, address validatorAddress, bytes32 publicKey);
-        event SkippedValidatorMigration(uint64 index, address validatorAddress, bytes32 publicKey);
+        event ValidatorAdded(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey, string ingress, string egress, address feeRecipient);
+        event ValidatorDeactivated(uint64 indexed index, address indexed validatorAddress);
+        event ValidatorRotated(uint64 indexed index, uint64 indexed deactivatedIndex, address indexed validatorAddress, bytes32 oldPublicKey, bytes32 newPublicKey, string ingress, string egress, address caller);
+        event FeeRecipientUpdated(uint64 indexed index, address feeRecipient, address caller);
+        event IpAddressesUpdated(uint64 indexed index, string ingress, string egress, address caller);
+        event ValidatorOwnershipTransferred(uint64 indexed index, address indexed oldAddress, address indexed newAddress, address caller);
+        event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+        event NetworkIdentityRotationEpochSet(uint64 indexed previousEpoch, uint64 indexed nextEpoch);
+        event ValidatorMigrated(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey);
+        event SkippedValidatorMigration(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey);
         event Initialized(uint64 height);
 
         error NotInitialized();
@@ -1363,7 +1363,13 @@ impl Precompile for ValidatorConfigV2 {
 
         dispatch_call(
             calldata,
-            IValidatorConfigV2::IValidatorConfigV2Calls::abi_decode,
+            IValidatorConfigV2::IValidatorConfigV2Calls::valid_selector,
+            |data| {
+                IValidatorConfigV2::IValidatorConfigV2Calls::abi_decode_with_config(
+                    data,
+                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
+                )
+            },
             |call| match call {
                 // View functions
                 IValidatorConfigV2::IValidatorConfigV2Calls::owner(call) => {

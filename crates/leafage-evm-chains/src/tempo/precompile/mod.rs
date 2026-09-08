@@ -10,17 +10,29 @@
 //! - [`storage_types`] -- `Slot`, `Mapping`, packing helpers, primitive type encoders
 
 pub mod account_keychain;
+pub mod address_registry;
+pub mod current_committee;
 pub mod error;
 pub mod fee_manager;
 pub mod nonce;
+pub mod receive_policy_guard;
+pub mod signature_verifier;
 pub mod stablecoin_dex;
 pub mod storage;
+pub mod storage_credits;
 pub mod storage_types;
 pub mod tip20;
+pub mod tip20_channel_reserve;
 pub mod tip20_factory;
 pub mod tip403_registry;
 pub mod validator_config;
 pub mod validator_config_v2;
+pub mod zone_factory;
+
+#[cfg(test)]
+pub(crate) mod test_utils;
+#[cfg(test)]
+mod event_abi_tests;
 
 pub use error::{IntoPrecompileResult, Result, TempoPrecompileError};
 pub use storage::{
@@ -35,7 +47,12 @@ pub use storage_types::{
 use alloy::primitives::{address, Address, Bytes};
 use alloy::sol_types::{SolCall, SolError};
 use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
-use revm::precompile::{PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+
+alloy::sol! {
+    /// Common Tempo precompile error for an unknown or hardfork-disabled selector.
+    error UnknownFunctionSelector(bytes4 selector);
+}
 
 // ===========================================================================
 // Address constants (from tempo-contracts)
@@ -51,6 +68,9 @@ pub const TIP20_FACTORY_ADDRESS: Address =
     address!("0x20FC000000000000000000000000000000000000");
 pub const STABLECOIN_DEX_ADDRESS: Address =
     address!("0xdec0000000000000000000000000000000000000");
+/// T5+ TIP-1034 payment channel reserve.
+pub const TIP20_CHANNEL_RESERVE_ADDRESS: Address =
+    address!("0x4D50500000000000000000000000000000000000");
 pub const NONCE_PRECOMPILE_ADDRESS: Address =
     address!("0x4E4F4E4345000000000000000000000000000000");
 pub const VALIDATOR_CONFIG_ADDRESS: Address =
@@ -59,23 +79,95 @@ pub const ACCOUNT_KEYCHAIN_ADDRESS: Address =
     address!("0xAAAAAAAA00000000000000000000000000000000");
 pub const VALIDATOR_CONFIG_V2_ADDRESS: Address =
     address!("0xCCCCCCCC00000000000000000000000000000001");
+/// T3+ TIP-1020 signature verifier (secp256k1 / P256 / WebAuthn).
+pub const SIGNATURE_VERIFIER_ADDRESS: Address =
+    address!("0x5165300000000000000000000000000000000000");
+/// T3+ TIP-1022 virtual address registry.
+pub const ADDRESS_REGISTRY_ADDRESS: Address =
+    address!("0xFDC0000000000000000000000000000000000000");
+/// T6+ TIP-1028 custody for blocked inbound TIP-20 transfers and mints.
+pub const RECEIVE_POLICY_GUARD_ADDRESS: Address =
+    address!("0xB10C000000000000000000000000000000000000");
+/// T7+ TIP-1060 storage credits.
+pub const STORAGE_CREDITS_ADDRESS: Address =
+    address!("0x1060000000000000000000000000000000000000");
+/// T8+ TIP-1070 current consensus committee.
+pub const CURRENT_COMMITTEE_ADDRESS: Address =
+    address!("0xC077E00000000000000000000000000000000000");
+/// T10+ TIP-1091 native ZoneFactory.
+pub const ZONE_FACTORY_ADDRESS: Address =
+    address!("0x5AF2000000000000000000000000000000000000");
+/// Initial ZoneFactory owner written by the writer at the T10 activation boundary.
+pub const INITIAL_ZONE_FACTORY_OWNER: Address =
+    address!("0xaF571FD4B3AD43a5807A5E58bFb25ea1aB327A14");
+/// Protocol-managed shared ZonePortal implementation.
+pub const ZONE_PORTAL_IMPL_ADDRESS: Address =
+    address!("0x5AD1000000000000000000000000000000000000");
+/// Protocol-managed Zone proof verifier.
+pub const ZONE_VERIFIER_ADDRESS: Address =
+    address!("0x5A56000000000000000000000000000000000000");
+/// Protocol-managed shared ZoneMessenger.
+pub const ZONE_MESSENGER_ADDRESS: Address =
+    address!("0x5A4D000000000000000000000000000000000000");
 
 // ===========================================================================
 // Gas constants
 // ===========================================================================
 
-/// Input per word cost. Covers ABI decoding and cloning of input into call data.
-pub const INPUT_PER_WORD_COST: u64 = 6;
+/// Input per word cost before T11. Covers ABI decoding and cloning of input into call data.
+const PRE_T11_INPUT_PER_WORD_COST: u64 = 6;
+
+/// Input per word cost starting at T11 (TIP-1100).
+const POST_T11_INPUT_PER_WORD_COST: u64 = 30;
 
 /// Gas cost for `ecrecover` signature verification.
 pub const ECRECOVER_GAS: u64 = 3_000;
 
+/// Maximum allocation allowed while ABI-decoding one precompile call.
+/// Matches Tempo v1.13.1 and prevents crafted dynamic offsets/lengths from
+/// forcing unbounded allocations during `eth_call` and trace simulation.
+pub const ABI_DECODER_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
+
+#[inline]
+pub const fn abi_decoder_config(
+    spec: crate::tempo::hardfork::TempoHardfork,
+) -> alloy::sol_types::abi::AbiDecoderConfig {
+    alloy::sol_types::abi::AbiDecoderConfig::new()
+        .memory_limit(ABI_DECODER_MEMORY_LIMIT)
+        .strict(spec.is_t11())
+}
+
+/// Charges duplicate validation before sorting, preserving the pre-T11 zero-cost schedule.
+pub fn has_duplicates_metered<T: Ord>(
+    storage: &mut StorageCtx,
+    values: impl IntoIterator<Item = T>,
+) -> Result<bool> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    let cost = if storage.spec().is_t11() {
+        u64::try_from(values.len())
+            .ok()
+            .and_then(|len| len.checked_mul(20))
+            .ok_or(TempoPrecompileError::OutOfGas)?
+    } else {
+        0
+    };
+    storage.deduct_gas(cost)?;
+    values.sort_unstable();
+    Ok(values.windows(2).any(|pair| pair[0] == pair[1]))
+}
+
 /// Returns the gas cost for decoding calldata of the given length, rounded up to word boundaries.
 #[inline]
 pub fn input_cost(calldata_len: usize) -> u64 {
+    let per_word_cost = if StorageCtx.spec().is_t11() {
+        POST_T11_INPUT_PER_WORD_COST
+    } else {
+        PRE_T11_INPUT_PER_WORD_COST
+    };
+
     calldata_len
         .div_ceil(32)
-        .saturating_mul(INPUT_PER_WORD_COST as usize) as u64
+        .saturating_mul(per_word_cost as usize) as u64
 }
 
 // ===========================================================================
@@ -141,7 +233,11 @@ macro_rules! tempo_precompile {
                 $crate::tempo::precompile::StorageCtx::enter(&mut storage, || {
                     let result = $impl.call($input.data, $input.caller);
                     // Fill gas accounting from the storage context
-                    let refund = $crate::tempo::precompile::StorageCtx.gas_refunded();
+                    let refund = if $crate::tempo::precompile::StorageCtx.spec().is_t4() {
+                        $crate::tempo::precompile::StorageCtx.gas_refunded()
+                    } else {
+                        0
+                    };
                     // Persist refund for TempoPrecompiles::run() to propagate
                     // to the Gas struct (alloy-evm's PrecompilesMap discards it).
                     $crate::tempo::precompile::storage::set_last_precompile_refund(refund);
@@ -229,16 +325,30 @@ pub fn fill_precompile_output(
 
 pub fn dispatch_call<T>(
     calldata: &[u8],
+    valid_selector: impl FnOnce([u8; 4]) -> bool,
     decode: impl FnOnce(&[u8]) -> core::result::Result<T, alloy::sol_types::Error>,
     f: impl FnOnce(T) -> PrecompileResult,
 ) -> PrecompileResult {
     let storage = StorageCtx::default();
 
     if calldata.len() < 4 {
+        if !storage.spec().is_t1() {
+            return Err(PrecompileError::other_static(
+                "Invalid input: missing function selector",
+            ));
+        }
         return Ok(fill_precompile_output(
             PrecompileOutput::new_reverted(0, Bytes::new()),
             &storage,
         ));
+    }
+
+    let selector = calldata[..4]
+        .try_into()
+        .expect("calldata length checked above");
+    if !valid_selector(selector) {
+        return unknown_selector(selector, storage.gas_used())
+            .map(|res| fill_precompile_output(res, &storage));
     }
 
     let result = decode(calldata);
@@ -264,15 +374,23 @@ pub fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
 // Precompile registration
 // ===========================================================================
 
-/// Registers all 9 Tempo precompiles into the given [`PrecompilesMap`].
+/// Registers all Tempo precompiles into the given [`PrecompilesMap`].
 ///
 /// Uses [`set_precompile_lookup`] to install a closure that matches addresses to
 /// the appropriate Tempo precompile. TIP-20 tokens use prefix matching; all other
 /// precompiles use exact address matching.
 ///
+/// `spec` is the active hardfork — T3+ precompiles (signature_verifier,
+/// address_registry) are only registered when `spec >= T3`, matching the writer's
+/// behaviour where their addresses behave as plain EOAs prior to T3.
+///
 /// Each precompile is wrapped via the [`tempo_precompile!`] macro which handles
 /// DELEGATECALL rejection, `LeafageStorageProvider` setup, and gas accounting.
-pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, chain_id: u64) {
+pub fn extend_tempo_precompiles(
+    precompiles: &mut PrecompilesMap,
+    chain_id: u64,
+    spec: crate::tempo::hardfork::TempoHardfork,
+) {
     precompiles.set_precompile_lookup(move |address: &Address| {
         if tip20::is_tip20_prefix(*address) {
             Some(create_tip20_precompile(*address, chain_id))
@@ -292,6 +410,20 @@ pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, chain_id: u64)
             Some(create_account_keychain_precompile(chain_id))
         } else if *address == VALIDATOR_CONFIG_V2_ADDRESS {
             Some(create_validator_config_v2_precompile(chain_id))
+        } else if *address == SIGNATURE_VERIFIER_ADDRESS && spec.is_t3() {
+            Some(create_signature_verifier_precompile(chain_id))
+        } else if *address == ADDRESS_REGISTRY_ADDRESS && spec.is_t3() {
+            Some(create_address_registry_precompile(chain_id))
+        } else if *address == TIP20_CHANNEL_RESERVE_ADDRESS && spec.is_t5() {
+            Some(create_tip20_channel_reserve_precompile(chain_id))
+        } else if *address == RECEIVE_POLICY_GUARD_ADDRESS && spec.is_t6() {
+            Some(create_receive_policy_guard_precompile(chain_id))
+        } else if *address == STORAGE_CREDITS_ADDRESS && spec.is_t7() {
+            Some(create_storage_credits_precompile(chain_id))
+        } else if *address == CURRENT_COMMITTEE_ADDRESS && spec.is_t8() {
+            Some(create_current_committee_precompile(chain_id))
+        } else if *address == ZONE_FACTORY_ADDRESS && spec.is_t10() {
+            Some(create_zone_factory_precompile(chain_id))
         } else {
             None
         }
@@ -352,6 +484,48 @@ fn create_validator_config_v2_precompile(chain_id: u64) -> DynPrecompile {
     })
 }
 
+fn create_signature_verifier_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("SignatureVerifier", chain_id, |input| {
+        signature_verifier::SignatureVerifier::new()
+    })
+}
+
+fn create_address_registry_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("AddressRegistry", chain_id, |input| {
+        address_registry::AddressRegistry::new()
+    })
+}
+
+fn create_tip20_channel_reserve_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("TIP20ChannelReserve", chain_id, |input| {
+        tip20_channel_reserve::TIP20ChannelReserve::new()
+    })
+}
+
+fn create_receive_policy_guard_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("ReceivePolicyGuard", chain_id, |input| {
+        receive_policy_guard::ReceivePolicyGuard::new()
+    })
+}
+
+fn create_storage_credits_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("StorageCredits", chain_id, |input| {
+        storage_credits::StorageCredits::new()
+    })
+}
+
+fn create_current_committee_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("CurrentCommittee", chain_id, |input| {
+        current_committee::CurrentCommittee::new()
+    })
+}
+
+fn create_zone_factory_precompile(chain_id: u64) -> DynPrecompile {
+    tempo_precompile!("ZoneFactory", chain_id, |input| {
+        zone_factory::ZoneFactory::new()
+    })
+}
+
 // ===========================================================================
 // caller_gas_allowance — read TIP-20 balance for estimateGas gas cap
 // ===========================================================================
@@ -365,30 +539,27 @@ const TEMPO_GAS_PRICE_SCALING_FACTOR: alloy::primitives::U256 =
 ///
 /// Ported from Tempo writer: `crates/node/src/rpc/mod.rs::caller_gas_allowance`.
 ///
-/// Returns `fee_token_balance * SCALING_FACTOR / gas_price`.
-/// Returns `None` if gas_price is 0 or on any storage read error.
-/// Computes the maximum gas the caller can afford, based on TIP-20 fee token balance.
-///
-/// Ported from Tempo writer: `crates/node/src/rpc/mod.rs::caller_gas_allowance`.
-///
 /// # Arguments
+/// - `tx` -- full transaction used for writer-equivalent fee-token inference
 /// - `payer` -- address whose balance determines the gas cap (caller or sponsor)
-/// - `fee_token_override` -- explicit fee token; skips FeeManager lookup when Some
 ///
 /// Returns `fee_token_balance * SCALING_FACTOR / gas_price`.
 /// Returns `None` if gas_price is 0 or on any storage read error.
 pub fn tempo_caller_gas_allowance<DB: revm::DatabaseRef>(
     db: &DB,
+    tx: &crate::tempo::tx::TempoTxEnv,
     payer: alloy::primitives::Address,
     gas_price: u128,
     timestamp: u64,
     chain_id: u64,
-    fee_token_override: Option<alloy::primitives::Address>,
 ) -> Option<u64>
 where
     DB::Error: core::fmt::Debug,
 {
-    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::{
+        fee_token::{resolve_from_storage, FeeTokenCandidates},
+        hardfork::TempoHardfork,
+    };
 
     if gas_price == 0 {
         return None;
@@ -396,32 +567,17 @@ where
 
     let spec = TempoHardfork::from_timestamp(timestamp);
 
-    // Fee token resolution:
-    // If fee_token_override is provided (from tx.fee_token), use it directly.
-    // Otherwise, read stored preference from FeeManager, fallback to DEFAULT_FEE_TOKEN.
-    let fee_token = if let Some(override_token) = fee_token_override {
-        override_token
-    } else {
-        storage::with_read_only_storage_ctx(db, spec, chain_id, || {
-            let user_token = fee_manager::TipFeeManager::new()
-                .user_tokens[payer]
-                .read()
-                .ok()?;
-            if user_token.is_zero() {
-                Some(DEFAULT_FEE_TOKEN)
-            } else {
-                Some(user_token)
-            }
-        })?
-    };
-
-    // Read TIP-20 balance of fee token for payer.
-    let balance = storage::with_read_only_storage_ctx(db, spec, chain_id, || {
-        tip20::TIP20Token::from_address_unchecked(fee_token)
-            .balances[payer]
-            .read()
-            .ok()
-    })?;
+    let candidates = FeeTokenCandidates::from_tx(tx, payer, spec);
+    let balance = storage::with_read_only_storage_ctx(
+        db,
+        spec,
+        chain_id,
+        || -> Result<alloy::primitives::U256> {
+            let fee_token = resolve_from_storage(candidates, payer)?;
+            tip20::TIP20Token::from_address_unchecked(fee_token).balances[payer].read()
+        },
+    )
+    .ok()?;
 
     // caller_gas_allowance = balance * SCALING_FACTOR / gas_price
     Some(
@@ -431,4 +587,193 @@ where
             .unwrap_or_default()
             .saturating_to(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use alloy::primitives::{address, U256};
+    use alloy::sol_types::{SolCall, SolInterface};
+    use revm::precompile::{PrecompileSpecId, Precompiles};
+
+    alloy::sol! {
+        interface ITestMemoryDispatch {
+            function setValues(uint256[] values) external;
+            function setPayloads(bytes first, bytes second) external;
+        }
+    }
+
+    #[test]
+    fn t11_strict_abi_rejects_gaps_overlap_trailing_and_padding() {
+        use crate::tempo::hardfork::TempoHardfork;
+        let canonical = ITestMemoryDispatch::setPayloadsCall {
+            first: Bytes::from_static(&[1]),
+            second: Bytes::from_static(&[2]),
+        }
+        .abi_encode();
+        let mut trailing = canonical.clone();
+        trailing.extend([0; 32]);
+        let mut overlap = canonical.clone();
+        overlap[36..68].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+        let mut padding = canonical.clone();
+        *padding.last_mut().unwrap() = 1;
+        let mut gap = canonical.clone();
+        gap.splice(68..68, [0; 32]);
+        gap[4..36].copy_from_slice(&U256::from(96).to_be_bytes::<32>());
+        gap[36..68].copy_from_slice(&U256::from(160).to_be_bytes::<32>());
+
+        for spec in [TempoHardfork::T10, TempoHardfork::T11] {
+            assert!(
+                ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+                    &canonical,
+                    abi_decoder_config(spec),
+                )
+                .is_ok()
+            );
+            for input in [&trailing, &overlap, &padding, &gap] {
+                let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+                    input,
+                    abi_decoder_config(spec),
+                );
+                assert_eq!(result.is_err(), spec.is_t11(), "{spec:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_validation_charges_before_checking_and_only_from_t11() {
+        use crate::tempo::hardfork::TempoHardfork;
+        for (spec, limit, expected) in [
+            (TempoHardfork::T10, 0, Ok(true)),
+            (TempoHardfork::T11, 59, Err(TempoPrecompileError::OutOfGas)),
+            (TempoHardfork::T11, 60, Ok(true)),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            provider.set_gas_limit(limit);
+            StorageCtx::enter(&mut provider, || {
+                assert_eq!(has_duplicates_metered(&mut StorageCtx, [2, 1, 2]), expected);
+            });
+        }
+    }
+
+    #[test]
+    fn abi_decoder_rejects_allocation_above_limit() {
+        let mut calldata = ITestMemoryDispatch::setValuesCall::SELECTOR.to_vec();
+        calldata.extend(U256::from(32).to_be_bytes::<32>());
+        calldata.extend(U256::from(ABI_DECODER_MEMORY_LIMIT as u64).to_be_bytes::<32>());
+
+        for spec in [
+            crate::tempo::hardfork::TempoHardfork::T10,
+            crate::tempo::hardfork::TempoHardfork::T11,
+        ] {
+            let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
+                &calldata,
+                abi_decoder_config(spec),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn input_cost_increases_at_t11() {
+        for (spec, one_word, two_words) in [
+            (crate::tempo::hardfork::TempoHardfork::T10, 6, 12),
+            (crate::tempo::hardfork::TempoHardfork::T11, 30, 60),
+        ] {
+            let mut storage = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut storage, || {
+                assert_eq!(input_cost(0), 0);
+                assert_eq!(input_cost(1), one_word);
+                assert_eq!(input_cost(32), one_word);
+                assert_eq!(input_cost(33), two_words);
+            });
+        }
+    }
+
+    #[test]
+    fn t11_input_cost_is_charged_before_decode() {
+        let mut storage = TestStorageProvider::new(crate::tempo::hardfork::TempoHardfork::T11);
+        storage.set_gas_limit(29);
+        StorageCtx::enter(&mut storage, || {
+            let result = nonce::NonceManager::new().call(&[0], Address::ZERO);
+            assert!(matches!(
+                result,
+                Err(revm::precompile::PrecompileError::OutOfGas)
+            ));
+        });
+    }
+
+    #[test]
+    fn caller_gas_allowance_uses_valid_inferred_tip20_balance() {
+        use crate::tempo::{
+            precompile::tip20::ITIP20,
+            tx::TempoTxEnv,
+        };
+        use revm::{
+            context::TxEnv,
+            database::{in_memory_db::CacheDB, EmptyDB},
+            primitives::TxKind,
+        };
+
+        fn short_currency(value: &[u8; 3]) -> U256 {
+            let mut word = [0u8; 32];
+            word[..3].copy_from_slice(value);
+            word[31] = 6;
+            U256::from_be_bytes(word)
+        }
+
+        let payer = Address::repeat_byte(0x11);
+        let inferred = address!("0x20c0000000000000000000000000000000000011");
+        let input = ITIP20::transferCall {
+            to: Address::repeat_byte(0x22),
+            amount: U256::ONE,
+        }
+        .abi_encode()
+        .into();
+        let tx = TempoTxEnv {
+            base: TxEnv {
+                caller: payer,
+                kind: TxKind::Call(inferred),
+                data: input,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(inferred, U256::from(4), short_currency(b"EUR"))
+            .unwrap();
+        db.insert_account_storage(inferred, payer.mapping_slot(U256::from(9)), U256::from(77))
+            .unwrap();
+        db.insert_account_storage(
+            DEFAULT_FEE_TOKEN,
+            payer.mapping_slot(U256::from(9)),
+            U256::from(9),
+        )
+        .unwrap();
+
+        let allowance = |db: &CacheDB<EmptyDB>| {
+            tempo_caller_gas_allowance(db, &tx, payer, 1_000_000_000_000, 1_782_223_200, 4217)
+        };
+        assert_eq!(allowance(&db), Some(9));
+
+        db.insert_account_storage(inferred, U256::from(4), short_currency(b"USD"))
+            .unwrap();
+        assert_eq!(allowance(&db), Some(77));
+    }
+
+    #[test]
+    fn zone_factory_registration_activates_at_t10() {
+        let mut t9 = PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::OSAKA));
+        extend_tempo_precompiles(&mut t9, 4217, crate::tempo::hardfork::TempoHardfork::T9);
+        assert!(t9.get(&ZONE_FACTORY_ADDRESS).is_none());
+
+        let mut t10 = PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::OSAKA));
+        extend_tempo_precompiles(&mut t10, 4217, crate::tempo::hardfork::TempoHardfork::T10);
+        assert!(t10.get(&ZONE_FACTORY_ADDRESS).is_some());
+        assert!(t10.get(&ZONE_PORTAL_IMPL_ADDRESS).is_none());
+        assert!(t10.get(&ZONE_VERIFIER_ADDRESS).is_none());
+        assert!(t10.get(&ZONE_MESSENGER_ADDRESS).is_none());
+    }
 }

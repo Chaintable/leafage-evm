@@ -3,7 +3,11 @@ use std::ops::{Deref, DerefMut};
 
 use crate::tempo::block::TempoBlockEnv;
 use crate::tempo::hardfork::TempoHardfork;
-use crate::tempo::precompile::{extend_tempo_precompiles, storage::take_last_precompile_refund};
+use crate::tempo::precompile::{
+    extend_tempo_precompiles,
+    storage::take_last_precompile_refund,
+    storage_credits::{with_non_creditable_slots, NonCreditableSlots},
+};
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
 use revm::{
@@ -54,13 +58,20 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
         context: &mut TempoContext<DB>,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
-        let result = self.0.run(context, inputs)?;
-        // Drain the thread-local refund set by the precompile macro.
-        // We intentionally do NOT call record_refund() here — the writer
-        // also uses PrecompilesMap which doesn't propagate precompile
-        // SSTORE refunds to the Gas struct. Matching writer behavior means
-        // used() == spent() for precompile calls.
+        // Clear a stale value left by a previous fatal precompile invocation.
         let _ = take_last_precompile_refund();
+        let non_creditable_slots = resolve_non_creditable_slots(context);
+        let result = with_non_creditable_slots(&non_creditable_slots, || {
+            self.0.run(context, inputs)
+        });
+        // Drain after both success and error so the thread-local value cannot leak.
+        let refund = take_last_precompile_refund();
+        let mut result = result?;
+        if let Some(result) = result.as_mut() {
+            if context.cfg.spec.is_t4() && result.is_ok() {
+                result.gas.record_refund(refund);
+            }
+        }
         Ok(result)
     }
 
@@ -73,10 +84,91 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     }
 }
 
+fn resolve_non_creditable_slots<DB: Database>(
+    context: &mut TempoContext<DB>,
+) -> NonCreditableSlots {
+    use crate::tempo::precompile::DEFAULT_FEE_TOKEN;
+
+    if !context.cfg.spec.is_t7() {
+        return NonCreditableSlots::default();
+    }
+
+    let caller = context.tx.base.caller;
+    let (fee_payer, fee_token_override, keychain_fee_key) = context
+        .tx
+        .tempo_fields
+        .as_ref()
+        .map(|fields| {
+            (
+                fields.fee_payer.unwrap_or(caller),
+                fields.fee_token,
+                (fields.is_keychain && fields.fee_payer.unwrap_or(caller) == caller)
+                    .then_some(fields.key_id)
+                    .flatten(),
+            )
+        })
+        .unwrap_or((caller, None, None));
+
+    let fee_token = context
+        .tx
+        .resolved_fee_token
+        .or(fee_token_override)
+        .unwrap_or(DEFAULT_FEE_TOKEN);
+
+    NonCreditableSlots::new(fee_payer, fee_token, keychain_fee_key)
+}
+
 mod exec;
+mod storage_credits;
 
 /// Type alias for the default context type of the TempoEvm.
 pub type TempoContext<DB> = Context<TempoBlockEnv, TempoTxEnv, CfgEnv<TempoHardfork>, DB>;
+
+/// Tempo-specific transaction validation errors used by [`TempoEvm`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TempoInvalidTransaction {
+    /// Standard Ethereum transaction validation error.
+    EthInvalidTransaction(revm::context::result::InvalidTransaction),
+    /// The selected fee token does not have the required TIP-20 address prefix.
+    FeeTokenNotTip20 { address: Address },
+    /// Nonce-manager validation failed.
+    NonceManagerError(String),
+    /// Expiring nonce transaction omitted `valid_before`.
+    ExpiringNonceMissingValidBefore,
+    /// Expiring nonce transaction used a non-zero transaction nonce.
+    ExpiringNonceNonceNotZero,
+}
+
+impl From<revm::context::result::InvalidTransaction> for TempoInvalidTransaction {
+    fn from(value: revm::context::result::InvalidTransaction) -> Self {
+        Self::EthInvalidTransaction(value)
+    }
+}
+
+impl core::fmt::Display for TempoInvalidTransaction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EthInvalidTransaction(error) => error.fmt(f),
+            Self::FeeTokenNotTip20 { address } => write!(
+                f,
+                "fee token {address} is not a TIP-20 token; fee tokens must be TIP-20 tokens"
+            ),
+            Self::NonceManagerError(reason) => write!(f, "nonce manager error: {reason}"),
+            Self::ExpiringNonceMissingValidBefore => {
+                f.write_str("expiring nonce transaction requires valid_before to be set")
+            }
+            Self::ExpiringNonceNonceNotZero => {
+                f.write_str("expiring nonce transaction must have nonce == 0")
+            }
+        }
+    }
+}
+
+impl core::error::Error for TempoInvalidTransaction {}
+
+/// EVM error type carrying Tempo transaction validation errors.
+pub type TempoEvmError<DBError> =
+    revm::context::result::EVMError<DBError, TempoInvalidTransaction>;
 
 /// Tempo EVM implementation.
 ///
@@ -106,14 +198,16 @@ impl<DB: Database, I> TempoEvm<DB, I> {
     /// 2. Extends them with all 9 Tempo precompiles via [`extend_tempo_precompiles`]
     /// 3. Builds the EVM context with the merged precompile set
     pub fn new(env: EvmEnv<TempoHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
-        let mut precompiles = PrecompilesMap::from_static(Precompiles::new(
-            PrecompileSpecId::from_spec_id(env.cfg_env.spec.into()),
-        ));
-        extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id);
-
-        let mut cfg_env = env.cfg_env;
+        // Derive the active hardfork from block timestamp first so precompile
+        // registration can hardfork-gate T3+ precompiles correctly.
         let timestamp = env.block_env.timestamp.saturating_to::<u64>();
         let hardfork = TempoHardfork::from_timestamp(timestamp);
+
+        let mut precompiles =
+            PrecompilesMap::from_static(Precompiles::new(ethereum_precompile_spec(hardfork)));
+        extend_tempo_precompiles(&mut precompiles, env.cfg_env.chain_id, hardfork);
+
+        let mut cfg_env = env.cfg_env;
         cfg_env.spec = hardfork;
         let mut gas_params = GasParams::new_spec(hardfork.into());
         if hardfork.is_t1() {
@@ -125,9 +219,19 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                 (GasId::new_account_cost_for_selfdestruct(), 250_000),
                 (GasId::code_deposit_cost(), 1_000),
                 (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                // T1 disables authorization refunds for both ordinary 0x04
+                // transactions and Tempo AA authorization lists.
+                (GasId::tx_eip7702_auth_refund(), 0),
                 // TIP-1000: Auth account creation cost (EIP-7702 auth with nonce==0).
                 // Custom GasId(255), same as Tempo writer: crates/revm/src/gas_params.rs
                 (GasId::new(255), 250_000),
+            ]);
+        }
+        if hardfork.is_t7() {
+            gas_params.override_gas([
+                (GasId::sstore_set_without_load_cost(), 5_000),
+                (GasId::sstore_set_refund(), 5_000),
+                (GasId::sstore_clearing_slot_refund(), 0),
             ]);
         }
         cfg_env.gas_params = gas_params;
@@ -135,6 +239,12 @@ impl<DB: Database, I> TempoEvm<DB, I> {
 
         // Build instruction table with MILLIS_TIMESTAMP opcode for pre-T1C archive mode.
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+        if hardfork.is_t7() {
+            instructions.insert_instruction(
+                0x55,
+                Instruction::new(storage_credits::sstore::<DB>, 0),
+            );
+        }
         if !hardfork.is_t1c() {
             // Register MILLIS_TIMESTAMP (0x4F) opcode — active pre-T1C only.
             // Ported from Tempo writer: crates/revm/src/instructions.rs
@@ -179,6 +289,18 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             },
             inspect,
         }
+    }
+}
+
+/// Tempo uses Osaka EVM rules at every Tempo hardfork, but did not enable the
+/// Osaka Ethereum built-in precompile set until T1C. Keep this decision
+/// independent from `From<TempoHardfork> for SpecId` so archive calls use the
+/// correct historical MODEXP implementation.
+const fn ethereum_precompile_spec(hardfork: TempoHardfork) -> PrecompileSpecId {
+    if hardfork.is_t1c() {
+        PrecompileSpecId::OSAKA
+    } else {
+        PrecompileSpecId::PRAGUE
     }
 }
 
@@ -455,6 +577,25 @@ mod tests {
     }
 
     #[test]
+    fn test_t7_storage_credit_gas_params() {
+        let evm = TempoEvm::new(
+            make_env_default_spec(1_783_605_600),
+            EmptyDB::default(),
+            NoOpInspector,
+            false,
+        );
+        let gas_params = &evm.inner.ctx.cfg.gas_params;
+
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T7);
+        assert_eq!(
+            gas_params.get(GasId::sstore_set_without_load_cost()),
+            5_000
+        );
+        assert_eq!(gas_params.get(GasId::sstore_set_refund()), 5_000);
+        assert_eq!(gas_params.get(GasId::sstore_clearing_slot_refund()), 0);
+    }
+
+    #[test]
     fn test_spec_override_no_downgrade() {
         let evm = TempoEvm::new(
             make_env_default_spec(1_774_965_600 + 1000),
@@ -466,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hardfork_maps_to_prague() {
+    fn test_hardfork_maps_to_osaka() {
         use revm::primitives::hardfork::SpecId;
         for hf in [
             TempoHardfork::Genesis,
@@ -476,11 +617,50 @@ mod tests {
             TempoHardfork::T1C,
             TempoHardfork::T2,
             TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T6,
+            TempoHardfork::T7,
+            TempoHardfork::T8,
+            TempoHardfork::T9,
+            TempoHardfork::T10,
         ] {
             assert_eq!(
                 SpecId::from(hf),
-                SpecId::PRAGUE,
-                "{hf:?} should map to PRAGUE"
+                SpecId::OSAKA,
+                "{hf:?} should map to OSAKA"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ethereum_precompile_spec_switches_at_t1c() {
+        for hardfork in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T1,
+            TempoHardfork::T1A,
+            TempoHardfork::T1B,
+        ] {
+            assert_eq!(
+                ethereum_precompile_spec(hardfork),
+                PrecompileSpecId::PRAGUE
+            );
+        }
+        for hardfork in [
+            TempoHardfork::T1C,
+            TempoHardfork::T2,
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T6,
+            TempoHardfork::T7,
+            TempoHardfork::T8,
+            TempoHardfork::T9,
+            TempoHardfork::T10,
+        ] {
+            assert_eq!(
+                ethereum_precompile_spec(hardfork),
+                PrecompileSpecId::OSAKA
             );
         }
     }
@@ -522,6 +702,9 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: None,
         };
 
         // Pre-T1A
@@ -586,6 +769,9 @@ mod tests {
                 nonce_key,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: None,
         }
     }
 
@@ -596,6 +782,201 @@ mod tests {
             to: TxKind::Call(Address::with_last_byte(to_byte)),
             value: revm::primitives::U256::ZERO,
             input: Bytes::copy_from_slice(data),
+        }
+    }
+
+    #[test]
+    fn review_sponsored_keychain_credit_exclusions_follow_the_payer() {
+        use crate::tempo::{
+            precompile::{
+                account_keychain::AccountKeychain, storage_credits::is_non_creditable_slot,
+                storage_types::StorageKey, ACCOUNT_KEYCHAIN_ADDRESS, DEFAULT_FEE_TOKEN,
+            },
+            tx::TempoTxFields,
+        };
+        use revm::primitives::U256;
+        let caller = Address::repeat_byte(0x11);
+        let sponsor = Address::repeat_byte(0x22);
+        let key = Address::repeat_byte(0x33);
+        for (timestamp, sponsored) in [
+            (1_783_605_599, true),
+            (1_783_605_600, false),
+            (1_783_605_600, true),
+        ] {
+            let mut evm = TempoEvm::new(
+                make_env_aa(timestamp),
+                EmptyDB::default(),
+                NoOpInspector,
+                false,
+            );
+            evm.inner.ctx.tx.base.caller = caller;
+            evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+                is_keychain: true,
+                key_id: Some(key),
+                fee_payer: sponsored.then_some(sponsor),
+                ..Default::default()
+            });
+            let exclusions = resolve_non_creditable_slots(&mut evm.inner.ctx);
+            let active = timestamp >= 1_783_605_600;
+            with_non_creditable_slots(&exclusions, || {
+                for owner in [caller, sponsor] {
+                    assert_eq!(
+                        is_non_creditable_slot(
+                            DEFAULT_FEE_TOKEN,
+                            owner.mapping_slot(U256::from(9))
+                        ),
+                        active && owner == if sponsored { sponsor } else { caller },
+                    );
+                    let limit_key = AccountKeychain::spending_limit_key(owner, key);
+                    let slot = AccountKeychain::new().spending_limits[limit_key][DEFAULT_FEE_TOKEN]
+                        .remaining
+                        .slot();
+                    assert_eq!(
+                        is_non_creditable_slot(ACCOUNT_KEYCHAIN_ADDRESS, slot),
+                        active && !sponsored && owner == caller
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn review_standard_and_aa_authorization_refunds_follow_t1() {
+        use crate::tempo::tx::{TempoAuthGas, TempoTxFields};
+        use alloy::eips::eip7702::{Authorization, SignedAuthorization};
+        use revm::{
+            database::CacheDB,
+            primitives::{Address, TxKind, U256},
+            state::AccountInfo,
+        };
+
+        let delegate = Address::repeat_byte(0x12);
+        let signed = SignedAuthorization::new_unchecked(
+            Authorization {
+                chain_id: U256::ZERO,
+                address: delegate,
+                nonce: 1,
+            },
+            0,
+            U256::ONE,
+            U256::ONE,
+        );
+        let authority = signed.recover_authority().unwrap();
+        for (timestamp, expected_refund) in [
+            (1_770_908_399, 9_200),
+            (1_770_908_400, 0),
+            (1_783_605_600, 0),
+            (1_787_320_800, 0),
+        ] {
+            for aa in [false, true] {
+                let mut db = CacheDB::new(EmptyDB::default());
+                db.insert_account_info(
+                    authority,
+                    AccountInfo {
+                        nonce: 1,
+                        ..Default::default()
+                    },
+                );
+                let mut tx = crate::tempo::tx::TempoTxEnv::default();
+                tx.base.caller = Address::repeat_byte(0x11);
+                tx.base.kind = TxKind::Call(delegate);
+                tx.base.gas_limit = 1_000_000;
+                tx.base.chain_id = Some(4217);
+                if aa {
+                    tx.tempo_fields = Some(TempoTxFields {
+                        aa_calls: vec![crate::tempo::tx::TempoCall {
+                            to: TxKind::Call(delegate),
+                            ..Default::default()
+                        }],
+                        auth_list: vec![TempoAuthGas {
+                            authority: Some(authority),
+                            delegate: Some(delegate),
+                            chain_id: Some(U256::ZERO),
+                            nonce: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    });
+                } else {
+                    tx.base.tx_type = 4;
+                    tx.base.set_signed_authorization(vec![signed.clone()]);
+                }
+                let mut evm = TempoEvm::new(make_env_aa(timestamp), db, NoOpInspector, false);
+                let result = evm.transact(tx).unwrap();
+                assert!(result.result.is_success());
+                assert_eq!(
+                    result.state[&authority].info.nonce, 2,
+                    "authorization must apply"
+                );
+                assert_eq!(
+                    result.result.gas().inner_refunded(),
+                    expected_refund,
+                    "timestamp={timestamp}, aa={aa}"
+                );
+                if timestamp >= 1_770_908_400 {
+                    assert_eq!(result.result.gas().used(), 283_500);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_aa_inner_value_is_rejected_before_execution() {
+        use revm::primitives::{TxKind, U256};
+        for timestamp in [1_770_908_399, 1_770_908_400, 1_783_605_600, 1_787_320_800] {
+            for create in [false, true] {
+                let mut call = make_call(0x99, &[]);
+                if create {
+                    call.to = TxKind::Create;
+                }
+                call.value = U256::ONE;
+                let tx = make_aa_tx(vec![call, make_call(0x98, &[])], 0, U256::ZERO, 10_000_000);
+                let mut evm = TempoEvm::new(
+                    make_env_aa(timestamp),
+                    EmptyDB::default(),
+                    NoOpInspector,
+                    false,
+                );
+                let error = evm.transact(tx).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("value transfer in Tempo Transaction not allowed"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_fee_token_prefix_is_checked_for_free_simulation() {
+        use crate::tempo::precompile::PATH_USD_ADDRESS;
+        use revm::primitives::{Address, U256};
+        let undeployed = alloy::primitives::address!("20c00000000000000000000000000000ffffffff");
+        for token in [
+            Address::ZERO,
+            Address::repeat_byte(0x11),
+            PATH_USD_ADDRESS,
+            undeployed,
+        ] {
+            let mut tx = make_aa_tx(vec![make_call(0x99, &[])], 0, U256::ZERO, 10_000_000);
+            tx.tempo_fields.as_mut().unwrap().fee_token = Some(token);
+            let mut evm = TempoEvm::new(
+                make_env_aa(1_787_320_800),
+                EmptyDB::default(),
+                NoOpInspector,
+                false,
+            );
+            let result = evm.transact(tx);
+            if token == PATH_USD_ADDRESS || token == undeployed {
+                assert!(result.unwrap().result.is_success());
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("is not a TIP-20 token"),
+                    "{error}"
+                );
+            }
         }
     }
 
@@ -701,18 +1082,22 @@ mod tests {
     /// AA tx with expiring nonce key (U256::MAX) on T1+ should add EXPIRING_NONCE_GAS (13k).
     #[test]
     fn test_aa_gas_expiring_nonce() {
+        use crate::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER;
         use revm::primitives::U256;
 
+        let timestamp = 1_770_908_400 + 100;
         let calls = vec![make_call(0x01, &[])];
 
         // Normal nonce_key (nonce > 0)
         let tx_normal = make_aa_tx(calls.clone(), 1, U256::from(1), 10_000_000);
         // Expiring nonce_key (U256::MAX) — requires valid_before to be set.
         let mut tx_expiring = make_aa_tx(calls, 1, U256::MAX, 10_000_000);
-        tx_expiring.tempo_fields.as_mut().unwrap().valid_before = Some(u64::MAX);
+        tx_expiring.base.nonce = 0;
+        tx_expiring.tempo_fields.as_mut().unwrap().valid_before = Some(timestamp + 30);
+        tx_expiring.unique_tx_identifier = Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
 
         let mut evm_normal = TempoEvm::new(
-            make_env_aa(1_770_908_400 + 100),
+            make_env_aa(timestamp),
             EmptyDB::default(),
             NoOpInspector,
             false,
@@ -724,7 +1109,7 @@ mod tests {
             .gas_used();
 
         let mut evm_exp = TempoEvm::new(
-            make_env_aa(1_770_908_400 + 100),
+            make_env_aa(timestamp),
             EmptyDB::default(),
             NoOpInspector,
             false,
@@ -915,15 +1300,35 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: None,
         };
 
-        let mut evm = TempoEvm::new(
-            make_env(1_770_908_400 + 100), // Post-T1A
+        let mut pre_t4_evm = TempoEvm::new(
+            make_env(1_779_112_800 - 1),
+            db.clone(),
+            NoOpInspector,
+            false,
+        );
+        let pre_t4_result = pre_t4_evm
+            .transact(tx.clone())
+            .expect("pre-T4 TIP20 transfer should succeed");
+        assert_eq!(
+            pre_t4_result.result.gas().inner_refunded(),
+            0,
+            "precompile refunds must not change historical pre-T4 gas accounting"
+        );
+
+        let mut t4_evm = TempoEvm::new(
+            make_env(1_779_112_800),
             db,
             NoOpInspector,
             false,
         );
-        let result = evm.transact(tx).expect("TIP20 transfer should succeed");
+        let result = t4_evm
+            .transact(tx)
+            .expect("T4 TIP20 transfer should succeed");
 
         assert!(
             result.result.is_success(),
@@ -932,14 +1337,13 @@ mod tests {
         );
 
         let gas = result.result.gas();
-        // Precompile SSTORE refunds are intentionally NOT propagated to ResultGas
-        // (matching writer behavior — both use alloy-evm PrecompilesMap which
-        // doesn't call record_refund). So used() == spent() for precompile calls.
-        // The GasParams-based sstore gas calculation ensures spent() matches writer.
-        assert_eq!(
-            gas.used(),
-            gas.spent_sub_refunded(),
-            "precompile gas: used() should equal spent_sub_refunded() (no refund propagation)"
+        assert!(
+            gas.inner_refunded() > 0,
+            "successful storage clear must propagate a non-zero refund"
+        );
+        assert!(
+            gas.final_refunded() > 0,
+            "the propagated refund must reduce the effective gas charge"
         );
     }
 
@@ -1223,7 +1627,7 @@ mod tests {
 
         // Build an authorize_key call. expiry=0 so pre-T2 hits ExpiryInPast after
         // admin check succeeds. keyId is nonzero to avoid ZeroPublicKey error.
-        let call = IAccountKeychain::authorizeKeyCall {
+        let call = IAccountKeychain::authorizeKey_0Call {
             keyId: key_id,
             signatureType: IAccountKeychain::SignatureType::Secp256k1,
             expiry: 0,
@@ -1364,6 +1768,9 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: None,
         };
 
         let mut evm = TempoEvm::new(
@@ -1446,6 +1853,9 @@ mod tests {
                 aa_calls: calls,
                 ..Default::default()
             }),
+            resolved_fee_token: None,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: None,
         };
 
         let mut evm_1 = TempoEvm::new(
@@ -1502,6 +1912,9 @@ mod tests {
                 ..Default::default()
             },
             tempo_fields: None,
+            resolved_fee_token: None,
+            tx_hash: revm::primitives::B256::ZERO,
+            unique_tx_identifier: None,
         };
 
         // WITHOUT pre-warm: normal T2 execution
