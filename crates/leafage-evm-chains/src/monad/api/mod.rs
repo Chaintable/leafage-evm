@@ -8,7 +8,7 @@ use crate::monad::MonadHardfork;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv};
 use revm::context::{Context, FrameStack};
-use revm::context::{ContextTr, Evm, JournalTr, Transaction, TxEnv};
+use revm::context::{ContextTr, Evm, JournalTr, TxEnv};
 use revm::context_interface::journaled_state::JournalCheckpoint;
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::{EthInstructions, InstructionProvider};
@@ -17,7 +17,8 @@ use revm::inspector::handler::{frame_end, frame_start};
 use revm::inspector::{inspect_instructions, InspectorEvmTr};
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::interpreter::CallOutcome;
+use revm::interpreter::{CallOutcome, FrameInput};
+use revm::primitives::{Address, U256};
 use revm::{Inspector, Journal};
 use std::ops::{Deref, DerefMut};
 
@@ -107,6 +108,7 @@ impl<DB: Database, I> MonadEvm<DB, I> {
     fn settle_first_frame_result(
         &mut self,
         checkpoint: Option<JournalCheckpoint>,
+        transfer: Option<FirstFrameTransfer>,
         frame_result: &mut FrameResult,
     ) -> Result<(), DB::Error> {
         let Some(checkpoint) = checkpoint else {
@@ -119,12 +121,10 @@ impl<DB: Database, I> MonadEvm<DB, I> {
         let violated = if outcome.result.result.is_ok() {
             reject_on_reserve_violation(ctx, &mut outcome.result)?
         } else {
-            let (tx, journal) = ctx.tx_journal_mut();
-            let (caller, value) = (tx.caller(), tx.value());
-            let to = tx.kind().to().copied();
+            let journal = ctx.journal_mut();
             let scope = journal.checkpoint();
-            if let Some(to) = to.filter(|_| !value.is_zero()) {
-                journal.transfer(caller, to, value)?;
+            if let Some(FirstFrameTransfer { from, to, value }) = transfer {
+                journal.transfer(from, to, value)?;
             }
             let violated = dipped_into_reserve(ctx)?;
             self.inner.ctx.journal_mut().checkpoint_revert(scope);
@@ -155,6 +155,30 @@ impl<DB: Database, I> MonadEvm<DB, I> {
             self.reserve_balance_violation = true;
         }
         Ok(())
+    }
+}
+
+/// The value transfer of the top level message as it was actually executed
+/// (an inspector may rewrite the call inputs in `frame_start`), replayed for
+/// the reserve check of a failed precompile call.
+#[derive(Clone, Copy)]
+struct FirstFrameTransfer {
+    from: Address,
+    to: Address,
+    value: U256,
+}
+
+impl FirstFrameTransfer {
+    fn of(frame_input: &FrameInput) -> Option<Self> {
+        let FrameInput::Call(inputs) = frame_input else {
+            return None;
+        };
+        let value = inputs.transfer_value().filter(|value| !value.is_zero())?;
+        Some(Self {
+            from: inputs.caller,
+            to: inputs.target_address,
+            value,
+        })
     }
 }
 
@@ -213,8 +237,9 @@ where
             return self.inner.frame_init(frame_input);
         }
         let checkpoint = self.first_frame_checkpoint();
+        let transfer = FirstFrameTransfer::of(&frame_input.frame_input);
         if let ItemOrResult::Result(mut output) = self.inner.frame_init(frame_input)? {
-            self.settle_first_frame_result(checkpoint, &mut output)?;
+            self.settle_first_frame_result(checkpoint, transfer, &mut output)?;
             return Ok(ItemOrResult::Result(output));
         }
         Ok(ItemOrResult::Item(self.inner.frame_stack.get()))
@@ -312,8 +337,9 @@ where
         } else {
             None
         };
+        let transfer = FirstFrameTransfer::of(&frame_input);
         if let ItemOrResult::Result(mut output) = self.inner.frame_init(frame_init)? {
-            self.settle_first_frame_result(checkpoint, &mut output)?;
+            self.settle_first_frame_result(checkpoint, transfer, &mut output)?;
             let (ctx, inspector) = self.ctx_inspector();
             // for precompiles send logs to inspector.
             if let FrameResult::Call(CallOutcome {

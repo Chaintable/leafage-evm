@@ -617,6 +617,54 @@ fn failed_precompile_call_still_reports_reserve_violation() {
     );
 }
 
+/// The replayed transfer of a failed top level precompile call follows the
+/// call inputs actually executed, not the transaction: an inspector that
+/// drops the value in `call` leaves no transfer to replay.
+#[test]
+fn failed_precompile_replay_uses_inspected_call_inputs() {
+    use revm::interpreter::{CallInputs, CallOutcome, CallValue};
+    use revm::{InspectEvm, Inspector};
+
+    struct DropValue;
+    impl<DB: revm::Database> Inspector<crate::monad::MonadContext<DB>> for DropValue {
+        fn call(
+            &mut self,
+            _context: &mut crate::monad::MonadContext<DB>,
+            inputs: &mut CallInputs,
+        ) -> Option<CallOutcome> {
+            inputs.value = CallValue::Transfer(U256::ZERO);
+            None
+        }
+    }
+
+    const BLAKE2F: Address = address!("0000000000000000000000000000000000000009");
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.insert_account_info(CALLER, account(mon(20), Bytecode::new_eip7702(DELEGATE)));
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+    );
+    let mut tx = call_tx(BLAKE2F, &[]);
+    tx.value = mon(15);
+
+    let hardfork = MonadHardfork::MonadTen;
+    let mut cfg = CfgEnv::new_with_spec(hardfork);
+    hardfork.apply_cfg(&mut cfg);
+    cfg.chain_id = crate::monad::MONAD_MAINNET_CHAIN_ID;
+    cfg.disable_nonce_check = true;
+    let mut evm = MonadEvm::new(EvmEnv::new(cfg, BlockEnv::default()), db, DropValue);
+    let out = evm.inspect_tx(tx).expect("transaction executes");
+    assert!(
+        matches!(
+            halt_reason(&out.result),
+            MonadHaltReason::Base(HaltReason::PrecompileErrorWithContext(_))
+        ),
+        "{:?}",
+        out.result
+    );
+    assert_eq!(out.state[&CALLER].info.balance, mon(20));
+}
+
 /// The inspected execution path (`inspect_run_exec_loop`,
 /// `inspect_frame_run`) applies the rule too, for a running frame and for a
 /// top level message that finishes during its init.
