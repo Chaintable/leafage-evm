@@ -13,7 +13,10 @@
 //!   `state3/page_tracker.hpp`);
 //! * contract code limit 128 KB, initcode limit 256 KB, no CREATE inside an
 //!   EIP-7702 delegated account, EIP-7951 P256 precompile from MONAD_FOUR;
-//! * stateful precompiles `0x1000` (staking) and `0x1001` (reserve balance).
+//! * stateful precompiles `0x1000` (staking) and `0x1001` (reserve balance);
+//! * the reserve balance rule: a transaction leaving an EOA below
+//!   `min(10 MON, pre-transaction balance)` is reverted;
+//! * unused gas is not refunded, the sender pays the whole gas limit.
 
 mod api;
 mod evm;
@@ -22,6 +25,8 @@ mod handler;
 mod hardforks;
 mod page_tracker;
 mod precompile;
+mod reserve_balance;
+mod result;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +35,7 @@ pub use hardforks::MonadHardfork;
 pub use precompile::{
     MonadPrecompiles, RESERVE_BALANCE_CONTRACT_ADDRESS, STAKING_CONTRACT_ADDRESS,
 };
+pub use result::MonadHaltReason;
 
 /// Monad mainnet chain id.
 pub const MONAD_MAINNET_CHAIN_ID: u64 = 143;

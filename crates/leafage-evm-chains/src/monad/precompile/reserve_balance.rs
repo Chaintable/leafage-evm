@@ -1,14 +1,16 @@
 //! Reserve balance precompile at `0x1001`
 //! (`execution/monad/reserve_balance/reserve_balance_contract.cpp`, MONAD_NINE).
 //!
-//! `dippedIntoReserve()` reports whether the current transaction has already
-//! pushed an account below its reserve balance, in which case the node reverts
-//! the whole transaction at the end. The RPC executes calls with balance
-//! checks disabled and does not track reserve balances, so the answer is
-//! always `false`; the gas accounting and error behaviour match the node.
+//! `dippedIntoReserve()` reports whether the transaction has, so far, pushed
+//! an account below its reserve balance (`revert_transaction_cached`), in
+//! which case the node reverts the whole transaction at the end. The node
+//! tracks the predicate incrementally, here it is evaluated on demand over
+//! the journal (`reserve_balance::dipped_into_reserve`).
 
 use super::staking::{run_monad_precompile, Failure};
-use revm::context::ContextTr;
+use crate::monad::reserve_balance::dipped_into_reserve;
+use crate::monad::MonadContext;
+use alloy_evm::Database;
 use revm::interpreter::{CallInputs, InterpreterResult};
 use revm::primitives::{Bytes, U256};
 
@@ -35,8 +37,8 @@ impl ReserveBalanceError {
     }
 }
 
-pub(crate) fn run<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn run<DB: Database>(
+    context: &mut MonadContext<DB>,
     inputs: &CallInputs,
     input: &[u8],
 ) -> Result<InterpreterResult, String> {
@@ -47,15 +49,32 @@ pub(crate) fn run<CTX: ContextTr>(
     } else {
         (None, FALLBACK_COST, input)
     };
+    // Evaluated up front: `run_monad_precompile` only hands the journal to
+    // the method body. The predicate has no side effects.
+    let dipped = match method {
+        Some(()) if value_and_input_ok(inputs, input) => {
+            Some(dipped_into_reserve(context).map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
     run_monad_precompile(context, inputs, cost, |_journal, _sender, value| {
         let error = match method {
             None => ReserveBalanceError::MethodNotSupported,
             Some(()) if !value.is_zero() => ReserveBalanceError::ValueNonZero,
             Some(()) if !input.is_empty() => ReserveBalanceError::InvalidInput,
-            Some(()) => return Ok(Bytes::from(U256::ZERO.to_be_bytes::<32>().to_vec())),
+            Some(()) => {
+                let dipped = dipped.unwrap_or(false);
+                return Ok(Bytes::from(
+                    U256::from(dipped as u8).to_be_bytes::<32>().to_vec(),
+                ));
+            }
         };
         Err(Failure::Revert(error.message()))
     })
+}
+
+fn value_and_input_ok(inputs: &CallInputs, input: &[u8]) -> bool {
+    inputs.value.get().is_zero() && input.is_empty()
 }
 
 #[cfg(test)]

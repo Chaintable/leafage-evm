@@ -9,13 +9,18 @@
 //!   (x4).
 //! * `0x1000` is the staking contract (callable from MONAD_FOUR, always a
 //!   warm "precompile" address) and `0x1001` the reserve balance contract
-//!   (MONAD_NINE).
+//!   (MONAD_NINE). Both reject calls with `msg.flags != 0`, which includes
+//!   `EVMC_DELEGATED`: an EIP-7702 account delegating to them cannot be
+//!   called (all gas consumed). Ethereum precompiles behind a delegation
+//!   run as empty code, like in revm.
 
 mod reserve_balance;
 mod staking;
 
-use crate::monad::MonadHardfork;
+use crate::monad::{MonadContext, MonadHardfork};
+use alloy_evm::Database;
 use once_cell::race::OnceBox;
+use revm::bytecode::Bytecode;
 use revm::context::{ContextTr, JournalTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
@@ -155,10 +160,46 @@ fn call_input_bytes<CTX: ContextTr>(context: &mut CTX, inputs: &CallInputs) -> B
     }
 }
 
-impl<CTX> PrecompileProvider<CTX> for MonadPrecompiles
-where
-    CTX: ContextTr<Cfg: revm::context::Cfg<Spec = MonadHardfork>>,
-{
+/// `check_call_monad_precompile`: `msg.kind != EVMC_CALL || msg.flags != 0`
+/// is `EVMC_REJECTED`, all gas of the call is consumed.
+pub(crate) fn rejected(gas_limit: u64) -> InterpreterResult {
+    InterpreterResult {
+        result: InstructionResult::PrecompileError,
+        gas: Gas::new_spent(gas_limit),
+        output: Bytes::new(),
+    }
+}
+
+impl MonadPrecompiles {
+    fn is_monad_address(&self, address: &Address) -> bool {
+        self.monad_addresses().any(|a| a == *address)
+    }
+
+    /// The call target is an EIP-7702 account delegating to a Monad
+    /// precompile (`EVMC_DELEGATED` set on `code_address`).
+    fn delegates_to_monad_precompile<DB: Database>(
+        &self,
+        context: &mut MonadContext<DB>,
+        inputs: &CallInputs,
+    ) -> Result<bool, String> {
+        if !self.hardfork.is_staking_enabled() || inputs.known_bytecode.is_none() {
+            return Ok(false);
+        }
+        // The account was loaded by the CALL instruction, this is a cache hit.
+        let account = context
+            .journal_mut()
+            .load_account_with_code(inputs.bytecode_address)
+            .map_err(|e| e.to_string())?;
+        Ok(account
+            .info
+            .code
+            .as_ref()
+            .and_then(Bytecode::eip7702_address)
+            .is_some_and(|delegate| self.is_monad_address(&delegate)))
+    }
+}
+
+impl<DB: Database> PrecompileProvider<MonadContext<DB>> for MonadPrecompiles {
     type Output = InterpreterResult;
 
     fn set_spec(&mut self, spec: MonadHardfork) -> bool {
@@ -171,7 +212,7 @@ where
 
     fn run(
         &mut self,
-        context: &mut CTX,
+        context: &mut MonadContext<DB>,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
         let address = inputs.bytecode_address;
@@ -189,15 +230,21 @@ where
             let input = call_input_bytes(context, inputs);
             return reserve_balance::run(context, inputs, &input).map(Some);
         }
-        let factor = if self.hardfork.is_pricing_v1_enabled() {
-            pricing_v1_factor(&address)
-        } else {
-            1
-        };
-        if factor == 1 {
-            return PrecompileProvider::<CTX>::run(&mut self.eth, context, inputs);
+        if self.eth.precompiles.contains(&address) {
+            let factor = if self.hardfork.is_pricing_v1_enabled() {
+                pricing_v1_factor(&address)
+            } else {
+                1
+            };
+            if factor == 1 {
+                return PrecompileProvider::<MonadContext<DB>>::run(&mut self.eth, context, inputs);
+            }
+            return self.run_scaled(context, inputs, factor);
         }
-        self.run_scaled(context, inputs, factor)
+        if self.delegates_to_monad_precompile(context, inputs)? {
+            return Ok(Some(rejected(inputs.gas_limit)));
+        }
+        Ok(None)
     }
 
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
@@ -211,7 +258,7 @@ where
     }
 
     fn contains(&self, address: &Address) -> bool {
-        self.eth.precompiles.contains(address) || self.monad_addresses().any(|a| a == *address)
+        self.eth.precompiles.contains(address) || self.is_monad_address(address)
     }
 }
 

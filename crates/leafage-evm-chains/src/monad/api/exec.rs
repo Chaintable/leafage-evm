@@ -1,6 +1,7 @@
 use super::MonadEvm;
 use crate::monad::api::MonadContext;
 use crate::monad::handler::MonadHandler;
+use crate::monad::MonadHaltReason;
 use alloy_evm::Database;
 use revm::handler::Handler;
 use revm::inspector::InspectorHandler;
@@ -19,7 +20,7 @@ impl<DB, INSP> ExecuteEvm for MonadEvm<DB, INSP>
 where
     DB: Database,
 {
-    type ExecutionResult = ExecutionResult;
+    type ExecutionResult = ExecutionResult<MonadHaltReason>;
     type State = EvmState;
     type Error = EVMError<DB::Error>;
     type Tx = TxEnv;
@@ -38,7 +39,7 @@ where
         self.inner.finalize()
     }
 
-    fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
+    fn replay(&mut self) -> Result<ResultAndState<MonadHaltReason>, Self::Error> {
         MonadHandler::default().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)

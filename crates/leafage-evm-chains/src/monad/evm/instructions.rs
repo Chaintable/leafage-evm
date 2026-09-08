@@ -25,6 +25,7 @@ use revm::bytecode::opcode::{
     LOG0, LOG1, LOG2, LOG3, LOG4, MCOPY, MLOAD, MSTORE, MSTORE8, RETURN, RETURNDATACOPY, REVERT,
     SLOAD, SSTORE, STATICCALL,
 };
+use revm::context::ContextTr;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::instructions::{contract, control, host, memory, system};
 use revm::interpreter::interpreter::EthInterpreter;
@@ -38,9 +39,7 @@ pub(crate) fn monad_instructions<DB: revm::database::Database>(
     hardfork: MonadHardfork,
 ) -> EthInstructions<EthInterpreter, MonadContext<DB>> {
     let mut instructions = EthInstructions::new_mainnet_with_spec(hardfork.into());
-    if hardfork.is_delegated_create_blocked() {
-        install_delegated_create_guard(&mut instructions);
-    }
+    install_create_guard(&mut instructions);
     if hardfork.is_mip3_enabled() {
         install_mip3_memory_instructions(&mut instructions);
     }
@@ -60,11 +59,11 @@ fn replace<DB: revm::database::Database>(
     instructions.insert_instruction(opcode, Instruction::new(f, static_gas));
 }
 
-fn install_delegated_create_guard<DB: revm::database::Database>(
+fn install_create_guard<DB: revm::database::Database>(
     instructions: &mut EthInstructions<EthInterpreter, MonadContext<DB>>,
 ) {
-    replace(instructions, CREATE, create_guarded::<false, false, _, _>);
-    replace(instructions, CREATE2, create_guarded::<true, false, _, _>);
+    replace(instructions, CREATE, create_guarded::<false, false, _>);
+    replace(instructions, CREATE2, create_guarded::<true, false, _>);
 }
 
 fn install_mip3_memory_instructions<DB: revm::database::Database>(
@@ -86,8 +85,8 @@ fn install_mip3_memory_instructions<DB: revm::database::Database>(
     replace(instructions, LOG4, mip3_log::<4, _, _>);
     replace(instructions, RETURN, mip3_ret);
     replace(instructions, REVERT, mip3_revert);
-    replace(instructions, CREATE, create_guarded::<false, true, _, _>);
-    replace(instructions, CREATE2, create_guarded::<true, true, _, _>);
+    replace(instructions, CREATE, create_guarded::<false, true, _>);
+    replace(instructions, CREATE2, create_guarded::<true, true, _>);
     replace(instructions, CALL, mip3_call);
     replace(instructions, CALLCODE, mip3_call_code);
     replace(instructions, DELEGATECALL, mip3_delegate_call);
@@ -276,7 +275,7 @@ fn mip3_log<const N: usize, WIRE: InterpreterTypes, H: Host + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
-// CREATE inside a delegated account + MIP-3 initcode memory
+// CREATE: delegated account guard, opcode initcode limit, MIP-3 memory
 // ---------------------------------------------------------------------------
 
 /// `vm/runtime/create.cpp`: with `can_create_inside_delegated() == false` a
@@ -287,36 +286,44 @@ fn is_eip7702_delegation(code: &[u8]) -> bool {
 }
 
 // [value, offset, len(, salt)]
-fn create_guarded<
-    const IS_CREATE2: bool,
-    const MIP3: bool,
-    WIRE: InterpreterTypes,
-    H: Host + ?Sized,
->(
-    context: InstructionContext<'_, H, WIRE>,
+fn create_guarded<const IS_CREATE2: bool, const MIP3: bool, DB: revm::database::Database>(
+    context: InstructionContext<'_, MonadContext<DB>, EthInterpreter>,
 ) {
+    let hardfork = *context.host.cfg().spec();
     if context.interpreter.runtime_flag.is_static() {
         context
             .interpreter
             .halt(InstructionResult::CallNotAllowedInsideStatic);
         return;
     }
-    let target = context.interpreter.input.target_address();
-    match context.host.load_account_code(target) {
-        Some(code) if is_eip7702_delegation(&code.data) => {
-            context.interpreter.halt(InstructionResult::NotActivated);
-            return;
+    if hardfork.is_delegated_create_blocked() {
+        let target = context.interpreter.input.target_address();
+        match context.host.load_account_code(target) {
+            Some(code) if is_eip7702_delegation(&code.data) => {
+                context.interpreter.halt(InstructionResult::NotActivated);
+                return;
+            }
+            Some(_) => {}
+            None => {
+                context.interpreter.halt_fatal();
+                return;
+            }
         }
-        Some(_) => {}
-        None => {
-            context.interpreter.halt_fatal();
+    }
+    // `traits::max_initcode_size()` at the opcode level (48 KiB before
+    // MONAD_FOUR) differs from the transaction level limit in `cfg`.
+    if let Some(len) = peek(context.interpreter, 2) {
+        if len > U256::from(hardfork.max_initcode_size()) {
+            context
+                .interpreter
+                .halt(InstructionResult::CreateInitCodeSizeLimit);
             return;
         }
     }
     if MIP3 && !expand_range(context.interpreter, 1, 2) {
         return;
     }
-    contract::create::<WIRE, IS_CREATE2, H>(context)
+    contract::create::<EthInterpreter, IS_CREATE2, MonadContext<DB>>(context)
 }
 
 // ---------------------------------------------------------------------------

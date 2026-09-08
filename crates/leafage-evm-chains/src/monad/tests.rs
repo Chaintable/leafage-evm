@@ -3,11 +3,14 @@
 //! MIP-3 memory pricing, zero refunds, pricing v1 precompile multipliers,
 //! the staking precompile call path and the EIP-7702 CREATE guard.
 
-use crate::monad::{MonadEvm, MonadHardfork, STAKING_CONTRACT_ADDRESS};
+use crate::monad::{
+    MonadEvm, MonadHaltReason, MonadHardfork, RESERVE_BALANCE_CONTRACT_ADDRESS,
+    STAKING_CONTRACT_ADDRESS,
+};
 use alloy::eips::eip2930::{AccessList, AccessListItem};
 use alloy_evm::EvmEnv;
 use leafage_evm_types::{BlockEnv, CfgEnv};
-use revm::context::result::{ExecutionResult, HaltReason, OutOfGasError};
+use revm::context::result::{ExecResultAndState, HaltReason, OutOfGasError};
 use revm::context::TxEnv;
 use revm::database::{in_memory_db::CacheDB, EmptyDB};
 use revm::inspector::NoOpInspector;
@@ -15,10 +18,23 @@ use revm::primitives::{address, Address, Bytes, TxKind, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use revm::ExecuteEvm;
 
+type ExecutionResult = revm::context::result::ExecutionResult<MonadHaltReason>;
+
 const CALLER: Address = address!("00000000000000000000000000000000000000aa");
 const CONTRACT: Address = address!("00000000000000000000000000000000000000c0");
 const DELEGATE: Address = address!("00000000000000000000000000000000000000d0");
+const RECIPIENT: Address = address!("00000000000000000000000000000000000000e0");
 const GAS_LIMIT: u64 = 1_000_000;
+
+fn mon(amount: u64) -> U256 {
+    U256::from(amount) * U256::from(10u128.pow(18))
+}
+
+fn account(balance: U256, code: Bytecode) -> AccountInfo {
+    let mut info = AccountInfo::from_bytecode(code);
+    info.balance = balance;
+    info
+}
 
 fn db_with_code(code: &[u8]) -> CacheDB<EmptyDB> {
     let mut db = CacheDB::new(EmptyDB::default());
@@ -47,14 +63,29 @@ fn call_tx(to: Address, data: &[u8]) -> TxEnv {
     }
 }
 
-fn run(hardfork: MonadHardfork, db: CacheDB<EmptyDB>, tx: TxEnv) -> ExecutionResult {
+fn run_with_state(
+    hardfork: MonadHardfork,
+    db: CacheDB<EmptyDB>,
+    tx: TxEnv,
+) -> ExecResultAndState<ExecutionResult> {
     let mut cfg = CfgEnv::new_with_spec(hardfork);
     hardfork.apply_cfg(&mut cfg);
     cfg.chain_id = crate::monad::MONAD_MAINNET_CHAIN_ID;
     cfg.disable_nonce_check = true;
     let env = EvmEnv::new(cfg, BlockEnv::default());
     let mut evm = MonadEvm::new(env, db, NoOpInspector {});
-    evm.transact(tx).expect("transaction executes").result
+    evm.transact(tx).expect("transaction executes")
+}
+
+fn run(hardfork: MonadHardfork, db: CacheDB<EmptyDB>, tx: TxEnv) -> ExecutionResult {
+    run_with_state(hardfork, db, tx).result
+}
+
+fn halt_reason(result: &ExecutionResult) -> MonadHaltReason {
+    match result {
+        ExecutionResult::Halt { reason, .. } => reason.clone(),
+        other => panic!("expected halt, got {other:?}"),
+    }
 }
 
 fn run_code(hardfork: MonadHardfork, code: &[u8]) -> ExecutionResult {
@@ -221,7 +252,10 @@ fn mip3_memory_limit_halts() {
     let code = &[0x60, 0x00, 0x63, 0x00, 0x80, 0x00, 0x00, 0x52, 0x00];
     match run_code(MonadHardfork::MonadNine, code) {
         ExecutionResult::Halt { reason, gas, .. } => {
-            assert_eq!(reason, HaltReason::OutOfGas(OutOfGasError::MemoryLimit));
+            assert_eq!(
+                reason,
+                MonadHaltReason::Base(HaltReason::OutOfGas(OutOfGasError::MemoryLimit))
+            );
             assert_eq!(gas.used(), GAS_LIMIT);
         }
         other => panic!("expected halt, got {other:?}"),
@@ -330,10 +364,10 @@ fn create_inside_delegated_account_is_blocked() {
         CONTRACT,
         AccountInfo::from_bytecode(Bytecode::new_eip7702(DELEGATE)),
     );
-    match run(MonadHardfork::MonadTen, db, call_tx(CONTRACT, &[])) {
-        ExecutionResult::Halt { reason, .. } => assert_eq!(reason, HaltReason::NotActivated),
-        other => panic!("expected halt, got {other:?}"),
-    }
+    assert_eq!(
+        halt_reason(&run(MonadHardfork::MonadTen, db, call_tx(CONTRACT, &[]))),
+        MonadHaltReason::Base(HaltReason::NotActivated)
+    );
 
     // The same code executed directly may CREATE.
     let direct = run_code(
@@ -341,4 +375,269 @@ fn create_inside_delegated_account_is_blocked() {
         &[0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x00],
     );
     assert!(direct.is_success(), "{direct:?}");
+}
+
+#[test]
+fn unused_gas_is_not_refunded() {
+    // STOP with gas price 1: the sender pays the whole gas limit and the
+    // beneficiary receives the priority fee on the whole gas limit.
+    let mut tx = call_tx(CONTRACT, &[]);
+    tx.gas_price = 1;
+    let out = run_with_state(MonadHardfork::MonadTen, db_with_code(&[0x00]), tx);
+    assert_eq!(success_gas(&out.result), 21_000);
+    assert_eq!(
+        out.state[&CALLER].info.balance,
+        U256::from(10u128.pow(18) - GAS_LIMIT as u128)
+    );
+    assert_eq!(
+        out.state[&Address::ZERO].info.balance,
+        U256::from(GAS_LIMIT)
+    );
+}
+
+/// PUSH1 0 x4 PUSH8 <value> PUSH20 <to> GAS CALL POP STOP
+fn send_value_code(to: Address, value: u64) -> Vec<u8> {
+    let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x67];
+    code.extend_from_slice(&value.to_be_bytes());
+    code.push(0x73);
+    code.extend_from_slice(to.as_slice());
+    code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x00]);
+    code
+}
+
+fn five_mon_wei() -> u64 {
+    5_000_000_000_000_000_000
+}
+
+/// `EthCallFixture::eth_call_reserve_balance`: a delegated EOA with 7 MON
+/// receives 3 MON and forwards 5 MON, ending below `min(10 MON, 7 MON)`.
+fn delegated_recipient_db(forwarded: u64) -> CacheDB<EmptyDB> {
+    let mut db = CacheDB::new(EmptyDB::default());
+    db.insert_account_info(
+        CALLER,
+        AccountInfo {
+            balance: mon(100),
+            ..Default::default()
+        },
+    );
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from(send_value_code(
+            RECIPIENT, forwarded,
+        )))),
+    );
+    db.insert_account_info(CONTRACT, account(mon(7), Bytecode::new_eip7702(DELEGATE)));
+    db
+}
+
+#[test]
+fn reserve_balance_violation_reverts_transaction() {
+    let mut tx = call_tx(CONTRACT, &[]);
+    tx.value = mon(3);
+    let out = run_with_state(
+        MonadHardfork::MonadTen,
+        delegated_recipient_db(five_mon_wei()),
+        tx,
+    );
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    // the message was rejected: no value moved
+    assert_eq!(out.state[&CONTRACT].info.balance, mon(7));
+    assert!(out
+        .state
+        .get(&RECIPIENT)
+        .is_none_or(|a| a.info.balance.is_zero()));
+
+    // Forwarding 2 MON leaves 8 MON >= 7 MON: fine.
+    let mut tx = call_tx(CONTRACT, &[]);
+    tx.value = mon(3);
+    let out = run_with_state(
+        MonadHardfork::MonadTen,
+        delegated_recipient_db(2_000_000_000_000_000_000),
+        tx,
+    );
+    assert!(out.result.is_success(), "{:?}", out.result);
+    assert_eq!(out.state[&CONTRACT].info.balance, mon(8));
+    assert_eq!(out.state[&RECIPIENT].info.balance, mon(2));
+}
+
+#[test]
+fn reserve_balance_rule_is_inactive_before_monad_four() {
+    let mut tx = call_tx(CONTRACT, &[]);
+    tx.value = mon(3);
+    // revm resolves the delegation regardless of the spec; without the
+    // reserve rule the forwarded value simply leaves the account.
+    let out = run_with_state(
+        MonadHardfork::MonadThree,
+        delegated_recipient_db(five_mon_wei()),
+        tx,
+    );
+    assert!(out.result.is_success(), "{:?}", out.result);
+    assert_eq!(out.state[&CONTRACT].info.balance, mon(5));
+}
+
+#[test]
+fn sender_may_dip_into_reserve_unless_delegated() {
+    // Plain EOA sender: 100 MON -> 5 MON is allowed.
+    let mut tx = call_tx(RECIPIENT, &[]);
+    tx.value = mon(95);
+    let mut db = db_with_code(&[]);
+    db.insert_account_info(
+        CALLER,
+        AccountInfo {
+            balance: mon(100),
+            ..Default::default()
+        },
+    );
+    let out = run_with_state(MonadHardfork::MonadTen, db.clone(), tx.clone());
+    assert!(out.result.is_success(), "{:?}", out.result);
+    assert_eq!(out.state[&RECIPIENT].info.balance, mon(95));
+
+    // Delegated sender: cannot dip below min(10 MON, 100 MON).
+    db.insert_account_info(CALLER, account(mon(100), Bytecode::new_eip7702(DELEGATE)));
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+    );
+    let out = run_with_state(MonadHardfork::MonadTen, db, tx);
+    assert_eq!(
+        halt_reason(&out.result),
+        MonadHaltReason::ReserveBalanceViolation
+    );
+    assert!(out
+        .state
+        .get(&RECIPIENT)
+        .is_none_or(|a| a.info.balance.is_zero()));
+}
+
+#[test]
+fn dipped_into_reserve_reports_transient_violation() {
+    // DELEGATE (run by the delegated EOA CONTRACT holding 7 MON):
+    //   1. send 5 MON to RECIPIENT (a contract) -> below reserve
+    //   2. CALL 0x1001 dippedIntoReserve(), answer at mem[0x20..0x40]
+    //   3. CALL RECIPIENT with 1 byte of calldata: it sends its balance back
+    //   4. RETURN mem[0x20..0x40]
+    let mut delegate = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x67];
+    delegate.extend_from_slice(&five_mon_wei().to_be_bytes());
+    delegate.push(0x73);
+    delegate.extend_from_slice(RECIPIENT.as_slice());
+    delegate.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+    // PUSH4 selector PUSH1 0xe0 SHL PUSH1 0 MSTORE
+    delegate.extend_from_slice(&[
+        0x63, 0x3a, 0x61, 0x58, 0x4e, 0x60, 0xe0, 0x1b, 0x60, 0x00, 0x52,
+    ]);
+    // retSize 0x20, retOffset 0x20, argsSize 4, argsOffset 0, value 0, 0x1001, GAS, CALL, POP
+    delegate.extend_from_slice(&[
+        0x60, 0x20, 0x60, 0x20, 0x60, 0x04, 0x60, 0x00, 0x60, 0x00, 0x61, 0x10, 0x01, 0x5a, 0xf1,
+        0x50,
+    ]);
+    // retSize 0, retOffset 0, argsSize 1, argsOffset 0, value 0, RECIPIENT, GAS, CALL, POP
+    delegate.extend_from_slice(&[
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x01, 0x60, 0x00, 0x60, 0x00, 0x73,
+    ]);
+    delegate.extend_from_slice(RECIPIENT.as_slice());
+    delegate.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+    // PUSH1 0x20 PUSH1 0x20 RETURN
+    delegate.extend_from_slice(&[0x60, 0x20, 0x60, 0x20, 0xf3]);
+
+    // RECIPIENT: with calldata, send the whole balance back to CALLER
+    // through SELFDESTRUCT (a CALL would re-enter the delegated code).
+    // CALLDATASIZE ISZERO PUSH1 end JUMPI CALLER SELFDESTRUCT end: JUMPDEST STOP
+    let recipient = vec![0x36, 0x15, 0x60, 0x07, 0x57, 0x33, 0xff, 0x5b, 0x00];
+    assert_eq!(recipient[0x07], 0x5b);
+
+    let mut db = db_with_code(&[]);
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from(delegate))),
+    );
+    db.insert_account_info(
+        RECIPIENT,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from(recipient))),
+    );
+    db.insert_account_info(CONTRACT, account(mon(7), Bytecode::new_eip7702(DELEGATE)));
+
+    let out = run_with_state(MonadHardfork::MonadTen, db, call_tx(CONTRACT, &[]));
+    assert!(out.result.is_success(), "{:?}", out.result);
+    assert_eq!(U256::from_be_slice(out.result.output().unwrap()), U256::ONE);
+    assert_eq!(out.state[&CONTRACT].info.balance, mon(7));
+
+    // Direct call from an EOA that never dips: false.
+    let result = run(
+        MonadHardfork::MonadTen,
+        db_with_code(&[]),
+        call_tx(
+            RESERVE_BALANCE_CONTRACT_ADDRESS,
+            &0x3a61584eu32.to_be_bytes(),
+        ),
+    );
+    assert_eq!(success_gas(&result), 21_064 + 100);
+    assert_eq!(U256::from_be_slice(result.output().unwrap()), U256::ZERO);
+}
+
+#[test]
+fn delegation_to_staking_precompile_is_rejected() {
+    // DELEGATE account is an EOA delegating to 0x1000.
+    let mut db = db_with_code(&[]);
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_eip7702(STAKING_CONTRACT_ADDRESS)),
+    );
+    // top level: EVMC_REJECTED, all gas consumed
+    let result = run(MonadHardfork::MonadTen, db.clone(), call_tx(DELEGATE, &[]));
+    assert_eq!(
+        halt_reason(&result),
+        MonadHaltReason::Base(HaltReason::PrecompileError)
+    );
+    assert_eq!(result.gas_used(), GAS_LIMIT);
+
+    // nested: CONTRACT calls DELEGATE and returns the CALL success flag
+    let mut code = vec![
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+    ];
+    code.extend_from_slice(DELEGATE.as_slice());
+    code.extend_from_slice(&[0x5a, 0xf1, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    db.insert_account_info(
+        CONTRACT,
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from(code.clone()))),
+    );
+    let result = run(MonadHardfork::MonadTen, db, call_tx(CONTRACT, &[]));
+    let gas_used = success_gas(&result);
+    assert_eq!(result.output().unwrap().as_ref(), &[0u8; 32]);
+    assert!(gas_used > GAS_LIMIT / 64 * 62, "gas used {gas_used}");
+
+    // Delegation to an Ethereum precompile runs as empty code (EIP-7702).
+    let mut db = db_with_code(&code);
+    db.insert_account_info(
+        DELEGATE,
+        AccountInfo::from_bytecode(Bytecode::new_eip7702(address!(
+            "0000000000000000000000000000000000000001"
+        ))),
+    );
+    let result = run(MonadHardfork::MonadTen, db, call_tx(CONTRACT, &[]));
+    assert!(success_gas(&result) < 40_000);
+    assert_eq!(U256::from_be_slice(result.output().unwrap()), U256::ONE);
+}
+
+#[test]
+fn initcode_limits_before_monad_four() {
+    // CREATE with 48 KiB + 1 of zeroed initcode:
+    // PUSH3 0xc001 PUSH1 0 PUSH1 0 CREATE STOP
+    let code = &[0x62, 0x00, 0xc0, 0x01, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x00];
+    assert_eq!(
+        halt_reason(&run_code(MonadHardfork::MonadThree, code)),
+        MonadHaltReason::Base(HaltReason::CreateInitCodeSizeLimit)
+    );
+    assert!(run_code(MonadHardfork::MonadFour, code).is_success());
+
+    // A top level deployment may use up to 2 * max code size even before
+    // MONAD_FOUR.
+    let mut tx = call_tx(CONTRACT, &[]);
+    tx.kind = TxKind::Create;
+    tx.data = Bytes::from(vec![0u8; 60 * 1024]);
+    let result = run(MonadHardfork::MonadThree, db_with_code(&[]), tx);
+    assert!(result.is_success(), "{result:?}");
 }

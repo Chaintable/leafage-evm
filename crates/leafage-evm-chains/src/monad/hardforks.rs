@@ -79,7 +79,11 @@ impl MonadHardfork {
     pub fn apply_cfg(self, cfg: &mut CfgEnv<MonadHardfork>) {
         cfg.set_spec_and_mainnet_gas_params(self);
         cfg.limit_contract_code_size = Some(self.max_code_size());
-        cfg.limit_contract_initcode_size = Some(self.max_initcode_size());
+        // Transaction level initcode limit (`validate_transaction.cpp`): always
+        // twice the code size limit, even in MONAD_TWO/THREE where the CREATE
+        // opcode limit stayed at 48 KiB (`max_initcode_size`, enforced by the
+        // CREATE wrapper).
+        cfg.limit_contract_initcode_size = Some(2 * self.max_code_size());
         apply_gas_rules(self, cfg);
     }
 
@@ -126,6 +130,26 @@ impl MonadHardfork {
 
     /// Reserve balance precompile (`0x1001`) exists.
     pub const fn is_reserve_balance_enabled(self) -> bool {
+        self.is_at_least(Self::MonadNine)
+    }
+
+    /// `revert_transaction` (`execution/monad/reserve_balance.cpp`): a
+    /// transaction that leaves an EOA below its reserve balance is reverted.
+    pub const fn is_reserve_balance_check_enabled(self) -> bool {
+        self.is_at_least(Self::MonadFour)
+    }
+
+    /// `ReserveBalance::use_recent_code_hash_`: the reserve check looks at
+    /// the account code after the transaction instead of the pre-transaction
+    /// code.
+    pub const fn reserve_check_uses_recent_code(self) -> bool {
+        self.is_at_least(Self::MonadEight)
+    }
+
+    /// `ReserveBalance::allow_init_selfdestruct_exemption_`: contracts that
+    /// self destruct during their init code are exempt from the reserve
+    /// check.
+    pub const fn reserve_check_exempts_init_selfdestruct(self) -> bool {
         self.is_at_least(Self::MonadNine)
     }
 
@@ -273,7 +297,9 @@ mod tests {
         let mut cfg = CfgEnv::new_with_spec(MonadHardfork::MonadThree);
         MonadHardfork::MonadThree.apply_cfg(&mut cfg);
         assert_eq!(cfg.limit_contract_code_size, Some(128 * 1024));
-        assert_eq!(cfg.limit_contract_initcode_size, Some(48 * 1024));
+        // Transaction level limit is 2 * max code size even before MONAD_FOUR
+        assert_eq!(cfg.limit_contract_initcode_size, Some(256 * 1024));
+        assert_eq!(MonadHardfork::MonadThree.max_initcode_size(), 48 * 1024);
     }
 
     #[test]
