@@ -11,7 +11,7 @@ earlier, non-equivalent comparison and is not the current acceptance gate.
 
 This is a frozen Arc-specific suite, not a portable runner. It requires the
 reviewed local `verify_arc_queries.py` fixture module and its adjacent
-`../fixtures/arc-pq-valid.json` vector. The local task directory is
+`fixtures/arc-pq-valid.json` vector. The local task directory is
 `/Users/lihe/code/task_arc/local/leafage-arc-verification/scripts`. The manifest
 records the fixture module hash; the task evidence checksum file also pins the
 PQ vector. Do not substitute fixtures without revalidating the corpus.
