@@ -55,6 +55,7 @@ pub struct Command {
             "moonriver",
             "polygon",
             "hemi",
+            "monad",
         ],
         default_value = "mainnet"
     )]
@@ -417,6 +418,9 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "tempo" {
         return Ok(4217);
     }
+    if arg == "monad" {
+        return Ok(leafage_evm_chains::monad::MONAD_MAINNET_CHAIN_ID);
+    }
     if arg.parse::<u64>().is_ok() {
         return Ok(arg.parse().unwrap());
     } else {
@@ -576,6 +580,21 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Polygon(chain_cfg))
+            }
+            "monad" => {
+                let spec = resolve_spec(
+                    self.spec_id,
+                    leafage_evm_chains::monad::MonadHardfork::default(),
+                    "monad",
+                )?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Monad(chain_cfg))
             }
             // Moonbeam and Moonriver share an identical EVM and precompile set;
             // they differ only by chain id (passed via --chain-cfg) and native

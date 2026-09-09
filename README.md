@@ -60,6 +60,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | WEMIX                                         | [Chaintable/go-wemix](https://github.com/Chaintable/go-wemix)                                    |
 | Polygon PoS                                   | [Chaintable/bor](https://github.com/Chaintable/bor)                                              |
 | Sonic                                         | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                          |
+| Monad                                         | [Chaintable/monad-bft-x](https://github.com/Chaintable/monad-bft-x)                              |
 
 ## Supported JSON-RPC Methods
 

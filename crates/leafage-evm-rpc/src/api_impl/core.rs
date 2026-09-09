@@ -10,6 +10,7 @@ use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::hemi::HemiHardfork;
 use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
+use leafage_evm_chains::monad::MonadHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
@@ -226,6 +227,7 @@ pub enum MultiChainCfgEnv {
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Iotex(CfgEnv<IotexHardfork>),
     Mantle(CfgEnv<MantleHardfork>),
+    Monad(CfgEnv<MonadHardfork>),
     Moonbeam(CfgEnv<MoonbeamHardfork>),
     Polygon(CfgEnv<PolygonHardfork>),
     Hemi(CfgEnv<HemiHardfork>),
@@ -244,6 +246,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Iotex(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Monad(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Moonbeam(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Polygon(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Hemi(cfg) => cfg.chain_id,
