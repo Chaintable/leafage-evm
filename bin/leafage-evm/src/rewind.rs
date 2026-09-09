@@ -7,6 +7,7 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
 
 /// `leafage-evm rewind` command
@@ -152,6 +153,7 @@ impl Command {
                 &cfg.s3_chain_id,
                 &cfg.version,
                 self.to_block,
+                Duration::from_secs(cfg.s3_read_timeout_secs.get()),
             )
             .await?
         };

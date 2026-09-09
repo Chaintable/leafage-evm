@@ -5,6 +5,7 @@ use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{ApiBuilder, TokenCollector};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{Address, DebankTransaction};
+use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{error, info};
 
@@ -57,6 +58,7 @@ where
 
     // only for replay block
     async fn fetch_warmup_blocks(&self) -> anyhow::Result<Vec<Vec<DebankTransaction>>> {
+        let read_timeout = Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get());
         let mut res = Vec::with_capacity(self.warmup_blocks);
         let end_block_number = self.tree.last_committed_block()?.unwrap().header.number;
         let start_block_number = end_block_number
@@ -83,6 +85,7 @@ where
                         &s3_chain_id,
                         &version,
                         block_num,
+                        read_timeout,
                     )
                     .await
                     .context(format!("s3 get transactions failed, {block_num}"))
