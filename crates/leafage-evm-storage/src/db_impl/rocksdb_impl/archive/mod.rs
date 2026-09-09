@@ -48,6 +48,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 mod iterator_tracker;
+mod rewind;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };

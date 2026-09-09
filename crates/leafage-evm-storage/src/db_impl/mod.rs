@@ -1,6 +1,7 @@
 //! Database implementation for EVM storage.
 
 mod archive_encoding;
+mod rewind;
 mod rocksdb_impl;
 
 mod mdbx_impl;
@@ -63,7 +64,7 @@ impl MultiStorage {
         disable_auto_compactions: bool,
         archive_zstd_compression: bool,
     ) -> Result<Self, StorageError> {
-        match (kind, is_archive) {
+        let db: Result<Self, StorageError> = match (kind, is_archive) {
             (StorageKind::Rocksdb, false) => {
                 let db = RocksDBStorage::open(path, cache_size, disable_auto_compactions);
                 Ok(MultiStorage::RocksDBState(Arc::new(db)))
@@ -85,7 +86,10 @@ impl MultiStorage {
                 let db = MDBXArchiveStorage::open(path);
                 Ok(MultiStorage::MDBXArchive(Arc::new(db)))
             }
-        }
+        };
+        let db = db?;
+        db.ensure_no_rewind()?;
+        Ok(db)
     }
 }
 

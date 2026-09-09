@@ -46,6 +46,8 @@ use tracing::{info, trace};
 
 const LATEST_BLOCK_HASH_KEY: &[u8] = &[1u8];
 
+mod rewind;
+
 // ===== Table Definition =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -196,6 +198,21 @@ impl DataBase {
 
     /// Open database with custom options for performance tuning
     pub fn open_with_options<P: AsRef<Path>>(path: P, options: MDBXOptions) -> Self {
+        Self::open_inner(path, options, false)
+    }
+
+    pub(crate) fn open_for_rewind(path: &Path) -> Self {
+        Self::open_inner(
+            path,
+            MDBXOptions {
+                sync_mode: SyncMode::Durable,
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    fn open_inner<P: AsRef<Path>>(path: P, options: MDBXOptions, exclusive: bool) -> Self {
         let path = path.as_ref();
 
         let mut inner_env = Environment::builder();
@@ -213,6 +230,7 @@ impl DataBase {
         inner_env.set_geometry(geometry);
 
         inner_env.set_flags(EnvironmentFlags {
+            exclusive,
             mode: Mode::ReadWrite {
                 sync_mode: options.sync_mode,
             },

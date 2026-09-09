@@ -37,7 +37,7 @@ pub(crate) enum Commands {
     /// are missing the prefix bloom / partitioned index (regenerates them)
     #[command(name = "force-compact")]
     ForceCompact(force_compact::Command),
-    /// Rewind the committed head to an earlier block to resync from S3
+    /// Offline rewind (archive: truncate future state; snapshot: reset head)
     #[command(name = "rewind")]
     Rewind(rewind::Command),
     /// Read-only scan of an archive DB column family (forensics/debugging)
