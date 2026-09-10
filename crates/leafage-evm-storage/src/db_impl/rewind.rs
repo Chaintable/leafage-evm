@@ -1,11 +1,12 @@
 //! Offline archive truncation. A durable marker prevents normal startup after
 //! a partial deletion; retrying the same target rescans the tables idempotently.
-use super::{inverted_block_encoding, MultiStorage, StorageError, StorageKind};
-use alloy_rlp::Decodable;
-use leafage_evm_types::{BlockInfo, RawHeader, H256};
-use std::path::Path;
+use super::{set_inverted_block_encoding, MultiStorage, StorageError, StorageKind};
+use leafage_evm_types::{BlockInfo, H256};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub(crate) const REWIND_KEY: &[u8] = b"leafage:archive_rewind";
+pub(crate) const REWIND_BATCH_BYTES: usize = 1024 * 1024;
 pub(crate) const REWIND_BATCH_SIZE: usize = if cfg!(test) { 2 } else { 10_000 };
 
 #[derive(Clone, Copy, Debug)]
@@ -48,7 +49,7 @@ pub(crate) fn remove_record(
         let number = if json_headers {
             serde_json::from_slice::<BlockInfo>(value)?.header.number
         } else {
-            RawHeader::decode(&mut &value[..])?.number
+            super::rocksdb_impl::decode_archive_header(&mut &value[..])?.number
         };
         return Ok(number > target);
     }
@@ -72,9 +73,106 @@ pub(crate) fn remove_record(
     Ok(height > target)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OffsetSource {
+    KafkaConfig,
+    Directory,
+}
+
+/// The offset belongs to the discarded branch. This choice is bound to the
+/// durable rewind marker and must match on every retry. It contains no secrets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveRewindOffset {
+    NoKafka,
+    Kafka { file: PathBuf, source: OffsetSource },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RewindMarker {
+    version: u32,
+    original_head: BlockInfo,
+    target: BlockInfo,
+    inverted: bool,
+    offset: ArchiveRewindOffset,
+}
+
+pub(crate) fn reject_pending(pending: bool) -> Result<(), StorageError> {
+    if pending {
+        return Err(StorageError::UnSupported("archive rewind is incomplete; rerun rewind --archive --truncate-archive with the same target, encoding and offset options".into()));
+    }
+    Ok(())
+}
+
+/// Canonicalize the existing ancestor without creating directories. The file
+/// itself is not canonicalized: resetting an offset removes its directory entry.
+pub fn archive_offset_file(dir: &Path) -> Result<PathBuf, StorageError> {
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while !ancestor.try_exists()? {
+        suffix.push(
+            ancestor
+                .file_name()
+                .ok_or_else(|| StorageError::UnSupported("invalid offset directory".into()))?,
+        );
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| StorageError::UnSupported("invalid offset directory".into()))?;
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved.join("offset"))
+}
+
+impl ArchiveRewindOffset {
+    fn validate(&self) -> Result<(), StorageError> {
+        if let Self::Kafka { file, .. } = self {
+            if !file.is_absolute() || file.file_name() != Some(std::ffi::OsStr::new("offset")) {
+                return Err(StorageError::UnSupported(
+                    "rewind requires an absolute offset file path ending in /offset".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reset(&self) -> Result<(), StorageError> {
+        let Self::Kafka { file, .. } = self else {
+            return Ok(());
+        };
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Always sync, including a retry after unlink succeeded but fsync failed.
+        // If the directory never existed, sync its nearest existing ancestor.
+        let mut parent = file.parent().unwrap();
+        loop {
+            match std::fs::File::open(parent) {
+                Ok(dir) => {
+                    dir.sync_all()?;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    parent = parent.parent().ok_or(e)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
 impl MultiStorage {
-    /// Opens an existing archive exclusively for maintenance. Normal callers
-    /// must use `open`, which refuses an unfinished rewind.
+    /// Exclusive maintenance open: never create missing databases or tables.
     pub fn open_for_archive_rewind(
         path: &Path,
         cache_size: usize,
@@ -92,10 +190,10 @@ impl MultiStorage {
         }
         Ok(match kind {
             StorageKind::Rocksdb => Self::RocksDBArchive(std::sync::Arc::new(
-                super::ArchiveRocksDBStorage::open(path, cache_size, false, false),
+                super::ArchiveRocksDBStorage::open_for_rewind(path, cache_size)?,
             )),
             StorageKind::MDBX => Self::MDBXArchive(std::sync::Arc::new(
-                super::MDBXArchiveStorage::open_for_rewind(path),
+                super::MDBXArchiveStorage::open_for_rewind(path)?,
             )),
         })
     }
@@ -104,73 +202,196 @@ impl MultiStorage {
         match self {
             Self::RocksDBArchive(db) => db.rewind_marker(),
             Self::MDBXArchive(db) => db.rewind_marker(),
-            _ => Ok(None),
+            Self::RocksDBState(db) => db.rewind_marker(),
+            Self::MDBXState(db) => db.rewind_marker(),
         }
     }
 
     pub(crate) fn ensure_no_rewind(&self) -> Result<(), StorageError> {
-        if self.rewind_marker()?.is_some() {
-            return Err(StorageError::UnSupported(
-                "archive rewind is incomplete; rerun rewind --archive with the same target before starting the node".into(),
-            ));
-        }
-        Ok(())
+        reject_pending(self.rewind_marker()?.is_some())
     }
 
-    /// Resolve and validate before the CLI invalidates its Kafka offset.
-    pub fn archive_rewind_target(&self, number: u64) -> Result<BlockInfo, StorageError> {
-        if let Some(marker) = self.rewind_marker()? {
-            let (target, inverted): (BlockInfo, bool) = serde_json::from_slice(&marker)?;
-            if target.header.number != number || inverted != inverted_block_encoding() {
-                return Err(StorageError::UnSupported(format!(
-                    "unfinished rewind targets block {} with inverted encoding {}; retry with the same target and encoding",
-                    target.header.number, inverted
-                )));
+    fn rewind_block(&self, number: Option<u64>) -> Result<BlockInfo, StorageError> {
+        let (hash, block) = match self {
+            Self::RocksDBArchive(db) => {
+                let hash = match number {
+                    Some(n) => db.read_block_hash(n)?,
+                    None => db.read_latest_block_hash()?,
+                };
+                (hash, db.read_block_info(hash)?)
             }
-            return Ok(target);
-        }
-        let (head, target) = match self {
-            Self::RocksDBArchive(db) => (
-                db.read_block_info(db.read_latest_block_hash()?)?,
-                db.read_block_info(db.read_block_hash(number)?)?,
-            ),
-            Self::MDBXArchive(db) => (
-                db.read_block_info(db.read_latest_block_hash()?)?,
-                db.read_block_info(db.read_block_hash(number)?)?,
-            ),
+            Self::MDBXArchive(db) => {
+                let hash = match number {
+                    Some(n) => db.read_block_hash(n)?,
+                    None => db.read_latest_block_hash()?,
+                };
+                (hash, db.read_block_info(hash)?)
+            }
             _ => {
                 return Err(StorageError::UnSupported(
                     "real rewind requires archive mode".into(),
                 ))
             }
         };
-        let head =
-            head.ok_or_else(|| StorageError::UnSupported("archive has no committed head".into()))?;
-        let target = target.ok_or_else(|| {
-            StorageError::UnSupported(format!("archive block {number} not found"))
+        let block = block.ok_or_else(|| {
+            StorageError::UnSupported(format!("archive block {number:?} not found"))
         })?;
-        // Equality also allows repairing an archive previously rewound by the
-        // old pointer-only command, and makes successful retries harmless.
-        if number > head.header.number
-            || target.header.number != number
-            || target.header.hash == H256::ZERO
+        if hash == H256::ZERO
+            || hash != block.header.hash
+            || number.is_some_and(|n| n != block.header.number)
         {
             return Err(StorageError::UnSupported(
-                "invalid archive rewind target".into(),
+                "inconsistent archive block index/header".into(),
             ));
         }
-        Ok(target)
+        Ok(block)
     }
 
-    /// Delete future state and block indexes, then atomically publish the head.
-    /// Callers must stop the node and durably reset its Kafka offset first.
-    pub fn rewind_archive(&self, number: u64) -> Result<BlockInfo, StorageError> {
-        let target = self.archive_rewind_target(number)?;
-        match self {
-            Self::RocksDBArchive(db) => db.rewind_to(&target)?,
-            Self::MDBXArchive(db) => db.rewind_to(&target)?,
-            _ => unreachable!("archive_rewind_target rejects state databases"),
+    /// Offline operation. Precheck -> durable marker -> durable offset reset ->
+    /// bounded deletion batches -> atomic head publication and marker removal.
+    /// All database users must remain stopped until this method succeeds.
+    pub fn rewind_archive(
+        &self,
+        number: u64,
+        encoding: Option<bool>,
+        offset: ArchiveRewindOffset,
+    ) -> Result<BlockInfo, StorageError> {
+        offset.validate()?;
+        let pending: Option<RewindMarker> = self
+            .rewind_marker()?
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()?;
+        let (disk_encoding, populated) = match self {
+            Self::RocksDBArchive(db) => db.rewind_layout()?,
+            Self::MDBXArchive(db) => db.rewind_layout()?,
+            _ => {
+                return Err(StorageError::UnSupported(
+                    "real rewind requires archive mode".into(),
+                ))
+            }
+        };
+        let stored_encoding = match disk_encoding.as_deref() {
+            None => None,
+            Some([0]) => Some(false),
+            Some([1]) => Some(true),
+            _ => {
+                return Err(StorageError::UnSupported(
+                    "invalid archive encoding marker".into(),
+                ))
+            }
+        };
+        if stored_encoding.zip(encoding).is_some_and(|(a, b)| a != b) {
+            return Err(StorageError::UnSupported(
+                "--archive-encoding conflicts with stored encoding".into(),
+            ));
         }
-        Ok(target)
+        let inverted = stored_encoding.or(encoding).ok_or_else(|| {
+            StorageError::UnSupported(
+                "unmarked archive requires --archive-encoding legacy|inverted".into(),
+            )
+        })?;
+        if !populated && stored_encoding.is_none() && pending.is_none() {
+            return Err(StorageError::UnSupported(
+                "cannot identify an empty unmarked database as archive".into(),
+            ));
+        }
+        let target = self.rewind_block(Some(number))?;
+        let marker = if let Some(marker) = pending {
+            if marker.version != 1
+                || marker.target.header.number != number
+                || marker.target.header.hash != target.header.hash
+                || marker.inverted != inverted
+                || marker.offset != offset
+                || number > marker.original_head.header.number
+            {
+                return Err(StorageError::UnSupported("unfinished rewind: target, encoding or offset configuration differs (or unsupported marker version)".into()));
+            }
+            marker
+        } else {
+            let original_head = self.rewind_block(None)?;
+            if number > original_head.header.number {
+                return Err(StorageError::UnSupported(
+                    "rewind target is above the committed head".into(),
+                ));
+            }
+            RewindMarker {
+                version: 1,
+                original_head,
+                target,
+                inverted,
+                offset,
+            }
+        };
+        let bytes = serde_json::to_vec(&marker)?;
+        match self {
+            Self::RocksDBArchive(db) => db.write_rewind_marker(&bytes)?,
+            Self::MDBXArchive(db) => db.write_rewind_marker(&bytes)?,
+            _ => unreachable!(),
+        }
+        marker.offset.reset()?;
+        set_inverted_block_encoding(inverted);
+        match self {
+            Self::RocksDBArchive(db) => db.rewind_to(&marker.target, inverted)?,
+            Self::MDBXArchive(db) => db.rewind_to(&marker.target, inverted)?,
+            _ => unreachable!(),
+        }
+        Ok(marker.target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_height_inverted_is_not_a_legacy_sentinel() {
+        for (table, len) in [(RewindTable::Accounts, 64), (RewindTable::Storage, 96)] {
+            let mut key = vec![0; len];
+            key[len - 8..].copy_from_slice(&u64::MAX.to_be_bytes());
+            assert!(!remove_record(table, &key, &[], 0, true, false).unwrap());
+            assert!(remove_record(table, &key, &[], 0, false, false).unwrap());
+            key[len - 32] = 1;
+            assert!(remove_record(table, &key, &[], 0, true, false).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_unmarked_archives_are_not_identifiable() {
+        use crate::{EvmStorageWrite, StateDBProvider, StateDBWrapper};
+        use leafage_evm_types::{Block, BlockId, BlockStorageDiff, Header, RawHeader};
+        let _lock = crate::db_impl::rocksdb_impl::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_inverted_block_encoding(false);
+        for kind in [StorageKind::Rocksdb, StorageKind::MDBX] {
+            let dir =
+                std::env::temp_dir().join(format!("empty-rewind-{kind:?}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = MultiStorage::open(&dir, 16, kind, true, false, false).unwrap();
+            StateDBWrapper(db.db_at(BlockId::latest()).unwrap().unwrap())
+                .update_block(
+                    BlockInfo::new(Block {
+                        header: Header {
+                            hash: H256::repeat_byte(1),
+                            inner: RawHeader {
+                                number: 1,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    BlockStorageDiff::default(),
+                )
+                .unwrap();
+            assert!(db
+                .rewind_archive(1, Some(false), ArchiveRewindOffset::NoKafka)
+                .unwrap_err()
+                .to_string()
+                .contains("empty unmarked"));
+            assert!(db.rewind_marker().unwrap().is_none());
+            drop(db);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

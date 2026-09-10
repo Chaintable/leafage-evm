@@ -731,3 +731,17 @@ impl StateDBWrite for StateDB {
         Ok(())
     }
 }
+
+impl DataBase {
+    pub(crate) fn rewind_marker(&self) -> Result<Option<Vec<u8>>, Error> {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| Error::UnSupported(e.to_string()))?;
+        txn.get(
+            self.dbis[StorageTable::LatestBlockHash.to_str()],
+            crate::db_impl::rewind::REWIND_KEY,
+        )
+        .map_err(|e| Error::UnSupported(e.to_string()))
+    }
+}

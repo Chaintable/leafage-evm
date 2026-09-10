@@ -198,10 +198,14 @@ impl DataBase {
 
     /// Open database with custom options for performance tuning
     pub fn open_with_options<P: AsRef<Path>>(path: P, options: MDBXOptions) -> Self {
-        Self::open_inner(path, options, false)
+        Self::open_inner(path, options, false).expect("Failed to open archive MDBX")
     }
 
-    pub(crate) fn open_for_rewind(path: &Path) -> Self {
+    pub(crate) fn try_open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        Self::open_inner(path, MDBXOptions::default(), false)
+    }
+
+    pub(crate) fn open_for_rewind(path: &Path) -> Result<Self, Error> {
         Self::open_inner(
             path,
             MDBXOptions {
@@ -212,7 +216,11 @@ impl DataBase {
         )
     }
 
-    fn open_inner<P: AsRef<Path>>(path: P, options: MDBXOptions, exclusive: bool) -> Self {
+    fn open_inner<P: AsRef<Path>>(
+        path: P,
+        options: MDBXOptions,
+        exclusive: bool,
+    ) -> Result<Self, Error> {
         let path = path.as_ref();
 
         let mut inner_env = Environment::builder();
@@ -246,71 +254,41 @@ impl DataBase {
 
         let mut dbis = HashMap::new();
 
-        let env = inner_env
-            .open(path)
-            .expect("Failed to open MDBX environment");
+        let env = inner_env.open(path).map_err(rewind::mdbx_error)?;
 
         info!(
             target = "mdbx_archive",
             "Opened MDBX archive database at {:?}", path
         );
 
-        // Create tables
-        let txn = env.begin_rw_txn().expect("Failed to begin transaction");
-        let t = txn
-            .create_db(
-                Some(StorageTable::LatestBlockHash.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create LatestBlockHash table");
-        dbis.insert(StorageTable::LatestBlockHash.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::BlockHashToBlockInfo.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create BlockHashToBlockInfo table");
-        dbis.insert(StorageTable::BlockHashToBlockInfo.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::BlockNumToBlockHash.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create BlockNumToBlockHash table");
-        dbis.insert(StorageTable::BlockNumToBlockHash.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::AddressToAccount.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create AddressToAccount table");
-        dbis.insert(StorageTable::AddressToAccount.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::AddressToStorage.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create AddressToStorage table");
-        dbis.insert(StorageTable::AddressToStorage.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::HashToCode.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create HashToCode table");
-        dbis.insert(StorageTable::HashToCode.to_str(), t.dbi());
-
-        txn.commit().expect("Failed to commit transaction");
-
-        Self {
+        let txn = env.begin_rw_txn().map_err(rewind::mdbx_error)?;
+        for table in [
+            StorageTable::LatestBlockHash,
+            StorageTable::BlockHashToBlockInfo,
+            StorageTable::BlockNumToBlockHash,
+            StorageTable::AddressToAccount,
+            StorageTable::AddressToStorage,
+            StorageTable::HashToCode,
+        ] {
+            let t = if exclusive {
+                txn.open_db(Some(table.to_str()))
+            } else {
+                txn.create_db(Some(table.to_str()), DatabaseFlags::empty())
+            }
+            .map_err(rewind::mdbx_error)?;
+            if !exclusive && table.to_str() == StorageTable::LatestBlockHash.to_str() {
+                let marker: Option<Vec<u8>> = txn
+                    .get(t.dbi(), crate::db_impl::rewind::REWIND_KEY)
+                    .map_err(rewind::mdbx_error)?;
+                crate::db_impl::rewind::reject_pending(marker.is_some())?;
+            }
+            dbis.insert(table.to_str(), t.dbi());
+        }
+        txn.commit().map_err(rewind::mdbx_error)?;
+        Ok(Self {
             env,
             dbis: Arc::new(dbis),
-        }
+        })
     }
 
     /// Manually sync/flush data to disk.

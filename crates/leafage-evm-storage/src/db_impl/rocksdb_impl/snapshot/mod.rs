@@ -968,3 +968,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+impl DataBase {
+    pub(crate) fn rewind_marker(&self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.db.get_cf(
+            self.db.cf_handle("1").unwrap(),
+            crate::db_impl::rewind::REWIND_KEY,
+        )?)
+    }
+}

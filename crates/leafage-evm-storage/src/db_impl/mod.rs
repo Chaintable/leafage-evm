@@ -2,6 +2,7 @@
 
 mod archive_encoding;
 mod rewind;
+pub use rewind::{archive_offset_file, ArchiveRewindOffset, OffsetSource};
 mod rocksdb_impl;
 
 mod mdbx_impl;
@@ -70,12 +71,12 @@ impl MultiStorage {
                 Ok(MultiStorage::RocksDBState(Arc::new(db)))
             }
             (StorageKind::Rocksdb, true) => {
-                let db = ArchiveRocksDBStorage::open(
+                let db = ArchiveRocksDBStorage::try_open(
                     path,
                     cache_size,
                     disable_auto_compactions,
                     archive_zstd_compression,
-                );
+                )?;
                 Ok(MultiStorage::RocksDBArchive(Arc::new(db)))
             }
             (StorageKind::MDBX, false) => {
@@ -83,7 +84,7 @@ impl MultiStorage {
                 Ok(MultiStorage::MDBXState(Arc::new(db)))
             }
             (StorageKind::MDBX, true) => {
-                let db = MDBXArchiveStorage::open(path);
+                let db = MDBXArchiveStorage::try_open(path)?;
                 Ok(MultiStorage::MDBXArchive(Arc::new(db)))
             }
         };
