@@ -194,6 +194,7 @@ mod tests {
             tempo_fields: None,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         }
     }
@@ -308,6 +309,7 @@ mod tests {
             tempo_fields: None,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         };
         TempoEvm::new(env(), db, NoOpInspector, false)

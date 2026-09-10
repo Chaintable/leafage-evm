@@ -626,6 +626,7 @@ where
             tempo_fields,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
             ),

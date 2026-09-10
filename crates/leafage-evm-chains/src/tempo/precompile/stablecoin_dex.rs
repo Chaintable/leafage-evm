@@ -1588,17 +1588,24 @@ impl StablecoinDEX {
         Ok(())
     }
 
-    /// Decrement user's DEX balance or transfer from wallet.
+    /// Decrement user's DEX balance or transfer from wallet. Callers whose
+    /// route already checked pause pass false to avoid a redundant SLOAD.
     fn decrement_balance_or_transfer_from(
         &mut self,
         user: Address,
         token: Address,
         amount: u128,
+        check_pause: bool,
     ) -> Result<()> {
-        TIP20Token::from_address(token)?.ensure_transfer_authorized(user, self.address)?;
+        let tip20 = TIP20Token::from_address(token)?;
+        tip20.ensure_transfer_authorized(user, self.address)?;
 
         let user_balance = self.balance_of(user, token)?;
         if user_balance >= amount {
+            // No TIP-20 transfer runs on this path, so orders must check pause.
+            if check_pause && self.storage.spec().is_t4() {
+                tip20.check_not_paused()?;
+            }
             self.sub_balance(user, token, amount)
         } else {
             let remaining = amount
@@ -1757,7 +1764,7 @@ impl StablecoinDEX {
         if self.storage.spec().is_t4() {
             non_escrow_tip20.check_not_paused()?;
         }
-        self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
+        self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount, true)?;
 
         let order_id = self.next_order_id_val()?;
         self.increment_next_order_id()?;
@@ -1906,7 +1913,7 @@ impl StablecoinDEX {
             }
             self.sub_balance(sender, escrow_token, escrow_amount)?;
         } else {
-            self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
+            self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount, true)?;
         }
 
         let order_id = self.next_order_id_val()?;
@@ -2561,7 +2568,7 @@ impl StablecoinDEX {
         min_amount_out: u128,
     ) -> Result<u128> {
         let route = self.find_trade_path(token_in, token_out)?;
-        self.decrement_balance_or_transfer_from(sender, token_in, amount_in)?;
+        self.decrement_balance_or_transfer_from(sender, token_in, amount_in, false)?;
 
         let mut amount = amount_in;
         let mut storage_credits = StorageCreditDeltas::new();
@@ -2611,7 +2618,7 @@ impl StablecoinDEX {
             return Err(err_max_input_exceeded());
         }
 
-        self.decrement_balance_or_transfer_from(sender, token_in, amount)?;
+        self.decrement_balance_or_transfer_from(sender, token_in, amount, false)?;
         self.transfer(token_out, sender, amount_out)?;
         storage_credits.flush(|user, slots| self.credit_dex_storage_slots(user, slots))?;
         Ok(amount)
@@ -3030,6 +3037,129 @@ mod tests {
                 amount: U256::from(amount),
             },
         )
+    }
+
+    #[test]
+    fn paused_order_escrow_full_internal_balance_respects_t4() {
+        for spec in [
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+        ] {
+            for is_bid in [false, true] {
+                for flip in [false, true] {
+                    let mut provider = TestStorageProvider::new(spec);
+                    StorageCtx::enter(&mut provider, || {
+                        let admin = Address::repeat_byte(0xa1);
+                        let maker = Address::repeat_byte(0xa2);
+                        let base = address!("0x20c00000000000000000000000000000000000a1");
+                        let escrow = if is_bid { PATH_USD_ADDRESS } else { base };
+                        let mut dex = StablecoinDEX::new();
+                        setup_dex_tokens(&mut dex, admin, base)?;
+                        dex.set_balance(maker, escrow, MIN_ORDER_AMOUNT)?;
+                        let mut token = TIP20Token::from_address_unchecked(escrow);
+                        token.grant_role(
+                            admin,
+                            IRolesAuth::grantRoleCall {
+                                role: *PAUSE_ROLE,
+                                account: admin,
+                            },
+                        )?;
+                        token.pause(admin, ITIP20::pauseCall {})?;
+                        let next_id = dex.next_order_id_val()?;
+                        let result = if flip {
+                            dex.place_flip(
+                                maker,
+                                base,
+                                MIN_ORDER_AMOUNT,
+                                is_bid,
+                                0,
+                                if is_bid { 10 } else { -10 },
+                                false,
+                            )
+                        } else {
+                            dex.place(maker, base, MIN_ORDER_AMOUNT, is_bid, 0)
+                        };
+                        if spec.is_t4() {
+                            assert_eq!(
+                                result,
+                                Err(TempoPrecompileError::Revert(
+                                    ITIP20::ContractPaused {}.abi_encode().into()
+                                )),
+                                "{spec:?}, bid={is_bid}, flip={flip}"
+                            );
+                            assert_eq!(dex.balance_of(maker, escrow)?, MIN_ORDER_AMOUNT);
+                            assert_eq!(dex.next_order_id_val()?, next_id);
+                        } else {
+                            assert_eq!(result?, next_id);
+                            assert_eq!(dex.balance_of(maker, escrow)?, 0);
+                        }
+                        Ok::<_, TempoPrecompileError>(())
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paused_order_wallet_fallback_and_non_escrow_boundaries() {
+        for spec in [
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T11,
+        ] {
+            for is_bid in [false, true] {
+                for flip in [false, true] {
+                    for pause_escrow in [false, true] {
+                        for balance in [
+                            0,
+                            MIN_ORDER_AMOUNT - 1,
+                            MIN_ORDER_AMOUNT,
+                            MIN_ORDER_AMOUNT + 1,
+                        ] {
+                            let mut provider = TestStorageProvider::new(spec);
+                            StorageCtx::enter(&mut provider, || {
+                                    let admin = Address::repeat_byte(0xa1);
+                                    let maker = Address::repeat_byte(0xa2);
+                                    let base = address!("0x20c00000000000000000000000000000000000a1");
+                                    let escrow = if is_bid { PATH_USD_ADDRESS } else { base };
+                                    let non_escrow = if is_bid { base } else { PATH_USD_ADDRESS };
+                                    let mut dex = StablecoinDEX::new();
+                                    setup_dex_tokens(&mut dex, admin, base)?;
+                                    grant_and_mint(escrow, admin, maker, MIN_ORDER_AMOUNT * 2)?;
+                                    TIP20Token::from_address(escrow)?.approve(maker, ITIP20::approveCall {
+                                        spender: STABLECOIN_DEX_ADDRESS, amount: U256::MAX,
+                                    })?;
+                                    dex.set_balance(maker, escrow, balance)?;
+                                    let mut token = TIP20Token::from_address(if pause_escrow { escrow } else { non_escrow })?;
+                                    token.grant_role(admin, IRolesAuth::grantRoleCall { role: *PAUSE_ROLE, account: admin })?;
+                                    token.pause(admin, ITIP20::pauseCall {})?;
+                                    let next_id = dex.next_order_id_val()?;
+                                    let result = if flip {
+                                        dex.place_flip(maker, base, MIN_ORDER_AMOUNT, is_bid, 0, if is_bid { 10 } else { -10 }, false)
+                                    } else {
+                                        dex.place(maker, base, MIN_ORDER_AMOUNT, is_bid, 0)
+                                    };
+                                    let should_succeed = !spec.is_t4() && (!pause_escrow || balance >= MIN_ORDER_AMOUNT);
+                                    if should_succeed {
+                                        assert_eq!(result?, next_id);
+                                        assert_eq!(dex.balance_of(maker, escrow)?, balance.saturating_sub(MIN_ORDER_AMOUNT));
+                                    } else {
+                                        assert_eq!(result, Err(TempoPrecompileError::Revert(ITIP20::ContractPaused {}.abi_encode().into())), "{spec:?}, bid={is_bid}, flip={flip}, escrow={pause_escrow}, balance={balance}");
+                                        assert_eq!(dex.balance_of(maker, escrow)?, balance);
+                                        assert_eq!(dex.next_order_id_val()?, next_id);
+                                    }
+                                    Ok::<_, TempoPrecompileError>(())
+                                }).unwrap();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
