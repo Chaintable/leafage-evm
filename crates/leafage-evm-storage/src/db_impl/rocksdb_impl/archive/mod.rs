@@ -945,21 +945,6 @@ impl DataBaseRef {
         disable_auto_compactions: bool,
         archive_zstd_compression: bool,
     ) -> Self {
-        Self::try_open(
-            path,
-            cache_size,
-            disable_auto_compactions,
-            archive_zstd_compression,
-        )
-        .expect("Failed to open archive RocksDB")
-    }
-
-    pub(crate) fn try_open<P: AsRef<Path>>(
-        path: P,
-        cache_size: usize,
-        disable_auto_compactions: bool,
-        archive_zstd_compression: bool,
-    ) -> Result<Self, Error> {
         Self::open_inner(
             path,
             cache_size,
@@ -968,6 +953,7 @@ impl DataBaseRef {
             archive_zstd_compression,
             false,
         )
+        .expect("Failed to open archive RocksDB")
     }
 
     /// Open the archive RocksDB tuned for bulk ingest:
@@ -1045,15 +1031,6 @@ impl DataBaseRef {
             db_opt.create_missing_column_families(false);
         }
         let db = DB::open_cf_descriptors(&db_opt, path, cfs)?;
-        if !maintenance {
-            crate::db_impl::rewind::reject_pending(
-                db.get_cf(
-                    db.cf_handle("1").unwrap(),
-                    crate::db_impl::rewind::REWIND_KEY,
-                )?
-                .is_some(),
-            )?;
-        }
         let cols = vec![
             (
                 StorageTypeColumn::LatestBlockHash,
@@ -1221,14 +1198,6 @@ impl DataBaseRef {
         ];
         let src = DB::open_cf_for_read_only(&src_opts, &src_path, cf_names, false)
             .map_err(Error::RocksDB)?;
-
-        crate::db_impl::rewind::reject_pending(
-            src.get_cf(
-                src.cf_handle("1").unwrap(),
-                crate::db_impl::rewind::REWIND_KEY,
-            )?
-            .is_some(),
-        )?;
 
         // Guard: refuse to re-encode a source that is already inverted.
         {

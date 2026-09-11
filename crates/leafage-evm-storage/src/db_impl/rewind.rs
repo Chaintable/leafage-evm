@@ -1,11 +1,9 @@
-//! Offline archive truncation. A durable marker prevents normal startup after
-//! a partial deletion; retrying the same target rescans the tables idempotently.
+//! Offline archive truncation. Delete future versions in bounded batches and
+//! publish the target head only after every table has been processed.
 use super::{set_inverted_block_encoding, MultiStorage, StorageError, StorageKind};
 use leafage_evm_types::{BlockInfo, H256};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub(crate) const REWIND_KEY: &[u8] = b"leafage:archive_rewind";
 pub(crate) const REWIND_BATCH_BYTES: usize = 1024 * 1024;
 pub(crate) const REWIND_BATCH_SIZE: usize = if cfg!(test) { 2 } else { 10_000 };
 
@@ -24,8 +22,8 @@ pub(crate) const REWIND_TABLES: [RewindTable; 4] = [
     RewindTable::Headers,
 ];
 
-/// Validate keys before interpreting them. Malformed data leaves the marker in
-/// place rather than silently publishing a partially truncated database.
+/// Validate keys before interpreting them. Malformed data stops truncation
+/// rather than silently publishing a partially truncated database.
 pub(crate) fn remove_record(
     table: RewindTable,
     key: &[u8],
@@ -73,35 +71,11 @@ pub(crate) fn remove_record(
     Ok(height > target)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OffsetSource {
-    KafkaConfig,
-    Directory,
-}
-
-/// The offset belongs to the discarded branch. This choice is bound to the
-/// durable rewind marker and must match on every retry. It contains no secrets.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Reset the discarded branch's Kafka offset, or explicitly declare no Kafka.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArchiveRewindOffset {
     NoKafka,
-    Kafka { file: PathBuf, source: OffsetSource },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RewindMarker {
-    version: u32,
-    original_head: BlockInfo,
-    target: BlockInfo,
-    inverted: bool,
-    offset: ArchiveRewindOffset,
-}
-
-pub(crate) fn reject_pending(pending: bool) -> Result<(), StorageError> {
-    if pending {
-        return Err(StorageError::UnSupported("archive rewind is incomplete; rerun rewind --archive --truncate-archive with the same target, encoding and offset options".into()));
-    }
-    Ok(())
+    Kafka { file: PathBuf },
 }
 
 /// Canonicalize the existing ancestor without creating directories. The file
@@ -133,7 +107,7 @@ pub fn archive_offset_file(dir: &Path) -> Result<PathBuf, StorageError> {
 
 impl ArchiveRewindOffset {
     fn validate(&self) -> Result<(), StorageError> {
-        if let Self::Kafka { file, .. } = self {
+        if let Self::Kafka { file } = self {
             if !file.is_absolute() || file.file_name() != Some(std::ffi::OsStr::new("offset")) {
                 return Err(StorageError::UnSupported(
                     "rewind requires an absolute offset file path ending in /offset".into(),
@@ -144,7 +118,7 @@ impl ArchiveRewindOffset {
     }
 
     fn reset(&self) -> Result<(), StorageError> {
-        let Self::Kafka { file, .. } = self else {
+        let Self::Kafka { file } = self else {
             return Ok(());
         };
         match std::fs::remove_file(file) {
@@ -198,19 +172,6 @@ impl MultiStorage {
         })
     }
 
-    fn rewind_marker(&self) -> Result<Option<Vec<u8>>, StorageError> {
-        match self {
-            Self::RocksDBArchive(db) => db.rewind_marker(),
-            Self::MDBXArchive(db) => db.rewind_marker(),
-            Self::RocksDBState(db) => db.rewind_marker(),
-            Self::MDBXState(db) => db.rewind_marker(),
-        }
-    }
-
-    pub(crate) fn ensure_no_rewind(&self) -> Result<(), StorageError> {
-        reject_pending(self.rewind_marker()?.is_some())
-    }
-
     fn rewind_block(&self, number: Option<u64>) -> Result<BlockInfo, StorageError> {
         let (hash, block) = match self {
             Self::RocksDBArchive(db) => {
@@ -247,8 +208,8 @@ impl MultiStorage {
         Ok(block)
     }
 
-    /// Offline operation. Precheck -> durable marker -> durable offset reset ->
-    /// bounded deletion batches -> atomic head publication and marker removal.
+    /// Offline operation: precheck, reset offset, delete future records, publish H.
+    /// Batches are durable; the whole operation has no atomicity or recovery guarantee.
     /// All database users must remain stopped until this method succeeds.
     pub fn rewind_archive(
         &self,
@@ -257,10 +218,6 @@ impl MultiStorage {
         offset: ArchiveRewindOffset,
     ) -> Result<BlockInfo, StorageError> {
         offset.validate()?;
-        let pending: Option<RewindMarker> = self
-            .rewind_marker()?
-            .map(|bytes| serde_json::from_slice(&bytes))
-            .transpose()?;
         let (disk_encoding, populated) = match self {
             Self::RocksDBArchive(db) => db.rewind_layout()?,
             Self::MDBXArchive(db) => db.rewind_layout()?,
@@ -290,52 +247,26 @@ impl MultiStorage {
                 "unmarked archive requires --archive-encoding legacy|inverted".into(),
             )
         })?;
-        if !populated && stored_encoding.is_none() && pending.is_none() {
+        if !populated && stored_encoding.is_none() {
             return Err(StorageError::UnSupported(
                 "cannot identify an empty unmarked database as archive".into(),
             ));
         }
-        let target = self.rewind_block(Some(number))?;
-        let marker = if let Some(marker) = pending {
-            if marker.version != 1
-                || marker.target.header.number != number
-                || marker.target.header.hash != target.header.hash
-                || marker.inverted != inverted
-                || marker.offset != offset
-                || number > marker.original_head.header.number
-            {
-                return Err(StorageError::UnSupported("unfinished rewind: target, encoding or offset configuration differs (or unsupported marker version)".into()));
-            }
-            marker
-        } else {
-            let original_head = self.rewind_block(None)?;
-            if number > original_head.header.number {
-                return Err(StorageError::UnSupported(
-                    "rewind target is above the committed head".into(),
-                ));
-            }
-            RewindMarker {
-                version: 1,
-                original_head,
-                target,
-                inverted,
-                offset,
-            }
-        };
-        let bytes = serde_json::to_vec(&marker)?;
-        match self {
-            Self::RocksDBArchive(db) => db.write_rewind_marker(&bytes)?,
-            Self::MDBXArchive(db) => db.write_rewind_marker(&bytes)?,
-            _ => unreachable!(),
+        let head = self.rewind_block(None)?;
+        if number > head.header.number {
+            return Err(StorageError::UnSupported(
+                "rewind target is above the committed head".into(),
+            ));
         }
-        marker.offset.reset()?;
+        let target = self.rewind_block(Some(number))?;
+        offset.reset()?;
         set_inverted_block_encoding(inverted);
         match self {
-            Self::RocksDBArchive(db) => db.rewind_to(&marker.target, inverted)?,
-            Self::MDBXArchive(db) => db.rewind_to(&marker.target, inverted)?,
+            Self::RocksDBArchive(db) => db.rewind_to(&target, inverted)?,
+            Self::MDBXArchive(db) => db.rewind_to(&target, inverted)?,
             _ => unreachable!(),
         }
-        Ok(marker.target)
+        Ok(target)
     }
 }
 
@@ -389,7 +320,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("empty unmarked"));
-            assert!(db.rewind_marker().unwrap().is_none());
             drop(db);
             std::fs::remove_dir_all(dir).unwrap();
         }

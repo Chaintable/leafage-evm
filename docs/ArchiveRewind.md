@@ -14,7 +14,7 @@ leafage-evm rewind --archive --truncate-archive \
 
 Both RocksDB (default) and MDBX (`--db-type mdbx`) are supported. Stop every database
 user, including initialization, migration, compaction and read-only export, and
-prevent automatic restart with an older binary. RocksDB holds its writer lock;
+prevent automatic restart during truncation. RocksDB holds its writer lock;
 MDBX maintenance opens exclusively. A RocksDB writer lock does not exclude
 read-only opens. Deleted history requires a backup or resync to recover.
 
@@ -65,44 +65,47 @@ Batches flush at 10,000 entries or 1 MiB: RocksDB counts serialized deletion byt
 MDBX counts scanned key/value bytes. A single record may cross the byte threshold.
 RocksDB iterators can retain old SST files until a table scan finishes.
 
-## Durability and recovery
+## Execution order and failure behavior
 
-The storage API enforces this order:
+1. Validate inputs, encoding, archive layout and the target block.
+2. Remove the actual offset file and fsync its directory (or the nearest existing
+   ancestor if the directory is absent).
+3. Delete future records in durable, bounded batches. Errors stop processing.
+4. Publish the target head durably after every table has completed.
 
-1. Validate inputs and durably record marker version, original head, full target
-   block, encoding and absolute offset path/source (or no Kafka).
-2. Remove the actual offset file and fsync its directory. A retry with an absent
-   file still syncs the directory, or its nearest existing ancestor.
-3. Delete future records in durable batches. Errors stop processing.
-4. Atomically publish the target head and remove the marker.
+There is no rewind recovery marker, checkpoint or dedicated interruption recovery.
+Normal startup, initialization, migration and compaction have no new rewind guards;
+shared open/header-decoding code preserves their existing behavior. The existing
+archive encoding marker is unrelated and remains supported.
 
-Each intermediate batch only removes records that must disappear. Retained history
-is unchanged, and repeating the scan is idempotent. The marker remains until every
-table is complete, including if offset reset fails. Normal startup, pointer rewind,
-archive initialization, migration/re-encoding and compaction reject a pending
-marker. Re-encoding rejects its source before creating the destination.
-
-After interruption, repeat the command with the same target, encoding and offset
-source/path. It rescans from the start and does not require the old head's header,
-which may already have been deleted. Unknown marker versions fail closed. Do not
-remove the marker manually or use an older binary on an unfinished database.
-Successful retries at H=C still undergo format checks; an empty unmarked result
-cannot subsequently be identified as archive without trusted format metadata.
+Each batch is atomic; the entire truncation is not. An error before deletion leaves
+archive records unchanged. After deletion starts, an error can leave partial
+truncation, including a missing old-head header, so repeating the command is not
+guaranteed to work. Only successful completion establishes the result described
+above. Keep database users stopped if truncation fails; normal opens do not detect
+an unfinished truncation.
 
 After completion, restart using the intended branch and the existing no-offset
 catch-up path. The upstream must retain the blocks needed to continue from H.
 
 ## Verification and cost
 
-Local validation on 2026-09-10: 40 storage tests passed (2.88 s), and 3 rewind CLI
-tests passed (0.20 s). Coverage includes both backends/encodings, tombstones, orphan
-headers, same-height cleanup, new-branch reads, partial deletion/reopen, loss of the
-old head header, offset reset failure, option/marker conflicts, header compatibility
-and normal-entry guards. The CLI test verifies that default archive rewind retains
-future versions and `--keep-offset`, then explicit truncation removes them.
+Local validation on 2026-09-11 after removal of recovery: 40 storage tests passed
+(2.66 s), and 3 rewind CLI tests passed (1.00 s). Coverage includes both
+backends/encodings, tombstones, orphan headers, same-height cleanup, new-branch
+reads, malformed records stopping before head publication, encoding conflicts,
+offset reset failure and header compatibility. The CLI test checks that default
+archive rewind preserves future versions and `--keep-offset`, then explicit
+truncation removes them.
 
-These tests check the implementation against the stated invariants. Physical power
-loss, a production-sized archive, full RPC/EVM state comparison and throughput/RSS/
-disk measurements have not been performed. Work scales with the entire archive;
-reserve WAL/compaction space. Immediate file shrinkage and code garbage collection
-are not completion criteria.
+The earlier CRO deployment used commit `2d4893a`, which still had recovery. After an
+intentional SIGKILL at 165 seconds, that version rescanned and completed in about
+23 minutes. Replay of 10,960 blocks took about 110 seconds; state comparisons passed
+444/444 after truncation and 759/759 after replay and restart. These are historical
+measurements, not a deployment or benchmark of the current revision. Physical
+power-loss behavior has not been tested.
+
+Work scales with the entire archive. Reserve WAL/compaction space; immediate file
+shrinkage and code garbage collection are not completion criteria. Tests verify
+the implementation against the stated invariants, rather than establish those
+invariants by themselves.

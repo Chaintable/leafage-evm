@@ -4956,7 +4956,6 @@ dependencies = [
  "page_size",
  "revm",
  "rocksdb",
- "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

@@ -2,12 +2,13 @@
 
 mod archive_encoding;
 mod rewind;
-pub use rewind::{archive_offset_file, ArchiveRewindOffset, OffsetSource};
 mod rocksdb_impl;
 
 mod mdbx_impl;
 
 mod error;
+
+pub use rewind::{archive_offset_file, ArchiveRewindOffset};
 
 pub use archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
@@ -65,18 +66,18 @@ impl MultiStorage {
         disable_auto_compactions: bool,
         archive_zstd_compression: bool,
     ) -> Result<Self, StorageError> {
-        let db: Result<Self, StorageError> = match (kind, is_archive) {
+        match (kind, is_archive) {
             (StorageKind::Rocksdb, false) => {
                 let db = RocksDBStorage::open(path, cache_size, disable_auto_compactions);
                 Ok(MultiStorage::RocksDBState(Arc::new(db)))
             }
             (StorageKind::Rocksdb, true) => {
-                let db = ArchiveRocksDBStorage::try_open(
+                let db = ArchiveRocksDBStorage::open(
                     path,
                     cache_size,
                     disable_auto_compactions,
                     archive_zstd_compression,
-                )?;
+                );
                 Ok(MultiStorage::RocksDBArchive(Arc::new(db)))
             }
             (StorageKind::MDBX, false) => {
@@ -84,13 +85,10 @@ impl MultiStorage {
                 Ok(MultiStorage::MDBXState(Arc::new(db)))
             }
             (StorageKind::MDBX, true) => {
-                let db = MDBXArchiveStorage::try_open(path)?;
+                let db = MDBXArchiveStorage::open(path);
                 Ok(MultiStorage::MDBXArchive(Arc::new(db)))
             }
-        };
-        let db = db?;
-        db.ensure_no_rewind()?;
-        Ok(db)
+        }
     }
 }
 

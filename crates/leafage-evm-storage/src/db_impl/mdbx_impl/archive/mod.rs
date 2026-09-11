@@ -189,6 +189,10 @@ impl MDBXWriteBatch {
     }
 }
 
+fn mdbx_error(error: libmdbx::Error) -> Error {
+    Error::UnSupported(format!("MDBX archive: {error}"))
+}
+
 // ===== DataBase Implementation =====
 
 impl DataBase {
@@ -199,10 +203,6 @@ impl DataBase {
     /// Open database with custom options for performance tuning
     pub fn open_with_options<P: AsRef<Path>>(path: P, options: MDBXOptions) -> Self {
         Self::open_inner(path, options, false).expect("Failed to open archive MDBX")
-    }
-
-    pub(crate) fn try_open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Self::open_inner(path, MDBXOptions::default(), false)
     }
 
     pub(crate) fn open_for_rewind(path: &Path) -> Result<Self, Error> {
@@ -254,14 +254,14 @@ impl DataBase {
 
         let mut dbis = HashMap::new();
 
-        let env = inner_env.open(path).map_err(rewind::mdbx_error)?;
+        let env = inner_env.open(path).map_err(mdbx_error)?;
 
         info!(
             target = "mdbx_archive",
             "Opened MDBX archive database at {:?}", path
         );
 
-        let txn = env.begin_rw_txn().map_err(rewind::mdbx_error)?;
+        let txn = env.begin_rw_txn().map_err(mdbx_error)?;
         for table in [
             StorageTable::LatestBlockHash,
             StorageTable::BlockHashToBlockInfo,
@@ -275,16 +275,10 @@ impl DataBase {
             } else {
                 txn.create_db(Some(table.to_str()), DatabaseFlags::empty())
             }
-            .map_err(rewind::mdbx_error)?;
-            if !exclusive && table.to_str() == StorageTable::LatestBlockHash.to_str() {
-                let marker: Option<Vec<u8>> = txn
-                    .get(t.dbi(), crate::db_impl::rewind::REWIND_KEY)
-                    .map_err(rewind::mdbx_error)?;
-                crate::db_impl::rewind::reject_pending(marker.is_some())?;
-            }
+            .map_err(mdbx_error)?;
             dbis.insert(table.to_str(), t.dbi());
         }
-        txn.commit().map_err(rewind::mdbx_error)?;
+        txn.commit().map_err(mdbx_error)?;
         Ok(Self {
             env,
             dbis: Arc::new(dbis),

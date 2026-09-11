@@ -1,11 +1,7 @@
 use super::*;
 use crate::db_impl::rewind::{
-    remove_record, RewindTable, REWIND_BATCH_BYTES, REWIND_BATCH_SIZE, REWIND_KEY, REWIND_TABLES,
+    remove_record, RewindTable, REWIND_BATCH_BYTES, REWIND_BATCH_SIZE, REWIND_TABLES,
 };
-
-pub(super) fn mdbx_error(error: libmdbx::Error) -> Error {
-    Error::UnSupported(format!("MDBX archive rewind: {error}"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -16,12 +12,13 @@ mod tests {
     use leafage_evm_types::{Block, BlockStorageDiff, Header, RawHeader};
 
     #[test]
-    fn mdbx_rewind_recovers_after_reopening_exclusively() {
+    fn malformed_storage_does_not_publish_target() {
         let _lock = crate::db_impl::rocksdb_impl::ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         set_inverted_block_encoding(false);
-        let dir = std::env::temp_dir().join(format!("mdbx-rewind-resume-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mdbx-rewind-malformed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let raw = Arc::new(DataBase::open(&dir));
         let db = MultiStorage::MDBXArchive(raw.clone());
@@ -78,63 +75,17 @@ mod tests {
         assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(2));
         drop(db);
         drop(raw);
-        assert!(MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).is_err());
-        assert!(MultiStorage::open(&dir, 16, StorageKind::MDBX, false, false, false).is_err());
-        assert!(std::panic::catch_unwind(|| DataBase::open_with_options(
-            &dir,
-            MDBXOptions::default()
-        ))
-        .is_err());
         let db = MultiStorage::open_for_archive_rewind(&dir, 16, StorageKind::MDBX).unwrap();
         let MultiStorage::MDBXArchive(raw) = &db else {
             unreachable!()
         };
-        let txn = raw.env.begin_rw_txn().unwrap();
-        txn.del(
-            raw.dbis[StorageTable::AddressToStorage.to_str()],
-            &[255u8],
-            None,
-        )
-        .unwrap();
-        txn.commit().unwrap();
-        db.rewind_archive(
-            1,
-            Some(inverted_block_encoding()),
-            crate::ArchiveRewindOffset::NoKafka,
-        )
-        .unwrap();
-        drop(db);
-        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
-        let state = db.db_at(BlockId::latest()).unwrap().unwrap();
-        assert_eq!(
-            state.read_latest_block_hash().unwrap(),
-            H256::repeat_byte(1)
-        );
-        assert_eq!(
-            state
-                .read_account(H256::repeat_byte(10))
-                .unwrap()
-                .unwrap()
-                .balance,
-            U256::from(1)
-        );
-        assert!(db.db_at(BlockId::number(2)).unwrap().is_none());
-        drop(state);
+        assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(2));
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
 impl DataBase {
-    pub(crate) fn rewind_marker(&self) -> Result<Option<Vec<u8>>, Error> {
-        let txn = self.env.begin_ro_txn().map_err(mdbx_error)?;
-        txn.get(
-            self.dbis[StorageTable::LatestBlockHash.to_str()],
-            REWIND_KEY,
-        )
-        .map_err(mdbx_error)
-    }
-
     pub(crate) fn rewind_layout(&self) -> Result<(Option<Vec<u8>>, bool), Error> {
         let txn = self.env.begin_ro_txn().map_err(mdbx_error)?;
         let mut populated = false;
@@ -150,20 +101,6 @@ impl DataBase {
             }
         }
         Ok((None, populated))
-    }
-
-    pub(crate) fn write_rewind_marker(&self, marker: &[u8]) -> Result<(), Error> {
-        let txn = self.env.begin_rw_txn().map_err(mdbx_error)?;
-        txn.put(
-            self.dbis[StorageTable::LatestBlockHash.to_str()],
-            REWIND_KEY,
-            marker,
-            WriteFlags::empty(),
-        )
-        .map_err(mdbx_error)?;
-        txn.commit().map_err(mdbx_error)?;
-        self.sync(true)?;
-        Ok(())
     }
 
     pub(crate) fn rewind_to(&self, target: &BlockInfo, inverted: bool) -> Result<(), Error> {
@@ -236,7 +173,6 @@ impl DataBase {
             WriteFlags::empty(),
         )
         .map_err(mdbx_error)?;
-        txn.del(meta, REWIND_KEY, None).map_err(mdbx_error)?;
         txn.commit().map_err(mdbx_error)?;
         self.sync(true)?;
         Ok(())

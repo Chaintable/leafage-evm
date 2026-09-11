@@ -1,18 +1,9 @@
 use super::*;
 use crate::db_impl::rewind::{
-    remove_record, RewindTable, REWIND_BATCH_BYTES, REWIND_BATCH_SIZE, REWIND_KEY, REWIND_TABLES,
+    remove_record, RewindTable, REWIND_BATCH_BYTES, REWIND_BATCH_SIZE, REWIND_TABLES,
 };
 
 impl DataBaseRef {
-    pub(crate) fn rewind_marker(&self) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.db.get_cf(
-            self.db
-                .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
-                .unwrap(),
-            REWIND_KEY,
-        )?)
-    }
-
     pub(crate) fn rewind_layout(&self) -> Result<(Option<Vec<u8>>, bool), Error> {
         let marker = self
             .db
@@ -33,18 +24,6 @@ impl DataBaseRef {
             }
         }
         Ok((marker, populated))
-    }
-
-    pub(crate) fn write_rewind_marker(&self, marker: &[u8]) -> Result<(), Error> {
-        let mut options = WriteOptions::default();
-        options.set_sync(true);
-        self.db.put_cf_opt(
-            self.db.cf_handle("1").unwrap(),
-            REWIND_KEY,
-            marker,
-            &options,
-        )?;
-        Ok(())
     }
 
     pub(crate) fn rewind_to(&self, target: &BlockInfo, inverted: bool) -> Result<(), Error> {
@@ -94,7 +73,6 @@ impl DataBaseRef {
         // affect state; collecting unused code is independent of rewind.
         let mut batch = WriteBatch::default();
         batch.put_cf(meta, [1u8], target.header.hash.as_slice());
-        batch.delete_cf(meta, REWIND_KEY);
         self.db.write_opt(batch, &options)?;
         Ok(())
     }
@@ -217,14 +195,12 @@ mod tests {
                 crate::ArchiveRewindOffset::NoKafka
             )
             .is_err());
-        db.ensure_no_rewind().unwrap();
         db.rewind_archive(
             2,
             Some(inverted_block_encoding()),
             crate::ArchiveRewindOffset::NoKafka,
         )
         .unwrap();
-        db.ensure_no_rewind().unwrap();
         assert!(db.db_at(BlockId::number(3)).unwrap().is_none());
         for hash in [3, 4, 5] {
             assert!(db
@@ -351,13 +327,13 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_rewind_blocks_startup_and_resumes_after_head_header_deleted() {
+    fn malformed_storage_stops_truncation_without_publishing_target() {
         let _lock = super::super::ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         set_inverted_block_encoding(false);
         let dir =
-            std::env::temp_dir().join(format!("archive-rewind-resume-{}", std::process::id()));
+            std::env::temp_dir().join(format!("archive-rewind-malformed-{}", std::process::id()));
         let raw = Arc::new(DataBaseRef::open(&dir, 16, false, false));
         let db = MultiStorage::RocksDBArchive(raw.clone());
         let target = block(1, 1, 0);
@@ -385,7 +361,7 @@ mod tests {
             )
             .unwrap();
         // A corrupt storage key fails after account truncation has committed.
-        // The command must preserve a durable marker and never publish H.
+        // The command must stop and leave the committed head unchanged.
         raw.db
             .put_cf(raw.db.cf_handle("5").unwrap(), [255u8], [0u8])
             .unwrap();
@@ -405,61 +381,8 @@ mod tests {
             )
             .unwrap()
             .is_none());
-        raw.db
-            .delete_cf(raw.db.cf_handle("5").unwrap(), [255u8])
-            .unwrap();
-        // Model interruption after some deletion batches, including the old
-        // head's header. Resume must rely on the durable target, not that head.
-        raw.db
-            .delete_cf(raw.db.cf_handle("2").unwrap(), H256::repeat_byte(2))
-            .unwrap();
-        assert!(db.ensure_no_rewind().is_err());
-        assert!(db
-            .rewind_archive(
-                2,
-                Some(inverted_block_encoding()),
-                crate::ArchiveRewindOffset::NoKafka
-            )
-            .is_err());
-        set_inverted_block_encoding(true);
-        assert!(db
-            .rewind_archive(
-                1,
-                Some(inverted_block_encoding()),
-                crate::ArchiveRewindOffset::NoKafka
-            )
-            .is_err());
-        set_inverted_block_encoding(false);
         drop(db);
         drop(raw);
-        // Release the existing test-only singleton before reopening the same
-        // database. Production rewind runs in a separate offline process.
-        unsafe {
-            super::super::DATA_BASE = None;
-        }
-        assert!(MultiStorage::open(&dir, 16, StorageKind::Rocksdb, true, false, false).is_err());
-        unsafe {
-            super::super::DATA_BASE = None;
-        }
-        let db = MultiStorage::open_for_archive_rewind(&dir, 16, StorageKind::Rocksdb).unwrap();
-        db.rewind_archive(
-            1,
-            Some(inverted_block_encoding()),
-            crate::ArchiveRewindOffset::NoKafka,
-        )
-        .unwrap();
-        db.ensure_no_rewind().unwrap();
-        assert_eq!(
-            db.db_at(BlockId::latest())
-                .unwrap()
-                .unwrap()
-                .read_account(H256::repeat_byte(10))
-                .unwrap()
-                .unwrap()
-                .balance,
-            U256::from(5)
-        );
-        drop(db);
         unsafe {
             super::super::DATA_BASE = None;
         }
@@ -538,8 +461,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn prechecks_offset_failure_and_all_normal_entry_guards() {
-        use crate::{ArchiveRewindOffset, OffsetSource};
+    fn prechecks_and_offset_failure_leave_state_unchanged() {
+        use crate::ArchiveRewindOffset;
         let _lock = super::super::ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -562,10 +485,7 @@ mod tests {
         let file = crate::archive_offset_file(&dir.join("offset")).unwrap();
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "456").unwrap();
-        let offset = ArchiveRewindOffset::Kafka {
-            file: file.clone(),
-            source: OffsetSource::Directory,
-        };
+        let offset = ArchiveRewindOffset::Kafka { file: file.clone() };
         assert!(db.rewind_archive(1, None, offset.clone()).is_err());
         for value in [vec![], vec![2], vec![0, 1]] {
             raw.db.put_cf(meta, ENCODING_MARKER_KEY, value).unwrap();
@@ -574,7 +494,7 @@ mod tests {
         raw.db.put_cf(meta, ENCODING_MARKER_KEY, [1]).unwrap();
         assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
         raw.db.delete_cf(meta, ENCODING_MARKER_KEY).unwrap();
-        // Snapshot-shaped keys must be rejected before marker/offset mutation.
+        // Snapshot-shaped keys must be rejected before state/offset mutation.
         raw.db
             .put_cf(raw.db.cf_handle("5").unwrap(), [0u8; 64], [0u8; 32])
             .unwrap();
@@ -582,23 +502,12 @@ mod tests {
         raw.db
             .delete_cf(raw.db.cf_handle("5").unwrap(), [0u8; 64])
             .unwrap();
-        assert!(raw.rewind_marker().unwrap().is_none());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "456");
-        // Force unlink failure. The marker must be durable but no state deleted.
+        // Force unlink failure. No archive records may be deleted.
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
         assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
-        let marker = raw.rewind_marker().unwrap().unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&marker).unwrap();
-        assert_eq!(json["version"], 1);
-        let mut unknown = json.clone();
-        unknown["version"] = serde_json::json!(2);
-        raw.write_rewind_marker(&serde_json::to_vec(&unknown).unwrap())
-            .unwrap();
-        assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
-        assert!(file.is_dir());
-        raw.write_rewind_marker(&marker).unwrap();
-
+        assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(2));
         assert!(raw
             .db
             .get_cf(
@@ -607,39 +516,12 @@ mod tests {
             )
             .unwrap()
             .is_some());
-        assert!(db
-            .rewind_archive(1, Some(false), ArchiveRewindOffset::NoKafka)
-            .is_err());
-        assert!(db
-            .rewind_archive(
-                1,
-                Some(false),
-                ArchiveRewindOffset::Kafka {
-                    file: file.clone(),
-                    source: OffsetSource::KafkaConfig
-                }
-            )
-            .is_err());
-        let dst = dir.with_extension("reencoded");
-        assert!(DataBaseRef::reencode_legacy_to_inverted(&dir, &dst, 16, 1).is_err());
-        assert!(!dst.exists());
+        std::fs::remove_dir(&file).unwrap();
+        // A node without an existing offset file still truncates successfully.
+        db.rewind_archive(1, Some(false), offset).unwrap();
+        assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(1));
         drop(db);
         drop(raw);
-        unsafe {
-            super::super::DATA_BASE = None;
-        }
-        assert!(MultiStorage::open(&dir, 16, StorageKind::Rocksdb, true, false, false).is_err());
-        assert!(MultiStorage::open(&dir, 16, StorageKind::Rocksdb, false, false, false).is_err());
-        assert!(
-            std::panic::catch_unwind(|| DataBaseRef::open_for_bulk_load(&dir, 16, false)).is_err()
-        );
-        assert!(std::panic::catch_unwind(|| DataBaseRef::open(&dir, 16, false, false)).is_err());
-        let db = MultiStorage::open_for_archive_rewind(&dir, 16, StorageKind::Rocksdb).unwrap();
-        std::fs::remove_dir(&file).unwrap();
-        // A missing offset on retry still takes the directory fsync path.
-        db.rewind_archive(1, Some(false), offset).unwrap();
-        db.ensure_no_rewind().unwrap();
-        drop(db);
         unsafe {
             super::super::DATA_BASE = None;
         }

@@ -3,7 +3,7 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, ValueEnum};
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
-    ArchiveRewindOffset, EvmStorageWrite, MultiStorage, OffsetSource, StateDBProvider, StateDBRead,
+    ArchiveRewindOffset, EvmStorageWrite, MultiStorage, StateDBProvider, StateDBRead,
     StateDBWrapper, StorageKind,
 };
 use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
@@ -26,7 +26,7 @@ use tracing::info;
 ///
 /// Archive mode resolves the target locally and only moves the head by default.
 /// Add --truncate-archive to delete future versions in place. Stop all database
-/// users first; an interrupted truncation must be resumed with the same options.
+/// users first; truncation has no checkpoint or automatic interruption recovery.
 #[derive(Debug, Parser)]
 pub struct Command {
     /// The path to the database to rewind.
@@ -236,6 +236,7 @@ impl Command {
         );
         Ok(())
     }
+
     fn truncate_offset(&self) -> Result<ArchiveRewindOffset> {
         if usize::from(self.no_kafka)
             + usize::from(self.offset_dir.is_some())
@@ -247,20 +248,13 @@ impl Command {
         if self.no_kafka {
             return Ok(ArchiveRewindOffset::NoKafka);
         }
-        let (dir, source) = match &self.kafka_s3_config {
-            Some(cfg) => (
-                if cfg.offset_dir.is_empty() {
-                    self.db_path.join("offset")
-                } else {
-                    PathBuf::from(&cfg.offset_dir)
-                },
-                OffsetSource::KafkaConfig,
-            ),
-            None => (self.offset_dir.clone().unwrap(), OffsetSource::Directory),
+        let dir = match &self.kafka_s3_config {
+            Some(cfg) if !cfg.offset_dir.is_empty() => PathBuf::from(&cfg.offset_dir),
+            Some(_) => self.db_path.join("offset"),
+            None => self.offset_dir.clone().unwrap(),
         };
         Ok(ArchiveRewindOffset::Kafka {
             file: leafage_evm_storage::archive_offset_file(&dir)?,
-            source,
         })
     }
 }
@@ -313,7 +307,6 @@ mod tests {
             ArchiveRewindOffset::Kafka {
                 file: leafage_evm_storage::archive_offset_file(&cmd.db_path.join("offset"))
                     .unwrap(),
-                source: OffsetSource::KafkaConfig,
             }
         );
         cmd.kafka_s3_config.as_mut().unwrap().offset_dir =
@@ -321,15 +314,12 @@ mod tests {
         let custom = cmd.truncate_offset().unwrap();
         cmd.kafka_s3_config = None;
         cmd.offset_dir = Some(std::env::temp_dir());
-        let ArchiveRewindOffset::Kafka { file, .. } = custom else {
+        let ArchiveRewindOffset::Kafka { file } = custom else {
             panic!()
         };
         assert_eq!(
             cmd.truncate_offset().unwrap(),
-            ArchiveRewindOffset::Kafka {
-                file,
-                source: OffsetSource::Directory
-            }
+            ArchiveRewindOffset::Kafka { file }
         );
     }
 
