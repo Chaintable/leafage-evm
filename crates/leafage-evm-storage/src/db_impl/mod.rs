@@ -8,8 +8,6 @@ mod mdbx_impl;
 
 mod error;
 
-pub use rewind::{archive_offset_file, ArchiveRewindOffset};
-
 pub use archive_encoding::{
     encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
     inverted_block_encoding, set_inverted_block_encoding, ACCOUNT_KEY_LEN, STORAGE_KEY_LEN,

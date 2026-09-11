@@ -9,7 +9,7 @@ To **delete future archive state in place**, explicitly add `--truncate-archive`
 ```sh
 leafage-evm rewind --archive --truncate-archive \
   --db-path /path/to/archive --to-block 123456 \
-  --archive-encoding legacy --offset-dir /path/to/node-offset
+  --archive-encoding legacy
 ```
 
 Both RocksDB (default) and MDBX (`--db-type mdbx`) are supported. Stop every database
@@ -25,10 +25,10 @@ read-only opens. Deleted history requires a backup or resync to recover.
   `--archive-encoding legacy|inverted` must agree with it. Malformed markers and
   read errors stop the operation. Unmarked archives, including MDBX, require an
   explicit, trusted encoding; the key bytes cannot reliably identify it.
-- Provide exactly one offset source: `--kafka-s3-config`, `--offset-dir`, or
-  `--no-kafka`. The last option explicitly declares that the node does not consume
-  Kafka. A config with no custom offset directory resolves to
-  `<db-path>/offset/offset`; `--offset-dir DIR` resolves to `DIR/offset`.
+- Offset paths use the existing rewind rule: a nonempty `offset_dir` in
+  `--kafka-s3-config` selects `<offset_dir>/offset`; otherwise use
+  `<db-path>/offset/offset`. Kafka configuration is optional. A missing offset
+  file is accepted; no additional offset flags or source declaration are required.
 - Only existing databases and tables are opened. Account/storage key shapes must
   identify an archive. Empty, unmarked databases cannot establish this and are
   rejected. Every scanned key is also validated; sampling does not prove that a
@@ -90,8 +90,8 @@ catch-up path. The upstream must retain the blocks needed to continue from H.
 
 ## Verification and cost
 
-Local validation on 2026-09-11 after removal of recovery: 40 storage tests passed
-(2.66 s), and 3 rewind CLI tests passed (1.00 s). Coverage includes both
+Local validation on 2026-09-11 after reusing the existing offset paths: 40 storage tests passed
+(3.17 s), and 3 rewind CLI tests passed (1.17 s). Coverage includes both
 backends/encodings, tombstones, orphan headers, same-height cleanup, new-branch
 reads, malformed records stopping before head publication, encoding conflicts,
 offset reset failure and header compatibility. The CLI test checks that default

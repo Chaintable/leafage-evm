@@ -2,7 +2,7 @@
 //! publish the target head only after every table has been processed.
 use super::{set_inverted_block_encoding, MultiStorage, StorageError, StorageKind};
 use leafage_evm_types::{BlockInfo, H256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) const REWIND_BATCH_BYTES: usize = 1024 * 1024;
 pub(crate) const REWIND_BATCH_SIZE: usize = if cfg!(test) { 2 } else { 10_000 };
@@ -71,77 +71,32 @@ pub(crate) fn remove_record(
     Ok(height > target)
 }
 
-/// Reset the discarded branch's Kafka offset, or explicitly declare no Kafka.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ArchiveRewindOffset {
-    NoKafka,
-    Kafka { file: PathBuf },
-}
-
-/// Canonicalize the existing ancestor without creating directories. The file
-/// itself is not canonicalized: resetting an offset removes its directory entry.
-pub fn archive_offset_file(dir: &Path) -> Result<PathBuf, StorageError> {
-    let absolute = if dir.is_absolute() {
-        dir.to_path_buf()
+/// Reset the offset before deleting archive records and persist the removal.
+fn reset_offset(file: &Path) -> Result<(), StorageError> {
+    let absolute = if file.is_absolute() {
+        file.to_path_buf()
     } else {
-        std::env::current_dir()?.join(dir)
+        std::env::current_dir()?.join(file)
     };
-    let mut ancestor = absolute.as_path();
-    let mut suffix = Vec::new();
-    while !ancestor.try_exists()? {
-        suffix.push(
-            ancestor
-                .file_name()
-                .ok_or_else(|| StorageError::UnSupported("invalid offset directory".into()))?,
-        );
-        ancestor = ancestor
-            .parent()
-            .ok_or_else(|| StorageError::UnSupported("invalid offset directory".into()))?;
+    match std::fs::remove_file(&absolute) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
-    let mut resolved = ancestor.canonicalize()?;
-    for part in suffix.into_iter().rev() {
-        resolved.push(part);
-    }
-    Ok(resolved.join("offset"))
-}
-
-impl ArchiveRewindOffset {
-    fn validate(&self) -> Result<(), StorageError> {
-        if let Self::Kafka { file } = self {
-            if !file.is_absolute() || file.file_name() != Some(std::ffi::OsStr::new("offset")) {
-                return Err(StorageError::UnSupported(
-                    "rewind requires an absolute offset file path ending in /offset".into(),
-                ));
+    // Sync even when the file is absent. A missing directory uses its nearest
+    // existing ancestor; no directories are created for offset cleanup.
+    let mut parent = absolute.parent().unwrap();
+    loop {
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                dir.sync_all()?;
+                return Ok(());
             }
-        }
-        Ok(())
-    }
-
-    fn reset(&self) -> Result<(), StorageError> {
-        let Self::Kafka { file } = self else {
-            return Ok(());
-        };
-        match std::fs::remove_file(file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                parent = parent.parent().ok_or(e)?;
+            }
             Err(e) => return Err(e.into()),
         }
-        // Always sync, including a retry after unlink succeeded but fsync failed.
-        // If the directory never existed, sync its nearest existing ancestor.
-        let mut parent = file.parent().unwrap();
-        loop {
-            match std::fs::File::open(parent) {
-                Ok(dir) => {
-                    dir.sync_all()?;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    parent = parent.parent().ok_or(e)?;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
     }
 }
 
@@ -215,9 +170,8 @@ impl MultiStorage {
         &self,
         number: u64,
         encoding: Option<bool>,
-        offset: ArchiveRewindOffset,
+        offset_file: &Path,
     ) -> Result<BlockInfo, StorageError> {
-        offset.validate()?;
         let (disk_encoding, populated) = match self {
             Self::RocksDBArchive(db) => db.rewind_layout()?,
             Self::MDBXArchive(db) => db.rewind_layout()?,
@@ -259,7 +213,7 @@ impl MultiStorage {
             ));
         }
         let target = self.rewind_block(Some(number))?;
-        offset.reset()?;
+        reset_offset(offset_file)?;
         set_inverted_block_encoding(inverted);
         match self {
             Self::RocksDBArchive(db) => db.rewind_to(&target, inverted)?,
@@ -316,7 +270,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(db
-                .rewind_archive(1, Some(false), ArchiveRewindOffset::NoKafka)
+                .rewind_archive(1, Some(false), &dir.join("offset/offset"))
                 .unwrap_err()
                 .to_string()
                 .contains("empty unmarked"));

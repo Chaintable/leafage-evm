@@ -69,7 +69,7 @@ mod tests {
             .rewind_archive(
                 1,
                 Some(inverted_block_encoding()),
-                crate::ArchiveRewindOffset::NoKafka
+                &dir.join("offset/offset")
             )
             .is_err());
         assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(2));

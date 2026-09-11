@@ -185,20 +185,20 @@ mod tests {
             .rewind_archive(
                 0,
                 Some(inverted_block_encoding()),
-                crate::ArchiveRewindOffset::NoKafka
+                &dir.join("offset/offset")
             )
             .is_err());
         assert!(db
             .rewind_archive(
                 5,
                 Some(inverted_block_encoding()),
-                crate::ArchiveRewindOffset::NoKafka
+                &dir.join("offset/offset")
             )
             .is_err());
         db.rewind_archive(
             2,
             Some(inverted_block_encoding()),
-            crate::ArchiveRewindOffset::NoKafka,
+            &dir.join("offset/offset"),
         )
         .unwrap();
         assert!(db.db_at(BlockId::number(3)).unwrap().is_none());
@@ -275,7 +275,7 @@ mod tests {
         db.rewind_archive(
             2,
             Some(inverted_block_encoding()),
-            crate::ArchiveRewindOffset::NoKafka,
+            &dir.join("offset/offset"),
         )
         .unwrap();
         commit(&db, block(3, 6, 2), BlockStorageDiff::default());
@@ -369,7 +369,7 @@ mod tests {
             .rewind_archive(
                 1,
                 Some(inverted_block_encoding()),
-                crate::ArchiveRewindOffset::NoKafka
+                &dir.join("offset/offset")
             )
             .is_err());
         assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(2));
@@ -438,7 +438,7 @@ mod tests {
         db.rewind_archive(
             1,
             Some(inverted_block_encoding()),
-            crate::ArchiveRewindOffset::NoKafka,
+            &dir.join("offset/offset"),
         )
         .unwrap();
         assert!(raw
@@ -462,7 +462,6 @@ mod tests {
     }
     #[test]
     fn prechecks_and_offset_failure_leave_state_unchanged() {
-        use crate::ArchiveRewindOffset;
         let _lock = super::super::ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -482,23 +481,22 @@ mod tests {
             );
         }
         let meta = raw.db.cf_handle("1").unwrap();
-        let file = crate::archive_offset_file(&dir.join("offset")).unwrap();
+        let file = dir.join("offset/offset");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "456").unwrap();
-        let offset = ArchiveRewindOffset::Kafka { file: file.clone() };
-        assert!(db.rewind_archive(1, None, offset.clone()).is_err());
+        assert!(db.rewind_archive(1, None, &file).is_err());
         for value in [vec![], vec![2], vec![0, 1]] {
             raw.db.put_cf(meta, ENCODING_MARKER_KEY, value).unwrap();
-            assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
+            assert!(db.rewind_archive(1, Some(false), &file).is_err());
         }
         raw.db.put_cf(meta, ENCODING_MARKER_KEY, [1]).unwrap();
-        assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
+        assert!(db.rewind_archive(1, Some(false), &file).is_err());
         raw.db.delete_cf(meta, ENCODING_MARKER_KEY).unwrap();
         // Snapshot-shaped keys must be rejected before state/offset mutation.
         raw.db
             .put_cf(raw.db.cf_handle("5").unwrap(), [0u8; 64], [0u8; 32])
             .unwrap();
-        assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
+        assert!(db.rewind_archive(1, Some(false), &file).is_err());
         raw.db
             .delete_cf(raw.db.cf_handle("5").unwrap(), [0u8; 64])
             .unwrap();
@@ -506,7 +504,7 @@ mod tests {
         // Force unlink failure. No archive records may be deleted.
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
-        assert!(db.rewind_archive(1, Some(false), offset.clone()).is_err());
+        assert!(db.rewind_archive(1, Some(false), &file).is_err());
         assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(2));
         assert!(raw
             .db
@@ -518,7 +516,7 @@ mod tests {
             .is_some());
         std::fs::remove_dir(&file).unwrap();
         // A node without an existing offset file still truncates successfully.
-        db.rewind_archive(1, Some(false), offset).unwrap();
+        db.rewind_archive(1, Some(false), &file).unwrap();
         assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(1));
         drop(db);
         drop(raw);
