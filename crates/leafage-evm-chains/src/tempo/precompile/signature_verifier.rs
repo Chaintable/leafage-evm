@@ -46,22 +46,7 @@ const MAX_CALLDATA_LEN: usize =
 // Solidity ABI
 // ===========================================================================
 
-alloy::sol! {
-    interface ISignatureVerifier {
-        /// Recovers the signer of a Tempo signature (secp256k1, P256, WebAuthn).
-        function recover(bytes32 hash, bytes calldata signature) external view returns (address signer);
-
-        /// Verifies a signer against a Tempo signature.
-        function verify(address signer, bytes32 hash, bytes calldata signature) external view returns (bool);
-
-        function verifyKeychain(address account, bytes32 hash, bytes calldata signature) external view returns (bool);
-
-        function verifyKeychainAdmin(address account, bytes32 hash, bytes calldata signature) external view returns (bool);
-
-        error InvalidFormat();
-        error InvalidSignature();
-    }
-}
+pub use tempo_contracts::precompiles::ISignatureVerifier;
 
 // ===========================================================================
 // SignatureVerifier struct

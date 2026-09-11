@@ -898,17 +898,13 @@ where
         // Ethereum EIP-7825 cap from Osaka when the raw field is None; Arbitrum
         // is explicitly exempt and enforces its state-derived limit in its handler.
         let chain_spec: EthSpecId = cfg.spec().clone().into();
-        let consensus_cap = self.inner.consensus_tx_gas_limit_cap(chain_spec);
+        let consensus_cap = self
+            .inner
+            .consensus_tx_gas_limit_cap_at_block(chain_spec, &block_env);
         let max_gas_limit =
             estimate_gas_limit_cap(cfg.tx_gas_limit_cap, consensus_cap, block_env_gas_limit);
         let mut highest_gas_limit = tx_request_gas_limit
-            .map(|tx_gas_limit| {
-                if tx_gas_limit > max_gas_limit {
-                    tx_gas_limit
-                } else {
-                    max_gas_limit
-                }
-            })
+            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
             .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
             &block,

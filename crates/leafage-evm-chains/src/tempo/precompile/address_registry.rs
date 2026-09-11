@@ -36,24 +36,7 @@ use crate::tempo::hardfork::TempoHardfork;
 // Solidity ABI
 // ===========================================================================
 
-alloy::sol! {
-    interface IAddressRegistry {
-        function registerVirtualMaster(bytes32 salt) external returns (bytes4 masterId);
-        function getMaster(bytes4 masterId) external view returns (address);
-        function resolveRecipient(address to) external view returns (address effectiveRecipient);
-        function resolveVirtualAddress(address virtualAddr) external view returns (address master);
-        function isVirtualAddress(address addr) external pure returns (bool);
-        function decodeVirtualAddress(address addr) external pure returns (bool isVirtual, bytes4 masterId, bytes6 userTag);
-        function isImplicitlyApproved(address addr) external view returns (bool);
-
-        event MasterRegistered(bytes4 indexed masterId, address indexed masterAddress);
-
-        error MasterIdCollision(address master);
-        error InvalidMasterAddress();
-        error ProofOfWorkFailed();
-        error VirtualAddressUnregistered();
-    }
-}
+pub use tempo_contracts::precompiles::IAddressRegistry;
 
 /// TIP-1035 precompiles allowed to pull a caller's TIP-20 balance without allowance.
 pub const IMPLICIT_APPROVAL_LIST: &[Address] = &[

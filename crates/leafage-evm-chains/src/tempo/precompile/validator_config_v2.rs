@@ -49,85 +49,7 @@ use super::{
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IValidatorConfigV2 {
-        function owner() external view returns (address);
-        function getActiveValidators() external view returns (Validator[] memory);
-        function getInitializedAtHeight() external view returns (uint64);
-        function validatorCount() external view returns (uint64);
-        function validatorByIndex(uint64 index) external view returns (Validator memory);
-        function validatorByAddress(address validatorAddress) external view returns (Validator memory);
-        function validatorByPublicKey(bytes32 publicKey) external view returns (Validator memory);
-        function getNextNetworkIdentityRotationEpoch() external view returns (uint64);
-        function isInitialized() external view returns (bool);
-
-        function addValidator(
-            address validatorAddress,
-            bytes32 publicKey,
-            string memory ingress,
-            string memory egress,
-            address feeRecipient,
-            bytes memory signature
-        ) external returns (uint64);
-        function deactivateValidator(uint64 idx) external;
-        function rotateValidator(
-            uint64 idx,
-            bytes32 publicKey,
-            string memory ingress,
-            string memory egress,
-            bytes memory signature
-        ) external;
-        function setFeeRecipient(uint64 idx, address feeRecipient) external;
-        function setIpAddresses(uint64 idx, string memory ingress, string memory egress) external;
-        function transferValidatorOwnership(uint64 idx, address newAddress) external;
-        function transferOwnership(address newOwner) external;
-        function setNetworkIdentityRotationEpoch(uint64 epoch) external;
-        function migrateValidator(uint64 idx) external;
-        function initializeIfMigrated() external;
-
-        struct Validator {
-            bytes32 publicKey;
-            address validatorAddress;
-            string ingress;
-            string egress;
-            address feeRecipient;
-            uint64 index;
-            uint64 addedAtHeight;
-            uint64 deactivatedAtHeight;
-        }
-
-        event ValidatorAdded(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey, string ingress, string egress, address feeRecipient);
-        event ValidatorDeactivated(uint64 indexed index, address indexed validatorAddress);
-        event ValidatorRotated(uint64 indexed index, uint64 indexed deactivatedIndex, address indexed validatorAddress, bytes32 oldPublicKey, bytes32 newPublicKey, string ingress, string egress, address caller);
-        event FeeRecipientUpdated(uint64 indexed index, address feeRecipient, address caller);
-        event IpAddressesUpdated(uint64 indexed index, string ingress, string egress, address caller);
-        event ValidatorOwnershipTransferred(uint64 indexed index, address indexed oldAddress, address indexed newAddress, address caller);
-        event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
-        event NetworkIdentityRotationEpochSet(uint64 indexed previousEpoch, uint64 indexed nextEpoch);
-        event ValidatorMigrated(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey);
-        event SkippedValidatorMigration(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey);
-        event Initialized(uint64 height);
-
-        error NotInitialized();
-        error AlreadyInitialized();
-        error Unauthorized();
-        error ValidatorNotFound();
-        error ValidatorAlreadyDeactivated();
-        error InvalidPublicKey();
-        error PublicKeyAlreadyExists();
-        error InvalidValidatorAddress();
-        error AddressAlreadyHasValidator();
-        error NotIpPort(string value, string reason);
-        error NotIp(string value, string reason);
-        error IngressAlreadyExists(string ingress);
-        error InvalidSignature();
-        error InvalidSignatureFormat();
-        error InvalidOwner();
-        error InvalidMigrationIndex();
-        error MigrationNotComplete();
-        error EmptyV1ValidatorSet();
-    }
-}
+pub use tempo_contracts::precompiles::IValidatorConfigV2;
 
 // ===========================================================================
 // Error helpers
@@ -191,17 +113,23 @@ fn err_address_already_has_validator() -> TempoPrecompileError {
 
 fn err_not_ip_port(value: String, reason: String) -> TempoPrecompileError {
     TempoPrecompileError::Revert(
-        IValidatorConfigV2::NotIpPort { value, reason }
-            .abi_encode()
-            .into(),
+        IValidatorConfigV2::NotIpPort {
+            input: value,
+            backtrace: reason,
+        }
+        .abi_encode()
+        .into(),
     )
 }
 
 fn err_not_ip(value: String, reason: String) -> TempoPrecompileError {
     TempoPrecompileError::Revert(
-        IValidatorConfigV2::NotIp { value, reason }
-            .abi_encode()
-            .into(),
+        IValidatorConfigV2::NotIp {
+            input: value,
+            backtrace: reason,
+        }
+        .abi_encode()
+        .into(),
     )
 }
 

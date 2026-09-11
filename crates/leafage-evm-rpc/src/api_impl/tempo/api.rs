@@ -98,6 +98,23 @@ pub struct TempoEvmCustomConfig;
 
 type TempoApiImpl<DB> = ApiImpl<DB, TempoHardfork, TempoEvmCustomConfig>;
 
+impl<DB> TempoApiImpl<DB> {
+    fn cfg_for_call(&self, block_env: &BlockEnv) -> revm::context::CfgEnv<TempoHardfork> {
+        let mut cfg = self.evm_cfg.cfg.clone();
+        // RPC zero means unlimited, not a literal zero REVM validation cap.
+        // With no explicit cap, use Tempo's fork instead of Ethereum Osaka's.
+        cfg.tx_gas_limit_cap = Some(match cfg.tx_gas_limit_cap {
+            Some(0) => u64::MAX,
+            Some(cap) => cap,
+            None => TempoHardfork::from_timestamp(block_env.timestamp.saturating_to())
+                .as_official()
+                .tx_gas_limit_cap()
+                .unwrap_or(u64::MAX),
+        });
+        cfg
+    }
+}
+
 impl ToJsonRpcError for TempoInvalidTransaction {
     fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
         match self {
@@ -609,6 +626,7 @@ where
             tempo_fields,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
             ),
@@ -674,7 +692,7 @@ where
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
+        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
@@ -698,14 +716,23 @@ where
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R,
     {
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
+        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
         let mut inspector = TracingInspector::new(inspector_cfg);
-        let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
-        evm.inspect_tx_commit(tx)
-            .map(|res| (res.into(), inspector_collect(inspector)))
+        let is_aa = tx.tempo_fields.is_some();
+        let caller = tx.base.caller;
+        let res = {
+            let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
+            evm.inspect_tx_commit(tx)?
+        };
+        if is_aa {
+            // AA subcalls start below the batch checkpoint, leaving a synthetic
+            // inspector root whose caller is not initialized by a call hook.
+            inspector.set_transaction_caller(caller);
+        }
+        Ok((res.into(), inspector_collect(inspector)))
     }
 
 }
@@ -716,6 +743,17 @@ where
 {
 
     type Tx = TempoTxEnv;
+
+    fn consensus_tx_gas_limit_cap_at_block(
+        &self,
+        _spec: revm::primitives::hardfork::SpecId,
+        block_env: &BlockEnv,
+    ) -> u64 {
+        TempoHardfork::from_timestamp(block_env.timestamp.saturating_to())
+            .as_official()
+            .tx_gas_limit_cap()
+            .unwrap_or(u64::MAX)
+    }
 
     fn prepare_estimate_request(&self, request: &mut CallRequest) {
         // The sponsor signs the original nonce. Account execution still uses

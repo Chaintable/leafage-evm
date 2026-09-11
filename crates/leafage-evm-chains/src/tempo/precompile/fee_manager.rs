@@ -50,60 +50,7 @@ pub const MIN_LIQUIDITY: U256 = U256::from_limbs([1000, 0, 0, 0]);
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IFeeManager {
-        function userTokens(address user) external view returns (address);
-        function validatorTokens(address validator) external view returns (address);
-        function collectedFees(address validator, address token) external view returns (uint256);
-
-        function setValidatorToken(address token) external;
-        function setUserToken(address token) external;
-        function distributeFees(address validator, address token) external;
-
-        event ValidatorTokenSet(address indexed validator, address indexed token);
-        event UserTokenSet(address indexed user, address indexed token);
-        event FeesDistributed(address indexed validator, address indexed token, uint256 amount);
-
-        error InvalidToken();
-        error CannotChangeWithinBlock();
-        error InsufficientLiquidity();
-        error PolicyForbids();
-    }
-
-    interface ITIPFeeAMM {
-        function M() external view returns (uint256);
-        function N() external view returns (uint256);
-        function SCALE() external view returns (uint256);
-        function MIN_LIQUIDITY() external view returns (uint256);
-
-        function getPoolId(address userToken, address validatorToken) external view returns (bytes32);
-        function getPool(address userToken, address validatorToken) external view returns (Pool memory);
-        function pools(bytes32 poolId) external view returns (Pool memory);
-        function totalSupply(bytes32 poolId) external view returns (uint256);
-        function liquidityBalances(bytes32 poolId, address user) external view returns (uint256);
-
-        function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) external returns (uint256);
-        function burn(address userToken, address validatorToken, uint256 liquidity, address to) external returns (uint256 amountUserToken, uint256 amountValidatorToken);
-        function rebalanceSwap(address userToken, address validatorToken, uint256 amountOut, address to) external returns (uint256);
-
-        struct Pool {
-            uint128 reserveUserToken;
-            uint128 reserveValidatorToken;
-        }
-
-        event Mint(address sender, address indexed to, address indexed userToken, address indexed validatorToken, uint256 amountValidatorToken, uint256 liquidity);
-        event Burn(address indexed sender, address indexed userToken, address indexed validatorToken, uint256 amountUserToken, uint256 amountValidatorToken, uint256 liquidity, address to);
-        event RebalanceSwap(address indexed userToken, address indexed validatorToken, address indexed swapper, uint256 amountIn, uint256 amountOut);
-
-        error IdenticalAddresses();
-        error InvalidAmount();
-        error InsufficientLiquidity();
-        error InsufficientReserves();
-        error InvalidSwapCalculation();
-        error DivisionByZero();
-        error InvalidCurrency();
-    }
-}
+pub use tempo_contracts::precompiles::{IFeeManager, ITIPFeeAMM};
 
 // ===========================================================================
 // Pool / PoolKey types

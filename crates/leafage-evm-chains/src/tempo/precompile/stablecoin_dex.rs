@@ -77,93 +77,7 @@ const MAX_PRICE: u32 = 102_000;
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IStablecoinDEX {
-        function place(address token, uint128 amount, bool isBid, int16 tick) external returns (uint128);
-        function placeFlip(address token, uint128 amount, bool isBid, int16 tick, int16 flipTick) external returns (uint128);
-        function balanceOf(address user, address token) external view returns (uint128);
-        function storageCredits(address user) external view returns (uint64 credits);
-        function getOrder(uint128 orderId) external view returns (Order memory);
-        function getTickLevel(address base, int16 tick, bool isBid) external view returns (uint128 head, uint128 tail, uint128 totalLiquidity);
-        function pairKey(address tokenA, address tokenB) external view returns (bytes32);
-        function books(bytes32 pairKey) external view returns (Orderbook memory);
-        function nextOrderId() external view returns (uint128);
-        function createPair(address base) external returns (bytes32);
-        function withdraw(address token, uint128 amount) external;
-        function cancel(uint128 orderId) external;
-        function cancelStaleOrder(uint128 orderId) external;
-        function swapExactAmountIn(address tokenIn, address tokenOut, uint128 amountIn, uint128 minAmountOut) external returns (uint128);
-        function swapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut, uint128 maxAmountIn) external returns (uint128);
-        function quoteSwapExactAmountIn(address tokenIn, address tokenOut, uint128 amountIn) external view returns (uint128);
-        function quoteSwapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut) external view returns (uint128);
-        function bookIndexForKey(bytes32 bookKey) external view returns (bool set, uint32 index);
-        function bookKeyForIndex(uint32 index) external view returns (bytes32 bookKey);
-        function setBookIndex(uint32 index) external;
-
-        function MIN_TICK() external view returns (int16);
-        function MAX_TICK() external view returns (int16);
-        function TICK_SPACING() external view returns (int16);
-        function PRICE_SCALE() external view returns (uint32);
-        function MIN_ORDER_AMOUNT() external view returns (uint128);
-        function MIN_PRICE() external view returns (uint32);
-        function MAX_PRICE() external view returns (uint32);
-        function tickToPrice(int16 tick) external view returns (uint32);
-        function priceToTick(uint32 price) external view returns (int16);
-
-        struct Order {
-            uint128 orderId;
-            address maker;
-            bytes32 bookKey;
-            bool isBid;
-            int16 tick;
-            uint128 amount;
-            uint128 remaining;
-            uint128 prev;
-            uint128 next;
-            bool isFlip;
-            int16 flipTick;
-        }
-
-        struct Orderbook {
-            address base;
-            address quote;
-            int16 bestBidTick;
-            int16 bestAskTick;
-        }
-
-        struct PriceLevel {
-            uint128 head;
-            uint128 tail;
-            uint128 totalLiquidity;
-        }
-
-        event OrderPlaced(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, bool isFlipOrder, int16 flipTick);
-        event OrderFilled(uint128 indexed orderId, address indexed maker, address indexed taker, uint128 amountFilled, bool partialFill);
-        event OrderCancelled(uint128 indexed orderId);
-        event PairCreated(bytes32 indexed key, address indexed base, address indexed quote);
-        event OrderFlipped(uint128 indexed orderId, address indexed maker, address indexed token, uint128 amount, bool isBid, int16 tick, int16 flipTick);
-        event FlipFailed(uint128 indexed orderId, address indexed maker, bytes4 reason);
-
-        error OrderDoesNotExist();
-        error Unauthorized();
-        error InsufficientBalance();
-        error InsufficientLiquidity();
-        error InsufficientOutput();
-        error MaxInputExceeded();
-        error InvalidBaseToken();
-        error InvalidToken();
-        error InvalidCurrency();
-        error IdenticalTokens();
-        error PairAlreadyExists();
-        error PairDoesNotExist();
-        error TickOutOfBounds(int16 tick);
-        error InvalidTick();
-        error InvalidFlipTick();
-        error BelowMinimumOrderSize(uint128 amount);
-        error OrderNotStale();
-        error IndexAlreadySet();
-    }
-}
+pub use tempo_contracts::precompiles::IStablecoinDEX;
 
 // ===========================================================================
 // Error helpers
@@ -1674,17 +1588,24 @@ impl StablecoinDEX {
         Ok(())
     }
 
-    /// Decrement user's DEX balance or transfer from wallet.
+    /// Decrement user's DEX balance or transfer from wallet. Callers whose
+    /// route already checked pause pass false to avoid a redundant SLOAD.
     fn decrement_balance_or_transfer_from(
         &mut self,
         user: Address,
         token: Address,
         amount: u128,
+        check_pause: bool,
     ) -> Result<()> {
-        TIP20Token::from_address(token)?.ensure_transfer_authorized(user, self.address)?;
+        let tip20 = TIP20Token::from_address(token)?;
+        tip20.ensure_transfer_authorized(user, self.address)?;
 
         let user_balance = self.balance_of(user, token)?;
         if user_balance >= amount {
+            // No TIP-20 transfer runs on this path, so orders must check pause.
+            if check_pause && self.storage.spec().is_t4() {
+                tip20.check_not_paused()?;
+            }
             self.sub_balance(user, token, amount)
         } else {
             let remaining = amount
@@ -1843,7 +1764,7 @@ impl StablecoinDEX {
         if self.storage.spec().is_t4() {
             non_escrow_tip20.check_not_paused()?;
         }
-        self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
+        self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount, true)?;
 
         let order_id = self.next_order_id_val()?;
         self.increment_next_order_id()?;
@@ -1992,7 +1913,7 @@ impl StablecoinDEX {
             }
             self.sub_balance(sender, escrow_token, escrow_amount)?;
         } else {
-            self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount)?;
+            self.decrement_balance_or_transfer_from(sender, escrow_token, escrow_amount, true)?;
         }
 
         let order_id = self.next_order_id_val()?;
@@ -2647,7 +2568,7 @@ impl StablecoinDEX {
         min_amount_out: u128,
     ) -> Result<u128> {
         let route = self.find_trade_path(token_in, token_out)?;
-        self.decrement_balance_or_transfer_from(sender, token_in, amount_in)?;
+        self.decrement_balance_or_transfer_from(sender, token_in, amount_in, false)?;
 
         let mut amount = amount_in;
         let mut storage_credits = StorageCreditDeltas::new();
@@ -2697,7 +2618,7 @@ impl StablecoinDEX {
             return Err(err_max_input_exceeded());
         }
 
-        self.decrement_balance_or_transfer_from(sender, token_in, amount)?;
+        self.decrement_balance_or_transfer_from(sender, token_in, amount, false)?;
         self.transfer(token_out, sender, amount_out)?;
         storage_credits.flush(|user, slots| self.credit_dex_storage_slots(user, slots))?;
         Ok(amount)
@@ -3116,6 +3037,129 @@ mod tests {
                 amount: U256::from(amount),
             },
         )
+    }
+
+    #[test]
+    fn paused_order_escrow_full_internal_balance_respects_t4() {
+        for spec in [
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+        ] {
+            for is_bid in [false, true] {
+                for flip in [false, true] {
+                    let mut provider = TestStorageProvider::new(spec);
+                    StorageCtx::enter(&mut provider, || {
+                        let admin = Address::repeat_byte(0xa1);
+                        let maker = Address::repeat_byte(0xa2);
+                        let base = address!("0x20c00000000000000000000000000000000000a1");
+                        let escrow = if is_bid { PATH_USD_ADDRESS } else { base };
+                        let mut dex = StablecoinDEX::new();
+                        setup_dex_tokens(&mut dex, admin, base)?;
+                        dex.set_balance(maker, escrow, MIN_ORDER_AMOUNT)?;
+                        let mut token = TIP20Token::from_address_unchecked(escrow);
+                        token.grant_role(
+                            admin,
+                            IRolesAuth::grantRoleCall {
+                                role: *PAUSE_ROLE,
+                                account: admin,
+                            },
+                        )?;
+                        token.pause(admin, ITIP20::pauseCall {})?;
+                        let next_id = dex.next_order_id_val()?;
+                        let result = if flip {
+                            dex.place_flip(
+                                maker,
+                                base,
+                                MIN_ORDER_AMOUNT,
+                                is_bid,
+                                0,
+                                if is_bid { 10 } else { -10 },
+                                false,
+                            )
+                        } else {
+                            dex.place(maker, base, MIN_ORDER_AMOUNT, is_bid, 0)
+                        };
+                        if spec.is_t4() {
+                            assert_eq!(
+                                result,
+                                Err(TempoPrecompileError::Revert(
+                                    ITIP20::ContractPaused {}.abi_encode().into()
+                                )),
+                                "{spec:?}, bid={is_bid}, flip={flip}"
+                            );
+                            assert_eq!(dex.balance_of(maker, escrow)?, MIN_ORDER_AMOUNT);
+                            assert_eq!(dex.next_order_id_val()?, next_id);
+                        } else {
+                            assert_eq!(result?, next_id);
+                            assert_eq!(dex.balance_of(maker, escrow)?, 0);
+                        }
+                        Ok::<_, TempoPrecompileError>(())
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paused_order_wallet_fallback_and_non_escrow_boundaries() {
+        for spec in [
+            TempoHardfork::T3,
+            TempoHardfork::T4,
+            TempoHardfork::T5,
+            TempoHardfork::T11,
+        ] {
+            for is_bid in [false, true] {
+                for flip in [false, true] {
+                    for pause_escrow in [false, true] {
+                        for balance in [
+                            0,
+                            MIN_ORDER_AMOUNT - 1,
+                            MIN_ORDER_AMOUNT,
+                            MIN_ORDER_AMOUNT + 1,
+                        ] {
+                            let mut provider = TestStorageProvider::new(spec);
+                            StorageCtx::enter(&mut provider, || {
+                                    let admin = Address::repeat_byte(0xa1);
+                                    let maker = Address::repeat_byte(0xa2);
+                                    let base = address!("0x20c00000000000000000000000000000000000a1");
+                                    let escrow = if is_bid { PATH_USD_ADDRESS } else { base };
+                                    let non_escrow = if is_bid { base } else { PATH_USD_ADDRESS };
+                                    let mut dex = StablecoinDEX::new();
+                                    setup_dex_tokens(&mut dex, admin, base)?;
+                                    grant_and_mint(escrow, admin, maker, MIN_ORDER_AMOUNT * 2)?;
+                                    TIP20Token::from_address(escrow)?.approve(maker, ITIP20::approveCall {
+                                        spender: STABLECOIN_DEX_ADDRESS, amount: U256::MAX,
+                                    })?;
+                                    dex.set_balance(maker, escrow, balance)?;
+                                    let mut token = TIP20Token::from_address(if pause_escrow { escrow } else { non_escrow })?;
+                                    token.grant_role(admin, IRolesAuth::grantRoleCall { role: *PAUSE_ROLE, account: admin })?;
+                                    token.pause(admin, ITIP20::pauseCall {})?;
+                                    let next_id = dex.next_order_id_val()?;
+                                    let result = if flip {
+                                        dex.place_flip(maker, base, MIN_ORDER_AMOUNT, is_bid, 0, if is_bid { 10 } else { -10 }, false)
+                                    } else {
+                                        dex.place(maker, base, MIN_ORDER_AMOUNT, is_bid, 0)
+                                    };
+                                    let should_succeed = !spec.is_t4() && (!pause_escrow || balance >= MIN_ORDER_AMOUNT);
+                                    if should_succeed {
+                                        assert_eq!(result?, next_id);
+                                        assert_eq!(dex.balance_of(maker, escrow)?, balance.saturating_sub(MIN_ORDER_AMOUNT));
+                                    } else {
+                                        assert_eq!(result, Err(TempoPrecompileError::Revert(ITIP20::ContractPaused {}.abi_encode().into())), "{spec:?}, bid={is_bid}, flip={flip}, escrow={pause_escrow}, balance={balance}");
+                                        assert_eq!(dex.balance_of(maker, escrow)?, balance);
+                                        assert_eq!(dex.next_order_id_val()?, next_id);
+                                    }
+                                    Ok::<_, TempoPrecompileError>(())
+                                }).unwrap();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

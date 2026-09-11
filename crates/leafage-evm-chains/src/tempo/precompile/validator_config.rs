@@ -12,7 +12,7 @@
 //! |  3   | next_dkg_ceremony | u64                            |
 
 use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -27,50 +27,7 @@ use super::{dispatch_call, input_cost, mutate_void, view, Precompile, VALIDATOR_
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IValidatorConfig {
-        function owner() external view returns (address);
-        function getValidators() external view returns (Validator[] memory);
-        function getNextFullDkgCeremony() external view returns (uint64);
-        function validatorsArray(uint256 index) external view returns (address);
-        function validators(address validator) external view returns (Validator memory);
-        function validatorCount() external view returns (uint64);
-
-        function addValidator(
-            address newValidatorAddress,
-            bytes32 publicKey,
-            bool active,
-            string memory inboundAddress,
-            string memory outboundAddress
-        ) external;
-        function updateValidator(
-            address newValidatorAddress,
-            bytes32 publicKey,
-            string memory inboundAddress,
-            string memory outboundAddress
-        ) external;
-        function changeValidatorStatus(address validator, bool active) external;
-        function changeValidatorStatusByIndex(uint256 index, bool active) external;
-        function changeOwner(address newOwner) external;
-        function setNextFullDkgCeremony(uint64 epoch) external;
-
-        struct Validator {
-            bytes32 publicKey;
-            bool active;
-            uint64 index;
-            address validatorAddress;
-            string inboundAddress;
-            string outboundAddress;
-        }
-
-        error Unauthorized();
-        error ValidatorAlreadyExists();
-        error ValidatorNotFound();
-        error InvalidPublicKey();
-        error NotHostPort(string field, string value, string reason);
-        error NotIpPort(string field, string value, string reason);
-    }
-}
+pub use tempo_contracts::precompiles::IValidatorConfig;
 
 // ===========================================================================
 // IP validation (inlined from tempo/ip_validation.rs)
@@ -365,8 +322,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotHostPort {
                     field: "inboundAddress".to_string(),
-                    value: call.inboundAddress.clone(),
-                    reason: err,
+                    input: call.inboundAddress.clone(),
+                    backtrace: err,
                 }
                 .abi_encode()
                 .into(),
@@ -376,8 +333,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotIpPort {
                     field: "outboundAddress".to_string(),
-                    value: call.outboundAddress.clone(),
-                    reason: err,
+                    input: call.outboundAddress.clone(),
+                    backtrace: err,
                 }
                 .abi_encode()
                 .into(),
@@ -435,8 +392,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotHostPort {
                     field: "inboundAddress".to_string(),
-                    value: call.inboundAddress.clone(),
-                    reason: err,
+                    input: call.inboundAddress.clone(),
+                    backtrace: err,
                 }
                 .abi_encode()
                 .into(),
@@ -446,8 +403,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotIpPort {
                     field: "outboundAddress".to_string(),
-                    value: call.outboundAddress.clone(),
-                    reason: err,
+                    input: call.outboundAddress.clone(),
+                    backtrace: err,
                 }
                 .abi_encode()
                 .into(),
@@ -557,7 +514,11 @@ impl Precompile for ValidatorConfig {
 
         dispatch_call(
             calldata,
-            IValidatorConfig::IValidatorConfigCalls::valid_selector,
+            |selector| {
+                IValidatorConfig::IValidatorConfigCalls::valid_selector(selector)
+                    && (StorageCtx.spec().is_t1()
+                        || selector != IValidatorConfig::changeValidatorStatusByIndexCall::SELECTOR)
+            },
             |data| {
                 IValidatorConfig::IValidatorConfigCalls::abi_decode_with_config(
                     data,
@@ -606,7 +567,6 @@ impl Precompile for ValidatorConfig {
                     mutate_void(call, msg_sender, |s, c| self.change_validator_status(s, c))
                 }
                 IValidatorConfig::IValidatorConfigCalls::changeValidatorStatusByIndex(call) => {
-                    // Leafage always runs latest spec, so this is always available
                     mutate_void(call, msg_sender, |s, c| {
                         self.change_validator_status_by_index(s, c)
                     })

@@ -664,7 +664,11 @@ fn check_and_mark_expiring_nonce_if_needed<DB: Database, INSP>(
     let valid_before = fields.valid_before.ok_or_else(|| {
         EVMError::Transaction(TempoInvalidTransaction::ExpiringNonceMissingValidBefore)
     })?;
-    let replay_hash = if hardfork.is_t1b() {
+    // This override applies to pre-T1B too: unsigned RPC tx_hash is zero.
+    // It must not replace the identity used to seed the MPP open context.
+    let replay_hash = if let Some(id) = evm.ctx().tx.stateful_simulation_replay_id {
+        id
+    } else if hardfork.is_t1b() {
         evm.ctx().tx.unique_tx_identifier.ok_or_else(|| {
             EVMError::Custom("expiring nonce transaction requires a transaction identifier".into())
         })?
@@ -2124,6 +2128,7 @@ mod tests {
             }),
             resolved_fee_token: None,
             tx_hash: replay_hash,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(replay_hash),
         }
     }
@@ -2473,6 +2478,394 @@ mod tests {
             actual,
             U256::from_be_bytes(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER.0),
         );
+    }
+
+    #[test]
+    fn stateful_simulation_preserves_mpp_sentinel() {
+        use crate::tempo::precompile::TIP20_CHANNEL_RESERVE_ADDRESS;
+        use crate::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER;
+        use revm::primitives::B256;
+
+        for index in [0, 7] {
+            let mut evm = make_evm();
+            evm.inner.ctx.tx.unique_tx_identifier = Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
+            evm.inner
+                .ctx
+                .tx
+                .set_stateful_simulation_context(B256::repeat_byte(0x71), index);
+            set_channel_open_context_hash(&mut evm);
+            assert_eq!(
+                evm.inner
+                    .ctx
+                    .journal_mut()
+                    .tload(TIP20_CHANNEL_RESERVE_ADDRESS, U256::from(3)),
+                U256::from_be_bytes(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER.0),
+                "stateful entry {index} must preserve the RPC MPP context",
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_mpp_open_topup_close_uses_rpc_descriptor() {
+        use crate::tempo::precompile::{
+            tip20::{IRolesAuth, TIP20Token, ISSUER_ROLE, ITIP20},
+            tip20_channel_reserve::ITIP20ChannelReserve as Mpp,
+            LeafageStorageProvider, StorageCtx, PATH_USD_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS,
+        };
+        use crate::tempo::tx::{TempoCall, RPC_SIMULATION_UNIQUE_TX_IDENTIFIER as CONTEXT};
+        use alloy::primitives::{aliases::U96, keccak256, Bytes, TxKind, B256};
+        use alloy::sol_types::{SolCall, SolError, SolValue};
+
+        let payer = Address::repeat_byte(0x11);
+        let salt = B256::repeat_byte(0x44);
+        let descriptor = Mpp::ChannelDescriptor {
+            payer,
+            payee: payer,
+            operator: Address::ZERO,
+            token: PATH_USD_ADDRESS,
+            salt,
+            authorizedSigner: Address::ZERO,
+            expiringNonceHash: CONTEXT,
+        };
+        let channel_id = keccak256(
+            (
+                payer,
+                payer,
+                Address::ZERO,
+                PATH_USD_ADDRESS,
+                salt,
+                Address::ZERO,
+                CONTEXT,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                U256::from(4217),
+            )
+                .abi_encode(),
+        );
+        let open = Mpp::openCall {
+            payee: payer,
+            operator: Address::ZERO,
+            token: PATH_USD_ADDRESS,
+            deposit: U96::from(100),
+            salt,
+            authorizedSigner: Address::ZERO,
+        }
+        .abi_encode();
+        let topup = Mpp::topUpCall {
+            descriptor: descriptor.clone(),
+            additionalDeposit: U96::from(20),
+        }
+        .abi_encode();
+
+        for spec in [TempoHardfork::T5, TempoHardfork::T10, TempoHardfork::T11] {
+            for aa in [false, true] {
+                // Registration captures the fork at construction; changing
+                // cfg.spec afterwards does not install the T5 MPP precompile.
+                let cfg = make_cached_evm_with_spec(spec).inner.ctx.cfg;
+                let block = BlockEnv {
+                    timestamp: U256::from(spec.as_official().mainnet_activation_timestamp().unwrap()),
+                    gas_limit: 100_000_000,
+                    ..Default::default()
+                };
+                let mut evm = TempoEvm::new(
+                    EvmEnv::new(cfg, block),
+                    revm::database::CacheDB::new(EmptyDB::default()),
+                    NoOpInspector,
+                    false,
+                );
+                {
+                    let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+                    let mut storage =
+                        LeafageStorageProvider::new_max_gas_with_spec(internals, 4217, spec);
+                    StorageCtx::enter(&mut storage, || {
+                        let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                        token.initialize(
+                            Address::ZERO,
+                            "Path USD",
+                            "pathUSD",
+                            "USD",
+                            PATH_USD_ADDRESS,
+                            payer,
+                        )?;
+                        token.grant_role(
+                            payer,
+                            IRolesAuth::grantRoleCall {
+                                role: *ISSUER_ROLE,
+                                account: payer,
+                            },
+                        )?;
+                        token.mint(
+                            payer,
+                            ITIP20::mintCall {
+                                to: payer,
+                                amount: U256::from(1000),
+                            },
+                        )
+                    })
+                    .unwrap();
+                }
+                let state = evm.finalize();
+                evm.commit(state);
+                let make_tx = |input: Vec<u8>, index: u64| {
+                    let mut tx = TempoTxEnv::default();
+                    tx.base.caller = payer;
+                    tx.base.kind = TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS);
+                    tx.base.gas_limit = 10_000_000;
+                    tx.base.chain_id = Some(4217);
+                    tx.base.data = input.clone().into();
+                    tx.unique_tx_identifier = Some(CONTEXT);
+                    if aa {
+                        tx.tempo_fields = Some(TempoTxFields {
+                            aa_calls: vec![TempoCall {
+                                to: tx.base.kind,
+                                input: input.into(),
+                                value: U256::ZERO,
+                            }],
+                            ..Default::default()
+                        });
+                    }
+                    tx.set_stateful_simulation_context(B256::repeat_byte(0x71), index);
+                    tx
+                };
+                let mut first = make_tx(open.clone(), 7);
+                if aa {
+                    first
+                        .tempo_fields
+                        .as_mut()
+                        .unwrap()
+                        .aa_calls
+                        .push(TempoCall {
+                            to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
+                            input: topup.clone().into(),
+                            value: U256::ZERO,
+                        });
+                }
+                let result = evm.transact_commit(first).unwrap();
+                assert!(result.is_success(), "{spec:?}, aa={aa}: {result:?}");
+                assert!(result
+                    .logs()
+                    .iter()
+                    .any(|log| log.address == TIP20_CHANNEL_RESERVE_ADDRESS
+                        && log.topics().get(1) == Some(&channel_id)));
+                if !aa {
+                    assert!(evm
+                        .transact_commit(make_tx(topup.clone(), 8))
+                        .unwrap()
+                        .is_success());
+                }
+                let read = Mpp::getChannelStateCall {
+                    channelId: channel_id,
+                }
+                .abi_encode();
+                let result = evm.transact(make_tx(read, 9)).unwrap().result;
+                assert_eq!(
+                    result.output().unwrap().as_ref(),
+                    (U256::ZERO, U256::from(120), U256::ZERO).abi_encode()
+                );
+
+                let close = Mpp::closeCall {
+                    descriptor: descriptor.clone(),
+                    cumulativeAmount: U96::ZERO,
+                    captureAmount: U96::ZERO,
+                    signature: Bytes::new(),
+                }
+                .abi_encode();
+                assert!(evm
+                    .transact_commit(make_tx(close, 10))
+                    .unwrap()
+                    .is_success());
+                // A new transaction clears opened_this_tx; fixed RPC context
+                // reuses the simulation ID after close. It is not a chain ID.
+                let reopened = evm.transact_commit(make_tx(open.clone(), 11)).unwrap();
+                assert!(reopened.is_success(), "{reopened:?}");
+                assert!(reopened
+                    .logs()
+                    .iter()
+                    .any(|log| log.address == TIP20_CHANNEL_RESERVE_ADDRESS
+                        && log.topics().get(1) == Some(&channel_id)));
+                let duplicate = evm.transact_commit(make_tx(open.clone(), 12)).unwrap();
+                assert!(!duplicate.is_success());
+                assert_eq!(
+                    duplicate.output().unwrap().as_ref(),
+                    Mpp::ChannelAlreadyExists {}.abi_encode()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dex_paused_output_reverts_fills_and_aa_prior_writes() {
+        use crate::tempo::precompile::{
+            stablecoin_dex::{IStablecoinDEX as Dex, StablecoinDEX},
+            tip20::{IRolesAuth, TIP20Token, ISSUER_ROLE, ITIP20, PAUSE_ROLE},
+            LeafageStorageProvider, StorageCtx, PATH_USD_ADDRESS, STABLECOIN_DEX_ADDRESS,
+        };
+        use crate::tempo::tx::TempoCall;
+        use alloy::primitives::{address, TxKind};
+        use alloy::sol_types::{SolCall, SolError};
+
+        let maker = Address::repeat_byte(0x11);
+        let taker = Address::repeat_byte(0x22);
+        let base = address!("0x20c00000000000000000000000000000000000a1");
+        let amount = 100_000_000u128;
+        for spec in [TempoHardfork::T4, TempoHardfork::T5, TempoHardfork::T11] {
+            let cfg = make_cached_evm_with_spec(spec).inner.ctx.cfg;
+            let block = BlockEnv {
+                timestamp: U256::from(spec.as_official().mainnet_activation_timestamp().unwrap()),
+                gas_limit: 100_000_000,
+                ..Default::default()
+            };
+            let mut evm = TempoEvm::new(
+                EvmEnv::new(cfg, block),
+                revm::database::CacheDB::new(EmptyDB::default()),
+                NoOpInspector,
+                false,
+            );
+            {
+                let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+                let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, 4217, spec);
+                StorageCtx::enter(&mut storage, || {
+                    for (address, owner) in [(PATH_USD_ADDRESS, taker), (base, maker)] {
+                        let mut token = TIP20Token::from_address_unchecked(address);
+                        token.initialize(
+                            Address::ZERO,
+                            "USD",
+                            "USD",
+                            "USD",
+                            PATH_USD_ADDRESS,
+                            maker,
+                        )?;
+                        for role in [*ISSUER_ROLE, *PAUSE_ROLE] {
+                            token.grant_role(
+                                maker,
+                                IRolesAuth::grantRoleCall {
+                                    role,
+                                    account: maker,
+                                },
+                            )?;
+                        }
+                        token.mint(
+                            maker,
+                            ITIP20::mintCall {
+                                to: owner,
+                                amount: U256::from(amount * 4),
+                            },
+                        )?;
+                        token.approve(
+                            owner,
+                            ITIP20::approveCall {
+                                spender: STABLECOIN_DEX_ADDRESS,
+                                amount: U256::MAX,
+                            },
+                        )?;
+                    }
+                    let mut dex = StablecoinDEX::new();
+                    dex.initialize()?;
+                    dex.create_pair(base)?;
+                    Ok::<_, crate::tempo::precompile::TempoPrecompileError>(())
+                })
+                .unwrap();
+            }
+            let state = evm.finalize();
+            evm.commit(state);
+            let make_tx = |caller, to, input: Vec<u8>| {
+                let mut tx = TempoTxEnv::default();
+                tx.base.caller = caller;
+                tx.base.kind = TxKind::Call(to);
+                tx.base.data = input.into();
+                tx.base.gas_limit = 10_000_000;
+                tx.base.chain_id = Some(4217);
+                tx
+            };
+            let snapshot = |evm: &TempoEvm<revm::database::CacheDB<EmptyDB>, NoOpInspector>| {
+                [PATH_USD_ADDRESS, base, STABLECOIN_DEX_ADDRESS]
+                    .into_iter()
+                    .flat_map(|address| {
+                        evm.inner.ctx.db().cache.accounts[&address]
+                            .storage
+                            .iter()
+                            .filter(|(_, value)| !value.is_zero())
+                            .map(move |(slot, value)| ((address, *slot), *value))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let place = Dex::placeCall {
+                token: base,
+                amount: amount * 2,
+                isBid: false,
+                tick: 0,
+            }
+            .abi_encode();
+            assert!(evm
+                .transact_commit(make_tx(maker, STABLECOIN_DEX_ADDRESS, place.clone()))
+                .unwrap()
+                .is_success());
+
+            // The first AA call cancels into internal balance. Pausing then
+            // placing must reject and undo cancellation, pause, and all logs.
+            let before = snapshot(&evm);
+            let mut aa = make_tx(maker, STABLECOIN_DEX_ADDRESS, Vec::new());
+            aa.tempo_fields = Some(TempoTxFields {
+                aa_calls: vec![
+                    TempoCall {
+                        to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                        input: Dex::cancelCall { orderId: 1 }.abi_encode().into(),
+                        value: U256::ZERO,
+                    },
+                    TempoCall {
+                        to: TxKind::Call(base),
+                        input: ITIP20::pauseCall {}.abi_encode().into(),
+                        value: U256::ZERO,
+                    },
+                    TempoCall {
+                        to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                        input: place.into(),
+                        value: U256::ZERO,
+                    },
+                ],
+                ..Default::default()
+            });
+            let rejected = evm.transact_commit(aa).unwrap();
+            assert!(!rejected.is_success(), "{spec:?}");
+            assert_eq!(
+                rejected.output().unwrap().as_ref(),
+                ITIP20::ContractPaused {}.abi_encode()
+            );
+            assert!(rejected.logs().is_empty());
+            assert_eq!(snapshot(&evm), before, "AA rollback {spec:?}");
+
+            assert!(evm
+                .transact_commit(make_tx(maker, base, ITIP20::pauseCall {}.abi_encode()))
+                .unwrap()
+                .is_success());
+            let before = snapshot(&evm);
+            for input in [
+                Dex::swapExactAmountInCall {
+                    tokenIn: PATH_USD_ADDRESS,
+                    tokenOut: base,
+                    amountIn: amount,
+                    minAmountOut: 0,
+                }
+                .abi_encode(),
+                Dex::swapExactAmountOutCall {
+                    tokenIn: PATH_USD_ADDRESS,
+                    tokenOut: base,
+                    amountOut: amount,
+                    maxAmountIn: amount * 2,
+                }
+                .abi_encode(),
+            ] {
+                let rejected = evm
+                    .transact_commit(make_tx(taker, STABLECOIN_DEX_ADDRESS, input))
+                    .unwrap();
+                assert!(!rejected.is_success(), "{spec:?}");
+                assert_eq!(
+                    rejected.output().unwrap().as_ref(),
+                    ITIP20::ContractPaused {}.abi_encode()
+                );
+                assert!(rejected.logs().is_empty());
+                assert_eq!(snapshot(&evm), before, "fill rollback {spec:?}");
+            }
+        }
     }
 
     #[test]
@@ -2964,6 +3357,7 @@ mod tests {
             }),
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         }
     }
@@ -2984,6 +3378,7 @@ mod tests {
             tempo_fields: None,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
@@ -3062,6 +3457,7 @@ mod tests {
             }),
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         };
         let result = evm.transact(tx);
@@ -3098,6 +3494,7 @@ mod tests {
             }),
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         };
         let error = evm.transact(tx).unwrap_err();
@@ -3280,19 +3677,42 @@ mod tests {
         use revm::primitives::B256;
 
         let block_hash = B256::repeat_byte(0x71);
-        let valid_before = 1_770_908_500 + 300;
-        let mut first = expiring_nonce_tx(valid_before, B256::ZERO);
-        first.set_stateful_simulation_context(block_hash, 0);
-        let mut second = expiring_nonce_tx(valid_before, B256::ZERO);
-        second.set_stateful_simulation_context(block_hash, 1);
-        assert_ne!(first.unique_tx_identifier, second.unique_tx_identifier);
+        for spec in [
+            TempoHardfork::T1,
+            TempoHardfork::T1A,
+            TempoHardfork::T1B,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+        ] {
+            let valid_before = 1_770_908_500 + 30;
+            let mut first = expiring_nonce_tx(valid_before, B256::ZERO);
+            first.unique_tx_identifier = Some(crate::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
+            let mut second = first.clone();
+            first.set_stateful_simulation_context(block_hash, 0);
+            second.set_stateful_simulation_context(block_hash, 1);
+            assert_ne!(
+                first.stateful_simulation_replay_id,
+                second.stateful_simulation_replay_id
+            );
+            assert_eq!(first.unique_tx_identifier, second.unique_tx_identifier);
+            assert_eq!(first.tx_hash, B256::ZERO);
 
-        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
-        assert!(evm.transact_commit(first.clone()).unwrap().is_success());
-        assert!(evm.transact_commit(second).unwrap().is_success());
+            let mut evm = make_cached_evm_with_spec(spec);
+            assert!(
+                evm.transact_commit(first.clone()).unwrap().is_success(),
+                "{spec:?}"
+            );
+            assert!(
+                evm.transact_commit(second).unwrap().is_success(),
+                "{spec:?}"
+            );
+            let error = evm.transact(first.clone()).unwrap_err().to_string();
+            assert!(error.contains("ExpiringNonceReplay"), "{spec:?}: {error}");
 
-        let error = evm.transact(first).unwrap_err().to_string();
-        assert!(error.contains("ExpiringNonceReplay"), "{error}");
+            // Another request has a fresh memory DB, not a persistent replay set.
+            let mut fresh = make_cached_evm_with_spec(spec);
+            assert!(fresh.transact_commit(first).unwrap().is_success());
+        }
     }
 
     #[test]
@@ -3303,24 +3723,32 @@ mod tests {
 
         let target = Address::with_last_byte(0x92);
         let code = Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x5f, 0xfd]));
-        let mut evm = make_cached_evm_with_spec(TempoHardfork::T11);
-        evm.inner.ctx.db_mut().insert_account_info(
-            target,
-            AccountInfo {
-                code_hash: code.hash_slow(),
-                code: Some(code),
-                ..Default::default()
-            },
-        );
-
-        let tx = expiring_nonce_tx(1_770_908_500 + 300, B256::repeat_byte(0x96));
-        assert!(matches!(
-            evm.transact_commit(tx.clone()).unwrap(),
-            ExecutionResult::Revert { .. }
-        ));
-
-        let error = evm.transact(tx).unwrap_err().to_string();
-        assert!(error.contains("ExpiringNonceReplay"), "{error}");
+        for spec in [TempoHardfork::T1A, TempoHardfork::T1B, TempoHardfork::T11] {
+            for stateful in [false, true] {
+                let mut evm = make_cached_evm_with_spec(spec);
+                evm.inner.ctx.db_mut().insert_account_info(
+                    target,
+                    AccountInfo {
+                        code_hash: code.hash_slow(),
+                        code: Some(code.clone()),
+                        ..Default::default()
+                    },
+                );
+                let mut tx = expiring_nonce_tx(1_770_908_500 + 30, B256::repeat_byte(0x96));
+                if stateful {
+                    tx.set_stateful_simulation_context(B256::repeat_byte(0x71), 0);
+                }
+                assert!(matches!(
+                    evm.transact_commit(tx.clone()).unwrap(),
+                    ExecutionResult::Revert { .. }
+                ));
+                let error = evm.transact(tx).unwrap_err().to_string();
+                assert!(
+                    error.contains("ExpiringNonceReplay"),
+                    "{spec:?}, stateful={stateful}: {error}"
+                );
+            }
+        }
     }
 
     fn regular_2d_nonce_tx(kind: revm::primitives::TxKind) -> TempoTxEnv {
@@ -3488,6 +3916,7 @@ mod tests {
             tempo_fields: None,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
         };
         // System tx should pass validate_env (though execution may fail later)

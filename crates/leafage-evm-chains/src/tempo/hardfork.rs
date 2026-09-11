@@ -1,24 +1,9 @@
-/// Tempo hardfork enum for leafage-evm with timestamp-based activation.
-///
-/// Supports both "latest spec" mode (via `Default`, returns the latest activated
-/// hardfork on mainnet) and archive mode (via `from_timestamp`, returns the
-/// hardfork active at a given block timestamp).
-///
-/// Mainnet activation timestamps (from `presto.json` genesis):
-/// - Genesis/T0: 0
-/// - T1/T1A: 1770908400 (Feb 12, 2026 15:00 UTC)
-/// - T1B: 1771858800 (Feb 23, 2026 15:00 UTC)
-/// - T1C: 1773327600 (Mar 12, 2026 15:00 UTC)
-/// - T2: 1774965600 (Mar 31, 2026 14:00 UTC)
-/// - T3: 1777298400 (Apr 27, 2026 14:00 UTC)
-/// - T4: 1779112800 (May 18, 2026 14:00 UTC)
-/// - T5: 1781013600 (Jun 9, 2026 14:00 UTC)
-/// - T6: 1782223200 (Jun 23, 2026 14:00 UTC)
-/// - T7: 1783605600 (Jul 9, 2026 14:00 UTC)
-/// - T8: 1785420000 (Jul 30, 2026 14:00 UTC)
-/// - T9: 1786024800 (Aug 6, 2026 14:00 UTC)
-/// - T10: 1787320800 (Aug 21, 2026 14:00 UTC)
-/// - T11: 1789048800 (Sep 10, 2026 14:00 UTC)
+//! Leafage compatibility wrapper around the pinned official Tempo protocol definitions.
+//! Mainnet schedule comes from tempo-hardfork; Default remains the legacy T10 value.
+//! Genesis folds upstream Genesis/T0, and REVM36 conversion remains local.
+
+use tempo_hardfork::TempoHardfork as OfficialHardfork;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TempoHardfork {
     Genesis,
@@ -36,190 +21,120 @@ pub enum TempoHardfork {
     T9,
     #[default]
     T10,
-    /// Formal T11 rules from Tempo v1.14.0.
     T11,
 }
 
-/// Tempo mainnet activation timestamps (from `presto.json` genesis config).
-///
-/// Note: T1 and T1A share the same activation timestamp on mainnet.
-/// The `Genesis` variant covers both the Genesis and T0 eras (T0 activates
-/// at timestamp 0 on mainnet, same as Genesis).
-const MAINNET_T1_TIME: u64 = 1_770_908_400;
-const MAINNET_T1A_TIME: u64 = 1_770_908_400;
-const MAINNET_T1B_TIME: u64 = 1_771_858_800;
-const MAINNET_T1C_TIME: u64 = 1_773_327_600;
-// T2 activated on mainnet: 2026-03-31 14:00 UTC (from presto.json genesis).
-const MAINNET_T2_TIME: u64 = 1_774_965_600;
-// T3 activated on mainnet: 2026-04-27 14:00 UTC (from presto.json genesis).
-const MAINNET_T3_TIME: u64 = 1_777_298_400;
-// T4 activates on mainnet: 2026-05-18 14:00 UTC (from presto.json genesis).
-const MAINNET_T4_TIME: u64 = 1_779_112_800;
-const MAINNET_T5_TIME: u64 = 1_781_013_600;
-const MAINNET_T6_TIME: u64 = 1_782_223_200;
-const MAINNET_T7_TIME: u64 = 1_783_605_600;
-const MAINNET_T8_TIME: u64 = 1_785_420_000;
-const MAINNET_T9_TIME: u64 = 1_786_024_800;
-const MAINNET_T10_TIME: u64 = 1_787_320_800;
-const MAINNET_T11_TIME: u64 = 1_789_048_800;
-
 impl TempoHardfork {
-    /// Determine the active hardfork for a given block timestamp.
-    ///
-    /// Uses Tempo mainnet activation timestamps. On mainnet, T0 activates at
-    /// timestamp 0 (same as Genesis), so the `Genesis` variant covers both
-    /// the Genesis and T0 eras.
+    /// Uses the official mainnet schedule, never latest() or the process clock.
+    /// The exact pinned revision has no scheduled T12; tests enforce that invariant.
     pub fn from_timestamp(timestamp: u64) -> Self {
-        if timestamp >= MAINNET_T11_TIME {
-            Self::T11
-        } else if timestamp >= MAINNET_T10_TIME {
-            Self::T10
-        } else if timestamp >= MAINNET_T9_TIME {
-            Self::T9
-        } else if timestamp >= MAINNET_T8_TIME {
-            Self::T8
-        } else if timestamp >= MAINNET_T7_TIME {
-            Self::T7
-        } else if timestamp >= MAINNET_T6_TIME {
-            Self::T6
-        } else if timestamp >= MAINNET_T5_TIME {
-            Self::T5
-        } else if timestamp >= MAINNET_T4_TIME {
-            Self::T4
-        } else if timestamp >= MAINNET_T3_TIME {
-            Self::T3
-        } else if timestamp >= MAINNET_T2_TIME {
-            Self::T2
-        } else if timestamp >= MAINNET_T1C_TIME {
-            Self::T1C
-        } else if timestamp >= MAINNET_T1B_TIME {
-            Self::T1B
-        } else if timestamp >= MAINNET_T1A_TIME {
-            Self::T1A
-        } else if timestamp >= MAINNET_T1_TIME {
-            // T1 and T1A share the same timestamp on mainnet, so this branch
-            // is effectively unreachable. Kept for correctness if timestamps
-            // ever diverge (e.g. testnet).
-            Self::T1
-        } else {
-            Self::Genesis
+        let fork = OfficialHardfork::from_chain_and_timestamp(4217, timestamp)
+            .expect("official Tempo mainnet schedule exists");
+        Self::try_from(fork).expect("scheduled fork must be supported by the pinned adapter")
+    }
+
+    pub const fn as_official(self) -> OfficialHardfork {
+        match self {
+            Self::Genesis => OfficialHardfork::T0,
+            Self::T1 => OfficialHardfork::T1,
+            Self::T1A => OfficialHardfork::T1A,
+            Self::T1B => OfficialHardfork::T1B,
+            Self::T1C => OfficialHardfork::T1C,
+            Self::T2 => OfficialHardfork::T2,
+            Self::T3 => OfficialHardfork::T3,
+            Self::T4 => OfficialHardfork::T4,
+            Self::T5 => OfficialHardfork::T5,
+            Self::T6 => OfficialHardfork::T6,
+            Self::T7 => OfficialHardfork::T7,
+            Self::T8 => OfficialHardfork::T8,
+            Self::T9 => OfficialHardfork::T9,
+            Self::T10 => OfficialHardfork::T10,
+            Self::T11 => OfficialHardfork::T11,
         }
     }
 
     pub const fn is_t0(&self) -> bool {
-        true // Genesis is always active
+        self.as_official().is_t0()
     }
     pub const fn is_t1(&self) -> bool {
-        *self as u8 >= Self::T1 as u8
+        self.as_official().is_t1()
     }
     pub const fn is_t1a(&self) -> bool {
-        *self as u8 >= Self::T1A as u8
+        self.as_official().is_t1a()
     }
     pub const fn is_t1b(&self) -> bool {
-        *self as u8 >= Self::T1B as u8
+        self.as_official().is_t1b()
     }
     pub const fn is_t1c(&self) -> bool {
-        *self as u8 >= Self::T1C as u8
+        self.as_official().is_t1c()
     }
     pub const fn is_t2(&self) -> bool {
-        *self as u8 >= Self::T2 as u8
+        self.as_official().is_t2()
     }
     pub const fn is_t3(&self) -> bool {
-        *self as u8 >= Self::T3 as u8
+        self.as_official().is_t3()
     }
     pub const fn is_t4(&self) -> bool {
-        *self as u8 >= Self::T4 as u8
+        self.as_official().is_t4()
     }
     pub const fn is_t5(&self) -> bool {
-        *self as u8 >= Self::T5 as u8
+        self.as_official().is_t5()
     }
     pub const fn is_t6(&self) -> bool {
-        *self as u8 >= Self::T6 as u8
+        self.as_official().is_t6()
     }
     pub const fn is_t7(&self) -> bool {
-        *self as u8 >= Self::T7 as u8
+        self.as_official().is_t7()
     }
     pub const fn is_t8(&self) -> bool {
-        *self as u8 >= Self::T8 as u8
+        self.as_official().is_t8()
     }
     pub const fn is_t9(&self) -> bool {
-        *self as u8 >= Self::T9 as u8
+        self.as_official().is_t9()
     }
     pub const fn is_t10(&self) -> bool {
-        *self as u8 >= Self::T10 as u8
+        self.as_official().is_t10()
     }
     pub const fn is_t11(&self) -> bool {
-        *self as u8 >= Self::T11 as u8
+        self.as_official().is_t11()
     }
 
-    /// Capacity of the expiring-nonce replay-protection ring.
     pub const fn expiring_nonce_set_capacity(&self) -> u32 {
-        if self.is_t11() {
-            3_000_000
-        } else {
-            300_000
-        }
+        self.as_official().expiring_nonce_set_capacity()
     }
-
-    /// Maximum number of seconds an expiring nonce may remain valid.
     pub const fn expiring_nonce_max_expiry_secs(&self) -> u64 {
-        if self.is_t11() {
-            300
-        } else {
-            30
-        }
+        self.as_official().expiring_nonce_max_expiry_secs()
     }
-
-    /// Gas cost for using an existing 2D nonce key (cold SLOAD + warm SSTORE reset).
-    /// Ported from Tempo writer: crates/chainspec/src/spec.rs
     pub const fn gas_existing_nonce_key(&self) -> u64 {
-        // T1 value: COLD_SLOAD (2100) + WARM_SSTORE_RESET (2900) = 5000
-        // T2 adds 2 * WARM_SLOAD (100) = 5200
-        match self {
-            Self::Genesis | Self::T1 | Self::T1A | Self::T1B | Self::T1C => {
-                // COLD_SLOAD_COST + WARM_SSTORE_RESET = 2100 + 2900
-                5_000
-            }
-            Self::T2
-            | Self::T3
-            | Self::T4
-            | Self::T5
-            | Self::T6
-            | Self::T7
-            | Self::T8
-            | Self::T9
-            | Self::T10
-            | Self::T11 => {
-                // T2 adds 2 warm SLOADs; later forks inherit the same schedule.
-                5_200
-            }
-        }
+        self.as_official().gas_existing_nonce_key()
     }
-
-    /// Gas cost for using a new 2D nonce key (cold SLOAD + SSTORE set for 0 -> non-zero).
-    /// Ported from Tempo writer: crates/chainspec/src/spec.rs
     pub const fn gas_new_nonce_key(&self) -> u64 {
-        // T1 value: COLD_SLOAD (2100) + SSTORE_SET (20000) = 22100
-        // T2 adds 2 * WARM_SLOAD (100) = 22300
-        match self {
-            Self::Genesis | Self::T1 | Self::T1A | Self::T1B | Self::T1C => {
-                // COLD_SLOAD_COST + SSTORE_SET = 2100 + 20000
-                22_100
-            }
-            Self::T2
-            | Self::T3
-            | Self::T4
-            | Self::T5
-            | Self::T6
-            | Self::T7
-            | Self::T8
-            | Self::T9
-            | Self::T10
-            | Self::T11 => {
-                // T2 adds 2 warm SLOADs; later forks inherit the same schedule.
-                22_300
-            }
-        }
+        self.as_official().gas_new_nonce_key()
+    }
+}
+
+impl TryFrom<OfficialHardfork> for TempoHardfork {
+    type Error = OfficialHardfork;
+
+    fn try_from(fork: OfficialHardfork) -> Result<Self, Self::Error> {
+        Ok(match fork {
+            OfficialHardfork::Genesis | OfficialHardfork::T0 => Self::Genesis,
+            OfficialHardfork::T1 => Self::T1,
+            OfficialHardfork::T1A => Self::T1A,
+            OfficialHardfork::T1B => Self::T1B,
+            OfficialHardfork::T1C => Self::T1C,
+            OfficialHardfork::T2 => Self::T2,
+            OfficialHardfork::T3 => Self::T3,
+            OfficialHardfork::T4 => Self::T4,
+            OfficialHardfork::T5 => Self::T5,
+            OfficialHardfork::T6 => Self::T6,
+            OfficialHardfork::T7 => Self::T7,
+            OfficialHardfork::T8 => Self::T8,
+            OfficialHardfork::T9 => Self::T9,
+            OfficialHardfork::T10 => Self::T10,
+            OfficialHardfork::T11 => Self::T11,
+            _ => return Err(fork),
+        })
     }
 }
 
@@ -235,6 +150,68 @@ impl From<TempoHardfork> for revm::primitives::hardfork::SpecId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Frozen pre-migration timestamps, independent of the upstream schedule implementation.
+    /// Tempo mainnet activation timestamps (from `presto.json` genesis config).
+    ///
+    /// Note: T1 and T1A share the same activation timestamp on mainnet.
+    /// The `Genesis` variant covers both the Genesis and T0 eras (T0 activates
+    /// at timestamp 0 on mainnet, same as Genesis).
+    const MAINNET_T1_TIME: u64 = 1_770_908_400;
+    const MAINNET_T1A_TIME: u64 = 1_770_908_400;
+    const MAINNET_T1B_TIME: u64 = 1_771_858_800;
+    const MAINNET_T1C_TIME: u64 = 1_773_327_600;
+    // T2 activated on mainnet: 2026-03-31 14:00 UTC (from presto.json genesis).
+    const MAINNET_T2_TIME: u64 = 1_774_965_600;
+    // T3 activated on mainnet: 2026-04-27 14:00 UTC (from presto.json genesis).
+    const MAINNET_T3_TIME: u64 = 1_777_298_400;
+    // T4 activates on mainnet: 2026-05-18 14:00 UTC (from presto.json genesis).
+    const MAINNET_T4_TIME: u64 = 1_779_112_800;
+    const MAINNET_T5_TIME: u64 = 1_781_013_600;
+    const MAINNET_T6_TIME: u64 = 1_782_223_200;
+    const MAINNET_T7_TIME: u64 = 1_783_605_600;
+    const MAINNET_T8_TIME: u64 = 1_785_420_000;
+    const MAINNET_T9_TIME: u64 = 1_786_024_800;
+    const MAINNET_T10_TIME: u64 = 1_787_320_800;
+    const MAINNET_T11_TIME: u64 = 1_789_048_800;
+
+    #[test]
+    fn official_mapping_preserves_legacy_default_and_rejects_unimplemented_forks() {
+        assert_eq!(TempoHardfork::default(), TempoHardfork::T10);
+        assert_eq!(
+            TempoHardfork::try_from(OfficialHardfork::T0),
+            Ok(TempoHardfork::Genesis)
+        );
+        assert_eq!(
+            TempoHardfork::try_from(OfficialHardfork::Genesis),
+            Ok(TempoHardfork::Genesis)
+        );
+        assert_eq!(
+            TempoHardfork::try_from(OfficialHardfork::T12),
+            Err(OfficialHardfork::T12)
+        );
+        assert_eq!(OfficialHardfork::T12.mainnet_activation_timestamp(), None);
+        assert_eq!(
+            OfficialHardfork::from_chain_and_timestamp(4217, u64::MAX),
+            Some(OfficialHardfork::T11)
+        );
+        assert_eq!(
+            OfficialHardfork::from_chain_and_timestamp(999, u64::MAX),
+            None
+        );
+        for fork in OfficialHardfork::VARIANTS {
+            if let Ok(local) = TempoHardfork::try_from(*fork) {
+                assert_eq!(
+                    local.as_official(),
+                    if *fork == OfficialHardfork::Genesis {
+                        OfficialHardfork::T0
+                    } else {
+                        *fork
+                    }
+                );
+            }
+        }
+    }
 
     #[test]
     fn from_timestamp_genesis() {
