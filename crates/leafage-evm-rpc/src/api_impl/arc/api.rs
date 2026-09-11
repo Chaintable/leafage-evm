@@ -77,6 +77,32 @@ where
         evm.transact(tx).map(|result| result.result)
     }
 
+    fn transact_for_estimation<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let factory = self.arc_factory().map_err(EVMError::Custom)?;
+        let mut cfg = self.evm_cfg.cfg.clone();
+        // Match Writer estimation: reserving gas must not reduce the USDC
+        // balance used by the business call. Keep GASPRICE and BASEFEE intact.
+        cfg.disable_fee_charge = true;
+        let env = EvmEnv::new(cfg, block_env.clone());
+        let mut evm = factory
+            .create(env, WrapDatabaseRef(state), NoOpInspector {})
+            .map_err(|err| EVMError::Custom(err.to_string()))?;
+        // Discard all state, including refunds: no probe may fund the next one.
+        evm.transact(tx).map(|result| result.result)
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,

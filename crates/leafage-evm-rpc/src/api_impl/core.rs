@@ -167,6 +167,24 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static;
 
+    /// Execute an isolated gas-estimation probe. Chains may override execution
+    /// settings without changing ordinary calls or committed simulations.
+    fn transact_for_estimation<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        self.transact(block_env, state, tx)
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
@@ -278,5 +296,73 @@ mod tests {
             handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA),
             eip7825::TX_GAS_LIMIT_CAP
         );
+    }
+
+    #[test]
+    fn default_estimation_execution_keeps_mainnet_fee_charging() {
+        use crate::api_impl::{api_impl::NoneEvmCustomConfig, ApiImpl};
+        use alloy::primitives::{Address, Bytes, U256};
+        use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+
+        let api = ApiImpl::<(), MainnetSpecId, NoneEvmCustomConfig>::new(
+            (),
+            CfgEnv::new_with_spec(EthSpecId::OSAKA),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            100,
+            None,
+            None,
+            None,
+        );
+        let caller = Address::repeat_byte(0x11);
+        let target = Address::repeat_byte(0x22);
+        let mut state = InMemoryDB::default();
+        state.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                nonce: 7,
+                ..Default::default()
+            },
+        );
+        // Return the caller's balance during execution, after reserving fees.
+        let code = Bytecode::new_raw(Bytes::from_static(&[
+            0x33, 0x31, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+        ]));
+        state.insert_account_info(
+            target,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+        let block_env = BlockEnv {
+            basefee: 3,
+            ..Default::default()
+        };
+        let tx = TxEnv::builder()
+            .caller(caller)
+            .to(target)
+            .nonce(7)
+            .gas_limit(50_000)
+            .gas_price(5)
+            .value(U256::from(7))
+            .build()
+            .unwrap();
+        let normal = api.transact(&block_env, &state, tx.clone()).unwrap();
+        let estimated = api.transact_for_estimation(&block_env, &state, tx).unwrap();
+        assert_eq!(estimated, normal);
+        assert_eq!(
+            estimated.output().unwrap().as_ref(),
+            U256::from(749_993).to_be_bytes::<32>()
+        );
+        assert!(!api.evm_cfg.cfg.disable_fee_charge);
     }
 }
