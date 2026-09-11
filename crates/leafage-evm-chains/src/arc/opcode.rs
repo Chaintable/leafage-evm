@@ -5,6 +5,7 @@ use super::{
         ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
         NATIVE_COIN_CONTROL_ADDRESS,
     },
+    ArcHardfork, ArcHardforkFlags,
 };
 use alloy_evm::Database;
 use revm::{
@@ -15,17 +16,72 @@ use revm::{
         interpreter::EthInterpreter,
         interpreter_action::InterpreterAction,
         interpreter_types::{InputsTr, LoopControl, RuntimeFlag, StackTr},
-        require_non_staticcall, InstructionContext, InstructionResult, StateLoad,
+        require_non_staticcall, Instruction, InstructionContext, InstructionResult, StateLoad,
     },
     primitives::{hardfork::SpecId, Address},
 };
 
-/// Arc Zero5/Zero6 SELFDESTRUCT.
-///
-/// This follows Arc v0.7.3: an unpreheated NCC account remains fail-open, while a real database
-/// error is retained by the context and surfaced by the transaction handler.
+#[derive(Clone, Copy)]
+enum BlocklistReadPolicy {
+    FailOpen,
+    FailClosed,
+}
+
+#[derive(Clone, Copy)]
+enum TargetWarmthPolicy {
+    AccessListOnly,
+    Transaction,
+}
+
+pub(crate) fn arc_selfdestruct_instruction<DB: Database>(
+    hardfork_flags: ArcHardforkFlags,
+) -> Instruction<EthInterpreter, ArcContext<DB>> {
+    if hardfork_flags.is_active(ArcHardfork::Zero8) {
+        Instruction::new(arc_selfdestruct_zero8::<DB>, 5_000)
+    } else if hardfork_flags.is_active(ArcHardfork::Zero7) {
+        Instruction::new(arc_selfdestruct_zero7::<DB>, 5_000)
+    } else {
+        Instruction::new(arc_selfdestruct::<DB>, 5_000)
+    }
+}
+
+/// Pre-Zero7 SELFDESTRUCT with fail-open blocklist reads.
 pub(crate) fn arc_selfdestruct<DB: Database>(
+    context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
+) {
+    arc_selfdestruct_impl(
+        context,
+        BlocklistReadPolicy::FailOpen,
+        TargetWarmthPolicy::AccessListOnly,
+    );
+}
+
+/// Zero7+ SELFDESTRUCT with fail-closed blocklist reads.
+pub(crate) fn arc_selfdestruct_zero7<DB: Database>(
+    context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
+) {
+    arc_selfdestruct_impl(
+        context,
+        BlocklistReadPolicy::FailClosed,
+        TargetWarmthPolicy::AccessListOnly,
+    );
+}
+
+/// Zero8+ SELFDESTRUCT with transaction-wide target warmth.
+pub(crate) fn arc_selfdestruct_zero8<DB: Database>(
+    context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
+) {
+    arc_selfdestruct_impl(
+        context,
+        BlocklistReadPolicy::FailClosed,
+        TargetWarmthPolicy::Transaction,
+    );
+}
+
+fn arc_selfdestruct_impl<DB: Database>(
     mut context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
+    blocklist_read_policy: BlocklistReadPolicy,
+    target_warmth_policy: TargetWarmthPolicy,
 ) {
     require_non_staticcall!(context.interpreter);
     let Some([target]) = StackTr::popn(&mut context.interpreter.stack) else {
@@ -45,8 +101,14 @@ pub(crate) fn arc_selfdestruct<DB: Database>(
                 revert(&mut context, ERR_ZERO_ADDRESS);
                 return;
             }
-            let Ok(is_target_cold) = check_accounts(&mut context, source, target, skip_cold_load)
-            else {
+            let Ok(is_target_cold) = check_accounts(
+                &mut context,
+                source,
+                target,
+                skip_cold_load,
+                blocklist_read_policy,
+                target_warmth_policy,
+            ) else {
                 return;
             };
             Some(is_target_cold)
@@ -112,11 +174,42 @@ pub(crate) fn arc_selfdestruct<DB: Database>(
 fn is_blocklisted<DB: Database>(
     context: &mut InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
     address: Address,
-) -> bool {
-    context
-        .host
-        .sload(NATIVE_COIN_CONTROL_ADDRESS, blocklist_storage_slot(address))
-        .is_some_and(|value| is_blocklisted_status(value.data))
+    policy: BlocklistReadPolicy,
+) -> Result<bool, LoadError> {
+    let slot = blocklist_storage_slot(address);
+    match policy {
+        BlocklistReadPolicy::FailOpen => Ok(context
+            .host
+            .sload(NATIVE_COIN_CONTROL_ADDRESS, slot)
+            .is_some_and(|value| is_blocklisted_status(value.data))),
+        BlocklistReadPolicy::FailClosed => {
+            let value =
+                match context
+                    .host
+                    .sload_skip_cold_load(NATIVE_COIN_CONTROL_ADDRESS, slot, false)
+                {
+                    Ok(value) => value,
+                    Err(LoadError::ColdLoadSkipped) => {
+                        let ncc_is_cold = context
+                            .host
+                            .load_account_info_skip_cold_load(
+                                NATIVE_COIN_CONTROL_ADDRESS,
+                                false,
+                                false,
+                            )?
+                            .is_cold;
+                        debug_assert!(!ncc_is_cold, "NativeCoinControl must be preloaded");
+                        context.host.sload_skip_cold_load(
+                            NATIVE_COIN_CONTROL_ADDRESS,
+                            slot,
+                            false,
+                        )?
+                    }
+                    Err(LoadError::DBError) => return Err(LoadError::DBError),
+                };
+            Ok(is_blocklisted_status(value.data))
+        }
+    }
 }
 
 fn check_accounts<DB: Database>(
@@ -124,36 +217,82 @@ fn check_accounts<DB: Database>(
     source: Address,
     target: Address,
     skip_cold_load: bool,
+    blocklist_read_policy: BlocklistReadPolicy,
+    target_warmth_policy: TargetWarmthPolicy,
 ) -> Result<bool, ()> {
     if source == target {
         context.interpreter.halt(InstructionResult::Revert);
         return Err(());
     }
-    if is_blocklisted(context, target) {
+    let target_blocklisted = match is_blocklisted(context, target, blocklist_read_policy) {
+        Ok(is_blocklisted) => is_blocklisted,
+        Err(_) => {
+            context.interpreter.halt_fatal();
+            return Err(());
+        }
+    };
+    if target_blocklisted {
         revert(context, ERR_BLOCKED_ADDRESS);
         return Err(());
     }
-    if is_blocklisted(context, source) {
+    let source_blocklisted = match is_blocklisted(context, source, blocklist_read_policy) {
+        Ok(is_blocklisted) => is_blocklisted,
+        Err(_) => {
+            context.interpreter.halt_fatal();
+            return Err(());
+        }
+    };
+    if source_blocklisted {
         revert(context, ERR_BLOCKED_ADDRESS);
         return Err(());
     }
 
-    if context
-        .host
-        .journal_mut()
-        .warm_addresses
-        .check_is_cold::<DB::Error>(&target, skip_cold_load)
-        .is_err()
-    {
-        context.interpreter.halt_oog();
-        return Err(());
-    }
+    let is_cold = match target_warmth_policy {
+        TargetWarmthPolicy::AccessListOnly => {
+            if context
+                .host
+                .journal_mut()
+                .warm_addresses
+                .check_is_cold::<DB::Error>(&target, skip_cold_load)
+                .is_err()
+            {
+                context.interpreter.halt_oog();
+                return Err(());
+            }
+            match context.host.journal_mut().load_account(target) {
+                Ok(account) => account.is_cold,
+                Err(_) => {
+                    context.interpreter.halt_fatal();
+                    return Err(());
+                }
+            }
+        }
+        TargetWarmthPolicy::Transaction => {
+            // revm 36's mutable helper cannot return ColdLoadSkipped without panicking. Load
+            // through Host first, then use the now-warm journal account for the status check.
+            match context
+                .host
+                .load_account_info_skip_cold_load(target, false, skip_cold_load)
+            {
+                Ok(account) => account.is_cold,
+                Err(LoadError::ColdLoadSkipped) => {
+                    context.interpreter.halt_oog();
+                    return Err(());
+                }
+                Err(LoadError::DBError) => {
+                    context.interpreter.halt_fatal();
+                    return Err(());
+                }
+            }
+        }
+    };
+
     match context.host.journal_mut().load_account(target) {
         Ok(account) if account.is_selfdestructed() => {
             revert(context, ERR_SELFDESTRUCTED_BALANCE_INCREASED);
             Err(())
         }
-        Ok(account) => Ok(account.is_cold),
+        Ok(_) => Ok(is_cold),
         Err(_) => {
             context.interpreter.halt_fatal();
             Err(())
@@ -179,7 +318,8 @@ fn revert<DB: Database>(
 mod tests {
     use super::*;
     use crate::arc::{
-        handler::ArcHandler, ArcChainConfig, ArcEvm, ArcEvmFactory, ARC_MAINNET_CHAIN_ID,
+        handler::ArcHandler, ArcChainConfig, ArcEvm, ArcEvmFactory, ArcForkActivation,
+        ArcHardforkSchedule, ARC_MAINNET_CHAIN_ID,
     };
     use alloy::primitives::{address, B256, U256};
     use alloy_evm::EvmEnv;
@@ -255,6 +395,39 @@ mod tests {
             gas_limit: u64,
             preload_ncc: bool,
         ) -> InterpreterResult {
+            self.simulate_instruction(
+                source,
+                target,
+                gas_limit,
+                preload_ncc,
+                Instruction::new(arc_selfdestruct::<DB>, STATIC_GAS_COST),
+            )
+        }
+
+        fn simulate_with_flags(
+            &mut self,
+            source: Address,
+            target: Address,
+            gas_limit: u64,
+            hardfork_flags: ArcHardforkFlags,
+        ) -> InterpreterResult {
+            self.simulate_instruction(
+                source,
+                target,
+                gas_limit,
+                true,
+                arc_selfdestruct_instruction::<DB>(hardfork_flags),
+            )
+        }
+
+        fn simulate_instruction(
+            &mut self,
+            source: Address,
+            target: Address,
+            gas_limit: u64,
+            preload_ncc: bool,
+            instruction: Instruction<EthInterpreter, ArcContext<DB>>,
+        ) -> InterpreterResult {
             if preload_ncc {
                 self.host
                     .journal_mut()
@@ -280,7 +453,7 @@ mod tests {
                 .push(U256::from_be_slice(target.into_word().as_ref())));
             assert!(interpreter.gas.record_cost(STATIC_GAS_COST));
 
-            arc_selfdestruct(InstructionContext {
+            instruction.execute(InstructionContext {
                 interpreter: &mut interpreter,
                 host: &mut self.host,
             });
@@ -310,6 +483,25 @@ mod tests {
             U256::ONE,
         )
         .unwrap();
+    }
+
+    fn hardfork_flags(zero7: bool, zero8: bool) -> ArcHardforkFlags {
+        let activation = |active| {
+            if active {
+                ArcForkActivation::Block(0)
+            } else {
+                ArcForkActivation::Never
+            }
+        };
+        ArcHardforkSchedule::new(
+            ArcForkActivation::Never,
+            ArcForkActivation::Never,
+            ArcForkActivation::Never,
+            ArcForkActivation::Never,
+            activation(zero7),
+            activation(zero8),
+        )
+        .flags_at(0, 0)
     }
 
     fn evm_env() -> EvmEnv<MainnetSpecId> {
@@ -396,6 +588,49 @@ mod tests {
         assert_eq!(result.gas.spent(), initial_gas);
         assert_eq!(env.balance(SOURCE), U256::ONE);
         assert!(env.host.journal_mut().take_logs().is_empty());
+    }
+
+    #[test]
+    fn zero8_uses_transaction_warmth_for_selfdestruct_target() {
+        let initial_gas = STATIC_GAS_COST + 100;
+
+        for flags in [hardfork_flags(false, false), hardfork_flags(true, false)] {
+            let mut env = HostTestEnv::new(db_with_source_balance(U256::ONE));
+            env.set_balance(TARGET, U256::ONE);
+
+            let result = env.simulate_with_flags(SOURCE, TARGET, initial_gas, flags);
+
+            assert_eq!(result.result, InstructionResult::OutOfGas);
+            assert_eq!(env.balance(SOURCE), U256::ONE);
+            assert_eq!(env.balance(TARGET), U256::ONE);
+        }
+
+        for flags in [hardfork_flags(false, true), hardfork_flags(true, true)] {
+            let mut env = HostTestEnv::new(db_with_source_balance(U256::ONE));
+            env.set_balance(TARGET, U256::ONE);
+
+            let result = env.simulate_with_flags(SOURCE, TARGET, initial_gas, flags);
+
+            assert_eq!(result.result, InstructionResult::SelfDestruct);
+            assert_eq!(result.gas.spent(), STATIC_GAS_COST);
+            assert_eq!(env.balance(SOURCE), U256::ZERO);
+            assert_eq!(env.balance(TARGET), U256::from(2));
+        }
+    }
+
+    #[test]
+    fn zero8_does_not_carry_target_warmth_across_transactions() {
+        let initial_gas = STATIC_GAS_COST + 100;
+        let mut env = HostTestEnv::new(db_with_source_balance(U256::ONE));
+        env.set_balance(TARGET, U256::ONE);
+        env.host.journal_mut().commit_tx();
+
+        let result =
+            env.simulate_with_flags(SOURCE, TARGET, initial_gas, hardfork_flags(false, true));
+
+        assert_eq!(result.result, InstructionResult::OutOfGas);
+        assert_eq!(env.balance(SOURCE), U256::ONE);
+        assert_eq!(env.balance(TARGET), U256::ONE);
     }
 
     #[test]
@@ -676,6 +911,27 @@ mod tests {
                 blocklist_storage_slot(SOURCE),
             ]
         );
+    }
+
+    #[test]
+    fn zero7_and_zero8_fail_closed_on_selfdestruct_blocklist_db_error() {
+        for flags in [hardfork_flags(true, false), hardfork_flags(false, true)] {
+            let amount = U256::from(42);
+            let db = SelectiveFailingStorageDb::new(db_with_source_balance(amount));
+            let mut env = HostTestEnv::new(db);
+
+            let result = env.simulate_with_flags(SOURCE, TARGET, u64::MAX, flags);
+
+            assert_eq!(result.result, InstructionResult::FatalExternalError);
+            assert_eq!(env.balance(SOURCE), amount);
+            assert_eq!(env.balance(TARGET), U256::ZERO);
+            assert!(env.host.journaled_state.logs.is_empty());
+            assert!(env.host.error.is_err());
+            assert_eq!(
+                env.host.journaled_state.db().ncc_reads,
+                [blocklist_storage_slot(TARGET)]
+            );
+        }
     }
 
     #[test]

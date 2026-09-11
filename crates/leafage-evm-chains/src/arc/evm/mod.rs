@@ -1,19 +1,21 @@
 use super::{
     frame_result::revert_frame,
     native::{
-        blocklist_storage_slot, eip7708_transfer_log, is_blocklisted_status, ERR_BLOCKED_ADDRESS,
-        ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS, NATIVE_COIN_CONTROL_ADDRESS,
+        blocklist_storage_slot, eip7708_transfer_log, is_blocklisted_status, revert_message,
+        ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
+        NATIVE_COIN_CONTROL_ADDRESS,
     },
-    opcode::arc_selfdestruct,
-    precompile::extend_arc_precompiles,
+    opcode::arc_selfdestruct_instruction,
+    precompile::{extend_arc_precompiles, subcall::SubcallPrecompile},
     ArcChainConfig, ArcExecutionSpec, ArcHardfork,
 };
-use alloy::primitives::{Address, Log};
+use alloy::primitives::{Address, Bytes, Log};
 use alloy_evm::{precompiles::PrecompilesMap, Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId, U256};
 use revm::{
-    bytecode::opcode::SELFDESTRUCT,
+    bytecode::{opcode::SELFDESTRUCT, Bytecode},
     context::{ContextTr, Evm as RevmEvm, FrameStack, JournalTr, Transaction, TxEnv},
+    context_interface::journaled_state::{JournalCheckpoint, JournalLoadError},
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
@@ -26,18 +28,27 @@ use revm::{
     interpreter::{
         interpreter::EthInterpreter,
         interpreter_action::{FrameInit, FrameInput},
-        CallOutcome, CallScheme, CreateScheme, Instruction,
+        CallInputs, CallOutcome, CallScheme, CreateScheme, Gas, InstructionResult,
+        InterpreterResult,
     },
     precompile::{PrecompileSpecId, Precompiles},
+    state::AccountInfo,
     Context, Inspector, Journal,
 };
 use std::{
+    collections::HashMap,
     error::Error,
     fmt,
     ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 mod exec;
+mod subcall;
+
+use subcall::{SubcallContinuation, SubcallRegistry};
+
+const SUBCALL_DISPATCH_COST: u64 = 100;
 
 /// REVM context used by Arc query execution.
 pub type ArcContext<DB> = Context<BlockEnv, TxEnv, CfgEnv<MainnetSpecId>, DB>;
@@ -141,8 +152,8 @@ impl ArcEvmFactory {
 /// Arc query EVM wrapper.
 ///
 /// Its separate type prevents Arc RPCs from being implemented by the generic
-/// mainnet executor. A4 and A5 extend this wrapper with Arc handler, frame,
-/// instruction, and precompile behavior.
+/// mainnet executor and keeps Arc handler, frame, instruction, and precompile
+/// behavior in one execution path.
 #[allow(missing_debug_implementations)]
 pub struct ArcEvm<DB: revm::Database, I> {
     pub(crate) inner: RevmEvm<
@@ -153,6 +164,27 @@ pub struct ArcEvm<DB: revm::Database, I> {
         EthFrame,
     >,
     execution_spec: ArcExecutionSpec,
+    subcall_registry: SubcallRegistry,
+    subcall_continuations: HashMap<usize, SubcallContinuation>,
+    subcall_trace_completion_hook: Option<fn(&mut I, ArcSubcallTraceCompletion)>,
+}
+
+/// Raw child and final completion results for one transparent Arc subcall trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcSubcallTraceCompletion {
+    pub child_status: InstructionResult,
+    pub child_output: Bytes,
+    pub child_gas_used: u64,
+    pub child_gas_limit: u64,
+    pub final_status: InstructionResult,
+    pub phase: ArcSubcallTraceCompletionPhase,
+}
+
+/// Position of subcall completion relative to the inspector's frame lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcSubcallTraceCompletionPhase {
+    BeforeFrameEnd,
+    AfterFrameEnd,
 }
 
 enum BeforeFrameInit {
@@ -170,6 +202,75 @@ struct NativeTransfer {
     from: Address,
     to: Address,
     amount: U256,
+}
+
+fn init_subcall_revert(message: &str, call_inputs: &CallInputs) -> FrameResult {
+    let mut gas = Gas::new(call_inputs.gas_limit);
+    if !gas.record_cost(SUBCALL_DISPATCH_COST) {
+        gas.spend_all();
+    }
+    FrameResult::Call(CallOutcome {
+        result: InterpreterResult::new(InstructionResult::Revert, revert_message(message), gas),
+        memory_offset: call_inputs.return_memory_offset.clone(),
+        was_precompile_called: true,
+        precompile_call_logs: Default::default(),
+    })
+}
+
+fn init_subcall_static_revert(call_inputs: &CallInputs) -> FrameResult {
+    let mut gas = Gas::new(call_inputs.gas_limit);
+    gas.spend_all();
+    FrameResult::Call(CallOutcome {
+        result: InterpreterResult::new(
+            InstructionResult::Revert,
+            revert_message("subcall precompiles cannot be invoked in static context"),
+            gas,
+        ),
+        memory_offset: call_inputs.return_memory_offset.clone(),
+        was_precompile_called: true,
+        precompile_call_logs: Default::default(),
+    })
+}
+
+fn subcall_oog(gas: Gas, return_memory_offset: std::ops::Range<usize>) -> FrameResult {
+    FrameResult::Call(CallOutcome {
+        result: InterpreterResult::new(InstructionResult::OutOfGas, Default::default(), gas),
+        memory_offset: return_memory_offset,
+        was_precompile_called: true,
+        precompile_call_logs: Default::default(),
+    })
+}
+
+fn resolve_shared_buffer<DB: Database>(ctx: &ArcContext<DB>, frame_input: &mut FrameInit) {
+    if let FrameInput::Call(inputs) = &mut frame_input.frame_input {
+        if matches!(inputs.input, revm::interpreter::CallInput::SharedBuffer(_)) {
+            let input = inputs.input.bytes(ctx);
+            inputs.input = revm::interpreter::CallInput::Bytes(input);
+        }
+    }
+}
+
+fn load_account_with_code_metered<J: JournalTr>(
+    journal: &mut J,
+    address: Address,
+    gas: &mut Gas,
+) -> Result<Option<AccountInfo>, <J::Database as revm::Database>::Error> {
+    let skip_cold_load = gas.remaining() < revm::interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+    match journal.load_account_info_skip_cold_load(address, true, skip_cold_load) {
+        Ok(info) => {
+            let cost = if info.is_cold {
+                revm::interpreter::gas::COLD_ACCOUNT_ACCESS_COST
+            } else {
+                revm::interpreter::gas::WARM_STORAGE_READ_COST
+            };
+            if !gas.record_cost(cost) {
+                return Ok(None);
+            }
+            Ok(Some(info.account.into_owned()))
+        }
+        Err(JournalLoadError::ColdLoadSkipped) => Ok(None),
+        Err(JournalLoadError::DBError(error)) => Err(error),
+    }
 }
 
 fn init_frame<'a, DB: Database>(
@@ -231,7 +332,7 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
         instructions.insert_instruction(
             SELFDESTRUCT,
-            Instruction::new(arc_selfdestruct::<DB>, 5_000),
+            arc_selfdestruct_instruction::<DB>(execution_spec.arc_flags),
         );
         let mut journaled_state = Journal::new(db);
         // Arc implements Zero5 transfer logs itself while its Ethereum base spec remains Osaka.
@@ -254,6 +355,23 @@ impl<DB: Database, I> ArcEvm<DB, I> {
                 frame_stack: Default::default(),
             },
             execution_spec,
+            subcall_registry: SubcallRegistry::for_hardforks(execution_spec.arc_flags),
+            subcall_continuations: HashMap::new(),
+            subcall_trace_completion_hook: None,
+        }
+    }
+
+    /// Installs an observer for transparent subcall completion metadata.
+    pub fn set_subcall_trace_completion_hook(
+        &mut self,
+        hook: fn(&mut I, ArcSubcallTraceCompletion),
+    ) {
+        self.subcall_trace_completion_hook = Some(hook);
+    }
+
+    fn notify_subcall_trace_completion(&mut self, completion: ArcSubcallTraceCompletion) {
+        if let Some(hook) = self.subcall_trace_completion_hook {
+            hook(&mut self.inner.inspector, completion);
         }
     }
 
@@ -368,14 +486,26 @@ impl<DB: Database, I> ArcEvm<DB, I> {
                 ERR_BLOCKED_ADDRESS,
             )));
         }
-        if flags.is_active(ArcHardfork::Zero5)
-            && self
-                .inner
-                .ctx
-                .journal_mut()
-                .load_account(to)?
-                .is_selfdestructed()
-        {
+        let target_is_selfdestructed = if flags.is_active(ArcHardfork::Zero5) {
+            let journal = self.inner.ctx.journal_mut();
+            if flags.is_active(ArcHardfork::Zero7) {
+                // Zero7 makes this an observation-only probe. The target must not remain
+                // warm merely because Arc checked whether it was already selfdestructed.
+                let checkpoint = journal.checkpoint();
+                let result = journal
+                    .load_account(to)
+                    .map(|account| account.is_selfdestructed());
+                journal.checkpoint_revert(checkpoint);
+                result?
+            } else {
+                journal
+                    .load_account(to)
+                    .map(|account| account.is_selfdestructed())?
+            }
+        } else {
+            false
+        };
+        if target_is_selfdestructed {
             return Ok(BeforeFrameInit::Revert(revert_frame(
                 frame_input,
                 ERR_SELFDESTRUCTED_BALANCE_INCREASED,
@@ -449,6 +579,233 @@ impl<DB: Database, I> ArcEvm<DB, I> {
             ItemOrResult::Result(result) => Ok(FrameInitOutcome::Immediate(result)),
         }
     }
+
+    fn init_subcall(
+        &mut self,
+        mut frame_input: FrameInit,
+        precompile: Arc<dyn SubcallPrecompile>,
+    ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<ArcContext<DB>>> {
+        let FrameInput::Call(inputs) = &frame_input.frame_input else {
+            return Ok(ItemOrResult::Result(revert_frame(
+                &frame_input,
+                "internal error: subcall interception on non-call frame",
+            )));
+        };
+        if inputs.scheme != CallScheme::Call {
+            return Ok(ItemOrResult::Result(init_subcall_revert(
+                "subcall precompiles only support CALL scheme",
+                inputs,
+            )));
+        }
+        if inputs.is_static {
+            return Ok(ItemOrResult::Result(init_subcall_static_revert(inputs)));
+        }
+        if inputs.transfers_value() {
+            return Ok(ItemOrResult::Result(init_subcall_revert(
+                "subcall precompiles do not support value transfers",
+                inputs,
+            )));
+        }
+
+        resolve_shared_buffer(&self.inner.ctx, &mut frame_input);
+        let FrameInput::Call(inputs) = &frame_input.frame_input else {
+            unreachable!("call input was checked before resolving its shared buffer")
+        };
+        let init_result = match precompile.init_subcall(inputs) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(ItemOrResult::Result(init_subcall_revert(
+                    &error.to_string(),
+                    inputs,
+                )));
+            }
+        };
+
+        if init_result.child_inputs.caller != inputs.caller
+            && init_result.child_inputs.caller != self.inner.ctx.tx().caller()
+        {
+            return Ok(ItemOrResult::Result(init_subcall_revert(
+                "sender spoofing requires tx.origin as sender",
+                inputs,
+            )));
+        }
+
+        let return_memory_offset = inputs.return_memory_offset.clone();
+        let parent_gas_limit = inputs.gas_limit;
+        let depth = frame_input.depth;
+        let mut child_inputs = init_result.child_inputs;
+
+        // These loads intentionally happen before the checkpoint. Like a normal CALL opcode,
+        // account warming survives child failure and CallFrom completion failure.
+        self.inner
+            .ctx
+            .journal_mut()
+            .load_account(child_inputs.caller)?;
+        let mut gas = Gas::new(parent_gas_limit);
+        if !gas.record_cost(init_result.gas_overhead) {
+            gas.spend_all();
+            return Ok(ItemOrResult::Result(subcall_oog(gas, return_memory_offset)));
+        }
+
+        let Some(target) = load_account_with_code_metered(
+            self.inner.ctx.journal_mut(),
+            child_inputs.target_address,
+            &mut gas,
+        )?
+        else {
+            gas.spend_all();
+            return Ok(ItemOrResult::Result(subcall_oog(gas, return_memory_offset)));
+        };
+
+        if let Some(delegate_address) = target.code.as_ref().and_then(Bytecode::eip7702_address) {
+            let Some(delegate) = load_account_with_code_metered(
+                self.inner.ctx.journal_mut(),
+                delegate_address,
+                &mut gas,
+            )?
+            else {
+                gas.spend_all();
+                return Ok(ItemOrResult::Result(subcall_oog(gas, return_memory_offset)));
+            };
+            if let Some(code) = delegate.code {
+                child_inputs.known_bytecode = Some((delegate.code_hash, code));
+            }
+        }
+
+        // Neutralize checkpoint depth so the synthetic child remains adjacent to the visible
+        // parent in tracing, while retaining a checkpoint that can undo a successful child if
+        // CallFrom completion later fails.
+        let checkpoint = self.inner.ctx.journal_mut().checkpoint();
+        self.inner.ctx.journal_mut().checkpoint_commit();
+
+        let remaining = gas.remaining();
+        #[allow(clippy::arithmetic_side_effects)]
+        let child_gas_limit = remaining - remaining / 64;
+        child_inputs.gas_limit = child_gas_limit;
+        #[allow(clippy::arithmetic_side_effects)]
+        let child_depth = depth + 1;
+        let child_frame_input = FrameInit {
+            depth: child_depth,
+            memory: frame_input.memory,
+            frame_input: FrameInput::Call(child_inputs),
+        };
+
+        let continuation = SubcallContinuation {
+            precompile,
+            gas_limit: parent_gas_limit,
+            init_subcall_gas_overhead: gas.spent(),
+            return_memory_offset,
+            continuation_data: init_result.continuation_data,
+            checkpoint,
+        };
+        match self.checked_frame_init(child_frame_input)? {
+            FrameInitOutcome::Pushed => {
+                self.subcall_continuations.insert(depth, continuation);
+                Ok(ItemOrResult::Item(self.inner.frame_stack.get()))
+            }
+            FrameInitOutcome::Immediate(child_result) => {
+                let trace_completion = self.subcall_trace_completion_hook.is_some().then(|| {
+                    (
+                        child_result.instruction_result(),
+                        child_result.interpreter_result().output.clone(),
+                        child_result.gas().spent(),
+                        child_result.gas().limit(),
+                    )
+                });
+                let final_result = self.complete_subcall(child_result, continuation)?;
+                if let Some((child_status, child_output, child_gas_used, child_gas_limit)) =
+                    trace_completion
+                {
+                    self.notify_subcall_trace_completion(ArcSubcallTraceCompletion {
+                        child_status,
+                        child_output,
+                        child_gas_used,
+                        child_gas_limit,
+                        final_status: final_result.instruction_result(),
+                        phase: ArcSubcallTraceCompletionPhase::BeforeFrameEnd,
+                    });
+                }
+                Ok(ItemOrResult::Result(final_result))
+            }
+        }
+    }
+
+    fn complete_subcall(
+        &mut self,
+        child_result: FrameResult,
+        continuation: SubcallContinuation,
+    ) -> Result<FrameResult, ContextDbError<ArcContext<DB>>> {
+        let child_gas = child_result.gas();
+        let (child_succeeded, child_halted) = match &child_result {
+            FrameResult::Call(outcome) => {
+                let result = outcome.result.result;
+                (result.is_ok(), !result.is_ok_or_revert())
+            }
+            FrameResult::Create(_) => (false, true),
+        };
+        let completion = continuation
+            .precompile
+            .complete_subcall(continuation.continuation_data, &child_result);
+        let completion_gas = completion.as_ref().map_or(0, |result| result.gas_overhead);
+        let metered_gas_used = continuation
+            .init_subcall_gas_overhead
+            .checked_add(child_gas.spent())
+            .expect("subcall gas overflow after child execution")
+            .checked_add(completion_gas)
+            .expect("subcall gas overflow during completion");
+        let gas_used = if child_halted {
+            continuation.gas_limit.max(metered_gas_used)
+        } else {
+            metered_gas_used
+        };
+        let mut gas = Gas::new(continuation.gas_limit);
+        if !gas.record_cost(gas_used) {
+            gas.spend_all();
+            if child_succeeded {
+                self.revert_subcall_checkpoint(continuation.checkpoint);
+            }
+            return Ok(subcall_oog(gas, continuation.return_memory_offset));
+        }
+
+        match completion {
+            Ok(result) if result.success => {
+                if child_succeeded {
+                    gas.record_refund(child_gas.refunded());
+                }
+                Ok(FrameResult::Call(CallOutcome {
+                    result: InterpreterResult::new(InstructionResult::Return, result.output, gas),
+                    memory_offset: continuation.return_memory_offset,
+                    was_precompile_called: true,
+                    precompile_call_logs: Default::default(),
+                }))
+            }
+            failure => {
+                let output = match failure {
+                    Ok(result) => result.output,
+                    Err(_) => {
+                        gas.spend_all();
+                        Default::default()
+                    }
+                };
+                if child_succeeded {
+                    self.revert_subcall_checkpoint(continuation.checkpoint);
+                }
+                Ok(FrameResult::Call(CallOutcome {
+                    result: InterpreterResult::new(InstructionResult::Revert, output, gas),
+                    memory_offset: continuation.return_memory_offset,
+                    was_precompile_called: true,
+                    precompile_call_logs: Default::default(),
+                }))
+            }
+        }
+    }
+
+    fn revert_subcall_checkpoint(&mut self, checkpoint: JournalCheckpoint) {
+        let depth = self.inner.ctx.journal_mut().depth();
+        let _ = self.inner.ctx.journal_mut().checkpoint();
+        self.inner.ctx.journal_mut().checkpoint_revert(checkpoint);
+        debug_assert_eq!(self.inner.ctx.journal_mut().depth(), depth);
+    }
 }
 
 impl<DB: Database, I> Deref for ArcEvm<DB, I> {
@@ -495,8 +852,33 @@ impl<DB: Database, I> EvmTr for ArcEvm<DB, I> {
 
     fn frame_init(
         &mut self,
-        frame_input: FrameInit,
+        mut frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        if let FrameInput::Call(inputs) = &frame_input.frame_input {
+            if let Some((precompile, allowed_callers)) =
+                self.subcall_registry.get(&inputs.target_address)
+            {
+                if !allowed_callers.is_allowed(&inputs.caller) {
+                    return Ok(ItemOrResult::Result(init_subcall_revert(
+                        "unauthorized caller",
+                        inputs,
+                    )));
+                }
+                let precompile = Arc::clone(precompile);
+
+                // CallFrom currently requires zero value, so this is normally a no-op. Keep the
+                // Arc transfer checks in front of the interception so future subcall precompiles
+                // cannot bypass blocklist or EIP-7708 behavior by allowing value.
+                match self.before_frame_init(&mut frame_input)? {
+                    BeforeFrameInit::Revert(result) => {
+                        return Ok(ItemOrResult::Result(result));
+                    }
+                    BeforeFrameInit::Log(_) | BeforeFrameInit::None => {}
+                }
+                return self.init_subcall(frame_input, precompile);
+            }
+        }
+
         match self.checked_frame_init(frame_input)? {
             FrameInitOutcome::Pushed => Ok(ItemOrResult::Item(self.inner.frame_stack.get())),
             FrameInitOutcome::Immediate(result) => Ok(ItemOrResult::Result(result)),
@@ -513,7 +895,62 @@ impl<DB: Database, I> EvmTr for ArcEvm<DB, I> {
         &mut self,
         result: FrameResult,
     ) -> Result<Option<FrameResult>, ContextDbError<Self::Context>> {
-        self.inner.frame_return_result(result)
+        let frame_was_finished = self.inner.frame_stack.get().is_finished();
+        let finished_depth = self.inner.frame_stack.get().depth;
+
+        if frame_was_finished {
+            self.inner.frame_stack.pop();
+        }
+        let stack_empty = self.inner.frame_stack.index().is_none();
+
+        if frame_was_finished {
+            if let Some(key) = finished_depth.checked_sub(1) {
+                if let Some(continuation) = self.subcall_continuations.remove(&key) {
+                    let trace_completion =
+                        self.subcall_trace_completion_hook.is_some().then(|| {
+                            (
+                                result.instruction_result(),
+                                result.interpreter_result().output.clone(),
+                                result.gas().spent(),
+                                result.gas().limit(),
+                            )
+                        });
+                    let final_result = self.complete_subcall(result, continuation)?;
+                    if let Some((child_status, child_output, child_gas_used, child_gas_limit)) =
+                        trace_completion
+                    {
+                        self.notify_subcall_trace_completion(ArcSubcallTraceCompletion {
+                            child_status,
+                            child_output,
+                            child_gas_used,
+                            child_gas_limit,
+                            final_status: final_result.instruction_result(),
+                            phase: ArcSubcallTraceCompletionPhase::AfterFrameEnd,
+                        });
+                    }
+                    if stack_empty {
+                        return Ok(Some(final_result));
+                    }
+                    self.inner
+                        .frame_stack
+                        .get()
+                        .return_result::<_, ContextDbError<Self::Context>>(
+                            &mut self.inner.ctx,
+                            final_result,
+                        )?;
+                    return Ok(None);
+                }
+            }
+        }
+
+        if stack_empty {
+            return Ok(Some(result));
+        }
+        self.inner
+            .frame_stack
+            .get()
+            .return_result::<_, ContextDbError<Self::Context>>(&mut self.inner.ctx, result)?;
+        Ok(None)
     }
 }
 
@@ -552,20 +989,72 @@ where
         &mut self,
         mut frame_init: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
-        let (ctx, inspector) = self.ctx_inspector();
-        if let Some(mut output) = frame_start(ctx, inspector, &mut frame_init.frame_input) {
-            frame_end(ctx, inspector, &frame_init.frame_input, &mut output);
-            return Ok(ItemOrResult::Result(output));
+        let is_subcall = matches!(
+            &frame_init.frame_input,
+            FrameInput::Call(inputs)
+                if self.subcall_registry.get(&inputs.target_address).is_some()
+        );
+        if !is_subcall {
+            return self.inspect_frame_init_impl(frame_init, None);
         }
 
-        let frame_input = frame_init.frame_input.clone();
-        let logs_i = ctx.journal().logs().len();
+        resolve_shared_buffer(&self.inner.ctx, &mut frame_init);
+        let FrameInput::Call(inputs) = &frame_init.frame_input else {
+            unreachable!("subcall registry only matches call frames")
+        };
+        let trace_input = self
+            .subcall_registry
+            .get(&inputs.target_address)
+            .and_then(|(precompile, _)| precompile.trace_child_call(inputs))
+            .map(|inputs| FrameInput::Call(Box::new(inputs)))
+            .unwrap_or_else(|| frame_init.frame_input.clone());
+
+        self.inspect_frame_init_impl(frame_init, Some(trace_input))
+    }
+}
+
+impl<DB, I> ArcEvm<DB, I>
+where
+    DB: Database,
+    I: Inspector<ArcContext<DB>, EthInterpreter>,
+{
+    fn frame_start_with_trace(
+        &mut self,
+        frame_init: &mut FrameInit,
+        trace_override: Option<FrameInput>,
+    ) -> Result<FrameInput, Box<FrameResult>> {
+        let (ctx, inspector) = self.ctx_inspector();
+        match trace_override {
+            Some(mut trace_input) => {
+                if let Some(mut output) = frame_start(ctx, inspector, &mut trace_input) {
+                    frame_end(ctx, inspector, &trace_input, &mut output);
+                    return Err(Box::new(output));
+                }
+                Ok(trace_input)
+            }
+            None => {
+                if let Some(mut output) = frame_start(ctx, inspector, &mut frame_init.frame_input) {
+                    frame_end(ctx, inspector, &frame_init.frame_input, &mut output);
+                    return Err(Box::new(output));
+                }
+                Ok(frame_init.frame_input.clone())
+            }
+        }
+    }
+
+    fn inspect_frame_init_impl(
+        &mut self,
+        mut frame_init: FrameInit,
+        trace_override: Option<FrameInput>,
+    ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<ArcContext<DB>>> {
+        let trace_input = match self.frame_start_with_trace(&mut frame_init, trace_override) {
+            Ok(input) => input,
+            Err(output) => return Ok(ItemOrResult::Result(*output)),
+        };
+
+        let logs_i = self.inner.ctx.journal().logs().len();
         if let ItemOrResult::Result(mut output) = self.frame_init(frame_init)? {
             let (ctx, inspector) = self.ctx_inspector();
-            // Arc can emit EIP-7708 while initializing any successful value
-            // frame. REVM's default inspector only forwards journal logs for
-            // immediate precompile frames, so forward every log added during
-            // Arc frame init before preserving its precompile-only log list.
             let logs_len = ctx.journal().logs().len();
             for log_index in logs_i..logs_len {
                 let log = ctx.journal().logs()[log_index].clone();
@@ -583,7 +1072,7 @@ where
                     }
                 }
             }
-            frame_end(ctx, inspector, &frame_input, &mut output);
+            frame_end(ctx, inspector, &trace_input, &mut output);
             return Ok(ItemOrResult::Result(output));
         }
 
@@ -603,8 +1092,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arc::{native::revert_message, ArcHardfork, ArcHardforkFlags, ARC_MAINNET_CHAIN_ID};
+    use crate::arc::{
+        native::revert_message,
+        precompile::{
+            call_from::{abi_decode_gas, CallFromPrecompile, CALL_FROM_ADDRESS, MEMO_ADDRESS},
+            subcall::{
+                SubcallCompletionResult, SubcallContinuationData, SubcallError, SubcallInitResult,
+            },
+        },
+        ArcHardfork, ArcHardforkFlags, ARC_MAINNET_CHAIN_ID,
+        ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+    };
     use alloy::primitives::{address, keccak256, Address, Bytes, LogData, B256};
+    use alloy::sol_types::{sol, SolCall};
     use alloy_evm::precompiles::DynPrecompile;
     use revm::interpreter::{CallInput, CallInputs, CallValue, CreateInputs, SharedMemory};
     use revm::{
@@ -624,12 +1124,19 @@ mod tests {
     const MOCK_PRECOMPILE: Address = address!("ff00000000000000000000000000000000000099");
     const MOCK_LOG_ADDRESS: Address = address!("aa00000000000000000000000000000000000001");
 
-    fn evm_env() -> EvmEnv<MainnetSpecId> {
+    sol! {
+        interface ITestCallFrom {
+            function callFrom(address sender, address target, bytes calldata data)
+                external returns (bool success, bytes memory returnData);
+        }
+    }
+
+    fn evm_env_at(timestamp: u64) -> EvmEnv<MainnetSpecId> {
         let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
         cfg.chain_id = ARC_MAINNET_CHAIN_ID;
         let block = BlockEnv {
             number: U256::from(1),
-            timestamp: U256::from(1),
+            timestamp: U256::from(timestamp),
             gas_limit: 30_000_000,
             prevrandao: Some(B256::ZERO),
             blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
@@ -641,9 +1148,23 @@ mod tests {
         EvmEnv::new(cfg, block)
     }
 
+    fn evm_env() -> EvmEnv<MainnetSpecId> {
+        evm_env_at(1)
+    }
+
     fn arc_evm(db: InMemoryDB) -> ArcEvm<InMemoryDB, NoOpInspector> {
         ArcEvmFactory::new(ArcChainConfig::mainnet())
             .create(evm_env(), db, NoOpInspector {})
+            .unwrap()
+    }
+
+    fn post_zero7_evm<I>(db: InMemoryDB, inspector: I) -> ArcEvm<InMemoryDB, I> {
+        ArcEvmFactory::new(ArcChainConfig::mainnet())
+            .create(
+                evm_env_at(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+                db,
+                inspector,
+            )
             .unwrap()
     }
 
@@ -771,6 +1292,173 @@ mod tests {
             gas_limit,
             chain_id: Some(ARC_MAINNET_CHAIN_ID),
             ..Default::default()
+        }
+    }
+
+    fn call_from_input(sender: Address, target: Address, data: Bytes) -> Bytes {
+        ITestCallFrom::callFromCall {
+            sender,
+            target,
+            data,
+        }
+        .abi_encode()
+        .into()
+    }
+
+    fn call_from_frame(
+        caller: Address,
+        sender: Address,
+        target: Address,
+        data: Bytes,
+        gas_limit: u64,
+    ) -> FrameInit {
+        FrameInit {
+            frame_input: FrameInput::Call(Box::new(CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(call_from_input(sender, target, data)),
+                gas_limit,
+                is_static: false,
+                caller,
+                return_memory_offset: 0..0,
+            })),
+            memory: SharedMemory::default(),
+            depth: 1,
+        }
+    }
+
+    fn run_call_from_frame(frame: FrameInit, tx_origin: Address) -> CallOutcome {
+        let mut evm = post_zero7_evm(InMemoryDB::default(), NoOpInspector {});
+        evm.inner.ctx.tx = call_tx(tx_origin, TARGET, 1_000_000);
+        load_native_coin_control(&mut evm);
+        match evm.frame_init(frame).expect("CallFrom frame executes") {
+            ItemOrResult::Result(FrameResult::Call(outcome)) => outcome,
+            ItemOrResult::Result(FrameResult::Create(_)) => {
+                panic!("CallFrom must return a CALL outcome")
+            }
+            ItemOrResult::Item(_) => panic!("empty target must complete immediately"),
+        }
+    }
+
+    fn forwarding_call_code(target: Address) -> Bytes {
+        let mut code = vec![
+            opcode::CALLDATASIZE,
+            opcode::PUSH1,
+            0,
+            opcode::PUSH1,
+            0,
+            opcode::CALLDATACOPY,
+            opcode::PUSH1,
+            0,
+            opcode::PUSH1,
+            0,
+            opcode::CALLDATASIZE,
+            opcode::PUSH1,
+            0,
+            opcode::PUSH1,
+            0,
+            opcode::PUSH20,
+        ];
+        code.extend_from_slice(target.as_slice());
+        code.extend_from_slice(&[
+            opcode::GAS,
+            opcode::CALL,
+            opcode::POP,
+            opcode::RETURNDATASIZE,
+            opcode::PUSH1,
+            0,
+            opcode::PUSH1,
+            0,
+            opcode::RETURNDATACOPY,
+            opcode::RETURNDATASIZE,
+            opcode::PUSH1,
+            0,
+            opcode::RETURN,
+        ]);
+        code.into()
+    }
+
+    fn return_caller_code() -> Bytes {
+        Bytes::from_static(&[
+            opcode::CALLER,
+            opcode::PUSH1,
+            0,
+            opcode::MSTORE,
+            opcode::PUSH1,
+            32,
+            opcode::PUSH1,
+            0,
+            opcode::RETURN,
+        ])
+    }
+
+    fn counter_code() -> Bytes {
+        Bytes::from_static(&[
+            opcode::PUSH0,
+            opcode::SLOAD,
+            opcode::PUSH1,
+            1,
+            opcode::ADD,
+            opcode::DUP1,
+            opcode::PUSH0,
+            opcode::SSTORE,
+            opcode::PUSH0,
+            opcode::MSTORE,
+            opcode::PUSH1,
+            32,
+            opcode::PUSH0,
+            opcode::RETURN,
+        ])
+    }
+
+    #[derive(Default)]
+    struct CallRecorder {
+        calls: Vec<CallInputs>,
+        subcall_completions: Vec<ArcSubcallTraceCompletion>,
+    }
+
+    fn record_subcall_completion(
+        inspector: &mut CallRecorder,
+        completion: ArcSubcallTraceCompletion,
+    ) {
+        inspector.subcall_completions.push(completion);
+    }
+
+    struct RejectingCompletionPrecompile;
+
+    impl SubcallPrecompile for RejectingCompletionPrecompile {
+        fn init_subcall(&self, inputs: &CallInputs) -> Result<SubcallInitResult, SubcallError> {
+            CallFromPrecompile.init_subcall(inputs)
+        }
+
+        fn complete_subcall(
+            &self,
+            _continuation_data: SubcallContinuationData,
+            _child_result: &FrameResult,
+        ) -> Result<SubcallCompletionResult, SubcallError> {
+            Ok(SubcallCompletionResult {
+                output: Bytes::from_static(b"completion rejected"),
+                success: false,
+                gas_overhead: 0,
+            })
+        }
+
+        fn trace_child_call(&self, inputs: &CallInputs) -> Option<CallInputs> {
+            CallFromPrecompile.trace_child_call(inputs)
+        }
+    }
+
+    impl Inspector<ArcContext<InMemoryDB>, EthInterpreter> for CallRecorder {
+        fn call(
+            &mut self,
+            _context: &mut ArcContext<InMemoryDB>,
+            inputs: &mut CallInputs,
+        ) -> Option<CallOutcome> {
+            self.calls.push(inputs.clone());
+            None
         }
     }
 
@@ -1248,6 +1936,350 @@ mod tests {
             .state
             .get(&target)
             .is_some_and(|account| account.is_selfdestructed()));
+    }
+
+    #[test]
+    fn zero7_callfrom_preserves_sender_and_is_transparent_to_inspector() {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            SOURCE,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+        insert_contract(
+            &mut db,
+            MEMO_ADDRESS,
+            U256::ZERO,
+            forwarding_call_code(CALL_FROM_ADDRESS),
+        );
+        insert_contract(&mut db, TARGET, U256::ZERO, return_caller_code());
+
+        let child_data = Bytes::from_static(b"arc-call-from-child");
+        let input = call_from_input(SOURCE, TARGET, child_data.clone());
+        let tx = TxEnv {
+            caller: SOURCE,
+            kind: TxKind::Call(MEMO_ADDRESS),
+            gas_limit: 300_000,
+            data: input.clone(),
+            chain_id: Some(ARC_MAINNET_CHAIN_ID),
+            ..Default::default()
+        };
+        let mut evm = post_zero7_evm(db, CallRecorder::default());
+        evm.set_subcall_trace_completion_hook(record_subcall_completion);
+        let outcome = evm.inspect_tx(tx).expect("CallFrom transaction executes");
+
+        assert!(outcome.result.is_success());
+        let output = outcome.result.output().expect("successful call has output");
+        let decoded = ITestCallFrom::callFromCall::abi_decode_returns(output)
+            .expect("wrapper returns valid CallFrom output");
+        assert!(decoded.success);
+        let mut expected_caller = [0_u8; 32];
+        expected_caller[12..].copy_from_slice(SOURCE.as_slice());
+        assert_eq!(decoded.returnData.as_ref(), expected_caller);
+
+        assert_eq!(evm.inner.inspector.calls.len(), 2);
+        let root = &evm.inner.inspector.calls[0];
+        assert_eq!(root.caller, SOURCE);
+        assert_eq!(root.target_address, MEMO_ADDRESS);
+        assert_eq!(root.input.bytes(&evm.inner.ctx), input);
+
+        let child = &evm.inner.inspector.calls[1];
+        assert_eq!(child.caller, SOURCE);
+        assert_eq!(child.target_address, TARGET);
+        assert_eq!(child.input.bytes(&evm.inner.ctx), child_data);
+        assert!(evm.inner.inspector.calls.iter().all(|call| {
+            call.caller != CALL_FROM_ADDRESS && call.target_address != CALL_FROM_ADDRESS
+        }));
+        assert_eq!(evm.inner.inspector.subcall_completions.len(), 1);
+        let completion = &evm.inner.inspector.subcall_completions[0];
+        assert_eq!(completion.child_status, InstructionResult::Return);
+        assert_eq!(completion.child_output.as_ref(), expected_caller);
+        assert!(completion.child_gas_used > 0);
+        assert!(completion.child_gas_limit > completion.child_gas_used);
+        assert_eq!(completion.final_status, InstructionResult::Return);
+        assert_eq!(
+            completion.phase,
+            ArcSubcallTraceCompletionPhase::AfterFrameEnd
+        );
+        assert!(evm.subcall_continuations.is_empty());
+    }
+
+    #[test]
+    fn zero7_subcall_completion_reports_exact_child_gas_limit() {
+        const PARENT_GAS_LIMIT: u64 = 100_000;
+        let delegate = Address::repeat_byte(0x82);
+        let child_data = Bytes::from_static(b"arc-call-from-child");
+
+        for delegated in [false, true] {
+            let mut db = InMemoryDB::default();
+            if delegated {
+                let delegation = Bytecode::new_eip7702(delegate);
+                db.insert_account_info(
+                    TARGET,
+                    AccountInfo {
+                        nonce: 1,
+                        code_hash: keccak256(delegation.bytes_slice()),
+                        code: Some(delegation),
+                        ..Default::default()
+                    },
+                );
+                insert_contract(&mut db, delegate, U256::ZERO, Bytes::new());
+            } else {
+                db.insert_account_info(TARGET, AccountInfo::default());
+            }
+
+            let mut evm = post_zero7_evm(db, CallRecorder::default());
+            evm.inner.ctx.tx = call_tx(SOURCE, MEMO_ADDRESS, 1_000_000);
+            evm.set_subcall_trace_completion_hook(record_subcall_completion);
+            let frame = call_from_frame(
+                MEMO_ADDRESS,
+                SOURCE,
+                TARGET,
+                child_data.clone(),
+                PARENT_GAS_LIMIT,
+            );
+            let ItemOrResult::Result(FrameResult::Call(_)) = evm
+                .inspect_frame_init(frame)
+                .expect("empty CallFrom child completes immediately")
+            else {
+                panic!("empty CallFrom child must return a CALL outcome")
+            };
+
+            let access_cost =
+                revm::interpreter::gas::COLD_ACCOUNT_ACCESS_COST * if delegated { 2 } else { 1 };
+            let remaining = PARENT_GAS_LIMIT - abi_decode_gas(child_data.len()) - access_cost;
+            let expected_child_gas_limit = remaining - remaining / 64;
+            assert_eq!(evm.inner.inspector.subcall_completions.len(), 1);
+            assert_eq!(
+                evm.inner.inspector.subcall_completions[0].child_gas_limit,
+                expected_child_gas_limit,
+                "target and optional EIP-7702 delegate access must be charged before EIP-150"
+            );
+        }
+    }
+
+    #[test]
+    fn zero7_callfrom_executes_eip7702_delegate_code() {
+        let delegated = Address::repeat_byte(0x81);
+        let delegate = Address::repeat_byte(0x82);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            SOURCE,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+        insert_contract(
+            &mut db,
+            MEMO_ADDRESS,
+            U256::ZERO,
+            forwarding_call_code(CALL_FROM_ADDRESS),
+        );
+        let delegation = Bytecode::new_eip7702(delegate);
+        db.insert_account_info(
+            delegated,
+            AccountInfo {
+                nonce: 1,
+                code_hash: keccak256(delegation.bytes_slice()),
+                code: Some(delegation),
+                ..Default::default()
+            },
+        );
+        insert_contract(&mut db, delegate, U256::ZERO, return_caller_code());
+
+        let input = call_from_input(SOURCE, delegated, Bytes::from_static(b"delegated-call"));
+        let tx = TxEnv {
+            caller: SOURCE,
+            kind: TxKind::Call(MEMO_ADDRESS),
+            gas_limit: 300_000,
+            data: input,
+            chain_id: Some(ARC_MAINNET_CHAIN_ID),
+            ..Default::default()
+        };
+        let mut evm = post_zero7_evm(db, CallRecorder::default());
+        let outcome = evm.inspect_tx(tx).expect("delegated CallFrom executes");
+
+        assert!(outcome.result.is_success());
+        let decoded = ITestCallFrom::callFromCall::abi_decode_returns(
+            outcome.result.output().expect("successful call has output"),
+        )
+        .expect("valid CallFrom output");
+        assert!(decoded.success);
+        let mut expected_caller = [0_u8; 32];
+        expected_caller[12..].copy_from_slice(SOURCE.as_slice());
+        assert_eq!(decoded.returnData.as_ref(), expected_caller);
+        assert_eq!(evm.inner.inspector.calls.len(), 2);
+        assert_eq!(evm.inner.inspector.calls[1].target_address, delegated);
+    }
+
+    #[test]
+    fn zero7_subcall_completion_failure_rolls_back_child_and_reports_folded_status() {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            SOURCE,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+        insert_contract(
+            &mut db,
+            MEMO_ADDRESS,
+            U256::ZERO,
+            forwarding_call_code(CALL_FROM_ADDRESS),
+        );
+        insert_contract(&mut db, TARGET, U256::ZERO, counter_code());
+
+        let tx = TxEnv {
+            caller: SOURCE,
+            kind: TxKind::Call(MEMO_ADDRESS),
+            gas_limit: 300_000,
+            data: call_from_input(SOURCE, TARGET, Bytes::new()),
+            chain_id: Some(ARC_MAINNET_CHAIN_ID),
+            ..Default::default()
+        };
+        let mut evm = post_zero7_evm(db, CallRecorder::default());
+        let mut registry = SubcallRegistry::new();
+        registry.register(
+            CALL_FROM_ADDRESS,
+            Arc::new(RejectingCompletionPrecompile),
+            subcall::AllowedCallers::Only(std::collections::HashSet::from([MEMO_ADDRESS])),
+        );
+        evm.subcall_registry = registry;
+        evm.set_subcall_trace_completion_hook(record_subcall_completion);
+
+        let outcome = evm
+            .inspect_tx(tx)
+            .expect("wrapper catches completion failure");
+        assert!(outcome.result.is_success());
+        let stored = outcome
+            .state
+            .get(&TARGET)
+            .and_then(|account| account.storage.get(&U256::ZERO))
+            .map(|slot| slot.present_value)
+            .unwrap_or_default();
+        assert_eq!(stored, U256::ZERO);
+
+        assert_eq!(evm.inner.inspector.subcall_completions.len(), 1);
+        let completion = &evm.inner.inspector.subcall_completions[0];
+        assert_eq!(completion.child_status, InstructionResult::Return);
+        assert_eq!(completion.final_status, InstructionResult::Revert);
+        assert_eq!(
+            completion.phase,
+            ArcSubcallTraceCompletionPhase::AfterFrameEnd
+        );
+    }
+
+    #[test]
+    fn zero7_callfrom_rejects_unauthorized_caller_with_dispatch_cost() {
+        let mut evm = post_zero7_evm(InMemoryDB::default(), NoOpInspector {});
+        let frame = call_from_frame(SOURCE, SOURCE, TARGET, Bytes::new(), 100_000);
+        let ItemOrResult::Result(FrameResult::Call(outcome)) = evm
+            .frame_init(frame)
+            .expect("unauthorized CallFrom is an EVM revert")
+        else {
+            panic!("unauthorized CallFrom must finish immediately")
+        };
+        assert_eq!(outcome.result.output, revert_message("unauthorized caller"));
+        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+    }
+
+    #[test]
+    fn zero7_callfrom_enforces_dispatch_rules_and_exact_overhead() {
+        let mut wrong_scheme = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
+        let FrameInput::Call(inputs) = &mut wrong_scheme.frame_input else {
+            unreachable!()
+        };
+        inputs.scheme = CallScheme::DelegateCall;
+        let outcome = run_call_from_frame(wrong_scheme, SOURCE);
+        assert_eq!(
+            outcome.result.output,
+            revert_message("subcall precompiles only support CALL scheme")
+        );
+        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+
+        let mut static_call = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
+        let FrameInput::Call(inputs) = &mut static_call.frame_input else {
+            unreachable!()
+        };
+        inputs.is_static = true;
+        let outcome = run_call_from_frame(static_call, SOURCE);
+        assert_eq!(
+            outcome.result.output,
+            revert_message("subcall precompiles cannot be invoked in static context")
+        );
+        assert_eq!(outcome.result.gas.spent(), 100_000);
+
+        let mut with_value = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
+        let FrameInput::Call(inputs) = &mut with_value.frame_input else {
+            unreachable!()
+        };
+        inputs.value = CallValue::Transfer(U256::ONE);
+        let outcome = run_call_from_frame(with_value, SOURCE);
+        assert_eq!(
+            outcome.result.output,
+            revert_message("subcall precompiles do not support value transfers")
+        );
+        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+
+        let spoofed = call_from_frame(
+            MEMO_ADDRESS,
+            Address::repeat_byte(0x99),
+            TARGET,
+            Bytes::new(),
+            100_000,
+        );
+        let outcome = run_call_from_frame(spoofed, SOURCE);
+        assert_eq!(
+            outcome.result.output,
+            revert_message("sender spoofing requires tx.origin as sender")
+        );
+        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+
+        let valid = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
+        let outcome = run_call_from_frame(valid, SOURCE);
+        assert!(outcome.result.result.is_ok());
+        assert_eq!(outcome.result.gas.spent(), 2_800);
+        let decoded = ITestCallFrom::callFromCall::abi_decode_returns(&outcome.result.output)
+            .expect("CallFrom returns valid ABI output");
+        assert!(decoded.success);
+        assert!(decoded.returnData.is_empty());
+
+        let direct_callfrom_target = call_from_frame(
+            MEMO_ADDRESS,
+            SOURCE,
+            CALL_FROM_ADDRESS,
+            Bytes::new(),
+            100_000,
+        );
+        let outcome = run_call_from_frame(direct_callfrom_target, SOURCE);
+        let decoded = ITestCallFrom::callFromCall::abi_decode_returns(&outcome.result.output)
+            .expect("direct child CallFrom target is not recursively intercepted");
+        assert!(decoded.success);
+        assert!(decoded.returnData.is_empty());
+    }
+
+    #[test]
+    fn zero7_value_transfer_probe_does_not_warm_target() {
+        let mut evm = post_zero7_evm(InMemoryDB::default(), NoOpInspector {});
+        load_native_coin_control(&mut evm);
+
+        let mut frame = call_frame(CallScheme::Call, SOURCE, TARGET, U256::ONE);
+        assert!(matches!(
+            evm.before_frame_init(&mut frame).unwrap(),
+            BeforeFrameInit::Log(_)
+        ));
+        assert!(
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(TARGET)
+                .unwrap()
+                .is_cold,
+            "Zero7 selfdestruct probe must not warm the transfer target"
+        );
     }
 
     #[test]

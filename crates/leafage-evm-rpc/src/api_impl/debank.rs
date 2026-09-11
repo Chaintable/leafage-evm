@@ -934,7 +934,8 @@ where
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
                         if let Ok(exec_res) =
-                            self.inner.transact(&block_env, &memory_db, tx.clone())
+                            self.inner
+                                .transact_for_estimation(&block_env, &memory_db, tx.clone())
                         {
                             if exec_res.is_success() {
                                 let l1_overhead = self
@@ -959,7 +960,7 @@ where
 
         let res = self
             .inner
-            .transact(&block_env, &memory_db, tx.clone())
+            .transact_for_estimation(&block_env, &memory_db, tx.clone())
             .map_err(|e| e.to_rpc_error())?;
 
         let gas_refund = match res {
@@ -991,7 +992,7 @@ where
             tx.set_gas_limit(optimistic_gas_limit);
             let res = self
                 .inner
-                .transact(&block_env, &memory_db, tx.clone())
+                .transact_for_estimation(&block_env, &memory_db, tx.clone())
                 .map_err(|e| e.to_rpc_error())?;
             gas_used = res.gas_used();
             update_estimated_gas_range(
@@ -1023,7 +1024,9 @@ where
 
             tx.set_gas_limit(mid_gas_limit);
 
-            let res = self.inner.transact(&block_env, &memory_db, tx.clone());
+            let res = self
+                .inner
+                .transact_for_estimation(&block_env, &memory_db, tx.clone());
 
             match res {
                 Err(e) => {

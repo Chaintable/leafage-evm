@@ -27,7 +27,13 @@ impl<DB: Database, I> ExecuteEvm for ArcEvm<DB, I> {
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        ArcHandler::new(self.execution_spec().arc_flags).run(self)
+        let result = ArcHandler::new(self.execution_spec().arc_flags).run(self);
+        debug_assert!(
+            result.is_err() || self.subcall_continuations.is_empty(),
+            "stale subcall continuations after transaction"
+        );
+        self.subcall_continuations.clear();
+        result
     }
 
     fn finalize(&mut self) -> Self::State {
@@ -35,9 +41,13 @@ impl<DB: Database, I> ExecuteEvm for ArcEvm<DB, I> {
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
-        ArcHandler::new(self.execution_spec().arc_flags)
-            .run(self)
-            .map(|result| ResultAndState::new(result, self.finalize()))
+        let result = ArcHandler::new(self.execution_spec().arc_flags).run(self);
+        debug_assert!(
+            result.is_err() || self.subcall_continuations.is_empty(),
+            "stale subcall continuations after replay"
+        );
+        self.subcall_continuations.clear();
+        result.map(|result| ResultAndState::new(result, self.finalize()))
     }
 }
 
@@ -63,7 +73,13 @@ where
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        ArcHandler::new(self.execution_spec().arc_flags).inspect_run(self)
+        let result = ArcHandler::new(self.execution_spec().arc_flags).inspect_run(self);
+        debug_assert!(
+            result.is_err() || self.subcall_continuations.is_empty(),
+            "stale subcall continuations after inspected transaction"
+        );
+        self.subcall_continuations.clear();
+        result
     }
 }
 

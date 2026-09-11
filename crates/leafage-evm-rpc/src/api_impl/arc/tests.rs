@@ -1,14 +1,17 @@
-use crate::api::{DebankApiServer, EthApiServer};
+use crate::api::{DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{Api, EvmExecutor, TxSetter};
 use crate::api_impl::debank::MIN_TRANSACTION_GAS;
 use crate::api_impl::{utils, ApiImpl};
 use alloy::eips::eip7702::Authorization;
-use alloy::primitives::{hex, keccak256};
+use alloy::primitives::{address, hex, keccak256};
 use alloy::rpc::types::state::{AccountOverride, StateOverride};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::signers::{local::PrivateKeySigner, SignerSync};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
+use leafage_evm_chains::arc::{
+    ArcChainConfig, ARC_MAINNET_CHAIN_ID, ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+    ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+};
 use leafage_evm_storage::{
     BlockContext, EvmStorageWrapper, EvmStorageWrite, MultiStorage, StateDBProvider,
     StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
@@ -19,8 +22,10 @@ use leafage_evm_types::{
     DebankErrorCode, DebankID, DebankSingleSimulateResult, IndexValuePair, MainnetSpecId,
     NewAccount, NewCode, H256, U256,
 };
+use revm::bytecode::opcode;
 use revm::context::result::{ExecutionResult, HaltReason};
-use revm::database::CacheDB;
+use revm::database::{CacheDB, InMemoryDB};
+use revm::{context::TxEnv, state::AccountInfo, DatabaseRef};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
@@ -36,6 +41,8 @@ const ANCHOR_NUMBER: u64 = 1;
 const ANCHOR_BASE_FEE: u64 = 3;
 const ENCODED_NEXT_BASE_FEE: u64 = 7;
 const OVERRIDDEN_BASE_FEE: u64 = 11;
+const CALL_FROM_ADDRESS: Address = address!("1800000000000000000000000000000000000003");
+const MEMO_ADDRESS: Address = address!("5294E9927c3306DcBaDb03fe70b92e01cCede505");
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -51,6 +58,8 @@ struct TestAddresses {
     environment: Address,
     counter: Address,
     balance_reader: Address,
+    account_probe: Address,
+    drain_target: Address,
     beneficiary: Address,
 }
 
@@ -133,6 +142,77 @@ fn balance_reader_code() -> Bytes {
     ])
 }
 
+fn account_probe_code() -> Bytes {
+    Bytes::from_static(&[
+        // Return BALANCE and EXTCODEHASH for address(calldataload(0)).
+        opcode::PUSH0,
+        opcode::CALLDATALOAD,
+        opcode::DUP1,
+        opcode::BALANCE,
+        opcode::PUSH0,
+        opcode::MSTORE,
+        opcode::EXTCODEHASH,
+        opcode::PUSH1,
+        0x20,
+        opcode::MSTORE,
+        opcode::PUSH1,
+        0x40,
+        opcode::PUSH0,
+        opcode::RETURN,
+    ])
+}
+
+fn forwarding_call_code(target: Address) -> Bytes {
+    let mut code = vec![
+        opcode::CALLDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::CALLDATACOPY,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::CALLDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH20,
+    ];
+    code.extend_from_slice(target.as_slice());
+    code.extend_from_slice(&[
+        opcode::GAS,
+        opcode::CALL,
+        opcode::POP,
+        opcode::RETURNDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::PUSH1,
+        0,
+        opcode::RETURNDATACOPY,
+        opcode::RETURNDATASIZE,
+        opcode::PUSH1,
+        0,
+        opcode::RETURN,
+    ]);
+    code.into()
+}
+
+fn call_from_input(sender: Address, target: Address, data: Bytes) -> Bytes {
+    let padded_len = data.len().div_ceil(32) * 32;
+    let mut encoded = Vec::with_capacity(4 + 128 + padded_len);
+    encoded.extend_from_slice(&selector("callFrom(address,address,bytes)"));
+    encoded.extend_from_slice(H256::left_padding_from(sender.as_slice()).as_slice());
+    encoded.extend_from_slice(H256::left_padding_from(target.as_slice()).as_slice());
+    encoded.extend_from_slice(&U256::from(96).to_be_bytes::<32>());
+    encoded.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+    encoded.extend_from_slice(&data);
+    encoded.resize(encoded.len() + padded_len - data.len(), 0);
+    encoded.into()
+}
+
 fn native_fiat_token_code(account: Address) -> Bytes {
     let native_coin_control: Address = "0x1800000000000000000000000000000000000001"
         .parse()
@@ -164,6 +244,18 @@ fn build_arc_fixture(estimate_gas_buffer: u64) -> ArcFixture {
 }
 
 fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64) -> ArcFixture {
+    build_arc_fixture_with_timestamp(estimate_gas_buffer, rpc_gas_cap, 1_000 + ANCHOR_NUMBER)
+}
+
+fn build_arc_fixture_at_timestamp(estimate_gas_buffer: u64, timestamp: u64) -> ArcFixture {
+    build_arc_fixture_with_timestamp(estimate_gas_buffer, ARC_RPC_GAS_CAP, timestamp)
+}
+
+fn build_arc_fixture_with_timestamp(
+    estimate_gas_buffer: u64,
+    rpc_gas_cap: u64,
+    anchor_timestamp: u64,
+) -> ArcFixture {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let path =
         std::env::temp_dir().join(format!("leafage-arc-estimate-{}-{id}", std::process::id()));
@@ -183,6 +275,8 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
         environment: Address::repeat_byte(0x66),
         counter: Address::repeat_byte(0x68),
         balance_reader: Address::repeat_byte(0x6c),
+        account_probe: Address::repeat_byte(0x6d),
+        drain_target: Address::repeat_byte(0x6e),
         beneficiary: Address::repeat_byte(0x77),
     };
     let native_fiat_token = native_fiat_token_code(addresses.empty);
@@ -194,6 +288,8 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
     let environment = environment_code();
     let counter = counter_code();
     let balance_reader = balance_reader_code();
+    let account_probe = account_probe_code();
+    let memo = forwarding_call_code(CALL_FROM_ADDRESS);
     let mut diff = BlockStorageDiff::default();
     for (address, balance, nonce, code_hash) in [
         (addresses.funded, U256::ONE << 128, 0, H256::ZERO),
@@ -226,6 +322,14 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
             1,
             keccak256(&balance_reader),
         ),
+        (
+            addresses.account_probe,
+            U256::ZERO,
+            1,
+            keccak256(&account_probe),
+        ),
+        (addresses.drain_target, U256::from(10), 0, H256::ZERO),
+        (MEMO_ADDRESS, U256::ZERO, 1, keccak256(&memo)),
     ] {
         diff.new_accounts.push(NewAccount {
             address: keccak256(address.as_slice()),
@@ -259,6 +363,14 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
             code_hash: keccak256(&balance_reader),
             code: balance_reader,
         },
+        NewCode {
+            code_hash: keccak256(&account_probe),
+            code: account_probe,
+        },
+        NewCode {
+            code_hash: keccak256(&memo),
+            code: memo,
+        },
     ]);
     diff.storage_diffs.push(AccountStorageDiff {
         address: keccak256(native_coin_control.as_slice()),
@@ -285,16 +397,15 @@ fn build_arc_fixture_with_rpc_gas_cap(estimate_gas_buffer: u64, rpc_gas_cap: u64
 
     let tree =
         Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
-    tree.update_block(
-        test_block(
-            ANCHOR_NUMBER,
-            H256::repeat_byte(0xbb),
-            H256::repeat_byte(0xaa),
-            ENCODED_NEXT_BASE_FEE,
-        ),
-        BlockStorageDiff::default(),
-    )
-    .unwrap();
+    let mut anchor = test_block(
+        ANCHOR_NUMBER,
+        H256::repeat_byte(0xbb),
+        H256::repeat_byte(0xaa),
+        ENCODED_NEXT_BASE_FEE,
+    );
+    anchor.inner.header.inner.timestamp = anchor_timestamp;
+    tree.update_block(anchor, BlockStorageDiff::default())
+        .unwrap();
 
     let arc_config = ArcChainConfig::mainnet();
     let mut cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
@@ -418,6 +529,14 @@ fn address_word(address: Address) -> Bytes {
     let mut word = [0u8; 32];
     word[12..].copy_from_slice(address.as_slice());
     Bytes::copy_from_slice(&word)
+}
+
+fn burn_input(from: Address, amount: U256) -> Bytes {
+    let mut input = Vec::with_capacity(4 + 64);
+    input.extend_from_slice(&selector("burn(address,uint256)"));
+    input.extend_from_slice(&address_word(from));
+    input.extend_from_slice(&amount.to_be_bytes::<32>());
+    input.into()
 }
 
 fn p256_valid_input() -> Bytes {
@@ -693,6 +812,212 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_zero8_commits_drain_cleanup_and_value_recreation() {
+    let fixture =
+        build_arc_fixture_at_timestamp(100, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+    let addresses = fixture.addresses;
+    let native_coin_authority: Address = "0x1800000000000000000000000000000000000000"
+        .parse()
+        .unwrap();
+    let drained_balance = U256::from(10);
+    let recredited_balance = U256::from(17);
+    let probe = || {
+        request_with_input(
+            addresses.observer,
+            addresses.account_probe,
+            address_word(addresses.drain_target),
+        )
+    };
+
+    let burn = request_with_input(
+        addresses.native_fiat_token,
+        native_coin_authority,
+        burn_input(addresses.drain_target, drained_balance),
+    );
+    let recredit = CallRequest {
+        inner: TransactionRequest::default()
+            .from(addresses.funded)
+            .to(addresses.drain_target)
+            .value(recredited_balance),
+        tempo: None,
+    };
+    let simulated = fixture
+        .api
+        .simulate_transactions(
+            vec![burn, probe(), recredit, probe()],
+            anchor_context(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(simulated.stats.success, "{simulated:#?}");
+    assert_eq!(simulated.results.len(), 4);
+    assert_eq!(
+        output_words(&root_trace_output(&simulated.results[0])),
+        vec![U256::ONE]
+    );
+    assert_eq!(
+        output_words(&root_trace_output(&simulated.results[1])),
+        vec![U256::ZERO, U256::ZERO]
+    );
+    assert_eq!(simulated.results[2].traces[0].value, recredited_balance);
+    assert_eq!(
+        output_words(&root_trace_output(&simulated.results[3])),
+        vec![
+            recredited_balance,
+            U256::from_be_slice(keccak256([]).as_slice()),
+        ]
+    );
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_activates_zero7_callfrom_and_commits_child_state() {
+    let fixture = build_arc_fixture(100);
+    let addresses = fixture.addresses;
+    let input = call_from_input(addresses.funded, addresses.counter, Bytes::new());
+    let request = || request_with_input(addresses.funded, MEMO_ADDRESS, input.clone());
+
+    let simulated = fixture
+        .api
+        .simulate_transactions(
+            vec![request(), request()],
+            anchor_context(),
+            Some(BlockOverrides {
+                time: Some(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(simulated.stats.success, "{simulated:#?}");
+    assert_eq!(simulated.results.len(), 2);
+    for (index, result) in simulated.results.iter().enumerate() {
+        assert_eq!(result.code, 0, "{result:#?}");
+        assert!(result.events.is_empty(), "{result:#?}");
+        assert_eq!(result.traces.len(), 2, "{result:#?}");
+
+        let root = &result.traces[0];
+        let child = &result.traces[1];
+        assert_eq!(root.from_addr, addresses.funded);
+        assert_eq!(root.to_addr, MEMO_ADDRESS);
+        assert_eq!(root.input, input);
+        assert_eq!(child.parent_trace_id, root.id);
+        assert_eq!(child.from_addr, addresses.funded);
+        assert_eq!(child.to_addr, addresses.counter);
+        assert_eq!(child.pos_in_parent_trace, 0);
+        assert_eq!(child.call_create_type, "call");
+        assert!(result.traces.iter().all(|trace| {
+            trace.from_addr != CALL_FROM_ADDRESS && trace.to_addr != CALL_FROM_ADDRESS
+        }));
+
+        let expected = U256::from(index + 1);
+        assert_eq!(output_words(&child.output), vec![expected]);
+        assert!(child.gas_used > 0, "{child:#?}");
+        assert!(child.gas_limit > child.gas_used, "{child:#?}");
+        assert_eq!(
+            output_words(&root.output),
+            vec![U256::ONE, U256::from(64), U256::from(32), expected]
+        );
+    }
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_uses_raw_immediate_callfrom_child_output_and_gas() {
+    let fixture = build_arc_fixture(100);
+    let addresses = fixture.addresses;
+    let child_input = Bytes::from_static(b"immediate-eoa");
+    let input = call_from_input(addresses.funded, addresses.empty, child_input.clone());
+
+    let simulated = fixture
+        .api
+        .simulate_transactions(
+            vec![request_with_input(addresses.funded, MEMO_ADDRESS, input)],
+            anchor_context(),
+            Some(BlockOverrides {
+                time: Some(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(simulated.stats.success, "{simulated:#?}");
+    let result = &simulated.results[0];
+    assert_eq!(result.traces.len(), 2, "{result:#?}");
+    let child = &result.traces[1];
+    assert_eq!(child.from_addr, addresses.funded);
+    assert_eq!(child.to_addr, addresses.empty);
+    assert_eq!(child.input, child_input);
+    assert!(child.output.is_empty(), "{child:#?}");
+    assert_eq!(child.gas_used, 0, "{child:#?}");
+    assert!(child.gas_limit > 0, "{child:#?}");
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_pre_traces_expose_post_zero7_callfrom_as_the_logical_child() {
+    let fixture =
+        build_arc_fixture_at_timestamp(100, ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+    let addresses = fixture.addresses;
+    let child_input = Bytes::new();
+    let input = call_from_input(addresses.funded, addresses.counter, child_input.clone());
+    let request = CallRequest {
+        inner: TransactionRequest::default()
+            .from(addresses.funded)
+            .to(MEMO_ADDRESS)
+            .gas_limit(500_000)
+            .input(TransactionInput::new(input)),
+        tempo: None,
+    };
+    let anchor = Some(BlockId::Number(BlockNumberOrTag::Number(ANCHOR_NUMBER)));
+
+    let traced = fixture
+        .api
+        .trace_many(vec![request.clone()], anchor)
+        .await
+        .unwrap();
+    assert_eq!(traced.len(), 1, "{traced:#?}");
+    let result = &traced[0];
+    assert_eq!(result.error.code, 0, "{result:#?}");
+    assert_eq!(result.trace.len(), 2, "{result:#?}");
+
+    let root = &result.trace[0].trace;
+    let child = &result.trace[1].trace;
+    let root_call = root.action.as_call().expect("root call trace");
+    let child_call = child.action.as_call().expect("logical child call trace");
+    assert_eq!(root_call.from, addresses.funded);
+    assert_eq!(root_call.to, MEMO_ADDRESS);
+    assert_eq!(child_call.from, addresses.funded);
+    assert_eq!(child_call.to, addresses.counter);
+    assert_eq!(child_call.input, child_input);
+    assert!(result.trace.iter().all(|trace| {
+        trace
+            .trace
+            .action
+            .as_call()
+            .is_none_or(|call| call.from != CALL_FROM_ADDRESS && call.to != CALL_FROM_ADDRESS)
+    }));
+
+    let child_result = child.result.as_ref().expect("logical child result");
+    assert_eq!(output_words(child_result.output()), vec![U256::ONE]);
+    assert_eq!(child_result.gas_used(), 22_126, "{child:#?}");
+    assert_eq!(child_call.gas, 457_879, "{child:#?}");
+
+    let geth = fixture.api.trace_call(request, anchor).await.unwrap();
+    assert!(!geth.failed, "{geth:#?}");
+    assert!(!geth.struct_logs.is_empty(), "{geth:#?}");
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
     let fixture = build_arc_fixture(100);
     let addresses = fixture.addresses;
@@ -714,6 +1039,29 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
         .to(addresses.empty)
         .gas_limit(500_000);
     authorize.authorization_list = Some(vec![authorization.into_signed(signature)]);
+
+    let estimate_request = CallRequest {
+        inner: authorize.clone(),
+        tempo: None,
+    };
+    let estimated = estimate(&fixture.api, estimate_request.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        estimate(&fixture.api, estimate_request, None)
+            .await
+            .unwrap(),
+        estimated
+    );
+    let original_state = EvmStorageWrapper {
+        db: fixture
+            .api
+            .debank_get_state_by_ctx_impl(anchor_context())
+            .unwrap(),
+        ovm_address: None,
+        normalize_state_key: false,
+    };
+    assert!(original_state.basic_ref(authority).unwrap().is_none());
 
     let simulated = fixture
         .api
@@ -923,6 +1271,199 @@ async fn arc_normal_and_inspect_paths_share_nca_pq_and_p256_precompiles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_estimate_fee_mode_does_not_reserve_business_funds() {
+    let fixture =
+        build_arc_fixture_at_timestamp(100, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+    let addresses = fixture.addresses;
+    let nca = address!("1800000000000000000000000000000000000000");
+    let balance: U256 = U256::ONE << 128;
+    // Keep allowance within u64 while testing the real native-coin transfer.
+    let price = 1u128 << 80;
+    for affordable_gas in [200_000u64, 5] {
+        let amount = balance - U256::from(price) * U256::from(affordable_gas);
+        let mut input = selector("transfer(address,address,uint256)").to_vec();
+        input.extend_from_slice(&address_word(addresses.native_fiat_token));
+        input.extend_from_slice(&address_word(addresses.empty));
+        input.extend_from_slice(&amount.to_be_bytes::<32>());
+        let mut request = request_with_input(addresses.native_fiat_token, nca, input.into());
+        request.gas = Some(ARC_RPC_GAS_CAP);
+        request.gas_price = Some(price);
+
+        // The original high-gas execution consumes business funds in both cases.
+        assert!(matches!(
+            execute_arc_estimate_probe(&fixture.api, request.clone(), None, ARC_RPC_GAS_CAP),
+            ExecutionResult::Revert { .. }
+        ));
+        let mut zero_price = request.clone();
+        zero_price.gas_price = Some(0);
+        let expected = estimate(&fixture.api, zero_price, None).await.unwrap();
+        // Mixed requests share the API, but must not share the estimation config.
+        for _ in 0..4 {
+            let (estimated, calls, simulated) = tokio::join!(
+                estimate(&fixture.api, request.clone(), None),
+                fixture.api.contract_multi_call(
+                    vec![request.clone()],
+                    anchor_context(),
+                    None,
+                    None,
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                ),
+                fixture
+                    .api
+                    .simulate_transactions(vec![request.clone()], anchor_context(), None),
+            );
+            assert_eq!(
+                estimated.unwrap(),
+                expected,
+                "affordable gas: {affordable_gas}"
+            );
+            assert_eq!(
+                calls.unwrap().results[0].code,
+                DebankErrorCode::EvmRevert as i32
+            );
+            assert_eq!(
+                simulated.unwrap().results[0].code,
+                DebankErrorCode::EvmRevert as i32
+            );
+        }
+        let gas: u64 = expected.try_into().unwrap();
+        assert!(gas < 200_000);
+
+        // Writer-style estimation is not a guarantee of fee affordability.
+        let normal = execute_arc_estimate_probe(&fixture.api, request.clone(), None, gas);
+        assert_eq!(normal.is_success(), affordable_gas == 200_000);
+        request.gas = Some(gas);
+        let calls = fixture
+            .api
+            .contract_multi_call(
+                vec![request.clone()],
+                anchor_context(),
+                None,
+                None,
+                Some(false),
+                Some(false),
+                Some(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.results[0].code == 0, normal.is_success());
+        assert_eq!(
+            calls.results[0].gas_used,
+            i64::try_from(normal.gas_used()).unwrap()
+        );
+        let simulated = fixture
+            .api
+            .simulate_transactions(vec![request], anchor_context(), None)
+            .await
+            .unwrap();
+        assert_eq!(simulated.results[0].code == 0, normal.is_success());
+        assert_eq!(simulated.results[0].gas_used, normal.gas_used());
+    }
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_estimate_fee_mode_preserves_prices_and_discards_refund_state() {
+    let fixture = build_arc_fixture(100);
+    let caller = fixture.addresses.funded;
+    let target = fixture.addresses.counter;
+    let balance = U256::from(10_000_000);
+    let mut db = InMemoryDB::default();
+    db.insert_account_info(
+        caller,
+        AccountInfo {
+            balance,
+            nonce: 4,
+            ..Default::default()
+        },
+    );
+    // Return GASPRICE, BASEFEE, caller balance, CALLVALUE, original storage and
+    // original transient storage. Clear slot 0 to earn a refund, then TSTORE.
+    let code = revm::bytecode::Bytecode::new_raw(Bytes::from_static(&[
+        0x3a, 0x5f, 0x52, 0x48, 0x60, 0x20, 0x52, 0x33, 0x31, 0x60, 0x40, 0x52, 0x34, 0x60, 0x60,
+        0x52, 0x5f, 0x54, 0x60, 0x80, 0x52, 0x5f, 0x5f, 0x55, 0x5f, 0x5c, 0x60, 0xa0, 0x52, 0x60,
+        0x01, 0x5f, 0x5d, 0x60, 0xc0, 0x5f, 0xf3,
+    ]));
+    db.insert_account_info(
+        target,
+        AccountInfo {
+            code_hash: code.hash_slow(),
+            code: Some(code),
+            nonce: 1,
+            ..Default::default()
+        },
+    );
+    db.insert_account_storage(target, U256::ZERO, U256::ONE)
+        .unwrap();
+    let state = utils::RequestCacheDB::new(db);
+    let original_caller = state.basic_ref(caller).unwrap();
+    let original_target = state.basic_ref(target).unwrap();
+    for (price, tip, basefee, effective) in
+        [(5, None, 3, 5), (20, Some(2), 3, 5), (20, Some(2), 11, 13)]
+    {
+        let block_env = leafage_evm_types::BlockEnv {
+            basefee,
+            ..Default::default()
+        };
+        for gas in [50_000, 100_000, 50_000] {
+            let tx = TxEnv::builder()
+                .caller(caller)
+                .to(target)
+                .nonce(4)
+                .value(U256::from(7))
+                .chain_id(Some(ARC_MAINNET_CHAIN_ID))
+                .gas_limit(gas)
+                .gas_price(price)
+                .gas_priority_fee(tip)
+                .build()
+                .unwrap();
+            let normal = fixture
+                .api
+                .inner
+                .transact(&block_env, &state, tx.clone())
+                .unwrap();
+            let estimated = fixture
+                .api
+                .inner
+                .transact_for_estimation(&block_env, &state, tx.clone())
+                .unwrap();
+            assert!(estimated.is_success(), "{estimated:#?}");
+            if let ExecutionResult::Success { gas, .. } = &estimated {
+                assert!(gas.inner_refunded() > 0);
+            }
+            assert_eq!(normal.gas_used(), estimated.gas_used());
+            assert_eq!(
+                output_words(&success_output(estimated)),
+                vec![
+                    U256::from(effective),
+                    U256::from(basefee),
+                    balance - U256::from(7),
+                    U256::from(7),
+                    U256::ONE,
+                    U256::ZERO,
+                ]
+            );
+            assert_eq!(
+                output_words(&success_output(normal.clone()))[2],
+                balance - U256::from(gas) * U256::from(effective) - U256::from(7)
+            );
+            // Normal calls after estimation still charge fees and see fresh state.
+            assert_eq!(
+                fixture.api.inner.transact(&block_env, &state, tx).unwrap(),
+                normal
+            );
+            assert!(!fixture.api.inner.evm_cfg.cfg.disable_fee_charge);
+            assert_eq!(state.basic_ref(caller).unwrap(), original_caller);
+            assert_eq!(state.basic_ref(target).unwrap(), original_target);
+            assert_eq!(state.storage_ref(target, U256::ZERO).unwrap(), U256::ONE);
+        }
+    }
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
     let fixture = build_arc_fixture(100);
     let addresses = fixture.addresses;
@@ -954,12 +1495,23 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
             .value(U256::ONE),
         tempo: None,
     };
+    // Writer-style estimation does not synthesize a balance to pay tx.value.
+    // Ordinary calls retain their existing balance-check-disabled policy.
+    assert!(execute_arc_estimate_probe(
+        &fixture.api,
+        value_without_balance.clone(),
+        None,
+        MIN_TRANSACTION_GAS,
+    )
+    .is_success());
+    let insufficient = estimate(&fixture.api, value_without_balance, None)
+        .await
+        .unwrap_err();
     assert_eq!(
-        estimate(&fixture.api, value_without_balance, None)
-            .await
-            .unwrap(),
-        U256::from(MIN_TRANSACTION_GAS)
+        insufficient.code(),
+        DebankErrorCode::BalanceExhausted as i32
     );
+    assert_eq!(insufficient.message(), "Halted: OutOfFunds");
 
     let fee_without_balance = CallRequest {
         inner: TransactionRequest::default()
