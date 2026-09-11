@@ -1,6 +1,6 @@
 use crate::utils::{parse_kafka_s3_config, s3_get_block_info_by_number, KafkaS3Config};
 use anyhow::{anyhow, bail, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
     EvmStorageWrite, MultiStorage, StateDBProvider, StateDBRead, StateDBWrapper, StorageKind,
@@ -23,9 +23,9 @@ use tracing::info;
 /// "latest" state is a mixture of old and replayed values — keep the node
 /// out of serving rotation until it has switched to the Kafka tail.
 ///
-/// Archive mode (--archive): the target block is resolved from the local
-/// database, and the height-versioned keys keep reads consistent at every
-/// height (including "latest") throughout the replay.
+/// Archive mode resolves the target locally and only moves the head by default.
+/// Add --truncate-archive to delete future versions in place. Stop all database
+/// users first; truncation has no checkpoint or automatic interruption recovery.
 #[derive(Debug, Parser)]
 pub struct Command {
     /// The path to the database to rewind.
@@ -49,6 +49,14 @@ pub struct Command {
     /// column family names but use different encodings.
     #[arg(long, default_value_t = false)]
     archive: bool,
+
+    /// Delete future archive state and indexes in place (offline only).
+    #[arg(long, requires = "archive", conflicts_with = "keep_offset")]
+    truncate_archive: bool,
+
+    /// Trusted key encoding, required for an archive without an encoding marker.
+    #[arg(long, value_enum, requires = "truncate_archive")]
+    archive_encoding: Option<ArchiveEncoding>,
 
     /// The block number to rewind the committed head to.
     #[arg(long)]
@@ -77,8 +85,30 @@ pub struct Command {
     keep_offset: bool,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ArchiveEncoding {
+    Legacy,
+    Inverted,
+}
+
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
+        if self.truncate_archive {
+            if !self.archive || self.keep_offset {
+                bail!("--truncate-archive requires --archive and forbids --keep-offset");
+            }
+            let offset_file = self.offset_file();
+            let db =
+                MultiStorage::open_for_archive_rewind(&self.db_path, self.db_cache, self.db_type)?;
+            let target = db.rewind_archive(
+                self.to_block,
+                self.archive_encoding
+                    .map(|e| matches!(e, ArchiveEncoding::Inverted)),
+                std::path::Path::new(&offset_file),
+            )?;
+            info!(target: "rewind", number = target.header.number, hash = %target.header.hash, "archive truncation complete");
+            return Ok(());
+        }
         let db = MultiStorage::open(
             self.db_path.as_path(),
             self.db_cache,
@@ -122,10 +152,7 @@ impl Command {
             // index locally, so no S3/RPC lookup is needed.
             let target_hash = state.0.read_block_hash(self.to_block)?;
             if target_hash == H256::ZERO {
-                bail!(
-                    "block {} not found in the archive database",
-                    self.to_block
-                );
+                bail!("block {} not found in the archive database", self.to_block);
             }
             state.0.read_block_info(target_hash)?.ok_or_else(|| {
                 anyhow!("block info for {target_hash} not found in the archive database")
@@ -175,11 +202,7 @@ impl Command {
         );
 
         if !self.keep_offset {
-            let offset_dir = match &self.kafka_s3_config {
-                Some(cfg) if !cfg.offset_dir.is_empty() => cfg.offset_dir.clone(),
-                _ => format!("{}/offset", self.db_path.to_str().unwrap_or_default()),
-            };
-            let offset_file = format!("{}/offset", offset_dir);
+            let offset_file = self.offset_file();
             match std::fs::remove_file(&offset_file) {
                 Ok(()) => info!(target: "rewind", "removed offset file {}", offset_file),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -195,5 +218,143 @@ impl Command {
             self.to_block + 1
         );
         Ok(())
+    }
+
+    fn offset_file(&self) -> String {
+        let offset_dir = match &self.kafka_s3_config {
+            Some(cfg) if !cfg.offset_dir.is_empty() => cfg.offset_dir.clone(),
+            _ => format!("{}/offset", self.db_path.to_str().unwrap_or_default()),
+        };
+        format!("{}/offset", offset_dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> Vec<&'static str> {
+        vec!["rewind", "--db-path", "/unused", "--to-block", "1"]
+    }
+
+    #[test]
+    fn truncate_options_are_opt_in() {
+        let mut a = args();
+        a.extend(["--archive", "--keep-offset"]);
+        assert!(!Command::try_parse_from(a).unwrap().truncate_archive);
+        let mut a = args();
+        a.push("--truncate-archive");
+        assert!(Command::try_parse_from(a).is_err());
+        let mut a = args();
+        a.extend(["--archive", "--truncate-archive", "--keep-offset"]);
+        assert!(Command::try_parse_from(a).is_err());
+        let mut a = args();
+        a.extend([
+            "--archive",
+            "--truncate-archive",
+            "--archive-encoding",
+            "legacy",
+        ]);
+        assert!(Command::try_parse_from(a).unwrap().truncate_archive);
+    }
+
+    #[test]
+    fn rewind_modes_share_existing_offset_paths() {
+        for truncate in [false, true] {
+            let mut a = args();
+            a.push("--archive");
+            if truncate {
+                a.push("--truncate-archive");
+            }
+            let mut cmd = Command::try_parse_from(a).unwrap();
+            assert_eq!(cmd.offset_file(), "/unused/offset/offset");
+            cmd.db_path = PathBuf::from("relative-db");
+            assert_eq!(cmd.offset_file(), "relative-db/offset/offset");
+            cmd.kafka_s3_config = Some(KafkaS3Config::default());
+            assert_eq!(cmd.offset_file(), "relative-db/offset/offset");
+            for dir in ["/custom-offset", "relative-offset"] {
+                cmd.kafka_s3_config.as_mut().unwrap().offset_dir = dir.into();
+                assert_eq!(cmd.offset_file(), format!("{dir}/offset"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_archive_rewind_keeps_versions_and_keep_offset() {
+        use leafage_evm_types::{Block, BlockInfo, Header, NewAccount, RawHeader, U256};
+        let dir = std::env::temp_dir().join(format!("rewind-default-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
+        for n in 1..=2 {
+            let block = BlockInfo::new(Block {
+                header: Header {
+                    hash: H256::repeat_byte(n as u8),
+                    inner: RawHeader {
+                        number: n,
+                        parent_hash: H256::repeat_byte(n as u8 - 1),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            StateDBWrapper(db.db_at(BlockId::latest()).unwrap().unwrap())
+                .update_block(
+                    block,
+                    BlockStorageDiff {
+                        new_accounts: vec![NewAccount {
+                            address: H256::repeat_byte(10),
+                            balance: U256::from(n),
+                            nonce: n,
+                            code_hash: H256::ZERO,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        drop(db);
+        let mut a = args();
+        a.extend(["--archive", "--keep-offset"]);
+        let mut cmd = Command::try_parse_from(a).unwrap();
+        cmd.db_path = dir.clone();
+        cmd.db_type = StorageKind::MDBX;
+        std::fs::create_dir_all(dir.join("offset")).unwrap();
+        std::fs::write(dir.join("offset/offset"), "123").unwrap();
+        cmd.run().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("offset/offset")).unwrap(),
+            "123"
+        );
+        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
+        assert_eq!(
+            db.db_at(BlockId::latest())
+                .unwrap()
+                .unwrap()
+                .read_latest_block_hash()
+                .unwrap(),
+            H256::repeat_byte(1)
+        );
+        assert_eq!(
+            db.db_at(BlockId::number(2))
+                .unwrap()
+                .unwrap()
+                .read_account(H256::repeat_byte(10))
+                .unwrap()
+                .unwrap()
+                .balance,
+            U256::from(2)
+        );
+        drop(db);
+        // Same-height truncation now removes the physical future left by default rewind.
+        cmd.keep_offset = false;
+        cmd.truncate_archive = true;
+        cmd.archive_encoding = Some(ArchiveEncoding::Legacy);
+        cmd.run().await.unwrap();
+        assert!(!dir.join("offset/offset").exists());
+        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
+        assert!(db.db_at(BlockId::number(2)).unwrap().is_none());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
