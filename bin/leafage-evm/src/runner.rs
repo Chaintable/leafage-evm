@@ -37,7 +37,7 @@ pub(crate) enum Commands {
     /// are missing the prefix bloom / partitioned index (regenerates them)
     #[command(name = "force-compact")]
     ForceCompact(force_compact::Command),
-    /// Rewind the committed head; optionally truncate archive state offline
+    /// Rewind to an earlier block; archive mode truncates unless --head-only is set
     #[command(name = "rewind")]
     Rewind(rewind::Command),
     /// Read-only scan of an archive DB column family (forensics/debugging)
