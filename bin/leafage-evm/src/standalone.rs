@@ -143,7 +143,8 @@ pub struct Command {
     /// Worker threads executing the calls of one contractMultiCall in
     /// parallel. Default: 0 (serial, same as before).
     ///
-    /// Results are byte-identical to serial execution; under fast_fail
+    /// Results match serial execution apart from each call's wall-clock
+    /// time_cost; under fast_fail
     /// the execution is speculative (calls past the first failure may
     /// run and be discarded). Each parallel multicall holds this many
     /// --evm-exec-concurrency permits, and the value is clamped to that

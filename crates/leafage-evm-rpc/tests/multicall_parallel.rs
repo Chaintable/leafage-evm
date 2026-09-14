@@ -74,6 +74,32 @@ fn normalize(resp: &DebankMultiCallResp) -> Vec<(i32, String, Bytes, i64, bool)>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn parallel_multicall_matches_serial() {
+    run_differential("127.0.0.1:18552", "127.0.0.1:18553").await;
+}
+
+/// Regression for a saturated blocking pool: with a single blocking
+/// thread the parent worker is the only one that can ever run, and the
+/// pooled workers can only start once it returns. The parent must abort
+/// them instead of waiting, or the request deadlocks the pool.
+#[test]
+fn parallel_multicall_survives_exhausted_blocking_pool() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                run_differential("127.0.0.1:18554", "127.0.0.1:18555"),
+            )
+            .await
+            .expect("parallel multicall deadlocked on an exhausted blocking pool");
+        });
+}
+
+async fn run_differential(serial_addr: &'static str, parallel_addr: &'static str) {
     let db_path = std::env::temp_dir().join(format!(
         "leafage-e2e-multicall-parallel-{}-{:?}",
         std::process::id(),
@@ -163,8 +189,6 @@ async fn parallel_multicall_matches_serial() {
             .await
             .unwrap()
     };
-    let serial_addr = "127.0.0.1:18552";
-    let parallel_addr = "127.0.0.1:18553";
     let serial_handle = run_args(
         ApiBuilder::new(tree.clone(), MultiChainCfgEnv::Mainnet(cfg())),
         serial_addr,

@@ -27,7 +27,7 @@ use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -767,7 +767,7 @@ where
             if stop_after.load(Ordering::SeqCst) < index {
                 continue;
             }
-            let res = self.debank_single_call_from_state_impl_inner(
+            let res = self.multicall_run_call_catching_panic(
                 state,
                 block,
                 block_env,
@@ -785,15 +785,41 @@ where
         }
     }
 
+    /// Runs one call of a parallel multicall, turning a panic into the
+    /// `multi call failed` internal error the serial path reports when
+    /// its blocking task panics. Catching it here keeps the panic from
+    /// unwinding a worker: an unwinding parent would drop the exec
+    /// permits while pooled workers are still executing, and would
+    /// bypass the ordered post-scan that lets a lower-index fast_fail
+    /// failure mask this call exactly as the serial loop does.
+    fn multicall_run_call_catching_panic(
+        &self,
+        state: &<C::DB as EvmStorageRead>::StateDB,
+        block: &BlockInfo,
+        block_env: &BlockEnv,
+        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        request: CallRequest,
+    ) -> RpcResult<DebankSingleCallResult> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.debank_single_call_from_state_impl_inner(state, block, block_env, db, request)
+        })) {
+            Ok(res) => res,
+            Err(_) => {
+                error!("multicall call panicked");
+                Err(internal_rpc_err("multi call failed"))
+            }
+        }
+    }
+
     /// Executes one multicall's calls on `workers` blocking-pool
     /// threads with atomic work stealing: `workers - 1` pooled tasks
     /// plus the current (already exec-permitted) blocking thread, so a
     /// parallel multicall occupies exactly the `workers` threads its
     /// permits account for, and per-request overhead is a pool wakeup
     /// rather than a thread spawn. Calls are independent (`transact`
-    /// never commits), so this returns byte-identical results to the
-    /// serial loop; the ordered post-scan reconstructs its exact
-    /// semantics — the first per-call failure (in request order) is
+    /// never commits), so this returns the same results as the serial
+    /// loop apart from each call's wall-clock `time_cost`; the ordered
+    /// post-scan reconstructs its exact semantics — the first per-call failure (in request order) is
     /// cloned over every later slot under fast_fail, and a
     /// transport-level `Err` aborts the whole request unless a
     /// lower-index fast_fail failure means the serial loop would never
@@ -821,8 +847,23 @@ where
             Arc::new((0..requests.len()).map(|_| OnceLock::new()).collect());
         let next = Arc::new(AtomicUsize::new(0));
         let stop_after = Arc::new(AtomicUsize::new(usize::MAX));
-        let joins: Vec<_> = (1..workers)
-            .map(|_| {
+        // Per-worker gate: a pooled worker moves QUEUED -> STARTED when
+        // it gets a thread, the parent moves QUEUED -> SKIPPED once it
+        // has drained the work. Exactly one side wins, so the parent
+        // never waits on a worker that has no thread (a saturated
+        // blocking pool could only run it after this thread returns,
+        // which would deadlock the pool), and a skipped worker does
+        // nothing if the pool runs it later.
+        const QUEUED: u8 = 0;
+        const STARTED: u8 = 1;
+        const SKIPPED: u8 = 2;
+        let gates: Vec<Arc<AtomicU8>> = (1..workers)
+            .map(|_| Arc::new(AtomicU8::new(QUEUED)))
+            .collect();
+        let joins: Vec<_> = gates
+            .iter()
+            .map(|gate| {
+                let gate = gate.clone();
                 let this = self.clone();
                 let state = state.clone();
                 let block = block.clone();
@@ -834,6 +875,12 @@ where
                 let stop_after = stop_after.clone();
                 let cancel_token = cancel_token.clone();
                 handle.spawn_blocking(move || {
+                    if gate
+                        .compare_exchange(QUEUED, STARTED, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        return;
+                    }
                     this.multicall_worker_loop(
                         &state,
                         &block,
@@ -862,8 +909,30 @@ where
             fast_fail,
             cancel_token,
         );
+        // The parent has drained the index space (or stopped on
+        // cancel / a known failure), so a worker still QUEUED has
+        // nothing left to do: skip it and drop its handle rather than
+        // wait for a thread it may never get. `abort` additionally lets
+        // the pool discard it unrun; it is a no-op for a STARTED worker,
+        // which owns its thread and is joined so every slot write is
+        // complete before the scan below.
+        let started: Vec<_> = joins
+            .into_iter()
+            .zip(&gates)
+            .filter_map(|(join, gate)| {
+                if gate
+                    .compare_exchange(QUEUED, SKIPPED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    join.abort();
+                    None
+                } else {
+                    Some(join)
+                }
+            })
+            .collect();
         handle.block_on(async {
-            for join in joins {
+            for join in started {
                 if let Err(err) = join.await {
                     error!("multicall worker task failed: {err:?}");
                 }
@@ -874,22 +943,23 @@ where
                 "multicall cancelled by caller".to_string(),
             ));
         }
-        // All worker clones are gone after the joins; a panicked worker
-        // leaves unset slots, which the serial catch-up below re-runs.
-        let slots = Arc::try_unwrap(slots)
-            .map_err(|_| internal_rpc_err("multicall worker leaked result slots"))?;
+        // Every started worker is joined, so all slot writes are
+        // visible. A skipped worker's closure may still hold its Arc
+        // clones until the pool discards it, so the slots are read in
+        // place rather than unwrapped. A panicked worker leaves unset
+        // slots, which the serial catch-up below re-runs.
         let mut results = Vec::with_capacity(requests.len());
         let mut fill: Option<DebankSingleCallResult> = None;
-        for (index, slot) in slots.into_iter().enumerate() {
+        for (index, slot) in slots.iter().enumerate() {
             if let Some(fill) = &fill {
                 results.push(fill.clone());
                 continue;
             }
-            let res = match slot.into_inner() {
-                Some(res) => res,
+            let res = match slot.get() {
+                Some(res) => res.clone(),
                 // Unreachable by the stop_after invariant above; serial
                 // catch-up keeps the scan total rather than trusting it.
-                None => self.debank_single_call_from_state_impl_inner(
+                None => self.multicall_run_call_catching_panic(
                     state,
                     block,
                     block_env,
