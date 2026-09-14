@@ -1,6 +1,6 @@
 use crate::utils::{parse_kafka_s3_config, s3_get_block_info_by_number, KafkaS3Config};
 use anyhow::{anyhow, bail, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
     EvmStorageWrite, MultiStorage, StateDBProvider, StateDBRead, StateDBWrapper, StorageKind,
@@ -11,21 +11,19 @@ use tracing::info;
 
 /// `leafage-evm rewind` command
 ///
-/// Rewind the database's committed-head pointer to an earlier block so the
-/// next `standalone` start resyncs `to_block + 1 ..= head` from S3.
-///
-/// The state itself is left untouched: `BlockStorageDiff` carries absolute
-/// post-state values, so the forward replay converges to the exact head
-/// state.
+/// Rewind to an earlier block so the next `standalone` start resyncs
+/// `to_block + 1 ..= head` from S3.
 ///
 /// Snapshot mode: the target block is resolved via --kafka-s3-config or
 /// --rpc-addr (one is required), and until the replay catches up the
-/// "latest" state is a mixture of old and replayed values — keep the node
-/// out of serving rotation until it has switched to the Kafka tail.
+/// "latest" state is a mixture of old and replayed values. This mode does
+/// not remove stale fork state; rebuild a polluted snapshot from a repaired
+/// archive before serving it.
 ///
-/// Archive mode resolves the target locally and only moves the head by default.
-/// Add --truncate-archive to delete future versions in place. Stop all database
-/// users first; truncation has no checkpoint or automatic interruption recovery.
+/// Archive mode resolves the target locally and deletes future versions by
+/// default. Use --head-only to keep those versions and only move the head.
+/// Stop all database users first; truncation has no checkpoint or automatic
+/// interruption recovery.
 #[derive(Debug, Parser)]
 pub struct Command {
     /// The path to the database to rewind.
@@ -50,13 +48,15 @@ pub struct Command {
     #[arg(long, default_value_t = false)]
     archive: bool,
 
-    /// Delete future archive state and indexes in place (offline only).
-    #[arg(long, requires = "archive", conflicts_with = "keep_offset")]
-    truncate_archive: bool,
+    /// Only move the archive head, retaining future state and block indexes.
+    /// Default archive rewind deletes those records in place (offline only).
+    #[arg(long, requires = "archive")]
+    head_only: bool,
 
-    /// Trusted key encoding, required for an archive without an encoding marker.
-    #[arg(long, value_enum, requires = "truncate_archive")]
-    archive_encoding: Option<ArchiveEncoding>,
+    /// Use inverted block-height keys for an unmarked archive (default: legacy).
+    /// A stored encoding marker takes precedence; truncation rejects conflicts.
+    #[arg(long, default_value_t = false, requires = "archive")]
+    inverted_block_encoding: bool,
 
     /// The block number to rewind the committed head to.
     #[arg(long)]
@@ -81,33 +81,30 @@ pub struct Command {
     /// the S3 catch-up path. A retained offset would resume Kafka at a
     /// position whose parent blocks no longer match the rewound head, making
     /// every update fail with ParentBlockHashNotFound.
+    /// In archive mode, this requires --head-only.
     #[arg(long, default_value_t = false)]
     keep_offset: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ArchiveEncoding {
-    Legacy,
-    Inverted,
-}
-
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
-        if self.truncate_archive {
-            if !self.archive || self.keep_offset {
-                bail!("--truncate-archive requires --archive and forbids --keep-offset");
+        if self.archive && !self.head_only {
+            if self.keep_offset {
+                bail!("archive truncation forbids --keep-offset; use --head-only to only move the head");
             }
             let offset_file = self.offset_file();
             let db =
                 MultiStorage::open_for_archive_rewind(&self.db_path, self.db_cache, self.db_type)?;
             let target = db.rewind_archive(
                 self.to_block,
-                self.archive_encoding
-                    .map(|e| matches!(e, ArchiveEncoding::Inverted)),
+                self.inverted_block_encoding.then_some(true),
                 std::path::Path::new(&offset_file),
             )?;
             info!(target: "rewind", number = target.header.number, hash = %target.header.hash, "archive truncation complete");
             return Ok(());
+        }
+        if self.archive {
+            leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         }
         let db = MultiStorage::open(
             self.db_path.as_path(),
@@ -238,33 +235,56 @@ mod tests {
     }
 
     #[test]
-    fn truncate_options_are_opt_in() {
+    fn archive_options_default_to_truncation() {
         let mut a = args();
-        a.extend(["--archive", "--keep-offset"]);
-        assert!(!Command::try_parse_from(a).unwrap().truncate_archive);
-        let mut a = args();
-        a.push("--truncate-archive");
-        assert!(Command::try_parse_from(a).is_err());
-        let mut a = args();
-        a.extend(["--archive", "--truncate-archive", "--keep-offset"]);
-        assert!(Command::try_parse_from(a).is_err());
+        a.push("--archive");
+        let cmd = Command::try_parse_from(a).unwrap();
+        assert!(!cmd.head_only);
+        assert!(!cmd.inverted_block_encoding);
+
         let mut a = args();
         a.extend([
             "--archive",
-            "--truncate-archive",
-            "--archive-encoding",
-            "legacy",
+            "--head-only",
+            "--keep-offset",
+            "--inverted-block-encoding",
         ]);
-        assert!(Command::try_parse_from(a).unwrap().truncate_archive);
+        let cmd = Command::try_parse_from(a).unwrap();
+        assert!(cmd.head_only && cmd.keep_offset && cmd.inverted_block_encoding);
+
+        for option in [
+            "--head-only",
+            "--inverted-block-encoding",
+            "--truncate-archive",
+        ] {
+            let mut a = args();
+            a.push(option);
+            assert!(Command::try_parse_from(a).is_err());
+        }
+        let mut a = args();
+        a.extend(["--archive", "--archive-encoding", "legacy"]);
+        assert!(Command::try_parse_from(a).is_err());
+        let mut a = args();
+        a.push("--keep-offset");
+        let cmd = Command::try_parse_from(a).unwrap();
+        assert!(!cmd.archive && cmd.keep_offset);
+    }
+
+    #[tokio::test]
+    async fn archive_truncation_rejects_keep_offset_before_opening() {
+        let mut a = args();
+        a.extend(["--archive", "--keep-offset"]);
+        let error = Command::try_parse_from(a).unwrap().run().await.unwrap_err();
+        assert!(error.to_string().contains("forbids --keep-offset"));
     }
 
     #[test]
     fn rewind_modes_share_existing_offset_paths() {
-        for truncate in [false, true] {
+        for head_only in [false, true] {
             let mut a = args();
             a.push("--archive");
-            if truncate {
-                a.push("--truncate-archive");
+            if head_only {
+                a.push("--head-only");
             }
             let mut cmd = Command::try_parse_from(a).unwrap();
             assert_eq!(cmd.offset_file(), "/unused/offset/offset");
@@ -280,81 +300,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_archive_rewind_keeps_versions_and_keep_offset() {
+    async fn archive_head_only_then_default_truncation() {
         use leafage_evm_types::{Block, BlockInfo, Header, NewAccount, RawHeader, U256};
-        let dir = std::env::temp_dir().join(format!("rewind-default-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
-        for n in 1..=2 {
-            let block = BlockInfo::new(Block {
-                header: Header {
-                    hash: H256::repeat_byte(n as u8),
-                    inner: RawHeader {
-                        number: n,
-                        parent_hash: H256::repeat_byte(n as u8 - 1),
+        for (kind, inverted, marked) in [
+            (StorageKind::MDBX, false, false),
+            (StorageKind::MDBX, true, false),
+            (StorageKind::Rocksdb, false, false),
+            (StorageKind::Rocksdb, true, false),
+            (StorageKind::Rocksdb, false, true),
+            (StorageKind::Rocksdb, true, true),
+        ] {
+            leafage_evm_storage::set_inverted_block_encoding(inverted);
+            let dir = std::env::temp_dir().join(format!(
+                "rewind-cli-{kind:?}-{inverted}-{marked}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = MultiStorage::open(&dir, 16, kind, true, false, false).unwrap();
+            for n in 1..=2 {
+                let block = BlockInfo::new(Block {
+                    header: Header {
+                        hash: H256::repeat_byte(n as u8),
+                        inner: RawHeader {
+                            number: n,
+                            parent_hash: H256::repeat_byte(n as u8 - 1),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
                     ..Default::default()
-                },
-                ..Default::default()
-            });
-            StateDBWrapper(db.db_at(BlockId::latest()).unwrap().unwrap())
-                .update_block(
-                    block,
-                    BlockStorageDiff {
-                        new_accounts: vec![NewAccount {
-                            address: H256::repeat_byte(10),
-                            balance: U256::from(n),
-                            nonce: n,
-                            code_hash: H256::ZERO,
-                        }],
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+                });
+                StateDBWrapper(db.db_at(BlockId::latest()).unwrap().unwrap())
+                    .update_block(
+                        block,
+                        BlockStorageDiff {
+                            new_accounts: vec![NewAccount {
+                                address: H256::repeat_byte(10),
+                                balance: U256::from(n),
+                                nonce: n,
+                                code_hash: H256::ZERO,
+                            }],
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            if marked {
+                let MultiStorage::RocksDBArchive(raw) = &db else {
+                    unreachable!()
+                };
+                raw.write_encoding_marker(inverted).unwrap();
+            }
+            drop(db);
+            let mut a = args();
+            a.extend(["--archive", "--head-only", "--keep-offset"]);
+            if inverted && !marked {
+                a.push("--inverted-block-encoding");
+            }
+            let mut cmd = Command::try_parse_from(a).unwrap();
+            cmd.db_path = dir.clone();
+            cmd.db_type = kind;
+            cmd.db_cache = 16;
+            std::fs::create_dir_all(dir.join("offset")).unwrap();
+            std::fs::write(dir.join("offset/offset"), "123").unwrap();
+            cmd.run().await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.join("offset/offset")).unwrap(),
+                "123"
+            );
+            let db = MultiStorage::open(&dir, 16, kind, true, false, false).unwrap();
+            assert_eq!(
+                db.db_at(BlockId::latest())
+                    .unwrap()
+                    .unwrap()
+                    .read_latest_block_hash()
+                    .unwrap(),
+                H256::repeat_byte(1)
+            );
+            assert_eq!(
+                db.db_at(BlockId::number(2))
+                    .unwrap()
+                    .unwrap()
+                    .read_account(H256::repeat_byte(10))
+                    .unwrap()
+                    .unwrap()
+                    .balance,
+                U256::from(2)
+            );
+            drop(db);
+            // Parse the default archive command afresh; H=C must remove head-only leftovers.
+            let mut a = args();
+            a.push("--archive");
+            if inverted && !marked {
+                a.push("--inverted-block-encoding");
+            }
+            let mut cmd = Command::try_parse_from(a).unwrap();
+            cmd.db_path = dir.clone();
+            cmd.db_type = kind;
+            cmd.db_cache = 16;
+            if marked && !inverted {
+                cmd.inverted_block_encoding = true;
+                assert!(cmd
+                    .run()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicts"));
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("offset/offset")).unwrap(),
+                    "123"
+                );
+                let db = MultiStorage::open(&dir, 16, kind, true, false, false).unwrap();
+                assert!(db.db_at(BlockId::number(2)).unwrap().is_some());
+                drop(db);
+                cmd.inverted_block_encoding = false;
+            }
+            // Neither a preceding open nor another archive may supply the encoding.
+            leafage_evm_storage::set_inverted_block_encoding(!inverted);
+            cmd.run().await.unwrap();
+            assert!(!dir.join("offset/offset").exists());
+            let db = MultiStorage::open(&dir, 16, kind, true, false, false).unwrap();
+            assert!(db.db_at(BlockId::number(2)).unwrap().is_none());
+            assert_eq!(
+                db.db_at(BlockId::latest())
+                    .unwrap()
+                    .unwrap()
+                    .read_account(H256::repeat_byte(10))
+                    .unwrap()
+                    .unwrap()
+                    .balance,
+                U256::from(1)
+            );
+            drop(db);
+            std::fs::remove_dir_all(dir).unwrap();
         }
-        drop(db);
-        let mut a = args();
-        a.extend(["--archive", "--keep-offset"]);
-        let mut cmd = Command::try_parse_from(a).unwrap();
-        cmd.db_path = dir.clone();
-        cmd.db_type = StorageKind::MDBX;
-        std::fs::create_dir_all(dir.join("offset")).unwrap();
-        std::fs::write(dir.join("offset/offset"), "123").unwrap();
-        cmd.run().await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("offset/offset")).unwrap(),
-            "123"
-        );
-        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
-        assert_eq!(
-            db.db_at(BlockId::latest())
-                .unwrap()
-                .unwrap()
-                .read_latest_block_hash()
-                .unwrap(),
-            H256::repeat_byte(1)
-        );
-        assert_eq!(
-            db.db_at(BlockId::number(2))
-                .unwrap()
-                .unwrap()
-                .read_account(H256::repeat_byte(10))
-                .unwrap()
-                .unwrap()
-                .balance,
-            U256::from(2)
-        );
-        drop(db);
-        // Same-height truncation now removes the physical future left by default rewind.
-        cmd.keep_offset = false;
-        cmd.truncate_archive = true;
-        cmd.archive_encoding = Some(ArchiveEncoding::Legacy);
-        cmd.run().await.unwrap();
-        assert!(!dir.join("offset/offset").exists());
-        let db = MultiStorage::open(&dir, 16, StorageKind::MDBX, true, false, false).unwrap();
-        assert!(db.db_at(BlockId::number(2)).unwrap().is_none());
-        drop(db);
-        std::fs::remove_dir_all(dir).unwrap();
+        leafage_evm_storage::set_inverted_block_encoding(false);
     }
 }

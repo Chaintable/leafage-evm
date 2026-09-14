@@ -484,7 +484,7 @@ mod tests {
         let file = dir.join("offset/offset");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "456").unwrap();
-        assert!(db.rewind_archive(1, None, &file).is_err());
+        assert!(db.rewind_archive(3, None, &file).is_err());
         for value in [vec![], vec![2], vec![0, 1]] {
             raw.db.put_cf(meta, ENCODING_MARKER_KEY, value).unwrap();
             assert!(db.rewind_archive(1, Some(false), &file).is_err());
@@ -515,8 +515,8 @@ mod tests {
             .unwrap()
             .is_some());
         std::fs::remove_dir(&file).unwrap();
-        // A node without an existing offset file still truncates successfully.
-        db.rewind_archive(1, Some(false), &file).unwrap();
+        // An unmarked legacy archive needs neither an encoding flag nor an offset file.
+        db.rewind_archive(1, None, &file).unwrap();
         assert_eq!(raw.read_latest_block_hash().unwrap(), H256::repeat_byte(1));
         drop(db);
         drop(raw);

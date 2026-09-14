@@ -164,6 +164,7 @@ impl MultiStorage {
     }
 
     /// Offline operation: precheck, reset offset, delete future records, publish H.
+    /// Without a stored marker or explicit encoding, use legacy keys.
     /// Batches are durable; the whole operation has no atomicity or recovery guarantee.
     /// All database users must remain stopped until this method succeeds.
     pub fn rewind_archive(
@@ -193,14 +194,10 @@ impl MultiStorage {
         };
         if stored_encoding.zip(encoding).is_some_and(|(a, b)| a != b) {
             return Err(StorageError::UnSupported(
-                "--archive-encoding conflicts with stored encoding".into(),
+                "requested archive encoding conflicts with stored encoding".into(),
             ));
         }
-        let inverted = stored_encoding.or(encoding).ok_or_else(|| {
-            StorageError::UnSupported(
-                "unmarked archive requires --archive-encoding legacy|inverted".into(),
-            )
-        })?;
+        let inverted = stored_encoding.or(encoding).unwrap_or(false);
         if !populated && stored_encoding.is_none() {
             return Err(StorageError::UnSupported(
                 "cannot identify an empty unmarked database as archive".into(),

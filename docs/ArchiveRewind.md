@@ -1,16 +1,27 @@
 # Archive rewind
 
-`rewind` keeps its existing behavior: it moves the committed head and applies the
-existing offset policy. This also applies to `rewind --archive`; future versions
-remain in the database, and `--keep-offset` is still accepted.
-
-To **delete future archive state in place**, explicitly add `--truncate-archive`:
+`rewind --archive` **deletes future archive state and block indexes in place** by
+default. Stop every database user before running it:
 
 ```sh
-leafage-evm rewind --archive --truncate-archive \
-  --db-path /path/to/archive --to-block 123456 \
-  --archive-encoding legacy
+leafage-evm rewind --archive --db-path /path/to/archive --to-block 123456
 ```
+
+To retain future versions and only move the committed head, explicitly use
+`--head-only`. This preserves the previous archive rewind behavior and accepts
+`--keep-offset`:
+
+```sh
+leafage-evm rewind --archive --head-only \
+  --db-path /path/to/archive --to-block 123456
+```
+
+Head-only rewind does not repair fork contamination: if X@100=5 and old-branch
+X@101=9, replaying a new block 101 that does not write X exposes the old value 9.
+Default truncation removes that old version before replay.
+
+Snapshot/state rewind retains its existing pointer-only behavior. It cannot remove
+stale fork state; regenerate a polluted state database from a repaired archive.
 
 Both RocksDB (default) and MDBX (`--db-type mdbx`) are supported. Stop every database
 user, including initialization, migration, compaction and read-only export, and
@@ -20,11 +31,17 @@ read-only opens. Deleted history requires a backup or resync to recover.
 
 ## Inputs and prechecks
 
-- `--truncate-archive` requires `--archive` and conflicts with `--keep-offset`.
-- A valid RocksDB encoding marker determines the encoding. An explicit
-  `--archive-encoding legacy|inverted` must agree with it. Malformed markers and
-  read errors stop the operation. Unmarked archives, including MDBX, require an
-  explicit, trusted encoding; the key bytes cannot reliably identify it.
+- `--head-only` requires `--archive`. Default archive truncation rejects
+  `--keep-offset` before opening the database; snapshot rewind still accepts it.
+- `--inverted-block-encoding` uses the same flag name and default as `standalone`
+  and `archive-init`: unmarked archives use legacy keys unless the flag is passed.
+  Pass it for unmarked inverted archives, including inverted MDBX. A valid RocksDB
+  encoding marker determines the encoding when the flag is absent; truncation
+  rejects an explicit inverted flag conflicting with a legacy marker. Malformed
+  markers and read errors stop truncation. Key bytes cannot reliably identify the
+  encoding, so an unmarked archive still requires a correct operator choice.
+  Head-only opens retain the normal reader's marker precedence.
+- The PR's earlier `--truncate-archive` and `--archive-encoding` options are removed.
 - Offset paths use the existing rewind rule: a nonempty `offset_dir` in
   `--kafka-s3-config` selects `<offset_dir>/offset`; otherwise use
   `<db-path>/offset/offset`. Kafka configuration is optional. A missing offset
@@ -90,20 +107,33 @@ catch-up path. The upstream must retain the blocks needed to continue from H.
 
 ## Verification and cost
 
-Local validation on 2026-09-11 after reusing the existing offset paths: 40 storage tests passed
-(3.17 s), and 3 rewind CLI tests passed (1.17 s). Coverage includes both
-backends/encodings, tombstones, orphan headers, same-height cleanup, new-branch
-reads, malformed records stopping before head publication, encoding conflicts,
-offset reset failure and header compatibility. The CLI test checks that default
-archive rewind preserves future versions and `--keep-offset`, then explicit
-truncation removes them.
+Local validation on 2026-09-14: all 40 storage tests passed (3.12 s), and all four
+rewind CLI tests passed (0.72 s). The CLI database test covers six combinations:
+MDBX legacy/inverted, unmarked RocksDB legacy/inverted, and marked RocksDB
+legacy/inverted. It verifies head-only retention and keep-offset, default same-height
+truncation, retained balances, marker auto-detection and conflict rejection. Other
+CLI tests cover parameter constraints, offset paths, and rejecting keep-offset
+before opening an archive for truncation. Modified Rust files pass rustfmt checks.
 
-The earlier CRO deployment used commit `2d4893a`, which still had recovery. After an
-intentional SIGKILL at 165 seconds, that version rescanned and completed in about
-23 minutes. Replay of 10,960 blocks took about 110 seconds; state comparisons passed
-444/444 after truncation and 759/759 after replay and restart. These are historical
-measurements, not a deployment or benchmark of the current revision. Physical
-power-loss behavior has not been tested.
+The storage algorithm at `17e2c1c` was tested on lihe-dev-next on 2026-09-11/12
+using the same candidate image and independent snapshot copies:
+
+| Case | Truncation | State comparisons | Limits |
+| --- | --- | --- | --- |
+| CRO RocksDB / inverted | 1,453.570 s; 1,475,263 block-number entries and 1,486,159 headers removed | 444/444 after truncation; 759/759 after replay and after restart | Existing estimateGas difference 24329 vs 23991 remains an exact mismatch |
+| HSK RocksDB / legacy, initially unmarked | 272.026 s; 2,048 block-number entries and 2,048 headers removed | 223/223 after truncation; full replay retry 406/406; restart 402/406 plus the four timed-out assertions rechecked successfully | 82 physical sample keys: 82 before, 41 retained, 82 byte-identical after replay; no legacy sentinel in this sample |
+
+These runs used the earlier explicit truncation CLI. They validate that revision's
+storage behavior; the default/flag changes in this revision have not been deployed.
+HSK's original failed requests were retained; its restart result is not a single
+406/406 run. Both real databases were RocksDB, so MDBX and legacy sentinel handling
+have local unit-test coverage only. RPC and physical-key samples are not a full
+key-by-key comparison of the database. Physical power-loss behavior was not tested.
+
+CRO replay completed 10,960 blocks across archive-init checkpoints after forwarding
+failures. The final 3,625 blocks took 711.8 s at concurrency 8, followed by 2,399.540 s
+of compaction. HSK replayed 2,048 blocks in 344.3 s, followed by 561.284 s of
+compaction. These compaction timings belong to replay, not the rewind command.
 
 Work scales with the entire archive. Reserve WAL/compaction space; immediate file
 shrinkage and code garbage collection are not completion criteria. Tests verify
