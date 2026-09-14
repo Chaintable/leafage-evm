@@ -5,6 +5,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("io error, {0}")]
+    Io(#[from] std::io::Error),
     #[error("rocksdb error, {0}")]
     RocksDB(#[from] rocksdb::Error),
     #[error("rlp error, {0}")]

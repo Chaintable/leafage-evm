@@ -48,6 +48,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 mod iterator_tracker;
+mod rewind;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
@@ -898,6 +899,38 @@ fn reencode_versioned_cf(
     ))
 }
 
+pub(crate) fn decode_archive_header(buf: &mut &[u8]) -> Result<RawHeader, Error> {
+    let original = *buf;
+    Ok(match RawHeader::decode(buf) {
+        Ok(header) => header,
+        Err(_) => {
+            *buf = original;
+            let rlp_head = alloy_rlp::Header::decode(buf)?;
+            if !rlp_head.list {
+                Err(alloy_rlp::Error::NonCanonicalSingleByte)?;
+            }
+            RawHeader {
+                parent_hash: Decodable::decode(buf)?,
+                ommers_hash: Decodable::decode(buf)?,
+                beneficiary: Decodable::decode(buf)?,
+                state_root: Decodable::decode(buf)?,
+                transactions_root: Decodable::decode(buf)?,
+                receipts_root: Decodable::decode(buf)?,
+                logs_bloom: Decodable::decode(buf)?,
+                difficulty: Decodable::decode(buf)?,
+                number: u64::decode(buf)?,
+                gas_limit: u64::decode(buf)?,
+                gas_used: u64::decode(buf)?,
+                timestamp: Decodable::decode(buf)?,
+                extra_data: Decodable::decode(buf)?,
+                mix_hash: Decodable::decode(buf)?,
+                nonce: B64::decode(buf)?,
+                ..Default::default()
+            }
+        }
+    })
+}
+
 impl DataBaseRef {
     /// Open the archive RocksDB with default throttles. Set
     /// `disable_auto_compactions=true` if a caller plans to run its own
@@ -918,7 +951,9 @@ impl DataBaseRef {
             disable_auto_compactions,
             false,
             archive_zstd_compression,
+            false,
         )
+        .expect("Failed to open archive RocksDB")
     }
 
     /// Open the archive RocksDB tuned for bulk ingest:
@@ -948,7 +983,19 @@ impl DataBaseRef {
         // compaction (work proportional to total written so far), so periodic
         // calls produced O(N²) total compaction work. Letting RocksDB do
         // incremental L0 → L1 in the background keeps each step bounded.
-        Self::open_inner(path, cache_size, false, true, archive_zstd_compression)
+        Self::open_inner(
+            path,
+            cache_size,
+            false,
+            true,
+            archive_zstd_compression,
+            false,
+        )
+        .expect("Failed to open archive RocksDB for bulk load")
+    }
+
+    pub(crate) fn open_for_rewind(path: &Path, cache_size: usize) -> Result<Self, Error> {
+        Self::open_inner(path, cache_size, false, false, false, true)
     }
 
     fn open_inner<P: AsRef<Path>>(
@@ -957,7 +1004,8 @@ impl DataBaseRef {
         disable_auto_compactions: bool,
         bulk_load: bool,
         archive_zstd_compression: bool,
-    ) -> Self {
+        maintenance: bool,
+    ) -> Result<Self, Error> {
         let total_cache_size = cache_size;
         let shared_cache = Cache::new_hyper_clock_cache(
             1024 * 1024 * total_cache_size,
@@ -977,8 +1025,12 @@ impl DataBaseRef {
             bulk_load,
             archive_zstd_compression,
         );
-        let db_opt = rocksdb_options(disable_auto_compactions);
-        let db = DB::open_cf_descriptors(&db_opt, path, cfs).unwrap();
+        let mut db_opt = rocksdb_options(disable_auto_compactions);
+        if maintenance {
+            db_opt.create_if_missing(false);
+            db_opt.create_missing_column_families(false);
+        }
+        let db = DB::open_cf_descriptors(&db_opt, path, cfs)?;
         let cols = vec![
             (
                 StorageTypeColumn::LatestBlockHash,
@@ -1037,8 +1089,10 @@ impl DataBaseRef {
         // Self-describing encoding: if the DB records its block-height key
         // encoding, honor it (a legacy DB has no marker and is left untouched),
         // so the node can't mistake an inverted DB for a legacy one.
-        db_ref.align_encoding_from_marker();
-        db_ref
+        if !maintenance {
+            db_ref.align_encoding_from_marker();
+        }
+        Ok(db_ref)
     }
 }
 
@@ -1331,34 +1385,7 @@ impl DataBaseRef {
         }
         let block_info_bytes = block_info_bytes.unwrap();
         let buf = &mut block_info_bytes.as_ref();
-        let block_header = match RawHeader::decode(buf) {
-            Ok(header) => header,
-            Err(_) => {
-                *buf = block_info_bytes.as_ref();
-                let rlp_head = alloy_rlp::Header::decode(buf)?;
-                if !rlp_head.list {
-                    Err(alloy_rlp::Error::NonCanonicalSingleByte)?;
-                }
-                RawHeader {
-                    parent_hash: Decodable::decode(buf)?,
-                    ommers_hash: Decodable::decode(buf)?,
-                    beneficiary: Decodable::decode(buf)?,
-                    state_root: Decodable::decode(buf)?,
-                    transactions_root: Decodable::decode(buf)?,
-                    receipts_root: Decodable::decode(buf)?,
-                    logs_bloom: Decodable::decode(buf)?,
-                    difficulty: Decodable::decode(buf)?,
-                    number: u64::decode(buf)?,
-                    gas_limit: u64::decode(buf)?,
-                    gas_used: u64::decode(buf)?,
-                    timestamp: Decodable::decode(buf)?,
-                    extra_data: Decodable::decode(buf)?,
-                    mix_hash: Decodable::decode(buf)?,
-                    nonce: B64::decode(buf)?,
-                    ..Default::default()
-                }
-            }
-        };
+        let block_header = decode_archive_header(buf)?;
         // After RLP decode, remaining bytes (if any) are JSON-encoded OtherFields
         let other = if buf.is_empty() {
             Default::default()
