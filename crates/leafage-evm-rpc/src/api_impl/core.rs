@@ -42,6 +42,12 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     /// starve — or be starved by — CPU-bound execution. `None` keeps
     /// reads unbounded.
     pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    /// Worker threads executing the calls of one contractMultiCall in
+    /// parallel; `0`/`1` keeps the serial loop. A parallel multicall
+    /// holds `workers` exec-limiter permits for its whole duration, so
+    /// the builder clamps this to the exec concurrency (acquiring more
+    /// permits than exist would deadlock).
+    pub multicall_parallelism: usize,
 }
 
 pub(crate) trait ApiCore:
