@@ -430,7 +430,7 @@ where
                 }
 
                 let mut h160_bytes = [0u8; 20];
-                h160_bytes.copy_from_slice(&data[16..]);
+                h160_bytes.copy_from_slice(&data[16..36]);
                 let user_addr = Address::from(h160_bytes);
                 // get address's native balance
                 let res = Self::get_balance_from_state(
