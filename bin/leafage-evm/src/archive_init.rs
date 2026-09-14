@@ -1511,6 +1511,7 @@ impl Command {
                 &chain_id,
                 &version,
                 block_num,
+                Duration::from_secs(60),
             )
             .await?
         } else if let Some(parent_state_root) = parent_state_root {
@@ -1523,6 +1524,7 @@ impl Command {
                 &version,
                 block_num,
                 parent_state_root,
+                Duration::from_secs(60),
             )
             .await?
         } else {
@@ -1534,6 +1536,7 @@ impl Command {
                 &chain_id,
                 &version,
                 block_num,
+                Duration::from_secs(60),
             )
             .await?
         };

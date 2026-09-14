@@ -5,6 +5,7 @@ use aws_sdk_s3::Client;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::EvmStorageWrite;
 use leafage_evm_types::{BlockInfo, BlockStorageDiff};
+use std::time::Duration;
 use tracing::info;
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
@@ -73,6 +74,7 @@ where
                 &self.kafka_s3_cfg.s3_chain_id,
                 &self.kafka_s3_cfg.version,
                 self.genesis_number,
+                Duration::from_secs(self.kafka_s3_cfg.s3_read_timeout_secs.get()),
             )
             .await
         }
