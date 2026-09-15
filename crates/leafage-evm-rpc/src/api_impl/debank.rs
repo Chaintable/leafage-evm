@@ -27,7 +27,8 @@ use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspectorConfig};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -429,7 +430,7 @@ where
                 }
 
                 let mut h160_bytes = [0u8; 20];
-                h160_bytes.copy_from_slice(&data[16..]);
+                h160_bytes.copy_from_slice(&data[16..36]);
                 let user_addr = Address::from(h160_bytes);
                 // get address's native balance
                 let res = Self::get_balance_from_state(
@@ -641,6 +642,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn debank_multi_call_from_state_impl_inner(
         &self,
         requests: Vec<CallRequest>,
@@ -648,6 +650,8 @@ where
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
         fast_fail: bool,
+        workers: usize,
+        handle: tokio::runtime::Handle,
         cancel_token: CancellationToken,
     ) -> RpcResult<DebankMultiCallResp> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
@@ -691,6 +695,21 @@ where
         if cache_db.db.supports_batched_reads() {
             Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token);
         }
+        if workers > 1 {
+            let results = self.debank_multi_call_parallel(
+                &handle,
+                &state,
+                &block,
+                &block_env,
+                cache_db,
+                Arc::new(requests),
+                fast_fail,
+                workers,
+                &cancel_token,
+            )?;
+            stats.success = results.iter().all(|res| res.code == 0);
+            return Ok(DebankMultiCallResp { stats, results });
+        }
         let db = utils::RequestCacheDB::new(cache_db);
         // run in sequence
         let mut results: Vec<DebankSingleCallResult> = vec![];
@@ -720,6 +739,243 @@ where
         Ok(DebankMultiCallResp { stats, results })
     }
 
+    /// One multicall worker: steals the next unclaimed request index
+    /// until the list is exhausted, the caller cancelled, or a
+    /// lower-index outcome (recorded in `stop_after`) makes further
+    /// work pointless. `stop_after` is stored only after its slot is
+    /// set, so an ordered scan hitting a skipped (empty) slot has
+    /// always passed the populated slot that caused the skip.
+    #[allow(clippy::too_many_arguments)]
+    fn multicall_worker_loop(
+        &self,
+        state: &<C::DB as EvmStorageRead>::StateDB,
+        block: &BlockInfo,
+        block_env: &BlockEnv,
+        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        requests: &[CallRequest],
+        slots: &[OnceLock<RpcResult<DebankSingleCallResult>>],
+        next: &AtomicUsize,
+        stop_after: &AtomicUsize,
+        fast_fail: bool,
+        cancel_token: &CancellationToken,
+    ) {
+        loop {
+            let index = next.fetch_add(1, Ordering::SeqCst);
+            if index >= requests.len() || cancel_token.is_cancelled() {
+                break;
+            }
+            if stop_after.load(Ordering::SeqCst) < index {
+                continue;
+            }
+            let res = self.multicall_run_call_catching_panic(
+                state,
+                block,
+                block_env,
+                db,
+                requests[index].clone(),
+            );
+            let stops = match &res {
+                Err(_) => true,
+                Ok(res) => fast_fail && res.code != 0,
+            };
+            let _ = slots[index].set(res);
+            if stops {
+                stop_after.fetch_min(index, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Runs one call of a parallel multicall, turning a panic into the
+    /// `multi call failed` internal error the serial path reports when
+    /// its blocking task panics. Catching it here keeps the panic from
+    /// unwinding a worker: an unwinding parent would drop the exec
+    /// permits while pooled workers are still executing, and would
+    /// bypass the ordered post-scan that lets a lower-index fast_fail
+    /// failure mask this call exactly as the serial loop does.
+    fn multicall_run_call_catching_panic(
+        &self,
+        state: &<C::DB as EvmStorageRead>::StateDB,
+        block: &BlockInfo,
+        block_env: &BlockEnv,
+        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        request: CallRequest,
+    ) -> RpcResult<DebankSingleCallResult> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.debank_single_call_from_state_impl_inner(state, block, block_env, db, request)
+        })) {
+            Ok(res) => res,
+            Err(_) => {
+                error!("multicall call panicked");
+                Err(internal_rpc_err("multi call failed"))
+            }
+        }
+    }
+
+    /// Executes one multicall's calls on `workers` blocking-pool
+    /// threads with atomic work stealing: `workers - 1` pooled tasks
+    /// plus the current (already exec-permitted) blocking thread, so a
+    /// parallel multicall occupies exactly the `workers` threads its
+    /// permits account for, and per-request overhead is a pool wakeup
+    /// rather than a thread spawn. Calls are independent (`transact`
+    /// never commits), so this returns the same results as the serial
+    /// loop apart from each call's wall-clock `time_cost`; the ordered
+    /// post-scan reconstructs its exact semantics — the first per-call failure (in request order) is
+    /// cloned over every later slot under fast_fail, and a
+    /// transport-level `Err` aborts the whole request unless a
+    /// lower-index fast_fail failure means the serial loop would never
+    /// have executed that call. Under fast_fail execution is
+    /// speculative: calls past a failure may already be running when
+    /// it is discovered (their results are discarded), but workers
+    /// stop picking up indexes beyond it. Every worker owns a
+    /// [`utils::RequestCacheDB`] cloned from the prefetched base
+    /// cache, so threads share the warmed accounts and code but not
+    /// each other's later reads.
+    #[allow(clippy::too_many_arguments)]
+    fn debank_multi_call_parallel(
+        &self,
+        handle: &tokio::runtime::Handle,
+        state: &<C::DB as EvmStorageRead>::StateDB,
+        block: &Arc<BlockInfo>,
+        block_env: &BlockEnv,
+        base_db: CacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        requests: Arc<Vec<CallRequest>>,
+        fast_fail: bool,
+        workers: usize,
+        cancel_token: &CancellationToken,
+    ) -> RpcResult<Vec<DebankSingleCallResult>> {
+        let slots: Arc<Vec<OnceLock<RpcResult<DebankSingleCallResult>>>> =
+            Arc::new((0..requests.len()).map(|_| OnceLock::new()).collect());
+        let next = Arc::new(AtomicUsize::new(0));
+        let stop_after = Arc::new(AtomicUsize::new(usize::MAX));
+        // Per-worker gate: a pooled worker moves QUEUED -> STARTED when
+        // it gets a thread, the parent moves QUEUED -> SKIPPED once it
+        // has drained the work. Exactly one side wins, so the parent
+        // never waits on a worker that has no thread (a saturated
+        // blocking pool could only run it after this thread returns,
+        // which would deadlock the pool), and a skipped worker does
+        // nothing if the pool runs it later.
+        const QUEUED: u8 = 0;
+        const STARTED: u8 = 1;
+        const SKIPPED: u8 = 2;
+        let gates: Vec<Arc<AtomicU8>> = (1..workers)
+            .map(|_| Arc::new(AtomicU8::new(QUEUED)))
+            .collect();
+        let joins: Vec<_> = gates
+            .iter()
+            .map(|gate| {
+                let gate = gate.clone();
+                let this = self.clone();
+                let state = state.clone();
+                let block = block.clone();
+                let block_env = block_env.clone();
+                let db = utils::RequestCacheDB::new(base_db.clone());
+                let requests = requests.clone();
+                let slots = slots.clone();
+                let next = next.clone();
+                let stop_after = stop_after.clone();
+                let cancel_token = cancel_token.clone();
+                handle.spawn_blocking(move || {
+                    if gate
+                        .compare_exchange(QUEUED, STARTED, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    this.multicall_worker_loop(
+                        &state,
+                        &block,
+                        &block_env,
+                        &db,
+                        &requests,
+                        &slots,
+                        &next,
+                        &stop_after,
+                        fast_fail,
+                        &cancel_token,
+                    )
+                })
+            })
+            .collect();
+        let parent_db = utils::RequestCacheDB::new(base_db.clone());
+        self.multicall_worker_loop(
+            state,
+            block.as_ref(),
+            block_env,
+            &parent_db,
+            &requests,
+            &slots,
+            &next,
+            &stop_after,
+            fast_fail,
+            cancel_token,
+        );
+        // The parent has drained the index space (or stopped on
+        // cancel / a known failure), so a worker still QUEUED has
+        // nothing left to do: skip it and drop its handle rather than
+        // wait for a thread it may never get. `abort` additionally lets
+        // the pool discard it unrun; it is a no-op for a STARTED worker,
+        // which owns its thread and is joined so every slot write is
+        // complete before the scan below.
+        let started: Vec<_> = joins
+            .into_iter()
+            .zip(&gates)
+            .filter_map(|(join, gate)| {
+                if gate
+                    .compare_exchange(QUEUED, SKIPPED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    join.abort();
+                    None
+                } else {
+                    Some(join)
+                }
+            })
+            .collect();
+        handle.block_on(async {
+            for join in started {
+                if let Err(err) = join.await {
+                    error!("multicall worker task failed: {err:?}");
+                }
+            }
+        });
+        if cancel_token.is_cancelled() {
+            return Err(internal_rpc_err(
+                "multicall cancelled by caller".to_string(),
+            ));
+        }
+        // Every started worker is joined, so all slot writes are
+        // visible. A skipped worker's closure may still hold its Arc
+        // clones until the pool discards it, so the slots are read in
+        // place rather than unwrapped. A panicked worker leaves unset
+        // slots, which the serial catch-up below re-runs.
+        let mut results = Vec::with_capacity(requests.len());
+        let mut fill: Option<DebankSingleCallResult> = None;
+        for (index, slot) in slots.iter().enumerate() {
+            if let Some(fill) = &fill {
+                results.push(fill.clone());
+                continue;
+            }
+            let res = match slot.get() {
+                Some(res) => res.clone(),
+                // Unreachable by the stop_after invariant above; serial
+                // catch-up keeps the scan total rather than trusting it.
+                None => self.multicall_run_call_catching_panic(
+                    state,
+                    block,
+                    block_env,
+                    &utils::RequestCacheDB::new(base_db.clone()),
+                    requests[index].clone(),
+                ),
+            };
+            let res = res?;
+            if fast_fail && res.code != 0 {
+                fill = Some(res.clone());
+            }
+            results.push(res);
+        }
+        Ok(results)
+    }
+
     pub async fn contract_multi_call_impl(
         &self,
         requests: Vec<CallRequest>,
@@ -727,18 +983,33 @@ where
         block_overrides: Option<BlockOverrides>,
         state_override: Option<StateOverride>,
         fast_fail: Option<bool>,
-        _use_parallel: Option<bool>,
+        use_parallel: Option<bool>,
         _disable_cache: Option<bool>,
     ) -> RpcResult<DebankMultiCallResp> {
-        let limiter = self.inner.evm_cfg().exec_limiter.clone();
+        let evm_cfg = self.inner.evm_cfg();
+        let limiter = evm_cfg.exec_limiter.clone();
+        // Parallel execution needs the server knob on and the client
+        // not explicitly opting out; an absent use_parallel follows the
+        // server default. One permit is held per worker thread.
+        let workers = if evm_cfg.multicall_parallelism > 1
+            && requests.len() > 1
+            && use_parallel.unwrap_or(true)
+        {
+            evm_cfg.multicall_parallelism.min(requests.len())
+        } else {
+            1
+        };
         let this = self.clone();
-        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
+        let handle = tokio::runtime::Handle::current();
+        utils::spawn_blocking_limited_many_with_cancel(limiter, workers as u32, move |token| {
             this.debank_multi_call_from_state_impl_inner(
                 requests,
                 block_ctx,
                 block_overrides,
                 state_override,
                 fast_fail.unwrap_or_default(),
+                workers,
+                handle,
                 token,
             )
         })

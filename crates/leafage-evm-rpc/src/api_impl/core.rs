@@ -11,6 +11,7 @@ use leafage_evm_chains::cosmos::{CosmosEvmConfig, CosmosHardfork};
 use leafage_evm_chains::hemi::HemiHardfork;
 use leafage_evm_chains::iotex::IotexHardfork;
 use leafage_evm_chains::mantle::MantleHardfork;
+use leafage_evm_chains::monad::MonadHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
@@ -42,6 +43,12 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     /// starve — or be starved by — CPU-bound execution. `None` keeps
     /// reads unbounded.
     pub state_read_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    /// Worker threads executing the calls of one contractMultiCall in
+    /// parallel; `0`/`1` keeps the serial loop. A parallel multicall
+    /// holds `workers` exec-limiter permits for its whole duration, so
+    /// the builder clamps this to the exec concurrency (acquiring more
+    /// permits than exist would deadlock).
+    pub multicall_parallelism: usize,
 }
 
 pub(crate) trait ApiCore:
@@ -246,6 +253,7 @@ pub enum MultiChainCfgEnv {
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
     Iotex(CfgEnv<IotexHardfork>),
     Mantle(CfgEnv<MantleHardfork>),
+    Monad(CfgEnv<MonadHardfork>),
     Moonbeam(CfgEnv<MoonbeamHardfork>),
     Polygon(CfgEnv<PolygonHardfork>),
     Hemi(CfgEnv<HemiHardfork>),
@@ -265,6 +273,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Iotex(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Mantle(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Monad(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Moonbeam(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Polygon(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Hemi(cfg) => cfg.chain_id,

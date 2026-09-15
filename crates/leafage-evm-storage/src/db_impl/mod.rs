@@ -1,6 +1,7 @@
 //! Database implementation for EVM storage.
 
 mod archive_encoding;
+mod rewind;
 mod rocksdb_impl;
 
 mod mdbx_impl;

@@ -34,6 +34,7 @@ pub struct ApiBuilder<DB> {
     token_collector: Option<TokenCollector>,
     evm_exec_concurrency: usize,
     state_read_concurrency: usize,
+    multicall_parallelism: usize,
 }
 
 impl<DB> ApiBuilder<DB>
@@ -54,6 +55,7 @@ where
             token_collector: None,
             evm_exec_concurrency: 0,
             state_read_concurrency: 0,
+            multicall_parallelism: 0,
         }
     }
 
@@ -117,6 +119,15 @@ where
         self.state_read_concurrency = permits;
         self
     }
+
+    /// Execute the calls of one contractMultiCall on this many worker
+    /// threads (`0`/`1` keeps the serial loop). Clamped to the EVM exec
+    /// concurrency when one is set, because a parallel multicall holds
+    /// one exec permit per worker.
+    pub fn with_multicall_parallelism(mut self, workers: usize) -> Self {
+        self.multicall_parallelism = workers;
+        self
+    }
 }
 
 /// Bind a non-blocking TCP listener with an explicit accept-queue `backlog`.
@@ -168,6 +179,13 @@ where
         let state_read_limiter = (self.state_read_concurrency > 0).then(|| {
             std::sync::Arc::new(tokio::sync::Semaphore::new(self.state_read_concurrency))
         });
+        // A parallel multicall holds one exec permit per worker, so more
+        // workers than permits would deadlock on acquire_many.
+        let multicall_parallelism = if self.evm_exec_concurrency > 0 {
+            self.multicall_parallelism.min(self.evm_exec_concurrency)
+        } else {
+            self.multicall_parallelism
+        };
 
         let http_middleware = tower::ServiceBuilder::new()
             .layer(HttpMetricLayer)
@@ -197,7 +215,7 @@ where
         let mut rpc_module = RpcModule::new(());
         macro_rules! run_chain_setup {
             ($cfg:expr, $custom_evm_cfg: expr) => {{
-                let api_impl = ApiImpl::new(
+                let mut api_impl = ApiImpl::new(
                     self.db,
                     $cfg,
                     $custom_evm_cfg,
@@ -212,6 +230,7 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -243,6 +262,9 @@ where
             }
             MultiChainCfgEnv::Iotex(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
             MultiChainCfgEnv::Mantle(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Monad(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Moonbeam(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
@@ -255,7 +277,7 @@ where
             MultiChainCfgEnv::Tempo(env) => {
                 // Tempo: set virtual balance placeholder (no native token).
                 // Writer returns this for all eth_getBalance calls.
-                let api_impl = ApiImpl::new(
+                let mut api_impl = ApiImpl::new(
                     self.db,
                     env,
                     Some(TempoEvmCustomConfig),
@@ -270,6 +292,7 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,

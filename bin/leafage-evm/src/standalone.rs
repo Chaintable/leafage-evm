@@ -57,6 +57,7 @@ pub struct Command {
             "moonriver",
             "polygon",
             "hemi",
+            "monad",
         ],
         default_value = "mainnet"
     )]
@@ -140,6 +141,18 @@ pub struct Command {
     /// from guessing off max_connections or the EVM limiter.
     #[arg(long, default_value = "0")]
     state_read_concurrency: usize,
+
+    /// Worker threads executing the calls of one contractMultiCall in
+    /// parallel. Default: 0 (serial, same as before).
+    ///
+    /// Results match serial execution apart from each call's wall-clock
+    /// time_cost; under fast_fail
+    /// the execution is speculative (calls past the first failure may
+    /// run and be discarded). Each parallel multicall holds this many
+    /// --evm-exec-concurrency permits, and the value is clamped to that
+    /// limit. Clients can opt out per request with use_parallel=false.
+    #[arg(long, default_value = "0")]
+    multicall_parallelism: usize,
 
     /// The TCP accept-queue backlog for the HTTP-RPC listener.
     /// Default: 4096
@@ -422,6 +435,9 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "arc" {
         return Ok(ARC_MAINNET_CHAIN_ID);
     }
+    if arg == "monad" {
+        return Ok(leafage_evm_chains::monad::MONAD_MAINNET_CHAIN_ID);
+    }
     if arg.parse::<u64>().is_ok() {
         return Ok(arg.parse().unwrap());
     } else {
@@ -592,6 +608,21 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Polygon(chain_cfg))
+            }
+            "monad" => {
+                let spec = resolve_spec(
+                    self.spec_id,
+                    leafage_evm_chains::monad::MonadHardfork::default(),
+                    "monad",
+                )?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Monad(chain_cfg))
             }
             // Moonbeam and Moonriver share an identical EVM and precompile set;
             // they differ only by chain id (passed via --chain-cfg) and native
@@ -818,7 +849,8 @@ impl Command {
             .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_evm_exec_concurrency(self.evm_exec_concurrency)
-            .with_state_read_concurrency(self.state_read_concurrency);
+            .with_state_read_concurrency(self.state_read_concurrency)
+            .with_multicall_parallelism(self.multicall_parallelism);
 
         #[cfg(target_os = "linux")]
         {

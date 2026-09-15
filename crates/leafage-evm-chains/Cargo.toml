@@ -22,6 +22,8 @@ op-revm.workspace = true
 leafage-evm-types.workspace = true
 once_cell.workspace = true
 bls_on_arkworks.workspace = true
+blst.workspace = true # Monad staking precompile addValidator BLS verify
+blake3.workspace = true # Monad staking precompile addValidator secp digest
 prost.workspace = true
 parity-bytes = { workspace = true, default-features = false }
 secp256k1 = { workspace = true, features = [
