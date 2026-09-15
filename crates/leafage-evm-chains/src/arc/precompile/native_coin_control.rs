@@ -151,7 +151,40 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                     )
                 )?;
 
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            if hardfork_flags.is_active(ArcHardfork::Zero8) {
+                let success_gas_floor = if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_BLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
+                    BLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST
+                } else {
+                    if !is_authorized(
+                        &mut precompile_input.internals,
+                        precompile_input.caller,
+                        &mut gas_counter,
+                        hardfork_flags,
+                    )? {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_BLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
+                    BLOCKLIST_GAS_COST
+                };
+
+                check_delegatecall(
+                    NATIVE_COIN_CONTROL_ADDRESS,
+                    &precompile_input,
+                    &gas_counter,
+                    hardfork_flags,
+                )?;
+                check_gas_remaining(&gas_counter, success_gas_floor)?;
+            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
                 if hardfork_flags.is_active(ArcHardfork::Zero6) {
                     // Auth first so the Zero6 early-revert penalty is reachable
                     // regardless of remaining gas; otherwise the success-path
@@ -197,13 +230,14 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 }
             }
 
-            // Check delegate call
-            check_delegatecall(
-                NATIVE_COIN_CONTROL_ADDRESS,
-                &precompile_input,
-                &gas_counter,
-                hardfork_flags,
-            )?;
+            if !hardfork_flags.is_active(ArcHardfork::Zero8) {
+                check_delegatecall(
+                    NATIVE_COIN_CONTROL_ADDRESS,
+                    &precompile_input,
+                    &gas_counter,
+                    hardfork_flags,
+                )?;
+            }
 
             // Add to blocklist
             let storage_slot = compute_is_blocklisted_storage_slot(args.account);
@@ -292,7 +326,40 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                     )
                 )?;
 
-            if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            if hardfork_flags.is_active(ArcHardfork::Zero8) {
+                let success_gas_floor = if hardfork_flags.is_active(ArcHardfork::Zero5) {
+                    if precompile_input.caller != ALLOWED_CALLER_ADDRESS {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_UNBLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
+                    UNBLOCKLIST_GAS_COST - PRECOMPILE_SLOAD_GAS_COST
+                } else {
+                    if !is_authorized(
+                        &mut precompile_input.internals,
+                        precompile_input.caller,
+                        &mut gas_counter,
+                        hardfork_flags,
+                    )? {
+                        return Err(new_reverted_with_early_penalty(
+                            gas_counter,
+                            ERR_CANNOT_UNBLOCKLIST,
+                            hardfork_flags,
+                        ));
+                    }
+                    UNBLOCKLIST_GAS_COST
+                };
+
+                check_delegatecall(
+                    NATIVE_COIN_CONTROL_ADDRESS,
+                    &precompile_input,
+                    &gas_counter,
+                    hardfork_flags,
+                )?;
+                check_gas_remaining(&gas_counter, success_gas_floor)?;
+            } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
                 if hardfork_flags.is_active(ArcHardfork::Zero6) {
                     // Auth first so the Zero6 early-revert penalty is reachable
                     // regardless of remaining gas; otherwise the success-path
@@ -338,13 +405,14 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
                 }
             }
 
-            // Check delegate call
-            check_delegatecall(
-                NATIVE_COIN_CONTROL_ADDRESS,
-                &precompile_input,
-                &gas_counter,
-                hardfork_flags,
-            )?;
+            if !hardfork_flags.is_active(ArcHardfork::Zero8) {
+                check_delegatecall(
+                    NATIVE_COIN_CONTROL_ADDRESS,
+                    &precompile_input,
+                    &gas_counter,
+                    hardfork_flags,
+                )?;
+            }
 
             // Remove from blocklist
             let storage_slot = compute_is_blocklisted_storage_slot(args.account);

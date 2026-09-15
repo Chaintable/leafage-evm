@@ -1,6 +1,9 @@
 use super::{
     extend_arc_precompiles,
-    helpers::NATIVE_FIAT_TOKEN_ADDRESS,
+    helpers::{
+        revert_message_to_bytes, ERR_CLEAR_EMPTY, ERR_DELEGATE_CALL_NOT_ALLOWED,
+        NATIVE_FIAT_TOKEN_ADDRESS, PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+    },
     native_coin_authority::{INativeCoinAuthority, NATIVE_COIN_AUTHORITY_ADDRESS},
     native_coin_control::{
         compute_is_blocklisted_storage_slot, INativeCoinControl, NATIVE_COIN_CONTROL_ADDRESS,
@@ -10,6 +13,7 @@ use super::{
         compute_gas_values_storage_slot, GasValues, ISystemAccounting, SYSTEM_ACCOUNTING_ADDRESS,
     },
 };
+use crate::arc::config::ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET;
 use crate::arc::{
     native::{blocklist_storage_slot, eip7708_transfer_log},
     ArcChainConfig, ArcContext, ArcEvm, ArcEvmFactory, ArcForkActivation, ArcHardforkSchedule,
@@ -24,10 +28,7 @@ use alloy_evm::{precompiles::PrecompilesMap, Database as AlloyDatabase, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};
 use revm::{
     bytecode::{opcode, Bytecode},
-    context::{
-        result::{ExecutionResult, HaltReason},
-        ContextTr, JournalTr, TxEnv,
-    },
+    context::{result::ExecutionResult, ContextTr, JournalTr, TxEnv},
     context_interface::block::BlobExcessGasAndPrice,
     database::InMemoryDB,
     database_interface::DBErrorMarker,
@@ -52,12 +53,12 @@ const QUERY_CALLER: Address = address!("3000000000000000000000000000000000000003
 const P256_ADDRESS: Address = address!("0000000000000000000000000000000000000100");
 const TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([2, 0, 0, 0]);
 
-fn evm_env() -> EvmEnv<MainnetSpecId> {
+fn evm_env_at_timestamp(timestamp: u64) -> EvmEnv<MainnetSpecId> {
     let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
     cfg.chain_id = ARC_MAINNET_CHAIN_ID;
     let block = BlockEnv {
         number: U256::from(1),
-        timestamp: U256::from(1),
+        timestamp: U256::from(timestamp),
         gas_limit: 30_000_000,
         prevrandao: Some(B256::ZERO),
         blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
@@ -69,9 +70,24 @@ fn evm_env() -> EvmEnv<MainnetSpecId> {
     EvmEnv::new(cfg, block)
 }
 
+fn evm_env() -> EvmEnv<MainnetSpecId> {
+    evm_env_at_timestamp(1)
+}
+
 fn arc_evm<DB: AlloyDatabase>(db: DB) -> ArcEvm<DB, NoOpInspector> {
     ArcEvmFactory::new(ArcChainConfig::mainnet())
         .create(evm_env(), db, NoOpInspector {})
+        .expect("valid Arc test environment")
+}
+
+fn arc_evm_with_zero8<DB: AlloyDatabase>(db: DB, active: bool) -> ArcEvm<DB, NoOpInspector> {
+    let timestamp = if active {
+        ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET
+    } else {
+        ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET - 1
+    };
+    ArcEvmFactory::new(ArcChainConfig::mainnet())
+        .create(evm_env_at_timestamp(timestamp), db, NoOpInspector {})
         .expect("valid Arc test environment")
 }
 
@@ -122,6 +138,49 @@ fn direct_call<DB: AlloyDatabase>(
             return_memory_offset: 0..0,
             known_bytecode: None,
             scheme: revm::interpreter::CallScheme::Call,
+        })),
+        memory: SharedMemory::default(),
+        depth: 1,
+    };
+
+    match EvmTr::frame_init(evm, frame).expect("frame initialization must not return a DB error") {
+        ItemOrResult::Result(result) => result,
+        ItemOrResult::Item(_) => panic!("registered precompile must return an immediate result"),
+    }
+}
+
+fn direct_delegatecall<DB: AlloyDatabase>(
+    evm: &mut ArcEvm<DB, NoOpInspector>,
+    caller: Address,
+    target: Address,
+    bytecode_address: Address,
+    data: Bytes,
+    gas_limit: u64,
+) -> FrameResult {
+    for address in [
+        caller,
+        target,
+        bytecode_address,
+        NATIVE_COIN_CONTROL_ADDRESS,
+    ] {
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(address)
+            .expect("load delegatecall participant");
+    }
+
+    let frame = FrameInit {
+        frame_input: FrameInput::Call(Box::new(CallInputs {
+            target_address: target,
+            bytecode_address,
+            caller,
+            input: CallInput::Bytes(data),
+            value: CallValue::Apparent(U256::ZERO),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+            known_bytecode: None,
+            scheme: revm::interpreter::CallScheme::DelegateCall,
         })),
         memory: SharedMemory::default(),
         depth: 1,
@@ -443,6 +502,244 @@ fn native_coin_control_zero6_auth_precedes_floor_and_late_oog_rolls_back_write()
         U256::ZERO
     );
     assert!(late_oog.ctx().journaled_state.logs.is_empty());
+}
+
+#[test]
+fn zero8_stateful_precompile_delegatecall_rejections_charge_200_gas() {
+    let cases: [(&str, Address, Address, Bytes); 3] = [
+        (
+            "native coin authority",
+            NATIVE_FIAT_TOKEN_ADDRESS,
+            NATIVE_COIN_AUTHORITY_ADDRESS,
+            INativeCoinAuthority::mintCall {
+                to: USER,
+                amount: U256::ONE,
+            }
+            .abi_encode()
+            .into(),
+        ),
+        (
+            "native coin control",
+            NATIVE_FIAT_TOKEN_ADDRESS,
+            NATIVE_COIN_CONTROL_ADDRESS,
+            INativeCoinControl::blocklistCall { account: USER }
+                .abi_encode()
+                .into(),
+        ),
+        (
+            "system accounting",
+            SYSTEM_ADDRESS,
+            SYSTEM_ACCOUNTING_ADDRESS,
+            ISystemAccounting::storeGasValuesCall {
+                blockNumber: 1,
+                gasValues: GasValues {
+                    gasUsed: 1,
+                    gasUsedSmoothed: 2,
+                    nextBaseFee: 3,
+                },
+            }
+            .abi_encode()
+            .into(),
+        ),
+    ];
+
+    for (name, caller, precompile, calldata) in cases {
+        let mut below_penalty = arc_evm_with_zero8(InMemoryDB::default(), true);
+        let result = direct_delegatecall(
+            &mut below_penalty,
+            caller,
+            OTHER,
+            precompile,
+            calldata.clone(),
+            PRECOMPILE_EARLY_REVERT_GAS_PENALTY - 1,
+        );
+        assert_eq!(
+            call_instruction(&result),
+            InstructionResult::PrecompileOOG,
+            "{name}: 199 gas must halt as OOG"
+        );
+        let mut exact_penalty = arc_evm_with_zero8(InMemoryDB::default(), true);
+        let result = direct_delegatecall(
+            &mut exact_penalty,
+            caller,
+            OTHER,
+            precompile,
+            calldata.clone(),
+            PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+        );
+        assert_eq!(
+            call_instruction(&result),
+            InstructionResult::Revert,
+            "{name}: 200 gas must reach the delegatecall revert"
+        );
+        assert_eq!(call_gas_spent(&result), PRECOMPILE_EARLY_REVERT_GAS_PENALTY);
+        assert_eq!(
+            call_output(&result),
+            revert_message_to_bytes(ERR_DELEGATE_CALL_NOT_ALLOWED).as_ref()
+        );
+
+        let mut pre_zero8 = arc_evm_with_zero8(InMemoryDB::default(), false);
+        let result =
+            direct_delegatecall(&mut pre_zero8, caller, OTHER, precompile, calldata, 100_000);
+        assert_eq!(call_instruction(&result), InstructionResult::Revert);
+        assert_eq!(
+            call_gas_spent(&result),
+            0,
+            "{name}: pre-Zero8 delegatecall rejection must remain free"
+        );
+    }
+}
+
+#[test]
+fn native_coin_control_zero8_orders_auth_delegatecall_then_success_floor() {
+    let cases: [(&str, Bytes, &str); 2] = [
+        (
+            "blocklist",
+            INativeCoinControl::blocklistCall { account: USER }
+                .abi_encode()
+                .into(),
+            "Not enabled for blocklisting",
+        ),
+        (
+            "unblocklist",
+            INativeCoinControl::unBlocklistCall { account: USER }
+                .abi_encode()
+                .into(),
+            "Not enabled for unblocklisting",
+        ),
+    ];
+
+    for (name, calldata, auth_error) in cases {
+        let mut unauthorized = arc_evm_with_zero8(InMemoryDB::default(), true);
+        let result = direct_delegatecall(
+            &mut unauthorized,
+            OTHER,
+            USER,
+            NATIVE_COIN_CONTROL_ADDRESS,
+            calldata.clone(),
+            PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+        );
+        assert_eq!(call_instruction(&result), InstructionResult::Revert);
+        assert_eq!(
+            call_output(&result),
+            revert_message_to_bytes(auth_error).as_ref(),
+            "{name}: authorization must run before delegatecall validation"
+        );
+
+        let mut authorized_delegate = arc_evm_with_zero8(InMemoryDB::default(), true);
+        let result = direct_delegatecall(
+            &mut authorized_delegate,
+            NATIVE_FIAT_TOKEN_ADDRESS,
+            USER,
+            NATIVE_COIN_CONTROL_ADDRESS,
+            calldata.clone(),
+            PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+        );
+        assert_eq!(call_instruction(&result), InstructionResult::Revert);
+        assert_eq!(
+            call_output(&result),
+            revert_message_to_bytes(ERR_DELEGATE_CALL_NOT_ALLOWED).as_ref(),
+            "{name}: delegatecall validation must run before the success gas floor"
+        );
+
+        let mut authorized_direct = arc_evm_with_zero8(InMemoryDB::default(), true);
+        let result = direct_call(
+            &mut authorized_direct,
+            NATIVE_FIAT_TOKEN_ADDRESS,
+            NATIVE_COIN_CONTROL_ADDRESS,
+            calldata.clone(),
+            PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+            U256::ZERO,
+        );
+        assert_eq!(
+            call_instruction(&result),
+            InstructionResult::PrecompileOOG,
+            "{name}: a direct call must still enforce the success gas floor"
+        );
+
+        let mut pre_zero8 = arc_evm_with_zero8(InMemoryDB::default(), false);
+        let result = direct_delegatecall(
+            &mut pre_zero8,
+            NATIVE_FIAT_TOKEN_ADDRESS,
+            USER,
+            NATIVE_COIN_CONTROL_ADDRESS,
+            calldata,
+            1_000,
+        );
+        assert_eq!(
+            call_instruction(&result),
+            InstructionResult::PrecompileOOG,
+            "{name}: pre-Zero8 must retain success-floor-before-delegatecall ordering"
+        );
+    }
+}
+
+#[test]
+fn native_coin_authority_zero8_permits_draining_an_account_to_empty() {
+    let make_db = || {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            USER,
+            AccountInfo {
+                balance: U256::from(10),
+                nonce: 0,
+                ..Default::default()
+            },
+        );
+        db.insert_account_storage(
+            NATIVE_COIN_AUTHORITY_ADDRESS,
+            TOTAL_SUPPLY_SLOT,
+            U256::from(10),
+        )
+        .expect("insert total supply");
+        db
+    };
+    let burn: Bytes = INativeCoinAuthority::burnCall {
+        from: USER,
+        amount: U256::from(10),
+    }
+    .abi_encode()
+    .into();
+
+    let mut pre_zero8 = arc_evm_with_zero8(make_db(), false);
+    let result = direct_call(
+        &mut pre_zero8,
+        NATIVE_FIAT_TOKEN_ADDRESS,
+        NATIVE_COIN_AUTHORITY_ADDRESS,
+        burn.clone(),
+        100_000,
+        U256::ZERO,
+    );
+    assert_eq!(call_instruction(&result), InstructionResult::Revert);
+    assert_eq!(
+        call_output(&result),
+        revert_message_to_bytes(ERR_CLEAR_EMPTY).as_ref()
+    );
+    assert_eq!(current_balance(&mut pre_zero8, USER), U256::from(10));
+    assert_eq!(
+        current_storage(
+            &mut pre_zero8,
+            NATIVE_COIN_AUTHORITY_ADDRESS,
+            TOTAL_SUPPLY_SLOT,
+        ),
+        U256::from(10)
+    );
+
+    let mut zero8 = arc_evm_with_zero8(make_db(), true);
+    let result = direct_call(
+        &mut zero8,
+        NATIVE_FIAT_TOKEN_ADDRESS,
+        NATIVE_COIN_AUTHORITY_ADDRESS,
+        burn,
+        100_000,
+        U256::ZERO,
+    );
+    assert_eq!(call_instruction(&result), InstructionResult::Return);
+    assert_eq!(current_balance(&mut zero8, USER), U256::ZERO);
+    assert_eq!(
+        current_storage(&mut zero8, NATIVE_COIN_AUTHORITY_ADDRESS, TOTAL_SUPPLY_SLOT,),
+        U256::ZERO
+    );
 }
 
 #[test]
@@ -1020,7 +1317,7 @@ impl RevmDatabase for FailingRecipientDb {
 }
 
 #[test]
-fn blocklist_db_error_becomes_precompile_halt_and_leaks_no_custom_state_or_logs() {
+fn blocklist_db_error_aborts_execution_and_clears_state_and_logs() {
     let mut inner = InMemoryDB::default();
     inner.insert_account_info(USER, account_info(U256::from(5)));
     let db = FailingBlocklistDb {
@@ -1043,16 +1340,11 @@ fn blocklist_db_error_becomes_precompile_halt_and_leaks_no_custom_state_or_logs(
             100_000,
             0,
         ))
-        .expect("DB failure inside precompile is an EVM halt");
+        .expect_err("DB failure must abort the transaction");
 
-    assert!(matches!(
-        result.result,
-        ExecutionResult::Halt {
-            reason: HaltReason::PrecompileError,
-            ..
-        }
-    ));
-    assert!(result.result.logs().is_empty());
+    assert!(matches!(result, revm::context::result::EVMError::Custom(_)));
+    assert!(evm.ctx().journaled_state.state.is_empty());
+    assert!(evm.ctx().journaled_state.logs.is_empty());
     assert_eq!(
         evm.ctx().journaled_state.db().ncc_reads,
         [
@@ -1060,18 +1352,20 @@ fn blocklist_db_error_becomes_precompile_halt_and_leaks_no_custom_state_or_logs(
             blocklist_storage_slot(USER),
         ]
     );
-    let nca = result.state.get(&NATIVE_COIN_AUTHORITY_ADDRESS);
-    assert!(
-        nca.and_then(|account| account.storage.get(&TOTAL_SUPPLY_SLOT))
-            .is_none_or(|slot| slot.present_value().is_zero()),
-        "total supply write must not escape the failed precompile"
+    assert_eq!(
+        infallible(evm.ctx_mut().db_mut().inner.basic(USER))
+            .unwrap()
+            .balance,
+        U256::from(5)
     );
     assert_eq!(
-        result
-            .state
-            .get(&USER)
-            .map_or(U256::from(5), |account| account.info.balance),
-        U256::from(5)
+        infallible(
+            evm.ctx_mut()
+                .db_mut()
+                .inner
+                .storage(NATIVE_COIN_AUTHORITY_ADDRESS, TOTAL_SUPPLY_SLOT)
+        ),
+        U256::ZERO
     );
 }
 
@@ -1097,24 +1391,21 @@ fn recipient_db_error_after_total_supply_write_rolls_back_partial_mutation() {
             100_000,
             0,
         ))
-        .expect("recipient DB failure inside precompile is an EVM halt");
+        .expect_err("recipient DB failure must abort the transaction");
 
-    assert!(matches!(
-        result.result,
-        ExecutionResult::Halt {
-            reason: HaltReason::PrecompileError,
-            ..
-        }
-    ));
-    assert!(result.result.logs().is_empty());
+    assert!(matches!(result, revm::context::result::EVMError::Custom(_)));
+    assert!(evm.ctx().journaled_state.state.is_empty());
+    assert!(evm.ctx().journaled_state.logs.is_empty());
     assert_eq!(evm.ctx().journaled_state.db().failed_recipient_reads, 1);
-    assert!(
-        result
-            .state
-            .get(&NATIVE_COIN_AUTHORITY_ADDRESS)
-            .and_then(|account| account.storage.get(&TOTAL_SUPPLY_SLOT))
-            .is_none_or(|slot| slot.present_value().is_zero()),
-        "totalSupply was written before recipient load and must be rolled back"
+    assert_eq!(
+        infallible(
+            evm.ctx_mut()
+                .db_mut()
+                .inner
+                .storage(NATIVE_COIN_AUTHORITY_ADDRESS, TOTAL_SUPPLY_SLOT)
+        ),
+        U256::ZERO,
+        "totalSupply was written before recipient load and must be discarded"
     );
     assert_eq!(
         infallible(evm.ctx_mut().db_mut().inner.basic(USER))

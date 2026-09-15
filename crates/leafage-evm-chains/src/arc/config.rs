@@ -3,6 +3,8 @@ use leafage_evm_types::MainnetSpecId;
 use super::{ArcForkActivation, ArcHardforkFlags, ArcHardforkSchedule};
 
 pub const ARC_MAINNET_CHAIN_ID: u64 = 5042;
+pub const ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET: u64 = 1_789_052_400;
+pub const ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET: u64 = 1_789_052_400;
 
 /// Ethereum and Arc hardfork state for one execution environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,8 +31,8 @@ impl ArcChainConfig {
                 ArcForkActivation::Block(0),
                 ArcForkActivation::Block(0),
                 ArcForkActivation::Block(0),
-                ArcForkActivation::Never,
-                ArcForkActivation::Never,
+                ArcForkActivation::Timestamp(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+                ArcForkActivation::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
             ),
         }
     }
@@ -75,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_arc_forks_match_v0_7_3_schedule() {
+    fn mainnet_arc_forks_match_v0_8_0_schedule() {
         let config = ArcChainConfig::mainnet();
 
         for (hardfork, activation) in [
@@ -83,8 +85,14 @@ mod tests {
             (ArcHardfork::Zero4, ArcForkActivation::Block(0)),
             (ArcHardfork::Zero5, ArcForkActivation::Block(0)),
             (ArcHardfork::Zero6, ArcForkActivation::Block(0)),
-            (ArcHardfork::Zero7, ArcForkActivation::Never),
-            (ArcHardfork::Zero8, ArcForkActivation::Never),
+            (
+                ArcHardfork::Zero7,
+                ArcForkActivation::Timestamp(ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+            ),
+            (
+                ArcHardfork::Zero8,
+                ArcForkActivation::Timestamp(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET),
+            ),
         ] {
             assert_eq!(config.hardforks().activation(hardfork), activation);
         }
@@ -102,8 +110,24 @@ mod tests {
         assert!(!genesis.arc_flags.is_active(ArcHardfork::Zero8));
 
         let latest = config.execution_spec_at(u64::MAX, u64::MAX);
-        assert!(!latest.arc_flags.is_active(ArcHardfork::Zero7));
-        assert!(!latest.arc_flags.is_active(ArcHardfork::Zero8));
+        assert!(latest.arc_flags.is_active(ArcHardfork::Zero7));
+        assert!(latest.arc_flags.is_active(ArcHardfork::Zero8));
+    }
+
+    #[test]
+    fn mainnet_zero7_and_zero8_activate_at_the_timestamp_boundary() {
+        let config = ArcChainConfig::mainnet();
+        let activation = ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET;
+
+        let before = config.execution_spec_at(u64::MAX, activation - 1);
+        assert!(!before.arc_flags.is_active(ArcHardfork::Zero7));
+        assert!(!before.arc_flags.is_active(ArcHardfork::Zero8));
+
+        for timestamp in [activation, activation + 1] {
+            let active = config.execution_spec_at(0, timestamp).arc_flags;
+            assert!(active.is_active(ArcHardfork::Zero7));
+            assert!(active.is_active(ArcHardfork::Zero8));
+        }
     }
 
     #[test]
