@@ -95,7 +95,11 @@ impl Storable for Pool {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[0..16].copy_from_slice(&self.reserve_validator_token.to_be_bytes());
         bytes[16..32].copy_from_slice(&self.reserve_user_token.to_be_bytes());
         storage.store(slot, U256::from_be_bytes(bytes))
@@ -515,6 +519,15 @@ impl TipFeeManager {
                 TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
             })?;
 
+        if self.storage.spec().is_t1c() {
+            let reserved = self.pending_fee_swap_reservation[pool_id].t_read()?;
+            if pool.reserve_validator_token < reserved {
+                return Err(TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
+                ));
+            }
+        }
+
         self.pools[pool_id].write(pool)?;
 
         // Transfer validator tokens from swapper into the pool
@@ -739,12 +752,33 @@ impl TipFeeManager {
             .and_then(|p| p.checked_div(total_supply_val))
             .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
 
+        let validator_amount: u128 = amount_validator_token.try_into().map_err(|_| {
+            TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
+        })?;
+        let available_after_burn = pool
+            .reserve_validator_token
+            .checked_sub(validator_amount)
+            .ok_or_else(|| {
+                TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientReserves {}.abi_encode().into(),
+                )
+            })?;
+        if self.storage.spec().is_t1c() {
+            let reserved = self.pending_fee_swap_reservation[pool_id].t_read()?;
+            if available_after_burn < reserved {
+                return Err(TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
+                ));
+            }
+        }
+
         // Update balances and supply
         self.liquidity_balances[pool_id][msg_sender].write(
             balance
                 .checked_sub(liquidity)
                 .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn balance".into()))?,
         )?;
+        let total_supply_val = self.total_supply[pool_id].read()?;
         self.total_supply[pool_id].write(total_supply_val.checked_sub(liquidity).ok_or_else(
             || TempoPrecompileError::Fatal("overflow in burn total_supply".into()),
         )?)?;

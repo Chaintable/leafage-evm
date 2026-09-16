@@ -191,7 +191,18 @@ impl Storable for UserRewardInfo {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        storage.store(slot, <Address as FromWord>::to_word(&self.reward_recipient))?;
+        let current = if StorageCtx::default().spec().is_t4() {
+            U256::ZERO
+        } else {
+            storage.load(slot)?
+        };
+        let recipient = super::storage_types::packing::insert_into_word(
+            current,
+            &self.reward_recipient,
+            0,
+            20,
+        )?;
+        storage.store(slot, recipient)?;
         storage.store(slot + U256::from(1), self.reward_per_token)?;
         storage.store(slot + U256::from(2), self.reward_balance)?;
         Ok(())
@@ -274,7 +285,7 @@ impl TIP20Token {
             currency: BytesLikeHandler::new(U256::from(4), address),
             logo_uri: BytesLikeHandler::new(U256::from(5), address),
             quote_token: Slot::new(U256::from(6), address),
-            next_quote_token: Slot::new(U256::from(7), address),
+            next_quote_token: Slot::new_with_ctx(U256::from(7), LayoutCtx::packed(0), address),
             transfer_policy_id: Slot::new_with_ctx(U256::from(7), LayoutCtx::packed(20), address),
             total_supply: Slot::new(U256::from(8), address),
             balances: Mapping::new(U256::from(9), address),
@@ -1563,11 +1574,11 @@ impl TIP20Token {
         amount: U256,
         check_protected: bool,
     ) -> Result<()> {
-        self.check_role(msg_sender, *BURN_BLOCKED_ROLE)?;
         // TIP-1038 #2 (T3+): burn_blocked must respect the paused flag.
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
         }
+        self.check_role(msg_sender, *BURN_BLOCKED_ROLE)?;
 
         if check_protected
             && (owner == TIP_FEE_MANAGER_ADDRESS

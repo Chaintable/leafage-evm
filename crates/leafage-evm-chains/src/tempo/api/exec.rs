@@ -608,6 +608,12 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     let hardfork = evm.ctx().cfg.spec;
     let chain_id = evm.ctx().cfg.chain_id;
     let candidates = FeeTokenCandidates::from_tx(&evm.ctx().tx, fee_payer, hardfork);
+    // Tempo uses a 256-bit gas payment calculation, without blob fees. Keep the
+    // checked addition: a zero gas price does not imply a free nonzero-value call.
+    let tx = &evm.ctx().tx.base;
+    let max_spending = U256::from(tx.gas_limit)
+        .checked_mul(U256::from(tx.gas_price))
+        .and_then(|fee| fee.checked_add(tx.value));
 
     let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
     let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
@@ -623,6 +629,33 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         return Err(EVMError::Transaction(
             TempoInvalidTransaction::FeeTokenNotTip20 { address: fee_token },
         ));
+    }
+    let max_spending = max_spending.ok_or_else(|| {
+        EVMError::Transaction(TempoInvalidTransaction::from(
+            revm::context::result::InvalidTransaction::OverflowPaymentInTransaction,
+        ))
+    })?;
+    if !max_spending.is_zero() {
+        // Mirror ensure_tip20_usd: both len and the short-string read matter for
+        // access ordering. Long metadata is rejected without loading its tail.
+        let currency = StorageCtx::enter(&mut storage, || {
+            let token = TIP20Token::from_address_unchecked(fee_token);
+            let len = token.currency.len()?;
+            if len > 31 {
+                Ok(format!("<{len} bytes>"))
+            } else {
+                token.currency.read()
+            }
+        })
+        .map_err(map_error)?;
+        if currency != "USD" {
+            return Err(EVMError::Transaction(
+                TempoInvalidTransaction::FeeTokenNotUsdCurrency {
+                    address: fee_token,
+                    currency,
+                },
+            ));
+        }
     }
     StorageCtx::enter(&mut storage, || {
         TIP20Token::from_address_unchecked(fee_token).balances[fee_payer].read()
@@ -1459,15 +1492,8 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
     // Calculate batch intrinsic gas.
     let mut batch_gas = calculate_aa_batch_intrinsic_gas(tempo_fields, &gas_params, evm, hardfork)?;
 
-    // Calculate 2D nonce gas based on hardfork and nonce_key.
-    // For nonceKey > 0, the relevant nonce is the 2D nonce from NonceManager storage,
-    // NOT the protocol nonce (tx.base.nonce). Writer uses tx.nonce which comes from the
-    // signed transaction (explicitly set by the AA sender). Leafage reads from DB.
-    // Read the 2D nonce from NonceManager to determine new_account vs existing_key gas.
-    // For nonceKey > 0, read the 2D nonce from NonceManager storage to determine
-    // whether this is a new nonce key (nonce==0 → +250k) or existing (→ +5k).
-    // Writer uses tx.nonce (from signed tx where sender explicitly sets nonce=0 for new keys).
-    // Leafage reads from storage since tx.nonce comes from DB (protocol nonce, not 2D nonce).
+    // RPC preparation places the selected 2D nonce in tx.base.nonce. Use that
+    // execution nonce here, not the caller's protocol nonce or a second DB read.
     let mut nonce_2d_gas: u64 = 0;
 
     if hardfork.is_t1() {
@@ -2367,7 +2393,8 @@ mod tests {
             let initial = 100_000;
             let mut init_gas = InitialAndFloorGas::new(initial, 0);
             apply_signed_key_authorization(&mut evm, Some(&mut init_gas)).unwrap();
-            assert_eq!(init_gas.initial_gas - initial, 250_575);
+            // Pre-T4 AuthorizedKey store includes the packed-group SLOAD.
+            assert_eq!(init_gas.initial_gas - initial, 250_675);
             assert_eq!(key_status(&mut evm, root, child), (true, false));
         }
     }

@@ -100,7 +100,11 @@ impl Storable for RegistryData {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[0] = self.ty;
         bytes[1..12].copy_from_slice(self.reserved.as_slice());
         bytes[12..32].copy_from_slice(self.master_address.as_slice());
@@ -114,12 +118,8 @@ impl Storable for RegistryData {
 
 /// TIP-1022 virtual address registry contract.
 ///
-/// `MasterId` (4 bytes) is stored as a Solidity-style mapping key — i.e. the
-/// 4 bytes are right-padded with 28 zero bytes before hashing to produce the
-/// storage slot. We implement this by storing the right-padded value as a
-/// `B256` Mapping key, since `bytes4` ABI encoding pads on the right but the
-/// leafage `StorageKey` infrastructure pads on the left (which would diverge
-/// from writer / Solidity behaviour for sub-32-byte byte types).
+/// Tempo storage left-pads `MasterId` to 32 bytes before hashing the mapping key.
+/// This differs from the right-padding used by the Solidity `bytes4` ABI.
 pub struct AddressRegistry {
     pub data: Mapping<B256, RegistryData>,
     pub address: Address,
@@ -136,12 +136,11 @@ impl AddressRegistry {
         }
     }
 
-    /// Encode a `MasterId` (4 bytes) as a Solidity `bytes4` mapping key
-    /// (right-padded with 28 zero bytes to 32 bytes).
+    /// Encode a `MasterId` using Tempo's left-padded storage key representation.
     #[inline]
     fn master_id_key(id: MasterId) -> B256 {
         let mut buf = [0u8; 32];
-        buf[..4].copy_from_slice(id.as_slice());
+        buf[28..].copy_from_slice(id.as_slice());
         B256::from(buf)
     }
 
@@ -385,7 +384,10 @@ mod tests {
         };
 
         let mut mock = MockStorage::new();
-        data.store(&mut mock, U256::from(42), LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            data.store(&mut mock, U256::from(42), LayoutCtx::FULL)
+        })
+        .unwrap();
         let loaded = RegistryData::load(&mock, U256::from(42), LayoutCtx::FULL).unwrap();
         assert_eq!(loaded, data);
     }
@@ -405,7 +407,10 @@ mod tests {
         };
 
         let mut mock = MockStorage::new();
-        data.store(&mut mock, U256::from(7), LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            data.store(&mut mock, U256::from(7), LayoutCtx::FULL)
+        })
+        .unwrap();
 
         let stored = mock.load(U256::from(7)).unwrap();
         let bytes = stored.to_be_bytes::<32>();
@@ -421,12 +426,12 @@ mod tests {
     }
 
     #[test]
-    fn master_id_key_right_pads_to_b256() {
+    fn master_id_key_left_pads_to_b256() {
         let id = MasterId::from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         let key = AddressRegistry::master_id_key(id);
         let bytes = key.as_slice();
-        assert_eq!(&bytes[..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(&bytes[4..], &[0u8; 28], "must right-pad with zeros");
+        assert_eq!(&bytes[28..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(&bytes[..28], &[0u8; 28], "must left-pad with zeros");
     }
 
     #[test]

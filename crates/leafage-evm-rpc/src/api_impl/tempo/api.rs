@@ -126,6 +126,15 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                     Some(serde_json::json!({"name": "FeeTokenNotTip20Error", "token": address})),
                 )
             }
+            TempoInvalidTransaction::FeeTokenNotUsdCurrency { address, currency } => {
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32003,
+                    self.to_string(),
+                    Some(serde_json::json!({
+                        "name": "FeeTokenNotUsdError", "token": address, "currency": currency,
+                    })),
+                )
+            }
             TempoInvalidTransaction::NonceManagerError(_)
             | TempoInvalidTransaction::ExpiringNonceMissingValidBefore
             | TempoInvalidTransaction::ExpiringNonceNonceNotZero => rpc_error_with_code(
@@ -443,6 +452,24 @@ where
         };
         use revm::primitives::TxKind;
 
+        // Reject ambiguous signed bytes before recovering the payer or filling defaults.
+        request
+            .inner
+            .input
+            .unique_input()
+            .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
+        if let Some(calls) = request
+            .tempo
+            .as_ref()
+            .and_then(|te| te.tempo_calls.as_ref())
+        {
+            for call in calls {
+                call.input
+                    .unique_input()
+                    .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
+            }
+        }
+
         // Extract Tempo-specific fields before consuming the request.
         let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
         let auth_list = request
@@ -476,13 +503,15 @@ where
             ));
         }
 
-        // Auto-fill 2D nonce from NonceManager storage when not provided.
-        // Ported from writer compat.rs:309-324.
+        // Unsigned eth_call-style requests execute with the current 2D state nonce,
+        // including the temporary state left by earlier calls in a simulation sequence.
+        // A sponsor signature binds the original nonce; preserve that signed path.
         if let Some(nk) = nonce_key {
-            if !nk.is_zero() && request.inner.nonce.is_none() {
-                use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+            if !nk.is_zero() && (te.fee_payer_signature.is_none() || request.inner.nonce.is_none())
+            {
                 use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
-                let nonce = if nk == revm::primitives::U256::MAX {
+                use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+                let nonce = if nk == revm::primitives::U256::MAX && hardfork.is_t1() {
                     0u64 // expiring nonce must be 0
                 } else {
                     let caller = request.inner.from.unwrap_or_default();
@@ -490,7 +519,7 @@ where
                     let slot = nk.mapping_slot(slot);
                     db.storage_ref(NONCE_PRECOMPILE_ADDRESS, slot)
                         .map(|v| v.saturating_to::<u64>())
-                        .unwrap_or(0)
+                        .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
                 };
                 request.inner.nonce = Some(nonce);
             }

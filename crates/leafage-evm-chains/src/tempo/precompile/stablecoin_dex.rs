@@ -273,12 +273,20 @@ impl Storable for TickLevel {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes0 = [0u8; 32];
+        let mut bytes0 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes0[16..32].copy_from_slice(&self.head.to_be_bytes());
         bytes0[0..16].copy_from_slice(&self.tail.to_be_bytes());
         storage.store(slot, U256::from_be_bytes(bytes0))?;
 
-        let mut bytes1 = [0u8; 32];
+        let mut bytes1 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(1))?.to_be_bytes::<32>()
+        };
         bytes1[16..32].copy_from_slice(&self.total_liquidity.to_be_bytes());
         storage.store(slot + U256::from(1), U256::from_be_bytes(bytes1))?;
 
@@ -515,12 +523,21 @@ impl Storable for Order {
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
         // Slot 0: order_id
-        let mut b0 = [0u8; 32];
+        let t4 = StorageCtx::default().spec().is_t4();
+        let mut b0 = if t4 {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         b0[16..32].copy_from_slice(&self.order_id.to_be_bytes());
         storage.store(slot, U256::from_be_bytes(b0))?;
 
         // Slot 1: maker
-        let mut b1 = [0u8; 32];
+        let mut b1 = if t4 {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(1))?.to_be_bytes::<32>()
+        };
         b1[12..32].copy_from_slice(self.maker.as_slice());
         storage.store(slot + U256::from(1), U256::from_be_bytes(b1))?;
 
@@ -528,20 +545,32 @@ impl Storable for Order {
         storage.store(slot + U256::from(2), U256::from_be_bytes(self.book_key.0))?;
 
         // Slot 3: is_bid + tick + amount
-        let mut b3 = [0u8; 32];
+        let mut b3 = if t4 {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(3))?.to_be_bytes::<32>()
+        };
         b3[31] = if self.is_bid { 1 } else { 0 };
         b3[29..31].copy_from_slice(&self.tick.to_be_bytes());
         b3[13..29].copy_from_slice(&self.amount.to_be_bytes());
         storage.store(slot + U256::from(3), U256::from_be_bytes(b3))?;
 
         // Slot 4: remaining + prev
-        let mut b4 = [0u8; 32];
+        let mut b4 = if t4 {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(4))?.to_be_bytes::<32>()
+        };
         b4[16..32].copy_from_slice(&self.remaining.to_be_bytes());
         b4[0..16].copy_from_slice(&self.prev.to_be_bytes());
         storage.store(slot + U256::from(4), U256::from_be_bytes(b4))?;
 
         // Slot 5: next + is_flip + flip_tick
-        let mut b5 = [0u8; 32];
+        let mut b5 = if t4 {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(5))?.to_be_bytes::<32>()
+        };
         b5[16..32].copy_from_slice(&self.next.to_be_bytes());
         b5[15] = if self.is_flip { 1 } else { 0 };
         b5[13..15].copy_from_slice(&self.flip_tick.to_be_bytes());
@@ -1197,15 +1226,19 @@ impl OrderbookHandle {
     }
 
     fn write_best_bid_tick(&mut self, tick: i16) -> Result<()> {
-        let mut data = self.read_data()?;
-        data.best_bid_tick = tick;
-        self.write_data(&data)
+        let mut ctx = StorageCtx::default();
+        let slot = self.slot + U256::from(4);
+        let current = ctx.sload(self.address, slot)?;
+        let updated = packing::insert_into_word(current, &tick, 0, 2)?;
+        ctx.sstore(self.address, slot, updated)
     }
 
     fn write_best_ask_tick(&mut self, tick: i16) -> Result<()> {
-        let mut data = self.read_data()?;
-        data.best_ask_tick = tick;
-        self.write_data(&data)
+        let mut ctx = StorageCtx::default();
+        let slot = self.slot + U256::from(4);
+        let current = ctx.sload(self.address, slot)?;
+        let updated = packing::insert_into_word(current, &tick, 2, 2)?;
+        ctx.sstore(self.address, slot, updated)
     }
 
     fn write_book_id(&mut self, book_id: BookId) -> Result<()> {

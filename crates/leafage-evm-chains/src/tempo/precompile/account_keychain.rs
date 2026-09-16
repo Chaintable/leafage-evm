@@ -240,7 +240,11 @@ impl Storable for AuthorizedKey {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[31] = self.signature_type;
         bytes[23..31].copy_from_slice(&self.expiry.to_be_bytes());
         bytes[22] = if self.enforce_limits { 1 } else { 0 };
@@ -344,7 +348,11 @@ impl Storable for SpendingLimitState {
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
         storage.store(slot, self.remaining)?;
-        let mut packed = U256::ZERO;
+        let mut packed = if StorageCtx::default().spec().is_t4() {
+            U256::ZERO
+        } else {
+            storage.load(slot + U256::ONE)?
+        };
         packed = packing::insert_into_word(
             packed,
             &self.max,
@@ -429,7 +437,12 @@ impl Handler<SpendingLimitState> for SpendingLimitStateHandler {
         // Write the packed slot in one shot to match writer's auto-derive
         // (which avoids 3 RMW SSTOREs for the packed fields).
         self.remaining.write(value.remaining)?;
-        let mut packed = U256::ZERO;
+        let mut packed_slot = Slot::<U256>::new(self.base_slot + U256::ONE, self.address);
+        let mut packed = if StorageCtx::default().spec().is_t4() {
+            U256::ZERO
+        } else {
+            packed_slot.read()?
+        };
         packed = packing::insert_into_word(
             packed,
             &value.max,
@@ -448,7 +461,6 @@ impl Handler<SpendingLimitState> for SpendingLimitStateHandler {
             SPENDING_LIMIT_PERIOD_END_OFFSET,
             SPENDING_LIMIT_PERIOD_END_BYTES,
         )?;
-        let mut packed_slot = Slot::<U256>::new(self.base_slot + U256::ONE, self.address);
         packed_slot.write(packed)
     }
 
@@ -3323,7 +3335,10 @@ mod tests {
         };
 
         let mut mock = MockStorage::new();
-        state.store(&mut mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            state.store(&mut mock, U256::from(7u8), LayoutCtx::FULL)
+        })
+        .unwrap();
         let loaded = SpendingLimitState::load(&mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
         assert_eq!(loaded, state);
     }
@@ -3338,7 +3353,10 @@ mod tests {
             period_end: 1_012,
         };
         let mut mock = MockStorage::new();
-        state.store(&mut mock, base_slot, LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            state.store(&mut mock, base_slot, LayoutCtx::FULL)
+        })
+        .unwrap();
         mock.reset_load_count();
 
         let handler = SpendingLimitStateHandler::new(base_slot, Address::ZERO);
@@ -3358,7 +3376,10 @@ mod tests {
         };
 
         let mut mock = MockStorage::new();
-        state.store(&mut mock, U256::from(0u8), LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            state.store(&mut mock, U256::from(0u8), LayoutCtx::FULL)
+        })
+        .unwrap();
 
         // Slot 0: remaining
         assert_eq!(mock.load(U256::ZERO).unwrap(), U256::from(42u8));

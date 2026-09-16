@@ -131,6 +131,8 @@ pub enum TempoInvalidTransaction {
     EthInvalidTransaction(revm::context::result::InvalidTransaction),
     /// The selected fee token does not have the required TIP-20 address prefix.
     FeeTokenNotTip20 { address: Address },
+    /// The selected TIP-20 fee token is not USD-denominated.
+    FeeTokenNotUsdCurrency { address: Address, currency: String },
     /// Nonce-manager validation failed.
     NonceManagerError(String),
     /// Expiring nonce transaction omitted `valid_before`.
@@ -152,6 +154,10 @@ impl core::fmt::Display for TempoInvalidTransaction {
             Self::FeeTokenNotTip20 { address } => write!(
                 f,
                 "fee token {address} is not a TIP-20 token; fee tokens must be TIP-20 tokens"
+            ),
+            Self::FeeTokenNotUsdCurrency { address, currency } => write!(
+                f,
+                "fee token {address} uses currency {currency:?}; fee tokens must be USD-denominated TIP-20 tokens"
             ),
             Self::NonceManagerError(reason) => write!(f, "nonce manager error: {reason}"),
             Self::ExpiringNonceMissingValidBefore => {

@@ -130,7 +130,11 @@ impl Storable for Validator {
         storage.store(slot, U256::from_be_bytes(self.public_key.0))?;
 
         // Slot+1: packed
-        let mut bytes1 = [0u8; 32];
+        let mut bytes1 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(1))?.to_be_bytes::<32>()
+        };
         // active at byte 31
         bytes1[31] = if self.active { 1 } else { 0 };
         // index at bytes 23..31

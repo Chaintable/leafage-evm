@@ -198,7 +198,11 @@ impl Storable for PolicyData {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[31] = self.policy_type;
         bytes[11..31].copy_from_slice(self.admin.as_slice());
         storage.store(slot, U256::from_be_bytes(bytes))
@@ -291,7 +295,11 @@ impl Storable for CompoundPolicyData {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[24..32].copy_from_slice(&self.sender_policy_id.to_be_bytes());
         bytes[16..24].copy_from_slice(&self.recipient_policy_id.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.mint_recipient_policy_id.to_be_bytes());
@@ -699,11 +707,11 @@ impl TIP403Registry {
             return Err(err);
         }
 
-        let record = self.policy_records[call.policyId].read()?;
+        let compound = self.get_compound_policy_data(call.policyId)?;
         Ok(ITIP403Registry::compoundPolicyDataReturn {
-            senderPolicyId: record.compound.sender_policy_id,
-            recipientPolicyId: record.compound.recipient_policy_id,
-            mintRecipientPolicyId: record.compound.mint_recipient_policy_id,
+            senderPolicyId: compound.sender_policy_id,
+            recipientPolicyId: compound.recipient_policy_id,
+            mintRecipientPolicyId: compound.mint_recipient_policy_id,
         })
     }
 
@@ -722,13 +730,13 @@ impl TIP403Registry {
                 .ok_or_else(TempoPrecompileError::under_overflow)?,
         )?;
 
-        self.policy_records[new_policy_id].write(PolicyRecord {
-            base: PolicyData {
+        self.set_policy_data(
+            new_policy_id,
+            PolicyData {
                 policy_type,
                 admin: call.admin,
             },
-            compound: CompoundPolicyData::default(),
-        })?;
+        )?;
 
         self.emit_event(ITIP403Registry::PolicyCreated {
             policyId: new_policy_id,
@@ -755,6 +763,9 @@ impl TIP403Registry {
     ) -> Result<u64> {
         let admin = call.admin;
         let policy_type = ensure_is_simple(&call.policyType)?;
+        if self.storage.spec().is_t3() && call.accounts.iter().any(|account| account.is_virtual()) {
+            return Err(err_virtual_address_not_allowed());
+        }
         let new_policy_id = self.policy_id_counter()?;
 
         self.policy_id_counter.write(
@@ -841,6 +852,9 @@ impl TIP403Registry {
         msg_sender: Address,
         call: ITIP403Registry::modifyPolicyWhitelistCall,
     ) -> Result<()> {
+        if self.storage.spec().is_t3() && call.account.is_virtual() {
+            return Err(err_virtual_address_not_allowed());
+        }
         let data = self.get_policy_data(call.policyId)?;
 
         if data.admin != msg_sender {
@@ -867,6 +881,9 @@ impl TIP403Registry {
         msg_sender: Address,
         call: ITIP403Registry::modifyPolicyBlacklistCall,
     ) -> Result<()> {
+        if self.storage.spec().is_t3() && call.account.is_virtual() {
+            return Err(err_virtual_address_not_allowed());
+        }
         let data = self.get_policy_data(call.policyId)?;
 
         if data.admin != msg_sender {
@@ -972,13 +989,27 @@ impl TIP403Registry {
             return Ok(None);
         }
 
-        if !self.is_authorized_simple(policy.token_filter_id, token)? {
+        if !self.is_authorized_simple_cached(
+            policy.token_filter_id,
+            token,
+            Some(PolicyData {
+                policy_type: policy.token_filter_type,
+                admin: Address::ZERO,
+            }),
+        )? {
             return Ok(Some((
                 ITIP403Registry::BlockedReason::TOKEN_FILTER,
                 self.receive_policy_recovery(receiver, policy.recovery_mode)?,
             )));
         }
-        if !self.is_authorized_simple(policy.sender_policy_id, sender)? {
+        if !self.is_authorized_simple_cached(
+            policy.sender_policy_id,
+            sender,
+            Some(PolicyData {
+                policy_type: policy.sender_policy_type,
+                admin: Address::ZERO,
+            }),
+        )? {
             return Ok(Some((
                 ITIP403Registry::BlockedReason::RECEIVE_POLICY,
                 self.receive_policy_recovery(receiver, policy.recovery_mode)?,
@@ -1063,6 +1094,9 @@ impl TIP403Registry {
 
     /// Core role-based authorization check (TIP-1015).
     pub fn is_authorized_as(&self, policy_id: u64, user: Address, role: AuthRole) -> Result<bool> {
+        if self.storage.spec().is_t6() && user == RECEIVE_POLICY_GUARD_ADDRESS {
+            return Ok(true);
+        }
         if let Some(auth) = self.builtin_authorization(policy_id) {
             return Ok(auth);
         }
@@ -1070,8 +1104,7 @@ impl TIP403Registry {
         let data = self.get_policy_data(policy_id)?;
 
         if data.is_compound() {
-            let record = self.policy_records[policy_id].read()?;
-            let compound = record.compound;
+            let compound = self.get_compound_policy_data(policy_id)?;
             return match role {
                 AuthRole::Sender => self.is_authorized_simple(compound.sender_policy_id, user),
                 AuthRole::Recipient => {
@@ -1108,10 +1141,23 @@ impl TIP403Registry {
 
     /// Authorization for simple (non-compound) policies only.
     fn is_authorized_simple(&self, policy_id: u64, user: Address) -> Result<bool> {
+        self.is_authorized_simple_cached(policy_id, user, None)
+    }
+
+    /// Receive-policy configuration already contains the immutable simple policy type.
+    fn is_authorized_simple_cached(
+        &self,
+        policy_id: u64,
+        user: Address,
+        cached: Option<PolicyData>,
+    ) -> Result<bool> {
         if let Some(auth) = self.builtin_authorization(policy_id) {
             return Ok(auth);
         }
-        let data = self.get_policy_data(policy_id)?;
+        let data = match cached {
+            Some(data) => data,
+            None => self.get_policy_data(policy_id)?,
+        };
         self.is_simple(policy_id, user, &data)
     }
 
@@ -1170,10 +1216,15 @@ impl TIP403Registry {
     }
 
     fn set_policy_data(&mut self, policy_id: u64, data: PolicyData) -> Result<()> {
-        // Read existing record to preserve compound data
-        let mut record = self.policy_records[policy_id].read()?;
-        record.base = data;
-        self.policy_records[policy_id].write(record)
+        Slot::new(self.policy_records[policy_id].slot(), self.address).write(data)
+    }
+
+    fn get_compound_policy_data(&self, policy_id: u64) -> Result<CompoundPolicyData> {
+        Slot::new(
+            self.policy_records[policy_id].slot() + U256::from(1),
+            self.address,
+        )
+        .read()
     }
 
     fn set_policy_set(&mut self, policy_id: u64, account: Address, value: bool) -> Result<()> {
