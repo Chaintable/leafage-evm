@@ -1,5 +1,5 @@
 use crate::bundle::s3_read_bundle;
-use crate::utils::{s3_get_block_info_and_diff_by_number_for_genesis, KafkaS3Config};
+use crate::utils::{s3_get_block_info_and_diff_by_number_for_genesis, KafkaS3Config, StateDiffKey};
 use anyhow::Result;
 use aws_sdk_s3::Client;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -13,6 +13,7 @@ pub struct Initializer<DB> {
     s3_client: Client,
     db: DB,
     kafka_s3_cfg: KafkaS3Config,
+    state_diff_key: StateDiffKey,
     genesis_number: u64,
 }
 
@@ -33,7 +34,9 @@ where
         }
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
+        let state_diff_key = kafka_s3_cfg.resolved_state_diff_key();
         Ok(Self {
+            state_diff_key,
             rpc_client,
             s3_client,
             db,
@@ -50,6 +53,7 @@ where
                 &self.kafka_s3_cfg.bundle_bucket_name,
                 &self.kafka_s3_cfg.s3_chain_id,
                 &self.kafka_s3_cfg.version,
+                self.state_diff_key,
                 self.genesis_number,
                 self.genesis_number,
                 32,
@@ -72,6 +76,7 @@ where
                 &self.kafka_s3_cfg.outer_bucket_name,
                 &self.kafka_s3_cfg.s3_chain_id,
                 &self.kafka_s3_cfg.version,
+                self.state_diff_key,
                 self.genesis_number,
             )
             .await

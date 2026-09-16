@@ -183,7 +183,7 @@ Keyed by **state root**, and written only when the state root actually changes.
 Blocks that leave the root untouched have no object; the reader synthesizes an
 empty `BlockStorageDiff` for them instead of fetching.
 
-##### HyperEVM (chain 999): keyed by block hash
+##### Block-hash addressing (HyperEVM default; configurable for other datasets)
 
 **Path**: `s3://{bucket_name}/999/{version}/{block_hash}/stateDiff`
 
@@ -192,13 +192,22 @@ of the layout above: a single object would serve the entire chain, and the
 "root unchanged since the parent" test — normally meaning the block wrote no
 state — matches every block, suppressing every diff.
 
-So chain `999` alone keys the object by **block hash**, matching the Block Info
+The block-hash strategy keys the object by **block hash**, matching the Block Info
 object above, and the producer writes one for *every* block — including blocks
 that change no state, which carry an empty `BlockStorageDiff`. The reader
 fetches it for every block and never infers an empty diff from the state root.
 
-No other chain is affected. The gate is `state_diff_keyed_by_block_hash()` in
-`bin/leafage-evm/src/utils.rs`, keyed off the configured `s3_chain_id`.
+Leafage selects this strategy through `KafkaS3Config.state_diff_key` for live
+sync or `archive-init --statediff-key`, both accepting `state-root` and
+`block-hash`. Omission preserves the existing default (S3 chain 999: block
+hash; all others: state root). An explicit setting overrides that default.
+For Arb Classic, use block-hash explicitly; its S3 chain ID alone does not
+identify the addressing scheme. The general path is
+`s3://{bucket_name}/{chain_id}/{version}/{block_hash}/stateDiff`.
+The `hash` and `parent_hash` fields inside the diff remain state roots.
+Missing or malformed diffs never cause a fallback to a state-root object.
+Bundles may be used only when every requested bitmap entry marks a real
+source diff; synthesized entries are rejected in block-hash mode.
 
 #### 3. Block Hash Index (Optional, for number-based lookup)
 
@@ -258,10 +267,11 @@ For each new block:
    Content: rlp_encode(BlockStorageDiff)
    ```
 
-   On chain `999` (HyperEVM), key by block hash and upload for *every* block,
+   When using block-hash addressing (including HyperEVM and Arb Classic),
+   key by block hash and upload for *every* block,
    including state-unchanged ones:
    ```
-   PUT s3://{bucket}/999/{version}/{block_hash}/stateDiff
+   PUT s3://{bucket}/{chain_id}/{version}/{block_hash}/stateDiff
    Content: rlp_encode(BlockStorageDiff)
    ```
 
