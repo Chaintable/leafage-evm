@@ -772,6 +772,30 @@ impl Command {
             self.archive_zstd_compression,
         )?;
 
+        // Stamp the block-height encoding marker on an archive DB that predates
+        // it, so later opens detect the layout from the DB instead of relying on
+        // the flag (a wrong flag silently returns garbage). A DB that already
+        // carries a marker is left untouched: the open above aligned the
+        // process-wide flag to it, and the marker is the source of truth.
+        //
+        // The marker records what --inverted-block-encoding asserts, so passing
+        // the flag against an unmarked *legacy* DB makes that mistake sticky.
+        if self.inverted_block_encoding {
+            if let MultiStorage::RocksDBArchive(rdb) = &db {
+                let marker = rdb
+                    .read_encoding_marker()
+                    .map_err(|e| anyhow!("failed to read block encoding marker: {e}"))?;
+                if marker.is_none() {
+                    rdb.write_encoding_marker(true)
+                        .map_err(|e| anyhow!("failed to write block encoding marker: {e}"))?;
+                    info!(
+                        "archive db carried no block encoding marker; recorded inverted \
+                         encoding from --inverted-block-encoding"
+                    );
+                }
+            }
+        }
+
         // check if db shoud be initialized
         initialize_check(
             StateDBWrapper(
