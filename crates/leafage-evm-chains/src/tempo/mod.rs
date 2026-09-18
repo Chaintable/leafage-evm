@@ -5,9 +5,11 @@ pub const VIRTUAL_BALANCE: alloy::primitives::U256 = alloy::primitives::uint!(
 );
 
 pub mod api;
-pub use api::TempoEvm;
+pub use api::{TempoEvm, TempoEvmError, TempoInvalidTransaction};
 
+pub mod address;
 pub mod block;
+pub(crate) mod fee_token;
 pub mod fee_payer;
 pub mod gas_params;
 pub mod hardfork;

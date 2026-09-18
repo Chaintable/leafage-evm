@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.93.0
+ARG RUST_VERSION=1.96.0
 
 # libstylus.so, built from Chaintable/nitro and published as a COPY-only image.
 ARG LIBSTYLUS_REV=v3.11.1-ct.5

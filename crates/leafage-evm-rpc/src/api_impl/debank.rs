@@ -1100,13 +1100,14 @@ where
                 .set_record_logs(true)
                 .set_steps(true);
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-            let tx = self.inner.create_txn_env(
+            let mut tx = self.inner.create_txn_env(
                 &block,
                 &block_env,
                 tx,
                 &memory_db,
                 self.inner.evm_cfg().cfg.chain_id,
             )?;
+            tx.set_stateful_simulation_context(block.header.hash, tx_info.index.unwrap());
             let (exec_res, (traces, events)) = self
                 .inner
                 .inspect_tx_commit(
@@ -1139,8 +1140,7 @@ where
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
-        // set nonce to None so that the correct nonce is chosen by the EVM
-        request.nonce = None;
+        self.inner.prepare_estimate_request(&mut request);
         let mut block_env = block_env_from_block(&block);
         let mut cache_db = CacheDB::new(EvmStorageWrapper {
             db: state,
@@ -1169,17 +1169,13 @@ where
         // Ethereum EIP-7825 cap from Osaka when the raw field is None; Arbitrum
         // is explicitly exempt and enforces its state-derived limit in its handler.
         let chain_spec: EthSpecId = cfg.spec().clone().into();
-        let consensus_cap = self.inner.consensus_tx_gas_limit_cap(chain_spec);
+        let consensus_cap = self
+            .inner
+            .consensus_tx_gas_limit_cap_at_block(chain_spec, &block_env);
         let max_gas_limit =
             estimate_gas_limit_cap(cfg.tx_gas_limit_cap, consensus_cap, block_env_gas_limit);
         let mut highest_gas_limit = tx_request_gas_limit
-            .map(|tx_gas_limit| {
-                if tx_gas_limit > max_gas_limit {
-                    tx_gas_limit
-                } else {
-                    max_gas_limit
-                }
-            })
+            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
             .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
             &block,
