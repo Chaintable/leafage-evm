@@ -28,6 +28,9 @@ use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions,
     WriteBatch, DB,
 };
+use std::path::PathBuf;
+
+use crate::db_impl::rocksdb_impl::sst::ingest_external_file_options;
 use serde_json::{from_slice, to_vec};
 use std::env;
 use std::fmt::Display;
@@ -57,6 +60,66 @@ fn rocksdb_read_options() -> ReadOptions {
     let mut read_options = ReadOptions::default();
     read_options.set_verify_checksums(false);
     read_options
+}
+
+/// The value a state DB stores for an account. Shared by the write path and the
+/// bulk loader so the two encodings cannot drift apart.
+#[inline]
+pub(crate) fn state_account_value(account: NewAccount) -> Vec<u8> {
+    let slim: SlimAccount = account.into();
+    let mut bytes = Vec::new();
+    slim.encode(&mut bytes);
+    bytes
+}
+
+/// The key a state DB stores a storage slot under: address ‖ index.
+#[inline]
+pub(crate) fn state_storage_key(address: H256, index: H256) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(address.as_slice());
+    key[32..].copy_from_slice(index.as_slice());
+    key
+}
+
+/// The key a state DB stores a block hash under: the block number, 32-byte
+/// big-endian, so the CF is ordered by height.
+#[inline]
+pub(crate) fn state_block_num_key(block_num: u64) -> [u8; 32] {
+    U256::from(block_num).to_be_bytes()
+}
+
+/// SstFileWriter options for the state column families. The filter policy
+/// matches [`rocksdb_column_options`], so an ingested file answers point
+/// lookups from its bloom instead of a disk read; without it the whole
+/// migrated database would read cold until compaction rewrote every file.
+pub(crate) fn state_sst_writer_options() -> Options {
+    let mut opts = Options::default();
+    let mut block_opts = BlockBasedOptions::default();
+    block_opts.set_bloom_filter(10.0, false);
+    opts.set_block_based_table_factory(&block_opts);
+    opts
+}
+
+/// A column family the bulk loader fills. These are the ones a migration
+/// rewrites wholesale in ascending key order; everything else a state DB holds
+/// is a handful of records the batch path writes.
+#[derive(Debug, Clone, Copy)]
+pub enum BulkColumn {
+    Account,
+    Storage,
+    Code,
+    BlockHash,
+}
+
+impl BulkColumn {
+    fn column(self) -> StorageTypeColumn {
+        match self {
+            BulkColumn::Account => StorageTypeColumn::AddressToAccount,
+            BulkColumn::Storage => StorageTypeColumn::AddressToStorage,
+            BulkColumn::Code => StorageTypeColumn::HashToCode,
+            BulkColumn::BlockHash => StorageTypeColumn::BlockNumToBlockHash,
+        }
+    }
 }
 
 #[inline]
@@ -369,10 +432,9 @@ impl StateDBWrite for DataBase {
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_hash.into();
-        let block_num_bytes: [u8; 32] = U256::from(block_num).to_be_bytes();
         batch.put_cf(
             block_num_to_block_hash_cf,
-            block_num_bytes,
+            state_block_num_key(block_num),
             block_hash_bytes,
         );
         Ok(())
@@ -414,10 +476,11 @@ impl StateDBWrite for DataBase {
             .unwrap();
         let address_bytes = address.as_slice();
         if let Some(raw_account) = raw_account {
-            let raw_account: SlimAccount = raw_account.into();
-            let mut raw_account_bytes = Vec::new();
-            raw_account.encode(&mut raw_account_bytes);
-            batch.put_cf(address_to_account_cf, address_bytes, raw_account_bytes);
+            batch.put_cf(
+                address_to_account_cf,
+                address_bytes,
+                state_account_value(raw_account),
+            );
         } else {
             batch.delete_cf(address_to_account_cf, address_bytes);
         }
@@ -503,8 +566,8 @@ fn rocksdb_column_options(shared_cache: &Cache) -> Options {
     cf_opts.set_block_based_table_factory(&block_opts);
     cf_opts.optimize_level_style_compaction(1 << 28); // e.g., 256MB
     cf_opts.set_max_compaction_bytes(2 * 1024 * 1024 * 1024); // 2GB
-    // Disable TTL-based compaction to avoid unnecessary full rewrites of old
-    // SST files (default 30 days from optimize_level_style_compaction).
+                                                              // Disable TTL-based compaction to avoid unnecessary full rewrites of old
+                                                              // SST files (default 30 days from optimize_level_style_compaction).
     cf_opts.set_ttl(0);
     cf_opts
 }
@@ -653,6 +716,29 @@ impl DataBase {
 }
 
 impl DataBase {
+    /// Where this database lives. The bulk loader stages its SST files inside
+    /// it so `ingest_external_file` can move them in instead of copying them
+    /// across filesystems.
+    pub fn path(&self) -> &Path {
+        self.db.path()
+    }
+
+    /// Adds SST files built from an ascending key stream straight to `column`,
+    /// skipping the WAL, the memtable and the compactions the same records
+    /// would cost as batch writes. The files must hold no key the column family
+    /// already has: RocksDB would accept them (the ingested copy wins by global
+    /// seqno), but a migration writes each key once into a fresh database, so a
+    /// duplicate means the caller got its key stream wrong.
+    pub fn ingest_bulk(&self, column: BulkColumn, paths: Vec<PathBuf>) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let cf = self.db.cf_handle(column.column().to_str()).unwrap();
+        self.db
+            .ingest_external_file_cf_opts(cf, &ingest_external_file_options(), paths)?;
+        Ok(())
+    }
+
     /// Flush every column family's memtable to SST files. Test/bench
     /// helper so read measurements exercise the SST + block-cache path
     /// instead of the memtable; not used on any production path.
