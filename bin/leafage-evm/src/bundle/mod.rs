@@ -1,3 +1,4 @@
+use crate::utils::StateDiffKey;
 use alloy_rlp::Decodable;
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
@@ -54,6 +55,7 @@ pub(crate) async fn s3_read_bundle<F, Fut>(
     bucket_name: &str,
     s3_chain_id: &str,
     version: &str,
+    state_diff_key_mode: StateDiffKey,
     start_block: u64,
     end_block: u64,
     bundle_range_size_mib: u32,
@@ -98,6 +100,16 @@ where
         bail!(
             "StateDiff bundle {bundle_id} object size is {state_diff_total_size}, expected {expected_state_diff_size} from its index"
         );
+    }
+
+    // Validate the whole requested range before invoking any write callback.
+    // A synthesized empty diff is never evidence of unchanged state when
+    // headers carry zero/unchanged roots in block-hash mode.
+    if state_diff_key_mode == StateDiffKey::BlockHash {
+        for position in bundle_position(start_block)..=bundle_position(end_block) {
+            anyhow::ensure!(index.has_source_diff(position)?,
+                "StateDiff bundle {bundle_id} entry {position} is synthesized; block-hash mode requires a source diff (disable bundle reads to use per-block objects)");
+        }
     }
 
     // pipeline-compactor writes the header before the StateDiff object. Once
@@ -486,12 +498,21 @@ pub(crate) mod tests {
     type RecordedRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
     #[derive(Clone, Default)]
-    struct MockS3 {
-        objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-        requests: RecordedRequests,
+    pub(crate) struct MockS3 {
+        pub(crate) objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        pub(crate) requests: RecordedRequests,
         missing_error_code: Option<&'static str>,
         ignore_range: bool,
         truncate_range_bodies: Arc<AtomicUsize>,
+    }
+
+    impl MockS3 {
+        pub(crate) fn with_objects(objects: HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                objects: Arc::new(Mutex::new(objects)),
+                ..Default::default()
+            }
+        }
     }
 
     async fn mock_s3_get(State(state): State<MockS3>, request: Request<Body>) -> Response<Body> {
@@ -562,7 +583,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn mock_client(state: MockS3) -> (Client, tokio::task::JoinHandle<()>) {
+    pub(crate) async fn mock_client(state: MockS3) -> (Client, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().fallback(mock_s3_get).with_state(state);
@@ -664,6 +685,54 @@ pub(crate) mod tests {
         BundleStorageDiffIndex::decode(&bytes).unwrap()
     }
 
+    #[tokio::test]
+    async fn block_hash_bundle_requires_source_diffs_before_any_callback() {
+        for (start, end) in [(0, 0), (1, 3), (2, 3)] {
+            for synthesized in [false, true] {
+                let mut objects = if start == 0 {
+                    genesis_bundle_objects()
+                } else {
+                    full_bundle_objects()
+                };
+                if synthesized {
+                    // Last requested entry: earlier entries must not be applied either.
+                    let key = if start == 0 {
+                        "1/0/stateDiff"
+                    } else {
+                        "1/1/stateDiff"
+                    };
+                    let position = bundle_position(end);
+                    objects.get_mut(key).unwrap()[position / 8] &= !(1 << (position % 8));
+                }
+                let (client, server) = mock_client(MockS3::with_objects(objects)).await;
+                let mut count = 0;
+                let result = s3_read_bundle(
+                    &client,
+                    "bundle",
+                    "1",
+                    "",
+                    StateDiffKey::BlockHash,
+                    start,
+                    end,
+                    32,
+                    |_, _| {
+                        count += 1;
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await;
+                server.abort();
+                if synthesized {
+                    assert!(result.unwrap_err().to_string().contains("is synthesized"));
+                    assert_eq!(count, 0);
+                } else {
+                    assert!(result.unwrap().is_some());
+                    assert_eq!(count, end - start + 1);
+                }
+            }
+        }
+    }
+
     #[test]
     fn maps_block_numbers_to_pipeline_compactor_bundles() {
         let cases = [
@@ -705,6 +774,7 @@ pub(crate) mod tests {
             "bundle",
             "1",
             "",
+            StateDiffKey::StateRoot,
             0,
             0,
             DEFAULT_BUNDLE_RANGE_SIZE_MIB,
@@ -762,6 +832,7 @@ pub(crate) mod tests {
             "bundle",
             "1",
             "",
+            StateDiffKey::StateRoot,
             10,
             12,
             DEFAULT_BUNDLE_RANGE_SIZE_MIB,
@@ -803,6 +874,7 @@ pub(crate) mod tests {
             "bundle",
             "1",
             "",
+            StateDiffKey::StateRoot,
             0,
             0,
             DEFAULT_BUNDLE_RANGE_SIZE_MIB,
@@ -830,6 +902,7 @@ pub(crate) mod tests {
             "bundle",
             "1",
             "",
+            StateDiffKey::StateRoot,
             1,
             1,
             DEFAULT_BUNDLE_RANGE_SIZE_MIB,
@@ -856,6 +929,7 @@ pub(crate) mod tests {
             "bundle",
             "1",
             "",
+            StateDiffKey::StateRoot,
             1,
             1,
             DEFAULT_BUNDLE_RANGE_SIZE_MIB,
@@ -883,6 +957,7 @@ pub(crate) mod tests {
             "bundle",
             "1",
             "",
+            StateDiffKey::StateRoot,
             0,
             0,
             DEFAULT_BUNDLE_RANGE_SIZE_MIB,
