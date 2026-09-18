@@ -8,7 +8,7 @@
 //! sentinel. Token state lives at the deterministic TIP-20 addresses themselves.
 
 use alloy::primitives::{keccak256, Address, Bytes, B256};
-use alloy::sol_types::{SolError, SolInterface, SolValue};
+use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -37,35 +37,11 @@ const USD_CURRENCY: &str = "USD";
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface ITIP20Factory {
-        function createToken(
-            string memory name,
-            string memory symbol,
-            string memory currency,
-            address quoteToken,
-            address admin,
-            bytes32 salt
-        ) external returns (address);
-
-        function isTIP20(address token) external view returns (bool);
-
-        function getTokenAddress(address sender, bytes32 salt) external view returns (address);
-
-        event TokenCreated(
-            address indexed token,
-            string name,
-            string symbol,
-            string currency,
-            address quoteToken,
-            address admin,
-            bytes32 salt
-        );
-
-        error TokenAlreadyExists(address token);
-        error AddressReserved();
-        error AddressNotReserved();
-    }
+/// Preserve the local Rust call alias; the official ABI includes both overloads.
+#[allow(non_snake_case)]
+pub mod ITIP20Factory {
+    pub use tempo_contracts::precompiles::ITIP20Factory::*;
+    pub use tempo_contracts::precompiles::createTokenCall;
 }
 
 // ===========================================================================
@@ -103,6 +79,32 @@ impl TIP20Factory {
             address: TIP20_FACTORY_ADDRESS,
             storage: StorageCtx::default(),
         }
+    }
+
+    /// T5 overload: validate before creating state, then emit the logo event from the token.
+    pub fn create_token_with_logo(
+        &mut self,
+        sender: Address,
+        call: ITIP20Factory::createToken_1Call,
+    ) -> Result<Address> {
+        if !call.logoURI.is_empty() {
+            TIP20Token::validate_logo_uri(&call.logoURI)?;
+        }
+        let token_address = self.create_token(
+            sender,
+            ITIP20Factory::createTokenCall {
+                name: call.name,
+                symbol: call.symbol,
+                currency: call.currency,
+                quoteToken: call.quoteToken,
+                admin: call.admin,
+                salt: call.salt,
+            },
+        )?;
+        if !call.logoURI.is_empty() {
+            TIP20Token::from_address(token_address)?.write_logo_uri(sender, call.logoURI)?;
+        }
+        Ok(token_address)
     }
 
     fn __initialize(&mut self) -> Result<()> {
@@ -302,7 +304,11 @@ impl Precompile for TIP20Factory {
 
         dispatch_call(
             calldata,
-            ITIP20Factory::ITIP20FactoryCalls::valid_selector,
+            |selector| {
+                ITIP20Factory::ITIP20FactoryCalls::valid_selector(selector)
+                    && (StorageCtx.spec().is_t5()
+                        || selector != ITIP20Factory::createToken_1Call::SELECTOR)
+            },
             |data| {
                 ITIP20Factory::ITIP20FactoryCalls::abi_decode_with_config(
                     data,
@@ -310,8 +316,11 @@ impl Precompile for TIP20Factory {
                 )
             },
             |call| match call {
-                ITIP20Factory::ITIP20FactoryCalls::createToken(call) => {
+                ITIP20Factory::ITIP20FactoryCalls::createToken_0(call) => {
                     mutate(call, msg_sender, |s, c| self.create_token(s, c))
+                }
+                ITIP20Factory::ITIP20FactoryCalls::createToken_1(call) => {
+                    mutate(call, msg_sender, |s, c| self.create_token_with_logo(s, c))
                 }
                 ITIP20Factory::ITIP20FactoryCalls::isTIP20(call) => {
                     view(call, |c| self.is_tip20(c.token))

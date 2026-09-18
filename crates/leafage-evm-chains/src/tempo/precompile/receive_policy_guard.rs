@@ -14,41 +14,7 @@ use super::{
     RECEIVE_POLICY_GUARD_ADDRESS,
 };
 
-alloy::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    interface IReceivePolicyGuard {
-        enum InboundKind {
-            TRANSFER,
-            MINT
-        }
-
-        struct ClaimReceiptV1 {
-            uint8 version;
-            address token;
-            address recoveryAuthority;
-            address originator;
-            address recipient;
-            uint64 blockedAt;
-            uint64 blockedNonce;
-            uint8 blockedReason;
-            InboundKind kind;
-            bytes32 memo;
-        }
-
-        function balanceOf(bytes calldata receipt) external view returns (uint256 amount);
-        function claim(address to, bytes calldata receipt) external;
-        function burnBlockedReceipt(bytes calldata receipt) external;
-
-        event TransferBlocked(address indexed token, address indexed receiver, uint64 indexed blockedNonce, uint256 amount, uint8 receiptVersion, bytes receipt);
-        event ReceiptClaimed(address indexed token, address indexed receiver, uint64 indexed blockedNonce, uint64 blockedAt, uint8 receiptVersion, address originator, address recipient, address recoveryAuthority, address caller, address to, uint256 amount);
-        event ReceiptBurned(address indexed token, address indexed receiver, uint64 indexed blockedNonce, uint64 blockedAt, uint8 receiptVersion, address originator, address recipient, address recoveryAuthority, address caller, uint256 amount);
-
-        error InvalidReceipt();
-        error InvalidClaimAddress();
-        error UnauthorizedClaimer();
-        error AddressReserved();
-    }
-}
+pub use tempo_contracts::precompiles::IReceivePolicyGuard;
 
 pub const BLOCKED_RECEIPT_VERSION: u8 = 1;
 
@@ -72,33 +38,6 @@ pub(crate) fn address_reserved() -> TempoPrecompileError {
     revert(IReceivePolicyGuard::AddressReserved {})
 }
 
-impl IReceivePolicyGuard::ClaimReceiptV1 {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        token: Address,
-        recovery_authority: Address,
-        originator: Address,
-        recipient: Address,
-        blocked_at: u64,
-        blocked_nonce: u64,
-        blocked_reason: u8,
-        kind: IReceivePolicyGuard::InboundKind,
-        memo: B256,
-    ) -> Self {
-        Self {
-            version: BLOCKED_RECEIPT_VERSION,
-            token,
-            recoveryAuthority: recovery_authority,
-            originator,
-            recipient,
-            blockedAt: blocked_at,
-            blockedNonce: blocked_nonce,
-            blockedReason: blocked_reason,
-            kind,
-            memo,
-        }
-    }
-}
 
 fn decode_receipt(receipt: Bytes) -> Result<IReceivePolicyGuard::ClaimReceiptV1> {
     IReceivePolicyGuard::ClaimReceiptV1::abi_decode(&receipt).map_err(|_| invalid_receipt())

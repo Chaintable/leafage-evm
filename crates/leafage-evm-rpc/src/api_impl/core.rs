@@ -81,6 +81,12 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
         }
     }
 
+    /// Resolve chain-specific limits at the requested execution block. Chains
+    /// whose forks map to the same Ethereum spec can select their own schedule.
+    fn consensus_tx_gas_limit_cap_at_block(&self, spec: EthSpecId, _block_env: &BlockEnv) -> u64 {
+        self.consensus_tx_gas_limit_cap(spec)
+    }
+
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         None
     }

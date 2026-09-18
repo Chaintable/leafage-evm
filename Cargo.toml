@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.96"
 authors = ["leafage-evm Contributors"]
 license = "MIT OR Apache-2.0"
 exclude = ["benches/", "tests/"]
@@ -93,6 +93,10 @@ alloy-evm = "0.29.2"
 alloy-sol-types = "=1.7.2"
 # alloy-contract 的 Rust 代码没直接 use，但 `sol!` 宏展开会生成 alloy_contract::* 的引用。
 alloy-contract = "1.1.3"
+
+# Protocol definitions from the official v1.14.0 release; SDK 1.11.0 lacks T11 activation.
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "1ec5653e39c97e02807dddf5e7106e979f3ad909", default-features = false, features = ["std"] }
+tempo-hardfork = { git = "https://github.com/tempoxyz/tempo", rev = "1ec5653e39c97e02807dddf5e7106e979f3ad909", default-features = false, features = ["std"] }
 
 # op
 

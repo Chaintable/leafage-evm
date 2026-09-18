@@ -98,6 +98,23 @@ pub struct TempoEvmCustomConfig;
 
 type TempoApiImpl<DB> = ApiImpl<DB, TempoHardfork, TempoEvmCustomConfig>;
 
+impl<DB> TempoApiImpl<DB> {
+    fn cfg_for_call(&self, block_env: &BlockEnv) -> revm::context::CfgEnv<TempoHardfork> {
+        let mut cfg = self.evm_cfg.cfg.clone();
+        // RPC zero means unlimited, not a literal zero REVM validation cap.
+        // With no explicit cap, use Tempo's fork instead of Ethereum Osaka's.
+        cfg.tx_gas_limit_cap = Some(match cfg.tx_gas_limit_cap {
+            Some(0) => u64::MAX,
+            Some(cap) => cap,
+            None => TempoHardfork::from_timestamp(block_env.timestamp.saturating_to())
+                .as_official()
+                .tx_gas_limit_cap()
+                .unwrap_or(u64::MAX),
+        });
+        cfg
+    }
+}
+
 impl ToJsonRpcError for TempoInvalidTransaction {
     fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
         match self {
@@ -107,6 +124,15 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                     -32003,
                     self.to_string(),
                     Some(serde_json::json!({"name": "FeeTokenNotTip20Error", "token": address})),
+                )
+            }
+            TempoInvalidTransaction::FeeTokenNotUsdCurrency { address, currency } => {
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32003,
+                    self.to_string(),
+                    Some(serde_json::json!({
+                        "name": "FeeTokenNotUsdError", "token": address, "currency": currency,
+                    })),
                 )
             }
             TempoInvalidTransaction::NonceManagerError(_)
@@ -426,6 +452,24 @@ where
         };
         use revm::primitives::TxKind;
 
+        // Reject ambiguous signed bytes before recovering the payer or filling defaults.
+        request
+            .inner
+            .input
+            .unique_input()
+            .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
+        if let Some(calls) = request
+            .tempo
+            .as_ref()
+            .and_then(|te| te.tempo_calls.as_ref())
+        {
+            for call in calls {
+                call.input
+                    .unique_input()
+                    .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
+            }
+        }
+
         // Extract Tempo-specific fields before consuming the request.
         let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
         let auth_list = request
@@ -459,13 +503,15 @@ where
             ));
         }
 
-        // Auto-fill 2D nonce from NonceManager storage when not provided.
-        // Ported from writer compat.rs:309-324.
+        // Unsigned eth_call-style requests execute with the current 2D state nonce,
+        // including the temporary state left by earlier calls in a simulation sequence.
+        // A sponsor signature binds the original nonce; preserve that signed path.
         if let Some(nk) = nonce_key {
-            if !nk.is_zero() && request.inner.nonce.is_none() {
-                use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+            if !nk.is_zero() && (te.fee_payer_signature.is_none() || request.inner.nonce.is_none())
+            {
                 use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
-                let nonce = if nk == revm::primitives::U256::MAX {
+                use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+                let nonce = if nk == revm::primitives::U256::MAX && hardfork.is_t1() {
                     0u64 // expiring nonce must be 0
                 } else {
                     let caller = request.inner.from.unwrap_or_default();
@@ -473,7 +519,7 @@ where
                     let slot = nk.mapping_slot(slot);
                     db.storage_ref(NONCE_PRECOMPILE_ADDRESS, slot)
                         .map(|v| v.saturating_to::<u64>())
-                        .unwrap_or(0)
+                        .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
                 };
                 request.inner.nonce = Some(nonce);
             }
@@ -609,6 +655,7 @@ where
             tempo_fields,
             resolved_fee_token: None,
             tx_hash: revm::primitives::B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
             ),
@@ -674,7 +721,7 @@ where
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
+        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
@@ -698,14 +745,23 @@ where
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R,
     {
-        let evm_env = EvmEnv::new(self.evm_cfg.cfg.clone(), block_env.clone());
+        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
         let mut inspector = TracingInspector::new(inspector_cfg);
-        let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
-        evm.inspect_tx_commit(tx)
-            .map(|res| (res.into(), inspector_collect(inspector)))
+        let is_aa = tx.tempo_fields.is_some();
+        let caller = tx.base.caller;
+        let res = {
+            let mut evm = TempoEvm::new(evm_env, wrap_database_ref, &mut inspector, true);
+            evm.inspect_tx_commit(tx)?
+        };
+        if is_aa {
+            // AA subcalls start below the batch checkpoint, leaving a synthetic
+            // inspector root whose caller is not initialized by a call hook.
+            inspector.set_transaction_caller(caller);
+        }
+        Ok((res.into(), inspector_collect(inspector)))
     }
 
 }
@@ -716,6 +772,17 @@ where
 {
 
     type Tx = TempoTxEnv;
+
+    fn consensus_tx_gas_limit_cap_at_block(
+        &self,
+        _spec: revm::primitives::hardfork::SpecId,
+        block_env: &BlockEnv,
+    ) -> u64 {
+        TempoHardfork::from_timestamp(block_env.timestamp.saturating_to())
+            .as_official()
+            .tx_gas_limit_cap()
+            .unwrap_or(u64::MAX)
+    }
 
     fn prepare_estimate_request(&self, request: &mut CallRequest) {
         // The sponsor signs the original nonce. Account execution still uses

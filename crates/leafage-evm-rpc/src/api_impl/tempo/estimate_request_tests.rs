@@ -194,6 +194,17 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
         keccak256(token),
         revm::state::AccountInfo::new(U256::ZERO, 1, marker.hash_slow(), marker),
     );
+    // A paid request must carry canonical USD metadata, not only the token marker.
+    let mut currency = [0u8; 32];
+    currency[..3].copy_from_slice(b"USD");
+    currency[31] = 6;
+    db.storage.insert(
+        (
+            keccak256(token),
+            keccak256(U256::from(4).to_be_bytes::<32>()),
+        ),
+        U256::from_be_bytes(currency),
+    );
     db.storage.insert(
         (
             keccak256(token),

@@ -163,6 +163,9 @@ pub struct TempoTxEnv {
     pub tx_hash: B256,
     /// Sender-scoped transaction identifier used by ChannelReserve.open().
     pub unique_tx_identifier: Option<B256>,
+    /// Replay key for one entry in a stateful RPC simulation. Never used as the
+    /// MPP open context or a persistent/cross-request transaction identity.
+    pub stateful_simulation_replay_id: Option<B256>,
 }
 
 impl TempoTxEnv {
@@ -195,9 +198,10 @@ impl TempoTxEnv {
 
     /// Assigns a deterministic per-entry identifier for a stateful RPC batch.
     ///
-    /// Single-call simulations retain Tempo's official fixed sentinel and zero
-    /// transaction hash. Stateful batches must distinguish entries because nonce
-    /// replay state is committed between calls.
+    /// Stateful batches must distinguish nonce replay entries because their
+    /// state is committed between calls. Keep the original transaction identity
+    /// (the official MPP sentinel for RPC calls) unchanged, even for a one-entry
+    /// batch. `index` is local to the request, not an on-chain transaction index.
     pub fn set_stateful_simulation_context(&mut self, block_hash: B256, index: u64) {
         const DOMAIN: &[u8] = b"leafage-tempo-stateful-simulation-v1";
 
@@ -208,8 +212,7 @@ impl TempoTxEnv {
         preimage.extend_from_slice(self.base.caller.as_slice());
 
         let identifier = keccak256(preimage);
-        self.tx_hash = identifier;
-        self.unique_tx_identifier = Some(identifier);
+        self.stateful_simulation_replay_id = Some(identifier);
     }
 }
 
@@ -300,6 +303,7 @@ mod tests {
         assert!(tx.tempo_fields.is_none());
         assert_eq!(tx.tx_hash, B256::ZERO);
         assert!(tx.unique_tx_identifier.is_none());
+        assert!(tx.stateful_simulation_replay_id.is_none());
         // TxEnv defaults gas_limit to TX_GAS_LIMIT_CAP (EIP-7825).
         assert!(tx.gas_limit() > 0);
     }
@@ -323,6 +327,7 @@ mod tests {
             }),
             resolved_fee_token: None,
             tx_hash: B256::ZERO,
+            stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER),
         };
         assert_eq!(tx.tx_type(), 0x76);
@@ -336,23 +341,39 @@ mod tests {
         let caller = Address::repeat_byte(0x22);
         let mut first = TempoTxEnv::default();
         first.base.caller = caller;
+        first.tx_hash = B256::repeat_byte(0x31);
+        first.unique_tx_identifier = Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
         first.set_stateful_simulation_context(block_hash, 7);
 
         let mut same = TempoTxEnv::default();
         same.base.caller = caller;
+        same.unique_tx_identifier = Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER);
         same.set_stateful_simulation_context(block_hash, 7);
-        assert_eq!(same.tx_hash, first.tx_hash);
-        assert_eq!(same.unique_tx_identifier, Some(first.tx_hash));
+        assert_eq!(
+            same.stateful_simulation_replay_id,
+            first.stateful_simulation_replay_id
+        );
+        assert_eq!(first.tx_hash, B256::repeat_byte(0x31));
+        assert_eq!(
+            first.unique_tx_identifier,
+            Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER)
+        );
 
         let mut next = TempoTxEnv::default();
         next.base.caller = caller;
         next.set_stateful_simulation_context(block_hash, 8);
-        assert_ne!(next.tx_hash, first.tx_hash);
+        assert_ne!(
+            next.stateful_simulation_replay_id,
+            first.stateful_simulation_replay_id
+        );
 
         let mut other_caller = TempoTxEnv::default();
         other_caller.base.caller = Address::repeat_byte(0x23);
         other_caller.set_stateful_simulation_context(block_hash, 7);
-        assert_ne!(other_caller.tx_hash, first.tx_hash);
-        assert_ne!(first.tx_hash, B256::ZERO);
+        assert_ne!(
+            other_caller.stateful_simulation_replay_id,
+            first.stateful_simulation_replay_id
+        );
+        assert_ne!(first.stateful_simulation_replay_id, Some(B256::ZERO));
     }
 }

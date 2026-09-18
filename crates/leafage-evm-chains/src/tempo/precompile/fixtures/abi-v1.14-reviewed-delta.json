@@ -1,0 +1,101 @@
+{
+  "IAccountKeychain": {
+    "added": [
+      {"inputs":[],"name":"InvalidKeyAuthorizationWitness","type":"error"}
+    ],
+    "removed": [
+
+    ]
+  },
+  "IFeeManager": {
+    "added": [
+      {"inputs":[],"name":"InsufficientFeeTokenBalance","type":"error"}
+    ],
+    "removed": [
+      {"inputs":[],"name":"InsufficientLiquidity","type":"error"},
+      {"inputs":[],"name":"PolicyForbids","type":"error"}
+    ]
+  },
+  "ITIPFeeAMM": {
+    "added": [
+      {"inputs":[],"name":"InvalidToken","type":"error"},
+      {"inputs":[{"type":"address"},{"type":"address"}],"name":"getPoolId","outputs":[{"type":"bytes32"}],"stateMutability":"pure","type":"function"}
+    ],
+    "removed": [
+      {"inputs":[],"name":"InvalidCurrency","type":"error"},
+      {"inputs":[{"type":"address"},{"type":"address"}],"name":"getPoolId","outputs":[{"type":"bytes32"}],"stateMutability":"view","type":"function"}
+    ]
+  },
+  "IStablecoinDEX": {
+    "added": [
+      {"inputs":[],"name":"MAX_PRICE","outputs":[{"type":"uint32"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[],"name":"MAX_TICK","outputs":[{"type":"int16"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[],"name":"MIN_ORDER_AMOUNT","outputs":[{"type":"uint128"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[],"name":"MIN_PRICE","outputs":[{"type":"uint32"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[],"name":"MIN_TICK","outputs":[{"type":"int16"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[],"name":"PRICE_SCALE","outputs":[{"type":"uint32"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[],"name":"TICK_SPACING","outputs":[{"type":"int16"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[{"type":"address"},{"type":"address"}],"name":"pairKey","outputs":[{"type":"bytes32"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[{"type":"int16"}],"name":"tickToPrice","outputs":[{"type":"uint32"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[{"type":"uint32"}],"name":"priceToTick","outputs":[{"type":"int16"}],"stateMutability":"pure","type":"function"}
+    ],
+    "removed": [
+      {"inputs":[],"name":"InvalidCurrency","type":"error"},
+      {"inputs":[],"name":"MAX_PRICE","outputs":[{"type":"uint32"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"MAX_TICK","outputs":[{"type":"int16"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"MIN_ORDER_AMOUNT","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"MIN_PRICE","outputs":[{"type":"uint32"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"MIN_TICK","outputs":[{"type":"int16"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"PRICE_SCALE","outputs":[{"type":"uint32"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"TICK_SPACING","outputs":[{"type":"int16"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"type":"address"},{"type":"address"}],"name":"pairKey","outputs":[{"type":"bytes32"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"type":"int16"}],"name":"tickToPrice","outputs":[{"type":"uint32"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"type":"uint32"}],"name":"priceToTick","outputs":[{"type":"int16"}],"stateMutability":"view","type":"function"}
+    ]
+  },
+  "IStorageCredits": {
+    "added": [
+      {"inputs":[],"name":"OnlyDirectCall","type":"error"}
+    ],
+    "removed": [
+
+    ]
+  },
+  "ITIP20": {
+    "added": [
+      {"inputs":[],"name":"InvalidPayload","type":"error"},
+      {"inputs":[],"name":"Unauthorized","type":"error"},
+      {"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"pure","type":"function"}
+    ],
+    "removed": [
+      {"inputs":[],"name":"SpendingLimitExceeded","type":"error"},
+      {"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}
+    ]
+  },
+  "IRolesAuth": {
+    "added": [
+      {"inputs":[{"type":"address"},{"type":"bytes32"}],"name":"hasRole","outputs":[{"type":"bool"}],"stateMutability":"view","type":"function"}
+    ],
+    "removed": [
+      {"inputs":[{"type":"bytes32"},{"type":"address"}],"name":"hasRole","outputs":[{"type":"bool"}],"stateMutability":"view","type":"function"}
+    ]
+  },
+  "ITIP20Factory": {
+    "added": [
+      {"inputs":[],"name":"InvalidQuoteToken","type":"error"},
+      {"inputs":[{"type":"address"},{"type":"bytes32"}],"name":"getTokenAddress","outputs":[{"type":"address"}],"stateMutability":"pure","type":"function"},
+      {"inputs":[{"type":"string"},{"type":"string"},{"type":"string"},{"type":"address"},{"type":"address"},{"type":"bytes32"},{"type":"string"}],"name":"createToken","outputs":[{"type":"address"}],"stateMutability":"nonpayable","type":"function"}
+    ],
+    "removed": [
+      {"inputs":[{"type":"address"},{"type":"bytes32"}],"name":"getTokenAddress","outputs":[{"type":"address"}],"stateMutability":"view","type":"function"}
+    ]
+  },
+  "IValidatorConfig": {
+    "added": [
+      {"inputs":[{"type":"uint64"},{"type":"bool"}],"name":"changeValidatorStatusByIndex","outputs":[],"stateMutability":"nonpayable","type":"function"}
+    ],
+    "removed": [
+      {"inputs":[{"type":"uint256"},{"type":"bool"}],"name":"changeValidatorStatusByIndex","outputs":[],"stateMutability":"nonpayable","type":"function"}
+    ]
+  }
+}

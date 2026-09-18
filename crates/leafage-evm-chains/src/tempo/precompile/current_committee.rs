@@ -12,19 +12,7 @@ use super::{
     CURRENT_COMMITTEE_ADDRESS,
 };
 
-alloy::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    interface ICurrentCommittee {
-        error Unauthorized();
-
-        function getCommitteeMembers()
-            external
-            view
-            returns (uint64 epoch, bytes32[] memory publicKeys);
-
-        function setCommitteeMembers(uint64 epoch, bytes32[] calldata publicKeys) external;
-    }
-}
+pub use tempo_contracts::precompiles::ICurrentCommittee;
 
 pub struct CurrentCommittee {
     pub epoch: Slot<u64>,

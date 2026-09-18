@@ -48,162 +48,7 @@ use super::{
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    interface IAccountKeychain {
-        enum SignatureType {
-            Secp256k1,
-            P256,
-            WebAuthn,
-        }
-
-        struct LegacyTokenLimit {
-            address token;
-            uint256 amount;
-        }
-
-        struct TokenLimit {
-            address token;
-            uint256 amount;
-            uint64 period;
-        }
-
-        /// Selector-level recipient rule (TIP-1011, T3+).
-        struct SelectorRule {
-            bytes4 selector;
-            address[] recipients;
-        }
-
-        /// Per-target call scope (TIP-1011, T3+).
-        struct CallScope {
-            address target;
-            SelectorRule[] selectorRules;
-        }
-
-        struct KeyRestrictions {
-            uint64 expiry;
-            bool enforceLimits;
-            TokenLimit[] limits;
-            bool allowAnyCalls;
-            CallScope[] allowedCalls;
-        }
-
-        struct KeyInfo {
-            SignatureType signatureType;
-            address keyId;
-            uint64 expiry;
-            bool enforceLimits;
-            bool isRevoked;
-        }
-
-        event KeyAuthorized(address indexed account, address indexed publicKey, uint8 signatureType, uint64 expiry);
-        event KeyRevoked(address indexed account, address indexed publicKey);
-        event SpendingLimitUpdated(address indexed account, address indexed publicKey, address indexed token, uint256 newLimit);
-        event AccessKeySpend(address indexed account, address indexed publicKey, address indexed token, uint256 amount, uint256 remainingLimit);
-        event KeyAuthorizationWitness(address indexed account, bytes32 indexed witness);
-        event KeyAuthorizationWitnessBurned(address indexed account, bytes32 indexed witness);
-        event AdminKeyAuthorized(address indexed account, address indexed publicKey);
-
-        function authorizeKey(
-            address keyId,
-            SignatureType signatureType,
-            uint64 expiry,
-            bool enforceLimits,
-            LegacyTokenLimit[] calldata limits
-        ) external;
-
-        function authorizeKey(
-            address keyId,
-            SignatureType signatureType,
-            KeyRestrictions calldata config
-        ) external;
-
-        function authorizeKey(
-            address keyId,
-            SignatureType signatureType,
-            KeyRestrictions calldata config,
-            bytes32 witness
-        ) external;
-
-        function authorizeAdminKey(
-            address keyId,
-            SignatureType signatureType,
-            bytes32 witness
-        ) external;
-
-        function burnKeyAuthorizationWitness(bytes32 witness) external;
-
-        function revokeKey(address keyId) external;
-
-        function updateSpendingLimit(
-            address keyId,
-            address token,
-            uint256 newLimit
-        ) external;
-
-        function getKey(address account, address keyId) external view returns (KeyInfo memory);
-
-        /// (TIP-1011, T3+) Set or replace allowed calls for one or more key+target pairs.
-        function setAllowedCalls(
-            address keyId,
-            CallScope[] calldata scopes
-        ) external;
-
-        /// (TIP-1011, T3+) Remove any configured call scope for a key+target pair.
-        function removeAllowedCalls(address keyId, address target) external;
-
-        /// (TIP-1011, T3+) Returns whether the key is call-scoped and the configured scopes.
-        ///
-        /// `isScoped = false` means unrestricted. `isScoped = true && scopes.length == 0`
-        /// means scoped deny-all. Missing, revoked, or expired keys report scoped deny-all
-        /// so this getter never exposes stale persisted scope state.
-        function getAllowedCalls(
-            address account,
-            address keyId
-        ) external view returns (bool isScoped, CallScope[] memory scopes);
-
-        function getRemainingLimit(
-            address account,
-            address keyId,
-            address token
-        ) external view returns (uint256);
-
-        function getRemainingLimitWithPeriod(
-            address account,
-            address keyId,
-            address token
-        ) external view returns (uint256 remaining, uint64 periodEnd);
-
-        function getTransactionKey() external view returns (address);
-
-        function isKeyAuthorizationWitnessBurned(
-            address account,
-            bytes32 witness
-        ) external view returns (bool);
-
-        function isAdminKey(address account, address keyId) external view returns (bool);
-
-        error UnauthorizedCaller();
-        error KeyAlreadyExists();
-        error KeyNotFound();
-        error KeyExpired();
-        error SpendingLimitExceeded();
-        error InvalidSignatureType();
-        error ZeroPublicKey();
-        error ExpiryInPast();
-        error KeyAlreadyRevoked();
-        error SignatureTypeMismatch(uint8 expected, uint8 actual);
-        /// (TIP-1011, T3+) Raised by setCallScopes / validate_call_scopes.
-        error InvalidCallScope();
-        /// (TIP-1011, T3+) Raised when an AA call is outside an access key's stored scope.
-        error CallNotAllowed();
-        /// (T3+) Spending limit value exceeds the TIP-20 `u128` supply range.
-        error InvalidSpendingLimit();
-        error KeyAuthorizationWitnessAlreadyBurned();
-        error InvalidKeyId();
-        error LegacyAuthorizeKeySelectorChanged(bytes4 newSelector);
-    }
-}
+pub use tempo_contracts::precompiles::IAccountKeychain;
 
 // ===========================================================================
 // Error helpers
@@ -395,7 +240,11 @@ impl Storable for AuthorizedKey {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[31] = self.signature_type;
         bytes[23..31].copy_from_slice(&self.expiry.to_be_bytes());
         bytes[22] = if self.enforce_limits { 1 } else { 0 };
@@ -499,7 +348,11 @@ impl Storable for SpendingLimitState {
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
         storage.store(slot, self.remaining)?;
-        let mut packed = U256::ZERO;
+        let mut packed = if StorageCtx::default().spec().is_t4() {
+            U256::ZERO
+        } else {
+            storage.load(slot + U256::ONE)?
+        };
         packed = packing::insert_into_word(
             packed,
             &self.max,
@@ -584,7 +437,12 @@ impl Handler<SpendingLimitState> for SpendingLimitStateHandler {
         // Write the packed slot in one shot to match writer's auto-derive
         // (which avoids 3 RMW SSTOREs for the packed fields).
         self.remaining.write(value.remaining)?;
-        let mut packed = U256::ZERO;
+        let mut packed_slot = Slot::<U256>::new(self.base_slot + U256::ONE, self.address);
+        let mut packed = if StorageCtx::default().spec().is_t4() {
+            U256::ZERO
+        } else {
+            packed_slot.read()?
+        };
         packed = packing::insert_into_word(
             packed,
             &value.max,
@@ -603,7 +461,6 @@ impl Handler<SpendingLimitState> for SpendingLimitStateHandler {
             SPENDING_LIMIT_PERIOD_END_OFFSET,
             SPENDING_LIMIT_PERIOD_END_BYTES,
         )?;
-        let mut packed_slot = Slot::<U256>::new(self.base_slot + U256::ONE, self.address);
         packed_slot.write(packed)
     }
 
@@ -3478,7 +3335,10 @@ mod tests {
         };
 
         let mut mock = MockStorage::new();
-        state.store(&mut mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            state.store(&mut mock, U256::from(7u8), LayoutCtx::FULL)
+        })
+        .unwrap();
         let loaded = SpendingLimitState::load(&mock, U256::from(7u8), LayoutCtx::FULL).unwrap();
         assert_eq!(loaded, state);
     }
@@ -3493,7 +3353,10 @@ mod tests {
             period_end: 1_012,
         };
         let mut mock = MockStorage::new();
-        state.store(&mut mock, base_slot, LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            state.store(&mut mock, base_slot, LayoutCtx::FULL)
+        })
+        .unwrap();
         mock.reset_load_count();
 
         let handler = SpendingLimitStateHandler::new(base_slot, Address::ZERO);
@@ -3513,7 +3376,10 @@ mod tests {
         };
 
         let mut mock = MockStorage::new();
-        state.store(&mut mock, U256::from(0u8), LayoutCtx::FULL).unwrap();
+        StorageCtx::enter(&mut TestStorageProvider::new(TempoHardfork::T4), || {
+            state.store(&mut mock, U256::from(0u8), LayoutCtx::FULL)
+        })
+        .unwrap();
 
         // Slot 0: remaining
         assert_eq!(mock.load(U256::ZERO).unwrap(), U256::from(42u8));
