@@ -30,6 +30,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
 | Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
 | IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| RSK (Rootstock)                               | [Chaintable/rskj](https://github.com/Chaintable/rskj)                                            |
 | Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
 | Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
 | Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |

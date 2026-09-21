@@ -9,4 +9,5 @@ pub mod mantle;
 pub mod monad;
 pub mod moonbeam;
 pub mod polygon;
+pub mod rsk;
 pub mod tempo;

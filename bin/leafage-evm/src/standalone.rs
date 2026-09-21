@@ -54,6 +54,7 @@ pub struct Command {
             "moonbeam",
             "moonriver",
             "polygon",
+            "rsk",
             "hemi",
             "monad",
         ],
@@ -577,6 +578,18 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Iotex(chain_cfg))
+            }
+            "rsk" => {
+                // RSK's instruction set is Cancun minus the blob opcodes, see `RskHardfork`.
+                let spec = resolve_spec(self.spec_id, MainnetSpecId::CANCUN, "rsk")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Rsk(chain_cfg))
             }
             "polygon" => {
                 let spec = resolve_spec(
