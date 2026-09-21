@@ -6,12 +6,14 @@
 //! RSK activates opcodes through RSKIPs rather than Ethereum hardforks. Its
 //! instruction set matches Cancun minus the blob opcodes (PUSH0, MCOPY,
 //! TLOAD/TSTORE, BASEFEE = the block minimum gas price), so Cancun is the spec
-//! to run it with. Two things do NOT match and are out of reach of a spec id:
+//! to run it with. What a spec id cannot express is layered on top by
+//! [`crate::rsk::RskEvm`]:
 //!
-//! * the gas schedule — RSK never adopted EIP-2929 access lists (SLOAD is 200,
-//!   CALL 700, ...), so gas used / estimations differ from a real node;
-//! * `DIFFICULTY` (0x44) — RSK returns the block difficulty, revm returns
-//!   PREVRANDAO from Paris on.
+//! * the gas schedule, frozen around EIP-150 (`rsk/gas.rs`);
+//! * the opcodes that behave differently — the call family, `SSTORE`,
+//!   `SELFDESTRUCT`, `EXTCODESIZE` / `EXTCODEHASH`, `DIFFICULTY`
+//!   (`rsk/instructions.rs`);
+//! * the 400 frame call depth limit, the refund cap and MODEXP pricing.
 
 use leafage_evm_types::MainnetSpecId;
 use std::ops::{Deref, DerefMut};

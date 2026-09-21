@@ -1,3 +1,6 @@
+use crate::rsk::gas::{rsk_gas_params, MAX_CALL_DEPTH};
+use crate::rsk::instructions::rsk_instructions;
+use crate::rsk::precompile::rsk_precompiles;
 use crate::rsk::RskHardfork;
 use alloy_evm::{Database, EvmEnv};
 use leafage_evm_types::{BlockEnv, CfgEnv};
@@ -5,11 +8,15 @@ use revm::context::{Context, ContextError, FrameStack};
 use revm::context::{Evm, JournalTr, TxEnv};
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::EthInstructions;
-use revm::handler::{EthFrame, EthPrecompiles, EvmTr, FrameInitOrResult, FrameResult, FrameTr};
+use revm::handler::{
+    EthFrame, EthPrecompiles, EvmTr, FrameInitOrResult, FrameResult, FrameTr, ItemOrResult,
+};
 use revm::inspector::InspectorEvmTr;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::interpreter::FrameInput;
+use revm::interpreter::{
+    CallOutcome, CreateOutcome, FrameInput, Gas, InstructionResult, InterpreterResult,
+};
 use revm::primitives::hardfork::SpecId;
 use revm::{Inspector, Journal};
 use std::ops::{Deref, DerefMut};
@@ -30,8 +37,12 @@ pub struct RskEvm<DB: revm::database::Database, I> {
 
 impl<DB: Database, I> RskEvm<DB, I> {
     /// Creates a new [`RskEvm`].
-    pub fn new(env: EvmEnv<RskHardfork>, db: DB, inspector: I) -> Self {
+    ///
+    /// The RSK gas schedule is applied here, whatever `env.cfg_env` carries, so
+    /// every caller gets it.
+    pub fn new(mut env: EvmEnv<RskHardfork>, db: DB, inspector: I) -> Self {
         let spec: SpecId = (*env.cfg_env.spec).into();
+        env.cfg_env.set_gas_params(rsk_gas_params(spec));
         Self {
             inner: Evm {
                 ctx: Context {
@@ -44,8 +55,11 @@ impl<DB: Database, I> RskEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: EthInstructions::new_mainnet_with_spec(spec),
-                precompiles: EthPrecompiles::new(spec),
+                instruction: rsk_instructions(spec),
+                precompiles: EthPrecompiles {
+                    precompiles: rsk_precompiles(spec),
+                    spec,
+                },
                 frame_stack: Default::default(),
             },
         }
@@ -114,6 +128,9 @@ where
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
         check_unsupported_precompiles(&frame_input.frame_input)?;
+        if let Some(result) = call_too_deep(&frame_input) {
+            return Ok(ItemOrResult::Result(result));
+        }
         self.inner.frame_init(frame_input)
     }
 
@@ -167,6 +184,9 @@ where
         frame_init: <Self::Frame as FrameTr>::FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
         check_unsupported_precompiles(&frame_init.frame_input)?;
+        if let Some(result) = call_too_deep(&frame_init) {
+            return Ok(ItemOrResult::Result(result));
+        }
         self.inner.inspect_frame_init(frame_init)
     }
 }
@@ -188,6 +208,33 @@ fn check_unsupported_precompiles<D>(frame_input: &FrameInput) -> Result<(), Cont
         }
     }
     Ok(())
+}
+
+/// `Program.getMaxDepth()`: RSK stops at 400 nested frames (RSKIP150), well
+/// before revm's 1024. The frame fails like revm's own depth check does: the
+/// caller gets its gas back and a zero on the stack.
+fn call_too_deep(frame_init: &FrameInit) -> Option<FrameResult> {
+    if frame_init.depth <= MAX_CALL_DEPTH {
+        return None;
+    }
+    let result = |gas_limit| InterpreterResult {
+        result: InstructionResult::CallTooDeep,
+        gas: Gas::new(gas_limit),
+        output: Default::default(),
+    };
+    match &frame_init.frame_input {
+        FrameInput::Call(inputs) => Some(FrameResult::Call(CallOutcome {
+            result: result(inputs.gas_limit),
+            memory_offset: inputs.return_memory_offset.clone(),
+            was_precompile_called: false,
+            precompile_call_logs: Vec::new(),
+        })),
+        FrameInput::Create(inputs) => Some(FrameResult::Create(CreateOutcome {
+            result: result(inputs.gas_limit()),
+            address: None,
+        })),
+        FrameInput::Empty => None,
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +303,31 @@ mod tests {
         let result: Result<(), ContextError<()>> =
             check_unsupported_precompiles(&FrameInput::Empty);
         assert!(result.is_ok());
+    }
+
+    /// RSK allows 400 nested frames; the 401st fails and hands its gas back.
+    #[test]
+    fn frames_deeper_than_the_rsk_limit_fail() {
+        let addr = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
+        let frame_init = |depth| {
+            let mut frame_input = build_call_to(addr);
+            if let FrameInput::Call(call) = &mut frame_input {
+                call.gas_limit = 1_000;
+            }
+            FrameInit {
+                depth,
+                memory: Default::default(),
+                frame_input,
+            }
+        };
+
+        assert!(call_too_deep(&frame_init(MAX_CALL_DEPTH)).is_none());
+        match call_too_deep(&frame_init(MAX_CALL_DEPTH + 1)) {
+            Some(FrameResult::Call(outcome)) => {
+                assert_eq!(outcome.result.result, InstructionResult::CallTooDeep);
+                assert_eq!(outcome.result.gas.remaining(), 1_000);
+            }
+            other => panic!("expected a failed call, got {other:?}"),
+        }
     }
 }

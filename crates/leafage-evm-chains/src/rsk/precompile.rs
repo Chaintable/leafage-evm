@@ -29,9 +29,11 @@
 //! call against a real RSK node. The check runs on every frame, so a regular
 //! contract that calls the Bridge internally is forwarded as a whole.
 
+use revm::precompile::{modexp, PrecompileSpecId, Precompiles};
+use revm::primitives::hardfork::SpecId;
 use revm::primitives::{address, Address};
-use std::collections::HashSet;
-use std::sync::LazyLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 
 // Native contracts (rskj `PrecompiledContracts`).
 const BRIDGE: Address = address!("0x0000000000000000000000000000000001000006");
@@ -75,6 +77,42 @@ pub static UNSUPPORTED_LIST: LazyLock<HashSet<Address>> = LazyLock::new(|| {
     .into_iter()
     .collect()
 });
+
+/// The precompiles RSK shares with Ethereum, priced like rskj does.
+///
+/// `0x05` MODEXP keeps the EIP-198 formula (`BigIntegerModexp.getGasForData`,
+/// divisor 20, no minimum); RSK did not take EIP-2565. The others cost the same
+/// as on Ethereum: altbn128 is at the EIP-1108 prices (RSKIP137) and blake2f at
+/// 1 gas per round (RSKIP153).
+pub(crate) fn rsk_precompiles(spec: SpecId) -> &'static Precompiles {
+    // One leaked set per precompile spec, like revm's own per-spec statics.
+    static SETS: LazyLock<Mutex<HashMap<PrecompileSpecId, &'static Precompiles>>> =
+        LazyLock::new(Default::default);
+    let spec = PrecompileSpecId::from_spec_id(spec);
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    sets.entry(spec).or_insert_with(|| {
+        let mut precompiles = Precompiles::new(spec).clone();
+        precompiles.extend([modexp::BYZANTIUM]);
+        Box::leak(Box::new(precompiles))
+    })
+}
+
+/// Every address rskj's `PrecompiledContracts.getContractForAddress` answers
+/// for: the native contracts and `0x01..=0x09`. `EXTCODESIZE` / `EXTCODEHASH`
+/// special-case them.
+pub(crate) fn is_rsk_precompile(addr: &Address) -> bool {
+    const NATIVE: [Address; 7] = [
+        BRIDGE,
+        REMASC,
+        HD_WALLET_UTILS,
+        BLOCK_HEADER,
+        ENVIRONMENT,
+        SECP256K1_ADD,
+        SECP256K1_MUL,
+    ];
+    let bytes = addr.as_slice();
+    (bytes[..19].iter().all(|b| *b == 0) && (1..=9).contains(&bytes[19])) || NATIVE.contains(addr)
+}
 
 pub fn is_unsupported(addr: &Address) -> bool {
     UNSUPPORTED_LIST.contains(addr)
