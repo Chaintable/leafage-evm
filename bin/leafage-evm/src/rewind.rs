@@ -1,5 +1,6 @@
 use crate::utils::{parse_kafka_s3_config, s3_get_block_info_by_number, KafkaS3Config};
 use anyhow::{anyhow, bail, Result};
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use clap::Parser;
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
@@ -7,6 +8,7 @@ use leafage_evm_storage::{
 };
 use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
 
 /// `leafage-evm rewind` command
@@ -141,9 +143,16 @@ impl Command {
             if let Some(rpc_url) = &self.rpc_addr {
                 rpc_client = Some(HttpClientBuilder::default().build(rpc_url)?);
             }
-            let s3_config = aws_config::load_from_env().await;
-            let s3_client = aws_sdk_s3::Client::new(&s3_config);
             let cfg = self.kafka_s3_config.clone().unwrap_or_default();
+            let s3_config = aws_config::from_env()
+                .timeout_config(
+                    TimeoutConfig::builder()
+                        .operation_timeout(Duration::from_secs(cfg.s3_read_timeout_secs.get()))
+                        .build(),
+                )
+                .load()
+                .await;
+            let s3_client = aws_sdk_s3::Client::new(&s3_config);
             s3_get_block_info_by_number(
                 &rpc_client,
                 &s3_client,

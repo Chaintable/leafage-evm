@@ -169,11 +169,14 @@ When using Kafka + S3 mode, provide a JSON config file:
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
-  "version": "v1"
+  "version": "v1",
+  "s3_read_timeout_secs": 20
 }
 ```
 
 `bundle_bucket_name` is optional; omit it or leave it empty to keep the legacy per-block S3 path.
+
+`s3_read_timeout_secs` is a positive integer, defaulting to 20. It sets the AWS SDK operation timeout for GET and LIST calls, including bundle GET/range requests and SDK retries. Response body consumption after `send()` returns is outside this timeout; the SDK's existing stalled-stream protection remains unchanged. Errors propagate to the existing caller handling. `archive-init` uses the same default 20-second operation timeout.
 
 Both `standalone` and `archive-init` accept `--bundle-range-size <MIB>` to tune the compacted StateDiff request size. The limit applies only when grouping multiple entries; a single entry larger than the configured value is fetched by itself.
 
