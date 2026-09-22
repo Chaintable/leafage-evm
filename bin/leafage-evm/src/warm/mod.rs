@@ -1,10 +1,11 @@
 use crate::utils::{s3_get_block_transactions_by_number, KafkaS3Config};
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client;
+use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{ApiBuilder, TokenCollector};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{Address, DebankTransaction};
+use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{error, info};
 
@@ -41,7 +42,14 @@ where
             let client = HttpClientBuilder::default().build(rpc_url.as_ref())?;
             rpc_client = Some(client);
         }
-        let s3_config = aws_config::load_from_env().await;
+        let s3_config = aws_config::from_env()
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(kafka_s3_cfg.s3_read_timeout_secs.get()))
+                    .build(),
+            )
+            .load()
+            .await;
         let s3_client = Client::new(&s3_config);
         Ok(Self {
             rpc_client,

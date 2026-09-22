@@ -6,7 +6,7 @@ use crate::utils::{
     KafkaS3Config,
 };
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client;
+use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
@@ -93,7 +93,14 @@ where
             )
             .create()?;
 
-        let s3_config = aws_config::load_from_env().await;
+        let s3_config = aws_config::from_env()
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(kafka_s3_cfg.s3_read_timeout_secs.get()))
+                    .build(),
+            )
+            .load()
+            .await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
         let read_from_bundle = !kafka_s3_cfg.bundle_bucket_name.is_empty();
 
