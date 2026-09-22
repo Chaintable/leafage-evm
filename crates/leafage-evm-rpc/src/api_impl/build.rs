@@ -268,6 +268,7 @@ where
             MultiChainCfgEnv::Polygon(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
+            MultiChainCfgEnv::Rsk(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
             MultiChainCfgEnv::Hemi(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
