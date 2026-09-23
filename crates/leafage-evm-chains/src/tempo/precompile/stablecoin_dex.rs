@@ -1194,16 +1194,29 @@ impl OrderbookHandle {
     }
 
     /// Writes the base orderbook data.
+    ///
+    /// Like the official Storable write, pre-T4 each packed slot group is loaded before it is
+    /// stored; T4+ starts from zero.
     fn write_data(&self, data: &OrderbookData) -> Result<()> {
         let mut ctx = StorageCtx::default();
+        let t4 = ctx.spec().is_t4();
 
         // slot+0: base
-        let mut b0 = [0u8; 32];
+        let mut b0 = if t4 {
+            [0u8; 32]
+        } else {
+            ctx.sload(self.address, self.slot)?.to_be_bytes::<32>()
+        };
         b0[12..32].copy_from_slice(data.base.as_slice());
         ctx.sstore(self.address, self.slot, U256::from_be_bytes(b0))?;
 
         // slot+1: quote
-        let mut b1 = [0u8; 32];
+        let mut b1 = if t4 {
+            [0u8; 32]
+        } else {
+            ctx.sload(self.address, self.slot + U256::from(1))?
+                .to_be_bytes::<32>()
+        };
         b1[12..32].copy_from_slice(data.quote.as_slice());
         ctx.sstore(
             self.address,
@@ -1212,7 +1225,12 @@ impl OrderbookHandle {
         )?;
 
         // slot+4: packed ticks
-        let mut b4 = [0u8; 32];
+        let mut b4 = if t4 {
+            [0u8; 32]
+        } else {
+            ctx.sload(self.address, self.slot + U256::from(4))?
+                .to_be_bytes::<32>()
+        };
         b4[30..32].copy_from_slice(&data.best_bid_tick.to_be_bytes());
         b4[28..30].copy_from_slice(&data.best_ask_tick.to_be_bytes());
         b4[24..28].copy_from_slice(&data.book_id.to_be_bytes());
@@ -1961,7 +1979,12 @@ impl StablecoinDEX {
             self.storage.spec(),
         )?;
 
-        self.next_order_id.write(order_id + 1)?;
+        if self.storage.spec().is_t1c() {
+            self.next_order_id.write(order_id + 1)?;
+        } else {
+            // Pre-T1C reads the counter again before writing it.
+            self.increment_next_order_id()?;
+        }
         self.commit_order_to_book(order, true)?;
 
         self.emit_event(IStablecoinDEX::OrderPlaced {
@@ -3039,11 +3062,13 @@ impl Precompile for StablecoinDEX {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, FixedBytes};
+    use alloy::primitives::{address, b256, FixedBytes, LogData};
     use alloy::sol_types::{SolCall, SolEvent};
+    use revm::state::{AccountInfo, Bytecode};
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{JournalCheckpoint, PrecompileStorageProvider};
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20, PAUSE_ROLE};
     use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
@@ -3997,6 +4022,182 @@ mod tests {
                 Result::<()>::Ok(())
             })
             .unwrap();
+        }
+    }
+
+    /// Delegates to [`TestStorageProvider`] and records every SLOAD, so tests can check the
+    /// storage access pattern that drives SLOAD gas on historical forks.
+    struct SloadRecorder {
+        inner: TestStorageProvider,
+        sloads: Vec<(Address, U256)>,
+    }
+
+    impl SloadRecorder {
+        fn new(spec: TempoHardfork) -> Self {
+            Self {
+                inner: TestStorageProvider::new(spec),
+                sloads: Vec::new(),
+            }
+        }
+
+        fn count(&self, address: Address, slot: U256) -> usize {
+            self.sloads
+                .iter()
+                .filter(|&&entry| entry == (address, slot))
+                .count()
+        }
+    }
+
+    impl PrecompileStorageProvider for SloadRecorder {
+        fn chain_id(&self) -> u64 {
+            self.inner.chain_id()
+        }
+
+        fn timestamp(&self) -> U256 {
+            self.inner.timestamp()
+        }
+
+        fn beneficiary(&self) -> Address {
+            self.inner.beneficiary()
+        }
+
+        fn block_number(&self) -> u64 {
+            self.inner.block_number()
+        }
+
+        fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
+            self.inner.set_code(address, code)
+        }
+
+        fn with_account_info(
+            &mut self,
+            address: Address,
+            f: &mut dyn FnMut(&AccountInfo),
+        ) -> Result<()> {
+            self.inner.with_account_info(address, f)
+        }
+
+        fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+            self.sloads.push((address, key));
+            self.inner.sload(address, key)
+        }
+
+        fn tload(&mut self, address: Address, key: U256) -> Result<U256> {
+            self.inner.tload(address, key)
+        }
+
+        fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+            self.inner.sstore(address, key, value)
+        }
+
+        fn tstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+            self.inner.tstore(address, key, value)
+        }
+
+        fn emit_event(&mut self, address: Address, event: LogData) -> Result<()> {
+            self.inner.emit_event(address, event)
+        }
+
+        fn deduct_gas(&mut self, gas: u64) -> Result<()> {
+            self.inner.deduct_gas(gas)
+        }
+
+        fn refund_gas(&mut self, gas: i64) {
+            self.inner.refund_gas(gas)
+        }
+
+        fn gas_used(&self) -> u64 {
+            self.inner.gas_used()
+        }
+
+        fn gas_refunded(&self) -> i64 {
+            self.inner.gas_refunded()
+        }
+
+        fn spec(&self) -> TempoHardfork {
+            self.inner.spec()
+        }
+
+        fn is_static(&self) -> bool {
+            self.inner.is_static()
+        }
+
+        fn checkpoint(&mut self) -> JournalCheckpoint {
+            self.inner.checkpoint()
+        }
+
+        fn checkpoint_commit(&mut self, checkpoint: JournalCheckpoint) {
+            self.inner.checkpoint_commit(checkpoint)
+        }
+
+        fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+            self.inner.checkpoint_revert(checkpoint)
+        }
+    }
+
+    #[test]
+    fn create_pair_reads_book_slots_before_writing_before_t4() {
+        for spec in [TempoHardfork::T3, TempoHardfork::T4] {
+            let admin = Address::repeat_byte(0xe1);
+            let base = address!("0x20c00000000000000000000000000000000000e1");
+            let mut provider = SloadRecorder::new(spec);
+            let book_slot = StorageCtx::enter(&mut provider, || {
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                Result::<U256>::Ok(
+                    dex.book_handle(compute_book_key(base, PATH_USD_ADDRESS))
+                        .slot,
+                )
+            })
+            .unwrap();
+
+            // The existence check loads each packed slot group once; before T4 the
+            // Storable write loads it again before storing.
+            let expected = if spec.is_t4() { 1 } else { 2 };
+            for offset in [0u64, 1, 4] {
+                assert_eq!(
+                    provider.count(STABLECOIN_DEX_ADDRESS, book_slot + U256::from(offset)),
+                    expected,
+                    "{spec:?} slot+{offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn place_flip_reads_next_order_id_twice_before_t1c() {
+        for spec in [TempoHardfork::T1B, TempoHardfork::T1C] {
+            let admin = Address::repeat_byte(0xe2);
+            let maker = Address::repeat_byte(0xe3);
+            let base = address!("0x20c00000000000000000000000000000000000e2");
+            let mut provider = SloadRecorder::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                dex.set_balance(maker, PATH_USD_ADDRESS, MIN_ORDER_AMOUNT)?;
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+            provider.sloads.clear();
+
+            let order_id = StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().place_flip(maker, base, MIN_ORDER_AMOUNT, true, 0, 10, false)
+            })
+            .unwrap();
+
+            assert_eq!(order_id, 1);
+            let expected = if spec.is_t1c() { 1 } else { 2 };
+            assert_eq!(
+                provider.count(STABLECOIN_DEX_ADDRESS, U256::from(3)),
+                expected,
+                "{spec:?}"
+            );
+            assert_eq!(
+                provider
+                    .inner
+                    .storage(STABLECOIN_DEX_ADDRESS, U256::from(3)),
+                U256::from(2)
+            );
         }
     }
 }
