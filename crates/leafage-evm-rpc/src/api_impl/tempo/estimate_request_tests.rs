@@ -277,6 +277,46 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
     handle.stopped().await;
 }
 
+/// Like reth's basic-transfer shortcut (estimate.rs:150-161), a plain transfer
+/// to a code-less account estimates exactly 21000. A sender with nonce 0 still
+/// pays the TIP-1000 surcharge: the 21000 trial fails and bisection runs.
+#[tokio::test]
+async fn basic_transfer_estimate_takes_min_gas_shortcut() {
+    let caller = address!("1111111111111111111111111111111111111111");
+    for nonce in [7u64, 0] {
+        let mut db = EstimateState::default();
+        db.block.header.number = 100;
+        db.block.header.timestamp = 1_788_743_086;
+        db.block.header.gas_limit = 100_000_000;
+        db.accounts.insert(
+            keccak256(caller),
+            revm::state::AccountInfo {
+                nonce,
+                ..Default::default()
+            },
+        );
+        let core = ApiImpl {
+            db,
+            evm_cfg: tests::review_api().evm_cfg,
+            historical_client: None,
+            historical_height: None,
+            token_collector: None,
+        };
+        let module = DebankApiServer::into_rpc(Api::new(core));
+        let request = json!({"from":caller,"to":Address::repeat_byte(0x22)});
+        let raw = json!({"jsonrpc":"2.0","id":1,"method":"estimateGas", "params":[request,{"block_id":"0x64","type":"Equals"}]}).to_string();
+        let (response, _) = module.raw_json_request(&raw, 1).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let gas: U256 = serde_json::from_value(response["result"].clone())
+            .unwrap_or_else(|_| panic!("nonce={nonce}: {response}"));
+        if nonce == 0 {
+            assert!(gas >= U256::from(271_000), "nonce=0: {gas}");
+        } else {
+            assert_eq!(gas, U256::from(21_000), "nonce={nonce}");
+        }
+    }
+}
+
 #[test]
 fn review_estimate_nonce_policy_preserves_other_chains_and_unsigned_requests() {
     use crate::api_impl::api_impl::NoneEvmCustomConfig;

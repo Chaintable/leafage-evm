@@ -914,11 +914,7 @@ where
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         tx.set_gas_estimation();
-        // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
-        // adds 250k gas that this optimization doesn't account for. The early return
-        // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
-        // required gas is 271000+.
-        if self.inner.virtual_balance().is_none() && tx.input().is_empty() {
+        if tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
