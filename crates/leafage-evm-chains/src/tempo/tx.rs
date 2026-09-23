@@ -166,6 +166,9 @@ pub struct TempoTxEnv {
     /// Replay key for one entry in a stateful RPC simulation. Never used as the
     /// MPP open context or a persistent/cross-request transaction identity.
     pub stateful_simulation_replay_id: Option<B256>,
+    /// Set for gas-estimation runs, which keep the block basefee (reth's
+    /// estimate path does not use `prepare_call_env`).
+    pub gas_estimation: bool,
 }
 
 impl TempoTxEnv {

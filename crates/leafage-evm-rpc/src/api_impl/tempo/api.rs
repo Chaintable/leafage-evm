@@ -117,9 +117,10 @@ impl<DB> TempoApiImpl<DB> {
     /// reth `prepare_call_env` lowers the basefee to 0 when the call's gas price is 0.
     /// reth's TxEnv gas price is the effective price (min(maxFee, basefee + tip) for
     /// 1559/AA); Leafage stores maxFee there, so compare the effective price instead.
+    /// reth's estimate path does not lower the basefee, so estimation runs keep it.
     fn block_env_for_call(block_env: &BlockEnv, tx: &TempoTxEnv) -> BlockEnv {
         let mut block_env = block_env.clone();
-        if tx.effective_gas_price(block_env.basefee as u128) == 0 {
+        if !tx.gas_estimation && tx.effective_gas_price(block_env.basefee as u128) == 0 {
             block_env.basefee = 0;
         }
         block_env
@@ -673,6 +674,7 @@ where
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
             ),
+            gas_estimation: false,
         })
     }
 
@@ -842,6 +844,10 @@ where
 impl TxSetter for TempoTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.gas_limit = gas_limit;
+    }
+
+    fn set_gas_estimation(&mut self) {
+        self.gas_estimation = true;
     }
 
     fn set_stateful_simulation_context(
@@ -1172,6 +1178,24 @@ mod tests {
                 "inspect_tx_commit {field}"
             );
         }
+
+        // reth's estimate path keeps the block basefee for zero-priced requests.
+        let mut tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                review_request("gasPrice", serde_json::json!("0x0")),
+                &db,
+                4217,
+            )
+            .unwrap();
+        tx.set_gas_estimation();
+        let result = api.transact(&block, &db, tx).unwrap();
+        assert_eq!(
+            result.output().unwrap().as_ref(),
+            U256::from(1_000u64).to_be_bytes::<32>(),
+            "estimation keeps basefee"
+        );
     }
 
     #[test]
