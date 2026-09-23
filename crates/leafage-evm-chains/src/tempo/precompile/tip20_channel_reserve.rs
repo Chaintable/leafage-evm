@@ -174,6 +174,7 @@ impl TIP20ChannelReserve {
         {
             return Err(revert(ITIP20ChannelReserve::InvalidPayee {}));
         }
+        let mut token = TIP20Token::from_address(call.token)?;
         if call.deposit.is_zero() {
             return Err(revert(ITIP20ChannelReserve::ZeroDeposit {}));
         }
@@ -195,7 +196,6 @@ impl TIP20ChannelReserve {
         }
 
         let payee = AddressRegistry::new().resolve_recipient(call.payee)?;
-        let mut token = TIP20Token::from_address(call.token)?;
         token.ensure_authorized_as(&[(payee, AuthRole::Recipient)])?;
         token.system_transfer_from(self.address, msg_sender, U256::from(call.deposit))?;
 
@@ -868,6 +868,29 @@ mod tests {
             TIP20ChannelReserve::new().open(Address::repeat_byte(1), call)
         });
         assert!(matches!(result, Err(TempoPrecompileError::Revert(_))));
+    }
+
+    #[test]
+    fn open_validates_token_right_after_payee() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T5);
+        let call = ITIP20ChannelReserve::openCall {
+            payee: Address::repeat_byte(2),
+            operator: Address::ZERO,
+            token: Address::repeat_byte(3),
+            deposit: U96::ZERO,
+            salt: B256::ZERO,
+            authorizedSigner: Address::ZERO,
+        };
+
+        let result = StorageCtx::enter(&mut provider, || {
+            TIP20ChannelReserve::new().open(Address::repeat_byte(1), call)
+        });
+        assert_eq!(
+            result,
+            Err(TempoPrecompileError::Revert(
+                ITIP20::InvalidToken {}.abi_encode().into()
+            ))
+        );
     }
 
     #[test]
