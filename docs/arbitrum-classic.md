@@ -13,7 +13,7 @@ Keep the producer and reader's StateDiff addressing aligned. For the existing Cl
 
 ## Supported scope
 
-This is **account-state-only call simulation**, not a replacement for the Classic AVM execution client. `eth_call`, `eth_multiCall`, `debank_contractMultiCall`, `pre_traceCall`, and `pre_traceMany` use the existing Arbitrum EVM, account journal, call stack, inspectors and historical state database.
+This is **account-state-only call simulation**, not a replacement for the Classic AVM execution client. `eth_call`, `eth_multiCall`, `contractMultiCall`, `pre_traceCall`, and `pre_traceMany` use the existing Arbitrum EVM, account journal, call stack, inspectors and historical state database.
 
 The supported subset includes ordinary EVM contract reads and simulated storage/value changes; CALL, STATICCALL and DELEGATECALL between ordinary contracts; standard Ethereum precompiles; and Classic-specific handling of:
 
@@ -30,9 +30,9 @@ Execution touching unavailable semantics returns an explicit `Arbitrum Classic:`
 - NUMBER (L1 height), BLOCKHASH (Classic's private inbox-derived hash history), GASLIMIT (private ArbOS pool limit), GASPRICE and BASEFEE (private ArbGas price). The L2 header's fields are not substitutes.
 - Other ArbOS builtins, including pricing, retryables, address/function tables, owner operations, ArbOS version and caller alias queries. Historical private ArbOS state and version are not in account StateDiffs.
 - Contract creation/destruction, whose Classic account lifecycle is not implemented in this mode.
-- Typed transactions, nonzero gasPrice, and `debank_estimateGas`.
+- Typed transactions, nonzero gasPrice, and `estimateGas`.
 
-Unknown or unsupported builtin selectors also return an explicit error rather than running Nitro code against Classic state. This error is a capability limit, not evidence that the original Classic call reverts.
+Recognized unsupported builtins return a capability error rather than running Nitro code against Classic state. Unknown ArbSys selectors retain Classic's catchable revert behavior. A capability error is not evidence that the original Classic call reverts.
 
 Gas in calls/traces/multicall remains **revm resource accounting, not Classic ArbGas**. GAS, gas-sensitive branches and low-gas calls can differ from AVM even if no missing-data instruction executes. Use the archive Classic node for exact gas, estimates, transaction replay or these unsupported paths. PUSH0 and later Ethereum opcodes are not enabled. Full transaction simulation/replay fidelity is not claimed.
 
@@ -46,4 +46,4 @@ python3 scripts/test_arbitrum_classic.py \
   --heights 156000,1107013,4198902 --report /tmp/classic-comparison.json
 ```
 
-The differential script issues only read/simulation RPCs. Both nodes must have archive state at the selected heights. It compares return bytes and historical balance/nonce/code/storage, not AVM gas usage. Synthetic opcode probes use RPC state overrides. It also checks explicit missing-data failures, multicall output, tracing and estimate rejection. The JSON report retains failures for debugging.
+The differential script issues only read/simulation RPCs. Both nodes must have archive state at the selected heights. It compares return bytes and historical balance/nonce/code/storage, not AVM gas usage. Synthetic opcode probes use RPC state overrides; if the Classic reference cannot apply these at an early height, the report marks those probes as skipped, while real historical calls and state comparisons still run. It also checks explicit missing-data failures, multicall output, tracing and estimate rejection. The JSON report retains failures for debugging.

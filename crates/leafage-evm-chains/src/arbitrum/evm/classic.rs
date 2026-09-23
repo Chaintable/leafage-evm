@@ -362,6 +362,27 @@ mod tests {
         );
     }
     #[test]
+    fn classic_unknown_arbsys_selector_reverts_but_missing_state_is_fatal() {
+        let forwarder =
+            alloy::primitives::hex::decode("3660006000376020600036600060645afa60005260206000f3")
+                .unwrap();
+        let mut evm = evm(&forwarder);
+        let mut tx = tx();
+        tx.base.data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            U256::from_be_slice(&output(evm.transact(tx.clone()).unwrap().result)),
+            U256::ZERO
+        );
+        tx.base.data = Bytes::from_static(&[0x05, 0x10, 0x38, 0xf2]);
+        assert!(
+            evm.inspect_tx(tx)
+                .unwrap_err()
+                .to_string()
+                .contains("Arbitrum Classic:")
+        );
+    }
+
+    #[test]
     fn classic_rejects_estimates_priced_calls_and_creation() {
         for kind in 0..3 {
             let mut evm = evm(&[0]);

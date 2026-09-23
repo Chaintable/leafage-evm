@@ -12,7 +12,7 @@ ARBSYS = '0x0000000000000000000000000000000000000064'
 ARBINFO = '0x0000000000000000000000000000000000000065'
 TOKENS = [
     '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',  # WETH
-    '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8',  # native Classic USDC
+    '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8',  # Classic USDC
 ]
 
 
@@ -32,13 +32,17 @@ def main():
     parser.add_argument('--report', required=True)
     args = parser.parse_args()
     records = []
+    override_supported = {}
 
     def record(name, height, ok, **details):
         records.append(dict(name=name, height=height, ok=ok, **details))
-        if not ok:
+        if ok is False:
             print('FAIL', height, name, json.dumps(details)[:1200], flush=True)
 
     def compare(name, height, method, params):
+        if method == 'eth_call' and len(params) > 2 and params[2] and not override_supported.get(height, True):
+            record(name, height, None, skipped='Classic reference cannot apply code/balance overrides at this height')
+            return None
         reference = rpc(args.classic, method, params)
         actual = rpc(args.leafage, method, params)
         ok = 'result' in reference and 'result' in actual and reference['result'] == actual['result']
@@ -52,6 +56,11 @@ def main():
     heights = [int(v) for v in args.heights.split(',')]
     for height in heights:
         block = hex(height)
+        probe = rpc(args.classic, 'eth_call', [dict(to=PROBE, **{'from': SENDER}), block,
+                    {PROBE: dict(code='0x602a60005260206000f3'), SENDER: dict(balance='0xde0b6b3a7640000', nonce='0x7')}])
+        override_supported[height] = probe.get('result') == '0x' + format(42, '064x')
+        if not override_supported[height]:
+            print('Classic state override unavailable at', height, probe.get('error'), flush=True)
         token_requests = []
         for token in TOKENS:
             for method, extra in [('eth_getCode', []), ('eth_getBalance', []),
@@ -80,7 +89,7 @@ def main():
                     {PROBE: dict(code='0x' + code), SENDER: dict(nonce='0x7', balance='0xde0b6b3a7640000')}])
 
         for selector in ['a3b1b31d', 'd127f54a', '08bd624c', '23ca0cd2' + SENDER[2:].zfill(64)]:
-            compare('arbsys.direct:' + selector[:8], height, 'eth_call', [dict(to=ARBSYS, data='0x' + selector, **{'from': SENDER}), block, {SENDER: dict(nonce='0x7')}])
+            compare('arbsys.direct:' + selector[:8], height, 'eth_call', [dict(to=ARBSYS, data='0x' + selector, **{'from': SENDER}), block])
             code = '0x3660006000376020600036600060645afa5060206000f3'
             compare('arbsys.nested:' + selector[:8], height, 'eth_call', [dict(to=PROBE, data='0x' + selector, **{'from': SENDER}), block, {PROBE: dict(code=code), SENDER: dict(nonce='0x7')}])
 
@@ -97,7 +106,7 @@ def main():
         for address, data in [(ARBSYS, '0x051038f2'), ('0x000000000000000000000000000000000000006c', '0x')]:
             rejected('builtin:' + address + data, height, 'eth_call', [dict(to=address, data=data), block])
         rejected('trace.unsupported', height, 'pre_traceCall', [dict(to=ARBSYS, data='0x051038f2'), block])
-        rejected('estimate.unsupported', height, 'debank_estimateGas', [dict(to=TOKENS[0], data='0x313ce567'), {'blockId': block, 'type': 'Equals'}])
+        rejected('estimate.unsupported', height, 'estimateGas', [dict(to=TOKENS[0], data='0x313ce567'), {'block_id': block, 'type': 'Equals'}])
 
         for parallel in [False, True]:
             actual = rpc(args.leafage, 'eth_multiCall', [[r for r, _ in token_requests], block, False, parallel, True])
@@ -108,7 +117,7 @@ def main():
         record('trace.supported', height, 'result' in actual and not actual['result'].get('failed', True), actual=actual)
         print('height', height, 'complete', flush=True)
 
-    summary = dict(total=len(records), passed=sum(r['ok'] for r in records), failed=sum(not r['ok'] for r in records))
+    summary = dict(total=len(records), passed=sum(r['ok'] is True for r in records), failed=sum(r['ok'] is False for r in records), skipped=sum(r['ok'] is None for r in records))
     Path(args.report).write_text(json.dumps(dict(summary=summary, records=records), indent=2) + '\n')
     print(json.dumps(summary))
     return int(summary['failed'] != 0)

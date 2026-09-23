@@ -115,10 +115,24 @@ pub(super) fn run<DB: Database + DatabaseRef>(
         }
         // Caller aliasing and version depend on historical private state. A
         // fatal error cannot be swallowed by a Solidity low-level CALL.
-        [0x05, 0x10, 0x38, 0xf2] | [0x17, 0x5a, 0x26, 0x0b] | [0xd7, 0x45, 0x23, 0xb3] => {
+        [0x05, 0x10, 0x38, 0xf2] // arbOSVersion
+        | [0x17, 0x5a, 0x26, 0x0b] // wasMyCallersAddressAliased
+        | [0xd7, 0x45, 0x23, 0xb3] // myCallersAddressWithoutAliasing
+        | [0xa9, 0x45, 0x97, 0xff] => { // getStorageGasAvailable
+            if data.len() != 4 { return Ok(result(None)); }
             return Err(unsupported());
         }
-        _ => return Err(unsupported()),
+        [0x4d, 0xbb, 0xd5, 0x06] => { // mapL1SenderContractAddressToL2Alias
+            if data.len() != 68 { return Ok(result(None)); }
+            return Err(unsupported());
+        }
+        [0x25, 0xe1, 0x60, 0x63] | [0x92, 0x8c, 0x16, 0x9a] => { // withdrawEth / sendTxToL1
+            if inputs.is_static { return Ok(result(None)); }
+            return Err(unsupported());
+        }
+        // Unknown selectors revert in Classic. Capability probes may catch
+        // this revert and continue; only recognized missing-data paths fail.
+        _ => return Ok(result(None)),
     };
     Ok(result(value))
 }
