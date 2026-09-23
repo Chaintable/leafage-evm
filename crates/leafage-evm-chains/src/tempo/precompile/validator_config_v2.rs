@@ -215,20 +215,19 @@ fn union_unique(namespace: &[u8], payload: &[u8]) -> Vec<u8> {
 // IP validation
 // ===========================================================================
 
-/// Validates that `input` is of the form `<ip>:<port>`.
+/// Validates that `input` is of the form `<ip>:<port>`. The error text is the writer's
+/// `IpWithPortParseError` message (V2 only runs from T2, so always `Display`).
 fn ensure_address_is_ip_port(input: &str) -> std::result::Result<(), String> {
-    input
-        .parse::<std::net::SocketAddr>()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    super::validator_config::ensure_address_is_ip_port(input).map_err(|err| err.to_string())
 }
 
-/// Validates that `input` is a bare IP address (no port).
+/// Validates that `input` is a bare IP address (no port). The error text is the
+/// writer's `ip_validation::IpParseError` message.
 fn ensure_address_is_ip(input: &str) -> std::result::Result<(), String> {
     input
         .parse::<std::net::IpAddr>()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|_| "input was not a valid IP address".to_string())
 }
 
 // ===========================================================================
@@ -683,9 +682,10 @@ impl ValidatorConfigV2 {
 
     /// Computes the keccak256 hash of the ingress IP:port for uniqueness checking.
     fn ingress_key(ingress: &str) -> Result<B256> {
-        let addr = ingress
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| err_not_ip_port(ingress.to_string(), e.to_string()))?;
+        let addr = ingress.parse::<std::net::SocketAddr>().map_err(|e| {
+            let err = super::validator_config::IpWithPortParseError::Parse(e);
+            err_not_ip_port(ingress.to_string(), err.to_string())
+        })?;
 
         let mut data = Vec::new();
         match addr {
@@ -1367,6 +1367,29 @@ mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
+
+    #[test]
+    fn invalid_endpoint_backtraces_use_writer_messages() {
+        let revert_data = |result: Result<()>| match result {
+            Err(TempoPrecompileError::Revert(data)) => data,
+            other => panic!("unexpected result {other:?}"),
+        };
+
+        let ingress = revert_data(ValidatorConfigV2::validate_endpoints("bad", "1.2.3.4"));
+        assert_eq!(
+            IValidatorConfigV2::NotIpPort::abi_decode(&ingress)
+                .unwrap()
+                .backtrace,
+            "input was not of the form `<ip>:<port>`"
+        );
+        let egress = revert_data(ValidatorConfigV2::validate_endpoints("1.2.3.4:1", "bad"));
+        assert_eq!(
+            IValidatorConfigV2::NotIp::abi_decode(&egress)
+                .unwrap()
+                .backtrace,
+            "input was not a valid IP address"
+        );
+    }
 
     #[test]
     fn validator_lists_with_huge_stored_length_run_out_of_gas() {

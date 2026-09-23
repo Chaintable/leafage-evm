@@ -631,11 +631,12 @@ impl AccountKeychain {
             return Err(err_zero_public_key());
         }
 
-        // T0+: Expiry must be in the future
-        // leafage always runs latest spec, so this is always enforced
-        let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
-        if call.expiry <= current_timestamp {
-            return Err(err_expiry_in_past());
+        // T0+: Expiry must be in the future (Genesis is official T0, so this always applies)
+        if self.storage.spec().is_t0() {
+            let current_timestamp: u64 = self.storage.timestamp().saturating_to::<u64>();
+            if call.expiry <= current_timestamp {
+                return Err(err_expiry_in_past());
+            }
         }
 
         // Check if key already exists (expiry > 0 means key exists)
