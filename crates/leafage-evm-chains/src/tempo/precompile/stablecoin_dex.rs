@@ -2159,7 +2159,7 @@ impl StablecoinDEX {
                 .map(|_| ())
             };
             if let Err(error) = &result {
-                if error.is_system_error() {
+                if error.is_system_error() && self.storage.spec().is_t1a() {
                     return Err(error.clone());
                 }
                 if self.storage.spec().is_t5() {
@@ -4018,6 +4018,52 @@ mod tests {
                     assert_eq!(dex.balance_of(maker, PATH_USD_ADDRESS)?, MIN_ORDER_AMOUNT);
                 } else {
                     assert_eq!(result, Err(err_order_not_stale()));
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn flip_panic_propagates_only_from_t1a() {
+        for spec in [TempoHardfork::T1, TempoHardfork::T1A] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xf1);
+                let alice = Address::repeat_byte(0xf2);
+                let bob = Address::repeat_byte(0xf3);
+                let base = address!("0x20c00000000000000000000000000000000000f1");
+                let amount = MIN_ORDER_AMOUNT;
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                grant_and_mint(PATH_USD_ADDRESS, admin, alice, amount)?;
+                TIP20Token::from_address(PATH_USD_ADDRESS)?.approve(
+                    alice,
+                    ITIP20::approveCall {
+                        spender: STABLECOIN_DEX_ADDRESS,
+                        amount: U256::from(amount),
+                    },
+                )?;
+                dex.place_flip(alice, base, amount, true, 0, 10, false)?;
+                // The flipped ask at tick 10 overflows the level's liquidity: Panic(0x11).
+                dex.book_handle(compute_book_key(base, PATH_USD_ADDRESS))
+                    .write_tick_level(
+                        10,
+                        false,
+                        TickLevel {
+                            head: 0,
+                            tail: 0,
+                            total_liquidity: u128::MAX,
+                        },
+                    )?;
+                dex.set_balance(bob, base, amount)?;
+
+                let result = dex.swap_exact_amount_in(bob, base, PATH_USD_ADDRESS, amount, 0);
+                if spec.is_t1a() {
+                    assert_eq!(result, Err(TempoPrecompileError::under_overflow()));
+                } else {
+                    assert_eq!(result, Ok(amount));
                 }
                 Result::<()>::Ok(())
             })
