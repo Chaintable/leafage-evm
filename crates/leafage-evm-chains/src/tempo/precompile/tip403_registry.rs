@@ -27,12 +27,8 @@ use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, 
 use super::tip20::TIP20Token;
 use super::tip20_factory::TIP20Factory;
 use super::{
-    ACCOUNT_KEYCHAIN_ADDRESS, ADDRESS_REGISTRY_ADDRESS, CURRENT_COMMITTEE_ADDRESS,
-    NONCE_PRECOMPILE_ADDRESS, Precompile, RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS,
-    STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS,
-    TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS, VALIDATOR_CONFIG_ADDRESS,
-    VALIDATOR_CONFIG_V2_ADDRESS, dispatch_call, input_cost, mutate, mutate_void, unknown_selector,
-    view,
+    Precompile, RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS, dispatch_call, input_cost,
+    mutate, mutate_void, unknown_selector, view,
 };
 
 // ===========================================================================
@@ -496,30 +492,6 @@ impl Storable for ReceivePolicy {
         storage.store(slot, U256::ZERO)?;
         storage.store(slot + U256::ONE, U256::ZERO)
     }
-}
-
-fn is_reserved_recovery_authority(address: Address) -> bool {
-    let bytes = address.as_slice();
-    let ethereum_precompile =
-        bytes[..19].iter().all(|byte| *byte == 0) && (1..=17).contains(&bytes[19]);
-    ethereum_precompile
-        || address.is_tip20()
-        || matches!(
-            address,
-            TIP_FEE_MANAGER_ADDRESS
-                | TIP403_REGISTRY_ADDRESS
-                | TIP20_FACTORY_ADDRESS
-                | STABLECOIN_DEX_ADDRESS
-                | TIP20_CHANNEL_RESERVE_ADDRESS
-                | NONCE_PRECOMPILE_ADDRESS
-                | VALIDATOR_CONFIG_ADDRESS
-                | ACCOUNT_KEYCHAIN_ADDRESS
-                | VALIDATOR_CONFIG_V2_ADDRESS
-                | SIGNATURE_VERIFIER_ADDRESS
-                | ADDRESS_REGISTRY_ADDRESS
-                | RECEIVE_POLICY_GUARD_ADDRESS
-                | CURRENT_COMMITTEE_ADDRESS
-        )
 }
 
 // ===========================================================================
@@ -1050,8 +1022,8 @@ impl TIP403Registry {
         if msg_sender.is_virtual() {
             return Err(err_virtual_address_not_allowed());
         }
-        if call.recoveryAuthority.is_virtual()
-            || is_reserved_recovery_authority(call.recoveryAuthority)
+        if call.recoveryAuthority.is_precompile(self.storage.spec())
+            || call.recoveryAuthority.is_virtual()
         {
             return Err(err_invalid_recovery_authority());
         }
@@ -1413,6 +1385,10 @@ mod tests {
     use crate::tempo::precompile::storage_types::StorageKey;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::UnknownFunctionSelector;
+    use crate::tempo::precompile::{
+        CURRENT_COMMITTEE_ADDRESS, STABLECOIN_DEX_ADDRESS, STORAGE_CREDITS_ADDRESS,
+        ZONE_FACTORY_ADDRESS,
+    };
     use alloy::primitives::FixedBytes;
     use alloy::sol_types::{SolCall, SolError};
     use std::{cell::Cell, collections::HashMap};
@@ -1769,6 +1745,42 @@ mod tests {
             )
         });
         assert_eq!(result.unwrap_err(), err_invalid_recovery_authority());
+    }
+
+    #[test]
+    fn receive_policy_recovery_authority_uses_active_precompile_set() {
+        let account = Address::repeat_byte(0x72);
+        for (spec, authority, rejected) in [
+            (TempoHardfork::T6, Address::with_last_byte(1), false),
+            (TempoHardfork::T6, STORAGE_CREDITS_ADDRESS, false),
+            (TempoHardfork::T7, STORAGE_CREDITS_ADDRESS, true),
+            (TempoHardfork::T7, CURRENT_COMMITTEE_ADDRESS, false),
+            (TempoHardfork::T8, CURRENT_COMMITTEE_ADDRESS, true),
+            (TempoHardfork::T9, ZONE_FACTORY_ADDRESS, false),
+            (TempoHardfork::T10, ZONE_FACTORY_ADDRESS, true),
+            (TempoHardfork::T6, PATH_USD_ADDRESS, true),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            let result = StorageCtx::enter(&mut provider, || {
+                TIP403Registry::new().set_receive_policy(
+                    account,
+                    ITIP403Registry::setReceivePolicyCall {
+                        senderPolicyId: ALLOW_ALL_POLICY_ID,
+                        tokenFilterId: ALLOW_ALL_POLICY_ID,
+                        recoveryAuthority: authority,
+                    },
+                )
+            });
+            if rejected {
+                assert_eq!(
+                    result,
+                    Err(err_invalid_recovery_authority()),
+                    "{spec:?} {authority}"
+                );
+            } else {
+                assert_eq!(result, Ok(()), "{spec:?} {authority}");
+            }
+        }
     }
 
     #[test]
