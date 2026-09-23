@@ -301,6 +301,75 @@ fn review_self_sponsorship_gate_and_incomplete_requests() {
 }
 
 #[test]
+fn review_pre_t5_signed_witness_is_rejected_by_execution() {
+    let signer = k256::ecdsa::SigningKey::from_slice(&[1u8; 32]).unwrap();
+    let caller = Address::from_public_key(signer.verifying_key());
+    let witness = B256::repeat_byte(0x53);
+    let hash = fp::KeyAuthorization {
+        chain_id: 4217,
+        key_type: fp::SignatureType::P256,
+        key_id: DELEGATE,
+        expiry: None,
+        limits: None,
+        allowed_calls: None,
+        witness: Some(witness),
+        is_admin: false,
+        account: None,
+    }
+    .signature_hash();
+    let signature: Signature = signer
+        .sign_prehash_recoverable(hash.as_slice())
+        .unwrap()
+        .into();
+    let mut json = json!({
+        "from":caller,"to":DELEGATE,"gas":"0x1e8480",
+        "keyAuthorization":{
+            "chainId":"0x1079","keyType":"p256","keyId":DELEGATE,"witness":witness,
+            "signature":{
+                "type":"secp256k1","r":signature.r(),"s":signature.s(),
+                "yParity":if signature.v() { "0x1" } else { "0x0" }
+            }
+        }
+    });
+    let mut block = block();
+    block.timestamp = U256::from(1_780_000_000u64); // T4
+    let api = tests::review_api();
+    let db = InMemoryDB::default();
+    // The official handler validates signed authorizations; the RPC layer does not.
+    let tx = api
+        .create_txn_env(
+            &Default::default(),
+            &block,
+            serde_json::from_value(json.clone()).unwrap(),
+            &db,
+            4217,
+        )
+        .unwrap();
+    let error = api.transact(&block, &db, tx).unwrap_err().to_rpc_error();
+    assert!(
+        error
+            .message()
+            .contains("key authorization witnesses are not active before T5"),
+        "{error:?}"
+    );
+    // The signature-less gas-only shape never reaches the handler check.
+    json["keyAuthorization"]
+        .as_object_mut()
+        .unwrap()
+        .remove("signature");
+    let error = api
+        .create_txn_env(
+            &Default::default(),
+            &block,
+            serde_json::from_value(json).unwrap(),
+            &db,
+            4217,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), -32602);
+}
+
+#[test]
 fn review_missing_sponsor_nonce_uses_state_nonce() {
     use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
     let sponsor = k256::ecdsa::SigningKey::from_slice(&[2u8; 32]).unwrap();

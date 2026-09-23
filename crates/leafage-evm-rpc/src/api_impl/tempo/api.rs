@@ -486,10 +486,11 @@ where
         let valid_after = te.valid_after;
         let valid_before = te.valid_before;
 
-        if key_authorization
-            .as_ref()
-            .is_some_and(|authorization| authorization.witness.is_some())
-            && !hardfork.is_t5()
+        // Signed authorizations are checked by the handler, in the official order.
+        // The Leafage-only signature-less gas shape never reaches that check.
+        if key_authorization.as_ref().is_some_and(|authorization| {
+            authorization.witness.is_some() && authorization.signature.is_none()
+        }) && !hardfork.is_t5()
         {
             return Err(invalid_params_rpc_err(
                 "key authorization witnesses are not active before T5",
