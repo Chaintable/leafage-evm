@@ -946,11 +946,7 @@ macro_rules! impl_uint_storable {
 
                 #[inline]
                 fn from_word(word: U256) -> Result<Self> {
-                    word.try_into().map_err(|_| {
-                        TempoPrecompileError::Fatal(
-                            format!("U256 value too large for {}", stringify!($ty))
-                        )
-                    })
+                    word.try_into().map_err(|_| TempoPrecompileError::under_overflow())
                 }
             }
         )+
@@ -1015,7 +1011,7 @@ impl FromWord for i16 {
     fn from_word(word: U256) -> Result<Self> {
         u16::try_from(word)
             .map(|value| value as i16)
-            .map_err(|_| TempoPrecompileError::Fatal("U256 value too large for i16".to_string()))
+            .map_err(|_| TempoPrecompileError::under_overflow())
     }
 }
 
@@ -1148,7 +1144,7 @@ impl Storable for Bytes {
             // Long: data starts at keccak256(slot)
             let data_start = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
             let num_slots = len.div_ceil(32);
-            let mut data = Vec::with_capacity(num_slots * 32);
+            let mut data = Vec::new();
 
             for i in 0..num_slots {
                 let word = storage.load(data_start + U256::from(i))?;
@@ -1283,7 +1279,7 @@ where
         let data_start = calc_data_slot(len_slot);
         if T::BYTES <= 16 {
             // Packed elements
-            let mut result = Vec::with_capacity(length);
+            let mut result = Vec::new();
             let slots_needed = packing::calc_packed_slot_count(length, T::BYTES);
             for slot_idx in 0..slots_needed {
                 let slot_value = storage.load(data_start + U256::from(slot_idx))?;
@@ -1300,7 +1296,7 @@ where
             Ok(result)
         } else {
             // Unpacked (multi-slot) elements
-            let mut result = Vec::with_capacity(length);
+            let mut result = Vec::new();
             for elem_idx in 0..length {
                 let elem_slot = data_start + U256::from(elem_idx * T::SLOTS);
                 let elem = T::load(storage, elem_slot, LayoutCtx::FULL)?;
@@ -1678,14 +1674,24 @@ where
         Ok(Self(values))
     }
 
-    /// Writes the set's values vector and length. The positions mapping at
-    /// `slot + 1` is NOT updated here — it is only used by single-element
-    /// `contains` / `insert` / `remove` paths. Full-replace writes via this
-    /// `store` (e.g. nested via parent struct `Storable::store`) skip them;
-    /// callers that need `contains` correctness afterwards must use
-    /// `SetHandler::write` which keeps positions in sync.
-    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        Vec::store(&self.0, storage, slot, LayoutCtx::FULL)
+    /// Rejected like writer `storage/types/set.rs`: a plain store cannot keep the
+    /// positions mapping in sync, so sets are written via `SetHandler::write`.
+    fn store<S: StorageOps>(&self, _storage: &mut S, _slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set must be stored via SetHandler::write() to maintain position invariants".into(),
+        ))
+    }
+
+    /// Clears every position entry, then the values vector (length and elements).
+    fn delete<S: StorageOps>(storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
+        let values: Vec<T> = Vec::load(storage, slot, LayoutCtx::FULL)?;
+
+        for value in values {
+            let pos_slot = value.mapping_slot(slot + U256::ONE);
+            <U256 as Storable>::delete(storage, pos_slot, LayoutCtx::FULL)?;
+        }
+
+        <Vec<T> as Storable>::delete(storage, slot, ctx)
     }
 }
 
@@ -1694,7 +1700,7 @@ fn checked_position(index: usize) -> Result<u32> {
     u32::try_from(index)
         .ok()
         .and_then(|i| i.checked_add(1))
-        .ok_or_else(|| TempoPrecompileError::Fatal("Set position overflow".into()))
+        .ok_or_else(TempoPrecompileError::under_overflow)
 }
 
 impl<T> SetHandler<T>
@@ -1794,7 +1800,7 @@ where
 {
     fn read(&self) -> Result<Set<T>> {
         let len = self.len()?;
-        let mut vec = Vec::with_capacity(len);
+        let mut vec = Vec::new();
         for i in 0..len {
             vec.push(self.values[i].read()?);
         }
@@ -1863,6 +1869,7 @@ mod tests {
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
     use crate::tempo::precompile::test_utils::TestStorageProvider;
 
     struct TestStorageOps(Address);
@@ -2088,6 +2095,121 @@ mod tests {
         });
 
         assert_eq!(result.unwrap_err(), TempoPrecompileError::under_overflow());
+    }
+
+    /// Element large enough that `Vec::with_capacity(u32::MAX)` exceeds any address
+    /// space (~512 TiB), so pre-allocating from the stored length aborts the process.
+    #[allow(dead_code)] // the payload only sets the element size
+    struct HugeElement([u8; 128 * 1024]);
+
+    impl StorableType for HugeElement {
+        const LAYOUT: Layout = Layout::Slots(1);
+        type Handler = ();
+
+        fn handle(_slot: U256, _ctx: LayoutCtx, _address: Address) -> Self::Handler {}
+    }
+
+    impl Storable for HugeElement {
+        fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+            storage.load(slot)?;
+            Ok(Self([0; 128 * 1024]))
+        }
+
+        fn store<S: StorageOps>(&self, _: &mut S, _: U256, _: LayoutCtx) -> Result<()> {
+            unreachable!("load-only test element")
+        }
+    }
+
+    /// Stores `len_word` at the length slot, then runs `load` with a 100k gas budget
+    /// under a provider that charges SLOAD gas.
+    fn load_with_stored_length<T>(
+        len_word: U256,
+        load: impl FnOnce(&TestStorageOps, U256) -> Result<T>,
+    ) -> Result<T> {
+        let address = address!("0x8888888888888888888888888888888888888888");
+        let slot = U256::from(24);
+        let mut provider = AccessLogProvider::new(TempoHardfork::T10);
+        provider.inner.sstore(address, slot, len_word).unwrap();
+        provider.inner.set_gas_limit(100_000);
+        StorageCtx::enter(&mut provider, || load(&TestStorageOps(address), slot))
+    }
+
+    #[test]
+    fn storage_controlled_lengths_run_out_of_gas_without_preallocating() {
+        let max_len = U256::from(u32::MAX);
+        let out_of_gas = TempoPrecompileError::OutOfGas;
+
+        let huge = load_with_stored_length(max_len, |s, slot| {
+            Vec::<HugeElement>::load(s, slot, LayoutCtx::FULL)
+        });
+        assert!(matches!(huge, Err(TempoPrecompileError::OutOfGas)));
+        let unpacked = load_with_stored_length(max_len, |s, slot| {
+            Vec::<B256>::load(s, slot, LayoutCtx::FULL)
+        });
+        assert_eq!(unpacked.unwrap_err(), out_of_gas);
+        let packed = load_with_stored_length(max_len, |s, slot| {
+            Vec::<u64>::load(s, slot, LayoutCtx::FULL)
+        });
+        assert_eq!(packed.unwrap_err(), out_of_gas);
+        let bytes = load_with_stored_length(max_len * U256::from(2) + U256::ONE, |s, slot| {
+            Bytes::load(s, slot, LayoutCtx::FULL)
+        });
+        assert_eq!(bytes.unwrap_err(), out_of_gas);
+        let set = load_with_stored_length(max_len, |s, slot| {
+            SetHandler::<Address>::new(slot, s.0).read()
+        });
+        assert_eq!(set.unwrap_err(), out_of_gas);
+    }
+
+    #[test]
+    fn set_storable_store_is_rejected_and_delete_clears_positions() {
+        let address = address!("0x9999999999999999999999999999999999999999");
+        let slot = U256::from(25);
+        let (first, second) = (Address::repeat_byte(0x01), Address::repeat_byte(0x02));
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+
+        let store_result = StorageCtx::enter(&mut provider, || {
+            let mut handler = SetHandler::<Address>::new(slot, address);
+            handler.write(Set::from(vec![first, second]))?;
+            <Set<Address> as Storable>::delete(
+                &mut TestStorageOps(address),
+                slot,
+                LayoutCtx::FULL,
+            )?;
+            assert!(!handler.contains(&first)?);
+            assert!(!handler.contains(&second)?);
+
+            Set::from(vec![first]).store(&mut TestStorageOps(address), slot, LayoutCtx::FULL)
+        });
+
+        assert!(matches!(store_result, Err(TempoPrecompileError::Fatal(_))));
+        // Length, both value slots and both positions are cleared; nothing was stored.
+        for key in [
+            slot,
+            calc_data_slot(slot),
+            calc_data_slot(slot) + U256::ONE,
+            first.mapping_slot(slot + U256::ONE),
+            second.mapping_slot(slot + U256::ONE),
+        ] {
+            assert_eq!(provider.storage(address, key), U256::ZERO);
+        }
+    }
+
+    #[test]
+    fn out_of_range_storage_words_are_under_overflow() {
+        let too_big = U256::from(u64::MAX) + U256::ONE;
+        assert_eq!(
+            u64::from_word(too_big).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+        assert_eq!(
+            i16::from_word(U256::from(u16::MAX) + U256::ONE).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+        assert_eq!(
+            checked_position(u32::MAX as usize).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
     }
 
     #[test]

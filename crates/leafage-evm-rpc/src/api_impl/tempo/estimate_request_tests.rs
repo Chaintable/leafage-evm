@@ -151,28 +151,30 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
     let to = Address::repeat_byte(0x22);
     let token = address!("20c0000000000000000000000000000000000000");
     let signature = Signature::new(U256::ONE, U256::ONE, false);
-    let payer = fp::recover_fee_payer(
-        &signature,
-        4217,
-        0,
-        1_000_000_000_000,
-        1_000_000,
-        &[fp::Call {
-            to: Some(to),
-            value: U256::ZERO,
-            input: Default::default(),
-        }],
-        &Default::default(),
-        U256::ZERO,
-        0,
-        None,
-        None,
-        Some(token),
-        caller,
-        &[],
-        None,
-    )
-    .unwrap();
+    let payer_for_nonce = |nonce| {
+        fp::recover_fee_payer(
+            &signature,
+            4217,
+            0,
+            1_000_000_000_000,
+            1_000_000,
+            &[fp::Call {
+                to: Some(to),
+                value: U256::ZERO,
+                input: Default::default(),
+            }],
+            &Default::default(),
+            U256::ZERO,
+            nonce,
+            None,
+            None,
+            Some(token),
+            caller,
+            &[],
+            None,
+        )
+        .unwrap()
+    };
     let request = json!({
         "from":caller,"to":to,"gas":"0xf4240","nonce":"0x0","chainId":"0x1079",
         "maxFeePerGas":"0xe8d4a51000","maxPriorityFeePerGas":"0x0",
@@ -205,13 +207,16 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
         ),
         U256::from_be_bytes(currency),
     );
-    db.storage.insert(
-        (
-            keccak256(token),
-            keccak256(payer.mapping_slot(U256::from(9)).to_be_bytes::<32>()),
-        ),
-        U256::from(2_000_000),
-    );
+    // Fund the sponsor recovered from the signed nonce (0) and from the state nonce (7).
+    for payer in [payer_for_nonce(0), payer_for_nonce(7)] {
+        db.storage.insert(
+            (
+                keccak256(token),
+                keccak256(payer.mapping_slot(U256::from(9)).to_be_bytes::<32>()),
+            ),
+            U256::from(2_000_000),
+        );
+    }
 
     let fallback_calls = Arc::new(AtomicUsize::new(0));
     let server = jsonrpsee::server::ServerBuilder::default()
@@ -253,9 +258,27 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
         );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
 
+        // Like the official node, a missing nonce is filled with the state nonce
+        // before the sponsor is recovered, so the request estimates locally.
         let mut missing_nonce = request.clone();
         missing_nonce.as_object_mut().unwrap().remove("nonce");
         let raw = json!({"jsonrpc":"2.0","id":2,"method":"estimateGas", "params":[missing_nonce,{"block_id":"0x64","type":"Equals"}]}).to_string();
+        let (response, _) = module.raw_json_request(&raw, 1).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let gas: U256 = serde_json::from_value(response["result"].clone()).unwrap();
+        assert!(
+            gas >= U256::from(21_000) && gas < U256::from(22_000),
+            "{gas}"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+        let mut incomplete = request.clone();
+        incomplete
+            .as_object_mut()
+            .unwrap()
+            .remove("maxPriorityFeePerGas");
+        let raw = json!({"jsonrpc":"2.0","id":3,"method":"estimateGas", "params":[incomplete,{"block_id":"0x64","type":"Equals"}]}).to_string();
         let (response, _) = module.raw_json_request(&raw, 1).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         if with_fallback {

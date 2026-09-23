@@ -16,10 +16,11 @@
 //! |  4   | token_transfer_policies | Mapping<Address, TokenTransferPolicy> (T9+) |
 
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::super::address::TempoAddressExt;
+use super::super::hardfork::TempoHardfork;
 use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
 use super::storage::{ContractStorage, ContractStorageReader, StorageCtx};
@@ -27,12 +28,8 @@ use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, 
 use super::tip20::TIP20Token;
 use super::tip20_factory::TIP20Factory;
 use super::{
-    ACCOUNT_KEYCHAIN_ADDRESS, ADDRESS_REGISTRY_ADDRESS, CURRENT_COMMITTEE_ADDRESS,
-    NONCE_PRECOMPILE_ADDRESS, Precompile, RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS,
-    STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS,
-    TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS, VALIDATOR_CONFIG_ADDRESS,
-    VALIDATOR_CONFIG_V2_ADDRESS, dispatch_call, input_cost, mutate, mutate_void, unknown_selector,
-    view,
+    Precompile, RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS, dispatch_call, input_cost,
+    mutate, mutate_void, view,
 };
 
 // ===========================================================================
@@ -123,7 +120,6 @@ pub enum AuthRole {
 impl AuthRole {
     #[inline]
     fn transfer_or(t2_variant: Self) -> Self {
-        // leafage always runs latest spec (T2+), so always return the T2 variant
         if StorageCtx::default().spec().is_t2() {
             t2_variant
         } else {
@@ -498,30 +494,6 @@ impl Storable for ReceivePolicy {
     }
 }
 
-fn is_reserved_recovery_authority(address: Address) -> bool {
-    let bytes = address.as_slice();
-    let ethereum_precompile =
-        bytes[..19].iter().all(|byte| *byte == 0) && (1..=17).contains(&bytes[19]);
-    ethereum_precompile
-        || address.is_tip20()
-        || matches!(
-            address,
-            TIP_FEE_MANAGER_ADDRESS
-                | TIP403_REGISTRY_ADDRESS
-                | TIP20_FACTORY_ADDRESS
-                | STABLECOIN_DEX_ADDRESS
-                | TIP20_CHANNEL_RESERVE_ADDRESS
-                | NONCE_PRECOMPILE_ADDRESS
-                | VALIDATOR_CONFIG_ADDRESS
-                | ACCOUNT_KEYCHAIN_ADDRESS
-                | VALIDATOR_CONFIG_V2_ADDRESS
-                | SIGNATURE_VERIFIER_ADDRESS
-                | ADDRESS_REGISTRY_ADDRESS
-                | RECEIVE_POLICY_GUARD_ADDRESS
-                | CURRENT_COMMITTEE_ADDRESS
-        )
-}
-
 // ===========================================================================
 // TIP403Registry struct
 // ===========================================================================
@@ -743,7 +715,7 @@ impl TIP403Registry {
             updater: msg_sender,
             policyType: policy_type
                 .try_into()
-                .unwrap_or(ITIP403Registry::PolicyType::WHITELIST),
+                .unwrap_or(ITIP403Registry::PolicyType::__Invalid),
         })?;
 
         self.emit_event(ITIP403Registry::PolicyAdminUpdated {
@@ -807,7 +779,7 @@ impl TIP403Registry {
             updater: msg_sender,
             policyType: policy_type
                 .try_into()
-                .unwrap_or(ITIP403Registry::PolicyType::WHITELIST),
+                .unwrap_or(ITIP403Registry::PolicyType::__Invalid),
         })?;
 
         self.emit_event(ITIP403Registry::PolicyAdminUpdated {
@@ -1050,8 +1022,8 @@ impl TIP403Registry {
         if msg_sender.is_virtual() {
             return Err(err_virtual_address_not_allowed());
         }
-        if call.recoveryAuthority.is_virtual()
-            || is_reserved_recovery_authority(call.recoveryAuthority)
+        if call.recoveryAuthority.is_precompile(self.storage.spec())
+            || call.recoveryAuthority.is_virtual()
         {
             return Err(err_invalid_recovery_authority());
         }
@@ -1290,19 +1262,66 @@ pub fn is_policy_lookup_error(e: &TempoPrecompileError) -> bool {
 // Dispatch
 // ===========================================================================
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `tip403_registry/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
+    (
+        ITIP403Registry::tokenTransferPolicyIdCall::SELECTOR,
+        TempoHardfork::T9,
+    ),
+    (
+        ITIP403Registry::isAuthorizedSenderCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::isAuthorizedRecipientCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::isAuthorizedMintRecipientCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::compoundPolicyDataCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::receivePolicyCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ITIP403Registry::validateReceivePolicyCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ITIP403Registry::setReceivePolicyCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ITIP403Registry::migrateTransferPolicyIdsCall::SELECTOR,
+        TempoHardfork::T9,
+    ),
+    (
+        ITIP403Registry::createCompoundPolicyCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+];
+
 impl Precompile for TIP403Registry {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
-        let selector = calldata
-            .get(..4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .unwrap_or_default();
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            ITIP403Registry::ITIP403RegistryCalls::valid_selector,
+            |selector| {
+                ITIP403Registry::ITIP403RegistryCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 ITIP403Registry::ITIP403RegistryCalls::abi_decode_with_config(
                     data,
@@ -1317,9 +1336,6 @@ impl Precompile for TIP403Registry {
                     view(call, |c| self.policy_exists(c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::tokenTransferPolicyId(call) => {
-                    if !self.storage.spec().is_t9() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| self.token_transfer_policy_id(c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::policyData(call) => {
@@ -1328,7 +1344,6 @@ impl Precompile for TIP403Registry {
                 ITIP403Registry::ITIP403RegistryCalls::isAuthorized(call) => view(call, |c| {
                     self.is_authorized_as(c.policyId, c.user, AuthRole::Transfer)
                 }),
-                // TIP-1015: T2+ only (leafage always runs T2+)
                 ITIP403Registry::ITIP403RegistryCalls::isAuthorizedSender(call) => {
                     view(call, |c| {
                         self.is_authorized_as(c.policyId, c.user, AuthRole::Sender)
@@ -1348,15 +1363,9 @@ impl Precompile for TIP403Registry {
                     view(call, |c| self.compound_policy_data(c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::receivePolicy(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| self.receive_policy(c.account))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::validateReceivePolicy(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| {
                         let blocked = self
                             .validate_receive_policy(c.token, c.sender, c.receiver)?
@@ -1384,20 +1393,13 @@ impl Precompile for TIP403Registry {
                 ITIP403Registry::ITIP403RegistryCalls::modifyPolicyBlacklist(call) => {
                     mutate_void(call, msg_sender, |s, c| self.modify_policy_blacklist(s, c))
                 }
-                // TIP-1015: T2+ only (leafage always runs T2+)
                 ITIP403Registry::ITIP403RegistryCalls::createCompoundPolicy(call) => {
                     mutate(call, msg_sender, |s, c| self.create_compound_policy(s, c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::setReceivePolicy(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate_void(call, msg_sender, |s, c| self.set_receive_policy(s, c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::migrateTransferPolicyIds(call) => {
-                    if !self.storage.spec().is_t9() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate(call, msg_sender, |_, c| self.migrate_transfer_policy_ids(c))
                 }
             },
@@ -1413,8 +1415,12 @@ mod tests {
     use crate::tempo::precompile::storage_types::StorageKey;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::UnknownFunctionSelector;
+    use crate::tempo::precompile::{
+        CURRENT_COMMITTEE_ADDRESS, STABLECOIN_DEX_ADDRESS, STORAGE_CREDITS_ADDRESS,
+        ZONE_FACTORY_ADDRESS,
+    };
     use alloy::primitives::FixedBytes;
-    use alloy::sol_types::{SolCall, SolError};
+    use alloy::sol_types::{SolCall, SolError, SolEvent};
     use std::{cell::Cell, collections::HashMap};
 
     #[derive(Default)]
@@ -1772,6 +1778,78 @@ mod tests {
     }
 
     #[test]
+    fn receive_policy_recovery_authority_uses_active_precompile_set() {
+        let account = Address::repeat_byte(0x72);
+        for (spec, authority, rejected) in [
+            (TempoHardfork::T6, Address::with_last_byte(1), false),
+            (TempoHardfork::T6, STORAGE_CREDITS_ADDRESS, false),
+            (TempoHardfork::T7, STORAGE_CREDITS_ADDRESS, true),
+            (TempoHardfork::T7, CURRENT_COMMITTEE_ADDRESS, false),
+            (TempoHardfork::T8, CURRENT_COMMITTEE_ADDRESS, true),
+            (TempoHardfork::T9, ZONE_FACTORY_ADDRESS, false),
+            (TempoHardfork::T10, ZONE_FACTORY_ADDRESS, true),
+            (TempoHardfork::T6, PATH_USD_ADDRESS, true),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            let result = StorageCtx::enter(&mut provider, || {
+                TIP403Registry::new().set_receive_policy(
+                    account,
+                    ITIP403Registry::setReceivePolicyCall {
+                        senderPolicyId: ALLOW_ALL_POLICY_ID,
+                        tokenFilterId: ALLOW_ALL_POLICY_ID,
+                        recoveryAuthority: authority,
+                    },
+                )
+            });
+            if rejected {
+                assert_eq!(
+                    result,
+                    Err(err_invalid_recovery_authority()),
+                    "{spec:?} {authority}"
+                );
+            } else {
+                assert_eq!(result, Ok(()), "{spec:?} {authority}");
+            }
+        }
+    }
+
+    #[test]
+    fn pre_t2_policy_created_emits_invalid_type() {
+        let admin = Address::repeat_byte(0x73);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T1C);
+        StorageCtx::enter(&mut provider, || {
+            let mut registry = TIP403Registry::new();
+            registry.create_policy(
+                admin,
+                ITIP403Registry::createPolicyCall {
+                    admin,
+                    policyType: ITIP403Registry::PolicyType::COMPOUND,
+                },
+            )?;
+            registry.create_policy_with_accounts(
+                admin,
+                ITIP403Registry::createPolicyWithAccountsCall {
+                    admin,
+                    policyType: ITIP403Registry::PolicyType::COMPOUND,
+                    accounts: vec![],
+                },
+            )?;
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        let created: Vec<_> = provider
+            .events(TIP403_REGISTRY_ADDRESS)
+            .iter()
+            .filter_map(|log| ITIP403Registry::PolicyCreated::decode_log_data(log).ok())
+            .collect();
+        assert_eq!(created.len(), 2);
+        for event in created {
+            assert_eq!(event.policyType, ITIP403Registry::PolicyType::__Invalid);
+        }
+    }
+
+    #[test]
     fn receive_policy_selectors_are_gated_at_t6() {
         let call = ITIP403Registry::receivePolicyCall {
             account: Address::repeat_byte(0x81),
@@ -1787,5 +1865,100 @@ mod tests {
             error.selector,
             FixedBytes::new(ITIP403Registry::receivePolicyCall::SELECTOR)
         );
+    }
+
+    #[test]
+    fn scheduled_selectors_reject_malformed_calldata_before_activation() {
+        for (selector, spec) in [
+            (
+                ITIP403Registry::receivePolicyCall::SELECTOR,
+                TempoHardfork::T5,
+            ),
+            (
+                ITIP403Registry::validateReceivePolicyCall::SELECTOR,
+                TempoHardfork::T5,
+            ),
+            (
+                ITIP403Registry::setReceivePolicyCall::SELECTOR,
+                TempoHardfork::T5,
+            ),
+            (
+                ITIP403Registry::tokenTransferPolicyIdCall::SELECTOR,
+                TempoHardfork::T8,
+            ),
+            (
+                ITIP403Registry::migrateTransferPolicyIdsCall::SELECTOR,
+                TempoHardfork::T8,
+            ),
+        ] {
+            let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+            let mut provider = TestStorageProvider::new(spec);
+            let output = StorageCtx::enter(&mut provider, || {
+                TIP403Registry::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                UnknownFunctionSelector {
+                    selector: FixedBytes::new(selector),
+                }
+                .abi_encode(),
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tip1015_selectors_activate_at_t2() {
+        let user = Address::repeat_byte(0x74);
+        let policy_id = ALLOW_ALL_POLICY_ID;
+        let calls = [
+            ITIP403Registry::isAuthorizedSenderCall {
+                policyId: policy_id,
+                user,
+            }
+            .abi_encode(),
+            ITIP403Registry::isAuthorizedRecipientCall {
+                policyId: policy_id,
+                user,
+            }
+            .abi_encode(),
+            ITIP403Registry::isAuthorizedMintRecipientCall {
+                policyId: policy_id,
+                user,
+            }
+            .abi_encode(),
+            ITIP403Registry::compoundPolicyDataCall {
+                policyId: policy_id,
+            }
+            .abi_encode(),
+            ITIP403Registry::createCompoundPolicyCall {
+                senderPolicyId: policy_id,
+                recipientPolicyId: policy_id,
+                mintRecipientPolicyId: policy_id,
+            }
+            .abi_encode(),
+        ];
+        for calldata in calls {
+            let unknown = UnknownFunctionSelector {
+                selector: FixedBytes::from_slice(&calldata[..4]),
+            }
+            .abi_encode();
+            for spec in [TempoHardfork::T1C, TempoHardfork::T2] {
+                let mut provider = TestStorageProvider::new(spec);
+                let output = StorageCtx::enter(&mut provider, || {
+                    TIP403Registry::new().call(&calldata, user)
+                })
+                .unwrap();
+                if spec.is_t2() {
+                    assert_ne!(output.bytes.as_ref(), unknown.as_slice());
+                } else {
+                    assert!(output.reverted);
+                    assert_eq!(output.bytes.as_ref(), unknown.as_slice());
+                    assert!(provider.events(TIP403_REGISTRY_ADDRESS).is_empty());
+                }
+            }
+        }
     }
 }

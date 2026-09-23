@@ -9,9 +9,7 @@ use revm::state::{AccountInfo, Bytecode};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{JournalCheckpoint, PrecompileStorageProvider};
-use super::storage_credits::{
-    account_storage_write, is_non_creditable_slot, AccountingError, StorageCreditsBackend,
-};
+use super::storage_credits::{account_storage_write, AccountingError, StorageCreditsBackend};
 use crate::tempo::hardfork::TempoHardfork;
 
 #[derive(Clone)]
@@ -322,10 +320,6 @@ impl StorageCreditsBackend for TestStorageProvider {
 
     fn tstore_raw(&mut self, address: Address, key: U256, value: U256) {
         self.transient.insert((address, key), value);
-    }
-
-    fn is_non_creditable_slot(&self, owner: Address, key: U256) -> bool {
-        is_non_creditable_slot(owner, key)
     }
 
     fn storage_credit_minting_enabled(&self) -> bool {

@@ -142,28 +142,12 @@ pub trait PrecompileStorageProvider {
             return Ok(None);
         }
 
-        let recid = secp256k1::ecdsa::RecoveryId::try_from((v as i32) - 27)
-            .map_err(|_| TempoPrecompileError::Fatal("invalid recovery id".to_string()))?;
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(r.as_slice());
-        sig_bytes[32..].copy_from_slice(s.as_slice());
-        let sig = match secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid) {
-            Ok(sig) => sig,
-            Err(_) => return Ok(None),
-        };
-        let msg = secp256k1::Message::from_digest(*digest);
-        let pubkey = match secp256k1::SECP256K1.recover_ecdsa(&msg, &sig) {
-            Ok(pk) => pk,
-            Err(_) => return Ok(None),
-        };
-        let hash = keccak256(&pubkey.serialize_uncompressed()[1..]);
-        let recovered = Address::from_slice(&hash[12..]);
+        // Same as official: alloy's `recover_signer` rejects high-s (EIP-2) signatures.
+        let parity = v == 28;
+        let sig = alloy::primitives::Signature::from_scalars_and_parity(r, s, parity);
+        let recovered = alloy::consensus::crypto::secp256k1::recover_signer(&sig, digest);
 
-        if recovered.is_zero() {
-            Ok(None)
-        } else {
-            Ok(Some(recovered))
-        }
+        Ok(recovered.ok().filter(|addr| !addr.is_zero()))
     }
 }
 
@@ -381,7 +365,7 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         let deposit_cost = self.gas_params.code_deposit_cost(code.len());
         self.deduct_gas(deposit_cost)?;
 
-        let _ = self.internals.set_code(address, code);
+        self.internals.set_code(address, code)?;
         Ok(())
     }
 
@@ -590,10 +574,6 @@ impl StorageCreditsBackend for LeafageStorageProvider<'_> {
 
     fn tstore_raw(&mut self, address: Address, key: U256, value: U256) {
         self.internals.tstore(address, key, value);
-    }
-
-    fn is_non_creditable_slot(&self, owner: Address, key: U256) -> bool {
-        crate::tempo::precompile::storage_credits::is_non_creditable_slot(owner, key)
     }
 
     fn storage_credit_minting_enabled(&self) -> bool {
@@ -970,6 +950,130 @@ where
 {
     let mut provider = ReadOnlyStorageProvider::new(db, spec, chain_id);
     StorageCtx::enter(&mut provider, f)
+}
+
+/// One persistent storage access recorded by [`AccessLogProvider`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageAccess {
+    Load(Address, U256),
+    Store(Address, U256),
+}
+
+/// Test provider that records every SLOAD/SSTORE in order and, unlike the wrapped
+/// [`TestStorageProvider`](super::test_utils::TestStorageProvider), charges EIP-2929
+/// SLOAD gas (2100 cold / 100 warm) and account-load gas (2600 cold / 100 warm) so
+/// storage-controlled loops and account checks can run out of gas.
+#[cfg(test)]
+pub(crate) struct AccessLogProvider {
+    pub(crate) inner: super::test_utils::TestStorageProvider,
+    pub(crate) accesses: Vec<StorageAccess>,
+    warm: std::collections::HashSet<(Address, U256)>,
+    warm_accounts: std::collections::HashSet<Address>,
+}
+
+#[cfg(test)]
+impl AccessLogProvider {
+    pub(crate) fn new(spec: TempoHardfork) -> Self {
+        Self {
+            inner: super::test_utils::TestStorageProvider::new(spec),
+            accesses: Vec::new(),
+            warm: Default::default(),
+            warm_accounts: Default::default(),
+        }
+    }
+
+    /// Accesses to `address` recorded since the log was last cleared.
+    pub(crate) fn accesses_of(&self, address: Address) -> Vec<StorageAccess> {
+        self.accesses
+            .iter()
+            .copied()
+            .filter(|access| match access {
+                StorageAccess::Load(a, _) | StorageAccess::Store(a, _) => *a == address,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl PrecompileStorageProvider for AccessLogProvider {
+    fn chain_id(&self) -> u64 {
+        self.inner.chain_id()
+    }
+    fn timestamp(&self) -> U256 {
+        self.inner.timestamp()
+    }
+    fn beneficiary(&self) -> Address {
+        self.inner.beneficiary()
+    }
+    fn block_number(&self) -> u64 {
+        self.inner.block_number()
+    }
+    fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
+        self.inner.set_code(address, code)
+    }
+    fn with_account_info(
+        &mut self,
+        address: Address,
+        f: &mut dyn FnMut(&revm::state::AccountInfo),
+    ) -> Result<()> {
+        let cold = self.warm_accounts.insert(address);
+        self.inner.deduct_gas(if cold { 2_600 } else { 100 })?;
+        self.inner.with_account_info(address, f)
+    }
+    fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.accesses.push(StorageAccess::Load(address, key));
+        let cold = self.warm.insert((address, key));
+        self.inner.deduct_gas(if cold { 2_100 } else { 100 })?;
+        self.inner.sload(address, key)
+    }
+    fn tload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.inner.tload(address, key)
+    }
+    fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.accesses.push(StorageAccess::Store(address, key));
+        self.warm.insert((address, key));
+        self.inner.sstore(address, key, value)
+    }
+    fn tstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.inner.tstore(address, key, value)
+    }
+    fn emit_event(&mut self, address: Address, event: LogData) -> Result<()> {
+        self.inner.emit_event(address, event)
+    }
+    fn deduct_gas(&mut self, gas: u64) -> Result<()> {
+        self.inner.deduct_gas(gas)
+    }
+    fn refund_gas(&mut self, gas: i64) {
+        self.inner.refund_gas(gas)
+    }
+    fn gas_used(&self) -> u64 {
+        self.inner.gas_used()
+    }
+    fn gas_refunded(&self) -> i64 {
+        self.inner.gas_refunded()
+    }
+    fn spec(&self) -> TempoHardfork {
+        self.inner.spec()
+    }
+    fn is_static(&self) -> bool {
+        self.inner.is_static()
+    }
+    fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        self.inner.set_tip1060_storage_credits(enabled)
+    }
+    fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        self.inner.set_tip1060_storage_credit_minting(enabled)
+    }
+    fn checkpoint(&mut self) -> JournalCheckpoint {
+        self.inner.checkpoint()
+    }
+    fn checkpoint_commit(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.checkpoint_commit(checkpoint)
+    }
+    fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.checkpoint_revert(checkpoint)
+    }
 }
 
 #[cfg(test)]

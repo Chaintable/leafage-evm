@@ -8,7 +8,7 @@
 //! essential error plumbing for storage operations.
 
 use alloy::primitives::{Bytes, FixedBytes};
-use alloy::sol_types::SolError;
+use alloy::sol_types::{Panic, SolError};
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 
 use super::UnknownFunctionSelector;
@@ -69,7 +69,12 @@ impl TempoPrecompileError {
     /// Returns true if this error represents a system-level failure that must be propagated
     /// rather than swallowed, because state may be inconsistent.
     pub fn is_system_error(&self) -> bool {
-        matches!(self, Self::OutOfGas | Self::Fatal(_))
+        match self {
+            Self::OutOfGas | Self::Fatal(_) => true,
+            // Official `Panic` and `StorageDeltaUnderflow`, both encoded as `Panic(uint256)`.
+            Self::Revert(data) => data.starts_with(&Panic::SELECTOR),
+            Self::UnknownFunctionSelector(_) => false,
+        }
     }
 
     /// Creates an arithmetic under/overflow panic error (Panic(0x11)).
@@ -143,5 +148,20 @@ impl<T> IntoPrecompileResult<T> for TempoPrecompileError {
         _encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult {
         TempoPrecompileError::into_precompile_result(self, gas_used)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_errors_include_panics() {
+        assert!(TempoPrecompileError::OutOfGas.is_system_error());
+        assert!(TempoPrecompileError::Fatal("db".into()).is_system_error());
+        assert!(TempoPrecompileError::under_overflow().is_system_error());
+        assert!(!TempoPrecompileError::UnknownFunctionSelector([1, 2, 3, 4]).is_system_error());
+        assert!(!TempoPrecompileError::Revert(Bytes::from_static(&[1, 2, 3, 4])).is_system_error());
+        assert!(!TempoPrecompileError::Revert(Bytes::new()).is_system_error());
     }
 }

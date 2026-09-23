@@ -215,20 +215,19 @@ fn union_unique(namespace: &[u8], payload: &[u8]) -> Vec<u8> {
 // IP validation
 // ===========================================================================
 
-/// Validates that `input` is of the form `<ip>:<port>`.
+/// Validates that `input` is of the form `<ip>:<port>`. The error text is the writer's
+/// `IpWithPortParseError` message (V2 only runs from T2, so always `Display`).
 fn ensure_address_is_ip_port(input: &str) -> std::result::Result<(), String> {
-    input
-        .parse::<std::net::SocketAddr>()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    super::validator_config::ensure_address_is_ip_port(input).map_err(|err| err.to_string())
 }
 
-/// Validates that `input` is a bare IP address (no port).
+/// Validates that `input` is a bare IP address (no port). The error text is the
+/// writer's `ip_validation::IpParseError` message.
 fn ensure_address_is_ip(input: &str) -> std::result::Result<(), String> {
     input
         .parse::<std::net::IpAddr>()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|_| "input was not a valid IP address".to_string())
 }
 
 // ===========================================================================
@@ -645,7 +644,7 @@ impl ValidatorConfigV2 {
     /// Returns all validators ever added.
     pub fn get_validators(&self) -> Result<Vec<IValidatorConfigV2::Validator>> {
         let count = self.validator_count()?;
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::new();
         for i in 0..count {
             out.push(self.read_validator_at(i)?);
         }
@@ -655,7 +654,7 @@ impl ValidatorConfigV2 {
     /// Returns only active validators.
     pub fn get_active_validators(&self) -> Result<Vec<IValidatorConfigV2::Validator>> {
         let count = self.active_indices.len()?;
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::new();
         for i in 0..count {
             let global_idx1 = self.active_indices[i].read()?;
             out.push(self.read_validator_at(global_idx1 - 1)?);
@@ -683,9 +682,10 @@ impl ValidatorConfigV2 {
 
     /// Computes the keccak256 hash of the ingress IP:port for uniqueness checking.
     fn ingress_key(ingress: &str) -> Result<B256> {
-        let addr = ingress
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| err_not_ip_port(ingress.to_string(), e.to_string()))?;
+        let addr = ingress.parse::<std::net::SocketAddr>().map_err(|e| {
+            let err = super::validator_config::IpWithPortParseError::Parse(e);
+            err_not_ip_port(ingress.to_string(), err.to_string())
+        })?;
 
         let mut data = Vec::new();
         match addr {
@@ -1359,5 +1359,65 @@ impl Precompile for ValidatorConfigV2 {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
+
+    #[test]
+    fn invalid_endpoint_backtraces_use_writer_messages() {
+        let revert_data = |result: Result<()>| match result {
+            Err(TempoPrecompileError::Revert(data)) => data,
+            other => panic!("unexpected result {other:?}"),
+        };
+
+        let ingress = revert_data(ValidatorConfigV2::validate_endpoints("bad", "1.2.3.4"));
+        assert_eq!(
+            IValidatorConfigV2::NotIpPort::abi_decode(&ingress)
+                .unwrap()
+                .backtrace,
+            "input was not of the form `<ip>:<port>`"
+        );
+        let egress = revert_data(ValidatorConfigV2::validate_endpoints("1.2.3.4:1", "bad"));
+        assert_eq!(
+            IValidatorConfigV2::NotIp::abi_decode(&egress)
+                .unwrap()
+                .backtrace,
+            "input was not a valid IP address"
+        );
+    }
+
+    #[test]
+    fn validator_lists_with_huge_stored_length_run_out_of_gas() {
+        // Slot 1: validators length; slot 6: active_indices length.
+        for len_slot in [1u64, 6] {
+            let mut provider = AccessLogProvider::new(TempoHardfork::T2);
+            provider
+                .inner
+                .sstore(
+                    VALIDATOR_CONFIG_V2_ADDRESS,
+                    U256::from(len_slot),
+                    U256::from(u32::MAX),
+                )
+                .unwrap();
+            // Enough for the cold length read only: the first element read runs out of
+            // gas, so active_indices never evaluates `idx1 - 1` on an empty entry.
+            provider.inner.set_gas_limit(3_000);
+
+            let result = StorageCtx::enter(&mut provider, || {
+                let config = ValidatorConfigV2::new();
+                if len_slot == 1 {
+                    config.get_validators()
+                } else {
+                    config.get_active_validators()
+                }
+            });
+
+            assert_eq!(result.unwrap_err(), TempoPrecompileError::OutOfGas);
+        }
     }
 }

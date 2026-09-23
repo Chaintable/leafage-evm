@@ -113,6 +113,18 @@ impl<DB> TempoApiImpl<DB> {
         });
         cfg
     }
+
+    /// reth `prepare_call_env` lowers the basefee to 0 when the call's gas price is 0.
+    /// reth's TxEnv gas price is the effective price (min(maxFee, basefee + tip) for
+    /// 1559/AA); Leafage stores maxFee there, so compare the effective price instead.
+    /// reth's estimate path does not lower the basefee, so estimation runs keep it.
+    fn block_env_for_call(block_env: &BlockEnv, tx: &TempoTxEnv) -> BlockEnv {
+        let mut block_env = block_env.clone();
+        if !tx.gas_estimation && tx.effective_gas_price(block_env.basefee as u128) == 0 {
+            block_env.basefee = 0;
+        }
+        block_env
+    }
 }
 
 impl ToJsonRpcError for TempoInvalidTransaction {
@@ -123,7 +135,9 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     -32003,
                     self.to_string(),
-                    Some(serde_json::json!({"name": "FeeTokenNotTip20Error", "token": address})),
+                    Some(serde_json::json!({
+                        "name": "FeeTokenNotTip20Error", "token": address.to_string(),
+                    })),
                 )
             }
             TempoInvalidTransaction::FeeTokenNotUsdCurrency { address, currency } => {
@@ -131,7 +145,8 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                     -32003,
                     self.to_string(),
                     Some(serde_json::json!({
-                        "name": "FeeTokenNotUsdError", "token": address, "currency": currency,
+                        "name": "FeeTokenNotUsdError", "token": address.to_string(),
+                        "currency": currency,
                     })),
                 )
             }
@@ -141,6 +156,15 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                 DebankErrorCode::NonceError as i32,
                 self.to_string(),
             ),
+            // The official node maps these through reth EthApiError::EvmCustom.
+            TempoInvalidTransaction::AccessKeyCannotAuthorizeOtherKeys
+            | TempoInvalidTransaction::KeyAuthorizationSignatureRecoveryFailed
+            | TempoInvalidTransaction::KeyAuthorizationNotSignedByRoot { .. }
+            | TempoInvalidTransaction::KeychainValidationFailed { .. }
+            | TempoInvalidTransaction::KeyAuthorizationChainIdMismatch { .. }
+            | TempoInvalidTransaction::CallsValidation(_) => {
+                rpc_error_with_code(-32603, format!("Revm error: {self}"))
+            }
         }
     }
 }
@@ -343,6 +367,7 @@ fn parse_tempo_authorization(
 
 /// Recover from the original request, before shared simulation defaults change
 /// its nonce, gas or fees. The resulting payer is reused by every execution path.
+/// The caller fills a missing nonce from state first, as the official node does.
 fn resolve_fee_payer(
     request: &CallRequest,
     auth_list: &[leafage_evm_chains::tempo::tx::TempoAuthGas],
@@ -453,22 +478,12 @@ where
         use revm::primitives::TxKind;
 
         // Reject ambiguous signed bytes before recovering the payer or filling defaults.
+        // Like the official Call deserializer, inner calls take input over data unchecked.
         request
             .inner
             .input
             .unique_input()
             .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
-        if let Some(calls) = request
-            .tempo
-            .as_ref()
-            .and_then(|te| te.tempo_calls.as_ref())
-        {
-            for call in calls {
-                call.input
-                    .unique_input()
-                    .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
-            }
-        }
 
         // Extract Tempo-specific fields before consuming the request.
         let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
@@ -480,7 +495,6 @@ where
             .iter()
             .map(parse_tempo_authorization)
             .collect::<RpcResult<Vec<_>>>()?;
-        let fee_payer = resolve_fee_payer(&request, &auth_list, hardfork)?;
         let te = request.tempo.clone().unwrap_or_default();
         let tempo_calls = te.tempo_calls;
         let nonce_key = te.nonce_key;
@@ -493,10 +507,11 @@ where
         let valid_after = te.valid_after;
         let valid_before = te.valid_before;
 
-        if key_authorization
-            .as_ref()
-            .is_some_and(|authorization| authorization.witness.is_some())
-            && !hardfork.is_t5()
+        // Signed authorizations are checked by the handler, in the official order.
+        // The Leafage-only signature-less gas shape never reaches that check.
+        if key_authorization.as_ref().is_some_and(|authorization| {
+            authorization.witness.is_some() && authorization.signature.is_none()
+        }) && !hardfork.is_t5()
         {
             return Err(invalid_params_rpc_err(
                 "key authorization witnesses are not active before T5",
@@ -506,9 +521,10 @@ where
         // Unsigned eth_call-style requests execute with the current 2D state nonce,
         // including the temporary state left by earlier calls in a simulation sequence.
         // A sponsor signature binds the original nonce; preserve that signed path.
-        if let Some(nk) = nonce_key {
-            if !nk.is_zero() && (te.fee_payer_signature.is_none() || request.inner.nonce.is_none())
-            {
+        // A missing nonce is filled from state before the sponsor is recovered, as
+        // the official create_txn_env does (2D/expiring nonce, else account nonce).
+        if let Some(nk) = nonce_key.filter(|nk| !nk.is_zero()) {
+            if te.fee_payer_signature.is_none() || request.inner.nonce.is_none() {
                 use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
                 use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
                 let nonce = if nk == revm::primitives::U256::MAX && hardfork.is_t1() {
@@ -523,7 +539,15 @@ where
                 };
                 request.inner.nonce = Some(nonce);
             }
+        } else if te.fee_payer_signature.is_some() && request.inner.nonce.is_none() {
+            let nonce = db
+                .basic_ref(request.inner.from.unwrap_or_default())
+                .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                .map(|account| account.nonce)
+                .unwrap_or_default();
+            request.inner.nonce = Some(nonce);
         }
+        let fee_payer = resolve_fee_payer(&request, &auth_list, hardfork)?;
 
         // For 2D-nonce AA (nonceKey > 0) the request/auto-filled nonce — not the
         // account's protocol nonce — drives TIP-1000 gas: a nonce of 0 adds the
@@ -659,6 +683,7 @@ where
             unique_tx_identifier: Some(
                 leafage_evm_chains::tempo::tx::RPC_SIMULATION_UNIQUE_TX_IDENTIFIER,
             ),
+            gas_estimation: false,
         })
     }
 
@@ -680,27 +705,20 @@ where
         // Pipeline may not sync this code change, so we inject it on every T2+ call.
         let ts: u64 = block_env.timestamp.saturating_to();
         if TempoHardfork::from_timestamp(ts).is_t2() {
-            let has_code = state
+            let info = state
                 .basic_ref(VALIDATOR_CONFIG_V2_ADDRESS)
-                .ok()
-                .flatten()
-                .map(|acc| !acc.is_empty_code_hash())
-                .unwrap_or(false);
-            if !has_code {
-                use revm::state::{Account, AccountInfo, AccountStatus};
+                .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                .unwrap_or_default();
+            if info.is_empty_code_hash() {
                 use revm::bytecode::Bytecode;
+                use revm::state::Account;
+                // Like writer's deploy_precompile_at_boundary: keep the account info
+                // and storage, install the marker and only touch the account.
                 let code = Bytecode::new_legacy(alloy::primitives::Bytes::from_static(&[0xef]));
-                let mut acc = Account {
-                    info: AccountInfo {
-                        code_hash: code.hash_slow(),
-                        code: Some(code),
-                        nonce: 1,
-                        ..Default::default()
-                    },
-                    status: AccountStatus::Touched,
-                    ..Default::default()
-                };
-                acc.mark_created();
+                let mut acc = Account::from(info);
+                acc.info.code_hash = code.hash_slow();
+                acc.info.code = Some(code);
+                acc.mark_touch();
                 let mut changes = revm::state::EvmState::default();
                 changes.insert(VALIDATOR_CONFIG_V2_ADDRESS, acc);
                 state.commit(changes);
@@ -721,7 +739,10 @@ where
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
+        let evm_env = EvmEnv::new(
+            self.cfg_for_call(block_env),
+            Self::block_env_for_call(block_env, &tx),
+        );
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
@@ -745,7 +766,10 @@ where
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R,
     {
-        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
+        let evm_env = EvmEnv::new(
+            self.cfg_for_call(block_env),
+            Self::block_env_for_call(block_env, &tx),
+        );
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
@@ -829,6 +853,10 @@ where
 impl TxSetter for TempoTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.gas_limit = gas_limit;
+    }
+
+    fn set_gas_estimation(&mut self) {
+        self.gas_estimation = true;
     }
 
     fn set_stateful_simulation_context(
@@ -949,6 +977,34 @@ mod tests {
         }
     }
 
+    /// L-6: writer rejects a T3+ access-key call whose first call is CREATE with
+    /// -32603 "Revm error: access-key transactions cannot use CREATE as the first call".
+    #[test]
+    fn review_access_key_create_first_call_returns_official_error() {
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: alloy::primitives::U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            ..Default::default()
+        };
+        let request: CallRequest = serde_json::from_value(serde_json::json!({
+            "from":"0x1111111111111111111111111111111111111111","gas":"0xf4240",
+            "keyId":"0x1111111111111111111111111111111111111112",
+            "calls":[{"data":"0x00"}]
+        }))
+        .unwrap();
+        let db = EmptyDB::default();
+        let tx = api
+            .create_txn_env(&Default::default(), &block, request, db, 4217)
+            .unwrap();
+        let error = api.transact(&block, db, tx).unwrap_err().to_rpc_error();
+        assert_eq!(error.code(), -32603, "{error:?}");
+        assert_eq!(
+            error.message(),
+            "Revm error: access-key transactions cannot use CREATE as the first call"
+        );
+    }
+
     #[test]
     fn review_invalid_fee_payer_signature_is_rejected() {
         let api = review_api();
@@ -1056,6 +1112,155 @@ mod tests {
     }
 
     #[test]
+    fn inner_call_input_takes_precedence_over_data() {
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: alloy::primitives::U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            ..Default::default()
+        };
+        let call = serde_json::json!([{
+            "to":"0x1111111111111111111111111111111111111113","data":"0xaaaa","input":"0xbbbb"
+        }]);
+        let tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                review_request("calls", call),
+                EmptyDB::default(),
+                4217,
+            )
+            .unwrap();
+        let aa_calls = &tx.tempo_fields.as_ref().unwrap().aa_calls;
+        assert_eq!(aa_calls[0].input.as_ref(), [0xbb, 0xbb]);
+
+        // Only the outer request rejects conflicting input and data.
+        let mut outer = review_request("data", serde_json::json!("0xaaaa"));
+        outer.input.input = Some(alloy::primitives::bytes!("bbbb"));
+        let error = api
+            .create_txn_env(&Default::default(), &block, outer, EmptyDB::default(), 4217)
+            .unwrap_err();
+        assert_eq!(error.code(), -32602);
+    }
+
+    #[test]
+    fn zero_gas_price_call_sees_zero_basefee() {
+        use alloy::primitives::{address, bytes, U256};
+        use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            basefee: 1_000,
+            ..Default::default()
+        };
+        let target = address!("1111111111111111111111111111111111111112");
+        let mut db = InMemoryDB::default();
+        // BASEFEE PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+        let code = Bytecode::new_legacy(bytes!("4860005260206000f3"));
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 1, code.hash_slow(), code),
+        );
+        // A priced call needs a USD fee token (default pathUSD) with a caller balance.
+        {
+            use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
+            let token = address!("20c0000000000000000000000000000000000000");
+            let marker = Bytecode::new_legacy(bytes!("ef"));
+            db.insert_account_info(
+                token,
+                AccountInfo::new(U256::ZERO, 1, marker.hash_slow(), marker),
+            );
+            let mut currency = [0u8; 32];
+            currency[..3].copy_from_slice(b"USD");
+            currency[31] = 6;
+            db.insert_account_storage(token, U256::from(4), U256::from_be_bytes(currency))
+                .unwrap();
+            let caller = address!("1111111111111111111111111111111111111111");
+            db.insert_account_storage(token, caller.mapping_slot(U256::from(9)), U256::MAX >> 1)
+                .unwrap();
+        }
+        for (field, value, expected) in [
+            ("value", serde_json::json!("0x0"), 0u64),
+            ("gasPrice", serde_json::json!("0x0"), 0),
+            ("maxFeePerGas", serde_json::json!("0x0"), 0),
+            ("keyType", serde_json::json!("p256"), 0),
+            ("maxPriorityFeePerGas", serde_json::json!("0x0"), 1_000),
+        ] {
+            let request = review_request(field, value);
+            let tx = api
+                .create_txn_env(&Default::default(), &block, request.clone(), &db, 4217)
+                .unwrap();
+            let result = api.transact(&block, &db, tx).unwrap();
+            assert_eq!(
+                result.output().unwrap().as_ref(),
+                U256::from(expected).to_be_bytes::<32>(),
+                "transact {field}"
+            );
+            let tx = api
+                .create_txn_env(&Default::default(), &block, request, &db, 4217)
+                .unwrap();
+            let (result, _) = api
+                .inspect_tx_commit(
+                    &block,
+                    db.clone(),
+                    TracingInspectorConfig::default_parity(),
+                    |_| (),
+                    tx,
+                )
+                .unwrap();
+            assert_eq!(
+                result.output().unwrap().as_ref(),
+                U256::from(expected).to_be_bytes::<32>(),
+                "inspect_tx_commit {field}"
+            );
+        }
+
+        // reth's estimate path keeps the block basefee for zero-priced requests.
+        let mut tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                review_request("gasPrice", serde_json::json!("0x0")),
+                &db,
+                4217,
+            )
+            .unwrap();
+        tx.set_gas_estimation();
+        let result = api.transact(&block, &db, tx).unwrap();
+        assert_eq!(
+            result.output().unwrap().as_ref(),
+            U256::from(1_000u64).to_be_bytes::<32>(),
+            "estimation keeps basefee"
+        );
+    }
+
+    #[test]
+    fn fee_token_error_data_uses_checksummed_address() {
+        let address = alloy::primitives::address!("abcdefabcdefabcdefabcdefabcdefabcdef0001");
+        let token = address.to_checksum(None);
+        for (error, expected) in [
+            (
+                TempoInvalidTransaction::FeeTokenNotTip20 { address },
+                serde_json::json!({"name":"FeeTokenNotTip20Error", "token":token}),
+            ),
+            (
+                TempoInvalidTransaction::FeeTokenNotUsdCurrency {
+                    address,
+                    currency: "EUR".into(),
+                },
+                serde_json::json!({"name":"FeeTokenNotUsdError", "token":token, "currency":"EUR"}),
+            ),
+        ] {
+            let error = error.to_rpc_error();
+            assert_eq!(error.code(), -32003);
+            let data: serde_json::Value =
+                serde_json::from_str(error.data().unwrap().get()).unwrap();
+            assert_eq!(data, expected);
+        }
+    }
+
+    #[test]
     fn expiring_nonce_transaction_error_maps_to_nonce_rpc_error() {
         let error = TempoInvalidTransaction::NonceManagerError("replay".into()).to_rpc_error();
         assert_eq!(error.code(), DebankErrorCode::NonceError as i32);
@@ -1076,6 +1281,46 @@ mod tests {
             acc.code.as_ref().map(|c| c.original_byte_slice()),
             Some(&[0xef][..]),
             "VCV2 code should be 0xef"
+        );
+    }
+
+    #[test]
+    fn vcv2_marker_injection_keeps_existing_account_and_storage() {
+        use revm::database::{in_memory_db::CacheDB, InMemoryDB};
+        use revm::primitives::U256;
+        use revm::state::AccountInfo;
+
+        let slot = U256::from(1);
+        let mut inner = InMemoryDB::default();
+        inner.insert_account_info(
+            VALIDATOR_CONFIG_V2_ADDRESS,
+            AccountInfo {
+                nonce: 3,
+                ..Default::default()
+            },
+        );
+        inner
+            .insert_account_storage(VALIDATOR_CONFIG_V2_ADDRESS, slot, U256::from(42))
+            .unwrap();
+        let mut db = CacheDB::new(inner);
+        let block = BlockEnv {
+            timestamp: U256::from(1_774_965_700u64), // T2+
+            ..Default::default()
+        };
+        review_api()
+            .apply_pre_execution_changes(alloy::consensus::Header::default(), &block, &mut db)
+            .unwrap();
+
+        let info = db.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap().unwrap();
+        assert_eq!(
+            info.code.as_ref().map(|c| c.original_byte_slice()),
+            Some(&[0xef][..])
+        );
+        assert_eq!(info.nonce, 3, "nonce should be preserved");
+        assert_eq!(
+            db.storage_ref(VALIDATOR_CONFIG_V2_ADDRESS, slot).unwrap(),
+            U256::from(42),
+            "storage should survive the marker injection"
         );
     }
 

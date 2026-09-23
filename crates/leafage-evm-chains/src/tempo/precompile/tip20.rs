@@ -1164,113 +1164,6 @@ impl TIP20Token {
         Ok(true)
     }
 
-    /// Transfers fee tokens from `from` to the fee manager before transaction execution.
-    /// Respects the token's pause state and deducts from the AccountKeychain spending limit.
-    pub fn transfer_fee_pre_tx(&mut self, from: Address, amount: U256) -> Result<()> {
-        // This function respects the token's pause state and will revert if the token is paused.
-        // transfer_fee_post_tx is intentionally allowed even when paused so that a pause
-        // transaction can still receive its fee refund.
-        self.check_not_paused()?;
-        let from_balance = self.get_balance(from)?;
-        if amount > from_balance {
-            return Err(TempoPrecompileError::Revert(
-                ITIP20::InsufficientBalance {
-                    available: from_balance,
-                    required: amount,
-                    token: self.address,
-                }
-                .abi_encode()
-                .into(),
-            ));
-        }
-
-        // AccountKeychain spending limit
-        super::account_keychain::AccountKeychain::new().authorize_transfer(
-            from,
-            self.address,
-            amount,
-        )?;
-
-        self.handle_rewards_on_transfer(from, TIP_FEE_MANAGER_ADDRESS, amount)?;
-
-        let new_from_balance = from_balance.checked_sub(amount).ok_or_else(|| {
-            TempoPrecompileError::Revert(
-                ITIP20::InsufficientBalance {
-                    available: from_balance,
-                    required: amount,
-                    token: self.address,
-                }
-                .abi_encode()
-                .into(),
-            )
-        })?;
-        self.set_balance(from, new_from_balance)?;
-
-        let to_balance = self.get_balance(TIP_FEE_MANAGER_ADDRESS)?;
-        let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
-            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
-        })?;
-        self.set_balance(TIP_FEE_MANAGER_ADDRESS, new_to_balance)
-    }
-
-    /// Refunds unused fee tokens from the fee manager back to `to` and emits a transfer
-    /// event for actual gas spent. Intentionally allowed when paused so that a pause
-    /// transaction can still receive its fee refund.
-    pub fn transfer_fee_post_tx(
-        &mut self,
-        to: Address,
-        refund: U256,
-        actual_spending: U256,
-    ) -> Result<()> {
-        self.emit_event(ITIP20::Transfer {
-            from: to,
-            to: TIP_FEE_MANAGER_ADDRESS,
-            amount: actual_spending,
-        })?;
-
-        // Exit early if there is no refund
-        if refund.is_zero() {
-            return Ok(());
-        }
-
-        // Refund spending limit (T1C+, matching writer tip20/mod.rs:1046)
-        if self.storage.spec().is_t1c() {
-            super::account_keychain::AccountKeychain::new().refund_spending_limit(
-                to,
-                self.address,
-                refund,
-            )?;
-        }
-
-        self.handle_rewards_on_transfer(TIP_FEE_MANAGER_ADDRESS, to, refund)?;
-
-        let from_balance = self.get_balance(TIP_FEE_MANAGER_ADDRESS)?;
-        let new_from_balance = from_balance.checked_sub(refund).ok_or_else(|| {
-            TempoPrecompileError::Revert(
-                ITIP20::InsufficientBalance {
-                    available: from_balance,
-                    required: refund,
-                    token: self.address,
-                }
-                .abi_encode()
-                .into(),
-            )
-        })?;
-        self.set_balance(TIP_FEE_MANAGER_ADDRESS, new_from_balance)?;
-
-        let to_balance = self.get_balance(to)?;
-        let new_to_balance = to_balance.checked_add(refund).ok_or_else(|| {
-            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
-        })?;
-        self.set_balance(to, new_to_balance)?;
-
-        self.emit_event(ITIP20::Transfer {
-            from: TIP_FEE_MANAGER_ADDRESS,
-            to,
-            amount: refund,
-        })
-    }
-
     fn consume_allowance(&mut self, owner: Address, spender: Address, amount: U256) -> Result<()> {
         let allowed = self.get_allowance(owner, spender)?;
         if amount > allowed {
@@ -1434,14 +1327,14 @@ impl TIP20Token {
 
         let new_from_balance = from_balance
             .checked_sub(amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("underflow in _transfer".to_string()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.set_balance(from, new_from_balance)?;
 
         if to.target != Address::ZERO {
             let to_balance = self.get_balance(to.target)?;
-            let new_to_balance = to_balance
-                .checked_add(amount)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _transfer".to_string()))?;
+            let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
+                TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
+            })?;
             self.set_balance(to.target, new_to_balance)?;
         }
 
@@ -1503,7 +1396,7 @@ impl TIP20Token {
     fn _mint_to(&mut self, to: Recipient, total_supply: U256, amount: U256) -> Result<()> {
         let new_supply = total_supply
             .checked_add(amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         let supply_cap = self.supply_cap()?;
         if new_supply > supply_cap {
@@ -1516,9 +1409,9 @@ impl TIP20Token {
 
         self.set_total_supply(new_supply)?;
         let to_balance = self.get_balance(to.target)?;
-        let new_to_balance = to_balance
-            .checked_add(amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
+        let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
+            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
+        })?;
         self.set_balance(to.target, new_to_balance)?;
 
         self.emit_event(ITIP20::Transfer {
@@ -1675,13 +1568,13 @@ impl TIP20Token {
     }
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
-        self.check_role(msg_sender, *ISSUER_ROLE)?;
         // TIP-1038 #2 (T3+): burn must respect the paused flag. `_transfer`
         // checks paused only on its public-entry callers, so _burn needs an
-        // explicit guard here on T3+.
+        // explicit guard here on T3+. Official checks paused before the role.
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
         }
+        self.check_role(msg_sender, *ISSUER_ROLE)?;
 
         self._transfer(msg_sender, Address::ZERO, amount)?;
 
@@ -1745,13 +1638,11 @@ impl TIP20Token {
             .amount
             .checked_mul(ACC_PRECISION)
             .and_then(|v| v.checked_div(opted_in_supply))
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in distribute_reward".to_string())
-            })?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         let current_rpt = self.get_global_reward_per_token()?;
-        let new_rpt = current_rpt.checked_add(delta_rpt).ok_or_else(|| {
-            TempoPrecompileError::Fatal("overflow in distribute_reward".to_string())
-        })?;
+        let new_rpt = current_rpt
+            .checked_add(delta_rpt)
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.set_global_reward_per_token(new_rpt)?;
 
         self.emit_event(ITIP20::RewardDistributed {
@@ -1772,9 +1663,7 @@ impl TIP20Token {
         let global_reward_per_token = self.get_global_reward_per_token()?;
         let reward_per_token_delta = global_reward_per_token
             .checked_sub(info.reward_per_token)
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("underflow in update_rewards".to_string())
-            })?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         if reward_per_token_delta != U256::ZERO {
             if cached_delegate != Address::ZERO {
@@ -1782,23 +1671,19 @@ impl TIP20Token {
                 let reward = holder_balance
                     .checked_mul(reward_per_token_delta)
                     .and_then(|v| v.checked_div(ACC_PRECISION))
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
-                    })?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
 
                 if cached_delegate == holder {
-                    info.reward_balance =
-                        info.reward_balance.checked_add(reward).ok_or_else(|| {
-                            TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
-                        })?;
+                    info.reward_balance = info
+                        .reward_balance
+                        .checked_add(reward)
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
                 } else {
                     let mut delegate_info = self.user_reward_info[cached_delegate].read()?;
                     delegate_info.reward_balance = delegate_info
                         .reward_balance
                         .checked_add(reward)
-                        .ok_or_else(|| {
-                            TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
-                        })?;
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
                     self.user_reward_info[cached_delegate].write(delegate_info)?;
                 }
             }
@@ -1840,22 +1725,22 @@ impl TIP20Token {
             if call.recipient == Address::ZERO {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_sub(holder_balance)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("underflow in set_reward_recipient".to_string())
-                    })?;
-                self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
-                })?)?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                self.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
             }
         } else if call.recipient != Address::ZERO {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(holder_balance)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
-                })?;
-            self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
-            })?)?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            self.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
 
         let mut info = self.user_reward_info[msg_sender].read()?;
@@ -1883,33 +1768,30 @@ impl TIP20Token {
 
         info.reward_balance = amount
             .checked_sub(max_amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("underflow in claim_rewards".to_string()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.user_reward_info[msg_sender].write(info)?;
 
         if max_amount > U256::ZERO {
-            let new_contract_balance =
-                contract_balance.checked_sub(max_amount).ok_or_else(|| {
-                    TempoPrecompileError::Fatal("underflow in claim_rewards".to_string())
-                })?;
+            let new_contract_balance = contract_balance
+                .checked_sub(max_amount)
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
             self.set_balance(contract_address, new_contract_balance)?;
 
             let recipient_balance = self
                 .get_balance(msg_sender)?
                 .checked_add(max_amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal("overflow in claim_rewards".to_string())
-                })?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
             self.set_balance(msg_sender, recipient_balance)?;
 
             if reward_recipient != Address::ZERO {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_add(max_amount)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("overflow in claim_rewards".to_string())
-                    })?;
-                self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal("overflow in claim_rewards".to_string())
-                })?)?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                self.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
             }
 
             self.emit_event(ITIP20::Transfer {
@@ -1954,28 +1836,22 @@ impl TIP20Token {
             if to_delegate.is_zero() {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_sub(amount)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal(
-                            "underflow in handle_rewards_on_transfer".to_string(),
-                        )
-                    })?;
-                self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in handle_rewards_on_transfer".to_string(),
-                    )
-                })?)?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                self.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
             }
         } else if !to_delegate.is_zero() {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in handle_rewards_on_transfer".to_string(),
-                    )
-                })?;
-            self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in handle_rewards_on_transfer".to_string())
-            })?)?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            self.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
 
         Ok(())
@@ -1988,12 +1864,12 @@ impl TIP20Token {
         if !to_delegate.is_zero() {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal("overflow in handle_rewards_on_mint".to_string())
-                })?;
-            self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in handle_rewards_on_mint".to_string())
-            })?)?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            self.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
 
         Ok(())
@@ -2011,9 +1887,9 @@ impl TIP20Token {
         let mut pending = info.reward_balance;
 
         if self.storage.spec().is_t8() {
-            return pending.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string())
-            });
+            return pending
+                .try_into()
+                .map_err(|_| TempoPrecompileError::under_overflow());
         }
 
         if info.reward_recipient == account {
@@ -2022,29 +1898,23 @@ impl TIP20Token {
                 let global_reward_per_token = self.get_global_reward_per_token()?;
                 let reward_per_token_delta = global_reward_per_token
                     .checked_sub(info.reward_per_token)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("underflow in get_pending_rewards".to_string())
-                    })?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
 
                 if reward_per_token_delta > U256::ZERO {
                     let accrued = holder_balance
                         .checked_mul(reward_per_token_delta)
                         .and_then(|v| v.checked_div(ACC_PRECISION))
-                        .ok_or_else(|| {
-                            TempoPrecompileError::Fatal(
-                                "overflow in get_pending_rewards".to_string(),
-                            )
-                        })?;
-                    pending = pending.checked_add(accrued).ok_or_else(|| {
-                        TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string())
-                    })?;
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
+                    pending = pending
+                        .checked_add(accrued)
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
                 }
             }
         }
 
         pending
             .try_into()
-            .map_err(|_| TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string()))
+            .map_err(|_| TempoPrecompileError::under_overflow())
     }
 }
 
@@ -2056,6 +1926,18 @@ impl TIP20Token {
 enum TIP20Call {
     TIP20(ITIP20::ITIP20Calls),
     RolesAuth(IRolesAuth::IRolesAuthCalls),
+}
+
+/// Selectors outside their official `#[schedule]` window (tip20/dispatch.rs):
+/// `logoURI` / `setLogoURI` since T5, EIP-2612 `permit` / `nonces` /
+/// `DOMAIN_SEPARATOR` since T2.
+fn selector_is_disabled(spec: crate::tempo::hardfork::TempoHardfork, selector: [u8; 4]) -> bool {
+    ((selector == ITIP20::logoURICall::SELECTOR || selector == ITIP20::setLogoURICall::SELECTOR)
+        && !spec.is_t5())
+        || ((selector == ITIP20::permitCall::SELECTOR
+            || selector == ITIP20::noncesCall::SELECTOR
+            || selector == ITIP20::DOMAIN_SEPARATORCall::SELECTOR)
+            && !spec.is_t2())
 }
 
 impl TIP20Call {
@@ -2083,10 +1965,23 @@ impl Precompile for TIP20Token {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
-        // Ensure that the token is initialized (has bytecode)
-        if !self.is_initialized().unwrap_or(false) {
+        // Ensure that the token is initialized (has bytecode). Like official, a failed
+        // account load only counts as "uninitialized" before T4.
+        let initialized = match self.is_initialized() {
+            Ok(initialized) => initialized,
+            Err(_) if !self.storage.spec().is_t4() => false,
+            Err(err) => return err.into_precompile_result(self.storage.gas_used()),
+        };
+        if !initialized {
             return TempoPrecompileError::Revert(ITIP20::Uninitialized {}.abi_encode().into())
                 .into_precompile_result(self.storage.gas_used());
+        }
+
+        // Fork-gated selectors are rejected before ABI decode, like official `dispatch!`.
+        if let Some(&selector) = calldata.first_chunk::<4>() {
+            if selector_is_disabled(self.storage.spec(), selector) {
+                return unknown_selector(selector, self.storage.gas_used());
+            }
         }
 
         dispatch_call(calldata, TIP20Call::valid_selector, TIP20Call::decode, |call| match call {
@@ -2104,12 +1999,6 @@ impl Precompile for TIP20Token {
                 metadata::<ITIP20::currencyCall>(|| self.currency())
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::logoURI(_)) => {
-                if !self.storage.spec().is_t5() {
-                    return unknown_selector(
-                        ITIP20::logoURICall::SELECTOR,
-                        self.storage.gas_used(),
-                    );
-                }
                 metadata::<ITIP20::logoURICall>(|| self.logo_uri())
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::totalSupply(_)) => {
@@ -2170,12 +2059,6 @@ impl Precompile for TIP20Token {
                 mutate_void(call, msg_sender, |s, c| self.set_supply_cap(s, c))
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::setLogoURI(call)) => {
-                if !self.storage.spec().is_t5() {
-                    return unknown_selector(
-                        ITIP20::setLogoURICall::SELECTOR,
-                        self.storage.gas_used(),
-                    );
-                }
                 mutate_void(call, msg_sender, |s, c| self.set_logo_uri(s, c))
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::pause(call)) => {
@@ -2237,7 +2120,7 @@ impl Precompile for TIP20Token {
                 view(call, |c| self.get_pending_rewards(c.account))
             }
 
-            // EIP-2612 (T2+, but leafage always runs latest spec)
+            // EIP-2612 (T2+, gated in `selector_is_disabled`)
             TIP20Call::TIP20(ITIP20::ITIP20Calls::permit(call)) => {
                 mutate_void(call, msg_sender, |_s, c| self.permit(c))
             }
@@ -2273,8 +2156,9 @@ impl Precompile for TIP20Token {
 mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
-    use crate::tempo::precompile::PATH_USD_ADDRESS;
+    use crate::tempo::precompile::storage::AccessLogProvider;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::{PATH_USD_ADDRESS, UnknownFunctionSelector};
     use alloy::sol_types::SolCall;
 
     #[test]
@@ -2363,6 +2247,96 @@ mod tests {
     }
 
     #[test]
+    fn fork_gated_selectors_are_unknown_before_activation_even_if_malformed() {
+        let admin = Address::repeat_byte(0xab);
+        let malformed = |selector: [u8; 4]| [selector.as_slice(), &[0xff; 10]].concat();
+        let permit = ITIP20::permitCall {
+            owner: admin,
+            spender: admin,
+            value: U256::ONE,
+            deadline: U256::MAX,
+            v: 27,
+            r: B256::ZERO,
+            s: B256::ZERO,
+        }
+        .abi_encode();
+        let gated: [(TempoHardfork, Vec<u8>); 7] = [
+            (TempoHardfork::T2, permit),
+            (TempoHardfork::T2, malformed(ITIP20::permitCall::SELECTOR)),
+            (
+                TempoHardfork::T2,
+                ITIP20::noncesCall { owner: admin }.abi_encode(),
+            ),
+            (
+                TempoHardfork::T2,
+                ITIP20::DOMAIN_SEPARATORCall {}.abi_encode(),
+            ),
+            (TempoHardfork::T5, ITIP20::logoURICall {}.abi_encode()),
+            (
+                TempoHardfork::T5,
+                malformed(ITIP20::setLogoURICall::SELECTOR),
+            ),
+            (TempoHardfork::T2, malformed(ITIP20::noncesCall::SELECTOR)),
+        ];
+
+        for (activation, calldata) in gated {
+            let selector: [u8; 4] = calldata[..4].try_into().unwrap();
+            let mut provider = TestStorageProvider::new(TempoHardfork::T1C);
+            StorageCtx::enter(&mut provider, || {
+                TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+                    Address::ZERO,
+                    "Path USD",
+                    "pathUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )
+            })
+            .unwrap();
+
+            for spec in [TempoHardfork::T1C, TempoHardfork::T4] {
+                provider.set_spec(spec);
+                let output = StorageCtx::enter(&mut provider, || {
+                    TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).call(&calldata, admin)
+                })
+                .unwrap();
+                if spec >= activation {
+                    continue;
+                }
+                assert!(output.reverted, "{selector:?} at {spec:?}");
+                assert_eq!(
+                    UnknownFunctionSelector::abi_decode(&output.bytes)
+                        .unwrap()
+                        .selector,
+                    selector,
+                    "{spec:?}"
+                );
+            }
+        }
+
+        // Active selectors dispatch normally.
+        let mut provider = TestStorageProvider::new(TempoHardfork::T2);
+        let nonce = StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+                Address::ZERO,
+                "Path USD",
+                "pathUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )?;
+            Ok::<_, TempoPrecompileError>(
+                TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                    .call(&ITIP20::noncesCall { owner: admin }.abi_encode(), admin),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!nonce.reverted);
+        assert_eq!(U256::abi_decode(&nonce.bytes).unwrap(), U256::ZERO);
+    }
+
+    #[test]
     fn system_transfer_from_rejects_unlisted_caller_from_t5() {
         let mut provider = TestStorageProvider::new(TempoHardfork::T5);
         let payer = Address::repeat_byte(0x11);
@@ -2408,6 +2382,168 @@ mod tests {
             token.system_transfer_from(unlisted, payer, U256::from(3))?;
             assert_eq!(token.get_balance(payer)?, U256::from(7));
             assert_eq!(token.get_balance(unlisted)?, U256::from(3));
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn burn_checks_paused_before_issuer_role_from_t3() {
+        let issuer = Address::repeat_byte(0x61);
+        let outsider = Address::repeat_byte(0x62);
+        let burn = |spec, paused: bool, caller: Address| {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                token.transfer_policy_id.write(1)?;
+                token.grant_role_internal(issuer, *ISSUER_ROLE)?;
+                token.set_balance(issuer, U256::from(10))?;
+                token.set_total_supply(U256::from(10))?;
+                token.paused.write(paused)?;
+                token.burn(caller, ITIP20::burnCall { amount: U256::ONE })
+            })
+        };
+        let revert_data = |result: Result<()>| match result {
+            Err(TempoPrecompileError::Revert(data)) => Some(data.to_vec()),
+            _ => None,
+        };
+        let paused = Some(ITIP20::ContractPaused {}.abi_encode());
+        let unauthorized = Some(IRolesAuth::Unauthorized {}.abi_encode());
+
+        // T3+: paused takes precedence over the issuer role check.
+        assert_eq!(revert_data(burn(TempoHardfork::T3, true, outsider)), paused);
+        assert_eq!(revert_data(burn(TempoHardfork::T3, true, issuer)), paused);
+        assert_eq!(
+            revert_data(burn(TempoHardfork::T3, false, outsider)),
+            unauthorized
+        );
+        assert!(burn(TempoHardfork::T3, false, issuer).is_ok());
+        // Pre-T3: burn ignores the paused flag.
+        assert_eq!(
+            revert_data(burn(TempoHardfork::T2, true, outsider)),
+            unauthorized
+        );
+        assert!(burn(TempoHardfork::T2, true, issuer).is_ok());
+    }
+
+    #[test]
+    fn is_initialized_error_is_returned_from_t4() {
+        let call = |spec| {
+            let mut provider = AccessLogProvider::new(spec);
+            // Covers the 6 gas input cost but not the cold account load.
+            provider.inner.set_gas_limit(60);
+            StorageCtx::enter(&mut provider, || {
+                TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                    .call(&ITIP20::totalSupplyCall {}.abi_encode(), Address::ZERO)
+            })
+        };
+
+        let pre_t4 = call(TempoHardfork::T3).unwrap();
+        assert!(pre_t4.reverted);
+        assert_eq!(pre_t4.bytes, ITIP20::Uninitialized {}.abi_encode());
+        assert!(matches!(
+            call(TempoHardfork::T4),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    #[test]
+    fn mint_overflows_revert_like_official() {
+        let issuer = Address::repeat_byte(0x63);
+        let holder = Address::repeat_byte(0x64);
+        let mint = |total_supply: U256, holder_balance: U256, amount: U256| {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T2);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                token.transfer_policy_id.write(1)?;
+                token.supply_cap.write(U256::MAX)?;
+                token.grant_role_internal(issuer, *ISSUER_ROLE)?;
+                token.set_total_supply(total_supply)?;
+                token.set_balance(holder, holder_balance)?;
+                token.mint(issuer, ITIP20::mintCall { to: holder, amount })
+            })
+        };
+
+        // totalSupply + amount overflows: Panic(0x11).
+        assert_eq!(
+            mint(U256::ONE, U256::ZERO, U256::MAX).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+        // Recipient balance overflows: official `increment_balance` maps it to
+        // SupplyCapExceeded.
+        assert_eq!(
+            mint(U256::ZERO, U256::MAX, U256::ONE).unwrap_err(),
+            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
+        );
+    }
+
+    #[test]
+    fn permit_rejects_high_s_signature() {
+        use alloy::consensus::crypto::SECP256K1N_HALF;
+        use secp256k1::{Message, SECP256K1, SecretKey};
+
+        let secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let owner = Address::from_raw_public_key(
+            &secret.public_key(SECP256K1).serialize_uncompressed()[1..],
+        );
+        let spender = Address::repeat_byte(0x77);
+        let value = U256::from(5);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T2);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            let struct_hash = keccak256(
+                (
+                    keccak256(
+                        b"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+                    ),
+                    owner,
+                    spender,
+                    value,
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                    .abi_encode(),
+            );
+            let digest = keccak256(
+                [
+                    &[0x19, 0x01],
+                    token.domain_separator()?.as_slice(),
+                    struct_hash.as_slice(),
+                ]
+                .concat(),
+            );
+            let (recid, sig) = SECP256K1
+                .sign_ecdsa_recoverable(&Message::from_digest(digest.0), &secret)
+                .serialize_compact();
+            let v = 27 + i32::from(recid) as u8;
+            let r = B256::from_slice(&sig[..32]);
+            let s = U256::from_be_slice(&sig[32..]);
+            assert!(s <= SECP256K1N_HALF);
+            let permit = |v: u8, s: U256| ITIP20::permitCall {
+                owner,
+                spender,
+                value,
+                deadline: U256::MAX,
+                v,
+                r,
+                s: s.into(),
+            };
+
+            // Malleated (r, n - s, flipped v) recovers the same key but must be rejected.
+            let secp256k1_n = SECP256K1N_HALF * U256::from(2) + U256::ONE;
+            let high_s = token.permit(permit(55 - v, secp256k1_n - s));
+            assert!(matches!(
+                high_s,
+                Err(TempoPrecompileError::Revert(data))
+                    if data.as_ref() == ITIP20::InvalidSignature {}.abi_encode().as_slice()
+            ));
+            assert_eq!(token.permit_nonces[owner].read()?, U256::ZERO);
+            assert_eq!(token.get_allowance(owner, spender)?, U256::ZERO);
+
+            token.permit(permit(v, s))?;
+            assert_eq!(token.permit_nonces[owner].read()?, U256::ONE);
+            assert_eq!(token.get_allowance(owner, spender)?, value);
             Result::<()>::Ok(())
         })
         .unwrap();

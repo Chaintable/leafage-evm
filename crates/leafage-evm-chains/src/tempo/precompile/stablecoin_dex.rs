@@ -28,7 +28,7 @@
 //! View methods (balance_of, get_order, quote_swap_*) work correctly against on-chain state.
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 use std::{
     collections::HashSet,
@@ -48,8 +48,9 @@ use super::tip20_factory::TIP20Factory;
 use super::tip403_registry::{AuthRole, TIP403Registry, is_policy_lookup_error};
 use super::{
     PATH_USD_ADDRESS, Precompile, STABLECOIN_DEX_ADDRESS, dispatch_call, input_cost, mutate,
-    mutate_void, unknown_selector, view,
+    mutate_void, view,
 };
+use crate::tempo::hardfork::TempoHardfork;
 
 // ===========================================================================
 // Constants
@@ -1194,16 +1195,29 @@ impl OrderbookHandle {
     }
 
     /// Writes the base orderbook data.
+    ///
+    /// Like the official Storable write, pre-T4 each packed slot group is loaded before it is
+    /// stored; T4+ starts from zero.
     fn write_data(&self, data: &OrderbookData) -> Result<()> {
         let mut ctx = StorageCtx::default();
+        let t4 = ctx.spec().is_t4();
 
         // slot+0: base
-        let mut b0 = [0u8; 32];
+        let mut b0 = if t4 {
+            [0u8; 32]
+        } else {
+            ctx.sload(self.address, self.slot)?.to_be_bytes::<32>()
+        };
         b0[12..32].copy_from_slice(data.base.as_slice());
         ctx.sstore(self.address, self.slot, U256::from_be_bytes(b0))?;
 
         // slot+1: quote
-        let mut b1 = [0u8; 32];
+        let mut b1 = if t4 {
+            [0u8; 32]
+        } else {
+            ctx.sload(self.address, self.slot + U256::from(1))?
+                .to_be_bytes::<32>()
+        };
         b1[12..32].copy_from_slice(data.quote.as_slice());
         ctx.sstore(
             self.address,
@@ -1212,7 +1226,12 @@ impl OrderbookHandle {
         )?;
 
         // slot+4: packed ticks
-        let mut b4 = [0u8; 32];
+        let mut b4 = if t4 {
+            [0u8; 32]
+        } else {
+            ctx.sload(self.address, self.slot + U256::from(4))?
+                .to_be_bytes::<32>()
+        };
         b4[30..32].copy_from_slice(&data.best_bid_tick.to_be_bytes());
         b4[28..30].copy_from_slice(&data.best_ask_tick.to_be_bytes());
         b4[24..28].copy_from_slice(&data.book_id.to_be_bytes());
@@ -1701,16 +1720,20 @@ impl StablecoinDEX {
         self.book_handle(book_key).read_tick_level(tick, is_bid)
     }
 
-    /// Converts a relative tick to a scaled price.
+    /// Converts a relative tick to a scaled price. On T2+ validates tick spacing.
     pub fn tick_to_price_fn(&self, tick: i16) -> Result<u32> {
-        validate_tick_spacing(tick)?;
+        if self.storage.spec().is_t2() {
+            validate_tick_spacing(tick)?;
+        }
         Ok(tick_to_price(tick))
     }
 
-    /// Converts a scaled price to a relative tick.
+    /// Converts a scaled price to a relative tick. On T2+ validates tick spacing.
     pub fn price_to_tick_fn(&self, price: u32) -> Result<i16> {
         let tick = price_to_tick(price)?;
-        validate_tick_spacing(tick)?;
+        if self.storage.spec().is_t2() {
+            validate_tick_spacing(tick)?;
+        }
         Ok(tick)
     }
 
@@ -1961,7 +1984,12 @@ impl StablecoinDEX {
             self.storage.spec(),
         )?;
 
-        self.next_order_id.write(order_id + 1)?;
+        if self.storage.spec().is_t1c() {
+            self.next_order_id.write(order_id + 1)?;
+        } else {
+            // Pre-T1C reads the counter again before writing it.
+            self.increment_next_order_id()?;
+        }
         self.commit_order_to_book(order, true)?;
 
         self.emit_event(IStablecoinDEX::OrderPlaced {
@@ -2136,7 +2164,7 @@ impl StablecoinDEX {
                 .map(|_| ())
             };
             if let Err(error) = &result {
-                if error.is_system_error() {
+                if error.is_system_error() && self.storage.spec().is_t1a() {
                     return Err(error.clone());
                 }
                 if self.storage.spec().is_t5() {
@@ -2780,16 +2808,31 @@ impl StablecoinDEX {
             return Err(err_order_does_not_exist());
         }
 
-        let handle = self.book_handle(order.book_key);
-        let book = handle.read_data()?;
-        let token = if order.is_bid { book.quote } else { book.base };
+        if self.is_maker_authorized(&order)? {
+            Err(err_order_not_stale())
+        } else {
+            self.cancel_active_order(order)
+        }
+    }
 
-        let policy_id = TIP20Token::from_address(token)?.transfer_policy_id()?;
-        match TIP403Registry::new().is_authorized_as(policy_id, order.maker, AuthRole::sender()) {
-            Ok(true) => Err(err_order_not_stale()),
-            Ok(false) => self.cancel_active_order(order),
-            Err(e) if is_policy_lookup_error(&e) => self.cancel_active_order(order),
-            Err(e) => Err(e),
+    /// Sender check on the escrow token (bid=quote, ask=base); T4+ also recipient check on
+    /// the payout token (bid=base, ask=quote).
+    fn is_maker_authorized(&self, order: &Order) -> Result<bool> {
+        let book = self.book_handle(order.book_key).read_data()?;
+        let (token_in, token_out) = if order.is_bid {
+            (book.quote, book.base)
+        } else {
+            (book.base, book.quote)
+        };
+
+        if !is_authorized_for_token(token_in, order.maker, AuthRole::sender())? {
+            return Ok(false);
+        }
+
+        if self.storage.spec().is_t4() {
+            is_authorized_for_token(token_out, order.maker, AuthRole::recipient())
+        } else {
+            Ok(true)
         }
     }
 
@@ -2801,6 +2844,17 @@ impl StablecoinDEX {
         }
         self.sub_balance(user, token, amount)?;
         self.transfer(token, user, amount)
+    }
+}
+
+/// Checks `address` against `token`'s transfer policy for `role`; a failed policy lookup
+/// counts as unauthorized.
+fn is_authorized_for_token(token: Address, address: Address, role: AuthRole) -> Result<bool> {
+    let policy_id = TIP20Token::from_address(token)?.transfer_policy_id()?;
+    match TIP403Registry::new().is_authorized_as(policy_id, address, role) {
+        Ok(authorized) => Ok(authorized),
+        Err(e) if is_policy_lookup_error(&e) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -2825,15 +2879,42 @@ impl ContractStorage for StablecoinDEX {
 // Dispatch
 // ===========================================================================
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `stablecoin_dex/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
+    (
+        IStablecoinDEX::storageCreditsCall::SELECTOR,
+        TempoHardfork::T7,
+    ),
+    (
+        IStablecoinDEX::bookIndexForKeyCall::SELECTOR,
+        TempoHardfork::T8,
+    ),
+    (
+        IStablecoinDEX::bookKeyForIndexCall::SELECTOR,
+        TempoHardfork::T8,
+    ),
+    (
+        IStablecoinDEX::setBookIndexCall::SELECTOR,
+        TempoHardfork::T8,
+    ),
+];
+
 impl Precompile for StablecoinDEX {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            IStablecoinDEX::IStablecoinDEXCalls::valid_selector,
+            |selector| {
+                IStablecoinDEX::IStablecoinDEXCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 IStablecoinDEX::IStablecoinDEXCalls::abi_decode_with_config(
                     data,
@@ -2857,38 +2938,20 @@ impl Precompile for StablecoinDEX {
                     view(call, |c| self.balance_of(c.user, c.token))
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::storageCredits(call) => {
-                    if !self.storage.spec().is_t7() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        view(call, |c| self.storage_credits(c.user))
-                    }
+                    view(call, |c| self.storage_credits(c.user))
                 }
-                IStablecoinDEX::IStablecoinDEXCalls::bookIndexForKey(call) => {
-                    if !self.storage.spec().is_t8() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        view(call, |c| {
-                            let index = self.book_key_index(c.bookKey)?;
-                            Ok((index.is_some(), index.unwrap_or(*BookId::UNSET)).into())
-                        })
-                    }
-                }
+                IStablecoinDEX::IStablecoinDEXCalls::bookIndexForKey(call) => view(call, |c| {
+                    let index = self.book_key_index(c.bookKey)?;
+                    Ok((index.is_some(), index.unwrap_or(*BookId::UNSET)).into())
+                }),
                 IStablecoinDEX::IStablecoinDEXCalls::bookKeyForIndex(call) => {
-                    if !self.storage.spec().is_t8() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        view(call, |c| self.book_key_for_index(c.index))
-                    }
+                    view(call, |c| self.book_key_for_index(c.index))
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::setBookIndex(call) => {
-                    if !self.storage.spec().is_t8() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        mutate_void(call, msg_sender, |_, c| {
-                            self.preserve_storage_credits()?;
-                            self.set_book_index(c.index)
-                        })
-                    }
+                    mutate_void(call, msg_sender, |_, c| {
+                        self.preserve_storage_credits()?;
+                        self.set_book_index(c.index)
+                    })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::getOrder(call) => view(call, |c| {
                     let order = self.get_order(c.orderId)?;
@@ -3013,11 +3076,13 @@ impl Precompile for StablecoinDEX {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, FixedBytes};
+    use alloy::primitives::{address, b256, FixedBytes, LogData};
     use alloy::sol_types::{SolCall, SolEvent};
+    use revm::state::{AccountInfo, Bytecode};
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{JournalCheckpoint, PrecompileStorageProvider};
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20, PAUSE_ROLE};
     use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
@@ -3927,5 +3992,329 @@ mod tests {
                 .iter()
                 .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH)
         );
+    }
+
+    #[test]
+    fn cancel_stale_order_checks_payout_recipient_from_t4() {
+        for spec in [TempoHardfork::T3, TempoHardfork::T4] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xd1);
+                let maker = Address::repeat_byte(0xd2);
+                let base = address!("0x20c00000000000000000000000000000000000d1");
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                // Bid escrows the quote token and pays out the base token.
+                dex.set_balance(maker, PATH_USD_ADDRESS, MIN_ORDER_AMOUNT)?;
+                let order_id = dex.place(maker, base, MIN_ORDER_AMOUNT, true, 0)?;
+
+                let mut registry = TIP403Registry::new();
+                registry.initialize()?;
+                let policy_id = registry.create_policy_with_accounts(
+                    admin,
+                    ITIP403Registry::createPolicyWithAccountsCall {
+                        admin,
+                        policyType: ITIP403Registry::PolicyType::BLACKLIST,
+                        accounts: vec![maker],
+                    },
+                )?;
+                TIP20Token::from_address(base)?.change_transfer_policy_id(
+                    admin,
+                    ITIP20::changeTransferPolicyIdCall {
+                        newPolicyId: policy_id,
+                    },
+                )?;
+
+                let result = dex.cancel_stale_order(order_id);
+                if spec.is_t4() {
+                    assert_eq!(result, Ok(()));
+                    assert!(dex.get_order(order_id).is_err());
+                    assert_eq!(dex.balance_of(maker, PATH_USD_ADDRESS)?, MIN_ORDER_AMOUNT);
+                } else {
+                    assert_eq!(result, Err(err_order_not_stale()));
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn flip_panic_propagates_only_from_t1a() {
+        for spec in [TempoHardfork::T1, TempoHardfork::T1A] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xf1);
+                let alice = Address::repeat_byte(0xf2);
+                let bob = Address::repeat_byte(0xf3);
+                let base = address!("0x20c00000000000000000000000000000000000f1");
+                let amount = MIN_ORDER_AMOUNT;
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                grant_and_mint(PATH_USD_ADDRESS, admin, alice, amount)?;
+                TIP20Token::from_address(PATH_USD_ADDRESS)?.approve(
+                    alice,
+                    ITIP20::approveCall {
+                        spender: STABLECOIN_DEX_ADDRESS,
+                        amount: U256::from(amount),
+                    },
+                )?;
+                dex.place_flip(alice, base, amount, true, 0, 10, false)?;
+                // The flipped ask at tick 10 overflows the level's liquidity: Panic(0x11).
+                dex.book_handle(compute_book_key(base, PATH_USD_ADDRESS))
+                    .write_tick_level(
+                        10,
+                        false,
+                        TickLevel {
+                            head: 0,
+                            tail: 0,
+                            total_liquidity: u128::MAX,
+                        },
+                    )?;
+                dex.set_balance(bob, base, amount)?;
+
+                let result = dex.swap_exact_amount_in(bob, base, PATH_USD_ADDRESS, amount, 0);
+                if spec.is_t1a() {
+                    assert_eq!(result, Err(TempoPrecompileError::under_overflow()));
+                } else {
+                    assert_eq!(result, Ok(amount));
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    /// Delegates to [`TestStorageProvider`] and records every SLOAD, so tests can check the
+    /// storage access pattern that drives SLOAD gas on historical forks.
+    struct SloadRecorder {
+        inner: TestStorageProvider,
+        sloads: Vec<(Address, U256)>,
+    }
+
+    impl SloadRecorder {
+        fn new(spec: TempoHardfork) -> Self {
+            Self {
+                inner: TestStorageProvider::new(spec),
+                sloads: Vec::new(),
+            }
+        }
+
+        fn count(&self, address: Address, slot: U256) -> usize {
+            self.sloads
+                .iter()
+                .filter(|&&entry| entry == (address, slot))
+                .count()
+        }
+    }
+
+    impl PrecompileStorageProvider for SloadRecorder {
+        fn chain_id(&self) -> u64 {
+            self.inner.chain_id()
+        }
+
+        fn timestamp(&self) -> U256 {
+            self.inner.timestamp()
+        }
+
+        fn beneficiary(&self) -> Address {
+            self.inner.beneficiary()
+        }
+
+        fn block_number(&self) -> u64 {
+            self.inner.block_number()
+        }
+
+        fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
+            self.inner.set_code(address, code)
+        }
+
+        fn with_account_info(
+            &mut self,
+            address: Address,
+            f: &mut dyn FnMut(&AccountInfo),
+        ) -> Result<()> {
+            self.inner.with_account_info(address, f)
+        }
+
+        fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+            self.sloads.push((address, key));
+            self.inner.sload(address, key)
+        }
+
+        fn tload(&mut self, address: Address, key: U256) -> Result<U256> {
+            self.inner.tload(address, key)
+        }
+
+        fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+            self.inner.sstore(address, key, value)
+        }
+
+        fn tstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+            self.inner.tstore(address, key, value)
+        }
+
+        fn emit_event(&mut self, address: Address, event: LogData) -> Result<()> {
+            self.inner.emit_event(address, event)
+        }
+
+        fn deduct_gas(&mut self, gas: u64) -> Result<()> {
+            self.inner.deduct_gas(gas)
+        }
+
+        fn refund_gas(&mut self, gas: i64) {
+            self.inner.refund_gas(gas)
+        }
+
+        fn gas_used(&self) -> u64 {
+            self.inner.gas_used()
+        }
+
+        fn gas_refunded(&self) -> i64 {
+            self.inner.gas_refunded()
+        }
+
+        fn spec(&self) -> TempoHardfork {
+            self.inner.spec()
+        }
+
+        fn is_static(&self) -> bool {
+            self.inner.is_static()
+        }
+
+        fn checkpoint(&mut self) -> JournalCheckpoint {
+            self.inner.checkpoint()
+        }
+
+        fn checkpoint_commit(&mut self, checkpoint: JournalCheckpoint) {
+            self.inner.checkpoint_commit(checkpoint)
+        }
+
+        fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+            self.inner.checkpoint_revert(checkpoint)
+        }
+    }
+
+    #[test]
+    fn create_pair_reads_book_slots_before_writing_before_t4() {
+        for spec in [TempoHardfork::T3, TempoHardfork::T4] {
+            let admin = Address::repeat_byte(0xe1);
+            let base = address!("0x20c00000000000000000000000000000000000e1");
+            let mut provider = SloadRecorder::new(spec);
+            let book_slot = StorageCtx::enter(&mut provider, || {
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                Result::<U256>::Ok(
+                    dex.book_handle(compute_book_key(base, PATH_USD_ADDRESS))
+                        .slot,
+                )
+            })
+            .unwrap();
+
+            // The existence check loads each packed slot group once; before T4 the
+            // Storable write loads it again before storing.
+            let expected = if spec.is_t4() { 1 } else { 2 };
+            for offset in [0u64, 1, 4] {
+                assert_eq!(
+                    provider.count(STABLECOIN_DEX_ADDRESS, book_slot + U256::from(offset)),
+                    expected,
+                    "{spec:?} slot+{offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn place_flip_reads_next_order_id_twice_before_t1c() {
+        for spec in [TempoHardfork::T1B, TempoHardfork::T1C] {
+            let admin = Address::repeat_byte(0xe2);
+            let maker = Address::repeat_byte(0xe3);
+            let base = address!("0x20c00000000000000000000000000000000000e2");
+            let mut provider = SloadRecorder::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                dex.set_balance(maker, PATH_USD_ADDRESS, MIN_ORDER_AMOUNT)?;
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+            provider.sloads.clear();
+
+            let order_id = StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().place_flip(maker, base, MIN_ORDER_AMOUNT, true, 0, 10, false)
+            })
+            .unwrap();
+
+            assert_eq!(order_id, 1);
+            let expected = if spec.is_t1c() { 1 } else { 2 };
+            assert_eq!(
+                provider.count(STABLECOIN_DEX_ADDRESS, U256::from(3)),
+                expected,
+                "{spec:?}"
+            );
+            assert_eq!(
+                provider
+                    .inner
+                    .storage(STABLECOIN_DEX_ADDRESS, U256::from(3)),
+                U256::from(2)
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_selectors_reject_malformed_calldata_before_activation() {
+        for (selector, spec) in [
+            (
+                IStablecoinDEX::storageCreditsCall::SELECTOR,
+                TempoHardfork::T6,
+            ),
+            (
+                IStablecoinDEX::bookIndexForKeyCall::SELECTOR,
+                TempoHardfork::T7,
+            ),
+            (
+                IStablecoinDEX::bookKeyForIndexCall::SELECTOR,
+                TempoHardfork::T7,
+            ),
+            (
+                IStablecoinDEX::setBookIndexCall::SELECTOR,
+                TempoHardfork::T7,
+            ),
+        ] {
+            let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+            let mut provider = TestStorageProvider::new(spec);
+            let output = StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                super::super::UnknownFunctionSelector {
+                    selector: FixedBytes::new(selector),
+                }
+                .abi_encode(),
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tick_price_conversion_checks_spacing_from_t2() {
+        for spec in [TempoHardfork::T1C, TempoHardfork::T2] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let dex = StablecoinDEX::new();
+                let tick_to_price = dex.tick_to_price_fn(5);
+                let price_to_tick = dex.price_to_tick_fn(PRICE_SCALE + 5);
+                if spec.is_t2() {
+                    assert_eq!(tick_to_price, Err(err_invalid_tick()));
+                    assert_eq!(price_to_tick, Err(err_invalid_tick()));
+                } else {
+                    assert_eq!(tick_to_price, Ok(PRICE_SCALE + 5));
+                    assert_eq!(price_to_tick, Ok(5));
+                }
+            });
+        }
     }
 }

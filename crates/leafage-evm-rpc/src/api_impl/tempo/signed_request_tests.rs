@@ -284,7 +284,8 @@ fn review_self_sponsorship_gate_and_incomplete_requests() {
         .unwrap_err()
         .message()
         .contains("cannot resolve to sender"));
-    for field in ["nonce", "gas", "maxFeePerGas", "maxPriorityFeePerGas", "to"] {
+    // A missing nonce is not incomplete: create_txn_env fills the state nonce first.
+    for field in ["gas", "maxFeePerGas", "maxPriorityFeePerGas", "to"] {
         let mut incomplete = json.clone();
         incomplete.as_object_mut().unwrap().remove(field);
         let request = serde_json::from_value(incomplete).unwrap();
@@ -297,6 +298,201 @@ fn review_self_sponsorship_gate_and_incomplete_requests() {
     bad.tempo.as_mut().unwrap().fee_payer_signature =
         Some(Signature::new(U256::ZERO, U256::ZERO, false));
     assert!(resolve_fee_payer(&bad, &[], TempoHardfork::T1C).is_err());
+}
+
+#[test]
+fn review_pre_t5_signed_witness_is_rejected_by_execution() {
+    let signer = k256::ecdsa::SigningKey::from_slice(&[1u8; 32]).unwrap();
+    let caller = Address::from_public_key(signer.verifying_key());
+    let witness = B256::repeat_byte(0x53);
+    let hash = fp::KeyAuthorization {
+        chain_id: 4217,
+        key_type: fp::SignatureType::P256,
+        key_id: DELEGATE,
+        expiry: None,
+        limits: None,
+        allowed_calls: None,
+        witness: Some(witness),
+        is_admin: false,
+        account: None,
+    }
+    .signature_hash();
+    let signature: Signature = signer
+        .sign_prehash_recoverable(hash.as_slice())
+        .unwrap()
+        .into();
+    let mut json = json!({
+        "from":caller,"to":DELEGATE,"gas":"0x1e8480",
+        "keyAuthorization":{
+            "chainId":"0x1079","keyType":"p256","keyId":DELEGATE,"witness":witness,
+            "signature":{
+                "type":"secp256k1","r":signature.r(),"s":signature.s(),
+                "yParity":if signature.v() { "0x1" } else { "0x0" }
+            }
+        }
+    });
+    let mut block = block();
+    block.timestamp = U256::from(1_780_000_000u64); // T4
+    let api = tests::review_api();
+    let db = InMemoryDB::default();
+    // The official handler validates signed authorizations; the RPC layer does not.
+    let tx = api
+        .create_txn_env(
+            &Default::default(),
+            &block,
+            serde_json::from_value(json.clone()).unwrap(),
+            &db,
+            4217,
+        )
+        .unwrap();
+    let error = api.transact(&block, &db, tx).unwrap_err().to_rpc_error();
+    // Writer output on lihe-dev.
+    assert_eq!(error.code(), -32603, "{error:?}");
+    assert_eq!(
+        error.message(),
+        "Revm error: keychain validation failed: key authorization witnesses are not active before T5"
+    );
+    // The signature-less gas-only shape never reaches the handler check.
+    json["keyAuthorization"]
+        .as_object_mut()
+        .unwrap()
+        .remove("signature");
+    let error = api
+        .create_txn_env(
+            &Default::default(),
+            &block,
+            serde_json::from_value(json).unwrap(),
+            &db,
+            4217,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), -32602);
+}
+
+/// Writer validates a signed key authorization in a fixed order
+/// (handler.rs:1838-2023): root signer, then chain ID, then the T5 witness gate.
+#[test]
+fn review_key_authorization_errors_follow_writer_order() {
+    let root = k256::ecdsa::SigningKey::from_slice(&[1u8; 32]).unwrap();
+    let caller = Address::from_public_key(root.verifying_key());
+    let other = k256::ecdsa::SigningKey::from_slice(&[2u8; 32]).unwrap();
+    let other_address = Address::from_public_key(other.verifying_key());
+    let witness = B256::repeat_byte(0x53);
+    let mut block = block();
+    block.timestamp = U256::from(1_780_000_000u64); // T4
+    let api = tests::review_api();
+    let db = InMemoryDB::default();
+    for (signer, chain_id, expected) in [
+        (
+            &root,
+            1u64,
+            "Revm error: KeyAuthorization chain_id mismatch: expected 4217, got 1".to_string(),
+        ),
+        (
+            &other,
+            1,
+            format!(
+                "Revm error: KeyAuthorization must be signed by root account {caller}, but was signed by {other_address}"
+            ),
+        ),
+    ] {
+        let hash = fp::KeyAuthorization {
+            chain_id,
+            key_type: fp::SignatureType::P256,
+            key_id: DELEGATE,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: Some(witness),
+            is_admin: false,
+            account: None,
+        }
+        .signature_hash();
+        let signature: Signature = signer
+            .sign_prehash_recoverable(hash.as_slice())
+            .unwrap()
+            .into();
+        let request = json!({
+            "from":caller,"to":DELEGATE,"gas":"0x1e8480",
+            "keyAuthorization":{
+                "chainId":format!("{chain_id:#x}"),"keyType":"p256","keyId":DELEGATE,
+                "witness":witness,
+                "signature":{
+                    "type":"secp256k1","r":signature.r(),"s":signature.s(),
+                    "yParity":if signature.v() { "0x1" } else { "0x0" }
+                }
+            }
+        });
+        let tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                serde_json::from_value(request).unwrap(),
+                &db,
+                4217,
+            )
+            .unwrap();
+        let error = api.transact(&block, &db, tx).unwrap_err().to_rpc_error();
+        assert_eq!(error.code(), -32603, "{error:?}");
+        assert_eq!(error.message(), expected);
+    }
+}
+
+#[test]
+fn review_missing_sponsor_nonce_uses_state_nonce() {
+    use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
+    let sponsor = k256::ecdsa::SigningKey::from_slice(&[2u8; 32]).unwrap();
+    let payer = Address::from_public_key(sponsor.verifying_key());
+    let mut db = InMemoryDB::default();
+    db.insert_account_info(
+        CALLER,
+        AccountInfo {
+            nonce: 7,
+            ..Default::default()
+        },
+    );
+    db.insert_account_storage(
+        NONCE_PRECOMPILE_ADDRESS,
+        U256::from(8).mapping_slot(CALLER.mapping_slot(U256::ZERO)),
+        U256::from(3),
+    )
+    .unwrap();
+    // Account nonce, 2D NonceManager nonce and expiring nonce, as the sponsor signed them.
+    for (nonce_key, nonce) in [(U256::ZERO, 7), (U256::from(8), 3), (U256::MAX, 0)] {
+        let hash = fp::fee_payer_signature_hash(
+            4217,
+            0,
+            0,
+            1_000_000,
+            &[fp::Call {
+                to: Some(DELEGATE),
+                value: U256::ZERO,
+                input: Default::default(),
+            }],
+            &Default::default(),
+            nonce_key,
+            nonce,
+            None,
+            None,
+            None,
+            CALLER,
+            &[],
+            None,
+        );
+        let signature: Signature = sponsor
+            .sign_prehash_recoverable(hash.as_slice())
+            .unwrap()
+            .into();
+        let mut json = json!({
+            "from":CALLER,"to":DELEGATE,"gas":"0xf4240",
+            "maxFeePerGas":"0x0","maxPriorityFeePerGas":"0x0","feePayerSignature":signature
+        });
+        if !nonce_key.is_zero() {
+            json["nonceKey"] = json!(nonce_key);
+        }
+        let fields = tx(json, &db).tempo_fields.unwrap();
+        assert_eq!(fields.fee_payer, Some(payer), "nonceKey {nonce_key}");
+    }
 }
 
 #[test]

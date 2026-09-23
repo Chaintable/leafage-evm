@@ -3,6 +3,9 @@
 //! Ported from Tempo writer: `crates/primitives/src/address.rs`.
 
 use alloy::primitives::{hex, Address, FixedBytes};
+use tempo_contracts::precompiles::SYSTEM_PRECOMPILES;
+
+use super::hardfork::TempoHardfork;
 
 /// TIP-20 token address prefix (12 bytes).
 ///
@@ -42,6 +45,9 @@ pub trait TempoAddressExt {
     /// Returns the nonzero zone ID encoded in a ZonePortal address.
     fn zone_portal_id(&self) -> Option<u64>;
 
+    /// Returns `true` if the address is a TIP-20 token or a system precompile active at `spec`.
+    fn is_precompile(&self, spec: TempoHardfork) -> bool;
+
     /// Returns `true` if the address matches the TIP-1022 virtual-address format
     /// (bytes `[4:14]` == [`Self::VIRTUAL_MAGIC`]).
     fn is_virtual(&self) -> bool;
@@ -77,6 +83,13 @@ impl TempoAddressExt for Address {
         suffix.copy_from_slice(&bytes[12..]);
         let zone_id = u64::from_be_bytes(suffix);
         (zone_id != 0).then_some(zone_id)
+    }
+
+    fn is_precompile(&self, spec: TempoHardfork) -> bool {
+        self.is_tip20()
+            || SYSTEM_PRECOMPILES
+                .iter()
+                .any(|&(a, activated)| &a == self && spec.as_official() >= activated)
     }
 
     fn is_virtual(&self) -> bool {
@@ -165,6 +178,26 @@ mod tests {
         // Path-USD (the canonical TIP-20 fee token) shares the prefix.
         let path_usd = address!("0x20C0000000000000000000000000000000000000");
         assert!(path_usd.is_tip20());
+    }
+
+    #[test]
+    fn is_precompile_follows_system_precompile_activation() {
+        let tip20 = address!("0x20C0000000000000000000000000000000000001");
+        assert!(tip20.is_precompile(TempoHardfork::Genesis));
+        // Ethereum precompiles are not Tempo system precompiles.
+        assert!(!Address::with_last_byte(1).is_precompile(TempoHardfork::T11));
+
+        let storage_credits = address!("0x1060000000000000000000000000000000000000");
+        let current_committee = address!("0xC077E00000000000000000000000000000000000");
+        let zone_factory = address!("0x5AF2000000000000000000000000000000000000");
+        for (address, before, activated) in [
+            (storage_credits, TempoHardfork::T6, TempoHardfork::T7),
+            (current_committee, TempoHardfork::T7, TempoHardfork::T8),
+            (zone_factory, TempoHardfork::T9, TempoHardfork::T10),
+        ] {
+            assert!(!address.is_precompile(before), "{address}");
+            assert!(address.is_precompile(activated), "{address}");
+        }
     }
 
     #[test]

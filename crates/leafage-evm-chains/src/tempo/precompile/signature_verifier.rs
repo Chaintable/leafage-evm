@@ -16,7 +16,7 @@
 //! file additionally guards the dispatch entry as defense in depth.
 
 use alloy::primitives::{Address, Bytes, B256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -24,6 +24,7 @@ use super::account_keychain::AccountKeychain;
 use super::storage::{ContractStorage, StorageCtx};
 use super::{dispatch_call, input_cost, unknown_selector, view, Precompile, SIGNATURE_VERIFIER_ADDRESS};
 use crate::tempo::fee_payer::{KeychainSignature, PrimitiveSignature, TempoSignature};
+use crate::tempo::hardfork::TempoHardfork;
 
 // ===========================================================================
 // Gas constants
@@ -169,6 +170,19 @@ impl ContractStorage for SignatureVerifier {
 // Dispatch
 // ===========================================================================
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `signature_verifier/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
+    (
+        ISignatureVerifier::verifyKeychainCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ISignatureVerifier::verifyKeychainAdminCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+];
+
 impl Precompile for SignatureVerifier {
     fn call(&mut self, calldata: &[u8], _msg_sender: Address) -> PrecompileResult {
         // Defense in depth: registration in extend_tempo_precompiles already gates
@@ -194,14 +208,15 @@ impl Precompile for SignatureVerifier {
             ));
         }
 
-        let selector = calldata
-            .get(..4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .unwrap_or([0; 4]);
-
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            ISignatureVerifier::ISignatureVerifierCalls::valid_selector,
+            |selector| {
+                ISignatureVerifier::ISignatureVerifierCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 ISignatureVerifier::ISignatureVerifierCalls::abi_decode_with_config(
                     data,
@@ -216,15 +231,9 @@ impl Precompile for SignatureVerifier {
                     view(c, |c| self.verify(c.signer, c.hash, c.signature))
                 }
                 ISignatureVerifier::ISignatureVerifierCalls::verifyKeychain(c) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(c, |c| self.verify_keychain(c.account, c.hash, c.signature))
                 }
                 ISignatureVerifier::ISignatureVerifierCalls::verifyKeychainAdmin(c) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(c, |c| self.verify_keychain_admin(c.account, c.hash, c.signature))
                 }
             },
@@ -503,5 +512,27 @@ mod tests {
         let returns = ISignatureVerifier::verifyCall::abi_decode_returns(&output.bytes)
             .expect("decode verify return");
         assert!(returns, "verify must return true for correct signer");
+    }
+
+    #[test]
+    fn keychain_selectors_reject_malformed_calldata_before_t6() {
+        for selector in [
+            ISignatureVerifier::verifyKeychainCall::SELECTOR,
+            ISignatureVerifier::verifyKeychainAdminCall::SELECTOR,
+        ] {
+            let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+            let output = run_with_spec(TempoHardfork::T5, || {
+                SignatureVerifier::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                UnknownFunctionSelector {
+                    selector: FixedBytes::new(selector),
+                }
+                .abi_encode()
+            );
+        }
     }
 }
