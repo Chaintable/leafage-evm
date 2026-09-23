@@ -332,6 +332,7 @@ mod tests {
             tx_hash: B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(RPC_SIMULATION_UNIQUE_TX_IDENTIFIER),
+            gas_estimation: false,
         };
         assert_eq!(tx.tx_type(), 0x76);
         assert_eq!(tx.gas_limit(), 1_000_000);

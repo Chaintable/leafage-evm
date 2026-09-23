@@ -2263,6 +2263,7 @@ mod tests {
             tx_hash: replay_hash,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: Some(replay_hash),
+            gas_estimation: false,
         }
     }
 
@@ -3566,6 +3567,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         }
     }
 
@@ -3587,6 +3589,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
         let result = evm.transact(tx);
         let err = result.unwrap_err().to_string();
@@ -3666,6 +3669,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
         let result = evm.transact(tx);
         let err = result.unwrap_err().to_string();
@@ -3798,6 +3802,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
         let error = evm.transact(tx).unwrap_err();
         assert!(
@@ -4220,6 +4225,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
         // System tx should pass validate_env (though execution may fail later)
         // We only check it doesn't fail at the validate_env step.

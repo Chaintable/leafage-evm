@@ -196,6 +196,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         }
     }
 
@@ -311,6 +312,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
         TempoEvm::new(env(), db, NoOpInspector, false)
             .transact(tx)

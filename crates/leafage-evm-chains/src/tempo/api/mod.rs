@@ -674,6 +674,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
 
         // Pre-T1A
@@ -742,6 +743,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         }
     }
 
@@ -1332,6 +1334,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
 
         let mut pre_t4_evm = TempoEvm::new(
@@ -1801,6 +1804,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
 
         let mut evm = TempoEvm::new(
@@ -1887,6 +1891,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
 
         let mut evm_1 = TempoEvm::new(
@@ -1947,6 +1952,7 @@ mod tests {
             tx_hash: revm::primitives::B256::ZERO,
             stateful_simulation_replay_id: None,
             unique_tx_identifier: None,
+            gas_estimation: false,
         };
 
         // WITHOUT pre-warm: normal T2 execution
