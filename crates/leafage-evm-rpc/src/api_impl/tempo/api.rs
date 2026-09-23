@@ -113,6 +113,17 @@ impl<DB> TempoApiImpl<DB> {
         });
         cfg
     }
+
+    /// reth `prepare_call_env` lowers the basefee to 0 when the call's gas price is 0.
+    /// reth's TxEnv gas price is the effective price (min(maxFee, basefee + tip) for
+    /// 1559/AA); Leafage stores maxFee there, so compare the effective price instead.
+    fn block_env_for_call(block_env: &BlockEnv, tx: &TempoTxEnv) -> BlockEnv {
+        let mut block_env = block_env.clone();
+        if tx.effective_gas_price(block_env.basefee as u128) == 0 {
+            block_env.basefee = 0;
+        }
+        block_env
+    }
 }
 
 impl ToJsonRpcError for TempoInvalidTransaction {
@@ -717,7 +728,10 @@ where
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
+        let evm_env = EvmEnv::new(
+            self.cfg_for_call(block_env),
+            Self::block_env_for_call(block_env, &tx),
+        );
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
@@ -741,7 +755,10 @@ where
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R,
     {
-        let evm_env = EvmEnv::new(self.cfg_for_call(block_env), block_env.clone());
+        let evm_env = EvmEnv::new(
+            self.cfg_for_call(block_env),
+            Self::block_env_for_call(block_env, &tx),
+        );
         let ts: u64 = block_env.timestamp.saturating_to();
         let db = Vcv2CodeInjector::new(state, ts);
         let wrap_database_ref = WrapDatabaseRef(db);
@@ -1081,6 +1098,80 @@ mod tests {
             .create_txn_env(&Default::default(), &block, outer, EmptyDB::default(), 4217)
             .unwrap_err();
         assert_eq!(error.code(), -32602);
+    }
+
+    #[test]
+    fn zero_gas_price_call_sees_zero_basefee() {
+        use alloy::primitives::{address, bytes, U256};
+        use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            basefee: 1_000,
+            ..Default::default()
+        };
+        let target = address!("1111111111111111111111111111111111111112");
+        let mut db = InMemoryDB::default();
+        // BASEFEE PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+        let code = Bytecode::new_legacy(bytes!("4860005260206000f3"));
+        db.insert_account_info(
+            target,
+            AccountInfo::new(U256::ZERO, 1, code.hash_slow(), code),
+        );
+        // A priced call needs a USD fee token (default pathUSD) with a caller balance.
+        {
+            use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
+            let token = address!("20c0000000000000000000000000000000000000");
+            let marker = Bytecode::new_legacy(bytes!("ef"));
+            db.insert_account_info(
+                token,
+                AccountInfo::new(U256::ZERO, 1, marker.hash_slow(), marker),
+            );
+            let mut currency = [0u8; 32];
+            currency[..3].copy_from_slice(b"USD");
+            currency[31] = 6;
+            db.insert_account_storage(token, U256::from(4), U256::from_be_bytes(currency))
+                .unwrap();
+            let caller = address!("1111111111111111111111111111111111111111");
+            db.insert_account_storage(token, caller.mapping_slot(U256::from(9)), U256::MAX >> 1)
+                .unwrap();
+        }
+        for (field, value, expected) in [
+            ("value", serde_json::json!("0x0"), 0u64),
+            ("gasPrice", serde_json::json!("0x0"), 0),
+            ("maxFeePerGas", serde_json::json!("0x0"), 0),
+            ("keyType", serde_json::json!("p256"), 0),
+            ("maxPriorityFeePerGas", serde_json::json!("0x0"), 1_000),
+        ] {
+            let request = review_request(field, value);
+            let tx = api
+                .create_txn_env(&Default::default(), &block, request.clone(), &db, 4217)
+                .unwrap();
+            let result = api.transact(&block, &db, tx).unwrap();
+            assert_eq!(
+                result.output().unwrap().as_ref(),
+                U256::from(expected).to_be_bytes::<32>(),
+                "transact {field}"
+            );
+            let tx = api
+                .create_txn_env(&Default::default(), &block, request, &db, 4217)
+                .unwrap();
+            let (result, _) = api
+                .inspect_tx_commit(
+                    &block,
+                    db.clone(),
+                    TracingInspectorConfig::default_parity(),
+                    |_| (),
+                    tx,
+                )
+                .unwrap();
+            assert_eq!(
+                result.output().unwrap().as_ref(),
+                U256::from(expected).to_be_bytes::<32>(),
+                "inspect_tx_commit {field}"
+            );
+        }
     }
 
     #[test]
