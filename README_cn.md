@@ -175,6 +175,12 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 
 `bundle_bucket_name` 为可选项；省略或留空时继续使用原有的逐块 S3 读取逻辑。
 
+Kafka + S3 JSON 可选字段 `state_diff_key` 支持 `"state-root"`、`"block-hash"`。读取按 block hash 上传的 Arb Classic 数据时，添加 `"state_diff_key": "block-hash"`。Archive 初始化使用 `archive-init --statediff-key block-hash`，并配置相同的源 bucket、S3 chain ID 和 version。该策略覆盖 genesis、实时消费、追赶、重启恢复与 parent hash 回溯；不增加 standalone 独立 flag，也不修改 Kafka 消息。
+
+不填写时保留历史行为：S3 chain ID `"999"` 默认使用 block hash，其他链使用 state root；显式配置可覆盖默认值，包括 chain 999。启动日志会输出最终策略。配置需与生产端一致，恢复同一批数据时保持一致；不能通过 42161 区分 Classic 和 Nitro。
+
+block-hash 模式要求每个区块都有真实 diff，包括 genesis、零 root 或 root 未变化的区块。对象缺失或损坏会报错，不会回退到 state root key。若 bundle 中请求范围包含合成的空 diff，会在该范围任何区块写入前报错；可禁用 bundle 读取以使用原始逐块对象，或重新生成包含真实 diff 的 bundle。diff 内部仍保留 state root。
+
 `standalone` 和 `archive-init` 均可通过 `--bundle-range-size <MIB>` 调整 compacted StateDiff 的请求大小。该限制只作用于多个 entry 的合并读取；单个 entry 超过配置值时会独立获取。
 
 ### 子命令
