@@ -331,16 +331,14 @@ mod tests {
         assert_eq!(credit.present_value, U256::ONE);
     }
 
+    /// RPC simulations never collect fees, so writer never marks the fee payer's
+    /// balance slot as non-creditable and its clear mints like any other slot.
     #[test]
-    fn fee_payer_balance_clear_does_not_mint_credit() {
+    fn fee_payer_balance_clear_mints_credit_in_simulation() {
         let result = transfer_result(PATH_USD_ADDRESS);
         assert!(result.result.is_success(), "{:?}", result.result);
-        let credit = result
-            .state
-            .get(&STORAGE_CREDITS_ADDRESS)
-            .and_then(|account| account.storage.get(&StorageCredits::slot(PATH_USD_ADDRESS)))
-            .map(|slot| slot.present_value)
-            .unwrap_or_default();
-        assert_eq!(credit, U256::ZERO);
+        let credit = &result.state[&STORAGE_CREDITS_ADDRESS].storage
+            [&StorageCredits::slot(PATH_USD_ADDRESS)];
+        assert_eq!(credit.present_value, U256::ONE);
     }
 }

@@ -3,11 +3,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::tempo::block::TempoBlockEnv;
 use crate::tempo::hardfork::TempoHardfork;
-use crate::tempo::precompile::{
-    extend_tempo_precompiles,
-    storage::take_last_precompile_refund,
-    storage_credits::{with_non_creditable_slots, NonCreditableSlots},
-};
+use crate::tempo::precompile::{extend_tempo_precompiles, storage::take_last_precompile_refund};
 use crate::tempo::tx::TempoTxEnv;
 use alloy_evm::{Database, EvmEnv};
 use revm::{
@@ -60,10 +56,10 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     ) -> Result<Option<InterpreterResult>, String> {
         // Clear a stale value left by a previous fatal precompile invocation.
         let _ = take_last_precompile_refund();
-        let non_creditable_slots = resolve_non_creditable_slots(context);
-        let result = with_non_creditable_slots(&non_creditable_slots, || {
-            self.0.run(context, inputs)
-        });
+        // Writer marks fee bookkeeping slots non-creditable only after collecting
+        // a fee (handler.rs collect_fee_pre_tx). RPC simulations never collect
+        // one, so that set is always empty here.
+        let result = self.0.run(context, inputs);
         // Drain after both success and error so the thread-local value cannot leak.
         let refund = take_last_precompile_refund();
         let mut result = result?;
@@ -82,40 +78,6 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     fn contains(&self, address: &Address) -> bool {
         PrecompileProvider::<TempoContext<DB>>::contains(&self.0, address)
     }
-}
-
-fn resolve_non_creditable_slots<DB: Database>(
-    context: &mut TempoContext<DB>,
-) -> NonCreditableSlots {
-    use crate::tempo::precompile::DEFAULT_FEE_TOKEN;
-
-    if !context.cfg.spec.is_t7() {
-        return NonCreditableSlots::default();
-    }
-
-    let caller = context.tx.base.caller;
-    let (fee_payer, fee_token_override, keychain_fee_key) = context
-        .tx
-        .tempo_fields
-        .as_ref()
-        .map(|fields| {
-            (
-                fields.fee_payer.unwrap_or(caller),
-                fields.fee_token,
-                (fields.is_keychain && fields.fee_payer.unwrap_or(caller) == caller)
-                    .then_some(fields.key_id)
-                    .flatten(),
-            )
-        })
-        .unwrap_or((caller, None, None));
-
-    let fee_token = context
-        .tx
-        .resolved_fee_token
-        .or(fee_token_override)
-        .unwrap_or(DEFAULT_FEE_TOKEN);
-
-    NonCreditableSlots::new(fee_payer, fee_token, keychain_fee_key)
 }
 
 mod exec;
@@ -793,58 +755,71 @@ mod tests {
         }
     }
 
+    /// Writer marks fee bookkeeping slots non-creditable only after collecting a
+    /// fee. RPC simulations never collect one, so an AA call clearing the fee
+    /// payer's fee-token balance mints a credit, sponsored or not.
     #[test]
-    fn review_sponsored_keychain_credit_exclusions_follow_the_payer() {
-        use crate::tempo::{
-            precompile::{
-                account_keychain::AccountKeychain, storage_credits::is_non_creditable_slot,
-                storage_types::StorageKey, ACCOUNT_KEYCHAIN_ADDRESS, DEFAULT_FEE_TOKEN,
-            },
-            tx::TempoTxFields,
+    fn review_simulated_fee_payer_balance_clear_mints_credit() {
+        use crate::tempo::precompile::{
+            storage_credits::StorageCredits, storage_types::StorageKey, DEFAULT_FEE_TOKEN,
+            STORAGE_CREDITS_ADDRESS,
         };
-        use revm::primitives::U256;
+        use revm::bytecode::Bytecode;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::{Bytes, TxKind, U256};
+        use revm::state::AccountInfo;
+
         let caller = Address::repeat_byte(0x11);
         let sponsor = Address::repeat_byte(0x22);
-        let key = Address::repeat_byte(0x33);
-        for (timestamp, sponsored) in [
-            (1_783_605_599, true),
-            (1_783_605_600, false),
-            (1_783_605_600, true),
-        ] {
-            let mut evm = TempoEvm::new(
-                make_env_aa(timestamp),
-                EmptyDB::default(),
-                NoOpInspector,
-                false,
-            );
-            evm.inner.ctx.tx.base.caller = caller;
-            evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
-                is_keychain: true,
-                key_id: Some(key),
-                fee_payer: sponsored.then_some(sponsor),
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(1_000u64);
+        let marker = Bytecode::new_legacy(vec![0xef].into());
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            DEFAULT_FEE_TOKEN,
+            AccountInfo {
+                code_hash: marker.hash_slow(),
+                code: Some(marker),
+                nonce: 1,
                 ..Default::default()
-            });
-            let exclusions = resolve_non_creditable_slots(&mut evm.inner.ctx);
-            let active = timestamp >= 1_783_605_600;
-            with_non_creditable_slots(&exclusions, || {
-                for owner in [caller, sponsor] {
-                    assert_eq!(
-                        is_non_creditable_slot(
-                            DEFAULT_FEE_TOKEN,
-                            owner.mapping_slot(U256::from(9))
-                        ),
-                        active && owner == if sponsored { sponsor } else { caller },
-                    );
-                    let limit_key = AccountKeychain::spending_limit_key(owner, key);
-                    let slot = AccountKeychain::new().spending_limits[limit_key][DEFAULT_FEE_TOKEN]
-                        .remaining
-                        .slot();
-                    assert_eq!(
-                        is_non_creditable_slot(ACCOUNT_KEYCHAIN_ADDRESS, slot),
-                        active && !sponsored && owner == caller
-                    );
-                }
-            });
+            },
+        );
+        db.insert_account_storage(DEFAULT_FEE_TOKEN, U256::from(7), U256::ONE << 160)
+            .unwrap();
+        db.insert_account_storage(DEFAULT_FEE_TOKEN, U256::from(8), amount * U256::from(3))
+            .unwrap();
+        // A non-zero recipient balance keeps the transfer from creating a slot
+        // that would settle the minted credit.
+        for owner in [caller, sponsor, recipient] {
+            db.insert_account_storage(DEFAULT_FEE_TOKEN, owner.mapping_slot(U256::from(9)), amount)
+                .unwrap();
+        }
+
+        let mut calldata = vec![0xa9, 0x05, 0x9c, 0xbb];
+        let mut recipient_word = [0u8; 32];
+        recipient_word[12..].copy_from_slice(recipient.as_slice());
+        calldata.extend_from_slice(&recipient_word);
+        calldata.extend_from_slice(&amount.to_be_bytes::<32>());
+        for sponsored in [false, true] {
+            let mut tx = make_aa_tx(
+                vec![crate::tempo::tx::TempoCall {
+                    to: TxKind::Call(DEFAULT_FEE_TOKEN),
+                    value: U256::ZERO,
+                    input: Bytes::from(calldata.clone()),
+                }],
+                1,
+                U256::ZERO,
+                10_000_000,
+            );
+            tx.base.caller = caller;
+            tx.tempo_fields.as_mut().unwrap().fee_payer = sponsored.then_some(sponsor);
+            let mut evm =
+                TempoEvm::new(make_env_aa(1_783_605_600), db.clone(), NoOpInspector, false);
+            let result = evm.transact(tx).unwrap();
+            assert!(result.result.is_success(), "{:?}", result.result);
+            let credit = &result.state[&STORAGE_CREDITS_ADDRESS].storage
+                [&StorageCredits::slot(DEFAULT_FEE_TOKEN)];
+            assert_eq!(credit.present_value, U256::ONE, "sponsored={sponsored}");
         }
     }
 
