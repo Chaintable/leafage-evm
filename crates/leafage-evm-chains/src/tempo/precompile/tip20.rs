@@ -1675,13 +1675,13 @@ impl TIP20Token {
     }
 
     fn _burn(&mut self, msg_sender: Address, amount: U256) -> Result<()> {
-        self.check_role(msg_sender, *ISSUER_ROLE)?;
         // TIP-1038 #2 (T3+): burn must respect the paused flag. `_transfer`
         // checks paused only on its public-entry callers, so _burn needs an
-        // explicit guard here on T3+.
+        // explicit guard here on T3+. Official checks paused before the role.
         if self.storage.spec().is_t3() {
             self.check_not_paused()?;
         }
+        self.check_role(msg_sender, *ISSUER_ROLE)?;
 
         self._transfer(msg_sender, Address::ZERO, amount)?;
 
@@ -2411,6 +2411,45 @@ mod tests {
             Result::<()>::Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn burn_checks_paused_before_issuer_role_from_t3() {
+        let issuer = Address::repeat_byte(0x61);
+        let outsider = Address::repeat_byte(0x62);
+        let burn = |spec, paused: bool, caller: Address| {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                token.transfer_policy_id.write(1)?;
+                token.grant_role_internal(issuer, *ISSUER_ROLE)?;
+                token.set_balance(issuer, U256::from(10))?;
+                token.set_total_supply(U256::from(10))?;
+                token.paused.write(paused)?;
+                token.burn(caller, ITIP20::burnCall { amount: U256::ONE })
+            })
+        };
+        let revert_data = |result: Result<()>| match result {
+            Err(TempoPrecompileError::Revert(data)) => Some(data.to_vec()),
+            _ => None,
+        };
+        let paused = Some(ITIP20::ContractPaused {}.abi_encode());
+        let unauthorized = Some(IRolesAuth::Unauthorized {}.abi_encode());
+
+        // T3+: paused takes precedence over the issuer role check.
+        assert_eq!(revert_data(burn(TempoHardfork::T3, true, outsider)), paused);
+        assert_eq!(revert_data(burn(TempoHardfork::T3, true, issuer)), paused);
+        assert_eq!(
+            revert_data(burn(TempoHardfork::T3, false, outsider)),
+            unauthorized
+        );
+        assert!(burn(TempoHardfork::T3, false, issuer).is_ok());
+        // Pre-T3: burn ignores the paused flag.
+        assert_eq!(
+            revert_data(burn(TempoHardfork::T2, true, outsider)),
+            unauthorized
+        );
+        assert!(burn(TempoHardfork::T2, true, issuer).is_ok());
     }
 
     #[test]
