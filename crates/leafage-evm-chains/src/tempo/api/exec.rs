@@ -250,6 +250,17 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 }
             }
 
+            // T3+: access-key transactions cannot start with CREATE
+            // (ported from writer: handler.rs:1807-1818).
+            if evm.ctx().cfg.spec.is_t3()
+                && fields.is_keychain
+                && calls.first().is_some_and(|call| call.to.is_create())
+            {
+                return Err(EVMError::Custom(
+                    "access-key transactions cannot use CREATE as the first call".into(),
+                ));
+            }
+
             // Validate time window (ported from writer: handler.rs:1755-1782).
             let block_ts: u64 = evm.ctx().block.timestamp.saturating_to();
             validate_time_window(fields.valid_after, fields.valid_before, block_ts)?;
@@ -3510,6 +3521,44 @@ mod tests {
             err.contains("calls cannot contain CREATE when authorization list"),
             "expected 'calls cannot contain CREATE when authorization list', got: {err}"
         );
+    }
+
+    /// Writer rejects a keychain-signed T3+ tx whose first call is CREATE in
+    /// validate_env, before any pre-execution state change.
+    #[test]
+    fn t3_validate_env_rejects_access_key_create_first_call() {
+        use crate::tempo::tx::TempoCall;
+        use revm::primitives::TxKind;
+
+        for (spec, keychain, rejected) in [
+            (TempoHardfork::T2, true, false),
+            (TempoHardfork::T3, false, false),
+            (TempoHardfork::T3, true, true),
+            (TempoHardfork::T11, true, true),
+        ] {
+            let mut tx = make_aa_tx_for_validate(vec![TempoCall {
+                to: TxKind::Create,
+                ..Default::default()
+            }]);
+            let fields = tx.tempo_fields.as_mut().unwrap();
+            fields.is_keychain = keychain;
+            fields.key_id = keychain.then(|| Address::repeat_byte(0x42));
+            let mut evm = make_evm_with_spec(spec);
+            evm.inner.ctx.tx = tx;
+            let result = TempoHandler::<EmptyDB, NoOpInspector>::new().validate_env(&mut evm);
+            if rejected {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(EVMError::Custom(reason))
+                            if reason == "access-key transactions cannot use CREATE as the first call"
+                    ),
+                    "{spec:?}: {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{spec:?} keychain={keychain}: {result:?}");
+            }
+        }
     }
 
     #[test]
