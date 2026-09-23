@@ -645,7 +645,7 @@ impl ValidatorConfigV2 {
     /// Returns all validators ever added.
     pub fn get_validators(&self) -> Result<Vec<IValidatorConfigV2::Validator>> {
         let count = self.validator_count()?;
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::new();
         for i in 0..count {
             out.push(self.read_validator_at(i)?);
         }
@@ -655,7 +655,7 @@ impl ValidatorConfigV2 {
     /// Returns only active validators.
     pub fn get_active_validators(&self) -> Result<Vec<IValidatorConfigV2::Validator>> {
         let count = self.active_indices.len()?;
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::new();
         for i in 0..count {
             let global_idx1 = self.active_indices[i].read()?;
             out.push(self.read_validator_at(global_idx1 - 1)?);
@@ -1359,5 +1359,42 @@ impl Precompile for ValidatorConfigV2 {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
+
+    #[test]
+    fn validator_lists_with_huge_stored_length_run_out_of_gas() {
+        // Slot 1: validators length; slot 6: active_indices length.
+        for len_slot in [1u64, 6] {
+            let mut provider = AccessLogProvider::new(TempoHardfork::T2);
+            provider
+                .inner
+                .sstore(
+                    VALIDATOR_CONFIG_V2_ADDRESS,
+                    U256::from(len_slot),
+                    U256::from(u32::MAX),
+                )
+                .unwrap();
+            // Enough for the cold length read only: the first element read runs out of
+            // gas, so active_indices never evaluates `idx1 - 1` on an empty entry.
+            provider.inner.set_gas_limit(3_000);
+
+            let result = StorageCtx::enter(&mut provider, || {
+                let config = ValidatorConfigV2::new();
+                if len_slot == 1 {
+                    config.get_validators()
+                } else {
+                    config.get_active_validators()
+                }
+            });
+
+            assert_eq!(result.unwrap_err(), TempoPrecompileError::OutOfGas);
+        }
     }
 }

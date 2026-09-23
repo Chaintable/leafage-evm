@@ -280,7 +280,7 @@ impl ValidatorConfig {
     /// Returns all registered validators in index order.
     pub fn get_validators(&self) -> Result<Vec<IValidatorConfig::Validator>> {
         let count = self.validators_array.len()?;
-        let mut validators = Vec::with_capacity(count);
+        let mut validators = Vec::new();
 
         for i in 0..count {
             let validator_address = self.validators_array[i].read()?;
@@ -585,5 +585,30 @@ impl Precompile for ValidatorConfig {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
+
+    #[test]
+    fn get_validators_with_huge_stored_length_runs_out_of_gas() {
+        let mut provider = AccessLogProvider::new(TempoHardfork::T1);
+        provider
+            .inner
+            .sstore(
+                VALIDATOR_CONFIG_ADDRESS,
+                U256::from(1),
+                U256::from(u32::MAX),
+            )
+            .unwrap();
+        provider.inner.set_gas_limit(100_000);
+
+        let result = StorageCtx::enter(&mut provider, || ValidatorConfig::new().get_validators());
+
+        assert_eq!(result.unwrap_err(), TempoPrecompileError::OutOfGas);
     }
 }

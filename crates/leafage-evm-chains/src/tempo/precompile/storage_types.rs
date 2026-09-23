@@ -1148,7 +1148,7 @@ impl Storable for Bytes {
             // Long: data starts at keccak256(slot)
             let data_start = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
             let num_slots = len.div_ceil(32);
-            let mut data = Vec::with_capacity(num_slots * 32);
+            let mut data = Vec::new();
 
             for i in 0..num_slots {
                 let word = storage.load(data_start + U256::from(i))?;
@@ -1283,7 +1283,7 @@ where
         let data_start = calc_data_slot(len_slot);
         if T::BYTES <= 16 {
             // Packed elements
-            let mut result = Vec::with_capacity(length);
+            let mut result = Vec::new();
             let slots_needed = packing::calc_packed_slot_count(length, T::BYTES);
             for slot_idx in 0..slots_needed {
                 let slot_value = storage.load(data_start + U256::from(slot_idx))?;
@@ -1300,7 +1300,7 @@ where
             Ok(result)
         } else {
             // Unpacked (multi-slot) elements
-            let mut result = Vec::with_capacity(length);
+            let mut result = Vec::new();
             for elem_idx in 0..length {
                 let elem_slot = data_start + U256::from(elem_idx * T::SLOTS);
                 let elem = T::load(storage, elem_slot, LayoutCtx::FULL)?;
@@ -1794,7 +1794,7 @@ where
 {
     fn read(&self) -> Result<Set<T>> {
         let len = self.len()?;
-        let mut vec = Vec::with_capacity(len);
+        let mut vec = Vec::new();
         for i in 0..len {
             vec.push(self.values[i].read()?);
         }
@@ -1863,6 +1863,7 @@ mod tests {
 
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
     use crate::tempo::precompile::test_utils::TestStorageProvider;
 
     struct TestStorageOps(Address);
@@ -2088,6 +2089,69 @@ mod tests {
         });
 
         assert_eq!(result.unwrap_err(), TempoPrecompileError::under_overflow());
+    }
+
+    /// Element large enough that `Vec::with_capacity(u32::MAX)` exceeds any address
+    /// space (~512 TiB), so pre-allocating from the stored length aborts the process.
+    struct HugeElement([u8; 128 * 1024]);
+
+    impl StorableType for HugeElement {
+        const LAYOUT: Layout = Layout::Slots(1);
+        type Handler = ();
+
+        fn handle(_slot: U256, _ctx: LayoutCtx, _address: Address) -> Self::Handler {}
+    }
+
+    impl Storable for HugeElement {
+        fn load<S: StorageOps>(storage: &S, slot: U256, _ctx: LayoutCtx) -> Result<Self> {
+            storage.load(slot)?;
+            Ok(Self([0; 128 * 1024]))
+        }
+
+        fn store<S: StorageOps>(&self, _: &mut S, _: U256, _: LayoutCtx) -> Result<()> {
+            unreachable!("load-only test element")
+        }
+    }
+
+    /// Stores `len_word` at the length slot, then runs `load` with a 100k gas budget
+    /// under a provider that charges SLOAD gas.
+    fn load_with_stored_length<T>(
+        len_word: U256,
+        load: impl FnOnce(&TestStorageOps, U256) -> Result<T>,
+    ) -> Result<T> {
+        let address = address!("0x8888888888888888888888888888888888888888");
+        let slot = U256::from(24);
+        let mut provider = AccessLogProvider::new(TempoHardfork::T10);
+        provider.inner.sstore(address, slot, len_word).unwrap();
+        provider.inner.set_gas_limit(100_000);
+        StorageCtx::enter(&mut provider, || load(&TestStorageOps(address), slot))
+    }
+
+    #[test]
+    fn storage_controlled_lengths_run_out_of_gas_without_preallocating() {
+        let max_len = U256::from(u32::MAX);
+        let out_of_gas = TempoPrecompileError::OutOfGas;
+
+        let huge = load_with_stored_length(max_len, |s, slot| {
+            Vec::<HugeElement>::load(s, slot, LayoutCtx::FULL)
+        });
+        assert!(matches!(huge, Err(TempoPrecompileError::OutOfGas)));
+        let unpacked = load_with_stored_length(max_len, |s, slot| {
+            Vec::<B256>::load(s, slot, LayoutCtx::FULL)
+        });
+        assert_eq!(unpacked.unwrap_err(), out_of_gas);
+        let packed = load_with_stored_length(max_len, |s, slot| {
+            Vec::<u64>::load(s, slot, LayoutCtx::FULL)
+        });
+        assert_eq!(packed.unwrap_err(), out_of_gas);
+        let bytes = load_with_stored_length(max_len * U256::from(2) + U256::ONE, |s, slot| {
+            Bytes::load(s, slot, LayoutCtx::FULL)
+        });
+        assert_eq!(bytes.unwrap_err(), out_of_gas);
+        let set = load_with_stored_length(max_len, |s, slot| {
+            SetHandler::<Address>::new(slot, s.0).read()
+        });
+        assert_eq!(set.unwrap_err(), out_of_gas);
     }
 
     #[test]

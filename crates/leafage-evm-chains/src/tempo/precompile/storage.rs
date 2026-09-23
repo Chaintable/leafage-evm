@@ -956,6 +956,125 @@ where
     StorageCtx::enter(&mut provider, f)
 }
 
+/// One persistent storage access recorded by [`AccessLogProvider`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageAccess {
+    Load(Address, U256),
+    Store(Address, U256),
+}
+
+/// Test provider that records every SLOAD/SSTORE in order and, unlike the wrapped
+/// [`TestStorageProvider`](super::test_utils::TestStorageProvider), charges EIP-2929
+/// SLOAD gas (2100 cold / 100 warm) so storage-controlled loops can run out of gas.
+#[cfg(test)]
+pub(crate) struct AccessLogProvider {
+    pub(crate) inner: super::test_utils::TestStorageProvider,
+    pub(crate) accesses: Vec<StorageAccess>,
+    warm: std::collections::HashSet<(Address, U256)>,
+}
+
+#[cfg(test)]
+impl AccessLogProvider {
+    pub(crate) fn new(spec: TempoHardfork) -> Self {
+        Self {
+            inner: super::test_utils::TestStorageProvider::new(spec),
+            accesses: Vec::new(),
+            warm: Default::default(),
+        }
+    }
+
+    /// Accesses to `address` recorded since the log was last cleared.
+    pub(crate) fn accesses_of(&self, address: Address) -> Vec<StorageAccess> {
+        self.accesses
+            .iter()
+            .copied()
+            .filter(|access| match access {
+                StorageAccess::Load(a, _) | StorageAccess::Store(a, _) => *a == address,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl PrecompileStorageProvider for AccessLogProvider {
+    fn chain_id(&self) -> u64 {
+        self.inner.chain_id()
+    }
+    fn timestamp(&self) -> U256 {
+        self.inner.timestamp()
+    }
+    fn beneficiary(&self) -> Address {
+        self.inner.beneficiary()
+    }
+    fn block_number(&self) -> u64 {
+        self.inner.block_number()
+    }
+    fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
+        self.inner.set_code(address, code)
+    }
+    fn with_account_info(
+        &mut self,
+        address: Address,
+        f: &mut dyn FnMut(&revm::state::AccountInfo),
+    ) -> Result<()> {
+        self.inner.with_account_info(address, f)
+    }
+    fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.accesses.push(StorageAccess::Load(address, key));
+        let cold = self.warm.insert((address, key));
+        self.inner.deduct_gas(if cold { 2_100 } else { 100 })?;
+        self.inner.sload(address, key)
+    }
+    fn tload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.inner.tload(address, key)
+    }
+    fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.accesses.push(StorageAccess::Store(address, key));
+        self.warm.insert((address, key));
+        self.inner.sstore(address, key, value)
+    }
+    fn tstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.inner.tstore(address, key, value)
+    }
+    fn emit_event(&mut self, address: Address, event: LogData) -> Result<()> {
+        self.inner.emit_event(address, event)
+    }
+    fn deduct_gas(&mut self, gas: u64) -> Result<()> {
+        self.inner.deduct_gas(gas)
+    }
+    fn refund_gas(&mut self, gas: i64) {
+        self.inner.refund_gas(gas)
+    }
+    fn gas_used(&self) -> u64 {
+        self.inner.gas_used()
+    }
+    fn gas_refunded(&self) -> i64 {
+        self.inner.gas_refunded()
+    }
+    fn spec(&self) -> TempoHardfork {
+        self.inner.spec()
+    }
+    fn is_static(&self) -> bool {
+        self.inner.is_static()
+    }
+    fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        self.inner.set_tip1060_storage_credits(enabled)
+    }
+    fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        self.inner.set_tip1060_storage_credit_minting(enabled)
+    }
+    fn checkpoint(&mut self) -> JournalCheckpoint {
+        self.inner.checkpoint()
+    }
+    fn checkpoint_commit(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.checkpoint_commit(checkpoint)
+    }
+    fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.checkpoint_revert(checkpoint)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
