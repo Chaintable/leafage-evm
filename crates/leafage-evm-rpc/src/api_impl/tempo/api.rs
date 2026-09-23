@@ -156,6 +156,15 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                 DebankErrorCode::NonceError as i32,
                 self.to_string(),
             ),
+            // The official node maps these through reth EthApiError::EvmCustom.
+            TempoInvalidTransaction::AccessKeyCannotAuthorizeOtherKeys
+            | TempoInvalidTransaction::KeyAuthorizationSignatureRecoveryFailed
+            | TempoInvalidTransaction::KeyAuthorizationNotSignedByRoot { .. }
+            | TempoInvalidTransaction::KeychainValidationFailed { .. }
+            | TempoInvalidTransaction::KeyAuthorizationChainIdMismatch { .. }
+            | TempoInvalidTransaction::CallsValidation(_) => {
+                rpc_error_with_code(-32603, format!("Revm error: {self}"))
+            }
         }
     }
 }
@@ -966,6 +975,34 @@ mod tests {
                 U256::from(42).to_be_bytes::<32>()
             );
         }
+    }
+
+    /// L-6: writer rejects a T3+ access-key call whose first call is CREATE with
+    /// -32603 "Revm error: access-key transactions cannot use CREATE as the first call".
+    #[test]
+    fn review_access_key_create_first_call_returns_official_error() {
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: alloy::primitives::U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            ..Default::default()
+        };
+        let request: CallRequest = serde_json::from_value(serde_json::json!({
+            "from":"0x1111111111111111111111111111111111111111","gas":"0xf4240",
+            "keyId":"0x1111111111111111111111111111111111111112",
+            "calls":[{"data":"0x00"}]
+        }))
+        .unwrap();
+        let db = EmptyDB::default();
+        let tx = api
+            .create_txn_env(&Default::default(), &block, request, db, 4217)
+            .unwrap();
+        let error = api.transact(&block, db, tx).unwrap_err().to_rpc_error();
+        assert_eq!(error.code(), -32603, "{error:?}");
+        assert_eq!(
+            error.message(),
+            "Revm error: access-key transactions cannot use CREATE as the first call"
+        );
     }
 
     #[test]

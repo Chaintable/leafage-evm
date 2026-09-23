@@ -346,11 +346,11 @@ fn review_pre_t5_signed_witness_is_rejected_by_execution() {
         )
         .unwrap();
     let error = api.transact(&block, &db, tx).unwrap_err().to_rpc_error();
-    assert!(
-        error
-            .message()
-            .contains("key authorization witnesses are not active before T5"),
-        "{error:?}"
+    // Writer output on lihe-dev.
+    assert_eq!(error.code(), -32603, "{error:?}");
+    assert_eq!(
+        error.message(),
+        "Revm error: keychain validation failed: key authorization witnesses are not active before T5"
     );
     // The signature-less gas-only shape never reaches the handler check.
     json["keyAuthorization"]
@@ -367,6 +367,75 @@ fn review_pre_t5_signed_witness_is_rejected_by_execution() {
         )
         .unwrap_err();
     assert_eq!(error.code(), -32602);
+}
+
+/// Writer validates a signed key authorization in a fixed order
+/// (handler.rs:1838-2023): root signer, then chain ID, then the T5 witness gate.
+#[test]
+fn review_key_authorization_errors_follow_writer_order() {
+    let root = k256::ecdsa::SigningKey::from_slice(&[1u8; 32]).unwrap();
+    let caller = Address::from_public_key(root.verifying_key());
+    let other = k256::ecdsa::SigningKey::from_slice(&[2u8; 32]).unwrap();
+    let other_address = Address::from_public_key(other.verifying_key());
+    let witness = B256::repeat_byte(0x53);
+    let mut block = block();
+    block.timestamp = U256::from(1_780_000_000u64); // T4
+    let api = tests::review_api();
+    let db = InMemoryDB::default();
+    for (signer, chain_id, expected) in [
+        (
+            &root,
+            1u64,
+            "Revm error: KeyAuthorization chain_id mismatch: expected 4217, got 1".to_string(),
+        ),
+        (
+            &other,
+            1,
+            format!(
+                "Revm error: KeyAuthorization must be signed by root account {caller}, but was signed by {other_address}"
+            ),
+        ),
+    ] {
+        let hash = fp::KeyAuthorization {
+            chain_id,
+            key_type: fp::SignatureType::P256,
+            key_id: DELEGATE,
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: Some(witness),
+            is_admin: false,
+            account: None,
+        }
+        .signature_hash();
+        let signature: Signature = signer
+            .sign_prehash_recoverable(hash.as_slice())
+            .unwrap()
+            .into();
+        let request = json!({
+            "from":caller,"to":DELEGATE,"gas":"0x1e8480",
+            "keyAuthorization":{
+                "chainId":format!("{chain_id:#x}"),"keyType":"p256","keyId":DELEGATE,
+                "witness":witness,
+                "signature":{
+                    "type":"secp256k1","r":signature.r(),"s":signature.s(),
+                    "yParity":if signature.v() { "0x1" } else { "0x0" }
+                }
+            }
+        });
+        let tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                serde_json::from_value(request).unwrap(),
+                &db,
+                4217,
+            )
+            .unwrap();
+        let error = api.transact(&block, &db, tx).unwrap_err().to_rpc_error();
+        assert_eq!(error.code(), -32603, "{error:?}");
+        assert_eq!(error.message(), expected);
+    }
 }
 
 #[test]

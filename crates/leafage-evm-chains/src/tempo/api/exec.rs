@@ -256,23 +256,10 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 && fields.is_keychain
                 && calls.first().is_some_and(|call| call.to.is_create())
             {
-                return Err(EVMError::Custom(
-                    "access-key transactions cannot use CREATE as the first call".into(),
-                ));
-            }
-
-            // Validate time window (ported from writer: handler.rs:1755-1782).
-            let block_ts: u64 = evm.ctx().block.timestamp.saturating_to();
-            validate_time_window(fields.valid_after, fields.valid_before, block_ts)?;
-
-            // Expiring nonce (nonceKey=MAX) requires validBefore to be set.
-            // Ported from writer: handler.rs validate_env expiring nonce check.
-            if evm.ctx().cfg.spec.is_t1()
-                && fields.nonce_key == U256::MAX
-                && fields.valid_before.is_none()
-            {
                 return Err(EVMError::Transaction(
-                    TempoInvalidTransaction::ExpiringNonceMissingValidBefore,
+                    TempoInvalidTransaction::CallsValidation(
+                        "access-key transactions cannot use CREATE as the first call",
+                    ),
                 ));
             }
 
@@ -288,6 +275,23 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             }
             // Outer signatures are mocked for RPC simulation; there are no
             // subblock transactions, and disable_base_fee=true.
+
+            validate_signed_key_authorization(evm)?;
+
+            // Validate time window (ported from writer: handler.rs:1755-1782).
+            let block_ts: u64 = evm.ctx().block.timestamp.saturating_to();
+            validate_time_window(fields.valid_after, fields.valid_before, block_ts)?;
+
+            // Expiring nonce (nonceKey=MAX) requires validBefore to be set.
+            // Ported from writer: handler.rs validate_env expiring nonce check.
+            if evm.ctx().cfg.spec.is_t1()
+                && fields.nonce_key == U256::MAX
+                && fields.valid_before.is_none()
+            {
+                return Err(EVMError::Transaction(
+                    TempoInvalidTransaction::ExpiringNonceMissingValidBefore,
+                ));
+            }
         }
 
         Ok(())
@@ -949,17 +953,178 @@ fn validate_existing_keychain_transaction<DB: Database, INSP>(
     });
     drop(storage);
 
+    // Writer: handler.rs:1324-1340.
     let key = validation.map_err(|error| match error {
         TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
-        error => EVMError::Custom(format!("keychain validation failed: {error}")),
+        error => EVMError::Transaction(TempoInvalidTransaction::KeychainValidationFailed {
+            reason: writer_keychain_error_debug(&error),
+        }),
     })?;
     if requires_admin && !key.is_admin {
-        return Err(EVMError::Custom(
-            "access key cannot authorize another key unless it is an active admin key".into(),
+        return Err(EVMError::Transaction(
+            TempoInvalidTransaction::AccessKeyCannotAuthorizeOtherKeys,
         ));
     }
 
     set_keychain_transaction_key(evm, key_id);
+    Ok(())
+}
+
+/// Formats a keychain validation error like writer's `format!("{e:?}")` on its
+/// typed precompile error, e.g. `AccountKeychainError(KeyNotFound(KeyNotFound))`.
+fn writer_keychain_error_debug(error: &crate::tempo::precompile::TempoPrecompileError) -> String {
+    use crate::tempo::precompile::TempoPrecompileError;
+    use alloy::sol_types::SolInterface;
+    use tempo_contracts::precompiles::AccountKeychainError;
+
+    if let TempoPrecompileError::Revert(data) = error {
+        if let Ok(error) = AccountKeychainError::abi_decode(data) {
+            return format!("AccountKeychainError({error:?})");
+        }
+    }
+    format!("{error:?}")
+}
+
+/// Stateless checks on a signed key authorization, in writer's order and with
+/// its errors (handler.rs:1838-2023, validate_env). Signature-less legacy
+/// gas-only input is not validated.
+fn validate_signed_key_authorization<DB: Database, INSP>(
+    evm: &TempoEvm<DB, INSP>,
+) -> Result<(), TempoEvmError<DB::Error>> {
+    let Some(fields) = evm.ctx().tx.tempo_fields.as_ref() else {
+        return Ok(());
+    };
+    let Some(signed) = fields
+        .key_auth
+        .as_ref()
+        .and_then(|auth| auth.signed_authorization.as_ref())
+    else {
+        return Ok(());
+    };
+    let hardfork = evm.ctx().cfg.spec;
+    let chain_id = evm.ctx().cfg.chain_id;
+    let caller = evm.ctx().tx.base.caller;
+    let authorization = &signed.authorization;
+    let invalid = |reason: &str| {
+        EVMError::Transaction(TempoInvalidTransaction::KeychainValidationFailed {
+            reason: reason.to_string(),
+        })
+    };
+    let recover_signer = || {
+        signed.recover_signer().map_err(|_| {
+            EVMError::Transaction(TempoInvalidTransaction::KeyAuthorizationSignatureRecoveryFailed)
+        })
+    };
+
+    let mut same_tx_auth_use = false;
+    if fields.is_keychain {
+        same_tx_auth_use = fields.key_id == Some(authorization.key_id);
+        if !same_tx_auth_use && !hardfork.is_t6() {
+            return Err(EVMError::Transaction(
+                TempoInvalidTransaction::AccessKeyCannotAuthorizeOtherKeys,
+            ));
+        }
+        if same_tx_auth_use
+            && hardfork.is_t3()
+            && fields.sig_type != signature_type_to_tempo(authorization.key_type)
+        {
+            return Err(invalid(
+                "key authorization key_type does not match the keychain signature type",
+            ));
+        }
+    }
+
+    if (authorization.is_admin || authorization.account.is_some()) && !hardfork.is_t6() {
+        return Err(invalid(
+            "T6 key authorization fields are not active before T6",
+        ));
+    }
+    if hardfork.is_t6()
+        && authorization
+            .account
+            .is_some_and(|account| account != caller)
+    {
+        return Err(invalid(if authorization.is_admin {
+            "admin key authorization account mismatch"
+        } else {
+            "key authorization account mismatch"
+        }));
+    }
+    if authorization.is_admin
+        && (authorization.expiry.is_some()
+            || authorization.limits.is_some()
+            || authorization.allowed_calls.is_some())
+    {
+        return Err(invalid(
+            "admin key authorizations cannot carry expiry, limits, or call scopes",
+        ));
+    }
+
+    if !hardfork.is_t6() {
+        let signer = recover_signer()?;
+        if signer != caller {
+            return Err(EVMError::Transaction(
+                TempoInvalidTransaction::KeyAuthorizationNotSignedByRoot {
+                    expected: caller,
+                    actual: signer,
+                },
+            ));
+        }
+    }
+
+    // T1C+ requires an exact chain ID; before that 0 is a wildcard.
+    if (hardfork.is_t1c() || authorization.chain_id != 0) && authorization.chain_id != chain_id {
+        return Err(EVMError::Transaction(
+            TempoInvalidTransaction::KeyAuthorizationChainIdMismatch {
+                expected: chain_id,
+                got: authorization.chain_id,
+            },
+        ));
+    }
+
+    if authorization.witness.is_some() && !hardfork.is_t5() {
+        return Err(invalid(
+            "key authorization witnesses are not active before T5",
+        ));
+    }
+
+    if !hardfork.is_t3() {
+        if authorization
+            .limits
+            .as_ref()
+            .is_some_and(|limits| limits.iter().any(|limit| limit.period != 0))
+        {
+            return Err(invalid("periodic token limits are not active before T3"));
+        }
+        if authorization.allowed_calls.is_some() {
+            return Err(invalid("call scopes are not active before T3"));
+        }
+    }
+
+    if hardfork.is_t6() {
+        let signer = recover_signer()?;
+        if signer != caller && authorization.account.is_none() {
+            return Err(invalid("admin-signed key authorization account mismatch"));
+        }
+        if signer == caller && fields.is_keychain && !same_tx_auth_use {
+            return Err(invalid(
+                "root-signed key authorization must use root transaction signature",
+            ));
+        }
+        if signer != caller {
+            if !fields.is_keychain || fields.key_id != Some(signer) {
+                return Err(invalid(
+                    "admin-signed key authorization must be signed by transaction key",
+                ));
+            }
+            if signature_type_to_tempo(signed.signature.signature_type()) != fields.sig_type {
+                return Err(invalid(
+                    "admin-signed key authorization signature type does not match transaction key signature type",
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -993,9 +1158,9 @@ fn set_keychain_transaction_key<DB: Database, INSP>(
     );
 }
 
-/// Validates and applies a complete signed key authorization carried by an AA
-/// RPC simulation. Signature-less legacy objects remain gas-only and are
-/// intentionally ignored here.
+/// Applies a complete signed key authorization carried by an AA RPC simulation.
+/// Its stateless checks run earlier in `validate_signed_key_authorization`.
+/// Signature-less legacy objects remain gas-only and are intentionally ignored here.
 fn apply_signed_key_authorization<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
     mut init_gas: Option<&mut InitialAndFloorGas>,
@@ -1006,23 +1171,12 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
         LeafageStorageProvider, PrecompileStorageProvider, StorageCtx, TempoPrecompileError,
     };
 
-    let Some((signed, transaction_key, transaction_sig_type, is_keychain)) = evm
+    let Some(signed) = evm
         .ctx()
         .tx
         .tempo_fields
         .as_ref()
-        .and_then(|fields| {
-            Some((
-                fields
-                    .key_auth
-                    .as_ref()?
-                    .signed_authorization
-                    .clone()?,
-                fields.key_id,
-                fields.sig_type,
-                fields.is_keychain,
-            ))
-        })
+        .and_then(|fields| fields.key_auth.as_ref()?.signed_authorization.clone())
     else {
         return Ok(());
     };
@@ -1032,105 +1186,10 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
     let caller = evm.ctx().tx.base.caller;
     let timestamp = evm.ctx().block.timestamp.saturating_to::<u64>();
     let authorization = &signed.authorization;
-    let same_tx_auth_use = transaction_key == Some(authorization.key_id);
-
-    if hardfork.is_t1c() {
-        if authorization.chain_id != chain_id {
-            return Err(EVMError::Custom(format!(
-                "key authorization chainId mismatch: expected {chain_id}, got {}",
-                authorization.chain_id
-            )));
-        }
-    } else if authorization.chain_id != 0 && authorization.chain_id != chain_id {
-        return Err(EVMError::Custom(format!(
-            "key authorization chainId mismatch: expected 0 or {chain_id}, got {}",
-            authorization.chain_id
-        )));
-    }
-
-    if (authorization.is_admin || authorization.account.is_some()) && !hardfork.is_t6() {
-        return Err(EVMError::Custom(
-            "T6 key authorization fields are not active before T6".into(),
-        ));
-    }
-    if authorization.account.is_some_and(|account| account != caller) {
-        return Err(EVMError::Custom(
-            "key authorization account does not match transaction caller".into(),
-        ));
-    }
-    if authorization.is_admin
-        && (authorization.expiry.is_some()
-            || authorization.limits.is_some()
-            || authorization.allowed_calls.is_some())
-    {
-        return Err(EVMError::Custom(
-            "admin key authorization cannot carry expiry, limits, or call scopes".into(),
-        ));
-    }
-    if authorization.witness.is_some() && !hardfork.is_t5() {
-        return Err(EVMError::Custom(
-            "key authorization witnesses are not active before T5".into(),
-        ));
-    }
-    if !hardfork.is_t3()
-        && (authorization.allowed_calls.is_some()
-            || authorization
-                .limits
-                .as_ref()
-                .is_some_and(|limits| limits.iter().any(|limit| limit.period != 0)))
-    {
-        return Err(EVMError::Custom(
-            "periodic limits and call scopes are not active before T3".into(),
-        ));
-    }
-
-    let signer = signed.recover_signer().map_err(|error| {
-        EVMError::Custom(format!("key authorization signature recovery failed: {error}"))
+    let signer = signed.recover_signer().map_err(|_| {
+        EVMError::Transaction(TempoInvalidTransaction::KeyAuthorizationSignatureRecoveryFailed)
     })?;
-    if !hardfork.is_t6() && signer != caller {
-        return Err(EVMError::Custom(format!(
-            "key authorization is not signed by root account {caller}"
-        )));
-    }
-    if is_keychain && !same_tx_auth_use && !hardfork.is_t6() {
-        return Err(EVMError::Custom(
-            "access key cannot authorize a different key before T6".into(),
-        ));
-    }
-    if same_tx_auth_use
-        && hardfork.is_t3()
-        && transaction_sig_type != signature_type_to_tempo(authorization.key_type)
-    {
-        return Err(EVMError::Custom(
-            "same-transaction key signature type does not match key authorization".into(),
-        ));
-    }
-
     let authorization_sig_type = signed.signature.signature_type();
-    if hardfork.is_t6() {
-        if signer != caller {
-            if authorization.account.is_none() {
-                return Err(EVMError::Custom(
-                    "admin-signed key authorization must bind the target account".into(),
-                ));
-            }
-            if transaction_key != Some(signer) {
-                return Err(EVMError::Custom(
-                    "admin-signed key authorization must be signed by transaction key".into(),
-                ));
-            }
-            if transaction_sig_type != signature_type_to_tempo(authorization_sig_type) {
-                return Err(EVMError::Custom(
-                    "admin authorization signature type does not match transaction key"
-                        .into(),
-                ));
-            }
-        } else if is_keychain && !same_tx_auth_use {
-            return Err(EVMError::Custom(
-                "root-signed key authorization must use root transaction signature".into(),
-            ));
-        }
-    }
 
     let signature_type = match authorization.key_type {
         SignatureType::Secp256k1 => IAccountKeychain::SignatureType::Secp256k1,
@@ -2373,10 +2432,12 @@ mod tests {
             });
             let result = apply_signed_key_authorization(&mut evm, None);
             if high {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("signature recovery failed"));
+                assert!(matches!(
+                    result,
+                    Err(EVMError::Transaction(
+                        TempoInvalidTransaction::KeyAuthorizationSignatureRecoveryFailed
+                    ))
+                ));
                 assert_eq!(key_status(&mut evm, root, key), (false, false));
             } else {
                 result.unwrap();
@@ -3738,6 +3799,168 @@ mod tests {
 
     /// Writer rejects a keychain-signed T3+ tx whose first call is CREATE in
     /// validate_env, before any pre-execution state change.
+    /// Writer validates a signed key authorization in validate_env in a fixed
+    /// order with its own error variants (handler.rs:1838-2023).
+    #[test]
+    fn signed_key_authorization_errors_follow_writer_order() {
+        use crate::tempo::fee_payer::{KeyAuthorization, SignatureType, TokenLimit};
+        use crate::tempo::tx::{TempoCall, TempoKeyAuthGas};
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+        use revm::primitives::{TxKind, B256};
+
+        let root_key = SigningKey::random(&mut OsRng);
+        let root = p256_address(&root_key);
+        let other_key = SigningKey::random(&mut OsRng);
+        let other = p256_address(&other_key);
+        let base = KeyAuthorization {
+            chain_id: 4217,
+            key_type: SignatureType::P256,
+            key_id: Address::repeat_byte(0x42),
+            expiry: None,
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let invalid = |reason: &str| TempoInvalidTransaction::KeychainValidationFailed {
+            reason: reason.to_string(),
+        };
+        let cases = [
+            // Access key authorizing another key: before the chain ID.
+            (
+                TempoHardfork::T4,
+                Some(other),
+                KeyAuthorization {
+                    chain_id: 1,
+                    ..base.clone()
+                },
+                &root_key,
+                TempoInvalidTransaction::AccessKeyCannotAuthorizeOtherKeys,
+            ),
+            // T6-only fields: before the root signature.
+            (
+                TempoHardfork::T4,
+                None,
+                KeyAuthorization {
+                    is_admin: true,
+                    ..base.clone()
+                },
+                &other_key,
+                invalid("T6 key authorization fields are not active before T6"),
+            ),
+            // Root signature: before the chain ID and the witness gate.
+            (
+                TempoHardfork::T4,
+                None,
+                KeyAuthorization {
+                    chain_id: 1,
+                    witness: Some(B256::ZERO),
+                    ..base.clone()
+                },
+                &other_key,
+                TempoInvalidTransaction::KeyAuthorizationNotSignedByRoot {
+                    expected: root,
+                    actual: other,
+                },
+            ),
+            // Chain ID: before the witness gate.
+            (
+                TempoHardfork::T4,
+                None,
+                KeyAuthorization {
+                    chain_id: 1,
+                    witness: Some(B256::ZERO),
+                    ..base.clone()
+                },
+                &root_key,
+                TempoInvalidTransaction::KeyAuthorizationChainIdMismatch {
+                    expected: 4217,
+                    got: 1,
+                },
+            ),
+            // Witness: before the T3 gates.
+            (
+                TempoHardfork::T2,
+                None,
+                KeyAuthorization {
+                    witness: Some(B256::ZERO),
+                    allowed_calls: Some(vec![]),
+                    ..base.clone()
+                },
+                &root_key,
+                invalid("key authorization witnesses are not active before T5"),
+            ),
+            // Periodic limits: before call scopes.
+            (
+                TempoHardfork::T2,
+                None,
+                KeyAuthorization {
+                    limits: Some(vec![TokenLimit {
+                        token: Address::ZERO,
+                        limit: U256::ONE,
+                        period: 1,
+                    }]),
+                    allowed_calls: Some(vec![]),
+                    ..base.clone()
+                },
+                &root_key,
+                invalid("periodic token limits are not active before T3"),
+            ),
+            (
+                TempoHardfork::T6,
+                None,
+                KeyAuthorization {
+                    account: Some(other),
+                    ..base.clone()
+                },
+                &root_key,
+                invalid("key authorization account mismatch"),
+            ),
+        ];
+        for (spec, tx_key, authorization, signer, expected) in cases {
+            let mut tx = make_aa_tx_for_validate(vec![TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                ..Default::default()
+            }]);
+            tx.base.caller = root;
+            let fields = tx.tempo_fields.as_mut().unwrap();
+            fields.sig_type = TempoSigType::P256;
+            fields.is_keychain = tx_key.is_some();
+            fields.key_id = tx_key;
+            fields.key_auth = Some(TempoKeyAuthGas {
+                signed_authorization: Some(sign_key_authorization(authorization, signer)),
+                ..Default::default()
+            });
+            let mut evm = make_evm_with_spec(spec);
+            evm.inner.ctx.tx = tx;
+            match TempoHandler::<EmptyDB, NoOpInspector>::new().validate_env(&mut evm) {
+                Err(EVMError::Transaction(error)) => assert_eq!(error, expected, "{spec:?}"),
+                other => panic!("{spec:?}: expected {expected:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Writer reports an existing access key failure as
+    /// KeychainValidationFailed { reason: format!("{e:?}") } (handler.rs:1331-1333).
+    #[test]
+    fn existing_keychain_failure_uses_writer_reason() {
+        let mut evm = make_cached_evm_with_spec(TempoHardfork::T6);
+        evm.inner.ctx.tx.base.caller = Address::repeat_byte(0x11);
+        evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+            is_keychain: true,
+            key_id: Some(Address::repeat_byte(0x42)),
+            ..Default::default()
+        });
+        match validate_existing_keychain_transaction(&mut evm) {
+            Err(EVMError::Transaction(TempoInvalidTransaction::KeychainValidationFailed {
+                reason,
+            })) => assert_eq!(reason, "AccountKeychainError(KeyNotFound(KeyNotFound))"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn t3_validate_env_rejects_access_key_create_first_call() {
         use crate::tempo::tx::TempoCall;
@@ -3763,8 +3986,11 @@ mod tests {
                 assert!(
                     matches!(
                         &result,
-                        Err(EVMError::Custom(reason))
-                            if reason == "access-key transactions cannot use CREATE as the first call"
+                        Err(EVMError::Transaction(
+                            TempoInvalidTransaction::CallsValidation(
+                                "access-key transactions cannot use CREATE as the first call"
+                            )
+                        ))
                     ),
                     "{spec:?}: {result:?}"
                 );

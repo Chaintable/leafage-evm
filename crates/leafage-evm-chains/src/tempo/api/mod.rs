@@ -101,6 +101,18 @@ pub enum TempoInvalidTransaction {
     ExpiringNonceMissingValidBefore,
     /// Expiring nonce transaction used a non-zero transaction nonce.
     ExpiringNonceNonceNotZero,
+    /// A non-admin access key tried to authorize a different key.
+    AccessKeyCannotAuthorizeOtherKeys,
+    /// Recovering the signer of a key authorization failed.
+    KeyAuthorizationSignatureRecoveryFailed,
+    /// A pre-T6 key authorization was not signed by the transaction caller.
+    KeyAuthorizationNotSignedByRoot { expected: Address, actual: Address },
+    /// Keychain or key-authorization validation failed.
+    KeychainValidationFailed { reason: String },
+    /// The key authorization chain ID does not match the current chain.
+    KeyAuthorizationChainIdMismatch { expected: u64, got: u64 },
+    /// Tempo transaction call-list validation failed.
+    CallsValidation(&'static str),
 }
 
 impl From<revm::context::result::InvalidTransaction> for TempoInvalidTransaction {
@@ -128,6 +140,25 @@ impl core::fmt::Display for TempoInvalidTransaction {
             Self::ExpiringNonceNonceNotZero => {
                 f.write_str("expiring nonce transaction must have nonce == 0")
             }
+            // Display strings match writer crates/revm/src/error.rs.
+            Self::AccessKeyCannotAuthorizeOtherKeys => f.write_str(
+                "access keys cannot authorize other keys, only the root key can authorize new keys",
+            ),
+            Self::KeyAuthorizationSignatureRecoveryFailed => {
+                f.write_str("failed to recover signer from KeyAuthorization signature")
+            }
+            Self::KeyAuthorizationNotSignedByRoot { expected, actual } => write!(
+                f,
+                "KeyAuthorization must be signed by root account {expected}, but was signed by {actual}"
+            ),
+            Self::KeychainValidationFailed { reason } => {
+                write!(f, "keychain validation failed: {reason}")
+            }
+            Self::KeyAuthorizationChainIdMismatch { expected, got } => write!(
+                f,
+                "KeyAuthorization chain_id mismatch: expected {expected}, got {got}"
+            ),
+            Self::CallsValidation(reason) => f.write_str(reason),
         }
     }
 }
