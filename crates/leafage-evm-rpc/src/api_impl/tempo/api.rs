@@ -683,27 +683,20 @@ where
         // Pipeline may not sync this code change, so we inject it on every T2+ call.
         let ts: u64 = block_env.timestamp.saturating_to();
         if TempoHardfork::from_timestamp(ts).is_t2() {
-            let has_code = state
+            let info = state
                 .basic_ref(VALIDATOR_CONFIG_V2_ADDRESS)
-                .ok()
-                .flatten()
-                .map(|acc| !acc.is_empty_code_hash())
-                .unwrap_or(false);
-            if !has_code {
-                use revm::state::{Account, AccountInfo, AccountStatus};
+                .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                .unwrap_or_default();
+            if info.is_empty_code_hash() {
                 use revm::bytecode::Bytecode;
+                use revm::state::Account;
+                // Like writer's deploy_precompile_at_boundary: keep the account info
+                // and storage, install the marker and only touch the account.
                 let code = Bytecode::new_legacy(alloy::primitives::Bytes::from_static(&[0xef]));
-                let mut acc = Account {
-                    info: AccountInfo {
-                        code_hash: code.hash_slow(),
-                        code: Some(code),
-                        nonce: 1,
-                        ..Default::default()
-                    },
-                    status: AccountStatus::Touched,
-                    ..Default::default()
-                };
-                acc.mark_created();
+                let mut acc = Account::from(info);
+                acc.info.code_hash = code.hash_slow();
+                acc.info.code = Some(code);
+                acc.mark_touch();
                 let mut changes = revm::state::EvmState::default();
                 changes.insert(VALIDATOR_CONFIG_V2_ADDRESS, acc);
                 state.commit(changes);
@@ -1136,6 +1129,46 @@ mod tests {
             acc.code.as_ref().map(|c| c.original_byte_slice()),
             Some(&[0xef][..]),
             "VCV2 code should be 0xef"
+        );
+    }
+
+    #[test]
+    fn vcv2_marker_injection_keeps_existing_account_and_storage() {
+        use revm::database::{in_memory_db::CacheDB, InMemoryDB};
+        use revm::primitives::U256;
+        use revm::state::AccountInfo;
+
+        let slot = U256::from(1);
+        let mut inner = InMemoryDB::default();
+        inner.insert_account_info(
+            VALIDATOR_CONFIG_V2_ADDRESS,
+            AccountInfo {
+                nonce: 3,
+                ..Default::default()
+            },
+        );
+        inner
+            .insert_account_storage(VALIDATOR_CONFIG_V2_ADDRESS, slot, U256::from(42))
+            .unwrap();
+        let mut db = CacheDB::new(inner);
+        let block = BlockEnv {
+            timestamp: U256::from(1_774_965_700u64), // T2+
+            ..Default::default()
+        };
+        review_api()
+            .apply_pre_execution_changes(alloy::consensus::Header::default(), &block, &mut db)
+            .unwrap();
+
+        let info = db.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap().unwrap();
+        assert_eq!(
+            info.code.as_ref().map(|c| c.original_byte_slice()),
+            Some(&[0xef][..])
+        );
+        assert_eq!(info.nonce, 3, "nonce should be preserved");
+        assert_eq!(
+            db.storage_ref(VALIDATOR_CONFIG_V2_ADDRESS, slot).unwrap(),
+            U256::from(42),
+            "storage should survive the marker injection"
         );
     }
 
