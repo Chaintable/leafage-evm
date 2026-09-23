@@ -16,10 +16,11 @@
 //! |  4   | token_transfer_policies | Mapping<Address, TokenTransferPolicy> (T9+) |
 
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::super::address::TempoAddressExt;
+use super::super::hardfork::TempoHardfork;
 use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
 use super::storage::{ContractStorage, ContractStorageReader, StorageCtx};
@@ -28,7 +29,7 @@ use super::tip20::TIP20Token;
 use super::tip20_factory::TIP20Factory;
 use super::{
     Precompile, RECEIVE_POLICY_GUARD_ADDRESS, TIP403_REGISTRY_ADDRESS, dispatch_call, input_cost,
-    mutate, mutate_void, unknown_selector, view,
+    mutate, mutate_void, view,
 };
 
 // ===========================================================================
@@ -1262,19 +1263,46 @@ pub fn is_policy_lookup_error(e: &TempoPrecompileError) -> bool {
 // Dispatch
 // ===========================================================================
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `tip403_registry/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
+    (
+        ITIP403Registry::tokenTransferPolicyIdCall::SELECTOR,
+        TempoHardfork::T9,
+    ),
+    (
+        ITIP403Registry::receivePolicyCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ITIP403Registry::validateReceivePolicyCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ITIP403Registry::setReceivePolicyCall::SELECTOR,
+        TempoHardfork::T6,
+    ),
+    (
+        ITIP403Registry::migrateTransferPolicyIdsCall::SELECTOR,
+        TempoHardfork::T9,
+    ),
+];
+
 impl Precompile for TIP403Registry {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
-        let selector = calldata
-            .get(..4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .unwrap_or_default();
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            ITIP403Registry::ITIP403RegistryCalls::valid_selector,
+            |selector| {
+                ITIP403Registry::ITIP403RegistryCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 ITIP403Registry::ITIP403RegistryCalls::abi_decode_with_config(
                     data,
@@ -1289,9 +1317,6 @@ impl Precompile for TIP403Registry {
                     view(call, |c| self.policy_exists(c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::tokenTransferPolicyId(call) => {
-                    if !self.storage.spec().is_t9() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| self.token_transfer_policy_id(c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::policyData(call) => {
@@ -1320,15 +1345,9 @@ impl Precompile for TIP403Registry {
                     view(call, |c| self.compound_policy_data(c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::receivePolicy(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| self.receive_policy(c.account))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::validateReceivePolicy(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     view(call, |c| {
                         let blocked = self
                             .validate_receive_policy(c.token, c.sender, c.receiver)?
@@ -1361,15 +1380,9 @@ impl Precompile for TIP403Registry {
                     mutate(call, msg_sender, |s, c| self.create_compound_policy(s, c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::setReceivePolicy(call) => {
-                    if !self.storage.spec().is_t6() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate_void(call, msg_sender, |s, c| self.set_receive_policy(s, c))
                 }
                 ITIP403Registry::ITIP403RegistryCalls::migrateTransferPolicyIds(call) => {
-                    if !self.storage.spec().is_t9() {
-                        return unknown_selector(selector, self.storage.gas_used());
-                    }
                     mutate(call, msg_sender, |_, c| self.migrate_transfer_policy_ids(c))
                 }
             },
@@ -1835,5 +1848,47 @@ mod tests {
             error.selector,
             FixedBytes::new(ITIP403Registry::receivePolicyCall::SELECTOR)
         );
+    }
+
+    #[test]
+    fn scheduled_selectors_reject_malformed_calldata_before_activation() {
+        for (selector, spec) in [
+            (
+                ITIP403Registry::receivePolicyCall::SELECTOR,
+                TempoHardfork::T5,
+            ),
+            (
+                ITIP403Registry::validateReceivePolicyCall::SELECTOR,
+                TempoHardfork::T5,
+            ),
+            (
+                ITIP403Registry::setReceivePolicyCall::SELECTOR,
+                TempoHardfork::T5,
+            ),
+            (
+                ITIP403Registry::tokenTransferPolicyIdCall::SELECTOR,
+                TempoHardfork::T8,
+            ),
+            (
+                ITIP403Registry::migrateTransferPolicyIdsCall::SELECTOR,
+                TempoHardfork::T8,
+            ),
+        ] {
+            let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+            let mut provider = TestStorageProvider::new(spec);
+            let output = StorageCtx::enter(&mut provider, || {
+                TIP403Registry::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                UnknownFunctionSelector {
+                    selector: FixedBytes::new(selector),
+                }
+                .abi_encode(),
+                "{spec:?}"
+            );
+        }
     }
 }

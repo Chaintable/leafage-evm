@@ -28,7 +28,7 @@
 //! View methods (balance_of, get_order, quote_swap_*) work correctly against on-chain state.
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 use std::{
     collections::HashSet,
@@ -48,8 +48,9 @@ use super::tip20_factory::TIP20Factory;
 use super::tip403_registry::{AuthRole, TIP403Registry, is_policy_lookup_error};
 use super::{
     PATH_USD_ADDRESS, Precompile, STABLECOIN_DEX_ADDRESS, dispatch_call, input_cost, mutate,
-    mutate_void, unknown_selector, view,
+    mutate_void, view,
 };
+use crate::tempo::hardfork::TempoHardfork;
 
 // ===========================================================================
 // Constants
@@ -2874,15 +2875,42 @@ impl ContractStorage for StablecoinDEX {
 // Dispatch
 // ===========================================================================
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `stablecoin_dex/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
+    (
+        IStablecoinDEX::storageCreditsCall::SELECTOR,
+        TempoHardfork::T7,
+    ),
+    (
+        IStablecoinDEX::bookIndexForKeyCall::SELECTOR,
+        TempoHardfork::T8,
+    ),
+    (
+        IStablecoinDEX::bookKeyForIndexCall::SELECTOR,
+        TempoHardfork::T8,
+    ),
+    (
+        IStablecoinDEX::setBookIndexCall::SELECTOR,
+        TempoHardfork::T8,
+    ),
+];
+
 impl Precompile for StablecoinDEX {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         self.storage
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            IStablecoinDEX::IStablecoinDEXCalls::valid_selector,
+            |selector| {
+                IStablecoinDEX::IStablecoinDEXCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 IStablecoinDEX::IStablecoinDEXCalls::abi_decode_with_config(
                     data,
@@ -2906,38 +2934,20 @@ impl Precompile for StablecoinDEX {
                     view(call, |c| self.balance_of(c.user, c.token))
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::storageCredits(call) => {
-                    if !self.storage.spec().is_t7() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        view(call, |c| self.storage_credits(c.user))
-                    }
+                    view(call, |c| self.storage_credits(c.user))
                 }
-                IStablecoinDEX::IStablecoinDEXCalls::bookIndexForKey(call) => {
-                    if !self.storage.spec().is_t8() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        view(call, |c| {
-                            let index = self.book_key_index(c.bookKey)?;
-                            Ok((index.is_some(), index.unwrap_or(*BookId::UNSET)).into())
-                        })
-                    }
-                }
+                IStablecoinDEX::IStablecoinDEXCalls::bookIndexForKey(call) => view(call, |c| {
+                    let index = self.book_key_index(c.bookKey)?;
+                    Ok((index.is_some(), index.unwrap_or(*BookId::UNSET)).into())
+                }),
                 IStablecoinDEX::IStablecoinDEXCalls::bookKeyForIndex(call) => {
-                    if !self.storage.spec().is_t8() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        view(call, |c| self.book_key_for_index(c.index))
-                    }
+                    view(call, |c| self.book_key_for_index(c.index))
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::setBookIndex(call) => {
-                    if !self.storage.spec().is_t8() {
-                        unknown_selector(calldata[..4].try_into().unwrap(), 0)
-                    } else {
-                        mutate_void(call, msg_sender, |_, c| {
-                            self.preserve_storage_credits()?;
-                            self.set_book_index(c.index)
-                        })
-                    }
+                    mutate_void(call, msg_sender, |_, c| {
+                        self.preserve_storage_credits()?;
+                        self.set_book_index(c.index)
+                    })
                 }
                 IStablecoinDEX::IStablecoinDEXCalls::getOrder(call) => view(call, |c| {
                     let order = self.get_order(c.orderId)?;
@@ -4243,6 +4253,44 @@ mod tests {
                     .inner
                     .storage(STABLECOIN_DEX_ADDRESS, U256::from(3)),
                 U256::from(2)
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_selectors_reject_malformed_calldata_before_activation() {
+        for (selector, spec) in [
+            (
+                IStablecoinDEX::storageCreditsCall::SELECTOR,
+                TempoHardfork::T6,
+            ),
+            (
+                IStablecoinDEX::bookIndexForKeyCall::SELECTOR,
+                TempoHardfork::T7,
+            ),
+            (
+                IStablecoinDEX::bookKeyForIndexCall::SELECTOR,
+                TempoHardfork::T7,
+            ),
+            (
+                IStablecoinDEX::setBookIndexCall::SELECTOR,
+                TempoHardfork::T7,
+            ),
+        ] {
+            let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+            let mut provider = TestStorageProvider::new(spec);
+            let output = StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().call(&calldata, Address::ZERO)
+            })
+            .unwrap();
+            assert!(output.reverted);
+            assert_eq!(
+                output.bytes.as_ref(),
+                super::super::UnknownFunctionSelector {
+                    selector: FixedBytes::new(selector),
+                }
+                .abi_encode(),
+                "{spec:?}"
             );
         }
     }

@@ -275,6 +275,13 @@ impl ContractStorage for AddressRegistry {
 // Dispatch
 // ===========================================================================
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `address_registry/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[(
+    IAddressRegistry::isImplicitlyApprovedCall::SELECTOR,
+    TempoHardfork::T5,
+)];
+
 impl Precompile for AddressRegistry {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         // Defense in depth — registration also gates on spec.is_t3(), but reject
@@ -292,9 +299,15 @@ impl Precompile for AddressRegistry {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            IAddressRegistry::IAddressRegistryCalls::valid_selector,
+            |selector| {
+                IAddressRegistry::IAddressRegistryCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 IAddressRegistry::IAddressRegistryCalls::abi_decode_with_config(
                     data,
@@ -333,12 +346,6 @@ impl Precompile for AddressRegistry {
                     })
                 }
                 IAddressRegistry::IAddressRegistryCalls::isImplicitlyApproved(c) => {
-                    if !self.storage.spec().is_t5() {
-                        return unknown_selector(
-                            IAddressRegistry::isImplicitlyApprovedCall::SELECTOR,
-                            self.storage.gas_used(),
-                        );
-                    }
                     view(c, |c| Ok(self.is_implicitly_approved(c.addr)))
                 }
             },
@@ -527,5 +534,24 @@ mod tests {
         .unwrap();
         assert!(!t5.reverted);
         assert!(bool::abi_decode(&t5.bytes).unwrap());
+    }
+
+    #[test]
+    fn implicit_approval_selector_rejects_malformed_calldata_before_t5() {
+        let selector = IAddressRegistry::isImplicitlyApprovedCall::SELECTOR;
+        let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T4);
+        let output = StorageCtx::enter(&mut provider, || {
+            AddressRegistry::new().call(&calldata, Address::ZERO)
+        })
+        .unwrap();
+        assert!(output.reverted);
+        assert_eq!(
+            output.bytes.as_ref(),
+            super::super::UnknownFunctionSelector {
+                selector: selector.into(),
+            }
+            .abi_encode()
+        );
     }
 }

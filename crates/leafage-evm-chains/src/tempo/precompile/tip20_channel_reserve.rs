@@ -19,6 +19,7 @@ use super::{
     TIP20_CHANNEL_RESERVE_ADDRESS,
 };
 use crate::tempo::address::TempoAddressExt;
+use crate::tempo::hardfork::TempoHardfork;
 
 pub const CLOSE_GRACE_PERIOD: u64 = 15 * 60;
 const MAINNET_CHAIN_ID: u64 = 4217;
@@ -681,6 +682,13 @@ impl ContractStorage for TIP20ChannelReserve {
     }
 }
 
+/// Selectors gated by `#[schedule(since = ...)]` in official `tip20_channel_reserve/dispatch.rs`.
+/// Checked before ABI decode, so they return `UnknownFunctionSelector` before activation.
+const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[(
+    ITIP20ChannelReserve::storageCreditsCall::SELECTOR,
+    TempoHardfork::T7,
+)];
+
 impl Precompile for TIP20ChannelReserve {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
         if !self.storage.spec().is_t5() {
@@ -694,9 +702,15 @@ impl Precompile for TIP20ChannelReserve {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
+        let spec = self.storage.spec();
         dispatch_call(
             calldata,
-            ITIP20ChannelReserve::ITIP20ChannelReserveCalls::valid_selector,
+            |selector| {
+                ITIP20ChannelReserve::ITIP20ChannelReserveCalls::valid_selector(selector)
+                    && SCHEDULED_SELECTORS
+                        .iter()
+                        .all(|&(gated, since)| gated != selector || spec >= since)
+            },
             |data| {
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::abi_decode_with_config(
                     data,
@@ -767,12 +781,6 @@ impl Precompile for TIP20ChannelReserve {
                     view(call, |_| self.domain_separator())
                 }
                 ITIP20ChannelReserve::ITIP20ChannelReserveCalls::storageCredits(call) => {
-                    if !self.storage.spec().is_t7() {
-                        return unknown_selector(
-                            ITIP20ChannelReserve::storageCreditsCall::SELECTOR,
-                            self.storage.gas_used(),
-                        );
-                    }
                     view(call, |call| self.storage_credits(call.payer))
                 }
             },
@@ -1074,5 +1082,24 @@ mod tests {
             Result::<()>::Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn storage_credits_selector_rejects_malformed_calldata_before_t7() {
+        let selector = ITIP20ChannelReserve::storageCreditsCall::SELECTOR;
+        let calldata = [selector.as_slice(), &[0xff; 10]].concat();
+        let mut provider = TestStorageProvider::new(TempoHardfork::T6);
+        let output = StorageCtx::enter(&mut provider, || {
+            TIP20ChannelReserve::new().call(&calldata, Address::ZERO)
+        })
+        .unwrap();
+        assert!(output.reverted);
+        assert_eq!(
+            output.bytes.as_ref(),
+            super::super::UnknownFunctionSelector {
+                selector: selector.into(),
+            }
+            .abi_encode()
+        );
     }
 }
