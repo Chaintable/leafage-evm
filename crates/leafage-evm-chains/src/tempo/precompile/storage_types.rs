@@ -2093,6 +2093,7 @@ mod tests {
 
     /// Element large enough that `Vec::with_capacity(u32::MAX)` exceeds any address
     /// space (~512 TiB), so pre-allocating from the stored length aborts the process.
+    #[allow(dead_code)] // the payload only sets the element size
     struct HugeElement([u8; 128 * 1024]);
 
     impl StorableType for HugeElement {
