@@ -61,7 +61,7 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
+    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode.
     ///
     /// # Example
     /// --evm-type=cosmos

@@ -49,6 +49,12 @@ def main():
         record(name, height, ok, reference=reference, actual=actual)
         return reference.get('result')
 
+    def compare_revert(name, height, params):
+        reference = rpc(args.classic, 'eth_call', params)
+        actual = rpc(args.leafage, 'eth_call', params)
+        ok = 'revert' in reference.get('error', {}).get('message', '').lower() and 'revert' in actual.get('error', {}).get('message', '').lower()
+        record(name, height, ok, reference=reference, actual=actual)
+
     def rejected(name, height, method, params):
         actual = rpc(args.leafage, method, params)
         record(name, height, 'Arbitrum Classic:' in actual.get('error', {}).get('message', ''), actual=actual)
@@ -95,6 +101,60 @@ def main():
 
         for selector in ['f8b2cb4f', '7e105ce2']:
             compare('arbinfo:' + selector, height, 'eth_call', [dict(to=ARBINFO, data='0x' + selector + TOKENS[0][2:].zfill(64)), block])
+
+        # Independent probes suggested by review, checked against real Classic.
+        synthetic = [
+            ('msize.mload', '600051505960005260206000f3'),
+            ('msize.sha3', '6020600020505960005260206000f3'),
+            ('msize.log', '60206000a05960005260206000f3'),
+            ('msize.mstore', '60006000525960005260206000f3'),
+            ('msize.mstore8', '60016020535960005260206000f3'),
+            ('msize.calldatacopy', '600160006020375960005260206000f3'),
+            ('msize.codecopy', '600160006020395960005260206000f3'),
+            ('msize.empty_call', '6020608060006000600060ee5af1505960005260206000f3'),
+        ]
+        huge = '68010000000000000000'
+        for name, opcode in [('calldatacopy', '37'), ('codecopy', '39'), ('returndatacopy.none', '3e')]:
+            synthetic.append(('copy.huge.' + name, '60ff6000536001' + huge + '6000' + opcode + '60206000f3'))
+        synthetic.append(('copy.huge.returndatacopy.empty', '60ff6000536000600060006000600060ee5af1506001' + huge + '60003e60206000f3'))
+        identity = '60016000536001600060016000600060045af150'
+        for address in [0x64, 0x65, 0x70, 0xc8]:
+            for opcode, value in [('f4', ''), ('f2', '6000')]:
+                call = '6000600060006000' + value + f'60{address:02x}5a' + opcode
+                synthetic.append((f'reserved.{address}.{opcode}', call + '60005260206000f3'))
+                synthetic.append((f'return_data.reserved.{address}.{opcode}', identity + call + '503d60005260206000f3'))
+        for name, code in synthetic:
+            compare(name, height, 'eth_call', [dict(to=PROBE, gas='0x989680'), block, {PROBE: dict(code='0x' + code)}])
+        for address in [CHILD, '0x' + format(1, '040x'), '0x' + format(9, '040x')]:
+            code = identity + '6000600060006000606573' + address[2:] + '5af1503d60005260206000f3'
+            overrides = {PROBE: dict(code='0x' + code, balance='0x64')}
+            if address == CHILD:
+                overrides[CHILD] = dict(code='0x00')
+            compare('return_data.insufficient_balance.' + address, height, 'eth_call', [dict(to=PROBE), block, overrides])
+        for empty_contract in [False, True]:
+            code = identity + '6000600060006000606573' + CHILD[2:] + '5af1503d60005260206000f3'
+            overrides = {PROBE: dict(code='0x' + code, balance='0x64')}
+            if empty_contract:
+                overrides[CHILD] = dict(code='0x')
+            rejected('unsupported.insufficient_balance.empty_contract=' + str(empty_contract), height, 'eth_call', [dict(to=PROBE), block, overrides])
+
+        for size in [0, 127, 128, 129]:
+            params = [dict(to='0x' + format(1, '040x'), data='0x' + '00' * size), block]
+            if size == 128:
+                compare('ecrecover.' + str(size), height, 'eth_call', params)
+            else:
+                compare_revert('ecrecover.' + str(size), height, params)
+        for size in [1, 191, 192, 193, 30 * 192, 31 * 192]:
+            params = [dict(to='0x' + format(8, '040x'), data='0x' + '00' * size, gas='0x989680'), block]
+            if size < 31 * 192:
+                compare('pairing.' + str(size), height, 'eth_call', params)
+            else:
+                compare_revert('pairing.' + str(size), height, params)
+        compare_revert('blake2.round_limit', height, [dict(to='0x' + format(9, '040x'), data='0x00010000' + '00' * 209), block])
+        compare_revert('arbsys.unknown_selector', height, [dict(to=ARBSYS, data='0xdeadbeef'), block])
+        word = lambda v: format(v, '064x')
+        for address, data in [(2, '616263'), (3, '616263'), (4, '010203'), (5, word(1)*3 + '02050d'), (6, word(1)+word(2)+word(0)*2), (7, word(1)+word(2)+word(2))]:
+            compare('precompile.' + str(address), height, 'eth_call', [dict(to='0x' + format(address, '040x'), data='0x' + data, gas='0x989680'), block])
 
         for name, opcode in [('NUMBER', '43'), ('BLOCKHASH', '40'), ('GASLIMIT', '45'), ('GASPRICE', '3a'), ('BASEFEE', '48')]:
             # BLOCKHASH needs an operand even though Classic fails before lookup.

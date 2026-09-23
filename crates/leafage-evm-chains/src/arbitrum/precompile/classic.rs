@@ -25,7 +25,7 @@ pub(super) fn run<DB: Database + DatabaseRef>(
 ) -> Result<Option<InterpreterResult>, String> {
     let address = inputs.bytecode_address;
     if !addresses().any(|a| a == address) {
-        return PrecompileProvider::<ArbitrumContext<DB>>::run(eth, ctx, inputs);
+        return run_eth(eth, ctx, inputs);
     }
     let unsupported = || {
         format!(
@@ -135,4 +135,57 @@ pub(super) fn run<DB: Database + DatabaseRef>(
         _ => return Ok(result(None)),
     };
     Ok(result(value))
+}
+
+fn run_eth<DB: Database + DatabaseRef>(
+    eth: &mut EthPrecompiles,
+    ctx: &mut ArbitrumContext<DB>,
+    inputs: &CallInputs,
+) -> Result<Option<InterpreterResult>, String> {
+    let address = inputs.bytecode_address;
+    let is_eth = address >= Address::with_last_byte(1) && address <= Address::with_last_byte(9);
+    if !is_eth {
+        return Ok(None);
+    }
+    let data = match &inputs.input {
+        CallInput::Bytes(b) => b.clone(),
+        CallInput::SharedBuffer(range) => ctx
+            .local_mut()
+            .shared_memory_buffer_slice(range.clone())
+            .map(|s| Bytes::copy_from_slice(&s))
+            .unwrap_or_default(),
+    };
+    let revert = || {
+        Ok(Some(InterpreterResult {
+            result: InstructionResult::Revert,
+            output: Bytes::new(),
+            gas: Gas::new(inputs.gas_limit),
+        }))
+    };
+    let id = address.as_slice()[19];
+    if id == 1 && data.len() != 128 {
+        return revert();
+    }
+    if id == 8 && data.len() / 192 > 30 {
+        return revert();
+    }
+    if id == 9 && (data.len() != 213 || u32::from_be_bytes(data[..4].try_into().unwrap()) > 65535) {
+        return revert();
+    }
+    let mut normalized = inputs.clone();
+    normalized.input = CallInput::Bytes(if id == 8 {
+        data.slice(..data.len() / 192 * 192)
+    } else {
+        data
+    });
+    let mut result = PrecompileProvider::<ArbitrumContext<DB>>::run(eth, ctx, &normalized)?;
+    if let Some(output) = &mut result {
+        if id == 1 && output.result.is_ok() && output.output.is_empty() {
+            output.output = Bytes::from(vec![0; 32]);
+        }
+        if output.result == InstructionResult::PrecompileError {
+            output.result = InstructionResult::Revert;
+        }
+    }
+    Ok(result)
 }

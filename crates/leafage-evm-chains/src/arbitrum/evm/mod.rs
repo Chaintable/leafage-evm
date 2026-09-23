@@ -16,7 +16,7 @@ use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::{EthInstructions, InstructionProvider};
 use revm::handler::{
     EthFrame, EvmTr, ExecuteCommitEvm, ExecuteEvm, FrameInitOrResult, FrameResult, Handler,
-    ItemOrResult,
+    ItemOrResult, PrecompileProvider,
 };
 use revm::inspector::handler::frame_end;
 use revm::inspector::{
@@ -24,7 +24,10 @@ use revm::inspector::{
 };
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::interpreter::{CallScheme, FrameInput};
+use revm::interpreter::interpreter_types::ReturnData;
+use revm::interpreter::{
+    CallOutcome, CallScheme, FrameInput, Gas, InstructionResult, InterpreterResult,
+};
 use revm::state::EvmState;
 use revm::{
     Database, DatabaseCommit, DatabaseRef, Journal,
@@ -204,6 +207,38 @@ where
         frame_init: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
         self.note_frame_context(&frame_init);
+        let classic = self.inner.precompiles.is_classic();
+        let parent_depth = frame_init.depth;
+        let call_address = if let FrameInput::Call(inputs) = &frame_init.frame_input {
+            Some(inputs.bytecode_address)
+        } else {
+            None
+        };
+        if classic {
+            self.inner.ctx.chain.reset_classic_frame(parent_depth + 1);
+            if let FrameInput::Call(inputs) = &frame_init.frame_input {
+                if classic::reserved_delegate_call(inputs) {
+                    self.inner
+                        .ctx
+                        .chain
+                        .classic_frame_mut(parent_depth)
+                        .preserve_return_data = true;
+                    return Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome::new(
+                        InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output: Default::default(),
+                            gas: Gas::new(inputs.gas_limit),
+                        },
+                        inputs.return_memory_offset.clone(),
+                    ))));
+                }
+                if matches!(inputs.scheme, CallScheme::CallCode) && !inputs.call_value().is_zero() {
+                    return Err(revm::context_interface::context::ContextError::Custom(
+                        "Arbitrum Classic: nonzero-value CALLCODE requires Classic account transfer handling".into()
+                    ));
+                }
+            }
+        }
         let is_first_init = self.inner.frame_stack.index().is_none();
         let new_frame = if is_first_init {
             self.inner.frame_stack.start_init()
@@ -217,6 +252,41 @@ where
             frame_init,
         )?;
 
+        if classic && parent_depth != 0 {
+            if let ItemOrResult::Result(FrameResult::Call(outcome)) = &result {
+                if *outcome.instruction_result() == InstructionResult::OutOfFunds {
+                    if let Some(address) = call_address {
+                        let account = self
+                            .inner
+                            .ctx
+                            .journal_mut()
+                            .load_account_with_code(address)?;
+                        let has_code = account
+                            .info
+                            .code
+                            .as_ref()
+                            .is_some_and(|code| !code.is_empty());
+                        let builtin = PrecompileProvider::<ArbitrumContext<DB>>::contains(
+                            &self.inner.precompiles,
+                            &address,
+                        );
+                        if !has_code && !builtin {
+                            // Classic keeps returnInfo for empty-runtime contracts,
+                            // but clears it for EOAs. Account StateDiffs cannot
+                            // identify the private contractInfo distinction.
+                            return Err(revm::context_interface::context::ContextError::Custom(
+                                "Arbitrum Classic: insufficient-balance CALL to an empty-code account requires Classic account metadata".into()
+                            ));
+                        }
+                        self.inner
+                            .ctx
+                            .chain
+                            .classic_frame_mut(parent_depth)
+                            .preserve_return_data = true;
+                    }
+                }
+            }
+        }
         Ok(result.map_item(|token| {
             if is_first_init {
                 // SAFETY: `token` was produced by `start_init` on this stack.
@@ -282,10 +352,45 @@ where
         if self.inner.frame_stack.index().is_none() {
             return Ok(Some(result));
         }
+        let mut old_return_data = None;
+        if self.inner.precompiles.is_classic() {
+            let depth = self.inner.ctx.journal().depth();
+            if let FrameResult::Call(outcome) = &result {
+                let frame = self.inner.ctx.chain.classic_frame_mut(depth);
+                if std::mem::take(&mut frame.preserve_return_data) {
+                    old_return_data = Some(
+                        self.inner
+                            .frame_stack
+                            .get()
+                            .interpreter
+                            .return_data
+                            .buffer()
+                            .clone(),
+                    );
+                } else {
+                    frame.has_return_data = true;
+                    if outcome.instruction_result().is_ok_or_revert() {
+                        self.inner.ctx.chain.classic_memory_write(
+                            depth,
+                            outcome.memory_start(),
+                            outcome.memory_length().min(outcome.output().len()),
+                        );
+                    }
+                }
+            }
+        }
         self.inner
             .frame_stack
             .get()
             .return_result::<_, ContextDbError<Self::Context>>(&mut self.inner.ctx, result)?;
+        if let Some(data) = old_return_data {
+            self.inner
+                .frame_stack
+                .get()
+                .interpreter
+                .return_data
+                .set_buffer(data);
+        }
         Ok(None)
     }
 }

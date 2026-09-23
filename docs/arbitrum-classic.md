@@ -18,9 +18,11 @@ This is **account-state-only call simulation**, not a replacement for the Classi
 The supported subset includes ordinary EVM contract reads and simulated storage/value changes; CALL, STATICCALL and DELEGATECALL between ordinary contracts; standard Ethereum precompiles; and Classic-specific handling of:
 
 - COINBASE = zero; DIFFICULTY = 2500000000000000; TIMESTAMP from the historical header; CHAINID from configuration.
-- RETURNDATACOPY zero-filling beyond the return buffer, including an empty buffer.
+- RETURNDATACOPY zero-filling beyond the return buffer; Classic 64-bit ByteArray source bounds; MSIZE tracking actual writes rather than Ethereum read expansion.
 - ArbSys `arbBlockNumber`, `arbChainID`, `isTopLevelCall`, `getTransactionCount`, and zero-caller-only `getStorageAt`.
 - Classic eth_call's unpriced ContractTransaction does not increment the caller nonce or charge Nitro poster fees.
+- Standard precompiles retain Classic ECRECOVER input/output, pairing truncation/point limits and Blake2 round limits while reusing the existing crypto implementations.
+- DELEGATECALL/CALLCODE into 0x64–0xc8 returns false and preserves prior return data, as do insufficient-balance calls to nonempty-code contracts and known builtins.
 - ArbInfo at 0x65 executes its actual historical EVM bytecode. Classic ArbOwner is 0x6b; Nitro-only 0x70+ are not intercepted.
 
 ## Limits
@@ -29,7 +31,9 @@ Execution touching unavailable semantics returns an explicit `Arbitrum Classic:`
 
 - NUMBER (L1 height), BLOCKHASH (Classic's private inbox-derived hash history), GASLIMIT (private ArbOS pool limit), GASPRICE and BASEFEE (private ArbGas price). The L2 header's fields are not substitutes.
 - Other ArbOS builtins, including pricing, retryables, address/function tables, owner operations, ArbOS version and caller alias queries. Historical private ArbOS state and version are not in account StateDiffs.
-- Contract creation/destruction, whose Classic account lifecycle is not implemented in this mode.
+- Contract creation/destruction and nonzero-value CALLCODE, whose Classic account lifecycle/transfer handling is not implemented in this mode.
+- Insufficient-balance CALL to an ordinary empty-code account: StateDiffs cannot distinguish EOA and empty-runtime contract return-data behavior.
+- EXTCODECOPY with an oversized source (outside Classic's 64-bit ByteArray range) on an empty-code account: StateDiffs do not distinguish an EOA from Classic empty-code contract metadata. Normal offsets are supported.
 - Typed transactions, nonzero gasPrice, and `estimateGas`.
 
 Recognized unsupported builtins return a capability error rather than running Nitro code against Classic state. Unknown ArbSys selectors retain Classic's catchable revert behavior. A capability error is not evidence that the original Classic call reverts.
