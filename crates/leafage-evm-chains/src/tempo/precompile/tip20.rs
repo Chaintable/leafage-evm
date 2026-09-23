@@ -1928,6 +1928,18 @@ enum TIP20Call {
     RolesAuth(IRolesAuth::IRolesAuthCalls),
 }
 
+/// Selectors outside their official `#[schedule]` window (tip20/dispatch.rs):
+/// `logoURI` / `setLogoURI` since T5, EIP-2612 `permit` / `nonces` /
+/// `DOMAIN_SEPARATOR` since T2.
+fn selector_is_disabled(spec: crate::tempo::hardfork::TempoHardfork, selector: [u8; 4]) -> bool {
+    ((selector == ITIP20::logoURICall::SELECTOR || selector == ITIP20::setLogoURICall::SELECTOR)
+        && !spec.is_t5())
+        || ((selector == ITIP20::permitCall::SELECTOR
+            || selector == ITIP20::noncesCall::SELECTOR
+            || selector == ITIP20::DOMAIN_SEPARATORCall::SELECTOR)
+            && !spec.is_t2())
+}
+
 impl TIP20Call {
     fn valid_selector(selector: [u8; 4]) -> bool {
         ITIP20::ITIP20Calls::valid_selector(selector)
@@ -1965,6 +1977,13 @@ impl Precompile for TIP20Token {
                 .into_precompile_result(self.storage.gas_used());
         }
 
+        // Fork-gated selectors are rejected before ABI decode, like official `dispatch!`.
+        if let Some(&selector) = calldata.first_chunk::<4>() {
+            if selector_is_disabled(self.storage.spec(), selector) {
+                return unknown_selector(selector, self.storage.gas_used());
+            }
+        }
+
         dispatch_call(calldata, TIP20Call::valid_selector, TIP20Call::decode, |call| match call {
             // Metadata functions (no calldata decoding needed)
             TIP20Call::TIP20(ITIP20::ITIP20Calls::name(_)) => {
@@ -1980,12 +1999,6 @@ impl Precompile for TIP20Token {
                 metadata::<ITIP20::currencyCall>(|| self.currency())
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::logoURI(_)) => {
-                if !self.storage.spec().is_t5() {
-                    return unknown_selector(
-                        ITIP20::logoURICall::SELECTOR,
-                        self.storage.gas_used(),
-                    );
-                }
                 metadata::<ITIP20::logoURICall>(|| self.logo_uri())
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::totalSupply(_)) => {
@@ -2046,12 +2059,6 @@ impl Precompile for TIP20Token {
                 mutate_void(call, msg_sender, |s, c| self.set_supply_cap(s, c))
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::setLogoURI(call)) => {
-                if !self.storage.spec().is_t5() {
-                    return unknown_selector(
-                        ITIP20::setLogoURICall::SELECTOR,
-                        self.storage.gas_used(),
-                    );
-                }
                 mutate_void(call, msg_sender, |s, c| self.set_logo_uri(s, c))
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::pause(call)) => {
@@ -2113,7 +2120,7 @@ impl Precompile for TIP20Token {
                 view(call, |c| self.get_pending_rewards(c.account))
             }
 
-            // EIP-2612 (T2+, but leafage always runs latest spec)
+            // EIP-2612 (T2+, gated in `selector_is_disabled`)
             TIP20Call::TIP20(ITIP20::ITIP20Calls::permit(call)) => {
                 mutate_void(call, msg_sender, |_s, c| self.permit(c))
             }
@@ -2149,9 +2156,9 @@ impl Precompile for TIP20Token {
 mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
-    use crate::tempo::precompile::PATH_USD_ADDRESS;
     use crate::tempo::precompile::storage::AccessLogProvider;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::{PATH_USD_ADDRESS, UnknownFunctionSelector};
     use alloy::sol_types::SolCall;
 
     #[test]
@@ -2237,6 +2244,96 @@ mod tests {
         .unwrap();
         assert!(!view_result.reverted);
         assert_eq!(String::abi_decode(&view_result.bytes).unwrap(), uri);
+    }
+
+    #[test]
+    fn fork_gated_selectors_are_unknown_before_activation_even_if_malformed() {
+        let admin = Address::repeat_byte(0xab);
+        let malformed = |selector: [u8; 4]| [selector.as_slice(), &[0xff; 10]].concat();
+        let permit = ITIP20::permitCall {
+            owner: admin,
+            spender: admin,
+            value: U256::ONE,
+            deadline: U256::MAX,
+            v: 27,
+            r: B256::ZERO,
+            s: B256::ZERO,
+        }
+        .abi_encode();
+        let gated: [(TempoHardfork, Vec<u8>); 7] = [
+            (TempoHardfork::T2, permit),
+            (TempoHardfork::T2, malformed(ITIP20::permitCall::SELECTOR)),
+            (
+                TempoHardfork::T2,
+                ITIP20::noncesCall { owner: admin }.abi_encode(),
+            ),
+            (
+                TempoHardfork::T2,
+                ITIP20::DOMAIN_SEPARATORCall {}.abi_encode(),
+            ),
+            (TempoHardfork::T5, ITIP20::logoURICall {}.abi_encode()),
+            (
+                TempoHardfork::T5,
+                malformed(ITIP20::setLogoURICall::SELECTOR),
+            ),
+            (TempoHardfork::T2, malformed(ITIP20::noncesCall::SELECTOR)),
+        ];
+
+        for (activation, calldata) in gated {
+            let selector: [u8; 4] = calldata[..4].try_into().unwrap();
+            let mut provider = TestStorageProvider::new(TempoHardfork::T1C);
+            StorageCtx::enter(&mut provider, || {
+                TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+                    Address::ZERO,
+                    "Path USD",
+                    "pathUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )
+            })
+            .unwrap();
+
+            for spec in [TempoHardfork::T1C, TempoHardfork::T4] {
+                provider.set_spec(spec);
+                let output = StorageCtx::enter(&mut provider, || {
+                    TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).call(&calldata, admin)
+                })
+                .unwrap();
+                if spec >= activation {
+                    continue;
+                }
+                assert!(output.reverted, "{selector:?} at {spec:?}");
+                assert_eq!(
+                    UnknownFunctionSelector::abi_decode(&output.bytes)
+                        .unwrap()
+                        .selector,
+                    selector,
+                    "{spec:?}"
+                );
+            }
+        }
+
+        // Active selectors dispatch normally.
+        let mut provider = TestStorageProvider::new(TempoHardfork::T2);
+        let nonce = StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+                Address::ZERO,
+                "Path USD",
+                "pathUSD",
+                "USD",
+                PATH_USD_ADDRESS,
+                admin,
+            )?;
+            Ok::<_, TempoPrecompileError>(
+                TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                    .call(&ITIP20::noncesCall { owner: admin }.abi_encode(), admin),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!nonce.reverted);
+        assert_eq!(U256::abi_decode(&nonce.bytes).unwrap(), U256::ZERO);
     }
 
     #[test]
