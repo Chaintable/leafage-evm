@@ -715,7 +715,7 @@ impl TIP403Registry {
             updater: msg_sender,
             policyType: policy_type
                 .try_into()
-                .unwrap_or(ITIP403Registry::PolicyType::WHITELIST),
+                .unwrap_or(ITIP403Registry::PolicyType::__Invalid),
         })?;
 
         self.emit_event(ITIP403Registry::PolicyAdminUpdated {
@@ -779,7 +779,7 @@ impl TIP403Registry {
             updater: msg_sender,
             policyType: policy_type
                 .try_into()
-                .unwrap_or(ITIP403Registry::PolicyType::WHITELIST),
+                .unwrap_or(ITIP403Registry::PolicyType::__Invalid),
         })?;
 
         self.emit_event(ITIP403Registry::PolicyAdminUpdated {
@@ -1390,7 +1390,7 @@ mod tests {
         ZONE_FACTORY_ADDRESS,
     };
     use alloy::primitives::FixedBytes;
-    use alloy::sol_types::{SolCall, SolError};
+    use alloy::sol_types::{SolCall, SolError, SolEvent};
     use std::{cell::Cell, collections::HashMap};
 
     #[derive(Default)]
@@ -1780,6 +1780,42 @@ mod tests {
             } else {
                 assert_eq!(result, Ok(()), "{spec:?} {authority}");
             }
+        }
+    }
+
+    #[test]
+    fn pre_t2_policy_created_emits_invalid_type() {
+        let admin = Address::repeat_byte(0x73);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T1C);
+        StorageCtx::enter(&mut provider, || {
+            let mut registry = TIP403Registry::new();
+            registry.create_policy(
+                admin,
+                ITIP403Registry::createPolicyCall {
+                    admin,
+                    policyType: ITIP403Registry::PolicyType::COMPOUND,
+                },
+            )?;
+            registry.create_policy_with_accounts(
+                admin,
+                ITIP403Registry::createPolicyWithAccountsCall {
+                    admin,
+                    policyType: ITIP403Registry::PolicyType::COMPOUND,
+                    accounts: vec![],
+                },
+            )?;
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+
+        let created: Vec<_> = provider
+            .events(TIP403_REGISTRY_ADDRESS)
+            .iter()
+            .filter_map(|log| ITIP403Registry::PolicyCreated::decode_log_data(log).ok())
+            .collect();
+        assert_eq!(created.len(), 2);
+        for event in created {
+            assert_eq!(event.policyType, ITIP403Registry::PolicyType::__Invalid);
         }
     }
 
