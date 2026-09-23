@@ -123,7 +123,9 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     -32003,
                     self.to_string(),
-                    Some(serde_json::json!({"name": "FeeTokenNotTip20Error", "token": address})),
+                    Some(serde_json::json!({
+                        "name": "FeeTokenNotTip20Error", "token": address.to_string(),
+                    })),
                 )
             }
             TempoInvalidTransaction::FeeTokenNotUsdCurrency { address, currency } => {
@@ -131,7 +133,8 @@ impl ToJsonRpcError for TempoInvalidTransaction {
                     -32003,
                     self.to_string(),
                     Some(serde_json::json!({
-                        "name": "FeeTokenNotUsdError", "token": address, "currency": currency,
+                        "name": "FeeTokenNotUsdError", "token": address.to_string(),
+                        "currency": currency,
                     })),
                 )
             }
@@ -1084,6 +1087,31 @@ mod tests {
             .create_txn_env(&Default::default(), &block, outer, EmptyDB::default(), 4217)
             .unwrap_err();
         assert_eq!(error.code(), -32602);
+    }
+
+    #[test]
+    fn fee_token_error_data_uses_checksummed_address() {
+        let address = alloy::primitives::address!("abcdefabcdefabcdefabcdefabcdefabcdef0001");
+        let token = address.to_checksum(None);
+        for (error, expected) in [
+            (
+                TempoInvalidTransaction::FeeTokenNotTip20 { address },
+                serde_json::json!({"name":"FeeTokenNotTip20Error", "token":token}),
+            ),
+            (
+                TempoInvalidTransaction::FeeTokenNotUsdCurrency {
+                    address,
+                    currency: "EUR".into(),
+                },
+                serde_json::json!({"name":"FeeTokenNotUsdError", "token":token, "currency":"EUR"}),
+            ),
+        ] {
+            let error = error.to_rpc_error();
+            assert_eq!(error.code(), -32003);
+            let data: serde_json::Value =
+                serde_json::from_str(error.data().unwrap().get()).unwrap();
+            assert_eq!(data, expected);
+        }
     }
 
     #[test]
