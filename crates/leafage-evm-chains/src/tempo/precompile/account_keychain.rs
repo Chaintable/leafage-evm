@@ -769,13 +769,13 @@ impl AccountKeychain {
             }
         }
 
+        // Call scopes are validated later, in `replace_allowed_calls`, like official.
         let allowed_calls = if config.allowAnyCalls {
             if self.storage.spec().is_t5() && !config.allowedCalls.is_empty() {
                 return Err(err_invalid_call_scope());
             }
             None
         } else {
-            self.validate_call_scopes(&config.allowedCalls)?;
             Some(config.allowedCalls.as_slice())
         };
 
@@ -791,31 +791,24 @@ impl AccountKeychain {
             is_admin,
         })?;
 
-        if !is_admin && config.enforceLimits {
-            let limit_key = Self::spending_limit_key(msg_sender, key_id);
-            for limit in &config.limits {
-                let period_end = if limit.period == 0 {
-                    0
-                } else {
-                    now.saturating_add(limit.period)
-                };
-                self.spending_limits[limit_key][limit.token].write(SpendingLimitState {
-                    remaining: limit.amount,
-                    max: Self::t3_spending_limit_cap(limit.amount)?,
-                    period: limit.period,
-                    period_end,
-                })?;
-            }
-        }
-
         if !is_admin {
-            if let Some(scopes) = allowed_calls {
-            let key_hash = Self::spending_limit_key(msg_sender, key_id);
-            for scope in scopes {
-                self.upsert_target_scope(key_hash, scope)?;
+            let limit_key = Self::spending_limit_key(msg_sender, key_id);
+            if config.enforceLimits {
+                for limit in &config.limits {
+                    let period_end = if limit.period == 0 {
+                        0
+                    } else {
+                        now.saturating_add(limit.period)
+                    };
+                    self.spending_limits[limit_key][limit.token].write(SpendingLimitState {
+                        remaining: limit.amount,
+                        max: Self::t3_spending_limit_cap(limit.amount)?,
+                        period: limit.period,
+                        period_end,
+                    })?;
+                }
             }
-            self.is_scoped_slot(key_hash).write(true)?;
-            }
+            self.replace_allowed_calls(limit_key, allowed_calls)?;
         }
 
         if let Some(witness) = witness {
@@ -1674,6 +1667,42 @@ impl AccountKeychain {
         Ok(())
     }
 
+    /// Replaces the full call-scope tree of a freshly authorized key. `None` means
+    /// unrestricted, `Some([])` scoped deny-all. Mirrors writer
+    /// `account_keychain/mod.rs:880-911 replace_allowed_calls`: the tree is cleared and
+    /// `is_scoped` written before scopes are validated and upserted.
+    fn replace_allowed_calls(
+        &mut self,
+        key_hash: B256,
+        allowed_calls: Option<&[IAccountKeychain::CallScope]>,
+    ) -> Result<()> {
+        self.clear_all_target_scopes(key_hash)?;
+
+        let Some(scopes) = allowed_calls else {
+            return self.is_scoped_slot(key_hash).write(false);
+        };
+        self.is_scoped_slot(key_hash).write(true)?;
+        if scopes.is_empty() {
+            return Ok(());
+        }
+
+        self.validate_call_scopes(scopes)?;
+        for scope in scopes {
+            self.upsert_target_scope(key_hash, scope)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every persisted target scope under a key.
+    /// Mirrors writer `account_keychain/mod.rs:915-922 clear_all_target_scopes`.
+    fn clear_all_target_scopes(&mut self, key_hash: B256) -> Result<()> {
+        let targets = self.targets_handler(key_hash).read()?;
+        for target in targets.into_inner() {
+            self.clear_target_selectors(key_hash, target)?;
+        }
+        self.targets_handler(key_hash).delete()
+    }
+
     /// Clears the selectors set (and any per-selector recipient rows) for one target.
     /// Mirrors writer `account_keychain/mod.rs:798-824 clear_target_selectors`.
     fn clear_target_selectors(&mut self, key_hash: B256, target: Address) -> Result<()> {
@@ -1929,7 +1958,9 @@ impl Precompile for AccountKeychain {
 mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
-    use crate::tempo::precompile::storage::with_read_only_storage_ctx;
+    use crate::tempo::precompile::storage::{
+        with_read_only_storage_ctx, AccessLogProvider, StorageAccess,
+    };
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use crate::tempo::precompile::UnknownFunctionSelector;
     use alloy::primitives::address;
@@ -3554,5 +3585,149 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Keychain storage accesses made after the new key row is written.
+    fn accesses_after_key_write(
+        provider: &AccessLogProvider,
+        account: Address,
+        key_id: Address,
+    ) -> Vec<StorageAccess> {
+        let key_slot = key_id.mapping_slot(account.mapping_slot(U256::ZERO));
+        let accesses = provider.accesses_of(ACCOUNT_KEYCHAIN_ADDRESS);
+        let key_write = accesses
+            .iter()
+            .rposition(|access| *access == StorageAccess::Store(ACCOUNT_KEYCHAIN_ADDRESS, key_slot))
+            .expect("key row written");
+        accesses[key_write + 1..].to_vec()
+    }
+
+    #[test]
+    fn t3_authorize_key_replaces_allowed_calls_like_official() {
+        let account = Address::repeat_byte(0xe1);
+        let key_id = Address::repeat_byte(0xe2);
+        let target = Address::repeat_byte(0xe3);
+        let key_hash = AccountKeychain::spending_limit_key(account, key_id);
+        let is_scoped = AccountKeychain::new().key_scope_base(key_hash);
+        let targets_len = is_scoped + U256::ONE;
+        let load = |slot| StorageAccess::Load(ACCOUNT_KEYCHAIN_ADDRESS, slot);
+        let store = |slot| StorageAccess::Store(ACCOUNT_KEYCHAIN_ADDRESS, slot);
+        // Official `replace_allowed_calls`: `clear_all_target_scopes` (targets read, then
+        // targets delete) and the `is_scoped` write come before any scope upsert.
+        let clear_then_is_scoped = vec![
+            load(targets_len),
+            load(targets_len),
+            load(targets_len),
+            store(targets_len),
+            store(is_scoped),
+        ];
+
+        for (allow_any, allowed_calls, expect_scoped) in [
+            (true, vec![], false),
+            (false, vec![], true),
+            (
+                false,
+                vec![IAccountKeychain::CallScope {
+                    target,
+                    selectorRules: Vec::new(),
+                }],
+                true,
+            ),
+        ] {
+            let has_scopes = !allowed_calls.is_empty();
+            let mut provider = AccessLogProvider::new(TempoHardfork::T8);
+            let is_scoped_read_gas = StorageCtx::enter(&mut provider, || -> Result<u64> {
+                let mut keychain = AccountKeychain::new();
+                keychain.set_tx_origin(account)?;
+                keychain.authorize_key_with_restrictions(
+                    account,
+                    key_id,
+                    IAccountKeychain::SignatureType::Secp256k1,
+                    IAccountKeychain::KeyRestrictions {
+                        allowAnyCalls: allow_any,
+                        allowedCalls: allowed_calls,
+                        ..unrestricted_restrictions()
+                    },
+                    None,
+                )?;
+
+                // Same-tx use of the new key reads `is_scoped` warm, as on the writer.
+                let before = keychain.storage.gas_used();
+                assert_eq!(keychain.is_scoped_slot(key_hash).read()?, expect_scoped);
+                Ok(keychain.storage.gas_used() - before)
+            })
+            .unwrap();
+            assert_eq!(is_scoped_read_gas, 100);
+
+            let accesses = accesses_after_key_write(&provider, account, key_id);
+            assert_eq!(accesses[..5], clear_then_is_scoped[..], "{accesses:?}");
+            if has_scopes {
+                // The scope upsert starts with `targets.contains(target)`.
+                let position = target.mapping_slot(targets_len + U256::ONE);
+                assert_eq!(accesses[5], load(position));
+            } else {
+                // Only the final `is_scoped` read follows.
+                assert_eq!(accesses.len(), 6, "{accesses:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn t3_authorize_key_validates_call_scopes_after_witness_and_limits() {
+        let account = Address::repeat_byte(0xe4);
+        let key_id = Address::repeat_byte(0xe5);
+        let witness = B256::repeat_byte(0xe6);
+        let invalid_scope = vec![IAccountKeychain::CallScope {
+            target: Address::ZERO,
+            selectorRules: Vec::new(),
+        }];
+        let authorize = |config: IAccountKeychain::KeyRestrictions, burned: bool| {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T8);
+            StorageCtx::enter(&mut provider, || {
+                let mut keychain = AccountKeychain::new();
+                keychain.set_tx_origin(account)?;
+                if burned {
+                    keychain.key_authorization_witnesses[account][witness].write(true)?;
+                }
+                keychain.authorize_key_with_restrictions(
+                    account,
+                    key_id,
+                    IAccountKeychain::SignatureType::Secp256k1,
+                    config,
+                    Some(witness),
+                )
+            })
+            .unwrap_err()
+            .selector()
+        };
+        let scoped = IAccountKeychain::KeyRestrictions {
+            allowAnyCalls: false,
+            allowedCalls: invalid_scope,
+            ..unrestricted_restrictions()
+        };
+
+        assert_eq!(
+            authorize(scoped.clone(), false),
+            IAccountKeychain::InvalidCallScope::SELECTOR
+        );
+        assert_eq!(
+            authorize(scoped.clone(), true),
+            IAccountKeychain::KeyAuthorizationWitnessAlreadyBurned::SELECTOR
+        );
+        assert_eq!(
+            authorize(
+                IAccountKeychain::KeyRestrictions {
+                    enforceLimits: true,
+                    limits: vec![IAccountKeychain::TokenLimit {
+                        token: Address::repeat_byte(0xe7),
+                        amount: U256::from(u128::MAX) + U256::ONE,
+                        period: 0,
+                    }],
+                    ..scoped
+                },
+                false,
+            ),
+            IAccountKeychain::InvalidSpendingLimit::SELECTOR
+        );
     }
 }
