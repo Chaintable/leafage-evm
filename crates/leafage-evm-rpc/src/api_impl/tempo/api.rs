@@ -343,6 +343,7 @@ fn parse_tempo_authorization(
 
 /// Recover from the original request, before shared simulation defaults change
 /// its nonce, gas or fees. The resulting payer is reused by every execution path.
+/// The caller fills a missing nonce from state first, as the official node does.
 fn resolve_fee_payer(
     request: &CallRequest,
     auth_list: &[leafage_evm_chains::tempo::tx::TempoAuthGas],
@@ -480,7 +481,6 @@ where
             .iter()
             .map(parse_tempo_authorization)
             .collect::<RpcResult<Vec<_>>>()?;
-        let fee_payer = resolve_fee_payer(&request, &auth_list, hardfork)?;
         let te = request.tempo.clone().unwrap_or_default();
         let tempo_calls = te.tempo_calls;
         let nonce_key = te.nonce_key;
@@ -506,9 +506,10 @@ where
         // Unsigned eth_call-style requests execute with the current 2D state nonce,
         // including the temporary state left by earlier calls in a simulation sequence.
         // A sponsor signature binds the original nonce; preserve that signed path.
-        if let Some(nk) = nonce_key {
-            if !nk.is_zero() && (te.fee_payer_signature.is_none() || request.inner.nonce.is_none())
-            {
+        // A missing nonce is filled from state before the sponsor is recovered, as
+        // the official create_txn_env does (2D/expiring nonce, else account nonce).
+        if let Some(nk) = nonce_key.filter(|nk| !nk.is_zero()) {
+            if te.fee_payer_signature.is_none() || request.inner.nonce.is_none() {
                 use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
                 use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
                 let nonce = if nk == revm::primitives::U256::MAX && hardfork.is_t1() {
@@ -523,7 +524,15 @@ where
                 };
                 request.inner.nonce = Some(nonce);
             }
+        } else if te.fee_payer_signature.is_some() && request.inner.nonce.is_none() {
+            let nonce = db
+                .basic_ref(request.inner.from.unwrap_or_default())
+                .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                .map(|account| account.nonce)
+                .unwrap_or_default();
+            request.inner.nonce = Some(nonce);
         }
+        let fee_payer = resolve_fee_payer(&request, &auth_list, hardfork)?;
 
         // For 2D-nonce AA (nonceKey > 0) the request/auto-filled nonce — not the
         // account's protocol nonce — drives TIP-1000 gas: a nonce of 0 adds the
