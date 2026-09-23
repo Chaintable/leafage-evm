@@ -305,6 +305,8 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         &self,
         evm: &mut Self::Evm,
     ) -> Result<InitialAndFloorGas, Self::Error> {
+        use revm::context::result::InvalidTransaction;
+
         let is_aa = evm
             .ctx()
             .tx
@@ -319,9 +321,10 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             return Ok(InitialAndFloorGas::default());
         }
 
-        if is_aa {
+        let gas_limit = evm.ctx().tx.base.gas_limit;
+        let mut init_gas = if is_aa {
             // AA transaction — use batch gas calculation.
-            validate_aa_initial_tx_gas(evm)
+            validate_aa_initial_tx_gas(evm)?
         } else {
             // Standard transaction — use GasParams::initial_tx_gas() instead of
             // MainnetHandler (which uses hardcoded constants from SpecId, ignoring
@@ -367,16 +370,35 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             }
 
             // Re-validate gas_limit after adding surcharges.
-            let gas_limit = evm.ctx().tx.base.gas_limit;
             if gas_limit < init_gas.initial_gas {
-                return Err(EVMError::Custom(format!(
-                    "insufficient gas for intrinsic cost: gas_limit {} < intrinsic_gas {}",
-                    gas_limit, init_gas.initial_gas
-                )));
+                return Err(EVMError::Transaction(
+                    InvalidTransaction::CallGasCostMoreThanGasLimit {
+                        gas_limit,
+                        initial_gas: init_gas.initial_gas,
+                    }
+                    .into(),
+                ));
             }
 
-            Ok(init_gas)
+            init_gas
+        };
+
+        // EIP-7623 floor for plain and AA transactions
+        // (ported from writer: handler.rs:2134-2145).
+        if evm.ctx().cfg.is_eip7623_disabled() {
+            init_gas.floor_gas = 0;
         }
+        if gas_limit < init_gas.floor_gas {
+            return Err(EVMError::Transaction(
+                InvalidTransaction::GasFloorMoreThanGasLimit {
+                    gas_limit,
+                    gas_floor: init_gas.floor_gas,
+                }
+                .into(),
+            ));
+        }
+
+        Ok(init_gas)
     }
 
     /// Pre-execution: standard flow + TIP-20 fee balance warm-up.
@@ -1572,22 +1594,19 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
         }
     }
 
+    // Writer: handler.rs:2432-2440. The EIP-7623 floor is checked by the caller.
     if gas_limit < batch_gas.initial_gas {
-        return Err(EVMError::Custom(format!(
-            "insufficient gas for AA intrinsic cost: gas_limit={}, intrinsic={}",
-            gas_limit, batch_gas.initial_gas
-        )));
+        return Err(EVMError::Transaction(
+            revm::context::result::InvalidTransaction::CallGasCostMoreThanGasLimit {
+                gas_limit,
+                initial_gas: batch_gas.initial_gas,
+            }
+            .into(),
+        ));
     }
 
     if !hardfork.is_t0() {
         batch_gas.initial_gas += nonce_2d_gas;
-    }
-
-    if gas_limit < batch_gas.floor_gas {
-        return Err(EVMError::Custom(format!(
-            "insufficient gas for AA floor: gas_limit={}, floor={}",
-            gas_limit, batch_gas.floor_gas
-        )));
     }
 
     Ok(batch_gas)
@@ -3544,6 +3563,63 @@ mod tests {
             err.contains("calls cannot contain CREATE when authorization list"),
             "expected 'calls cannot contain CREATE when authorization list', got: {err}"
         );
+    }
+
+    /// Writer rejects too-low intrinsic and EIP-7623 floor gas with
+    /// InvalidTransaction errors for plain and AA transactions
+    /// (handler.rs:2122-2145), which estimate bisection recognizes.
+    #[test]
+    fn initial_tx_gas_rejects_intrinsic_and_floor_as_invalid_transaction() {
+        use crate::tempo::tx::{TempoCall, TempoTxEnv, TempoTxFields};
+        use revm::context::result::InvalidTransaction;
+        use revm::primitives::{Bytes, TxKind};
+
+        // 1000 non-zero bytes: intrinsic 21000 + 16000, floor 21000 + 40000.
+        let data = Bytes::from(vec![0xff; 1000]);
+        let to = TxKind::Call(Address::with_last_byte(0x02));
+        for aa in [false, true] {
+            for (gas_limit, expected) in [
+                (
+                    30_000,
+                    InvalidTransaction::CallGasCostMoreThanGasLimit {
+                        gas_limit: 30_000,
+                        initial_gas: 37_000,
+                    },
+                ),
+                (
+                    40_000,
+                    InvalidTransaction::GasFloorMoreThanGasLimit {
+                        gas_limit: 40_000,
+                        gas_floor: 61_000,
+                    },
+                ),
+            ] {
+                let mut tx = TempoTxEnv::default();
+                tx.base.caller = Address::with_last_byte(0x01);
+                tx.base.kind = to;
+                tx.base.nonce = 1;
+                tx.base.gas_limit = gas_limit;
+                tx.base.chain_id = Some(4217);
+                if aa {
+                    tx.tempo_fields = Some(TempoTxFields {
+                        aa_calls: vec![TempoCall {
+                            to,
+                            value: U256::ZERO,
+                            input: data.clone(),
+                        }],
+                        ..Default::default()
+                    });
+                } else {
+                    tx.base.data = data.clone();
+                }
+                let mut evm = make_evm_with_spec(TempoHardfork::T8);
+                evm.inner.ctx.tx = tx;
+                let error = TempoHandler::<EmptyDB, NoOpInspector>::new()
+                    .validate_initial_tx_gas(&mut evm)
+                    .unwrap_err();
+                assert_eq!(error, EVMError::Transaction(expected.into()), "aa={aa}");
+            }
+        }
     }
 
     /// Writer rejects a keychain-signed T3+ tx whose first call is CREATE in
