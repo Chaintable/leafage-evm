@@ -15,13 +15,14 @@ Keep the producer and reader's StateDiff addressing aligned. For the existing Cl
 
 This is **account-state-only call simulation**, not a replacement for the Classic AVM execution client. `eth_call`, `eth_multiCall`, `contractMultiCall`, `pre_traceCall`, and `pre_traceMany` use the existing Arbitrum EVM, account journal, call stack, inspectors and historical state database.
 
-The supported subset includes ordinary EVM contract reads and simulated storage/value changes; CALL, STATICCALL and DELEGATECALL between ordinary contracts; standard Ethereum precompiles; and Classic-specific handling of:
+The supported subset includes ordinary EVM contract reads and simulated storage/value changes; CALL, STATICCALL and DELEGATECALL between ordinary contracts; Classic standard-precompile behavior; and Classic-specific handling of:
 
 - COINBASE = zero; DIFFICULTY = 2500000000000000; TIMESTAMP from the historical header; CHAINID from configuration.
 - RETURNDATACOPY zero-filling beyond the return buffer; Classic 64-bit ByteArray source bounds; MSIZE tracking actual writes rather than Ethereum read expansion.
 - ArbSys `arbBlockNumber`, `arbChainID`, `isTopLevelCall`, `getTransactionCount`, and zero-caller-only `getStorageAt`.
 - Classic eth_call's unpriced ContractTransaction does not increment the caller nonce or charge Nitro poster fees.
-- Standard precompiles retain Classic ECRECOVER input/output, pairing truncation/point limits and Blake2 round limits while reusing the existing crypto implementations.
+- RIPEMD160 (0x03) and Blake2 (0x09) retain the native Classic AVM's catchable revert: their hash instructions exist in the Rust emulator but are absent from the native interpreter.
+- Standard precompiles retain Classic ECRECOVER input/output, pairing truncation and point limits while reusing the existing crypto implementations.
 - DELEGATECALL/CALLCODE into 0x64–0xc8 returns false and preserves prior return data, as do insufficient-balance calls to nonempty-code contracts and known builtins.
 - ArbInfo at 0x65 executes its actual historical EVM bytecode. Classic ArbOwner is 0x6b; Nitro-only 0x70+ are not intercepted.
 

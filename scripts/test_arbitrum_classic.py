@@ -151,9 +151,13 @@ def main():
             else:
                 compare_revert('pairing.' + str(size), height, params)
         compare_revert('blake2.round_limit', height, [dict(to='0x' + format(9, '040x'), data='0x00010000' + '00' * 209), block])
+        for rounds in [0, 1]:
+            compare_revert('blake2.valid.' + str(rounds), height, [dict(to='0x' + format(9, '040x'), data='0x' + format(rounds, '08x') + '00' * 209), block])
         compare_revert('arbsys.unknown_selector', height, [dict(to=ARBSYS, data='0xdeadbeef'), block])
+        for data in ['0x', '0x616263']:
+            compare_revert('ripemd160:' + data, height, [dict(to='0x' + format(3, '040x'), data=data), block])
         word = lambda v: format(v, '064x')
-        for address, data in [(2, '616263'), (3, '616263'), (4, '010203'), (5, word(1)*3 + '02050d'), (6, word(1)+word(2)+word(0)*2), (7, word(1)+word(2)+word(2))]:
+        for address, data in [(2, '616263'), (4, '010203'), (5, word(1)*3 + '02050d'), (6, word(1)+word(2)+word(0)*2), (7, word(1)+word(2)+word(2))]:
             compare('precompile.' + str(address), height, 'eth_call', [dict(to='0x' + format(address, '040x'), data='0x' + data, gas='0x989680'), block])
 
         for name, opcode in [('NUMBER', '43'), ('BLOCKHASH', '40'), ('GASLIMIT', '45'), ('GASPRICE', '3a'), ('BASEFEE', '48')]:
@@ -175,6 +179,29 @@ def main():
             record('multicall.parallel=' + str(parallel), height, ok, actual=actual)
         actual = rpc(args.leafage, 'pre_traceCall', [dict(to=TOKENS[0], data='0x313ce567'), block])
         record('trace.supported', height, 'result' in actual and not actual['result'].get('failed', True), actual=actual)
+        context = dict(block_id=block, type='Equals')
+        for parallel in [False, True]:
+            actual = rpc(args.leafage, 'contractMultiCall', [[r for r, _ in token_requests], context, None, None, False, parallel, True])
+            outputs = actual.get('result', {}).get('results', [])
+            ok = len(outputs) == len(token_requests) and all(v.get('code') == 0 and v.get('result') == exp for v, (_, exp) in zip(outputs, token_requests))
+            record('contractMultiCall.parallel=' + str(parallel), height, ok, actual=actual)
+        requests = [dict(to=t, data='0x313ce567') for t in TOKENS]
+        for method in ['pre_traceMany', 'simulateTransactions']:
+            actual = rpc(args.leafage, method, [requests, block if method == 'pre_traceMany' else context])
+            result = actual.get('result', [])
+            if method == 'pre_traceMany':
+                ok = isinstance(result, list) and len(result) == len(requests) and all(x.get('error', {}).get('code') == 0 for x in result)
+            else:
+                ok = isinstance(result, dict) and result.get('stats', {}).get('success') and len(result.get('results', [])) == len(requests) and all(x.get('code') == 0 for x in result['results'])
+            record(method, height, bool(ok), actual=actual)
+        bad = dict(to=ARBSYS, data='0x051038f2')
+        for method, params in [('pre_traceMany', [[bad], block]), ('simulateTransactions', [[bad], context]), ('contractMultiCall', [[bad], context, None, None, False, True, True])]:
+            actual = rpc(args.leafage, method, params)
+            record(method + '.missing_state', height, 'Arbitrum Classic:' in json.dumps(actual), actual=actual)
+        for method, eth, extra in [('getAddressNonce', 'eth_getTransactionCount', []), ('getAddressBalance', 'eth_getBalance', []), ('getAddressCode', 'eth_getCode', []), ('getStorageAt', 'eth_getStorageAt', ['0x0'])]:
+            actual = rpc(args.leafage, method, [TOKENS[0], *extra, context])
+            reference = rpc(args.classic, eth, [TOKENS[0], *extra, block])
+            record(method, height, 'result' in actual and actual['result'] == reference.get('result'), actual=actual, reference=reference)
         print('height', height, 'complete', flush=True)
 
     summary = dict(total=len(records), passed=sum(r['ok'] is True for r in records), failed=sum(r['ok'] is False for r in records), skipped=sum(r['ok'] is None for r in records))

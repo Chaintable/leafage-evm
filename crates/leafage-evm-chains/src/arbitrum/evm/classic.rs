@@ -689,6 +689,49 @@ mod tests {
     }
 
     #[test]
+    fn classic_native_hash_builtins_revert_and_can_be_caught_by_callers() {
+        for (address, input) in [
+            (3, Bytes::new()),
+            (3, Bytes::from_static(b"abc")),
+            (9, Bytes::from(vec![0; 213])),
+            (9, {
+                let mut data = vec![0; 213];
+                data[3] = 1;
+                Bytes::from(data)
+            }),
+        ] {
+            for inspect in [false, true] {
+                let mut executor = evm(&[]);
+                let mut request = tx();
+                request.base.kind = TxKind::Call(Address::with_last_byte(address));
+                request.base.data = input.clone();
+                let result = if inspect {
+                    executor.inspect_tx(request)
+                } else {
+                    executor.transact(request)
+                }
+                .unwrap();
+                assert!(matches!(result.result, ExecutionResult::Revert { .. }));
+                // Forward valid calldata, then return the STATICCALL success bit.
+                let bytes = alloy::primitives::hex::decode(format!(
+                    "3660006000376000600036600060{address:02x}5afa60005260206000f3"
+                ))
+                .unwrap();
+                let mut executor = evm(&bytes);
+                let mut request = tx();
+                request.base.data = input.clone();
+                let result = if inspect {
+                    executor.inspect_tx(request)
+                } else {
+                    executor.transact(request)
+                }
+                .unwrap();
+                assert_eq!(U256::from_be_slice(&output(result.result)), U256::ZERO);
+            }
+        }
+    }
+
+    #[test]
     fn classic_standard_precompile_boundaries_match_archive() {
         for len in [0, 127, 128, 129] {
             let mut evm = evm(&[]);

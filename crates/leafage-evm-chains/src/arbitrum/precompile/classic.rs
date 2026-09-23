@@ -163,13 +163,16 @@ fn run_eth<DB: Database + DatabaseRef>(
         }))
     };
     let id = address.as_slice()[19];
+    // The native Classic AVM has no RIPEMD160F (0x25) or BLAKE2F (0x26),
+    // although the Mini source and Rust emulator implement both. Archive
+    // calls to these builtins therefore revert, even with valid input.
+    if matches!(id, 3 | 9) {
+        return revert();
+    }
     if id == 1 && data.len() != 128 {
         return revert();
     }
     if id == 8 && data.len() / 192 > 30 {
-        return revert();
-    }
-    if id == 9 && (data.len() != 213 || u32::from_be_bytes(data[..4].try_into().unwrap()) > 65535) {
         return revert();
     }
     let mut normalized = inputs.clone();
