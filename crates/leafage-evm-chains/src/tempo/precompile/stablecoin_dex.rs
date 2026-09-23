@@ -2780,16 +2780,31 @@ impl StablecoinDEX {
             return Err(err_order_does_not_exist());
         }
 
-        let handle = self.book_handle(order.book_key);
-        let book = handle.read_data()?;
-        let token = if order.is_bid { book.quote } else { book.base };
+        if self.is_maker_authorized(&order)? {
+            Err(err_order_not_stale())
+        } else {
+            self.cancel_active_order(order)
+        }
+    }
 
-        let policy_id = TIP20Token::from_address(token)?.transfer_policy_id()?;
-        match TIP403Registry::new().is_authorized_as(policy_id, order.maker, AuthRole::sender()) {
-            Ok(true) => Err(err_order_not_stale()),
-            Ok(false) => self.cancel_active_order(order),
-            Err(e) if is_policy_lookup_error(&e) => self.cancel_active_order(order),
-            Err(e) => Err(e),
+    /// Sender check on the escrow token (bid=quote, ask=base); T4+ also recipient check on
+    /// the payout token (bid=base, ask=quote).
+    fn is_maker_authorized(&self, order: &Order) -> Result<bool> {
+        let book = self.book_handle(order.book_key).read_data()?;
+        let (token_in, token_out) = if order.is_bid {
+            (book.quote, book.base)
+        } else {
+            (book.base, book.quote)
+        };
+
+        if !is_authorized_for_token(token_in, order.maker, AuthRole::sender())? {
+            return Ok(false);
+        }
+
+        if self.storage.spec().is_t4() {
+            is_authorized_for_token(token_out, order.maker, AuthRole::recipient())
+        } else {
+            Ok(true)
         }
     }
 
@@ -2801,6 +2816,17 @@ impl StablecoinDEX {
         }
         self.sub_balance(user, token, amount)?;
         self.transfer(token, user, amount)
+    }
+}
+
+/// Checks `address` against `token`'s transfer policy for `role`; a failed policy lookup
+/// counts as unauthorized.
+fn is_authorized_for_token(token: Address, address: Address, role: AuthRole) -> Result<bool> {
+    let policy_id = TIP20Token::from_address(token)?.transfer_policy_id()?;
+    match TIP403Registry::new().is_authorized_as(policy_id, address, role) {
+        Ok(authorized) => Ok(authorized),
+        Err(e) if is_policy_lookup_error(&e) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -3927,5 +3953,50 @@ mod tests {
                 .iter()
                 .any(|event| event.topics()[0] == IStablecoinDEX::OrderFlipped::SIGNATURE_HASH)
         );
+    }
+
+    #[test]
+    fn cancel_stale_order_checks_payout_recipient_from_t4() {
+        for spec in [TempoHardfork::T3, TempoHardfork::T4] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xd1);
+                let maker = Address::repeat_byte(0xd2);
+                let base = address!("0x20c00000000000000000000000000000000000d1");
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, base)?;
+                // Bid escrows the quote token and pays out the base token.
+                dex.set_balance(maker, PATH_USD_ADDRESS, MIN_ORDER_AMOUNT)?;
+                let order_id = dex.place(maker, base, MIN_ORDER_AMOUNT, true, 0)?;
+
+                let mut registry = TIP403Registry::new();
+                registry.initialize()?;
+                let policy_id = registry.create_policy_with_accounts(
+                    admin,
+                    ITIP403Registry::createPolicyWithAccountsCall {
+                        admin,
+                        policyType: ITIP403Registry::PolicyType::BLACKLIST,
+                        accounts: vec![maker],
+                    },
+                )?;
+                TIP20Token::from_address(base)?.change_transfer_policy_id(
+                    admin,
+                    ITIP20::changeTransferPolicyIdCall {
+                        newPolicyId: policy_id,
+                    },
+                )?;
+
+                let result = dex.cancel_stale_order(order_id);
+                if spec.is_t4() {
+                    assert_eq!(result, Ok(()));
+                    assert!(dex.get_order(order_id).is_err());
+                    assert_eq!(dex.balance_of(maker, PATH_USD_ADDRESS)?, MIN_ORDER_AMOUNT);
+                } else {
+                    assert_eq!(result, Err(err_order_not_stale()));
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
     }
 }
