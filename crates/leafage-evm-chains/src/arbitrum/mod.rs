@@ -13,5 +13,5 @@ pub mod precompile;
 mod stylus_prefix;
 pub mod tx;
 
-pub use config::ArbitrumEvmConfig;
+pub use config::{ArbitrumEvmConfig, ArbitrumExecutionMode};
 pub use hardforks::ArbitrumHardfork;

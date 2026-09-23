@@ -1,7 +1,7 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root, DEFAULT_S3_READ_TIMEOUT_SECS,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, StateDiffKey, DEFAULT_S3_READ_TIMEOUT_SECS,
 };
 use anyhow::Result;
 use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
@@ -93,6 +93,10 @@ pub struct Command {
     /// S3 version (optional)
     #[arg(long, default_value = "")]
     s3_version: String,
+
+    /// S3 StateDiff key. Omitted: block-hash for S3 chain 999, state-root otherwise.
+    #[arg(long = "statediff-key", value_enum)]
+    state_diff_key: Option<StateDiffKey>,
 
     /// End block number (inclusive)
     #[arg(long)]
@@ -513,13 +517,8 @@ fn spawn_rocksdb_batch_accumulator(
                 let bh = b.block_hash;
                 let bnum = b.block_num;
 
-                StateDBWrite::write_block_hash(
-                    &db,
-                    &mut small,
-                    b.block_info.header.number,
-                    bh,
-                )
-                .expect("write_block_hash");
+                StateDBWrite::write_block_hash(&db, &mut small, b.block_info.header.number, bh)
+                    .expect("write_block_hash");
                 StateDBWrite::write_block_info(&db, &mut small, b.block_info)
                     .expect("write_block_info");
                 acc_writes.extend(
@@ -857,7 +856,8 @@ fn spawn_rocksdb_watermark_advancer(
 
 impl Command {
     pub async fn run(&mut self) -> Result<()> {
-        info!(target: "archive_init", "Starting archive initialization");
+        let state_diff_key = StateDiffKey::resolve(self.state_diff_key, &self.s3_chain_id);
+        info!(target: "archive_init", %state_diff_key, "Starting archive initialization");
         info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, db_type: {:?}, inverted_block_encoding: {}",
               self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type, self.inverted_block_encoding);
 
@@ -1018,6 +1018,7 @@ impl Command {
                     outer_bucket.clone(),
                     chain_id.clone(),
                     version.clone(),
+                    state_diff_key,
                     start_block,
                     parent_state_root,
                     self.end_block,
@@ -1062,6 +1063,7 @@ impl Command {
                     outer_bucket.clone(),
                     chain_id.clone(),
                     version.clone(),
+                    state_diff_key,
                     start_block,
                     parent_state_root,
                     self.end_block,
@@ -1328,6 +1330,7 @@ impl Command {
         outer_bucket: String,
         chain_id: String,
         version: String,
+        state_diff_key: StateDiffKey,
         start_block: u64,
         mut parent_state_root: Option<H256>,
         end_block: u64,
@@ -1343,6 +1346,7 @@ impl Command {
                 &bundle_bucket,
                 &chain_id,
                 &version,
+                state_diff_key,
                 next_block,
                 current_bundle_end,
                 bundle_range_size_mib,
@@ -1392,6 +1396,7 @@ impl Command {
                 outer_bucket.clone(),
                 chain_id.clone(),
                 version.clone(),
+                state_diff_key,
                 next_block,
                 Some(parent_state_root),
             )
@@ -1422,6 +1427,7 @@ impl Command {
                             outer_bucket,
                             chain_id,
                             version,
+                            state_diff_key,
                             block_num,
                             None,
                         )
@@ -1452,6 +1458,7 @@ impl Command {
         outer_bucket: String,
         chain_id: String,
         version: String,
+        state_diff_key: StateDiffKey,
         block_num: u64,
         parent_state_root: Option<H256>,
     ) -> Result<EncodedBlockData> {
@@ -1465,6 +1472,7 @@ impl Command {
                 outer_bucket.clone(),
                 chain_id.clone(),
                 version.clone(),
+                state_diff_key,
                 block_num,
                 parent_state_root,
             )
@@ -1505,6 +1513,7 @@ impl Command {
         outer_bucket: String,
         chain_id: String,
         version: String,
+        state_diff_key: StateDiffKey,
         block_num: u64,
         parent_state_root: Option<H256>,
     ) -> Result<EncodedBlockData> {
@@ -1517,6 +1526,7 @@ impl Command {
                 &outer_bucket,
                 &chain_id,
                 &version,
+                state_diff_key,
                 block_num,
             )
             .await?
@@ -1528,6 +1538,7 @@ impl Command {
                 &outer_bucket,
                 &chain_id,
                 &version,
+                state_diff_key,
                 block_num,
                 parent_state_root,
             )
@@ -1540,6 +1551,7 @@ impl Command {
                 &outer_bucket,
                 &chain_id,
                 &version,
+                state_diff_key,
                 block_num,
             )
             .await?
@@ -1556,9 +1568,8 @@ impl Command {
         let block_num = block_info.header.number;
         let block_hash = block_info.header.hash;
 
-        let mut accounts = Vec::with_capacity(
-            block_diff.deleted_accounts.len() + block_diff.new_accounts.len(),
-        );
+        let mut accounts =
+            Vec::with_capacity(block_diff.deleted_accounts.len() + block_diff.new_accounts.len());
         for address in block_diff.deleted_accounts {
             accounts.push((encode_account_key(address, block_num), None));
         }
@@ -1590,5 +1601,49 @@ impl Command {
             storage,
             codes: block_diff.new_codes,
         })
+    }
+}
+
+#[cfg(test)]
+mod statediff_key_tests {
+    use super::*;
+
+    #[test]
+    fn archive_cli_accepts_explicit_keys_and_preserves_omitted_default() {
+        let base = [
+            "archive-init",
+            "--db-path",
+            "/tmp/test",
+            "--rpc-addr",
+            "http://localhost:8545",
+            "--s3-bucket",
+            "source",
+            "--s3-outer-bucket",
+            "outer",
+            "--s3-chain-id",
+            "42161",
+            "--end-block",
+            "2",
+        ];
+        assert!(Command::try_parse_from(base)
+            .unwrap()
+            .state_diff_key
+            .is_none());
+        for (value, expected) in [
+            ("state-root", StateDiffKey::StateRoot),
+            ("block-hash", StateDiffKey::BlockHash),
+        ] {
+            let args = base.into_iter().chain(["--statediff-key", value]);
+            assert_eq!(
+                Command::try_parse_from(args).unwrap().state_diff_key,
+                Some(expected)
+            );
+        }
+        for invalid in ["auto", "block_hash", "hash"] {
+            assert!(
+                Command::try_parse_from(base.into_iter().chain(["--statediff-key", invalid]))
+                    .is_err()
+            );
+        }
     }
 }

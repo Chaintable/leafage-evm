@@ -61,7 +61,7 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
+    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode.
     ///
     /// # Example
     /// --evm-type=cosmos
@@ -777,6 +777,9 @@ impl Command {
                 kafka_s3_config.offset_dir =
                     format!("{}/offset", self.db_path.to_str().unwrap_or_default());
             }
+            let state_diff_key = kafka_s3_config.resolved_state_diff_key();
+            kafka_s3_config.state_diff_key = Some(state_diff_key);
+            info!(target: "updater", %state_diff_key, "resolved S3 StateDiff addressing");
             info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
         } else {
             info!(target:"updater", "no kafka s3 config");

@@ -1,3 +1,4 @@
+mod classic;
 mod context;
 mod handler;
 mod instructions;
@@ -15,7 +16,7 @@ use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::{EthInstructions, InstructionProvider};
 use revm::handler::{
     EthFrame, EvmTr, ExecuteCommitEvm, ExecuteEvm, FrameInitOrResult, FrameResult, Handler,
-    ItemOrResult,
+    ItemOrResult, PrecompileProvider,
 };
 use revm::inspector::handler::frame_end;
 use revm::inspector::{
@@ -23,7 +24,10 @@ use revm::inspector::{
 };
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::interpreter::{CallScheme, FrameInput};
+use revm::interpreter::interpreter_types::ReturnData;
+use revm::interpreter::{
+    CallOutcome, CallScheme, FrameInput, Gas, InstructionResult, InterpreterResult,
+};
 use revm::state::EvmState;
 use revm::{
     Database, DatabaseCommit, DatabaseRef, Journal,
@@ -51,13 +55,27 @@ pub struct ArbitrumEvm<DB: Database + DatabaseRef, I> {
 
 impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
     pub fn new(
-        block_env: BlockEnv,
-        cfg: CfgEnv<ArbitrumHardfork>,
+        mut block_env: BlockEnv,
+        mut cfg: CfgEnv<ArbitrumHardfork>,
         db: DB,
         inspector: I,
-        precompile_env: ArbitrumPrecompileEnv,
+        mut precompile_env: ArbitrumPrecompileEnv,
         mut execution_context: ArbitrumExecutionContext,
     ) -> Self {
+        let classic =
+            precompile_env.execution_mode == crate::arbitrum::ArbitrumExecutionMode::Classic;
+        if classic {
+            // Classic's EVM opcode set predates Shanghai. Never activate Nitro
+            // features from a numerically similar Classic ArbOS version.
+            ArbitrumHardfork::Berlin.apply_cfg(&mut cfg);
+            cfg.disable_eip7623 = true;
+            execution_context.set_current_l2_context(block_env.number, 0);
+            block_env.beneficiary = alloy::primitives::Address::ZERO;
+            block_env.difficulty = alloy::primitives::U256::from(2_500_000_000_000_000u64);
+            block_env.prevrandao = None;
+            block_env.basefee = 0;
+            precompile_env.current_arbos_version = 0;
+        }
         let hardfork = cfg.spec;
         let spec = hardfork.into();
         execution_context.set_current_arbos_version(precompile_env.current_arbos_version);
@@ -73,7 +91,11 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: instructions::arbitrum_instructions(spec),
+                instruction: if classic {
+                    classic::instructions()
+                } else {
+                    instructions::arbitrum_instructions(spec)
+                },
                 precompiles: ArbitrumPrecompiles::new_with_env(hardfork, precompile_env),
                 frame_stack: Default::default(),
             },
@@ -185,6 +207,38 @@ where
         frame_init: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
         self.note_frame_context(&frame_init);
+        let classic = self.inner.precompiles.is_classic();
+        let parent_depth = frame_init.depth;
+        let call_address = if let FrameInput::Call(inputs) = &frame_init.frame_input {
+            Some(inputs.bytecode_address)
+        } else {
+            None
+        };
+        if classic {
+            self.inner.ctx.chain.reset_classic_frame(parent_depth + 1);
+            if let FrameInput::Call(inputs) = &frame_init.frame_input {
+                if classic::reserved_delegate_call(inputs) {
+                    self.inner
+                        .ctx
+                        .chain
+                        .classic_frame_mut(parent_depth)
+                        .preserve_return_data = true;
+                    return Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome::new(
+                        InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output: Default::default(),
+                            gas: Gas::new(inputs.gas_limit),
+                        },
+                        inputs.return_memory_offset.clone(),
+                    ))));
+                }
+                if matches!(inputs.scheme, CallScheme::CallCode) && !inputs.call_value().is_zero() {
+                    return Err(revm::context_interface::context::ContextError::Custom(
+                        "Arbitrum Classic: nonzero-value CALLCODE requires Classic account transfer handling".into()
+                    ));
+                }
+            }
+        }
         let is_first_init = self.inner.frame_stack.index().is_none();
         let new_frame = if is_first_init {
             self.inner.frame_stack.start_init()
@@ -198,6 +252,41 @@ where
             frame_init,
         )?;
 
+        if classic && parent_depth != 0 {
+            if let ItemOrResult::Result(FrameResult::Call(outcome)) = &result {
+                if *outcome.instruction_result() == InstructionResult::OutOfFunds {
+                    if let Some(address) = call_address {
+                        let account = self
+                            .inner
+                            .ctx
+                            .journal_mut()
+                            .load_account_with_code(address)?;
+                        let has_code = account
+                            .info
+                            .code
+                            .as_ref()
+                            .is_some_and(|code| !code.is_empty());
+                        let builtin = PrecompileProvider::<ArbitrumContext<DB>>::contains(
+                            &self.inner.precompiles,
+                            &address,
+                        );
+                        if !has_code && !builtin {
+                            // Classic keeps returnInfo for empty-runtime contracts,
+                            // but clears it for EOAs. Account StateDiffs cannot
+                            // identify the private contractInfo distinction.
+                            return Err(revm::context_interface::context::ContextError::Custom(
+                                "Arbitrum Classic: insufficient-balance CALL to an empty-code account requires Classic account metadata".into()
+                            ));
+                        }
+                        self.inner
+                            .ctx
+                            .chain
+                            .classic_frame_mut(parent_depth)
+                            .preserve_return_data = true;
+                    }
+                }
+            }
+        }
         Ok(result.map_item(|token| {
             if is_first_init {
                 // SAFETY: `token` was produced by `start_init` on this stack.
@@ -250,10 +339,10 @@ where
                         .cfg()
                         .gas_params()
                         .code_deposit_cost(outcome.output().len());
-                    self.inner.ctx.chain_mut().record_multi_gas(
-                        ArbResourceKind::StorageGrowth,
-                        code_deposit_gas,
-                    );
+                    self.inner
+                        .ctx
+                        .chain_mut()
+                        .record_multi_gas(ArbResourceKind::StorageGrowth, code_deposit_gas);
                 }
             }
         }
@@ -263,10 +352,45 @@ where
         if self.inner.frame_stack.index().is_none() {
             return Ok(Some(result));
         }
+        let mut old_return_data = None;
+        if self.inner.precompiles.is_classic() {
+            let depth = self.inner.ctx.journal().depth();
+            if let FrameResult::Call(outcome) = &result {
+                let frame = self.inner.ctx.chain.classic_frame_mut(depth);
+                if std::mem::take(&mut frame.preserve_return_data) {
+                    old_return_data = Some(
+                        self.inner
+                            .frame_stack
+                            .get()
+                            .interpreter
+                            .return_data
+                            .buffer()
+                            .clone(),
+                    );
+                } else {
+                    frame.has_return_data = true;
+                    if outcome.instruction_result().is_ok_or_revert() {
+                        self.inner.ctx.chain.classic_memory_write(
+                            depth,
+                            outcome.memory_start(),
+                            outcome.memory_length().min(outcome.output().len()),
+                        );
+                    }
+                }
+            }
+        }
         self.inner
             .frame_stack
             .get()
             .return_result::<_, ContextDbError<Self::Context>>(&mut self.inner.ctx, result)?;
+        if let Some(data) = old_return_data {
+            self.inner
+                .frame_stack
+                .get()
+                .interpreter
+                .return_data
+                .set_buffer(data);
+        }
         Ok(None)
     }
 }
@@ -287,7 +411,11 @@ where
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        ArbitrumHandler::new().run(self)
+        if self.inner.precompiles.is_classic() {
+            classic::ClassicHandler::new().run(self)
+        } else {
+            ArbitrumHandler::new().run(self)
+        }
     }
 
     fn finalize(&mut self) -> Self::State {
@@ -295,7 +423,12 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
-        ArbitrumHandler::new().run(self).map(|result| {
+        let result = if self.inner.precompiles.is_classic() {
+            classic::ClassicHandler::new().run(self)
+        } else {
+            ArbitrumHandler::new().run(self)
+        };
+        result.map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
         })
@@ -324,7 +457,11 @@ where
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        ArbitrumHandler::new().inspect_run(self)
+        if self.inner.precompiles.is_classic() {
+            classic::ClassicHandler::new().inspect_run(self)
+        } else {
+            ArbitrumHandler::new().inspect_run(self)
+        }
     }
 }
 

@@ -89,6 +89,7 @@ impl RecentWasms {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArbitrumExecutionContext {
     current_call: ArbitrumCallContext,
+    classic_frames: Vec<ClassicFrameContext>,
     current_l2_block_number: Option<U256>,
     current_l2_basefee: Option<u64>,
     tx_fee_context: Option<ArbitrumTxFeeContext>,
@@ -105,7 +106,36 @@ pub struct ArbitrumExecutionContext {
     scheduled_retryables: VecDeque<ArbitrumRetryTx>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ClassicFrameContext {
+    pub memory_size: usize,
+    pub has_return_data: bool,
+    pub preserve_return_data: bool,
+}
+
 impl ArbitrumExecutionContext {
+    pub(crate) fn reset_classic_frame(&mut self, depth: usize) {
+        if self.classic_frames.len() <= depth {
+            self.classic_frames.resize_with(depth + 1, Default::default);
+        }
+        self.classic_frames[depth] = ClassicFrameContext::default();
+    }
+
+    pub(crate) fn classic_frame(&self, depth: usize) -> &ClassicFrameContext {
+        &self.classic_frames[depth]
+    }
+
+    pub(crate) fn classic_frame_mut(&mut self, depth: usize) -> &mut ClassicFrameContext {
+        &mut self.classic_frames[depth]
+    }
+
+    pub(crate) fn classic_memory_write(&mut self, depth: usize, offset: usize, len: usize) {
+        if len != 0 {
+            let frame = self.classic_frame_mut(depth);
+            frame.memory_size = frame.memory_size.max(offset.saturating_add(len));
+        }
+    }
+
     pub fn set_current_l2_context(&mut self, block_number: U256, basefee: u64) {
         self.current_l2_block_number = Some(block_number);
         self.current_l2_basefee = Some(basefee);
