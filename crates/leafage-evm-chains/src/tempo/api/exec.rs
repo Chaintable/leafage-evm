@@ -524,6 +524,10 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
+        if let Some(oog) = oog_frame_result_if_intrinsic_exceeds_limit(evm, init_and_floor_gas) {
+            return Ok(oog);
+        }
+
         let calls = evm
             .ctx()
             .tx
@@ -1286,6 +1290,7 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
             evm.ctx_mut()
                 .journal_mut()
                 .checkpoint_revert(checkpoint.unwrap());
+            // Execution then halts with OOG (oog_frame_result_if_intrinsic_exceeds_limit).
             init_gas.unwrap().initial_gas = u64::MAX;
             Ok(())
         }
@@ -1308,6 +1313,34 @@ const fn signature_type_to_tempo(
         crate::tempo::fee_payer::SignatureType::P256 => TempoSigType::P256,
         crate::tempo::fee_payer::SignatureType::WebAuthn => TempoSigType::WebAuthn,
     }
+}
+
+/// Builds the out-of-gas result for a transaction whose intrinsic gas ended up
+/// above its gas limit after validation: pre-T1B, a metered key authorization
+/// that runs out of gas raises it to `u64::MAX`. Such a transaction consumes
+/// its gas limit and executes no call, so a CREATE does not bump the nonce.
+///
+/// Ported from Tempo writer: handler.rs `oog_frame_result_if_intrinsic_exceeds_limit`.
+fn oog_frame_result_if_intrinsic_exceeds_limit<DB: Database, INSP>(
+    evm: &TempoEvm<DB, INSP>,
+    init_and_floor_gas: &InitialAndFloorGas,
+) -> Option<FrameResult> {
+    let gas_limit = evm.ctx().tx.base.gas_limit;
+    if gas_limit >= init_and_floor_gas.initial_gas {
+        return None;
+    }
+    let first_kind = evm
+        .ctx()
+        .tx
+        .tempo_fields
+        .as_ref()
+        .and_then(|fields| fields.aa_calls.first())
+        .map_or(evm.ctx().tx.base.kind, |call| call.to);
+    Some(if first_kind.is_call() {
+        FrameResult::new_call_oog(gas_limit, 0..0)
+    } else {
+        FrameResult::new_create_oog(gas_limit)
+    })
 }
 
 /// Executes a batch of AA calls atomically.
@@ -1980,6 +2013,10 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
+        if let Some(oog) = oog_frame_result_if_intrinsic_exceeds_limit(evm, init_and_floor_gas) {
+            return Ok(oog);
+        }
+
         let calls = evm
             .ctx()
             .tx
@@ -2509,6 +2546,79 @@ mod tests {
         apply_signed_key_authorization(&mut evm, Some(&mut init_gas)).unwrap();
         assert_eq!(init_gas.initial_gas, u64::MAX);
         assert_eq!(key_status(&mut evm, root, child), (false, false));
+    }
+
+    /// Writer halts a T1/T1A transaction whose metered key authorization runs
+    /// out of gas: all gas is consumed and no call executes, so a CREATE does
+    /// not bump the protocol nonce (handler.rs oog_frame_result_if_intrinsic_exceeds_limit).
+    #[test]
+    fn t1_key_authorization_out_of_gas_halts_without_executing_calls() {
+        use crate::tempo::fee_payer::{KeyAuthorization, SignatureType};
+        use crate::tempo::tx::{TempoCall, TempoKeyAuthGas};
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+        use revm::context::result::{HaltReason, OutOfGasError};
+        use revm::primitives::TxKind;
+
+        let root_key = SigningKey::random(&mut OsRng);
+        let root = p256_address(&root_key);
+        let signed = sign_key_authorization(
+            KeyAuthorization {
+                chain_id: 4217,
+                key_type: SignatureType::Secp256k1,
+                key_id: Address::repeat_byte(0x45),
+                expiry: None,
+                limits: None,
+                allowed_calls: None,
+                witness: None,
+                is_admin: false,
+                account: None,
+            },
+            &root_key,
+        );
+
+        // Both limits cover intrinsic gas but not the ~250k authorization write.
+        for (to, gas_limit) in [
+            (TxKind::Call(Address::with_last_byte(0x99)), 100_000),
+            (TxKind::Create, 700_000),
+        ] {
+            let mut tx = TempoTxEnv::default();
+            tx.base.caller = root;
+            tx.base.kind = to;
+            tx.base.nonce = 1;
+            tx.base.gas_limit = gas_limit;
+            tx.base.chain_id = Some(4217);
+            tx.tempo_fields = Some(TempoTxFields {
+                aa_calls: vec![TempoCall {
+                    to,
+                    ..Default::default()
+                }],
+                key_auth: Some(TempoKeyAuthGas {
+                    sig_type: TempoSigType::P256,
+                    signed_authorization: Some(signed.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let mut evm = make_cached_evm_with_spec(TempoHardfork::T1A);
+            let result = evm.transact(tx).unwrap();
+            assert!(
+                matches!(
+                    result.result,
+                    ExecutionResult::Halt {
+                        reason: HaltReason::OutOfGas(OutOfGasError::Basic),
+                        ..
+                    }
+                ),
+                "{to:?}: {:?}",
+                result.result
+            );
+            assert_eq!(result.result.gas_used(), gas_limit, "{to:?}");
+            // CALL bumps the protocol nonce before execution; CREATE never
+            // reaches frame creation.
+            let expected_nonce = if to.is_call() { 1 } else { 0 };
+            assert_eq!(result.state[&root].info.nonce, expected_nonce, "{to:?}");
+        }
     }
 
     #[test]
