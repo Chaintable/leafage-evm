@@ -1953,8 +1953,14 @@ impl Precompile for TIP20Token {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
-        // Ensure that the token is initialized (has bytecode)
-        if !self.is_initialized().unwrap_or(false) {
+        // Ensure that the token is initialized (has bytecode). Like official, a failed
+        // account load only counts as "uninitialized" before T4.
+        let initialized = match self.is_initialized() {
+            Ok(initialized) => initialized,
+            Err(_) if !self.storage.spec().is_t4() => false,
+            Err(err) => return err.into_precompile_result(self.storage.gas_used()),
+        };
+        if !initialized {
             return TempoPrecompileError::Revert(ITIP20::Uninitialized {}.abi_encode().into())
                 .into_precompile_result(self.storage.gas_used());
         }
@@ -2144,6 +2150,7 @@ mod tests {
     use super::*;
     use crate::tempo::hardfork::TempoHardfork;
     use crate::tempo::precompile::PATH_USD_ADDRESS;
+    use crate::tempo::precompile::storage::AccessLogProvider;
     use crate::tempo::precompile::test_utils::TestStorageProvider;
     use alloy::sol_types::SolCall;
 
@@ -2320,6 +2327,27 @@ mod tests {
             unauthorized
         );
         assert!(burn(TempoHardfork::T2, true, issuer).is_ok());
+    }
+
+    #[test]
+    fn is_initialized_error_is_returned_from_t4() {
+        let call = |spec| {
+            let mut provider = AccessLogProvider::new(spec);
+            // Covers the 6 gas input cost but not the cold account load.
+            provider.inner.set_gas_limit(60);
+            StorageCtx::enter(&mut provider, || {
+                TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                    .call(&ITIP20::totalSupplyCall {}.abi_encode(), Address::ZERO)
+            })
+        };
+
+        let pre_t4 = call(TempoHardfork::T3).unwrap();
+        assert!(pre_t4.reverted);
+        assert_eq!(pre_t4.bytes, ITIP20::Uninitialized {}.abi_encode());
+        assert!(matches!(
+            call(TempoHardfork::T4),
+            Err(PrecompileError::OutOfGas)
+        ));
     }
 
     #[test]

@@ -966,12 +966,14 @@ pub(crate) enum StorageAccess {
 
 /// Test provider that records every SLOAD/SSTORE in order and, unlike the wrapped
 /// [`TestStorageProvider`](super::test_utils::TestStorageProvider), charges EIP-2929
-/// SLOAD gas (2100 cold / 100 warm) so storage-controlled loops can run out of gas.
+/// SLOAD gas (2100 cold / 100 warm) and account-load gas (2600 cold / 100 warm) so
+/// storage-controlled loops and account checks can run out of gas.
 #[cfg(test)]
 pub(crate) struct AccessLogProvider {
     pub(crate) inner: super::test_utils::TestStorageProvider,
     pub(crate) accesses: Vec<StorageAccess>,
     warm: std::collections::HashSet<(Address, U256)>,
+    warm_accounts: std::collections::HashSet<Address>,
 }
 
 #[cfg(test)]
@@ -981,6 +983,7 @@ impl AccessLogProvider {
             inner: super::test_utils::TestStorageProvider::new(spec),
             accesses: Vec::new(),
             warm: Default::default(),
+            warm_accounts: Default::default(),
         }
     }
 
@@ -1018,6 +1021,8 @@ impl PrecompileStorageProvider for AccessLogProvider {
         address: Address,
         f: &mut dyn FnMut(&revm::state::AccountInfo),
     ) -> Result<()> {
+        let cold = self.warm_accounts.insert(address);
+        self.inner.deduct_gas(if cold { 2_600 } else { 100 })?;
         self.inner.with_account_info(address, f)
     }
     fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
