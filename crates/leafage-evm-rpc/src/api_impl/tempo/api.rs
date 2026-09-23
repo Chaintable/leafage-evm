@@ -454,22 +454,12 @@ where
         use revm::primitives::TxKind;
 
         // Reject ambiguous signed bytes before recovering the payer or filling defaults.
+        // Like the official Call deserializer, inner calls take input over data unchecked.
         request
             .inner
             .input
             .unique_input()
             .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
-        if let Some(calls) = request
-            .tempo
-            .as_ref()
-            .and_then(|te| te.tempo_calls.as_ref())
-        {
-            for call in calls {
-                call.input
-                    .unique_input()
-                    .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
-            }
-        }
 
         // Extract Tempo-specific fields before consuming the request.
         let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
@@ -1062,6 +1052,38 @@ mod tests {
             data,
             serde_json::json!({"name":"FeeTokenNotTip20Error", "token":token})
         );
+    }
+
+    #[test]
+    fn inner_call_input_takes_precedence_over_data() {
+        let api = review_api();
+        let block = BlockEnv {
+            timestamp: alloy::primitives::U256::from(1_788_743_086u64),
+            gas_limit: 100_000_000,
+            ..Default::default()
+        };
+        let call = serde_json::json!([{
+            "to":"0x1111111111111111111111111111111111111113","data":"0xaaaa","input":"0xbbbb"
+        }]);
+        let tx = api
+            .create_txn_env(
+                &Default::default(),
+                &block,
+                review_request("calls", call),
+                EmptyDB::default(),
+                4217,
+            )
+            .unwrap();
+        let aa_calls = &tx.tempo_fields.as_ref().unwrap().aa_calls;
+        assert_eq!(aa_calls[0].input.as_ref(), [0xbb, 0xbb]);
+
+        // Only the outer request rejects conflicting input and data.
+        let mut outer = review_request("data", serde_json::json!("0xaaaa"));
+        outer.input.input = Some(alloy::primitives::bytes!("bbbb"));
+        let error = api
+            .create_txn_env(&Default::default(), &block, outer, EmptyDB::default(), 4217)
+            .unwrap_err();
+        assert_eq!(error.code(), -32602);
     }
 
     #[test]
