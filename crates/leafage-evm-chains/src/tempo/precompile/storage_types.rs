@@ -946,11 +946,7 @@ macro_rules! impl_uint_storable {
 
                 #[inline]
                 fn from_word(word: U256) -> Result<Self> {
-                    word.try_into().map_err(|_| {
-                        TempoPrecompileError::Fatal(
-                            format!("U256 value too large for {}", stringify!($ty))
-                        )
-                    })
+                    word.try_into().map_err(|_| TempoPrecompileError::under_overflow())
                 }
             }
         )+
@@ -1015,7 +1011,7 @@ impl FromWord for i16 {
     fn from_word(word: U256) -> Result<Self> {
         u16::try_from(word)
             .map(|value| value as i16)
-            .map_err(|_| TempoPrecompileError::Fatal("U256 value too large for i16".to_string()))
+            .map_err(|_| TempoPrecompileError::under_overflow())
     }
 }
 
@@ -1704,7 +1700,7 @@ fn checked_position(index: usize) -> Result<u32> {
     u32::try_from(index)
         .ok()
         .and_then(|i| i.checked_add(1))
-        .ok_or_else(|| TempoPrecompileError::Fatal("Set position overflow".into()))
+        .ok_or_else(TempoPrecompileError::under_overflow)
 }
 
 impl<T> SetHandler<T>
@@ -2197,6 +2193,23 @@ mod tests {
         ] {
             assert_eq!(provider.storage(address, key), U256::ZERO);
         }
+    }
+
+    #[test]
+    fn out_of_range_storage_words_are_under_overflow() {
+        let too_big = U256::from(u64::MAX) + U256::ONE;
+        assert_eq!(
+            u64::from_word(too_big).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+        assert_eq!(
+            i16::from_word(U256::from(u16::MAX) + U256::ONE).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+        assert_eq!(
+            checked_position(u32::MAX as usize).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
     }
 
     #[test]

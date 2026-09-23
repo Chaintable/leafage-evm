@@ -129,9 +129,7 @@ pub fn compute_amount_out(amount_in: U256) -> Result<U256> {
     amount_in
         .checked_mul(M)
         .map(|product| product / SCALE)
-        .ok_or_else(|| {
-            TempoPrecompileError::Fatal("underflow/overflow in compute_amount_out".into())
-        })
+        .ok_or_else(TempoPrecompileError::under_overflow)
 }
 
 // ===========================================================================
@@ -350,7 +348,7 @@ impl TipFeeManager {
             .checked_mul(N)
             .and_then(|product| product.checked_div(SCALE))
             .and_then(|result| result.checked_add(U256::from(1)))
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in rebalance_swap".into()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         let amount_in_u128: u128 = amount_in.try_into().map_err(|_| {
             TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
@@ -458,7 +456,7 @@ impl TipFeeManager {
             let two = U256::from(2);
             let half_amount = amount_validator_token
                 .checked_div(two)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint".into()))?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
 
             if half_amount <= MIN_LIQUIDITY {
                 return Err(TempoPrecompileError::Revert(
@@ -468,7 +466,7 @@ impl TipFeeManager {
 
             total_supply_val = total_supply_val
                 .checked_add(MIN_LIQUIDITY)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint".into()))?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
             self.total_supply[pool_id].write(total_supply_val)?;
 
             half_amount.checked_sub(MIN_LIQUIDITY).ok_or_else(|| {
@@ -534,15 +532,17 @@ impl TipFeeManager {
 
         self.pools[pool_id].write(pool)?;
 
-        self.total_supply[pool_id].write(total_supply_val.checked_add(liquidity).ok_or_else(
-            || TempoPrecompileError::Fatal("overflow in mint total_supply".into()),
-        )?)?;
+        self.total_supply[pool_id].write(
+            total_supply_val
+                .checked_add(liquidity)
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
+        )?;
 
         let balance = self.liquidity_balances[pool_id][to].read()?;
         self.liquidity_balances[pool_id][to].write(
             balance
                 .checked_add(liquidity)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint balance".into()))?,
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
         )?;
 
         self.emit_event(ITIPFeeAMM::Mint {
@@ -602,11 +602,11 @@ impl TipFeeManager {
         let amount_user_token = liquidity
             .checked_mul(U256::from(pool.reserve_user_token))
             .and_then(|p| p.checked_div(total_supply_val))
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         let amount_validator_token = liquidity
             .checked_mul(U256::from(pool.reserve_validator_token))
             .and_then(|p| p.checked_div(total_supply_val))
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         let validator_amount: u128 = amount_validator_token.try_into().map_err(|_| {
             TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
@@ -632,12 +632,14 @@ impl TipFeeManager {
         self.liquidity_balances[pool_id][msg_sender].write(
             balance
                 .checked_sub(liquidity)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn balance".into()))?,
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
         )?;
         let total_supply_val = self.total_supply[pool_id].read()?;
-        self.total_supply[pool_id].write(total_supply_val.checked_sub(liquidity).ok_or_else(
-            || TempoPrecompileError::Fatal("overflow in burn total_supply".into()),
-        )?)?;
+        self.total_supply[pool_id].write(
+            total_supply_val
+                .checked_sub(liquidity)
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
+        )?;
 
         // Update reserves
         let user_amount: u128 = amount_user_token.try_into().map_err(|_| {
@@ -1089,4 +1091,25 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn rebalance_swap_amount_in_overflow_reverts_with_panic() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T8);
+
+        let result = StorageCtx::enter(&mut provider, || {
+            TipFeeManager::new().rebalance_swap(
+                Address::repeat_byte(0x71),
+                address!("0x20c0000000000000000000000000000000000071"),
+                address!("0x20c0000000000000000000000000000000000072"),
+                U256::ONE << 255,
+                Address::repeat_byte(0x72),
+            )
+        });
+
+        // Official returns Panic(0x11), a revert callers can catch, not a fatal error.
+        assert_eq!(result.unwrap_err(), TempoPrecompileError::under_overflow());
+        assert_eq!(
+            compute_amount_out(U256::MAX).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+    }
 }

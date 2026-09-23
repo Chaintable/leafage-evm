@@ -1327,14 +1327,14 @@ impl TIP20Token {
 
         let new_from_balance = from_balance
             .checked_sub(amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("underflow in _transfer".to_string()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.set_balance(from, new_from_balance)?;
 
         if to.target != Address::ZERO {
             let to_balance = self.get_balance(to.target)?;
-            let new_to_balance = to_balance
-                .checked_add(amount)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _transfer".to_string()))?;
+            let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
+                TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
+            })?;
             self.set_balance(to.target, new_to_balance)?;
         }
 
@@ -1396,7 +1396,7 @@ impl TIP20Token {
     fn _mint_to(&mut self, to: Recipient, total_supply: U256, amount: U256) -> Result<()> {
         let new_supply = total_supply
             .checked_add(amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         let supply_cap = self.supply_cap()?;
         if new_supply > supply_cap {
@@ -1409,9 +1409,9 @@ impl TIP20Token {
 
         self.set_total_supply(new_supply)?;
         let to_balance = self.get_balance(to.target)?;
-        let new_to_balance = to_balance
-            .checked_add(amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in _mint".to_string()))?;
+        let new_to_balance = to_balance.checked_add(amount).ok_or_else(|| {
+            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
+        })?;
         self.set_balance(to.target, new_to_balance)?;
 
         self.emit_event(ITIP20::Transfer {
@@ -1638,13 +1638,11 @@ impl TIP20Token {
             .amount
             .checked_mul(ACC_PRECISION)
             .and_then(|v| v.checked_div(opted_in_supply))
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in distribute_reward".to_string())
-            })?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         let current_rpt = self.get_global_reward_per_token()?;
-        let new_rpt = current_rpt.checked_add(delta_rpt).ok_or_else(|| {
-            TempoPrecompileError::Fatal("overflow in distribute_reward".to_string())
-        })?;
+        let new_rpt = current_rpt
+            .checked_add(delta_rpt)
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.set_global_reward_per_token(new_rpt)?;
 
         self.emit_event(ITIP20::RewardDistributed {
@@ -1665,9 +1663,7 @@ impl TIP20Token {
         let global_reward_per_token = self.get_global_reward_per_token()?;
         let reward_per_token_delta = global_reward_per_token
             .checked_sub(info.reward_per_token)
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("underflow in update_rewards".to_string())
-            })?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         if reward_per_token_delta != U256::ZERO {
             if cached_delegate != Address::ZERO {
@@ -1675,23 +1671,19 @@ impl TIP20Token {
                 let reward = holder_balance
                     .checked_mul(reward_per_token_delta)
                     .and_then(|v| v.checked_div(ACC_PRECISION))
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
-                    })?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
 
                 if cached_delegate == holder {
-                    info.reward_balance =
-                        info.reward_balance.checked_add(reward).ok_or_else(|| {
-                            TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
-                        })?;
+                    info.reward_balance = info
+                        .reward_balance
+                        .checked_add(reward)
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
                 } else {
                     let mut delegate_info = self.user_reward_info[cached_delegate].read()?;
                     delegate_info.reward_balance = delegate_info
                         .reward_balance
                         .checked_add(reward)
-                        .ok_or_else(|| {
-                            TempoPrecompileError::Fatal("overflow in update_rewards".to_string())
-                        })?;
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
                     self.user_reward_info[cached_delegate].write(delegate_info)?;
                 }
             }
@@ -1733,22 +1725,22 @@ impl TIP20Token {
             if call.recipient == Address::ZERO {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_sub(holder_balance)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("underflow in set_reward_recipient".to_string())
-                    })?;
-                self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
-                })?)?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                self.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
             }
         } else if call.recipient != Address::ZERO {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(holder_balance)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
-                })?;
-            self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in set_reward_recipient".to_string())
-            })?)?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            self.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
 
         let mut info = self.user_reward_info[msg_sender].read()?;
@@ -1776,33 +1768,30 @@ impl TIP20Token {
 
         info.reward_balance = amount
             .checked_sub(max_amount)
-            .ok_or_else(|| TempoPrecompileError::Fatal("underflow in claim_rewards".to_string()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.user_reward_info[msg_sender].write(info)?;
 
         if max_amount > U256::ZERO {
-            let new_contract_balance =
-                contract_balance.checked_sub(max_amount).ok_or_else(|| {
-                    TempoPrecompileError::Fatal("underflow in claim_rewards".to_string())
-                })?;
+            let new_contract_balance = contract_balance
+                .checked_sub(max_amount)
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
             self.set_balance(contract_address, new_contract_balance)?;
 
             let recipient_balance = self
                 .get_balance(msg_sender)?
                 .checked_add(max_amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal("overflow in claim_rewards".to_string())
-                })?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
             self.set_balance(msg_sender, recipient_balance)?;
 
             if reward_recipient != Address::ZERO {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_add(max_amount)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("overflow in claim_rewards".to_string())
-                    })?;
-                self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal("overflow in claim_rewards".to_string())
-                })?)?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                self.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
             }
 
             self.emit_event(ITIP20::Transfer {
@@ -1847,28 +1836,22 @@ impl TIP20Token {
             if to_delegate.is_zero() {
                 let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                     .checked_sub(amount)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal(
-                            "underflow in handle_rewards_on_transfer".to_string(),
-                        )
-                    })?;
-                self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in handle_rewards_on_transfer".to_string(),
-                    )
-                })?)?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                self.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
             }
         } else if !to_delegate.is_zero() {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal(
-                        "overflow in handle_rewards_on_transfer".to_string(),
-                    )
-                })?;
-            self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in handle_rewards_on_transfer".to_string())
-            })?)?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            self.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
 
         Ok(())
@@ -1881,12 +1864,12 @@ impl TIP20Token {
         if !to_delegate.is_zero() {
             let opted_in_supply = U256::from(self.get_opted_in_supply()?)
                 .checked_add(amount)
-                .ok_or_else(|| {
-                    TempoPrecompileError::Fatal("overflow in handle_rewards_on_mint".to_string())
-                })?;
-            self.set_opted_in_supply(opted_in_supply.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in handle_rewards_on_mint".to_string())
-            })?)?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            self.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
 
         Ok(())
@@ -1904,9 +1887,9 @@ impl TIP20Token {
         let mut pending = info.reward_balance;
 
         if self.storage.spec().is_t8() {
-            return pending.try_into().map_err(|_| {
-                TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string())
-            });
+            return pending
+                .try_into()
+                .map_err(|_| TempoPrecompileError::under_overflow());
         }
 
         if info.reward_recipient == account {
@@ -1915,29 +1898,23 @@ impl TIP20Token {
                 let global_reward_per_token = self.get_global_reward_per_token()?;
                 let reward_per_token_delta = global_reward_per_token
                     .checked_sub(info.reward_per_token)
-                    .ok_or_else(|| {
-                        TempoPrecompileError::Fatal("underflow in get_pending_rewards".to_string())
-                    })?;
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
 
                 if reward_per_token_delta > U256::ZERO {
                     let accrued = holder_balance
                         .checked_mul(reward_per_token_delta)
                         .and_then(|v| v.checked_div(ACC_PRECISION))
-                        .ok_or_else(|| {
-                            TempoPrecompileError::Fatal(
-                                "overflow in get_pending_rewards".to_string(),
-                            )
-                        })?;
-                    pending = pending.checked_add(accrued).ok_or_else(|| {
-                        TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string())
-                    })?;
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
+                    pending = pending
+                        .checked_add(accrued)
+                        .ok_or_else(TempoPrecompileError::under_overflow)?;
                 }
             }
         }
 
         pending
             .try_into()
-            .map_err(|_| TempoPrecompileError::Fatal("overflow in get_pending_rewards".to_string()))
+            .map_err(|_| TempoPrecompileError::under_overflow())
     }
 }
 
@@ -2343,6 +2320,36 @@ mod tests {
             unauthorized
         );
         assert!(burn(TempoHardfork::T2, true, issuer).is_ok());
+    }
+
+    #[test]
+    fn mint_overflows_revert_like_official() {
+        let issuer = Address::repeat_byte(0x63);
+        let holder = Address::repeat_byte(0x64);
+        let mint = |total_supply: U256, holder_balance: U256, amount: U256| {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T2);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                token.transfer_policy_id.write(1)?;
+                token.supply_cap.write(U256::MAX)?;
+                token.grant_role_internal(issuer, *ISSUER_ROLE)?;
+                token.set_total_supply(total_supply)?;
+                token.set_balance(holder, holder_balance)?;
+                token.mint(issuer, ITIP20::mintCall { to: holder, amount })
+            })
+        };
+
+        // totalSupply + amount overflows: Panic(0x11).
+        assert_eq!(
+            mint(U256::ONE, U256::ZERO, U256::MAX).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
+        // Recipient balance overflows: official `increment_balance` maps it to
+        // SupplyCapExceeded.
+        assert_eq!(
+            mint(U256::ZERO, U256::MAX, U256::ONE).unwrap_err(),
+            TempoPrecompileError::Revert(ITIP20::SupplyCapExceeded {}.abi_encode().into())
+        );
     }
 
     #[test]
