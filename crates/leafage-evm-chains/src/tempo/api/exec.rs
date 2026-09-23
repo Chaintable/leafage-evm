@@ -1602,6 +1602,24 @@ fn primitive_sig_gas(sig_type: TempoSigType, webauthn_data_size: usize) -> u64 {
     }
 }
 
+/// Additional gas for a real primitive signature (beyond base 21k).
+/// Ported from Tempo writer: `primitive_signature_verification_gas`.
+#[inline]
+fn primitive_signature_gas(signature: &crate::tempo::fee_payer::PrimitiveSignature) -> u64 {
+    use crate::tempo::fee_payer::PrimitiveSignature;
+    use revm::context_interface::cfg::gas::get_tokens_in_calldata_istanbul;
+
+    match signature {
+        PrimitiveSignature::Secp256k1(_) => 0,
+        PrimitiveSignature::P256(_) => P256_VERIFY_GAS,
+        PrimitiveSignature::WebAuthn(signature) => {
+            P256_VERIFY_GAS
+                + get_tokens_in_calldata_istanbul(&signature.webauthn_data)
+                    * gas_params_tx_token_cost()
+        }
+    }
+}
+
 /// Returns the standard tx token cost (4 gas per token).
 /// Matches revm's STANDARD_TOKEN_COST (context-interface/cfg/gas.rs).
 /// Note: non-zero bytes cost 16 gas each = 4 tokens * 4 gas/token.
@@ -1695,9 +1713,12 @@ fn call_scope_extra_gas(s: &ScopeCounts) -> u64 {
 /// which is byte-accurate vs writer for that case. Once tx-envelope parsing
 /// fills `scope_counts` from `KeyAuthorization.allowedCalls`, call-scope tx
 /// will also be byte-accurate.
+///
+/// `signature_gas` is the authorization signature's verification gas beyond
+/// base 21k (writer `primitive_signature_verification_gas`).
 #[inline]
 fn key_auth_gas(
-    sig_type: TempoSigType,
+    signature_gas: u64,
     num_limits: u32,
     scope_counts: &ScopeCounts,
     has_witness: bool,
@@ -1705,7 +1726,7 @@ fn key_auth_gas(
     gas_params: &GasParams,
     hardfork: TempoHardfork,
 ) -> u64 {
-    let sig_gas = ECRECOVER_GAS + primitive_sig_gas(sig_type, 0);
+    let sig_gas = ECRECOVER_GAS + signature_gas;
     let num_limits = num_limits as u64;
 
     if !hardfork.is_t1b() {
@@ -1800,20 +1821,11 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
 
     for auth in auth_list {
         let auth_sig_gas = if let Some(signed) = &auth.signed_authorization {
-            use crate::tempo::fee_payer::{PrimitiveSignature, TempoSignature};
-            let primitive = match &signed.signature {
+            use crate::tempo::fee_payer::TempoSignature;
+            primitive_signature_gas(match &signed.signature {
                 TempoSignature::Primitive(signature) => signature,
                 TempoSignature::Keychain(signature) => &signature.signature,
-            };
-            match primitive {
-                PrimitiveSignature::Secp256k1(_) => 0,
-                PrimitiveSignature::P256(_) => P256_VERIFY_GAS,
-                PrimitiveSignature::WebAuthn(signature) => {
-                    P256_VERIFY_GAS
-                        + get_tokens_in_calldata_istanbul(&signature.webauthn_data)
-                            * gas_params_tx_token_cost()
-                }
-            }
+            })
         } else {
             primitive_sig_gas(auth.sig_type, 0)
         };
@@ -1828,11 +1840,16 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
         }
     }
 
-    // 5. Key authorization costs (if present).
+    // 5. Key authorization costs (if present). Legacy gas-only input has no
+    // signature, so it keeps the mock WebAuthn size.
     if let Some(ka) = &fields.key_auth {
+        let ka_sig_gas = ka.signed_authorization.as_ref().map_or_else(
+            || primitive_sig_gas(ka.sig_type, 0),
+            |signed| primitive_signature_gas(&signed.signature),
+        );
         gas.initial_gas +=
             key_auth_gas(
-                ka.sig_type,
+                ka_sig_gas,
                 ka.num_limits,
                 &ka.scope_counts,
                 ka.has_witness,
@@ -4079,6 +4096,76 @@ mod tests {
         );
     }
 
+    /// Writer charges a key authorization signature from its real WebAuthn data
+    /// (handler.rs calculate_key_authorization_gas); the mock size is only a
+    /// fallback for legacy gas-only input without a signed authorization.
+    #[test]
+    fn key_auth_intrinsic_gas_uses_signed_webauthn_data() {
+        use crate::tempo::fee_payer::{
+            KeyAuthorization, PrimitiveSignature, SignatureType, SignedKeyAuthorization,
+            WebAuthnSignature,
+        };
+        use crate::tempo::tx::{TempoCall, TempoKeyAuthGas, TempoTxFields};
+        use revm::context_interface::cfg::gas::get_tokens_in_calldata_istanbul;
+        use revm::primitives::{TxKind, B256};
+
+        let mut webauthn_data = vec![0u8; 37];
+        webauthn_data[32] = 0x01;
+        webauthn_data.extend_from_slice(
+            br#"{"type":"webauthn.get","challenge":"3q2-7wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","origin":"https://wallet.example","crossOrigin":false}"#,
+        );
+        let tokens = get_tokens_in_calldata_istanbul(&webauthn_data);
+        let signed = SignedKeyAuthorization {
+            authorization: KeyAuthorization {
+                chain_id: 4217,
+                key_type: SignatureType::P256,
+                key_id: Address::repeat_byte(0x42),
+                expiry: None,
+                limits: None,
+                allowed_calls: None,
+                witness: None,
+                is_admin: false,
+                account: None,
+            },
+            signature: PrimitiveSignature::WebAuthn(WebAuthnSignature {
+                r: B256::ZERO,
+                s: B256::ZERO,
+                pub_key_x: B256::ZERO,
+                pub_key_y: B256::ZERO,
+                webauthn_data: webauthn_data.into(),
+            }),
+        };
+        let fields = |signed_authorization| TempoTxFields {
+            aa_calls: vec![TempoCall {
+                to: TxKind::Call(Address::with_last_byte(0x01)),
+                ..Default::default()
+            }],
+            key_auth: Some(TempoKeyAuthGas {
+                sig_type: TempoSigType::WebAuthn,
+                signed_authorization,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for hardfork in [TempoHardfork::T1A, TempoHardfork::T8] {
+            let evm = make_evm_with_spec(hardfork);
+            let gas_params = gas_params_for(hardfork);
+            let intrinsic = |fields: &TempoTxFields| {
+                calculate_aa_batch_intrinsic_gas(fields, &gas_params, &evm, hardfork)
+                    .unwrap()
+                    .initial_gas
+            };
+            let legacy = intrinsic(&fields(None));
+            let real = intrinsic(&fields(Some(signed.clone())));
+            assert_eq!(
+                real - legacy,
+                P256_VERIFY_GAS + tokens * 4 - primitive_sig_gas(TempoSigType::WebAuthn, 0),
+                "{hardfork:?}"
+            );
+        }
+    }
+
     // ==================== 2D nonce increment tests ====================
 
     #[test]
@@ -4251,7 +4338,7 @@ mod tests {
     fn key_auth_gas_pre_t1b_uses_heuristic() {
         let gp = gas_params_for(TempoHardfork::T1A);
         let g = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             2,
             &ScopeCounts::default(),
             false,
@@ -4267,7 +4354,7 @@ mod tests {
     #[test]
     fn key_auth_gas_t1b_uses_precise_sstore() {
         let g = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             2,
             &ScopeCounts::default(),
             false,
@@ -4282,7 +4369,7 @@ mod tests {
     #[test]
     fn key_auth_gas_t2_matches_t1b_formula() {
         let g = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             3,
             &ScopeCounts::default(),
             false,
@@ -4298,7 +4385,7 @@ mod tests {
     fn key_auth_gas_t3_doubles_limit_slots() {
         // T3 stores 2 slots per spending limit; no scopes -> scope_slots = 0.
         let g = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             2,
             &ScopeCounts::default(),
             false,
@@ -4314,7 +4401,7 @@ mod tests {
     fn key_auth_gas_t4_adds_base_scope_gas() {
         // T4, no scope tree -> scope_slots = 0, extra_gas = BASE_SCOPE_GAS.
         let g = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             2,
             &ScopeCounts::default(),
             false,
@@ -4335,7 +4422,7 @@ mod tests {
     fn key_auth_gas_t7_restores_creditable_sstore_cost() {
         let gas = |hardfork| {
             key_auth_gas(
-                TempoSigType::Secp256k1,
+                primitive_sig_gas(TempoSigType::Secp256k1, 0),
                 2,
                 &ScopeCounts::default(),
                 false,
@@ -4358,7 +4445,7 @@ mod tests {
             TempoHardfork::T4,
         ] {
             let g = key_auth_gas(
-                TempoSigType::Secp256k1,
+                primitive_sig_gas(TempoSigType::Secp256k1, 0),
                 0,
                 &ScopeCounts::default(),
                 false,
@@ -4486,7 +4573,7 @@ mod tests {
             recipients: 1,
         };
         let g = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             0,
             &s,
             false,
@@ -4510,7 +4597,7 @@ mod tests {
         let hardfork = TempoHardfork::T5;
         let gas_params = gas_params_for(hardfork);
         let without = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             0,
             &ScopeCounts::default(),
             false,
@@ -4519,7 +4606,7 @@ mod tests {
             hardfork,
         );
         let with = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             0,
             &ScopeCounts::default(),
             true,
@@ -4537,7 +4624,7 @@ mod tests {
         let hardfork = TempoHardfork::T6;
         let gas_params = gas_params_for(hardfork);
         let regular = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             0,
             &ScopeCounts::default(),
             false,
@@ -4546,7 +4633,7 @@ mod tests {
             hardfork,
         );
         let admin = key_auth_gas(
-            TempoSigType::Secp256k1,
+            primitive_sig_gas(TempoSigType::Secp256k1, 0),
             0,
             &ScopeCounts::default(),
             false,
