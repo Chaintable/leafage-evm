@@ -694,7 +694,6 @@ impl TipFeeManager {
 
         Ok((amount_user_token, amount_validator_token))
     }
-
 }
 
 impl ContractStorage for TipFeeManager {
