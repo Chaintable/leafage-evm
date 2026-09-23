@@ -576,10 +576,6 @@ impl StorageCreditsBackend for LeafageStorageProvider<'_> {
         self.internals.tstore(address, key, value);
     }
 
-    fn is_non_creditable_slot(&self, owner: Address, key: U256) -> bool {
-        crate::tempo::precompile::storage_credits::is_non_creditable_slot(owner, key)
-    }
-
     fn storage_credit_minting_enabled(&self) -> bool {
         self.tip1060_storage_credit_minting_enabled
     }

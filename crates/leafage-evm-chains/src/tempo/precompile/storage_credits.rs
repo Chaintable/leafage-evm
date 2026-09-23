@@ -9,7 +9,6 @@ use revm::{
     context_interface::cfg::GasParams,
     interpreter::{Gas, Host, SStoreResult, StateLoad},
 };
-use scoped_tls::scoped_thread_local;
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx};
@@ -82,54 +81,6 @@ pub struct TransientState {
 /// The creditable part of one T7 storage creation.
 pub(crate) const STORAGE_CREDIT_VALUE: u64 = 245_000;
 
-/// Transaction fee slots whose clear cannot mint a backed storage credit.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NonCreditableSlots {
-    fee_token: Address,
-    fee_balance_slot: U256,
-    keychain_limit_slot: Option<U256>,
-}
-
-impl NonCreditableSlots {
-    pub(crate) fn new(
-        fee_payer: Address,
-        fee_token: Address,
-        keychain_fee_key: Option<Address>,
-    ) -> Self {
-        use super::account_keychain::AccountKeychain;
-        use super::storage_types::StorageKey;
-
-        let fee_balance_slot = fee_payer.mapping_slot(U256::from(9));
-        let keychain_limit_slot = keychain_fee_key.map(|key_id| {
-            let keychain = AccountKeychain::new();
-            let limit_key = AccountKeychain::spending_limit_key(fee_payer, key_id);
-            keychain.spending_limits[limit_key][fee_token]
-                .remaining
-                .slot()
-        });
-        Self {
-            fee_token,
-            fee_balance_slot,
-            keychain_limit_slot,
-        }
-    }
-
-    fn contains(&self, owner: Address, key: U256) -> bool {
-        (owner == self.fee_token && key == self.fee_balance_slot)
-            || (owner == super::ACCOUNT_KEYCHAIN_ADDRESS && self.keychain_limit_slot == Some(key))
-    }
-}
-
-scoped_thread_local!(static NON_CREDITABLE_SLOTS: NonCreditableSlots);
-
-pub(crate) fn with_non_creditable_slots<T>(slots: &NonCreditableSlots, f: impl FnOnce() -> T) -> T {
-    NON_CREDITABLE_SLOTS.set(slots, f)
-}
-
-pub(crate) fn is_non_creditable_slot(owner: Address, key: U256) -> bool {
-    NON_CREDITABLE_SLOTS.is_set() && NON_CREDITABLE_SLOTS.with(|slots| slots.contains(owner, key))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccountingError {
     OutOfGas,
@@ -156,6 +107,8 @@ pub(crate) trait StorageCreditsBackend {
     fn tload_raw(&mut self, address: Address, key: U256) -> U256;
     fn tstore_raw(&mut self, address: Address, key: U256, value: U256);
 
+    /// Writer excludes fee bookkeeping slots only after collecting a fee;
+    /// RPC simulations never collect one, so no slot is excluded.
     fn is_non_creditable_slot(&self, _owner: Address, _key: U256) -> bool {
         false
     }
