@@ -823,6 +823,51 @@ mod tests {
         }
     }
 
+    /// Writer never moves native balance: fees go through the fee manager (not
+    /// charged in RPC simulations) and reward_beneficiary is a no-op. Protocol
+    /// nonce handling is unchanged.
+    #[test]
+    fn review_gas_price_does_not_touch_native_balances() {
+        use crate::tempo::precompile::DEFAULT_FEE_TOKEN;
+        use revm::database::in_memory_db::CacheDB;
+        use revm::primitives::{TxKind, U256};
+
+        let caller = Address::repeat_byte(0x11);
+        let coinbase = Address::repeat_byte(0xc0);
+        let mut currency = [0u8; 32];
+        currency[..3].copy_from_slice(b"USD");
+        currency[31] = 6;
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(DEFAULT_FEE_TOKEN, U256::from(4), U256::from_be_bytes(currency))
+            .unwrap();
+
+        for (aa, nonce_key, bumped_nonce) in [
+            (false, U256::ZERO, 1),
+            (true, U256::ZERO, 1),
+            (true, U256::from(1), 0),
+        ] {
+            let mut tx = make_aa_tx(vec![make_call(0x99, &[])], 1, nonce_key, 300_000);
+            if !aa {
+                tx.tempo_fields = None;
+            }
+            tx.base.caller = caller;
+            tx.base.kind = TxKind::Call(Address::with_last_byte(0x99));
+            tx.base.gas_price = 1_200_000_000;
+            let mut evm =
+                TempoEvm::new(make_env_aa(1_787_320_800), db.clone(), NoOpInspector, false);
+            evm.inner.ctx.block.inner.beneficiary = coinbase;
+            let result = evm.transact(tx).unwrap();
+            assert!(result.result.is_success(), "{:?}", result.result);
+            let caller_info = &result.state[&caller].info;
+            assert_eq!(caller_info.balance, U256::ZERO, "aa={aa} nonce_key={nonce_key}");
+            assert_eq!(caller_info.nonce, bumped_nonce, "aa={aa} nonce_key={nonce_key}");
+            assert!(
+                !result.state.contains_key(&coinbase),
+                "aa={aa} nonce_key={nonce_key}"
+            );
+        }
+    }
+
     #[test]
     fn review_standard_and_aa_authorization_refunds_follow_t1() {
         use crate::tempo::tx::{TempoAuthGas, TempoTxFields};

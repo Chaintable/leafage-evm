@@ -394,6 +394,10 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
 
     /// Tempo keeps the account protocol nonce unchanged for CALL transactions
     /// that use a non-zero 2D nonce key. CREATE increments it in frame creation.
+    ///
+    /// Writer never touches native balance: fees are paid in TIP-20 through the
+    /// fee manager, which RPC simulations do not charge (reth sets
+    /// `disable_fee_charge`). Ported from writer: handler.rs:1034-1043, :1222-1229.
     #[inline]
     fn validate_against_state_and_deduct_caller(
         &self,
@@ -407,22 +411,18 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .tempo_fields
             .as_ref()
             .is_some_and(|fields| !fields.nonce_key.is_zero());
-        if !uses_2d_nonce {
-            return MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-                .validate_against_state_and_deduct_caller(evm);
-        }
 
-        let (block, tx, cfg, journal, _, _) = evm.ctx_mut().all_mut();
+        let (_, tx, cfg, journal, _, _) = evm.ctx_mut().all_mut();
         let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
         pre_execution::validate_account_nonce_and_code_with_components(
             &caller.account().info,
             tx,
             cfg,
         )?;
-        let new_balance =
-            pre_execution::calculate_caller_fee(*caller.balance(), tx, block, cfg)?;
         caller.touch();
-        caller.set_balance(new_balance);
+        if !uses_2d_nonce && tx.kind().is_call() {
+            caller.bump_nonce();
+        }
         Ok(())
     }
 
@@ -545,6 +545,29 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         self.reimburse_caller(evm, exec_result)?;
         self.reward_beneficiary(evm, exec_result)?;
         Ok(result_gas)
+    }
+
+    /// Writer refunds through the fee manager (`collectFeePostTx`), skipped in
+    /// RPC simulations because no fee was collected (handler.rs:1679-1746).
+    /// Native balance is never credited.
+    #[inline]
+    fn reimburse_caller(
+        &self,
+        _evm: &mut Self::Evm,
+        _exec_result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Writer: validators claim fees from the fee manager; no-op
+    /// (handler.rs:1749-1757).
+    #[inline]
+    fn reward_beneficiary(
+        &self,
+        _evm: &mut Self::Evm,
+        _exec_result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
