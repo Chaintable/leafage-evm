@@ -120,7 +120,6 @@ pub enum AuthRole {
 impl AuthRole {
     #[inline]
     fn transfer_or(t2_variant: Self) -> Self {
-        // leafage always runs latest spec (T2+), so always return the T2 variant
         if StorageCtx::default().spec().is_t2() {
             t2_variant
         } else {
@@ -1271,6 +1270,22 @@ const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
         TempoHardfork::T9,
     ),
     (
+        ITIP403Registry::isAuthorizedSenderCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::isAuthorizedRecipientCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::isAuthorizedMintRecipientCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
+        ITIP403Registry::compoundPolicyDataCall::SELECTOR,
+        TempoHardfork::T2,
+    ),
+    (
         ITIP403Registry::receivePolicyCall::SELECTOR,
         TempoHardfork::T6,
     ),
@@ -1285,6 +1300,10 @@ const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
     (
         ITIP403Registry::migrateTransferPolicyIdsCall::SELECTOR,
         TempoHardfork::T9,
+    ),
+    (
+        ITIP403Registry::createCompoundPolicyCall::SELECTOR,
+        TempoHardfork::T2,
     ),
 ];
 
@@ -1325,7 +1344,6 @@ impl Precompile for TIP403Registry {
                 ITIP403Registry::ITIP403RegistryCalls::isAuthorized(call) => view(call, |c| {
                     self.is_authorized_as(c.policyId, c.user, AuthRole::Transfer)
                 }),
-                // TIP-1015: T2+ only (leafage always runs T2+)
                 ITIP403Registry::ITIP403RegistryCalls::isAuthorizedSender(call) => {
                     view(call, |c| {
                         self.is_authorized_as(c.policyId, c.user, AuthRole::Sender)
@@ -1375,7 +1393,6 @@ impl Precompile for TIP403Registry {
                 ITIP403Registry::ITIP403RegistryCalls::modifyPolicyBlacklist(call) => {
                     mutate_void(call, msg_sender, |s, c| self.modify_policy_blacklist(s, c))
                 }
-                // TIP-1015: T2+ only (leafage always runs T2+)
                 ITIP403Registry::ITIP403RegistryCalls::createCompoundPolicy(call) => {
                     mutate(call, msg_sender, |s, c| self.create_compound_policy(s, c))
                 }
@@ -1889,6 +1906,59 @@ mod tests {
                 .abi_encode(),
                 "{spec:?}"
             );
+        }
+    }
+
+    #[test]
+    fn tip1015_selectors_activate_at_t2() {
+        let user = Address::repeat_byte(0x74);
+        let policy_id = ALLOW_ALL_POLICY_ID;
+        let calls = [
+            ITIP403Registry::isAuthorizedSenderCall {
+                policyId: policy_id,
+                user,
+            }
+            .abi_encode(),
+            ITIP403Registry::isAuthorizedRecipientCall {
+                policyId: policy_id,
+                user,
+            }
+            .abi_encode(),
+            ITIP403Registry::isAuthorizedMintRecipientCall {
+                policyId: policy_id,
+                user,
+            }
+            .abi_encode(),
+            ITIP403Registry::compoundPolicyDataCall {
+                policyId: policy_id,
+            }
+            .abi_encode(),
+            ITIP403Registry::createCompoundPolicyCall {
+                senderPolicyId: policy_id,
+                recipientPolicyId: policy_id,
+                mintRecipientPolicyId: policy_id,
+            }
+            .abi_encode(),
+        ];
+        for calldata in calls {
+            let unknown = UnknownFunctionSelector {
+                selector: FixedBytes::from_slice(&calldata[..4]),
+            }
+            .abi_encode();
+            for spec in [TempoHardfork::T1C, TempoHardfork::T2] {
+                let mut provider = TestStorageProvider::new(spec);
+                let output = StorageCtx::enter(&mut provider, || {
+                    TIP403Registry::new().call(&calldata, user)
+                })
+                .unwrap();
+                if spec.is_t2() {
+                    assert_ne!(output.bytes.as_ref(), unknown.as_slice());
+                } else {
+                    assert!(output.reverted);
+                    assert_eq!(output.bytes.as_ref(), unknown.as_slice());
+                    assert!(provider.events(TIP403_REGISTRY_ADDRESS).is_empty());
+                }
+            }
         }
     }
 }

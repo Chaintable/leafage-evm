@@ -1720,16 +1720,20 @@ impl StablecoinDEX {
         self.book_handle(book_key).read_tick_level(tick, is_bid)
     }
 
-    /// Converts a relative tick to a scaled price.
+    /// Converts a relative tick to a scaled price. On T2+ validates tick spacing.
     pub fn tick_to_price_fn(&self, tick: i16) -> Result<u32> {
-        validate_tick_spacing(tick)?;
+        if self.storage.spec().is_t2() {
+            validate_tick_spacing(tick)?;
+        }
         Ok(tick_to_price(tick))
     }
 
-    /// Converts a scaled price to a relative tick.
+    /// Converts a scaled price to a relative tick. On T2+ validates tick spacing.
     pub fn price_to_tick_fn(&self, price: u32) -> Result<i16> {
         let tick = price_to_tick(price)?;
-        validate_tick_spacing(tick)?;
+        if self.storage.spec().is_t2() {
+            validate_tick_spacing(tick)?;
+        }
         Ok(tick)
     }
 
@@ -4292,6 +4296,25 @@ mod tests {
                 .abi_encode(),
                 "{spec:?}"
             );
+        }
+    }
+
+    #[test]
+    fn tick_price_conversion_checks_spacing_from_t2() {
+        for spec in [TempoHardfork::T1C, TempoHardfork::T2] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let dex = StablecoinDEX::new();
+                let tick_to_price = dex.tick_to_price_fn(5);
+                let price_to_tick = dex.price_to_tick_fn(PRICE_SCALE + 5);
+                if spec.is_t2() {
+                    assert_eq!(tick_to_price, Err(err_invalid_tick()));
+                    assert_eq!(price_to_tick, Err(err_invalid_tick()));
+                } else {
+                    assert_eq!(tick_to_price, Ok(PRICE_SCALE + 5));
+                    assert_eq!(price_to_tick, Ok(5));
+                }
+            });
         }
     }
 }
