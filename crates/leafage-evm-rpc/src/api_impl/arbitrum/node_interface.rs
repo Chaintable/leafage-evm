@@ -530,6 +530,9 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
+        if self.is_classic() {
+            return Ok(None);
+        }
         let TxKind::Call(to) = tx.kind() else {
             return Ok(None);
         };

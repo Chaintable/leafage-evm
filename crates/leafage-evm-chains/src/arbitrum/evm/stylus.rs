@@ -55,6 +55,9 @@ pub(super) fn frame_stylus_version<DB, I>(
 where
     DB: Database + DatabaseRef,
 {
+    if evm.inner.precompiles.is_classic() {
+        return Ok(None);
+    }
     let code = {
         let frame = evm.inner.frame_stack.get();
         if !matches!(frame.data, FrameData::Call(_)) {

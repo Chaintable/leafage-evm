@@ -1,3 +1,4 @@
+mod classic;
 mod context;
 mod handler;
 mod instructions;
@@ -51,13 +52,27 @@ pub struct ArbitrumEvm<DB: Database + DatabaseRef, I> {
 
 impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
     pub fn new(
-        block_env: BlockEnv,
-        cfg: CfgEnv<ArbitrumHardfork>,
+        mut block_env: BlockEnv,
+        mut cfg: CfgEnv<ArbitrumHardfork>,
         db: DB,
         inspector: I,
-        precompile_env: ArbitrumPrecompileEnv,
+        mut precompile_env: ArbitrumPrecompileEnv,
         mut execution_context: ArbitrumExecutionContext,
     ) -> Self {
+        let classic =
+            precompile_env.execution_mode == crate::arbitrum::ArbitrumExecutionMode::Classic;
+        if classic {
+            // Classic's EVM opcode set predates Shanghai. Never activate Nitro
+            // features from a numerically similar Classic ArbOS version.
+            ArbitrumHardfork::Berlin.apply_cfg(&mut cfg);
+            cfg.disable_eip7623 = true;
+            execution_context.set_current_l2_context(block_env.number, 0);
+            block_env.beneficiary = alloy::primitives::Address::ZERO;
+            block_env.difficulty = alloy::primitives::U256::from(2_500_000_000_000_000u64);
+            block_env.prevrandao = None;
+            block_env.basefee = 0;
+            precompile_env.current_arbos_version = 0;
+        }
         let hardfork = cfg.spec;
         let spec = hardfork.into();
         execution_context.set_current_arbos_version(precompile_env.current_arbos_version);
@@ -73,7 +88,11 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
                     error: Ok(()),
                 },
                 inspector,
-                instruction: instructions::arbitrum_instructions(spec),
+                instruction: if classic {
+                    classic::instructions()
+                } else {
+                    instructions::arbitrum_instructions(spec)
+                },
                 precompiles: ArbitrumPrecompiles::new_with_env(hardfork, precompile_env),
                 frame_stack: Default::default(),
             },
@@ -250,10 +269,10 @@ where
                         .cfg()
                         .gas_params()
                         .code_deposit_cost(outcome.output().len());
-                    self.inner.ctx.chain_mut().record_multi_gas(
-                        ArbResourceKind::StorageGrowth,
-                        code_deposit_gas,
-                    );
+                    self.inner
+                        .ctx
+                        .chain_mut()
+                        .record_multi_gas(ArbResourceKind::StorageGrowth, code_deposit_gas);
                 }
             }
         }
@@ -287,7 +306,11 @@ where
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        ArbitrumHandler::new().run(self)
+        if self.inner.precompiles.is_classic() {
+            classic::ClassicHandler::new().run(self)
+        } else {
+            ArbitrumHandler::new().run(self)
+        }
     }
 
     fn finalize(&mut self) -> Self::State {
@@ -295,7 +318,12 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
-        ArbitrumHandler::new().run(self).map(|result| {
+        let result = if self.inner.precompiles.is_classic() {
+            classic::ClassicHandler::new().run(self)
+        } else {
+            ArbitrumHandler::new().run(self)
+        };
+        result.map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
         })
@@ -324,7 +352,11 @@ where
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.inner.ctx.set_tx(tx);
-        ArbitrumHandler::new().inspect_run(self)
+        if self.inner.precompiles.is_classic() {
+            classic::ClassicHandler::new().inspect_run(self)
+        } else {
+            ArbitrumHandler::new().inspect_run(self)
+        }
     }
 }
 

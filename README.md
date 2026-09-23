@@ -318,3 +318,7 @@ leafage-evm/
 ## License
 
 MIT OR Apache-2.0
+
+### Arbitrum Classic
+
+For historical Classic calls, use `--evm-type=arbitrum --evm-custom-config='{"execution_mode":"classic"}'`. See [Classic execution scope and verification](docs/arbitrum-classic.md) for StateDiff configuration, supported calls and the limits of account-state-only simulation. Nitro remains the default.
