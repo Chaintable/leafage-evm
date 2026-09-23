@@ -2453,6 +2453,78 @@ mod tests {
     }
 
     #[test]
+    fn permit_rejects_high_s_signature() {
+        use alloy::consensus::crypto::SECP256K1N_HALF;
+        use secp256k1::{Message, SECP256K1, SecretKey};
+
+        let secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let owner = Address::from_raw_public_key(
+            &secret.public_key(SECP256K1).serialize_uncompressed()[1..],
+        );
+        let spender = Address::repeat_byte(0x77);
+        let value = U256::from(5);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T2);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            let struct_hash = keccak256(
+                (
+                    keccak256(
+                        b"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+                    ),
+                    owner,
+                    spender,
+                    value,
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                    .abi_encode(),
+            );
+            let digest = keccak256(
+                [
+                    &[0x19, 0x01],
+                    token.domain_separator()?.as_slice(),
+                    struct_hash.as_slice(),
+                ]
+                .concat(),
+            );
+            let (recid, sig) = SECP256K1
+                .sign_ecdsa_recoverable(&Message::from_digest(digest.0), &secret)
+                .serialize_compact();
+            let v = 27 + i32::from(recid) as u8;
+            let r = B256::from_slice(&sig[..32]);
+            let s = U256::from_be_slice(&sig[32..]);
+            assert!(s <= SECP256K1N_HALF);
+            let permit = |v: u8, s: U256| ITIP20::permitCall {
+                owner,
+                spender,
+                value,
+                deadline: U256::MAX,
+                v,
+                r,
+                s: s.into(),
+            };
+
+            // Malleated (r, n - s, flipped v) recovers the same key but must be rejected.
+            let secp256k1_n = SECP256K1N_HALF * U256::from(2) + U256::ONE;
+            let high_s = token.permit(permit(55 - v, secp256k1_n - s));
+            assert!(matches!(
+                high_s,
+                Err(TempoPrecompileError::Revert(data))
+                    if data.as_ref() == ITIP20::InvalidSignature {}.abi_encode().as_slice()
+            ));
+            assert_eq!(token.permit_nonces[owner].read()?, U256::ZERO);
+            assert_eq!(token.get_allowance(owner, spender)?, U256::ZERO);
+
+            token.permit(permit(v, s))?;
+            assert_eq!(token.permit_nonces[owner].read()?, U256::ONE);
+            assert_eq!(token.get_allowance(owner, spender)?, value);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn explicit_reward_configuration_becomes_noop_at_t7() {
         let holder = Address::repeat_byte(0x66);
         let recipient = Address::repeat_byte(0x67);

@@ -142,28 +142,12 @@ pub trait PrecompileStorageProvider {
             return Ok(None);
         }
 
-        let recid = secp256k1::ecdsa::RecoveryId::try_from((v as i32) - 27)
-            .map_err(|_| TempoPrecompileError::Fatal("invalid recovery id".to_string()))?;
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(r.as_slice());
-        sig_bytes[32..].copy_from_slice(s.as_slice());
-        let sig = match secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid) {
-            Ok(sig) => sig,
-            Err(_) => return Ok(None),
-        };
-        let msg = secp256k1::Message::from_digest(*digest);
-        let pubkey = match secp256k1::SECP256K1.recover_ecdsa(&msg, &sig) {
-            Ok(pk) => pk,
-            Err(_) => return Ok(None),
-        };
-        let hash = keccak256(&pubkey.serialize_uncompressed()[1..]);
-        let recovered = Address::from_slice(&hash[12..]);
+        // Same as official: alloy's `recover_signer` rejects high-s (EIP-2) signatures.
+        let parity = v == 28;
+        let sig = alloy::primitives::Signature::from_scalars_and_parity(r, s, parity);
+        let recovered = alloy::consensus::crypto::secp256k1::recover_signer(&sig, digest);
 
-        if recovered.is_zero() {
-            Ok(None)
-        } else {
-            Ok(Some(recovered))
-        }
+        Ok(recovered.ok().filter(|addr| !addr.is_zero()))
     }
 }
 
