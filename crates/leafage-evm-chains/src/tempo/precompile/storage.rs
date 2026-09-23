@@ -365,7 +365,7 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         let deposit_cost = self.gas_params.code_deposit_cost(code.len());
         self.deduct_gas(deposit_cost)?;
 
-        let _ = self.internals.set_code(address, code);
+        self.internals.set_code(address, code)?;
         Ok(())
     }
 

@@ -1678,14 +1678,24 @@ where
         Ok(Self(values))
     }
 
-    /// Writes the set's values vector and length. The positions mapping at
-    /// `slot + 1` is NOT updated here — it is only used by single-element
-    /// `contains` / `insert` / `remove` paths. Full-replace writes via this
-    /// `store` (e.g. nested via parent struct `Storable::store`) skip them;
-    /// callers that need `contains` correctness afterwards must use
-    /// `SetHandler::write` which keeps positions in sync.
-    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        Vec::store(&self.0, storage, slot, LayoutCtx::FULL)
+    /// Rejected like writer `storage/types/set.rs`: a plain store cannot keep the
+    /// positions mapping in sync, so sets are written via `SetHandler::write`.
+    fn store<S: StorageOps>(&self, _storage: &mut S, _slot: U256, _ctx: LayoutCtx) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "Set must be stored via SetHandler::write() to maintain position invariants".into(),
+        ))
+    }
+
+    /// Clears every position entry, then the values vector (length and elements).
+    fn delete<S: StorageOps>(storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
+        let values: Vec<T> = Vec::load(storage, slot, LayoutCtx::FULL)?;
+
+        for value in values {
+            let pos_slot = value.mapping_slot(slot + U256::ONE);
+            <U256 as Storable>::delete(storage, pos_slot, LayoutCtx::FULL)?;
+        }
+
+        <Vec<T> as Storable>::delete(storage, slot, ctx)
     }
 }
 
@@ -2153,6 +2163,40 @@ mod tests {
             SetHandler::<Address>::new(slot, s.0).read()
         });
         assert_eq!(set.unwrap_err(), out_of_gas);
+    }
+
+    #[test]
+    fn set_storable_store_is_rejected_and_delete_clears_positions() {
+        let address = address!("0x9999999999999999999999999999999999999999");
+        let slot = U256::from(25);
+        let (first, second) = (Address::repeat_byte(0x01), Address::repeat_byte(0x02));
+        let mut provider = TestStorageProvider::new(TempoHardfork::T10);
+
+        let store_result = StorageCtx::enter(&mut provider, || {
+            let mut handler = SetHandler::<Address>::new(slot, address);
+            handler.write(Set::from(vec![first, second]))?;
+            <Set<Address> as Storable>::delete(
+                &mut TestStorageOps(address),
+                slot,
+                LayoutCtx::FULL,
+            )?;
+            assert!(!handler.contains(&first)?);
+            assert!(!handler.contains(&second)?);
+
+            Set::from(vec![first]).store(&mut TestStorageOps(address), slot, LayoutCtx::FULL)
+        });
+
+        assert!(matches!(store_result, Err(TempoPrecompileError::Fatal(_))));
+        // Length, both value slots and both positions are cleared; nothing was stored.
+        for key in [
+            slot,
+            calc_data_slot(slot),
+            calc_data_slot(slot) + U256::ONE,
+            first.mapping_slot(slot + U256::ONE),
+            second.mapping_slot(slot + U256::ONE),
+        ] {
+            assert_eq!(provider.storage(address, key), U256::ZERO);
+        }
     }
 
     #[test]
