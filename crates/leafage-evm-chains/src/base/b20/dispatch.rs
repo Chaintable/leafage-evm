@@ -3,17 +3,27 @@
 //! Transcribed from Base reth (`b20_asset/dispatch.rs`, `b20_stablecoin/dispatch.rs`).
 //! The preamble order — nonpayable check, calldata gas, initialization check — is charged
 //! before any handler runs and is part of every call's cost, so it must stay as Base has it.
+//!
+//! The logic version is resolved once per call from the executing block (see
+//! [`B20Version`]), and every call is gated on that version's frozen wire surface before it is
+//! decoded into the canonical (Cobalt) types — so a Cobalt selector, or the `SEIZE` pausable
+//! feature, is an unknown selector / decode failure on a Beryl block exactly as on Base.
+//!
+//! Known residual: Base's pre-Cobalt `AbiDecodeFailed` revert appends alloy's decoder message
+//! after the selector; leafage returns the selector alone, which is what Base returns from
+//! Cobalt on (`selector_only_abi_decode_errors`).
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
 
-use super::abi::{IB20, IB20Asset, IB20Stablecoin};
+use super::abi::{IB20, IB20Asset, IB20AssetV1, IB20Stablecoin, IB20V1};
 use super::error::{B20Error, Result};
 use super::ids;
 use super::layout::{B20Store, WAD};
-use super::permit::{self, PermitArgs};
 use super::ops;
+use super::permit::{self, PermitArgs};
 use super::port::B20Port;
+use super::version::B20Version;
 
 use IB20::IB20Calls as C;
 use IB20Asset::IB20AssetCalls as A;
@@ -51,7 +61,8 @@ pub fn dispatch<P: B20Port>(
     }
     port.deduct_gas(calldata_gas_cost(calldata))?;
 
-    let mut store = B20Store::new(port, address, is_asset);
+    let version = B20Version::resolve(port.chain_id(), port.timestamp());
+    let mut store = B20Store::new(port, address, is_asset, version);
 
     // An address with no marker bytecode is not a created token.
     if !store.is_initialized()? {
@@ -75,28 +86,54 @@ fn selector_of(calldata: &[u8]) -> Option<[u8; 4]> {
     })
 }
 
+/// A decode failure reverts with the bare selector.
+fn decode_failed(selector: [u8; 4]) -> B20Error {
+    B20Error::Revert(selector.to_vec().into())
+}
+
+/// Whether `selector` is on the asset-extension surface of `version`.
+fn asset_selector(version: B20Version, selector: [u8; 4]) -> bool {
+    match version {
+        B20Version::V1 => IB20AssetV1::IB20AssetV1Calls::valid_selector(selector),
+        B20Version::V2 => A::valid_selector(selector),
+    }
+}
+
+/// Whether `selector` is on the common B20 surface of `version`.
+fn common_selector(version: B20Version, selector: [u8; 4]) -> bool {
+    match version {
+        B20Version::V1 => IB20V1::IB20V1Calls::valid_selector(selector),
+        B20Version::V2 => C::valid_selector(selector),
+    }
+}
+
 /// Decodes and executes one call. `privileged` skips the checks the factory bypasses
 /// during token creation; leafage never creates tokens, so it is always `false` at entry
 /// and only becomes `true` inside `batchMint`'s inner mints.
-fn run<P: B20Port>(
+pub(super) fn run<P: B20Port>(
     store: &mut B20Store<'_, P>,
     calldata: &[u8],
     privileged: bool,
 ) -> Result<Bytes> {
+    // Base reports calldata shorter than a selector as the unknown selector `0x00000000`.
     let Some(selector) = selector_of(calldata) else {
-        return Err(B20Error::Revert(Bytes::new()));
+        return Err(decode_failed([0u8; 4]));
     };
+    let version = store.version();
 
     // Variant-specific selectors take precedence over the inherited IB20 set.
     if store.is_asset() {
-        if A::valid_selector(selector) {
-            let call = A::abi_decode_validate(calldata)
-                .map_err(|_| B20Error::Revert(selector.to_vec().into()))?;
+        if asset_selector(version, selector) {
+            if version == B20Version::V1 {
+                IB20AssetV1::IB20AssetV1Calls::abi_decode_validate(calldata)
+                    .map_err(|_| decode_failed(selector))?;
+            }
+            let call = A::abi_decode_validate(calldata).map_err(|_| decode_failed(selector))?;
             return run_asset(store, call, privileged);
         }
     } else if IB20Stablecoin::IB20StablecoinCalls::valid_selector(selector) {
         let call = IB20Stablecoin::IB20StablecoinCalls::abi_decode_validate(calldata)
-            .map_err(|_| B20Error::Revert(selector.to_vec().into()))?;
+            .map_err(|_| decode_failed(selector))?;
         return match call {
             IB20Stablecoin::IB20StablecoinCalls::currency(_) => {
                 Ok(store.currency()?.abi_encode().into())
@@ -104,11 +141,14 @@ fn run<P: B20Port>(
         };
     }
 
-    if !C::valid_selector(selector) {
-        return Err(B20Error::Revert(selector.to_vec().into()));
+    if !common_selector(version, selector) {
+        return Err(decode_failed(selector));
     }
-    let call =
-        C::abi_decode_validate(calldata).map_err(|_| B20Error::Revert(selector.to_vec().into()))?;
+    if version == B20Version::V1 {
+        // The frozen Beryl surface is what rejects the `SEIZE` pausable feature.
+        IB20V1::IB20V1Calls::abi_decode_validate(calldata).map_err(|_| decode_failed(selector))?;
+    }
+    let call = C::abi_decode_validate(calldata).map_err(|_| decode_failed(selector))?;
     run_b20(store, call, privileged)
 }
 
@@ -141,12 +181,15 @@ fn run_b20<P: B20Port>(
         C::PAUSE_ROLE(_) => ids::PAUSE_ROLE.abi_encode().into(),
         C::UNPAUSE_ROLE(_) => ids::UNPAUSE_ROLE.abi_encode().into(),
         C::METADATA_ROLE(_) => ids::METADATA_ROLE.abi_encode().into(),
+        C::SEIZE_ROLE(_) => ids::SEIZE_ROLE.abi_encode().into(),
 
         // --- Policy scope identifiers ---
         C::TRANSFER_SENDER_POLICY(_) => ids::TRANSFER_SENDER_POLICY.abi_encode().into(),
         C::TRANSFER_RECEIVER_POLICY(_) => ids::TRANSFER_RECEIVER_POLICY.abi_encode().into(),
         C::TRANSFER_EXECUTOR_POLICY(_) => ids::TRANSFER_EXECUTOR_POLICY.abi_encode().into(),
         C::MINT_RECEIVER_POLICY(_) => ids::MINT_RECEIVER_POLICY.abi_encode().into(),
+        C::SEIZE_EXEMPT_POLICY(_) => ids::SEIZE_EXEMPT_POLICY.abi_encode().into(),
+        C::SEIZE_RECEIVER_POLICY(_) => ids::SEIZE_RECEIVER_POLICY.abi_encode().into(),
 
         // --- Role reads ---
         C::hasRole(c) => store.has_role(c.role, c.account)?.abi_encode().into(),
@@ -223,6 +266,13 @@ fn run_b20<P: B20Port>(
         }
         C::burnBlocked(c) => {
             ops::burn_blocked(store, caller, c.from, c.amount, privileged)?;
+            Bytes::new()
+        }
+
+        // --- Seize (Cobalt) ---
+        // Never factory-privileged.
+        C::seizeWithMemo(c) => {
+            ops::seize_with_memo(store, caller, c.from, c.to, c.amount, c.memo)?;
             Bytes::new()
         }
 
@@ -316,12 +366,23 @@ fn run_asset<P: B20Port>(
         // --- Role / precision constants ---
         A::OPERATOR_ROLE(_) => ids::OPERATOR_ROLE.abi_encode().into(),
         A::WAD_PRECISION(_) => WAD.abi_encode().into(),
+        A::MAX_UI_MULTIPLIER(_) => ops::MAX_UI_MULTIPLIER.abi_encode().into(),
 
         // --- Multiplier reads ---
-        A::multiplier(_) => store.multiplier()?.abi_encode().into(),
+        // `uiMultiplier`, `toUIAmount`, `fromUIAmount` and `balanceOfUI` are ERC-8056 aliases.
+        A::multiplier(_) | A::uiMultiplier(_) => {
+            ops::effective_multiplier(store)?.abi_encode().into()
+        }
+        A::newUIMultiplier(_) => ops::new_ui_multiplier(store)?.abi_encode().into(),
+        A::effectiveAt(_) => ops::effective_at(store)?.abi_encode().into(),
         A::toScaledBalance(c) => ops::to_scaled_balance(store, c.rawBalance)?.abi_encode().into(),
+        A::toUIAmount(c) => ops::to_scaled_balance(store, c.rawAmount)?.abi_encode().into(),
         A::toRawBalance(c) => ops::to_raw_balance(store, c.scaledBalance)?.abi_encode().into(),
+        A::fromUIAmount(c) => ops::to_raw_balance(store, c.uiAmount)?.abi_encode().into(),
         A::scaledBalanceOf(c) => ops::scaled_balance_of(store, c.account)?.abi_encode().into(),
+        A::balanceOfUI(c) => ops::scaled_balance_of(store, c.account)?.abi_encode().into(),
+        A::totalSupplyUI(_) => ops::total_supply_ui(store)?.abi_encode().into(),
+        A::supportsInterface(c) => ops::supports_interface(c.interfaceId).abi_encode().into(),
 
         // --- Announcement / metadata reads ---
         A::isAnnouncementIdUsed(c) => {
@@ -332,6 +393,14 @@ fn run_asset<P: B20Port>(
         // --- Mutations ---
         A::updateMultiplier(c) => {
             ops::update_multiplier(store, caller, c.newMultiplier, privileged)?;
+            Bytes::new()
+        }
+        A::updateUIMultiplier(c) => {
+            ops::update_ui_multiplier(store, caller, c.newMultiplier, c.effectiveAt, privileged)?;
+            Bytes::new()
+        }
+        A::cancelUIMultiplierUpdate(_) => {
+            ops::cancel_ui_multiplier_update(store, caller, privileged)?;
             Bytes::new()
         }
         A::updateExtraMetadata(c) => {
@@ -393,9 +462,10 @@ fn announce<P: B20Port>(
             return Err(B20Error::revert(IB20Asset::AnnouncementInProgress {}));
         }
         run(store, bytes, privileged).map_err(|err| match err {
-            // System errors propagate unchanged; ordinary reverts are wrapped.
+            // System errors (Base's `is_system_error`: out of gas, fatal, panics) propagate
+            // unchanged; ordinary reverts are wrapped.
             B20Error::OutOfGas | B20Error::StaticCallViolation | B20Error::Fatal(_) => err,
-            B20Error::UnderOverflow => err,
+            B20Error::Panic(_) => err,
             B20Error::Revert(_) => {
                 B20Error::revert(IB20Asset::InternalCallFailed { call: inner.clone() })
             }
