@@ -3,6 +3,7 @@ use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
+use crate::api_impl::estimate_gas_debug::{self, EstimateTrace, ReadTracker};
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
 };
@@ -725,11 +726,7 @@ where
                 continue;
             }
             let res = self.debank_single_call_from_state_impl_inner(
-                &state,
-                &block,
-                &block_env,
-                &db,
-                request,
+                &state, &block, &block_env, &db, request,
             )?;
             if res.code != 0 {
                 stats.success = false;
@@ -1134,19 +1131,25 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
         cancel_token: CancellationToken,
+        trace: EstimateTrace,
     ) -> RpcResult<U256> {
+        let state_read = trace.stage("state_acquisition");
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
+        trace.resolved_block(block.header.number, block.header.hash);
+        drop(state_read);
+        let reads = ReadTracker::new(trace.clone());
+        let preparation = trace.stage("transaction_preparation");
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(EvmStorageWrapper {
+        let mut cache_db = CacheDB::new(reads.backing(EvmStorageWrapper {
             db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        }));
         if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(
                 overrides,
@@ -1158,7 +1161,7 @@ where
         // The binary search below re-executes the same tx many times;
         // the request-scoped cache lets every retry after the first read
         // its state from memory instead of re-walking the layered state.
-        let memory_db = utils::RequestCacheDB::new(cache_db);
+        let memory_db = reads.cached(utils::RequestCacheDB::new(cache_db));
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
@@ -1189,6 +1192,8 @@ where
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         tx.set_gas_estimation();
+        drop(preparation);
+        let prechecks = trace.stage("prechecks");
         // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
         // adds 250k gas that this optimization doesn't account for. The early return
         // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
@@ -1205,12 +1210,17 @@ where
                         let mut tx = tx.clone();
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
                         if let Ok(exec_res) =
-                            self.inner.transact(&block_env, &memory_db, tx.clone())
+                            trace.execute("transfer_probe", tx.gas_limit(), || {
+                                self.inner.transact(&block_env, &memory_db, tx.clone())
+                            })
                         {
                             if exec_res.is_success() {
-                                let l1_overhead = self
-                                    .inner
-                                    .estimate_l1_overhead(&block, &block_env, tx, &memory_db);
+                                let l1_overhead = {
+                                    let _stage = trace.stage("l1_overhead");
+                                    self.inner
+                                        .estimate_l1_overhead(&block, &block_env, tx, &memory_db)
+                                };
+                                trace.exit_reason("simple_transfer");
                                 return Ok(U256::from(
                                     MIN_TRANSACTION_GAS.saturating_add(l1_overhead),
                                 ));
@@ -1228,9 +1238,11 @@ where
         }
         tx.set_gas_limit(tx.gas_limit().min(highest_gas_limit));
 
-        let res = self
-            .inner
-            .transact(&block_env, &memory_db, tx.clone())
+        drop(prechecks);
+        let res = trace
+            .execute("initial", tx.gas_limit(), || {
+                self.inner.transact(&block_env, &memory_db, tx.clone())
+            })
             .map_err(|e| e.to_rpc_error())?;
 
         let gas_refund = match res {
@@ -1255,14 +1267,16 @@ where
         highest_gas_limit = tx.gas_limit();
         let mut gas_used = res.gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
+        trace.gas_range(lowest_gas_limit, highest_gas_limit);
 
         let optimistic_gas_limit = (gas_used + gas_refund + CALL_STIPEND_GAS) * 64 / 63;
 
         if optimistic_gas_limit < highest_gas_limit {
             tx.set_gas_limit(optimistic_gas_limit);
-            let res = self
-                .inner
-                .transact(&block_env, &memory_db, tx.clone())
+            let res = trace
+                .execute("optimistic", tx.gas_limit(), || {
+                    self.inner.transact(&block_env, &memory_db, tx.clone())
+                })
                 .map_err(|e| e.to_rpc_error())?;
             gas_used = res.gas_used();
             update_estimated_gas_range(
@@ -1271,6 +1285,7 @@ where
                 &mut highest_gas_limit,
                 &mut lowest_gas_limit,
             )?;
+            trace.gas_range(lowest_gas_limit, highest_gas_limit);
         };
 
         // Pick a point that's close to the estimated gas
@@ -1279,9 +1294,11 @@ where
             ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64,
         );
 
+        trace.exit_reason("gas_range");
         // https://github.com/paradigmxyz/reth/pull/16413
         while (lowest_gas_limit + 1) < highest_gas_limit {
             if cancel_token.is_cancelled() {
+                trace.exit_reason("cancelled");
                 return Err(internal_rpc_err(
                     "estimate gas cancelled by caller".to_string(),
                 ));
@@ -1289,12 +1306,15 @@ where
             if (highest_gas_limit - lowest_gas_limit) as f64 / (highest_gas_limit as f64)
                 < ESTIMATE_GAS_ERROR_RATIO
             {
+                trace.exit_reason("tolerance");
                 break;
             };
 
             tx.set_gas_limit(mid_gas_limit);
 
-            let res = self.inner.transact(&block_env, &memory_db, tx.clone());
+            let res = trace.execute("binary_search", tx.gas_limit(), || {
+                self.inner.transact(&block_env, &memory_db, tx.clone())
+            });
 
             match res {
                 Err(e) => {
@@ -1329,6 +1349,7 @@ where
                 }
             };
 
+            trace.gas_range(lowest_gas_limit, highest_gas_limit);
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
@@ -1341,9 +1362,11 @@ where
         };
 
         tx.set_gas_limit(final_gas);
-        let l1_overhead =
+        let l1_overhead = {
+            let _stage = trace.stage("l1_overhead");
             self.inner
-                .estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db);
+                .estimate_l1_overhead(&block, &block_env, tx.clone(), &memory_db)
+        };
 
         Ok(U256::from(final_gas.saturating_add(l1_overhead)))
     }
@@ -1356,8 +1379,17 @@ where
     ) -> RpcResult<U256> {
         let limiter = self.inner.evm_cfg().exec_limiter.clone();
         let this = self.clone();
-        utils::spawn_blocking_limited_with_cancel(limiter, move |token| {
-            this.debank_estimate_gas_inner(request, block_ctx, block_overrides, token)
+        let trace = EstimateTrace::current();
+        estimate_gas_debug::spawn_blocking(limiter, trace.clone(), move |token| {
+            let result = this.debank_estimate_gas_inner(
+                request,
+                block_ctx,
+                block_overrides,
+                token,
+                trace.clone(),
+            );
+            trace.local_result(&result);
+            result
         })
         .await
         .inspect_err(|err| error!("Failed to spawn debank_estimate result: {:?}", err))
@@ -1769,13 +1801,21 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
-        match self
+        let trace = EstimateTrace::current();
+        trace.context(
+            self.inner.evm_cfg().cfg.chain_id,
+            &self.inner.evm_cfg().version,
+            &request,
+        );
+        let local = self
             .debank_estimate_gas_impl(request.clone(), block_ctx.clone(), block_overrides.clone())
-            .await
-        {
+            .await;
+        trace.local_result(&local);
+        let result = match local {
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
+                    let _stage = trace.stage("historical_rpc");
                     match historical_client
                         .estimate_gas(request, block_ctx, block_overrides)
                         .await
@@ -1787,6 +1827,8 @@ where
                     Err(err)
                 }
             }
-        }
+        };
+        trace.final_result(&result);
+        result
     }
 }
