@@ -32,6 +32,7 @@ mod base;
 mod bsc;
 mod citrea;
 mod op;
+pub use op::build_op_custom_config;
 mod hemi;
 mod mantle;
 mod warmup;

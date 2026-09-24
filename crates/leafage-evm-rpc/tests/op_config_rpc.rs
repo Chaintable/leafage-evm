@@ -2,14 +2,16 @@
 use alloy::primitives::keccak256;
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
-use leafage_evm_rpc::{ApiBuilder, DebankApiClient, EthApiClient, MultiChainCfgEnv};
+use leafage_evm_rpc::{
+    build_op_custom_config, ApiBuilder, DebankApiClient, EthApiClient, MultiChainCfgEnv,
+};
 use leafage_evm_storage::{
     EvmStorageWrite, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
     StorageKind,
 };
 use leafage_evm_types::{
     Address, Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, Bytes, CallRequest,
-    CfgEnv, NewAccount, NewCode, OpSpecId, H256, U256,
+    NewAccount, NewCode, OpSpecId, H256, U256,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -18,10 +20,16 @@ async fn op_config_reaches_call_estimate_multicall_and_trace() {
     let alice = Address::repeat_byte(0x11);
     let contract = Address::repeat_byte(0x22);
     let code: Bytes = "60011e60005260206000f3".parse().unwrap();
-    for (name, spec, sizes) in [
-        ("default", OpSpecId::OSAKA, None),
-        ("rise", OpSpecId::JOVIAN, Some((262144, 524288))),
-        ("metis_sizes", OpSpecId::OSAKA, Some((2457600, usize::MAX))),
+    for (name, json) in [
+        ("default", "{}"),
+        (
+            "rise",
+            r#"{"op_spec_id":"Jovian","limit_contract_code_size":262144,"limit_contract_initcode_size":524288}"#,
+        ),
+        (
+            "metis_sizes",
+            r#"{"limit_contract_code_size":2457600,"limit_contract_initcode_size":"unlimited"}"#,
+        ),
     ] {
         let path =
             std::env::temp_dir().join(format!("leafage-op-rpc-{}-{name}", std::process::id()));
@@ -59,16 +67,14 @@ async fn op_config_reaches_call_estimate_multicall_and_trace() {
         .unwrap();
         let tree =
             Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
-        let mut cfg = CfgEnv::new_with_spec(spec);
+        let mut cfg = build_op_custom_config(Some(json)).unwrap();
+        let spec = cfg.spec;
+        let raised = cfg.limit_contract_code_size.is_some();
         cfg.disable_balance_check = true;
         cfg.disable_eip3607 = true;
         cfg.disable_base_fee = true;
         cfg.disable_block_gas_limit = true;
         cfg.tx_gas_limit_cap = Some(100_000_000);
-        if let Some((code, init)) = sizes {
-            cfg.limit_contract_code_size = Some(code);
-            cfg.limit_contract_initcode_size = Some(init);
-        }
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         drop(socket);
@@ -128,7 +134,7 @@ async fn op_config_reaches_call_estimate_multicall_and_trace() {
                     rpc_params![vec![request.clone()], latest],
                 )
                 .await;
-            if sizes.is_some() {
+            if raised {
                 let output = call.unwrap();
                 assert_eq!(output.len(), if is_initcode { 0 } else { 24577 });
                 assert!(output.iter().all(|b| *b == 0));

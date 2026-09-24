@@ -1,4 +1,5 @@
-//! Exercise the production OP transaction builder and both execution paths.
+//! Exercise the production OP config parser, transaction builder and both execution paths.
+use super::build_op_custom_config;
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::{core::EvmExecutor, ApiImpl};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
@@ -11,16 +12,18 @@ use revm::context::BlockEnv;
 use revm::database::{CacheDB, EmptyDB};
 use revm_inspectors::tracing::TracingInspectorConfig;
 
-fn cfg(spec: OpSpecId, code: Option<usize>, init: Option<usize>) -> CfgEnv<OpSpecId> {
-    let mut cfg = CfgEnv::new_with_spec(spec);
+const RISE: &str = r#"{"op_spec_id":"Jovian","limit_contract_code_size":262144,"limit_contract_initcode_size":524288}"#;
+const METIS: &str =
+    r#"{"limit_contract_code_size":2457600,"limit_contract_initcode_size":"unlimited"}"#;
+
+fn cfg(json: &str) -> CfgEnv<OpSpecId> {
+    let mut cfg = build_op_custom_config(Some(json)).unwrap();
     cfg.disable_balance_check = true;
     cfg.disable_eip3607 = true;
     cfg.disable_base_fee = true;
     cfg.disable_block_gas_limit = true;
     // Metis code-deposit boundary needs ~492M gas. Test-only, not an RPC default.
     cfg.tx_gas_limit_cap = Some(1_000_000_000);
-    cfg.limit_contract_code_size = code;
-    cfg.limit_contract_initcode_size = init;
     cfg
 }
 
@@ -128,10 +131,14 @@ fn factory(create2: bool) -> Vec<u8> {
 
 #[test]
 fn code_limits_cover_top_level_and_internal_creation() {
-    for (limit, init) in [(24576, 49152), (262144, 524288), (2457600, usize::MAX)] {
+    for (limit, json) in [
+        (24576, r#"{"op_spec_id":"Jovian"}"#),
+        (262144, RISE),
+        (2457600, METIS),
+    ] {
         for inspect in [false, true] {
             for size in [limit, limit + 1] {
-                let config = cfg(OpSpecId::JOVIAN, Some(limit), Some(init));
+                let config = cfg(json);
                 let result = execute(config.clone(), runtime(size), None, inspect).unwrap();
                 if size == limit {
                     assert!(result.is_success(), "{result:?}");
@@ -169,9 +176,20 @@ fn code_limits_cover_top_level_and_internal_creation() {
 
 #[test]
 fn initcode_limits_cover_top_level_and_internal_creation() {
-    for limit in [49152, 524288] {
+    for (limit, json) in [
+        (49152, r#"{"op_spec_id":"Jovian"}"#),
+        (
+            524288,
+            r#"{"op_spec_id":"Jovian","limit_contract_initcode_size":524288}"#,
+        ),
+        // Code-only override: initcode follows revm's 2 * code size.
+        (
+            524288,
+            r#"{"op_spec_id":"Jovian","limit_contract_code_size":262144}"#,
+        ),
+    ] {
         for inspect in [false, true] {
-            let config = cfg(OpSpecId::JOVIAN, None, Some(limit));
+            let config = cfg(json);
             assert!(execute(config.clone(), vec![0; limit], None, inspect)
                 .unwrap()
                 .is_success());
@@ -220,14 +238,16 @@ fn initcode_limits_cover_top_level_and_internal_creation() {
 #[test]
 fn unlimited_initcode_and_early_forks_do_not_add_a_length_limit() {
     for inspect in [false, true] {
-        let metis = cfg(OpSpecId::OSAKA, Some(2457600), Some(usize::MAX));
+        let metis = cfg(METIS);
         for contract in [None, Some(factory(false)), Some(factory(true))] {
             assert!(execute(metis.clone(), vec![0; 4915201], contract, inspect)
                 .unwrap()
                 .is_success());
         }
-        for spec in [OpSpecId::BEDROCK, OpSpecId::REGOLITH] {
-            let early = cfg(spec, None, Some(0));
+        for spec in ["Bedrock", "Regolith"] {
+            let early = cfg(&format!(
+                r#"{{"op_spec_id":"{spec}","limit_contract_initcode_size":0}}"#
+            ));
             assert!(execute(early, vec![0; 49153], None, inspect)
                 .unwrap()
                 .is_success());
@@ -239,13 +259,7 @@ fn unlimited_initcode_and_early_forks_do_not_add_a_length_limit() {
 fn clz_follows_spec_with_rise_size_overrides() {
     for inspect in [false, true] {
         let code = vec![0x60, 1, 0x1e, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3];
-        let rise = execute(
-            cfg(OpSpecId::JOVIAN, Some(262144), Some(524288)),
-            vec![],
-            Some(code.clone()),
-            inspect,
-        )
-        .unwrap();
+        let rise = execute(cfg(RISE), vec![], Some(code.clone()), inspect).unwrap();
         assert!(
             matches!(
                 rise,
@@ -256,13 +270,7 @@ fn clz_follows_spec_with_rise_size_overrides() {
             ),
             "{rise:?}"
         );
-        let osaka = execute(
-            cfg(OpSpecId::OSAKA, None, None),
-            vec![],
-            Some(code),
-            inspect,
-        )
-        .unwrap();
+        let osaka = execute(cfg("{}"), vec![], Some(code), inspect).unwrap();
         assert_eq!(
             U256::from_be_slice(osaka.output().unwrap()),
             U256::from(255)
@@ -276,10 +284,10 @@ fn p256_precompile_follows_op_fork_in_normal_and_trace_execution() {
     let input: Bytes = "4cee90eb86eaa050036147a12d49004b6b9c72bd725d39d4785011fe190f0b4da73bd4903f0ce3b639bbbf6e8e80d16931ff4bcf5993d58468e8fb19086e8cac36dbcd03009df8c59286b162af3bd7fcc0450c9aa81be5d10d312af6c66b1d604aebd3099c618202fcfe16ae7770b0c49ab5eadf74b754204a3bb6060e44eff37618b065f9832de4ca6ca971a7a1adc826d0f7c00181a5fb2ddf79ae00b4e10e".parse().unwrap();
     for inspect in [false, true] {
         let mut results = Vec::new();
-        for spec in [OpSpecId::ECOTONE, OpSpecId::FJORD] {
+        for spec in ["Ecotone", "Fjord"] {
             let api: ApiImpl<(), OpSpecId, NoneEvmCustomConfig> = ApiImpl::new(
                 (),
-                cfg(spec, None, None),
+                cfg(&format!(r#"{{"op_spec_id":"{spec}"}}"#)),
                 None,
                 None,
                 None,
