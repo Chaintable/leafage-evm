@@ -3,9 +3,9 @@ use futures::FutureExt;
 use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::server::MethodResponse;
 use jsonrpsee::types::Request;
-use metrics::{counter, histogram};
 #[cfg(any(target_os = "linux", test))]
 use metrics::gauge;
+use metrics::{counter, histogram};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{BoxError, Layer, Service};
@@ -130,17 +130,26 @@ where
         async move {
             let method_name = req.method_name().to_string();
             let start = std::time::Instant::now();
+            let trace = (method_name == "estimateGas")
+                .then(|| crate::api_impl::estimate_gas_debug::EstimateTrace::new(start, &req));
+            let mut trace_guard = trace.as_ref().map(|trace| trace.rpc_guard());
             let call_time_metric = histogram!(
                 "leafage_rpc_call_time",
                 &[("method_name", method_name.clone())]
             );
-            let rsp = service.call(req).await;
-            let duration = start.elapsed().as_secs_f64();
-            call_time_metric.record(duration);
+            let rsp = match &trace {
+                Some(trace) => trace.scope(service.call(req)).await,
+                None => service.call(req).await,
+            };
+            let duration = start.elapsed();
+            call_time_metric.record(duration.as_secs_f64());
             let mut return_code = 0;
             if let Some(code) = rsp.as_error_code() {
                 return_code = code
             };
+            if let Some(guard) = &mut trace_guard {
+                guard.finish(duration, return_code);
+            }
             let call_status_metric = counter!(
                 "leafage_rpc_call_status",
                 &[

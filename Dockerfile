@@ -64,6 +64,14 @@ RUN cargo test --release -p leafage-evm-chains --lib \
     && cargo test --release -p leafage-evm-chains --lib -- \
         --ignored --test-threads=1
 
+FROM builder AS rpc-debug-tests
+
+# Run only in CI's explicit test target; the runtime image and entrypoint stay
+# identical to the normal build. Exercise cancellation/cache diagnostics and
+# real estimateGas execution over RocksDB plus in-memory state layers.
+RUN cargo test --release -p leafage-evm-rpc --lib estimate_gas_debug \
+    && cargo test --release -p leafage-evm-rpc --test e2e_smoke
+
 FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
