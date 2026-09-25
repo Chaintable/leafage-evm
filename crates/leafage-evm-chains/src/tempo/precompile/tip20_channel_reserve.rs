@@ -1211,4 +1211,624 @@ mod tests {
             .abi_encode()
         );
     }
+
+    // TIP-1095 (T12) tests ported from tempo `tip20_channel_reserve/mod.rs` (upstream 402e2722).
+
+    use crate::tempo::precompile::tip20::PAUSE_ROLE;
+    use crate::tempo::precompile::tip403_registry::{
+        ITIP403Registry, TIP403Registry, ALLOW_ALL_POLICY_ID,
+    };
+    use crate::tempo::precompile::RECEIVE_POLICY_GUARD_ADDRESS;
+
+    fn policy_forbids() -> TempoPrecompileError {
+        TempoPrecompileError::Revert(ITIP20::PolicyForbids {}.abi_encode().into())
+    }
+
+    fn path_usd() -> TIP20Token {
+        TIP20Token::from_address_unchecked(super::super::PATH_USD_ADDRESS)
+    }
+
+    fn balance(token: &TIP20Token, account: Address) -> Result<U256> {
+        token.balance_of(ITIP20::balanceOfCall { account })
+    }
+
+    /// Initializes pathUSD with `admin` as admin and issuer, minting `amount` to `admin`.
+    fn setup_path_usd(admin: Address, amount: u128, roles: &[B256]) -> Result<TIP20Token> {
+        let mut token = path_usd();
+        token.initialize(
+            Address::ZERO,
+            "Path USD",
+            "pathUSD",
+            "USD",
+            super::super::PATH_USD_ADDRESS,
+            admin,
+        )?;
+        for &role in [*ISSUER_ROLE].iter().chain(roles) {
+            token.grant_role(
+                admin,
+                IRolesAuth::grantRoleCall {
+                    role,
+                    account: admin,
+                },
+            )?;
+        }
+        token.mint(
+            admin,
+            ITIP20::mintCall {
+                to: admin,
+                amount: U256::from(amount),
+            },
+        )?;
+        Ok(token)
+    }
+
+    /// Opens a pathUSD channel without operator or authorized signer.
+    fn open_channel(
+        reserve: &mut TIP20ChannelReserve,
+        payer: Address,
+        payee: Address,
+        deposit: u128,
+        salt: B256,
+        context_hash: B256,
+    ) -> Result<(B256, ITIP20ChannelReserve::ChannelDescriptor)> {
+        reserve.set_channel_open_context_hash(context_hash)?;
+        let channel_id = reserve.open(
+            payer,
+            ITIP20ChannelReserve::openCall {
+                payee,
+                operator: Address::ZERO,
+                token: super::super::PATH_USD_ADDRESS,
+                deposit: U96::from(deposit),
+                salt,
+                authorizedSigner: Address::ZERO,
+            },
+        )?;
+        let descriptor = ITIP20ChannelReserve::ChannelDescriptor {
+            payer,
+            payee,
+            operator: Address::ZERO,
+            token: super::super::PATH_USD_ADDRESS,
+            salt,
+            authorizedSigner: Address::ZERO,
+            expiringNonceHash: context_hash,
+        };
+        Ok((channel_id, descriptor))
+    }
+
+    fn sign_voucher(
+        reserve: &TIP20ChannelReserve,
+        signer: &k256::ecdsa::SigningKey,
+        channel_id: B256,
+        amount: U96,
+    ) -> Result<Bytes> {
+        let digest = reserve.get_voucher_digest(ITIP20ChannelReserve::getVoucherDigestCall {
+            channelId: channel_id,
+            cumulativeAmount: amount,
+        })?;
+        let signature: alloy::primitives::Signature = signer
+            .sign_prehash_recoverable(digest.as_slice())
+            .unwrap()
+            .into();
+        Ok(Bytes::copy_from_slice(&signature.as_bytes()))
+    }
+
+    fn channel_state(
+        reserve: &TIP20ChannelReserve,
+        channel_id: B256,
+    ) -> Result<ITIP20ChannelReserve::ChannelState> {
+        reserve.get_channel_state(ITIP20ChannelReserve::getChannelStateCall {
+            channelId: channel_id,
+        })
+    }
+
+    fn set_blacklisted(
+        registry: &mut TIP403Registry,
+        admin: Address,
+        policy_id: u64,
+        account: Address,
+        restricted: bool,
+    ) -> Result<()> {
+        registry.modify_policy_blacklist(
+            admin,
+            ITIP403Registry::modifyPolicyBlacklistCall {
+                policyId: policy_id,
+                account,
+                restricted,
+            },
+        )
+    }
+
+    fn install_recipient_whitelist_policy(
+        token: &mut TIP20Token,
+        admin: Address,
+        recipients: &[Address],
+    ) -> Result<()> {
+        let mut registry = TIP403Registry::new();
+        registry.initialize()?;
+        let recipient_policy = registry.create_policy_with_accounts(
+            admin,
+            ITIP403Registry::createPolicyWithAccountsCall {
+                admin,
+                policyType: ITIP403Registry::PolicyType::WHITELIST,
+                accounts: recipients.to_vec(),
+            },
+        )?;
+        let compound_policy = registry.create_compound_policy(
+            admin,
+            ITIP403Registry::createCompoundPolicyCall {
+                senderPolicyId: ALLOW_ALL_POLICY_ID,
+                recipientPolicyId: recipient_policy,
+                mintRecipientPolicyId: ALLOW_ALL_POLICY_ID,
+            },
+        )?;
+        token.change_transfer_policy_id(
+            admin,
+            ITIP20::changeTransferPolicyIdCall {
+                newPolicyId: compound_policy,
+            },
+        )
+    }
+
+    fn install_receive_sender_blacklist(
+        receiver: Address,
+        blocked_sender: Address,
+    ) -> Result<(TIP403Registry, u64)> {
+        let mut registry = TIP403Registry::new();
+        registry.initialize()?;
+        let sender_policy = registry.create_policy_with_accounts(
+            receiver,
+            ITIP403Registry::createPolicyWithAccountsCall {
+                admin: receiver,
+                policyType: ITIP403Registry::PolicyType::BLACKLIST,
+                accounts: vec![blocked_sender],
+            },
+        )?;
+        registry.set_receive_policy(
+            receiver,
+            ITIP403Registry::setReceivePolicyCall {
+                senderPolicyId: sender_policy,
+                tokenFilterId: ALLOW_ALL_POLICY_ID,
+                recoveryAuthority: Address::ZERO,
+            },
+        )?;
+        Ok((registry, sender_policy))
+    }
+
+    #[test]
+    fn t12_recipient_restricted_token_supports_channel_capture_and_refund() -> Result<()> {
+        let signer = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let payer = Address::from_public_key(signer.verifying_key());
+        let payee = Address::repeat_byte(0x22);
+        let stranger = Address::repeat_byte(0x33);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = setup_path_usd(payer, 1_000, &[])?;
+            install_recipient_whitelist_policy(&mut token, payer, &[payee])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+
+            // The reserve is not an authorized recipient, but the logical payer -> payee path is.
+            let (channel_id, descriptor) = open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            )?;
+            reserve.top_up(
+                payer,
+                ITIP20ChannelReserve::topUpCall {
+                    descriptor: descriptor.clone(),
+                    additionalDeposit: U96::from(20),
+                },
+            )?;
+            let signature = sign_voucher(&reserve, &signer, channel_id, U96::from(40))?;
+            reserve.settle(
+                payee,
+                ITIP20ChannelReserve::settleCall {
+                    descriptor: descriptor.clone(),
+                    cumulativeAmount: U96::from(40),
+                    signature,
+                },
+            )?;
+
+            // Exercise a positive capture delta and a refund in the same close.
+            let signature = sign_voucher(&reserve, &signer, channel_id, U96::from(60))?;
+            reserve.close(
+                payee,
+                ITIP20ChannelReserve::closeCall {
+                    descriptor,
+                    cumulativeAmount: U96::from(60),
+                    captureAmount: U96::from(60),
+                    signature,
+                },
+            )?;
+
+            assert_eq!(balance(&token, payer)?, U256::from(940));
+            assert_eq!(balance(&token, payee)?, U256::from(60));
+            assert_eq!(balance(&token, TIP20_CHANNEL_RESERVE_ADDRESS)?, U256::ZERO);
+
+            // The channel path does not weaken ordinary transfer restrictions.
+            let result = token.transfer(
+                payer,
+                ITIP20::transferCall {
+                    to: stranger,
+                    amount: U256::ONE,
+                },
+            );
+            assert_eq!(result, Err(policy_forbids()));
+
+            // A caller cannot use the reserve to route value to an unauthorized payee.
+            let result = open_channel(
+                &mut reserve,
+                payer,
+                stranger,
+                1,
+                B256::repeat_byte(3),
+                B256::repeat_byte(4),
+            );
+            assert_eq!(result.unwrap_err(), policy_forbids());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn t12_funding_checks_payee_receive_policy() -> Result<()> {
+        let payer = Address::repeat_byte(0x11);
+        let payee = Address::repeat_byte(0x22);
+        let salt = B256::repeat_byte(1);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+
+        StorageCtx::enter(&mut provider, || {
+            let token = setup_path_usd(payer, 1_000, &[])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            let (mut registry, sender_policy) = install_receive_sender_blacklist(payee, payer)?;
+
+            let result = open_channel(&mut reserve, payer, payee, 100, salt, B256::repeat_byte(2));
+            assert_eq!(result.unwrap_err(), policy_forbids());
+            assert_eq!(balance(&token, payer)?, U256::from(1_000));
+
+            set_blacklisted(&mut registry, payee, sender_policy, payer, false)?;
+            let (channel_id, descriptor) =
+                open_channel(&mut reserve, payer, payee, 100, salt, B256::repeat_byte(3))?;
+
+            set_blacklisted(&mut registry, payee, sender_policy, payer, true)?;
+            let result = reserve.top_up(
+                payer,
+                ITIP20ChannelReserve::topUpCall {
+                    descriptor,
+                    additionalDeposit: U96::from(1),
+                },
+            );
+            assert_eq!(result, Err(policy_forbids()));
+            assert_eq!(channel_state(&reserve, channel_id)?.deposit, U96::from(100));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn t12_grandfathers_pre_t12_receive_policy_sender() -> Result<()> {
+        assert_eq!(<PackedChannelState as StorableType>::SLOTS, 1);
+
+        let signer = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let payer = Address::from_public_key(signer.verifying_key());
+        let payee = Address::repeat_byte(0x22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+
+        let (channel_id, descriptor) = StorageCtx::enter(&mut provider, || {
+            setup_path_usd(payer, 1_000, &[])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            // This payee accepts the reserve but not the individual payer, matching the policy
+            // under which pre-T12 channel captures were funded.
+            install_receive_sender_blacklist(payee, payer)?;
+            open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            )
+        })?;
+
+        provider.set_spec(TempoHardfork::T12);
+        StorageCtx::enter(&mut provider, || {
+            let token = path_usd();
+            let mut reserve = TIP20ChannelReserve::new();
+
+            // Post-activation top-ups and captures retain the reserve sender for this channel.
+            reserve.top_up(
+                payer,
+                ITIP20ChannelReserve::topUpCall {
+                    descriptor: descriptor.clone(),
+                    additionalDeposit: U96::from(20),
+                },
+            )?;
+            let signature = sign_voucher(&reserve, &signer, channel_id, U96::from(40))?;
+            reserve.settle(
+                payee,
+                ITIP20ChannelReserve::settleCall {
+                    descriptor: descriptor.clone(),
+                    cumulativeAmount: U96::from(40),
+                    signature,
+                },
+            )?;
+            let signature = sign_voucher(&reserve, &signer, channel_id, U96::from(60))?;
+            reserve.close(
+                payee,
+                ITIP20ChannelReserve::closeCall {
+                    descriptor,
+                    cumulativeAmount: U96::from(60),
+                    captureAmount: U96::from(60),
+                    signature,
+                },
+            )?;
+
+            assert_eq!(balance(&token, payer)?, U256::from(940));
+            assert_eq!(balance(&token, payee)?, U256::from(60));
+            assert_eq!(balance(&token, TIP20_CHANNEL_RESERVE_ADDRESS)?, U256::ZERO);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn t12_blocked_capture_reverts_and_remains_retryable() -> Result<()> {
+        let signer = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let payer = Address::from_public_key(signer.verifying_key());
+        let payee = Address::repeat_byte(0x22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+
+        StorageCtx::enter(&mut provider, || {
+            let token = setup_path_usd(payer, 1_000, &[])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            let (channel_id, descriptor) = open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            )?;
+
+            // Receive policies remain mutable after funding. The payee now rejects only the
+            // logical payer, while the physical reserve sender remains authorized.
+            let (mut registry, sender_policy) = install_receive_sender_blacklist(payee, payer)?;
+
+            let cumulative = U96::from(40);
+            let signature = sign_voucher(&reserve, &signer, channel_id, cumulative)?;
+            let result = reserve.settle(
+                payee,
+                ITIP20ChannelReserve::settleCall {
+                    descriptor: descriptor.clone(),
+                    cumulativeAmount: cumulative,
+                    signature: signature.clone(),
+                },
+            );
+            assert_eq!(result, Err(policy_forbids()));
+            assert_eq!(balance(&token, payer)?, U256::from(900));
+            assert_eq!(balance(&token, payee)?, U256::ZERO);
+            assert_eq!(
+                balance(&token, TIP20_CHANNEL_RESERVE_ADDRESS)?,
+                U256::from(100)
+            );
+            assert_eq!(balance(&token, RECEIVE_POLICY_GUARD_ADDRESS)?, U256::ZERO);
+            assert_eq!(channel_state(&reserve, channel_id)?.settled, U96::ZERO);
+
+            let result = reserve.close(
+                payee,
+                ITIP20ChannelReserve::closeCall {
+                    descriptor: descriptor.clone(),
+                    cumulativeAmount: cumulative,
+                    captureAmount: cumulative,
+                    signature: signature.clone(),
+                },
+            );
+            assert_eq!(result, Err(policy_forbids()));
+            let state = channel_state(&reserve, channel_id)?;
+            assert_eq!(state.deposit, U96::from(100));
+            assert_eq!(state.settled, U96::ZERO);
+
+            // Once the payee accepts the logical payer, the same voucher can settle.
+            set_blacklisted(&mut registry, payee, sender_policy, payer, false)?;
+            reserve.settle(
+                payee,
+                ITIP20ChannelReserve::settleCall {
+                    descriptor,
+                    cumulativeAmount: cumulative,
+                    signature,
+                },
+            )?;
+            assert_eq!(balance(&token, payee)?, U256::from(40));
+            assert_eq!(channel_state(&reserve, channel_id)?.settled, cumulative);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn t12_recipient_restricted_token_supports_unilateral_withdraw() -> Result<()> {
+        let payer = Address::repeat_byte(0x11);
+        let payee = Address::repeat_byte(0x22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+        provider.set_timestamp(U256::from(1_000u64));
+
+        let descriptor = StorageCtx::enter(&mut provider, || {
+            let mut token = setup_path_usd(payer, 100, &[])?;
+            install_recipient_whitelist_policy(&mut token, payer, &[payee])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            let (_, descriptor) = open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            )?;
+            reserve.request_close(
+                payer,
+                ITIP20ChannelReserve::requestCloseCall {
+                    descriptor: descriptor.clone(),
+                },
+            )?;
+            Result::<_>::Ok(descriptor)
+        })?;
+
+        provider.set_timestamp(U256::from(1_000u64 + CLOSE_GRACE_PERIOD));
+        StorageCtx::enter(&mut provider, || {
+            let token = path_usd();
+            TIP20ChannelReserve::new()
+                .withdraw(payer, ITIP20ChannelReserve::withdrawCall { descriptor })?;
+            assert_eq!(balance(&token, payer)?, U256::from(100));
+            assert_eq!(balance(&token, TIP20_CHANNEL_RESERVE_ADDRESS)?, U256::ZERO);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn t12_blocked_refund_reverts_and_remains_retryable() -> Result<()> {
+        let payer = Address::repeat_byte(0x11);
+        let payee = Address::repeat_byte(0x22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+        provider.set_timestamp(U256::from(1_000u64));
+
+        let (channel_id, descriptor) = StorageCtx::enter(&mut provider, || {
+            setup_path_usd(payer, 1_000, &[])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            let (channel_id, descriptor) = open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            )?;
+            reserve.request_close(
+                payer,
+                ITIP20ChannelReserve::requestCloseCall {
+                    descriptor: descriptor.clone(),
+                },
+            )?;
+            Result::<_>::Ok((channel_id, descriptor))
+        })?;
+
+        provider.set_timestamp(U256::from(1_000u64 + CLOSE_GRACE_PERIOD));
+        StorageCtx::enter(&mut provider, || {
+            let token = path_usd();
+            let mut reserve = TIP20ChannelReserve::new();
+
+            // Originator recovery would make a guarded reserve-originated refund unclaimable.
+            // Channel refunds reject the policy instead and leave channel state intact.
+            let (mut registry, sender_policy) =
+                install_receive_sender_blacklist(payer, TIP20_CHANNEL_RESERVE_ADDRESS)?;
+
+            let result = reserve.close(
+                payee,
+                ITIP20ChannelReserve::closeCall {
+                    descriptor: descriptor.clone(),
+                    cumulativeAmount: U96::ZERO,
+                    captureAmount: U96::ZERO,
+                    signature: Bytes::new(),
+                },
+            );
+            assert_eq!(result, Err(policy_forbids()));
+
+            let result = reserve.withdraw(
+                payer,
+                ITIP20ChannelReserve::withdrawCall {
+                    descriptor: descriptor.clone(),
+                },
+            );
+            assert_eq!(result, Err(policy_forbids()));
+            assert_eq!(channel_state(&reserve, channel_id)?.deposit, U96::from(100));
+            assert_eq!(balance(&token, payer)?, U256::from(900));
+            assert_eq!(balance(&token, RECEIVE_POLICY_GUARD_ADDRESS)?, U256::ZERO);
+
+            set_blacklisted(
+                &mut registry,
+                payer,
+                sender_policy,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                false,
+            )?;
+            reserve.withdraw(payer, ITIP20ChannelReserve::withdrawCall { descriptor })?;
+            assert_eq!(balance(&token, payer)?, U256::from(1_000));
+            assert!(channel_state(&reserve, channel_id)?.deposit.is_zero());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pre_t12_recipient_restricted_token_cannot_fund_reserve() -> Result<()> {
+        let payer = Address::repeat_byte(0x11);
+        let payee = Address::repeat_byte(0x22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = setup_path_usd(payer, 100, &[])?;
+            install_recipient_whitelist_policy(&mut token, payer, &[payee])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            let result = open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            );
+            assert_eq!(result.unwrap_err(), policy_forbids());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pre_t12_settle_preserves_state_write_before_transfer_failure() -> Result<()> {
+        let signer = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let payer = Address::from_public_key(signer.verifying_key());
+        let payee = Address::repeat_byte(0x22);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = setup_path_usd(payer, 100, &[*PAUSE_ROLE])?;
+            let mut reserve = TIP20ChannelReserve::new();
+            reserve.initialize()?;
+            let (channel_id, descriptor) = open_channel(
+                &mut reserve,
+                payer,
+                payee,
+                100,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+            )?;
+            let cumulative = U96::from(40);
+            let signature = sign_voucher(&reserve, &signer, channel_id, cumulative)?;
+
+            token.pause(payer, ITIP20::pauseCall {})?;
+            let result = reserve.settle(
+                payee,
+                ITIP20ChannelReserve::settleCall {
+                    descriptor,
+                    cumulativeAmount: cumulative,
+                    signature,
+                },
+            );
+            assert_eq!(
+                result,
+                Err(TempoPrecompileError::Revert(
+                    ITIP20::ContractPaused {}.abi_encode().into()
+                ))
+            );
+
+            // Direct unit calls do not apply EVM rollback, exposing the intermediate write and
+            // pinning its position before the failing transfer. On-chain the whole call reverts.
+            assert_eq!(channel_state(&reserve, channel_id)?.settled, cumulative);
+            Ok(())
+        })
+    }
 }
