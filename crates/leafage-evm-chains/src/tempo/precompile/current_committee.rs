@@ -90,9 +90,9 @@ impl Precompile for CurrentCommittee {
             calldata,
             ICurrentCommittee::ICurrentCommitteeCalls::valid_selector,
             |data| {
-                ICurrentCommittee::ICurrentCommitteeCalls::abi_decode_with_config(
+                super::decode_precompile_call::<ICurrentCommittee::ICurrentCommitteeCalls>(
                     data,
-                    super::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

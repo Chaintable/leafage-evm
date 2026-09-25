@@ -2916,10 +2916,9 @@ impl Precompile for StablecoinDEX {
                         .all(|&(gated, since)| gated != selector || spec >= since)
             },
             |data| {
-                IStablecoinDEX::IStablecoinDEXCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    IStablecoinDEX::IStablecoinDEXCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 IStablecoinDEX::IStablecoinDEXCalls::place(call) => {

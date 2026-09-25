@@ -104,6 +104,32 @@ pub const fn abi_decoder_config(
         .strict(spec.is_t11())
 }
 
+/// Decodes precompile calldata under the fork's ABI rules.
+///
+/// TIP-1116 (T12) accepts trailing bytes after an otherwise strict encoding. alloy 1.7.2
+/// cannot skip only strict mode's final length check, so the input is decoded strictly again
+/// up to its canonical length: a strict encoding is the canonical one, which ends at
+/// `4 + abi_encoded_size()`.
+pub fn decode_precompile_call<C: alloy::sol_types::SolInterface>(
+    calldata: &[u8],
+    spec: crate::tempo::hardfork::TempoHardfork,
+) -> core::result::Result<C, alloy::sol_types::Error> {
+    let config = abi_decoder_config(spec);
+    let error = match C::abi_decode_with_config(calldata, config) {
+        Ok(call) => return Ok(call),
+        Err(error) if spec.is_t12() => error,
+        Err(error) => return Err(error),
+    };
+    let Ok(call) = C::abi_decode_with_config(calldata, config.strict(false).validate(true)) else {
+        return Err(error);
+    };
+    let canonical_len = 4 + call.abi_encoded_size();
+    if canonical_len >= calldata.len() {
+        return Err(error);
+    }
+    C::abi_decode_with_config(&calldata[..canonical_len], config).map_err(|_| error)
+}
+
 /// Charges duplicate validation before sorting, preserving the pre-T11 zero-cost schedule.
 pub fn has_duplicates_metered<T: Ord>(
     storage: &mut StorageCtx,
@@ -571,6 +597,15 @@ mod tests {
         }
     }
 
+    alloy::sol! {
+        interface ITestTrailingDispatch {
+            function noArgs() external;
+            function pair(uint8 a, bool b) external;
+            function mixed(bytes a, string[] b) external;
+            function list(bytes[] a) external;
+        }
+    }
+
     #[test]
     fn t11_strict_abi_rejects_gaps_overlap_trailing_and_padding() {
         use crate::tempo::hardfork::TempoHardfork;
@@ -608,6 +643,117 @@ mod tests {
         }
     }
 
+    // Mirrors tempo dispatch.rs `trailing_bytes_are_allowed_from_t12`.
+    #[test]
+    fn trailing_bytes_are_allowed_from_t12() {
+        use crate::tempo::hardfork::TempoHardfork;
+        type Calls = ITestMemoryDispatch::ITestMemoryDispatchCalls;
+        let call = ITestMemoryDispatch::setValuesCall {
+            values: vec![U256::from(1), U256::from(2)],
+        };
+        let canonical = call.abi_encode();
+        let mut gapped = canonical.clone();
+        gapped[4..36].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+        gapped.splice(36..36, [0u8; 32]);
+
+        for spec in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+            TempoHardfork::T12,
+        ] {
+            for suffix_len in [0, 1, 32, 33] {
+                let mut calldata = canonical.clone();
+                calldata.extend(vec![0xff; suffix_len]);
+                let result = decode_precompile_call::<Calls>(&calldata, spec);
+                let expected_success = suffix_len == 0 || !spec.is_t11() || spec.is_t12();
+                assert_eq!(result.is_ok(), expected_success, "{spec:?}, {suffix_len}");
+                if let Ok(decoded) = result {
+                    assert_eq!(decoded.abi_encode(), canonical, "{spec:?}");
+                }
+            }
+            // Allowing a suffix must not permit gaps inside the encoding.
+            assert_eq!(
+                decode_precompile_call::<Calls>(&gapped, spec).is_ok(),
+                !spec.is_t11(),
+                "{spec:?}"
+            );
+            assert!(
+                decode_precompile_call::<Calls>(&canonical[..canonical.len() - 1], spec).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn t12_trailing_bytes_keep_other_strict_checks() {
+        use crate::tempo::hardfork::TempoHardfork;
+        type Calls = ITestMemoryDispatch::ITestMemoryDispatchCalls;
+        let canonical = ITestMemoryDispatch::setPayloadsCall {
+            first: Bytes::from_static(&[1]),
+            second: Bytes::from_static(&[2]),
+        }
+        .abi_encode();
+        let mut overlap = canonical.clone();
+        overlap[36..68].copy_from_slice(&U256::from(64).to_be_bytes::<32>());
+        let mut padding = canonical.clone();
+        *padding.last_mut().unwrap() = 1;
+        let mut gap = canonical.clone();
+        gap.splice(68..68, [0; 32]);
+        gap[4..36].copy_from_slice(&U256::from(96).to_be_bytes::<32>());
+        gap[36..68].copy_from_slice(&U256::from(160).to_be_bytes::<32>());
+
+        for input in [&overlap, &padding, &gap] {
+            for suffix in [&[][..], &[0xff][..], &[0; 32][..]] {
+                let mut calldata = input.clone();
+                calldata.extend_from_slice(suffix);
+                assert!(decode_precompile_call::<Calls>(&calldata, TempoHardfork::T12).is_err());
+            }
+        }
+
+        let mut flag = ITestTrailingDispatch::pairCall { a: 1, b: true }.abi_encode();
+        flag[67] = 2;
+        flag.push(0xff);
+        assert!(
+            decode_precompile_call::<ITestTrailingDispatch::ITestTrailingDispatchCalls>(
+                &flag,
+                TempoHardfork::T12,
+            )
+            .is_err()
+        );
+    }
+
+    // Mirrors alloy-sol-types 1.7.3 `validate_allow_trailing_bytes_accepts_encoded_prefixes`.
+    #[test]
+    fn t12_accepts_every_canonical_prefix_with_suffix() {
+        use crate::tempo::hardfork::TempoHardfork;
+        type Calls = ITestTrailingDispatch::ITestTrailingDispatchCalls;
+        let calls = [
+            Calls::noArgs(ITestTrailingDispatch::noArgsCall {}),
+            Calls::pair(ITestTrailingDispatch::pairCall { a: 42, b: true }),
+            Calls::mixed(ITestTrailingDispatch::mixedCall {
+                a: Bytes::from_static(&[0x12, 0x34]),
+                b: vec!["hello".into(), String::new()],
+            }),
+            Calls::list(ITestTrailingDispatch::listCall { a: vec![] }),
+        ];
+        for call in calls {
+            for suffix in [&[][..], &[0xff][..], &[0xaa; 32][..], &[0xbb; 33][..]] {
+                let mut calldata = call.abi_encode();
+                calldata.extend_from_slice(suffix);
+                assert_eq!(
+                    decode_precompile_call::<Calls>(&calldata, TempoHardfork::T12)
+                        .unwrap()
+                        .abi_encode(),
+                    call.abi_encode()
+                );
+                assert_eq!(
+                    decode_precompile_call::<Calls>(&calldata, TempoHardfork::T11).is_ok(),
+                    suffix.is_empty()
+                );
+            }
+        }
+    }
+
     #[test]
     fn duplicate_validation_charges_before_checking_and_only_from_t11() {
         use crate::tempo::hardfork::TempoHardfork;
@@ -633,12 +779,21 @@ mod tests {
         for spec in [
             crate::tempo::hardfork::TempoHardfork::T10,
             crate::tempo::hardfork::TempoHardfork::T11,
+            crate::tempo::hardfork::TempoHardfork::T12,
         ] {
             let result = ITestMemoryDispatch::ITestMemoryDispatchCalls::abi_decode_with_config(
                 &calldata,
                 abi_decoder_config(spec),
             );
             assert!(result.is_err());
+            let mut with_suffix = calldata.clone();
+            with_suffix.push(0xff);
+            for input in [&calldata, &with_suffix] {
+                let result = decode_precompile_call::<ITestMemoryDispatch::ITestMemoryDispatchCalls>(
+                    input, spec,
+                );
+                assert!(result.is_err(), "{spec:?}");
+            }
         }
     }
 

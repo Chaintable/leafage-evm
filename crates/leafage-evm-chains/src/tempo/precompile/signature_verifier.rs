@@ -218,10 +218,9 @@ impl Precompile for SignatureVerifier {
                         .all(|&(gated, since)| gated != selector || spec >= since)
             },
             |data| {
-                ISignatureVerifier::ISignatureVerifierCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    ISignatureVerifier::ISignatureVerifierCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 ISignatureVerifier::ISignatureVerifierCalls::recover(c) => {

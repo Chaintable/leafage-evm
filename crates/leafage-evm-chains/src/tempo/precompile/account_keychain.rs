@@ -1866,10 +1866,9 @@ impl Precompile for AccountKeychain {
             calldata,
             IAccountKeychain::IAccountKeychainCalls::valid_selector,
             |data| {
-                IAccountKeychain::IAccountKeychainCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    IAccountKeychain::IAccountKeychainCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 IAccountKeychain::IAccountKeychainCalls::authorizeKey_0(call) => {

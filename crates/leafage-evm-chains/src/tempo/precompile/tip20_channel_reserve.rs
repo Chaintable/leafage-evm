@@ -712,9 +712,9 @@ impl Precompile for TIP20ChannelReserve {
                         .all(|&(gated, since)| gated != selector || spec >= since)
             },
             |data| {
-                ITIP20ChannelReserve::ITIP20ChannelReserveCalls::abi_decode_with_config(
+                super::decode_precompile_call::<ITIP20ChannelReserve::ITIP20ChannelReserveCalls>(
                     data,
-                    super::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

@@ -4118,7 +4118,11 @@ mod tests {
 
             let mut t12 = make_cached_evm_with_spec(TempoHardfork::T12);
             let result = t12.transact(tx).unwrap();
-            assert!(result.result.is_success(), "nonce {nonce}: {:?}", result.result);
+            assert!(
+                result.result.is_success(),
+                "nonce {nonce}: {:?}",
+                result.result
+            );
             // The discriminator never bumps the account nonce.
             assert_eq!(result.state[&Address::with_last_byte(0x91)].info.nonce, 0);
         }

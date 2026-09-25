@@ -296,9 +296,9 @@ impl Precompile for ReceivePolicyGuard {
             calldata,
             IReceivePolicyGuard::IReceivePolicyGuardCalls::valid_selector,
             |data| {
-                IReceivePolicyGuard::IReceivePolicyGuardCalls::abi_decode_with_config(
+                super::decode_precompile_call::<IReceivePolicyGuard::IReceivePolicyGuardCalls>(
                     data,
-                    super::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

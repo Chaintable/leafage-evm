@@ -213,9 +213,9 @@ impl Precompile for NonceManager {
             calldata,
             INonce::INonceCalls::valid_selector,
             |data| {
-                INonce::INonceCalls::abi_decode_with_config(
+                crate::tempo::precompile::decode_precompile_call::<INonce::INonceCalls>(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

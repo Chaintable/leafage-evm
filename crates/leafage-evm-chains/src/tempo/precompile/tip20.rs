@@ -50,7 +50,8 @@ use super::storage_types::{
 };
 use super::{
     Precompile, RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
-    dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view,
+    decode_precompile_call, dispatch_call, input_cost, metadata, mutate, mutate_void,
+    unknown_selector, view,
 };
 use crate::tempo::address::TempoAddressExt;
 
@@ -1948,13 +1949,13 @@ impl TIP20Call {
 
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
-        let config = crate::tempo::precompile::abi_decoder_config(StorageCtx.spec());
+        let spec = StorageCtx.spec();
 
         if IRolesAuth::IRolesAuthCalls::valid_selector(selector) {
-            IRolesAuth::IRolesAuthCalls::abi_decode_with_config(calldata, config)
+            decode_precompile_call::<IRolesAuth::IRolesAuthCalls>(calldata, spec)
                 .map(Self::RolesAuth)
         } else {
-            ITIP20::ITIP20Calls::abi_decode_with_config(calldata, config).map(Self::TIP20)
+            decode_precompile_call::<ITIP20::ITIP20Calls>(calldata, spec).map(Self::TIP20)
         }
     }
 }

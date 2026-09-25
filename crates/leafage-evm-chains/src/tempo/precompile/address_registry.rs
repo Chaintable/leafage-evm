@@ -309,10 +309,9 @@ impl Precompile for AddressRegistry {
                         .all(|&(gated, since)| gated != selector || spec >= since)
             },
             |data| {
-                IAddressRegistry::IAddressRegistryCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    IAddressRegistry::IAddressRegistryCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 IAddressRegistry::IAddressRegistryCalls::registerVirtualMaster(c) => {

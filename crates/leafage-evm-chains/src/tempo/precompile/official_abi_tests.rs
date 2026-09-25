@@ -210,6 +210,46 @@ fn official_has_role_order_is_used_by_dispatch() {
 }
 
 #[test]
+fn trailing_calldata_is_dispatched_only_from_t12() {
+    let admin = Address::repeat_byte(0x11);
+    let has_role = IRolesAuth::hasRoleCall {
+        account: admin,
+        role: DEFAULT_ADMIN_ROLE,
+    }
+    .abi_encode();
+    let owner = IValidatorConfig::ownerCall {}.abi_encode();
+    for fork in [TempoHardfork::T11, TempoHardfork::T12] {
+        let mut provider = TestStorageProvider::new(fork);
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address(PATH_USD_ADDRESS).unwrap();
+            token
+                .initialize(admin, "USD", "USD", "USD", Address::ZERO, admin)
+                .unwrap();
+            let mut config = ValidatorConfig::new();
+            config.initialize(admin).unwrap();
+
+            for suffix in [&[0xff][..], &[0; 32][..]] {
+                let mut data = has_role.clone();
+                data.extend_from_slice(suffix);
+                let output = token.call(&data, admin).unwrap();
+                assert_eq!(output.reverted, !fork.is_t12(), "{fork:?}");
+                if fork.is_t12() {
+                    assert_eq!(output.bytes.as_ref(), true.abi_encode());
+                }
+
+                let mut data = owner.clone();
+                data.extend_from_slice(suffix);
+                let output = config.call(&data, admin).unwrap();
+                assert_eq!(output.reverted, !fork.is_t12(), "{fork:?}");
+                if fork.is_t12() {
+                    assert_eq!(output.bytes.as_ref(), admin.abi_encode());
+                }
+            }
+        });
+    }
+}
+
+#[test]
 fn official_validator_index_is_uint64_and_activates_at_t1() {
     let owner = Address::repeat_byte(0x11);
     let validator = Address::repeat_byte(0x22);

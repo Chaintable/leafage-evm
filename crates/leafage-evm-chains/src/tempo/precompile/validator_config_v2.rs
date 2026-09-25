@@ -1287,10 +1287,9 @@ impl Precompile for ValidatorConfigV2 {
             calldata,
             IValidatorConfigV2::IValidatorConfigV2Calls::valid_selector,
             |data| {
-                IValidatorConfigV2::IValidatorConfigV2Calls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    IValidatorConfigV2::IValidatorConfigV2Calls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 // View functions

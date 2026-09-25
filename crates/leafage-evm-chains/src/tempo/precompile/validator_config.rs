@@ -556,10 +556,9 @@ impl Precompile for ValidatorConfig {
                         || selector != IValidatorConfig::changeValidatorStatusByIndexCall::SELECTOR)
             },
             |data| {
-                IValidatorConfig::IValidatorConfigCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    IValidatorConfig::IValidatorConfigCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 // View functions
