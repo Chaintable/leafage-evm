@@ -38,6 +38,8 @@ pub(crate) struct TestStorageProvider {
     gas_refunded: i64,
     tip1060_storage_credits_enabled: bool,
     tip1060_storage_credit_minting_enabled: bool,
+    sload_count: u64,
+    sstore_count: u64,
 }
 
 impl TestStorageProvider {
@@ -59,7 +61,23 @@ impl TestStorageProvider {
             gas_refunded: 0,
             tip1060_storage_credits_enabled: spec.is_t7(),
             tip1060_storage_credit_minting_enabled: true,
+            sload_count: 0,
+            sstore_count: 0,
         }
+    }
+
+    /// Resets the persistent-storage access counters.
+    pub(crate) fn reset_counters(&mut self) {
+        self.sload_count = 0;
+        self.sstore_count = 0;
+    }
+
+    pub(crate) fn counter_sload(&self) -> u64 {
+        self.sload_count
+    }
+
+    pub(crate) fn counter_sstore(&self) -> u64 {
+        self.sstore_count
     }
 
     pub(crate) fn storage(&self, address: Address, slot: U256) -> U256 {
@@ -154,6 +172,7 @@ impl PrecompileStorageProvider for TestStorageProvider {
     }
 
     fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.sload_count += 1;
         Ok(self.storage(address, key))
     }
 
@@ -162,6 +181,7 @@ impl PrecompileStorageProvider for TestStorageProvider {
     }
 
     fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.sstore_count += 1;
         let present_value = self.storage(address, key);
         self.storage.insert((address, key), value);
         if self.tip1060_storage_credits_enabled {
