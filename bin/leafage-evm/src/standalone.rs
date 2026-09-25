@@ -14,7 +14,7 @@ use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
-use leafage_evm_rpc::{ApiBuilder, MultiChainCfgEnv, TokenCollector};
+use leafage_evm_rpc::{build_op_custom_config, ApiBuilder, MultiChainCfgEnv, TokenCollector};
 use leafage_evm_storage::{
     MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
 };
@@ -61,7 +61,10 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Custom EVM parameters. Currently, this only supports the **Cosmos** ecosystem.
+    /// Custom EVM parameters for Cosmos, Arbitrum or OP.
+    /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Osaka),
+    /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
+    /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
     ///
     /// # Example
     /// --evm-type=cosmos
@@ -69,7 +72,8 @@ pub struct Command {
     #[arg(long)]
     evm_custom_config: Option<String>,
 
-    /// The Ethereum Execution Specification ID for the chain.
+    /// Execution specification ID, using the selected EVM type's numbering.
+    /// For OP, use op_spec_id in --evm-custom-config instead.
     ///
     /// if not specified, the default spec_id is u8::MAX
     #[arg(long, default_value = "255")]
@@ -519,7 +523,12 @@ impl Command {
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                if self.spec_id != u8::MAX {
+                    bail!(
+                        "--spec-id is not supported for op; use op_spec_id in --evm-custom-config"
+                    );
+                }
+                let mut chain_cfg = build_op_custom_config(custom_evm_cfg.as_deref())?;
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -953,5 +962,50 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod op_config_tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Command {
+        Command::try_parse_from(
+            ["standalone", "--db-path=/unused", "--evm-type=op"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap()
+    }
+
+    fn config(args: &[&str]) -> CfgEnv<OpSpecId> {
+        let MultiChainCfgEnv::Op(cfg) = command(args).build_chain_cfg_env().unwrap() else {
+            panic!("expected OP configuration")
+        };
+        cfg
+    }
+
+    #[test]
+    fn op_uses_custom_config_and_rejects_global_spec_id() {
+        assert_eq!(config(&[]).spec, OpSpecId::OSAKA);
+        let rise = config(&[
+            "--evm-custom-config",
+            r#"{"op_spec_id":"Jovian","limit_contract_code_size":262144}"#,
+        ]);
+        assert_eq!(rise.spec, OpSpecId::JOVIAN);
+        assert_eq!(rise.limit_contract_code_size, Some(262144));
+        assert!(command(&["--evm-custom-config", r#"{"op_spec_id":108}"#])
+            .build_chain_cfg_env()
+            .is_err());
+        // The global selector must not silently override or be ignored by OP config.
+        for id in ["18", "108"] {
+            for json in ["{}", r#"{"op_spec_id":"Jovian"}"#] {
+                let err = command(&["--spec-id", id, "--evm-custom-config", json])
+                    .build_chain_cfg_env()
+                    .err()
+                    .unwrap();
+                assert!(err.to_string().contains("use op_spec_id"));
+            }
+        }
     }
 }
