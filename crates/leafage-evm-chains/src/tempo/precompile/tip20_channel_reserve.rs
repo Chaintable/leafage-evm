@@ -12,7 +12,7 @@ use super::signature_verifier::SignatureVerifier;
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
 use super::storage_credits::StorageCredits;
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
-use super::tip20::{is_tip20_prefix, TIP20Token, ITIP20};
+use super::tip20::{is_tip20_prefix, Recipient, TIP20Token, ITIP20};
 use super::tip403_registry::AuthRole;
 use super::{
     dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view, Precompile,
@@ -49,6 +49,9 @@ struct PackedChannelState {
     settled: U96,
     deposit: U96,
     close_requested_at: u32,
+    /// Whether TIP-1028 sees the logical payer during capture (TIP-1095, set by T12 opens).
+    /// Channels created before T12 decode it as false and keep the reserve as sender.
+    uses_logical_receive_policy_sender: bool,
 }
 
 impl PackedChannelState {
@@ -58,6 +61,14 @@ impl PackedChannelState {
 
     fn close_requested_at(self) -> Option<u32> {
         (self.close_requested_at != 0).then_some(self.close_requested_at)
+    }
+
+    fn receive_policy_sender(self, payer: Address) -> Address {
+        if self.uses_logical_receive_policy_sender {
+            payer
+        } else {
+            TIP20_CHANNEL_RESERVE_ADDRESS
+        }
     }
 
     fn to_sol(self) -> ITIP20ChannelReserve::ChannelState {
@@ -70,7 +81,7 @@ impl PackedChannelState {
 }
 
 impl StorableType for PackedChannelState {
-    const LAYOUT: Layout = Layout::Bytes(28);
+    const LAYOUT: Layout = Layout::Bytes(29);
     type Handler = Slot<Self>;
 
     fn handle(slot: U256, ctx: LayoutCtx, address: Address) -> Self::Handler {
@@ -90,6 +101,7 @@ impl Storable for PackedChannelState {
         };
         let bytes = word.to_be_bytes::<32>();
         Ok(Self {
+            uses_logical_receive_policy_sender: bytes[3] != 0,
             close_requested_at: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
             deposit: U96::from_be_slice(&bytes[8..20]),
             settled: U96::from_be_slice(&bytes[20..32]),
@@ -98,6 +110,7 @@ impl Storable for PackedChannelState {
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
         let mut bytes = [0u8; 32];
+        bytes[3] = u8::from(self.uses_logical_receive_policy_sender);
         bytes[4..8].copy_from_slice(&self.close_requested_at.to_be_bytes());
         bytes[8..20].copy_from_slice(&self.deposit.to_be_bytes::<12>());
         bytes[20..32].copy_from_slice(&self.settled.to_be_bytes::<12>());
@@ -197,8 +210,19 @@ impl TIP20ChannelReserve {
         }
 
         let payee = AddressRegistry::new().resolve_recipient(call.payee)?;
-        token.ensure_authorized_as(&[(payee, AuthRole::Recipient)])?;
-        token.system_transfer_from(self.address, msg_sender, U256::from(call.deposit))?;
+        if self.storage.spec().is_t12() {
+            token.ensure_transfer_authorized(msg_sender, payee)?;
+            token.ensure_receive_policy_authorized(msg_sender, payee)?;
+            token.channel_reserve_transfer(
+                msg_sender,
+                Recipient::direct(self.address),
+                U256::from(call.deposit),
+                msg_sender,
+            )?;
+        } else {
+            token.ensure_authorized_as(&[(payee, AuthRole::Recipient)])?;
+            token.system_transfer_from(self.address, msg_sender, U256::from(call.deposit))?;
+        }
 
         self.write_channel_state_spending_credit(
             msg_sender,
@@ -207,6 +231,7 @@ impl TIP20ChannelReserve {
                 settled: U96::ZERO,
                 deposit: call.deposit,
                 close_requested_at: 0,
+                uses_logical_receive_policy_sender: self.storage.spec().is_t12(),
             },
         )?;
         self.opened_this_tx[channel_id].t_write(true)?;
@@ -247,16 +272,30 @@ impl TIP20ChannelReserve {
 
         let delta = call.cumulativeAmount.checked_sub(state.settled).unwrap();
         let mut token = TIP20Token::from_address(call.descriptor.token)?;
-        token.ensure_authorized_as(&[(call.descriptor.payer, AuthRole::Sender)])?;
-        state.settled = call.cumulativeAmount;
-        self.channel_states[channel_id].write(state)?;
-        token.transfer(
-            self.address,
-            ITIP20::transferCall {
-                to: call.descriptor.payee,
-                amount: U256::from(delta),
-            },
-        )?;
+        if self.storage.spec().is_t12() {
+            let payee = Recipient::resolve(call.descriptor.payee)?;
+            token.ensure_transfer_authorized(call.descriptor.payer, payee.target)?;
+            token.channel_reserve_transfer(
+                self.address,
+                payee,
+                U256::from(delta),
+                state.receive_policy_sender(call.descriptor.payer),
+            )?;
+            state.settled = call.cumulativeAmount;
+            self.channel_states[channel_id].write(state)?;
+        } else {
+            token.ensure_authorized_as(&[(call.descriptor.payer, AuthRole::Sender)])?;
+            // Pre-T12 writes the state before the transfer; the order is gas-visible.
+            state.settled = call.cumulativeAmount;
+            self.channel_states[channel_id].write(state)?;
+            token.transfer(
+                self.address,
+                ITIP20::transferCall {
+                    to: call.descriptor.payee,
+                    amount: U256::from(delta),
+                },
+            )?;
+        }
         self.emit_event(ITIP20ChannelReserve::Settled {
             channelId: channel_id,
             payer: call.descriptor.payer,
@@ -286,14 +325,30 @@ impl TIP20ChannelReserve {
                 .deposit
                 .checked_add(call.additionalDeposit)
                 .ok_or_else(|| revert(ITIP20ChannelReserve::DepositOverflow {}))?;
-            let payee = AddressRegistry::new().resolve_recipient(call.descriptor.payee)?;
-            let mut token = TIP20Token::from_address(call.descriptor.token)?;
-            token.ensure_authorized_as(&[(payee, AuthRole::Recipient)])?;
-            token.system_transfer_from(
-                self.address,
-                msg_sender,
-                U256::from(call.additionalDeposit),
-            )?;
+            if self.storage.spec().is_t12() {
+                let mut token = TIP20Token::from_address(call.descriptor.token)?;
+                let payee = AddressRegistry::new().resolve_recipient(call.descriptor.payee)?;
+                token.ensure_transfer_authorized(msg_sender, payee)?;
+                token.ensure_receive_policy_authorized(
+                    state.receive_policy_sender(msg_sender),
+                    payee,
+                )?;
+                token.channel_reserve_transfer(
+                    msg_sender,
+                    Recipient::direct(self.address),
+                    U256::from(call.additionalDeposit),
+                    msg_sender,
+                )?;
+            } else {
+                let payee = AddressRegistry::new().resolve_recipient(call.descriptor.payee)?;
+                let mut token = TIP20Token::from_address(call.descriptor.token)?;
+                token.ensure_authorized_as(&[(payee, AuthRole::Recipient)])?;
+                token.system_transfer_from(
+                    self.address,
+                    msg_sender,
+                    U256::from(call.additionalDeposit),
+                )?;
+            }
         }
         if had_close_request {
             state.close_requested_at = 0;
@@ -362,27 +417,52 @@ impl TIP20ChannelReserve {
         }
         let delta = call.captureAmount.checked_sub(state.settled).unwrap();
         let refund = state.deposit.checked_sub(call.captureAmount).unwrap();
-        self.delete_channel_state_and_credit_payer(channel_id, call.descriptor.payer)?;
+        if self.storage.spec().is_t12() {
+            let mut token = TIP20Token::from_address(call.descriptor.token)?;
+            if !delta.is_zero() {
+                let payee = Recipient::resolve(call.descriptor.payee)?;
+                token.ensure_transfer_authorized(call.descriptor.payer, payee.target)?;
+                token.channel_reserve_transfer(
+                    self.address,
+                    payee,
+                    U256::from(delta),
+                    state.receive_policy_sender(call.descriptor.payer),
+                )?;
+            }
+            if !refund.is_zero() {
+                token.channel_reserve_transfer(
+                    self.address,
+                    Recipient::resolve(call.descriptor.payer)?,
+                    U256::from(refund),
+                    self.address,
+                )?;
+            }
+            // T12 deletes the channel only after both deliveries succeed, so a TIP-1028
+            // rejection leaves it available for retry.
+            self.delete_channel_state_and_credit_payer(channel_id, call.descriptor.payer)?;
+        } else {
+            self.delete_channel_state_and_credit_payer(channel_id, call.descriptor.payer)?;
 
-        let mut token = TIP20Token::from_address(call.descriptor.token)?;
-        if !delta.is_zero() {
-            token.ensure_authorized_as(&[(call.descriptor.payer, AuthRole::Sender)])?;
-            token.transfer(
-                self.address,
-                ITIP20::transferCall {
-                    to: call.descriptor.payee,
-                    amount: U256::from(delta),
-                },
-            )?;
-        }
-        if !refund.is_zero() {
-            token.transfer(
-                self.address,
-                ITIP20::transferCall {
-                    to: call.descriptor.payer,
-                    amount: U256::from(refund),
-                },
-            )?;
+            let mut token = TIP20Token::from_address(call.descriptor.token)?;
+            if !delta.is_zero() {
+                token.ensure_authorized_as(&[(call.descriptor.payer, AuthRole::Sender)])?;
+                token.transfer(
+                    self.address,
+                    ITIP20::transferCall {
+                        to: call.descriptor.payee,
+                        amount: U256::from(delta),
+                    },
+                )?;
+            }
+            if !refund.is_zero() {
+                token.transfer(
+                    self.address,
+                    ITIP20::transferCall {
+                        to: call.descriptor.payer,
+                        amount: U256::from(refund),
+                    },
+                )?;
+            }
         }
         self.emit_event(ITIP20ChannelReserve::ChannelClosed {
             channelId: channel_id,
@@ -410,15 +490,28 @@ impl TIP20ChannelReserve {
             return Err(revert(ITIP20ChannelReserve::CloseNotReady {}));
         }
         let refund = state.deposit.checked_sub(state.settled).unwrap();
-        self.delete_channel_state_and_credit_payer(channel_id, call.descriptor.payer)?;
-        if !refund.is_zero() {
-            TIP20Token::from_address(call.descriptor.token)?.transfer(
-                self.address,
-                ITIP20::transferCall {
-                    to: call.descriptor.payer,
-                    amount: U256::from(refund),
-                },
-            )?;
+        if self.storage.spec().is_t12() {
+            if !refund.is_zero() {
+                TIP20Token::from_address(call.descriptor.token)?.channel_reserve_transfer(
+                    self.address,
+                    Recipient::resolve(call.descriptor.payer)?,
+                    U256::from(refund),
+                    self.address,
+                )?;
+            }
+            // T12 deletes the channel only after a nonzero refund succeeds.
+            self.delete_channel_state_and_credit_payer(channel_id, call.descriptor.payer)?;
+        } else {
+            self.delete_channel_state_and_credit_payer(channel_id, call.descriptor.payer)?;
+            if !refund.is_zero() {
+                TIP20Token::from_address(call.descriptor.token)?.transfer(
+                    self.address,
+                    ITIP20::transferCall {
+                        to: call.descriptor.payer,
+                        amount: U256::from(refund),
+                    },
+                )?;
+            }
         }
         self.emit_event(ITIP20ChannelReserve::ChannelClosed {
             channelId: channel_id,
@@ -816,6 +909,7 @@ mod tests {
             settled: U96::from(0x11),
             deposit: U96::from(0x22),
             close_requested_at: 0x33445566,
+            uses_logical_receive_policy_sender: false,
         };
         let mut word = super::super::storage_types::packing::PackedSlot(U256::ZERO);
         state.store(&mut word, U256::ZERO, LayoutCtx::FULL).unwrap();
@@ -824,6 +918,21 @@ mod tests {
         assert_eq!(&bytes[4..8], &0x33445566u32.to_be_bytes());
         assert_eq!(U96::from_be_slice(&bytes[8..20]), U96::from(0x22));
         assert_eq!(U96::from_be_slice(&bytes[20..]), U96::from(0x11));
+
+        // TIP-1095 (T12): the flag is the next packed field, one byte after close_requested_at.
+        let state = PackedChannelState {
+            uses_logical_receive_policy_sender: true,
+            ..state
+        };
+        let mut word = super::super::storage_types::packing::PackedSlot(U256::ZERO);
+        state.store(&mut word, U256::ZERO, LayoutCtx::FULL).unwrap();
+        let bytes = word.0.to_be_bytes::<32>();
+        assert_eq!(&bytes[..4], &[0, 0, 0, 1]);
+        assert_eq!(&bytes[4..8], &0x33445566u32.to_be_bytes());
+        assert_eq!(
+            PackedChannelState::load(&word, U256::ZERO, LayoutCtx::FULL).unwrap(),
+            state
+        );
     }
 
     #[test]
