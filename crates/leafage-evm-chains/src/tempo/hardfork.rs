@@ -1,5 +1,6 @@
 //! Leafage compatibility wrapper around the pinned official Tempo protocol definitions.
-//! Mainnet schedule comes from tempo-hardfork; Default remains the legacy T10 value.
+//! Mainnet schedule comes from tempo-hardfork, except the T12 timestamp (see
+//! `MAINNET_T12_TIMESTAMP`); Default remains the legacy T10 value.
 //! Genesis folds upstream Genesis/T0, and REVM36 conversion remains local.
 
 use tempo_hardfork::TempoHardfork as OfficialHardfork;
@@ -22,14 +23,27 @@ pub enum TempoHardfork {
     #[default]
     T10,
     T11,
+    T12,
 }
+
+/// Mainnet T12 activation, copied from the official release `presto.json`.
+/// The pinned tempo-hardfork (v1.14.0) defines T12 without a schedule and later
+/// revisions require alloy core >= 1.7.3, so the timestamp is kept here.
+/// `None` until Tempo publishes the T12 release.
+const MAINNET_T12_TIMESTAMP: Option<u64> = None;
 
 impl TempoHardfork {
     /// Uses the official mainnet schedule, never latest() or the process clock.
-    /// The exact pinned revision has no scheduled T12; tests enforce that invariant.
     pub fn from_timestamp(timestamp: u64) -> Self {
-        let fork = OfficialHardfork::from_chain_and_timestamp(4217, timestamp)
+        Self::from_timestamp_with_t12(timestamp, MAINNET_T12_TIMESTAMP)
+    }
+
+    fn from_timestamp_with_t12(timestamp: u64, t12_timestamp: Option<u64>) -> Self {
+        let mut fork = OfficialHardfork::from_chain_and_timestamp(4217, timestamp)
             .expect("official Tempo mainnet schedule exists");
+        if fork == OfficialHardfork::T11 && t12_timestamp.is_some_and(|t12| timestamp >= t12) {
+            fork = OfficialHardfork::T12;
+        }
         Self::try_from(fork).expect("scheduled fork must be supported by the pinned adapter")
     }
 
@@ -50,6 +64,7 @@ impl TempoHardfork {
             Self::T9 => OfficialHardfork::T9,
             Self::T10 => OfficialHardfork::T10,
             Self::T11 => OfficialHardfork::T11,
+            Self::T12 => OfficialHardfork::T12,
         }
     }
 
@@ -98,6 +113,9 @@ impl TempoHardfork {
     pub const fn is_t11(&self) -> bool {
         self.as_official().is_t11()
     }
+    pub const fn is_t12(&self) -> bool {
+        self.as_official().is_t12()
+    }
 
     pub const fn expiring_nonce_set_capacity(&self) -> u32 {
         self.as_official().expiring_nonce_set_capacity()
@@ -133,6 +151,7 @@ impl TryFrom<OfficialHardfork> for TempoHardfork {
             OfficialHardfork::T9 => Self::T9,
             OfficialHardfork::T10 => Self::T10,
             OfficialHardfork::T11 => Self::T11,
+            OfficialHardfork::T12 => Self::T12,
             _ => return Err(fork),
         })
     }
@@ -176,7 +195,7 @@ mod tests {
     const MAINNET_T11_TIME: u64 = 1_789_048_800;
 
     #[test]
-    fn official_mapping_preserves_legacy_default_and_rejects_unimplemented_forks() {
+    fn official_mapping_preserves_legacy_default_and_covers_every_pinned_fork() {
         assert_eq!(TempoHardfork::default(), TempoHardfork::T10);
         assert_eq!(
             TempoHardfork::try_from(OfficialHardfork::T0),
@@ -188,9 +207,8 @@ mod tests {
         );
         assert_eq!(
             TempoHardfork::try_from(OfficialHardfork::T12),
-            Err(OfficialHardfork::T12)
+            Ok(TempoHardfork::T12)
         );
-        assert_eq!(OfficialHardfork::T12.mainnet_activation_timestamp(), None);
         assert_eq!(
             OfficialHardfork::from_chain_and_timestamp(4217, u64::MAX),
             Some(OfficialHardfork::T11)
@@ -200,17 +218,40 @@ mod tests {
             None
         );
         for fork in OfficialHardfork::VARIANTS {
-            if let Ok(local) = TempoHardfork::try_from(*fork) {
-                assert_eq!(
-                    local.as_official(),
-                    if *fork == OfficialHardfork::Genesis {
-                        OfficialHardfork::T0
-                    } else {
-                        *fork
-                    }
-                );
-            }
+            let local = TempoHardfork::try_from(*fork).expect("every pinned fork is mapped");
+            assert_eq!(
+                local.as_official(),
+                if *fork == OfficialHardfork::Genesis {
+                    OfficialHardfork::T0
+                } else {
+                    *fork
+                }
+            );
         }
+    }
+
+    #[test]
+    fn local_t12_timestamp_matches_any_official_schedule() {
+        if let Some(official) = OfficialHardfork::T12.mainnet_activation_timestamp() {
+            assert_eq!(MAINNET_T12_TIMESTAMP, Some(official));
+        }
+    }
+
+    #[test]
+    fn t12_activates_only_from_local_timestamp_after_t11() {
+        let t12 = MAINNET_T11_TIME + 1_000_000;
+        let at = |timestamp| TempoHardfork::from_timestamp_with_t12(timestamp, Some(t12));
+
+        assert_eq!(at(t12 - 1), TempoHardfork::T11);
+        assert_eq!(at(t12), TempoHardfork::T12);
+        assert_eq!(at(t12 + 1), TempoHardfork::T12);
+        assert_eq!(at(u64::MAX), TempoHardfork::T12);
+        assert_eq!(at(MAINNET_T11_TIME - 1), TempoHardfork::T10);
+        assert_eq!(at(MAINNET_T11_TIME), TempoHardfork::T11);
+        assert_eq!(
+            TempoHardfork::from_timestamp_with_t12(u64::MAX, None),
+            TempoHardfork::T11
+        );
     }
 
     #[test]
@@ -431,6 +472,16 @@ mod tests {
         assert!(hf.is_t9());
         assert!(hf.is_t10());
         assert!(hf.is_t11());
+        assert!(!hf.is_t12());
+    }
+
+    #[test]
+    fn is_methods_on_t12() {
+        let hf = TempoHardfork::T12;
+        assert!(hf.is_t10());
+        assert!(hf.is_t11());
+        assert!(hf.is_t12());
+        assert!(!TempoHardfork::T11.is_t12());
     }
 
     #[test]
@@ -442,8 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn t3_through_t11_gas_matches_t2() {
-        // T3-T11 inherit T2 nonce gas (no schedule change).
+    fn t3_through_t12_gas_matches_t2() {
+        // T3-T12 inherit T2 nonce gas (no schedule change).
         for hardfork in [
             TempoHardfork::T3,
             TempoHardfork::T4,
@@ -454,6 +505,7 @@ mod tests {
             TempoHardfork::T9,
             TempoHardfork::T10,
             TempoHardfork::T11,
+            TempoHardfork::T12,
         ] {
             assert_eq!(
                 hardfork.gas_existing_nonce_key(),
@@ -486,6 +538,7 @@ mod tests {
             TempoHardfork::T9,
             TempoHardfork::T10,
             TempoHardfork::T11,
+            TempoHardfork::T12,
         ] {
             assert_eq!(SpecId::from(hardfork), SpecId::OSAKA);
         }
@@ -497,5 +550,7 @@ mod tests {
         assert_eq!(TempoHardfork::T10.expiring_nonce_max_expiry_secs(), 30);
         assert_eq!(TempoHardfork::T11.expiring_nonce_set_capacity(), 3_000_000);
         assert_eq!(TempoHardfork::T11.expiring_nonce_max_expiry_secs(), 300);
+        assert_eq!(TempoHardfork::T12.expiring_nonce_set_capacity(), 3_000_000);
+        assert_eq!(TempoHardfork::T12.expiring_nonce_max_expiry_secs(), 300);
     }
 }
