@@ -193,6 +193,78 @@ fn quote_to_base(quote_amount: u128, tick: i16, rounding: RoundingDirection) -> 
     result.try_into().ok()
 }
 
+/// Per-order result of stepping a trade across one resting order (official `OrderStep`).
+struct OrderStep {
+    /// Base amount filled from this order; below `remaining` means the trade ends here.
+    fill_amount: u128,
+    /// Taker output for exact-in trades, taker input for exact-out trades.
+    accumulate: u128,
+    /// Input (exact-in) or output (exact-out) left after fully consuming this order.
+    next_amount: u128,
+}
+
+/// Amount the taker receives for filling `fill_amount` base of a resting order.
+fn taker_output(fill_amount: u128, tick: i16, is_bid: bool) -> Option<u128> {
+    if is_bid {
+        base_to_quote(fill_amount, tick, RoundingDirection::Down)
+    } else {
+        Some(fill_amount)
+    }
+}
+
+/// Official `step_exact_in`: fill arithmetic uses the route side, taker payout the order side.
+fn step_exact_in(amount_in: u128, order: &Order, is_bid: bool) -> Option<OrderStep> {
+    let (remaining, tick) = (order.remaining, order.tick);
+    let (fill_amount, next_amount) = if is_bid {
+        (
+            amount_in.min(remaining),
+            amount_in.saturating_sub(remaining),
+        )
+    } else {
+        let base_out = quote_to_base(amount_in, tick, RoundingDirection::Down)?;
+        let next_amount = if base_out > remaining {
+            let quote_needed = base_to_quote(remaining, tick, RoundingDirection::Up)?;
+            amount_in.checked_sub(quote_needed)?
+        } else {
+            0
+        };
+        (base_out.min(remaining), next_amount)
+    };
+
+    Some(OrderStep {
+        fill_amount,
+        accumulate: taker_output(fill_amount, tick, order.is_bid)?,
+        next_amount,
+    })
+}
+
+/// Official `step_exact_out`: the carried output uses the order side like `step_exact_in`.
+fn step_exact_out(amount_out: u128, order: &Order, is_bid: bool) -> Option<OrderStep> {
+    let (remaining, tick) = (order.remaining, order.tick);
+    let (fill_amount, accumulate, demand) = if is_bid {
+        let base_needed = quote_to_base(amount_out, tick, RoundingDirection::Up)?;
+        let fill_amount = base_needed.min(remaining);
+        (fill_amount, fill_amount, base_needed)
+    } else {
+        let fill_amount = amount_out.min(remaining);
+        let amount_in = base_to_quote(fill_amount, tick, RoundingDirection::Up)?;
+        (fill_amount, amount_in, amount_out)
+    };
+
+    let next_amount = if demand > remaining {
+        let amount_out_received = taker_output(remaining, tick, order.is_bid)?;
+        amount_out.checked_sub(amount_out_received)?
+    } else {
+        0
+    };
+
+    Some(OrderStep {
+        fill_amount,
+        accumulate,
+        next_amount,
+    })
+}
+
 /// Convert relative tick to scaled price.
 fn tick_to_price(tick: i16) -> u32 {
     (PRICE_SCALE as i32 + tick as i32) as u32
@@ -261,6 +333,15 @@ impl Storable for TickLevel {
         let head = u128::from_be_bytes(bytes0[16..32].try_into().unwrap());
         let tail = u128::from_be_bytes(bytes0[0..16].try_into().unwrap());
 
+        // T12 (TIP-1088) reads only the live links slot; the stale aggregate reads as zero.
+        if StorageCtx.spec().is_t12() {
+            return Ok(Self {
+                head,
+                tail,
+                total_liquidity: 0,
+            });
+        }
+
         // Slot+1: total_liquidity (u128 at offset 0, bytes 16..32)
         let word1 = storage.load(slot + U256::from(1))?;
         let bytes1 = word1.to_be_bytes::<32>();
@@ -283,6 +364,11 @@ impl Storable for TickLevel {
         bytes0[0..16].copy_from_slice(&self.tail.to_be_bytes());
         storage.store(slot, U256::from_be_bytes(bytes0))?;
 
+        // T12 (TIP-1088) writes only the links slot and leaves the aggregate stale.
+        if StorageCtx.spec().is_t12() {
+            return Ok(());
+        }
+
         let mut bytes1 = if StorageCtx::default().spec().is_t4() {
             [0u8; 32]
         } else {
@@ -296,7 +382,10 @@ impl Storable for TickLevel {
 
     fn delete<S: StorageOps>(storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
         storage.store(slot, U256::ZERO)?;
-        storage.store(slot + U256::from(1), U256::ZERO)?;
+        // T12 (TIP-1088) deletes only the links slot and preserves the stale aggregate.
+        if !StorageCtx.spec().is_t12() {
+            storage.store(slot + U256::from(1), U256::ZERO)?;
+        }
         Ok(())
     }
 }
@@ -1717,7 +1806,23 @@ impl StablecoinDEX {
     pub fn get_price_level(&self, base: Address, tick: i16, is_bid: bool) -> Result<TickLevel> {
         let quote = TIP20Token::from_address(base)?.quote_token()?;
         let book_key = compute_book_key(base, quote);
-        self.book_handle(book_key).read_tick_level(tick, is_bid)
+        let mut level = self.book_handle(book_key).read_tick_level(tick, is_bid)?;
+
+        if self.storage.spec().is_t12() {
+            // T12 (TIP-1088): sum the remaining amount of every order reachable from the head.
+            let mut order_id = level.head;
+            level.total_liquidity = 0;
+            while order_id != 0 {
+                let order = self.orders[order_id].read_in_book(book_key)?;
+                level.total_liquidity = level
+                    .total_liquidity
+                    .checked_add(order.remaining)
+                    .ok_or(TempoPrecompileError::under_overflow())?;
+                order_id = order.next;
+            }
+        }
+
+        Ok(level)
     }
 
     /// Converts a relative tick to a scaled price. On T2+ validates tick spacing.
@@ -1879,11 +1984,13 @@ impl StablecoinDEX {
             level.tail = order.order_id;
         }
 
-        let new_liquidity = level
-            .total_liquidity
-            .checked_add(order.remaining)
-            .ok_or(TempoPrecompileError::under_overflow())?;
-        level.total_liquidity = new_liquidity;
+        if !self.storage.spec().is_t12() {
+            let new_liquidity = level
+                .total_liquidity
+                .checked_add(order.remaining)
+                .ok_or(TempoPrecompileError::under_overflow())?;
+            level.total_liquidity = new_liquidity;
+        }
 
         handle.write_tick_level(order.tick, order.is_bid, level)?;
         if charge_credits && self.storage.spec().is_t7() {
@@ -2110,13 +2217,16 @@ impl StablecoinDEX {
             fill_amount
         };
 
-        let new_liquidity = level
-            .total_liquidity
-            .checked_sub(fill_amount)
-            .ok_or(TempoPrecompileError::under_overflow())?;
-        level.total_liquidity = new_liquidity;
+        // T12 (TIP-1088): a partial fill leaves the links unchanged, so the level is not written.
+        if !self.storage.spec().is_t12() {
+            let new_liquidity = level
+                .total_liquidity
+                .checked_sub(fill_amount)
+                .ok_or(TempoPrecompileError::under_overflow())?;
+            level.total_liquidity = new_liquidity;
 
-        handle.write_tick_level(order.tick, order.is_bid, *level)?;
+            handle.write_tick_level(order.tick, order.is_bid, *level)?;
+        }
         self.emit_order_filled(order.order_id, order.maker, taker, fill_amount, true)?;
 
         Ok(amount_out)
@@ -2209,11 +2319,13 @@ impl StablecoinDEX {
             let (_, credits) = StorageCredits::new()
                 .track_minted_credits(self.address, || self.orders[order.next].prev()?.delete())?;
 
-            let new_liquidity = level
-                .total_liquidity
-                .checked_sub(fill_amount)
-                .ok_or(TempoPrecompileError::under_overflow())?;
-            level.total_liquidity = new_liquidity;
+            if !self.storage.spec().is_t12() {
+                let new_liquidity = level
+                    .total_liquidity
+                    .checked_sub(fill_amount)
+                    .ok_or(TempoPrecompileError::under_overflow())?;
+                level.total_liquidity = new_liquidity;
+            }
 
             handle.write_tick_level(order.tick, order.is_bid, level)?;
             let new_order = self.orders[order.next].read_in_book(book_key)?;
@@ -2389,8 +2501,76 @@ impl StablecoinDEX {
         Ok(total_amount_in)
     }
 
+    /// Read-only traversal to the order a swap fills after fully consuming `order`
+    /// (official `next_order_after`): the next linked order, else the next initialized tick.
+    fn next_order_after(
+        &self,
+        book_key: B256,
+        order: &Order,
+        is_bid: bool,
+    ) -> Result<Option<Order>> {
+        if order.next != 0 {
+            return Ok(Some(self.orders[order.next].read_in_book(book_key)?));
+        }
+
+        let handle = self.book_handle(book_key);
+        let (next_tick, has_liquidity) = handle.next_initialized_tick(order.tick, is_bid)?;
+        if !has_liquidity {
+            return Ok(None);
+        }
+
+        let next_level = handle.read_tick_level(next_tick, is_bid)?;
+        self.orders[next_level.head]
+            .read_in_book(book_key)
+            .map(Some)
+    }
+
+    /// T12 (TIP-1088) quote: walks resting orders with the swap's per-order arithmetic
+    /// and the same storage reads as official `walk_resting_orders`, without settling.
+    fn quote_per_order(
+        &self,
+        book_key: B256,
+        mut amount: u128,
+        is_bid: bool,
+        step: fn(u128, &Order, bool) -> Option<OrderStep>,
+    ) -> Result<u128> {
+        let level = self.get_best_price_level(book_key, is_bid)?;
+        let mut order = self.orders[level.head].read_in_book(book_key)?;
+        let mut total: u128 = 0;
+
+        while amount > 0 {
+            let s = step(amount, &order, is_bid).ok_or(TempoPrecompileError::under_overflow())?;
+            if s.fill_amount < order.remaining {
+                total = total
+                    .checked_add(s.accumulate)
+                    .ok_or(TempoPrecompileError::under_overflow())?;
+                break;
+            }
+
+            let next = self.next_order_after(book_key, &order, is_bid)?;
+            total = total
+                .checked_add(s.accumulate)
+                .ok_or(TempoPrecompileError::under_overflow())?;
+            match next {
+                Some(next) => order = next,
+                None => {
+                    if s.next_amount > 0 {
+                        return Err(err_insufficient_liquidity());
+                    }
+                    break;
+                }
+            }
+            amount = s.next_amount;
+        }
+
+        Ok(total)
+    }
+
     /// Quote exact input without executing.
     fn quote_exact_in(&self, book_key: B256, amount_in: u128, is_bid: bool) -> Result<u128> {
+        if self.storage.spec().is_t12() {
+            return self.quote_per_order(book_key, amount_in, is_bid, step_exact_in);
+        }
         let mut remaining_in = amount_in;
         let mut amount_out = 0u128;
         let handle = self.book_handle(book_key);
@@ -2455,6 +2635,9 @@ impl StablecoinDEX {
 
     /// Quote exact output without executing.
     fn quote_exact_out(&self, book_key: B256, amount_out: u128, is_bid: bool) -> Result<u128> {
+        if self.storage.spec().is_t12() {
+            return self.quote_per_order(book_key, amount_out, is_bid, step_exact_out);
+        }
         let mut remaining_out = amount_out;
         let mut amount_in = 0u128;
         let handle = self.book_handle(book_key);
@@ -2751,11 +2934,17 @@ impl StablecoinDEX {
             level.tail = order.prev;
         }
 
-        let new_liquidity = level
-            .total_liquidity
-            .checked_sub(order.remaining)
-            .ok_or(TempoPrecompileError::under_overflow())?;
-        level.total_liquidity = new_liquidity;
+        let has_level_changed = if self.storage.spec().is_t12() {
+            // T12 (TIP-1088): only cancelling the head or tail changes tick-level storage.
+            order.prev == 0 || order.next == 0
+        } else {
+            let new_liquidity = level
+                .total_liquidity
+                .checked_sub(order.remaining)
+                .ok_or(TempoPrecompileError::under_overflow())?;
+            level.total_liquidity = new_liquidity;
+            true
+        };
 
         if level.head == 0 {
             handle.delete_tick_bit(order.tick, order.is_bid)?;
@@ -2781,7 +2970,9 @@ impl StablecoinDEX {
             }
         }
 
-        handle.write_tick_level(order.tick, order.is_bid, level)?;
+        if has_level_changed {
+            handle.write_tick_level(order.tick, order.is_bid, level)?;
+        }
 
         // Refund tokens to maker
         let orderbook = handle.read_data()?;
@@ -2916,10 +3107,9 @@ impl Precompile for StablecoinDEX {
                         .all(|&(gated, since)| gated != selector || spec >= since)
             },
             |data| {
-                IStablecoinDEX::IStablecoinDEXCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    IStablecoinDEX::IStablecoinDEXCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 IStablecoinDEX::IStablecoinDEXCalls::place(call) => {
@@ -4316,5 +4506,923 @@ mod tests {
                 }
             });
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // T12 (TIP-1088): tick aggregate retirement and per-order quotes.
+    // Ported from official stablecoin_dex/{orderbook.rs,mod.rs} tests (upstream main 402e2722e7).
+    // ----------------------------------------------------------------------
+
+    const T12_BASE: Address = address!("0x20c0000000000000000000000000000000000006");
+
+    fn tick_level_slot(dex: &StablecoinDEX, book_key: B256, tick: i16, is_bid: bool) -> U256 {
+        let handle = dex.book_handle(book_key);
+        if is_bid {
+            handle.bids[tick].slot()
+        } else {
+            handle.asks[tick].slot()
+        }
+    }
+
+    /// Raw legacy aggregate in the tick level's second slot, bypassing the T12 read gate.
+    fn stored_tick_aggregate(
+        dex: &StablecoinDEX,
+        book_key: B256,
+        tick: i16,
+        is_bid: bool,
+    ) -> Result<u128> {
+        let slot = tick_level_slot(dex, book_key, tick, is_bid);
+        Ok(StorageCtx
+            .sload(dex.address, slot + U256::from(1))?
+            .saturating_to())
+    }
+
+    /// Seeds a fresh exchange with one resting order per `(size, tick)` from distinct makers.
+    fn with_fragmented_book<R>(
+        spec: TempoHardfork,
+        book: &[(u128, i16)],
+        maker_is_bid: bool,
+        body: impl FnOnce(&mut StablecoinDEX, Address, Address, Address) -> Result<R>,
+    ) -> Result<R> {
+        let mut provider = TestStorageProvider::new(spec);
+        StorageCtx::enter(&mut provider, || {
+            let admin = Address::repeat_byte(0xa1);
+            let taker = Address::repeat_byte(0xa2);
+            let fund = 1_000_000_000_000_000_000u128;
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, T12_BASE)?;
+            grant_and_mint(T12_BASE, admin, taker, fund)?;
+            grant_and_mint(PATH_USD_ADDRESS, admin, taker, fund)?;
+            for (i, (size, tick)) in book.iter().enumerate() {
+                let maker = Address::with_last_byte(0x10 + i as u8);
+                grant_and_mint(T12_BASE, admin, maker, fund)?;
+                grant_and_mint(PATH_USD_ADDRESS, admin, maker, fund)?;
+                dex.place(maker, T12_BASE, *size, maker_is_bid, *tick)?;
+            }
+            body(&mut dex, T12_BASE, PATH_USD_ADDRESS, taker)
+        })
+    }
+
+    #[test]
+    fn t12_tick_level_storage_reads_writes_and_deletes_only_links() {
+        let slot = U256::from(7);
+        let address = Address::repeat_byte(0x77);
+        let links_word = |head: u128, tail: u128| (U256::from(tail) << 128) | U256::from(head);
+
+        for spec in [
+            TempoHardfork::Genesis,
+            TempoHardfork::T3,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+            TempoHardfork::T12,
+        ] {
+            let is_t12 = spec.is_t12();
+            let mut provider = TestStorageProvider::new(spec);
+            // Legacy two-slot layout written directly, like official `Handler::<TickLevel>::write`.
+            provider.sstore(address, slot, links_word(11, 22)).unwrap();
+            provider
+                .sstore(address, slot + U256::from(1), U256::from(33))
+                .unwrap();
+
+            provider.reset_counters();
+            let level = StorageCtx::enter(&mut provider, || {
+                Slot::<TickLevel>::new(slot, address).read()
+            })
+            .unwrap();
+            assert_eq!((level.head, level.tail), (11, 22), "{spec:?}");
+            assert_eq!(
+                level.total_liquidity,
+                if is_t12 { 0 } else { 33 },
+                "{spec:?}"
+            );
+            assert_eq!(
+                provider.counter_sload(),
+                if is_t12 { 1 } else { 2 },
+                "{spec:?}"
+            );
+            assert_eq!(provider.counter_sstore(), 0, "{spec:?}");
+
+            provider.reset_counters();
+            StorageCtx::enter(&mut provider, || {
+                Slot::<TickLevel>::new(slot, address).write(TickLevel {
+                    head: 44,
+                    tail: 55,
+                    total_liquidity: 0,
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                provider.counter_sload(),
+                if spec.is_t4() { 0 } else { 2 },
+                "{spec:?}"
+            );
+            assert_eq!(
+                provider.counter_sstore(),
+                if is_t12 { 1 } else { 2 },
+                "{spec:?}"
+            );
+
+            provider.reset_counters();
+            StorageCtx::enter(&mut provider, || {
+                Slot::<TickLevel>::new(slot, address).delete()
+            })
+            .unwrap();
+            assert_eq!(provider.counter_sload(), 0, "{spec:?}");
+            assert_eq!(
+                provider.counter_sstore(),
+                if is_t12 { 1 } else { 2 },
+                "{spec:?}"
+            );
+
+            assert_eq!(provider.storage(address, slot), U256::ZERO, "{spec:?}");
+            assert_eq!(
+                provider.storage(address, slot + U256::from(1)),
+                U256::from(if is_t12 { 33 } else { 0 }),
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn t12_get_price_level_derives_liquidity_across_fork() {
+        let admin = Address::repeat_byte(0x71);
+        let maker = Address::repeat_byte(0x72);
+        let tick = 10;
+        let amount = MIN_ORDER_AMOUNT;
+        let fund = amount * 8;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T11);
+
+        let (book_key, first_order) = StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, T12_BASE)?;
+            grant_and_mint(PATH_USD_ADDRESS, admin, maker, fund)?;
+            grant_and_mint(T12_BASE, admin, maker, fund)?;
+            let book_key = compute_book_key(T12_BASE, PATH_USD_ADDRESS);
+            let first_order = dex.place(maker, T12_BASE, amount, true, tick)?;
+            dex.place(maker, T12_BASE, amount, true, tick)?;
+
+            assert_eq!(
+                stored_tick_aggregate(&dex, book_key, tick, true)?,
+                amount * 2
+            );
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                amount * 2,
+                "pre-T12 must return the maintained aggregate"
+            );
+            Result::<_>::Ok((book_key, first_order))
+        })
+        .unwrap();
+
+        provider.set_spec(TempoHardfork::T12);
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                amount * 2,
+                "T12 must derive the same liquidity at the fork boundary"
+            );
+
+            dex.cancel(maker, first_order)?;
+            assert_eq!(
+                stored_tick_aggregate(&dex, book_key, tick, true)?,
+                amount * 2,
+                "T12 must leave the legacy aggregate stale"
+            );
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                amount,
+                "T12 must derive liquidity from the remaining order"
+            );
+
+            dex.place(maker, T12_BASE, amount * 2, true, tick)?;
+            assert_eq!(
+                stored_tick_aggregate(&dex, book_key, tick, true)?,
+                amount * 2,
+                "T12 placement must not write the legacy aggregate"
+            );
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                amount * 3
+            );
+
+            dex.swap_exact_amount_in(maker, T12_BASE, PATH_USD_ADDRESS, amount * 3, 0)?;
+            let level = dex.book_handle(book_key).read_tick_level(tick, true)?;
+            assert_eq!((level.head, level.tail), (0, 0));
+            assert_eq!(
+                stored_tick_aggregate(&dex, book_key, tick, true)?,
+                amount * 2,
+                "T12 tick exhaustion must not clear the legacy aggregate"
+            );
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                0
+            );
+
+            // Two resting orders whose sum overflows u128: placement succeeds at T12
+            // (no aggregate), but deriving the level total reports the overflow.
+            let overflow_amount = u128::MAX / 2 + 1;
+            let escrow = base_to_quote(overflow_amount, MIN_TICK, RoundingDirection::Up).unwrap();
+            let maker_1 = Address::repeat_byte(0x73);
+            let maker_2 = Address::repeat_byte(0x74);
+            for maker in [maker_1, maker_2] {
+                grant_and_mint(PATH_USD_ADDRESS, admin, maker, escrow)?;
+            }
+            let head = dex.place(maker_1, T12_BASE, overflow_amount, true, MIN_TICK)?;
+            let tail = dex.place(maker_2, T12_BASE, overflow_amount, true, MIN_TICK)?;
+            let links_before = dex.book_handle(book_key).read_tick_level(MIN_TICK, true)?;
+            assert_eq!((links_before.head, links_before.tail), (head, tail));
+            assert_eq!(
+                dex.get_price_level(T12_BASE, MIN_TICK, true),
+                Err(TempoPrecompileError::under_overflow())
+            );
+            assert_eq!(
+                dex.book_handle(book_key).read_tick_level(MIN_TICK, true)?,
+                links_before
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Official `test_quote_vs_swap_exact_in_fragmented`: tick 10 -> price 100_010;
+    /// per-order execution rounds down twice (2 x 100_016_000) while the pre-T12
+    /// per-tick quote rounds once over the aggregate (200_032_001).
+    #[test]
+    fn t12_quote_vs_swap_exact_in_fragmented() {
+        let run = |spec| {
+            with_fragmented_book(
+                spec,
+                &[(100_006_000, 10), (100_006_000, 10)],
+                true,
+                |dex, base, quote, taker| {
+                    let quoted = dex.quote_swap_exact_amount_in(base, quote, 200_012_000)?;
+                    let executed = dex.swap_exact_amount_in(taker, base, quote, 200_012_000, 0)?;
+                    Ok((quoted, executed))
+                },
+            )
+            .unwrap()
+        };
+
+        assert_eq!(run(TempoHardfork::T11), (200_032_001, 200_032_000));
+        assert_eq!(run(TempoHardfork::T12), (200_032_000, 200_032_000));
+    }
+
+    #[test]
+    fn t12_quote_matches_swap_multi_hop_fragmented() {
+        let token_a = address!("0x20c0000000000000000000000000000000000006");
+        let token_b = address!("0x20c0000000000000000000000000000000000007");
+        let run = |exact_in: bool| {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xb1);
+                let taker = Address::repeat_byte(0xb2);
+                let makers = [0xb3, 0xb4, 0xb5, 0xb6].map(Address::repeat_byte);
+                let fund = 1_000_000_000_000_000_000u128;
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, token_a)?;
+                TIP20Token::from_address_unchecked(token_b).initialize(
+                    Address::ZERO,
+                    "Token B",
+                    "TOKB",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )?;
+                dex.create_pair(token_b)?;
+                for actor in makers.iter().copied().chain([taker]) {
+                    for token in [PATH_USD_ADDRESS, token_a, token_b] {
+                        grant_and_mint(token, admin, actor, fund)?;
+                    }
+                }
+
+                // TOKEN_A -> pathUSD consumes bids on TOKEN_A.
+                dex.place(makers[0], token_a, 100_006_000, true, 10)?;
+                dex.place(makers[1], token_a, 100_006_000, true, 10)?;
+                // pathUSD -> TOKEN_B consumes asks on TOKEN_B.
+                dex.place(makers[2], token_b, 100_000_003, false, 20)?;
+                dex.place(makers[3], token_b, 150_000_009, false, 20)?;
+
+                if exact_in {
+                    let quoted = dex.quote_swap_exact_amount_in(token_a, token_b, 200_012_000)?;
+                    let executed =
+                        dex.swap_exact_amount_in(taker, token_a, token_b, 200_012_000, quoted)?;
+                    Result::<_>::Ok((quoted, executed))
+                } else {
+                    let quoted = dex.quote_swap_exact_amount_out(token_a, token_b, 150_000_000)?;
+                    let executed =
+                        dex.swap_exact_amount_out(taker, token_a, token_b, 150_000_000, quoted)?;
+                    Ok((quoted, executed))
+                }
+            })
+            .unwrap()
+        };
+
+        for exact_in in [true, false] {
+            let (quoted, executed) = run(exact_in);
+            assert_eq!(quoted, executed, "multi-hop parity (exact_in={exact_in})");
+        }
+    }
+
+    #[test]
+    fn t12_quote_matches_swap_state_side_effects() {
+        let admin = Address::repeat_byte(0xc1);
+        let maker_1 = Address::repeat_byte(0xc2);
+        let maker_2 = Address::repeat_byte(0xc3);
+        let taker = Address::repeat_byte(0xc4);
+        let tick = 10;
+        let (size_1, size_2) = (100_000_005, 100_000_007);
+        let amount_in = size_1 + 1;
+        let fund = 1_000_000_000_000_000_000u128;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+
+        let (order_1, order_2) = StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, T12_BASE)?;
+            grant_and_mint(T12_BASE, admin, taker, fund)?;
+            grant_and_mint(PATH_USD_ADDRESS, admin, maker_1, fund)?;
+            grant_and_mint(PATH_USD_ADDRESS, admin, maker_2, fund)?;
+            let book_key = compute_book_key(T12_BASE, PATH_USD_ADDRESS);
+            let order_1 = dex.place(maker_1, T12_BASE, size_1, true, tick)?;
+            let order_2 = dex.place(maker_2, T12_BASE, size_2, true, tick)?;
+
+            let quoted = dex.quote_swap_exact_amount_in(T12_BASE, PATH_USD_ADDRESS, amount_in)?;
+            let expected_out = base_to_quote(size_1, tick, RoundingDirection::Down).unwrap()
+                + base_to_quote(1, tick, RoundingDirection::Down).unwrap();
+            assert_eq!(
+                quoted, expected_out,
+                "test setup should cross one order boundary"
+            );
+
+            let executed =
+                dex.swap_exact_amount_in(taker, T12_BASE, PATH_USD_ADDRESS, amount_in, quoted)?;
+            assert_eq!(executed, quoted);
+            assert_eq!(dex.balance_of(maker_1, T12_BASE)?, size_1);
+            assert_eq!(dex.balance_of(maker_2, T12_BASE)?, 1);
+            assert!(
+                dex.get_order(order_1).is_err(),
+                "fully filled order deleted"
+            );
+            let residual = dex.get_order(order_2)?;
+            assert_eq!(residual.remaining, size_2 - 1);
+            assert_eq!(residual.maker, maker_2);
+
+            let handle = dex.book_handle(book_key);
+            assert_eq!(handle.read_data()?.best_bid_tick, tick);
+            let level = handle.read_tick_level(tick, true)?;
+            assert_eq!((level.head, level.tail), (order_2, order_2));
+            assert_eq!(
+                level.total_liquidity, 0,
+                "stored T12 aggregate stays unused"
+            );
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                size_2 - 1
+            );
+            Result::<_>::Ok((order_1, order_2))
+        })
+        .unwrap();
+
+        let fills: Vec<_> = provider
+            .events(STABLECOIN_DEX_ADDRESS)
+            .iter()
+            .filter(|event| event.topics()[0] == IStablecoinDEX::OrderFilled::SIGNATURE_HASH)
+            .cloned()
+            .collect();
+        let filled = |order_id, maker, amount_filled, partial_fill| {
+            IStablecoinDEX::OrderFilled {
+                orderId: order_id,
+                maker,
+                taker,
+                amountFilled: amount_filled,
+                partialFill: partial_fill,
+            }
+            .encode_log_data()
+        };
+        assert_eq!(
+            fills,
+            vec![
+                filled(order_1, maker_1, size_1, false),
+                filled(order_2, maker_2, 1, true),
+            ],
+            "expected full fill then partial fill"
+        );
+    }
+
+    #[test]
+    fn t12_quote_matches_swap_zero_amount_with_liquidity() {
+        let book = &[(100_000_005, 10), (100_000_007, 10)];
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            assert_eq!(dex.quote_swap_exact_amount_in(base, quote, 0)?, 0);
+            assert_eq!(dex.swap_exact_amount_in(taker, base, quote, 0, 0)?, 0);
+            assert_eq!(dex.quote_swap_exact_amount_out(base, quote, 0)?, 0);
+            assert_eq!(dex.swap_exact_amount_out(taker, base, quote, 0, 0)?, 0);
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                assert_eq!(dex.quote_swap_exact_amount_in(quote, base, 0)?, 0);
+                assert_eq!(dex.swap_exact_amount_in(taker, quote, base, 0, 0)?, 0);
+                assert_eq!(dex.quote_swap_exact_amount_out(quote, base, 0)?, 0);
+                assert_eq!(dex.swap_exact_amount_out(taker, quote, base, 0, 0)?, 0);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    /// Official `test_quote_matches_swap_t12_parity`: all four per-order branches over
+    /// fragmented books; the last config crosses two ticks (`next_order_after`).
+    #[test]
+    fn t12_quote_matches_swap_parity() {
+        let books: &[&[(u128, i16)]] = &[
+            &[(100_000_005, 10), (100_000_007, 10)],
+            &[(100_000_003, 20), (100_000_009, 20), (100_000_001, 20)],
+            &[(123_456_789, 30), (100_000_000, 30)],
+            &[(100_000_001, -10), (100_000_001, -10), (100_000_001, -10)],
+            &[
+                (100_000_005, 10),
+                (100_000_007, 10),
+                (100_000_003, -10),
+                (100_000_009, -10),
+            ],
+        ];
+
+        for (i, book) in books.iter().enumerate() {
+            let total_base: u128 = book.iter().map(|(s, _)| *s).sum();
+            let partial = book[0].0 + book.get(1).map(|(s, _)| *s).unwrap_or(0) / 2;
+
+            for amount_in in [total_base, partial] {
+                with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+                    let q = dex.quote_swap_exact_amount_in(base, quote, amount_in)?;
+                    let ex = dex.swap_exact_amount_in(taker, base, quote, amount_in, 0)?;
+                    assert_eq!(
+                        q, ex,
+                        "bid exact-in parity (book={i}, amount_in={amount_in})"
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }
+
+            for amount_out in [total_base, partial] {
+                with_fragmented_book(
+                    TempoHardfork::T12,
+                    book,
+                    false,
+                    |dex, base, quote, taker| {
+                        let q = dex.quote_swap_exact_amount_out(quote, base, amount_out)?;
+                        let ex =
+                            dex.swap_exact_amount_out(taker, quote, base, amount_out, u128::MAX)?;
+                        assert_eq!(
+                            q, ex,
+                            "ask exact-out parity (book={i}, amount_out={amount_out})"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+
+            with_fragmented_book(
+                TempoHardfork::T12,
+                book,
+                false,
+                |dex, base, quote, taker| {
+                    let amount_in = dex.quote_swap_exact_amount_out(quote, base, total_base)?;
+                    let q = dex.quote_swap_exact_amount_in(quote, base, amount_in)?;
+                    let ex = dex.swap_exact_amount_in(taker, quote, base, amount_in, 0)?;
+                    assert_eq!(q, ex, "ask exact-in parity (book={i})");
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+                let amount_out = dex.quote_swap_exact_amount_in(base, quote, total_base / 2)?;
+                let q = dex.quote_swap_exact_amount_out(base, quote, amount_out)?;
+                let ex = dex.swap_exact_amount_out(taker, base, quote, amount_out, u128::MAX)?;
+                assert_eq!(q, ex, "bid exact-out parity (book={i})");
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    /// Official `check_quote_matches_swap_t12_property_case` (deterministic cases only;
+    /// the official proptest sweep needs a dev-dependency this crate does not have).
+    fn check_quote_matches_swap_t12_case(
+        book: &[(u128, i16)],
+        maker_is_bid: bool,
+        exact_in: bool,
+        target_ppm: u16,
+    ) {
+        let total_base = book.iter().map(|(size, _)| *size).sum::<u128>();
+        let target_base = (total_base * u128::from(target_ppm) / 1_000).clamp(1, total_base);
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            maker_is_bid,
+            |dex, base, quote, taker| {
+                let (quoted, executed) = match (maker_is_bid, exact_in) {
+                    (true, true) => {
+                        let quoted = dex.quote_swap_exact_amount_in(base, quote, target_base)?;
+                        (
+                            quoted,
+                            dex.swap_exact_amount_in(taker, base, quote, target_base, quoted)?,
+                        )
+                    }
+                    (true, false) => {
+                        let amount_out =
+                            dex.quote_swap_exact_amount_in(base, quote, target_base)?;
+                        let quoted = dex.quote_swap_exact_amount_out(base, quote, amount_out)?;
+                        (
+                            quoted,
+                            dex.swap_exact_amount_out(taker, base, quote, amount_out, quoted)?,
+                        )
+                    }
+                    (false, true) => {
+                        let amount_in =
+                            dex.quote_swap_exact_amount_out(quote, base, target_base)?;
+                        let quoted = dex.quote_swap_exact_amount_in(quote, base, amount_in)?;
+                        (
+                            quoted,
+                            dex.swap_exact_amount_in(taker, quote, base, amount_in, quoted)?,
+                        )
+                    }
+                    (false, false) => {
+                        let quoted = dex.quote_swap_exact_amount_out(quote, base, target_base)?;
+                        (
+                            quoted,
+                            dex.swap_exact_amount_out(taker, quote, base, target_base, quoted)?,
+                        )
+                    }
+                };
+                assert_eq!(
+                    quoted, executed,
+                    "book={book:?} bid={maker_is_bid} exact_in={exact_in}"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn t12_quote_matches_swap_boundary_ticks() {
+        let boundary_books = [
+            [
+                (100_000_005, MAX_TICK),
+                (100_000_007, 1280),
+                (100_000_003, 1270),
+            ],
+            [
+                (100_000_005, MIN_TICK),
+                (100_000_007, -1280),
+                (100_000_003, -1270),
+            ],
+        ];
+        for book in boundary_books {
+            for maker_is_bid in [true, false] {
+                for exact_in in [true, false] {
+                    check_quote_matches_swap_t12_case(&book, maker_is_bid, exact_in, 1_000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn t12_quote_matches_swap_tight_slippage_bounds() {
+        let book = &[(100_000_005, 10), (100_000_007, 10)];
+        let target_base = 100_000_006;
+
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            let quoted = dex.quote_swap_exact_amount_in(base, quote, target_base)?;
+            assert_eq!(
+                dex.swap_exact_amount_in(taker, base, quote, target_base, quoted)?,
+                quoted
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            let quoted = dex.quote_swap_exact_amount_in(base, quote, target_base)?;
+            let err = dex
+                .swap_exact_amount_in(taker, base, quote, target_base, quoted + 1)
+                .unwrap_err();
+            assert_eq!(err, err_insufficient_output());
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            let amount_out = dex.quote_swap_exact_amount_in(base, quote, target_base)?;
+            let quoted = dex.quote_swap_exact_amount_out(base, quote, amount_out)?;
+            assert_eq!(
+                dex.swap_exact_amount_out(taker, base, quote, amount_out, quoted)?,
+                quoted
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            let amount_out = dex.quote_swap_exact_amount_in(base, quote, target_base)?;
+            let quoted = dex.quote_swap_exact_amount_out(base, quote, amount_out)?;
+            let err = dex
+                .swap_exact_amount_out(taker, base, quote, amount_out, quoted - 1)
+                .unwrap_err();
+            assert_eq!(err, err_max_input_exceeded());
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                let amount_in = dex.quote_swap_exact_amount_out(quote, base, target_base)?;
+                let quoted = dex.quote_swap_exact_amount_in(quote, base, amount_in)?;
+                assert_eq!(
+                    dex.swap_exact_amount_in(taker, quote, base, amount_in, quoted)?,
+                    quoted
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                let amount_in = dex.quote_swap_exact_amount_out(quote, base, target_base)?;
+                let quoted = dex.quote_swap_exact_amount_in(quote, base, amount_in)?;
+                let err = dex
+                    .swap_exact_amount_in(taker, quote, base, amount_in, quoted + 1)
+                    .unwrap_err();
+                assert_eq!(err, err_insufficient_output());
+                Ok(())
+            },
+        )
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                let quoted = dex.quote_swap_exact_amount_out(quote, base, target_base)?;
+                assert_eq!(
+                    dex.swap_exact_amount_out(taker, quote, base, target_base, quoted)?,
+                    quoted
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                let quoted = dex.quote_swap_exact_amount_out(quote, base, target_base)?;
+                let err = dex
+                    .swap_exact_amount_out(taker, quote, base, target_base, quoted - 1)
+                    .unwrap_err();
+                assert_eq!(err, err_max_input_exceeded());
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn t12_quote_matches_swap_flip_order_read_only_advance() {
+        let admin = Address::repeat_byte(0xd1);
+        let maker_flip = Address::repeat_byte(0xd2);
+        let maker_next = Address::repeat_byte(0xd3);
+        let taker = Address::repeat_byte(0xd4);
+        let (tick, flip_tick) = (10, 20);
+        let amount = MIN_ORDER_AMOUNT;
+        let fund = 1_000_000_000_000_000_000u128;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+
+        StorageCtx::enter(&mut provider, || {
+            let mut dex = StablecoinDEX::new();
+            setup_dex_tokens(&mut dex, admin, T12_BASE)?;
+            for actor in [maker_flip, maker_next, taker] {
+                grant_and_mint(T12_BASE, admin, actor, fund)?;
+                grant_and_mint(PATH_USD_ADDRESS, admin, actor, fund)?;
+            }
+            let book_key = compute_book_key(T12_BASE, PATH_USD_ADDRESS);
+            let flip_order =
+                dex.place_flip(maker_flip, T12_BASE, amount, true, tick, flip_tick, false)?;
+            let next_order = dex.place(maker_next, T12_BASE, amount + 7, true, tick)?;
+
+            let level_before = dex.book_handle(book_key).read_tick_level(tick, true)?;
+            assert_eq!(
+                (level_before.head, level_before.tail),
+                (flip_order, next_order)
+            );
+
+            let amount_in = amount + 1;
+            let quoted = dex.quote_swap_exact_amount_in(T12_BASE, PATH_USD_ADDRESS, amount_in)?;
+            let expected = base_to_quote(amount, tick, RoundingDirection::Down).unwrap()
+                + base_to_quote(1, tick, RoundingDirection::Down).unwrap();
+            assert_eq!(quoted, expected);
+
+            let flip_after_quote = dex.get_order(flip_order)?;
+            assert!(flip_after_quote.is_bid);
+            assert_eq!(flip_after_quote.tick, tick);
+            assert_eq!(flip_after_quote.next, next_order);
+            assert_eq!(
+                dex.book_handle(book_key).read_tick_level(tick, true)?,
+                level_before
+            );
+
+            let executed =
+                dex.swap_exact_amount_in(taker, T12_BASE, PATH_USD_ADDRESS, amount_in, quoted)?;
+            assert_eq!(executed, quoted);
+
+            let flipped = dex.get_order(flip_order)?;
+            assert!(!flipped.is_bid);
+            assert_eq!(flipped.tick, flip_tick);
+            assert_eq!(flipped.remaining, amount);
+            assert_eq!(dex.get_order(next_order)?.remaining, amount + 6);
+            let level_after = dex.book_handle(book_key).read_tick_level(tick, true)?;
+            assert_eq!(
+                (level_after.head, level_after.tail),
+                (next_order, next_order)
+            );
+            assert_eq!(
+                level_after.total_liquidity, 0,
+                "stored T12 aggregate stays unused"
+            );
+            assert_eq!(
+                dex.get_price_level(T12_BASE, tick, true)?.total_liquidity,
+                amount + 6
+            );
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Official `test_quote_matches_swap_t12_exhaustion`: quote and swap fail at the same boundary.
+    #[test]
+    fn t12_quote_matches_swap_exhaustion() {
+        let book: &[(u128, i16)] = &[(100_000_005, 10), (100_000_007, 10)];
+        let total_base: u128 = book.iter().map(|(s, _)| *s).sum();
+        let expected = err_insufficient_liquidity();
+
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            let over = total_base + 1;
+            assert_eq!(
+                dex.quote_swap_exact_amount_in(base, quote, over)
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                dex.swap_exact_amount_in(taker, base, quote, over, 0)
+                    .unwrap_err(),
+                expected
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(TempoHardfork::T12, book, true, |dex, base, quote, taker| {
+            let max_quote_out = book
+                .iter()
+                .map(|(size, tick)| base_to_quote(*size, *tick, RoundingDirection::Down).unwrap())
+                .sum::<u128>();
+            let over = max_quote_out + 1;
+            assert_eq!(
+                dex.quote_swap_exact_amount_out(base, quote, over)
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                dex.swap_exact_amount_out(taker, base, quote, over, u128::MAX)
+                    .unwrap_err(),
+                expected
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                let over_quote =
+                    base_to_quote(total_base * 2, book[0].1, RoundingDirection::Up).unwrap();
+                assert_eq!(
+                    dex.quote_swap_exact_amount_in(quote, base, over_quote)
+                        .unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    dex.swap_exact_amount_in(taker, quote, base, over_quote, 0)
+                        .unwrap_err(),
+                    expected
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        with_fragmented_book(
+            TempoHardfork::T12,
+            book,
+            false,
+            |dex, base, quote, taker| {
+                let over = total_base + 1;
+                assert_eq!(
+                    dex.quote_swap_exact_amount_out(quote, base, over)
+                        .unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    dex.swap_exact_amount_out(taker, quote, base, over, u128::MAX)
+                        .unwrap_err(),
+                    expected
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    /// T12 partial fills and middle-order cancels leave the tick level untouched
+    /// (official `partial_fill_order` / `cancel_active_order`), so each saves the
+    /// legacy level write and one aggregate read compared with T11.
+    #[test]
+    fn t12_partial_fill_and_middle_cancel_skip_tick_level_io() {
+        let book: &[(u128, i16)] = &[(100_000_005, 10), (100_000_007, 10), (100_000_009, 10)];
+        let partial_fill = |spec| {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let admin = Address::repeat_byte(0xe1);
+                let taker = Address::repeat_byte(0xe2);
+                let mut dex = StablecoinDEX::new();
+                setup_dex_tokens(&mut dex, admin, T12_BASE)?;
+                grant_and_mint(T12_BASE, admin, taker, u128::MAX / 4)?;
+                for (i, (size, tick)) in book.iter().enumerate() {
+                    let maker = Address::with_last_byte(0x20 + i as u8);
+                    grant_and_mint(PATH_USD_ADDRESS, admin, maker, u128::MAX / 4)?;
+                    dex.place(maker, T12_BASE, *size, true, *tick)?;
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+            provider.reset_counters();
+            StorageCtx::enter(&mut provider, || {
+                StablecoinDEX::new().swap_exact_amount_in(
+                    Address::repeat_byte(0xe2),
+                    T12_BASE,
+                    PATH_USD_ADDRESS,
+                    1,
+                    0,
+                )
+            })
+            .unwrap();
+            let fill_io = (provider.counter_sload(), provider.counter_sstore());
+
+            provider.reset_counters();
+            StorageCtx::enter(&mut provider, || {
+                // Order 2 is the middle order: cancelling it only relinks its neighbours.
+                StablecoinDEX::new().cancel(Address::with_last_byte(0x21), 2)
+            })
+            .unwrap();
+            (
+                fill_io,
+                (provider.counter_sload(), provider.counter_sstore()),
+            )
+        };
+
+        let ((t11_fill_sload, t11_fill_sstore), (t11_cancel_sload, t11_cancel_sstore)) =
+            partial_fill(TempoHardfork::T11);
+        let ((t12_fill_sload, t12_fill_sstore), (t12_cancel_sload, t12_cancel_sstore)) =
+            partial_fill(TempoHardfork::T12);
+        assert_eq!(
+            t11_fill_sload - t12_fill_sload,
+            1,
+            "aggregate slot is no longer read"
+        );
+        assert_eq!(
+            t11_fill_sstore - t12_fill_sstore,
+            2,
+            "partial fill no longer writes the level"
+        );
+        assert_eq!(
+            t11_cancel_sload - t12_cancel_sload,
+            1,
+            "aggregate slot is no longer read"
+        );
+        assert_eq!(
+            t11_cancel_sstore - t12_cancel_sstore,
+            2,
+            "middle cancel no longer writes the level"
+        );
     }
 }

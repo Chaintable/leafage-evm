@@ -50,7 +50,8 @@ use super::storage_types::{
 };
 use super::{
     Precompile, RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
-    dispatch_call, input_cost, metadata, mutate, mutate_void, unknown_selector, view,
+    TIP20_CHANNEL_RESERVE_ADDRESS, decode_precompile_call, dispatch_call, input_cost, metadata,
+    mutate, mutate_void, unknown_selector, view,
 };
 use crate::tempo::address::TempoAddressExt;
 
@@ -581,6 +582,23 @@ impl TIP20Token {
                     ITIP20::PolicyForbids {}.abi_encode().into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Ensures `receiver` currently accepts this token from `sender` under TIP-1028.
+    pub(crate) fn ensure_receive_policy_authorized(
+        &self,
+        sender: Address,
+        receiver: Address,
+    ) -> Result<()> {
+        if super::tip403_registry::TIP403Registry::new()
+            .validate_receive_policy(self.address, sender, receiver)?
+            .is_some()
+        {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::PolicyForbids {}.abi_encode().into(),
+            ));
         }
         Ok(())
     }
@@ -1162,6 +1180,43 @@ impl TIP20Token {
         self._transfer_to(from, to, amount)?;
         self.emit_virtual_hop(to, amount)?;
         Ok(true)
+    }
+
+    /// Moves channel-reserve custody after the reserve applies its TIP-403 rules (TIP-1095, T12).
+    ///
+    /// One endpoint must be the channel reserve. `receive_policy_sender` is the sender presented
+    /// to TIP-1028; unlike ordinary transfers, a rejected delivery reverts instead of being
+    /// routed to the receive-policy guard.
+    pub(crate) fn channel_reserve_transfer(
+        &mut self,
+        from: Address,
+        to: Recipient,
+        amount: U256,
+        receive_policy_sender: Address,
+    ) -> Result<()> {
+        if from != TIP20_CHANNEL_RESERVE_ADDRESS
+            && to.event_address() != TIP20_CHANNEL_RESERVE_ADDRESS
+        {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::Unauthorized {}.abi_encode().into(),
+            ));
+        }
+
+        self.check_not_paused()?;
+        to.validate()?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            from,
+            self.address,
+            amount,
+        )?;
+
+        if to.target == RECEIVE_POLICY_GUARD_ADDRESS {
+            return Err(address_reserved());
+        }
+        self.ensure_receive_policy_authorized(receive_policy_sender, to.target)?;
+
+        self._transfer_to(from, to, amount)?;
+        self.emit_virtual_hop(to, amount)
     }
 
     fn consume_allowance(&mut self, owner: Address, spender: Address, amount: U256) -> Result<()> {
@@ -1948,13 +2003,13 @@ impl TIP20Call {
 
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
-        let config = crate::tempo::precompile::abi_decoder_config(StorageCtx.spec());
+        let spec = StorageCtx.spec();
 
         if IRolesAuth::IRolesAuthCalls::valid_selector(selector) {
-            IRolesAuth::IRolesAuthCalls::abi_decode_with_config(calldata, config)
+            decode_precompile_call::<IRolesAuth::IRolesAuthCalls>(calldata, spec)
                 .map(Self::RolesAuth)
         } else {
-            ITIP20::ITIP20Calls::abi_decode_with_config(calldata, config).map(Self::TIP20)
+            decode_precompile_call::<ITIP20::ITIP20Calls>(calldata, spec).map(Self::TIP20)
         }
     }
 }

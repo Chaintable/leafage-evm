@@ -1323,10 +1323,9 @@ impl Precompile for TIP403Registry {
                         .all(|&(gated, since)| gated != selector || spec >= since)
             },
             |data| {
-                ITIP403Registry::ITIP403RegistryCalls::abi_decode_with_config(
-                    data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
-                )
+                crate::tempo::precompile::decode_precompile_call::<
+                    ITIP403Registry::ITIP403RegistryCalls,
+                >(data, StorageCtx.spec())
             },
             |call| match call {
                 ITIP403Registry::ITIP403RegistryCalls::policyIdCounter(call) => {

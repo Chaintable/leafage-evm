@@ -488,9 +488,9 @@ impl Precompile for StorageCredits {
             calldata,
             IStorageCredits::IStorageCreditsCalls::valid_selector,
             |data| {
-                IStorageCredits::IStorageCreditsCalls::abi_decode_with_config(
+                super::decode_precompile_call::<IStorageCredits::IStorageCreditsCalls>(
                     data,
-                    super::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

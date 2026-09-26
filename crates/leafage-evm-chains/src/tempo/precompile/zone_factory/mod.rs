@@ -379,9 +379,9 @@ impl Precompile for ZoneFactory {
             calldata,
             IZoneFactory::IZoneFactoryCalls::valid_selector,
             |data| {
-                IZoneFactory::IZoneFactoryCalls::abi_decode_with_config(
+                super::decode_precompile_call::<IZoneFactory::IZoneFactoryCalls>(
                     data,
-                    super::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

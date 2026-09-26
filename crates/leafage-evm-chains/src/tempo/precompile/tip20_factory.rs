@@ -310,9 +310,9 @@ impl Precompile for TIP20Factory {
                         || selector != ITIP20Factory::createToken_1Call::SELECTOR)
             },
             |data| {
-                ITIP20Factory::ITIP20FactoryCalls::abi_decode_with_config(
+                crate::tempo::precompile::decode_precompile_call::<ITIP20Factory::ITIP20FactoryCalls>(
                     data,
-                    crate::tempo::precompile::abi_decoder_config(StorageCtx.spec()),
+                    StorageCtx.spec(),
                 )
             },
             |call| match call {

@@ -528,7 +528,7 @@ where
                 use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
                 use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
                 let nonce = if nk == revm::primitives::U256::MAX && hardfork.is_t1() {
-                    0u64 // expiring nonce must be 0
+                    0u64 // required before T12; unsigned requests keep 0 from T12
                 } else {
                     let caller = request.inner.from.unwrap_or_default();
                     let slot = caller.mapping_slot(revm::primitives::U256::ZERO);

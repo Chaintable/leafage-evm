@@ -29,8 +29,8 @@ use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, 
 use super::tip20::TIP20Token;
 use super::tip403_registry::AuthRole;
 use super::{
-    DEFAULT_FEE_TOKEN, Precompile, TIP_FEE_MANAGER_ADDRESS, dispatch_call, input_cost, metadata,
-    mutate, mutate_void, view,
+    DEFAULT_FEE_TOKEN, Precompile, TIP_FEE_MANAGER_ADDRESS, decode_precompile_call, dispatch_call,
+    input_cost, metadata, mutate, mutate_void, view,
 };
 
 // ===========================================================================
@@ -747,13 +747,13 @@ impl TipFeeManagerCall {
 
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
-        let config = crate::tempo::precompile::abi_decoder_config(StorageCtx.spec());
+        let spec = StorageCtx.spec();
 
         if IFeeManager::IFeeManagerCalls::valid_selector(selector) {
-            IFeeManager::IFeeManagerCalls::abi_decode_with_config(calldata, config)
+            decode_precompile_call::<IFeeManager::IFeeManagerCalls>(calldata, spec)
                 .map(Self::FeeManager)
         } else {
-            ITIPFeeAMM::ITIPFeeAMMCalls::abi_decode_with_config(calldata, config).map(Self::Amm)
+            decode_precompile_call::<ITIPFeeAMM::ITIPFeeAMMCalls>(calldata, spec).map(Self::Amm)
         }
     }
 }

@@ -752,7 +752,9 @@ fn check_and_mark_expiring_nonce_if_needed<DB: Database, INSP>(
         return Ok(());
     }
 
-    if evm.ctx().tx.base.nonce != 0 {
+    // TIP-1106: from T12 the nonce is an opaque discriminator committed to by the
+    // signing and replay-protection hashes; before T12 it must be zero.
+    if !hardfork.is_t12() && evm.ctx().tx.base.nonce != 0 {
         return Err(EVMError::Transaction(
             TempoInvalidTransaction::ExpiringNonceNonceNotZero,
         ));
@@ -4094,6 +4096,36 @@ mod tests {
             "nonce-manager bookkeeping must not mint TIP-1060 storage credits",
         );
         assert_eq!(result.state[&Address::with_last_byte(0x91)].info.nonce, 0);
+    }
+
+    #[test]
+    fn expiring_nonce_accepts_nonzero_nonce_only_from_t12() {
+        use revm::primitives::B256;
+
+        let valid_before = 1_770_908_500 + 300;
+        for (index, nonce) in [1, (1u64 << 53) + 1, u64::MAX].into_iter().enumerate() {
+            let mut tx = expiring_nonce_tx(valid_before, B256::repeat_byte(0xa0 + index as u8));
+            tx.base.nonce = nonce;
+
+            let mut t11 = make_cached_evm_with_spec(TempoHardfork::T11);
+            assert!(
+                matches!(
+                    t11.transact(tx.clone()).unwrap_err(),
+                    EVMError::Transaction(TempoInvalidTransaction::ExpiringNonceNonceNotZero)
+                ),
+                "nonce {nonce}"
+            );
+
+            let mut t12 = make_cached_evm_with_spec(TempoHardfork::T12);
+            let result = t12.transact(tx).unwrap();
+            assert!(
+                result.result.is_success(),
+                "nonce {nonce}: {:?}",
+                result.result
+            );
+            // The discriminator never bumps the account nonce.
+            assert_eq!(result.state[&Address::with_last_byte(0x91)].info.nonce, 0);
+        }
     }
 
     #[test]
