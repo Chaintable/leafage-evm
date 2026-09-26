@@ -9,28 +9,26 @@
 //! ## API adaptation notes (alloy-evm 0.29.2)
 //!
 //! - `chain_id` passed explicitly to `LeafageStorageProvider::new` for convenience
-//! - Gas accounting uses hardcoded `TempoGasCosts` constants (matching GasParams overrides)
+//! - Gas accounting uses the active [`GasParams`], including handler-specific overrides
 //! - `with_account_info` uses `load_account_code` + `JournaledAccountTr::account()` for info access
 //! - Checkpoint operations delegate to `EvmInternals` (alloy-evm 0.29.2)
 
 use alloy::primitives::{keccak256, Address, Log, LogData, B256, U256};
 use alloy_evm::EvmInternals;
 use revm::{
-    interpreter::gas::{
-        COLD_ACCOUNT_ACCESS_COST_ADDITIONAL, COLD_SLOAD_COST, KECCAK256, KECCAK256WORD, LOG,
-        LOGDATA, LOGTOPIC, WARM_STORAGE_READ_COST,
-    },
+    context_interface::cfg::gas_params::GasParams,
+    interpreter::gas::{KECCAK256, KECCAK256WORD, LOG},
     state::Bytecode,
 };
 
-/// COLD_SLOAD_COST - WARM_STORAGE_READ_COST (removed in revm 36, was 2000)
-const COLD_SLOAD_COST_ADDITIONAL: u64 = COLD_SLOAD_COST - WARM_STORAGE_READ_COST;
 use scoped_tls::scoped_thread_local;
 use std::cell::RefCell;
 
 use super::error::{Result, TempoPrecompileError};
-use crate::tempo::gas_params::TempoGasCosts;
 use crate::tempo::hardfork::TempoHardfork;
+use crate::tempo::precompile::storage_credits::{
+    account_storage_write, AccountingError, StorageCreditsBackend,
+};
 
 /// Re-export of `revm::context_interface::journaled_state::JournalCheckpoint`.
 ///
@@ -103,6 +101,12 @@ pub trait PrecompileStorageProvider {
     /// Returns whether the current call context is static.
     fn is_static(&self) -> bool;
 
+    /// Enables or disables all TIP-1060 accounting for subsequent storage writes.
+    fn set_tip1060_storage_credits(&mut self, _enabled: bool) {}
+
+    /// Enables or disables minting credits on clears while retaining creation accounting.
+    fn set_tip1060_storage_credit_minting(&mut self, _enabled: bool) {}
+
     /// Creates a new journal checkpoint.
     fn checkpoint(&mut self) -> JournalCheckpoint;
 
@@ -138,28 +142,12 @@ pub trait PrecompileStorageProvider {
             return Ok(None);
         }
 
-        let recid = secp256k1::ecdsa::RecoveryId::try_from((v as i32) - 27)
-            .map_err(|_| TempoPrecompileError::Fatal("invalid recovery id".to_string()))?;
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(r.as_slice());
-        sig_bytes[32..].copy_from_slice(s.as_slice());
-        let sig = match secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid) {
-            Ok(sig) => sig,
-            Err(_) => return Ok(None),
-        };
-        let msg = secp256k1::Message::from_digest(*digest);
-        let pubkey = match secp256k1::SECP256K1.recover_ecdsa(&msg, &sig) {
-            Ok(pk) => pk,
-            Err(_) => return Ok(None),
-        };
-        let hash = keccak256(&pubkey.serialize_uncompressed()[1..]);
-        let recovered = Address::from_slice(&hash[12..]);
+        // Same as official: alloy's `recover_signer` rejects high-s (EIP-2) signatures.
+        let parity = v == 28;
+        let sig = alloy::primitives::Signature::from_scalars_and_parity(r, s, parity);
+        let recovered = alloy::consensus::crypto::secp256k1::recover_signer(&sig, digest);
 
-        if recovered.is_zero() {
-            Ok(None)
-        } else {
-            Ok(Some(recovered))
-        }
+        Ok(recovered.ok().filter(|addr| !addr.is_zero()))
     }
 }
 
@@ -171,6 +159,43 @@ pub trait StorageOps {
     fn store(&mut self, slot: U256, value: U256) -> Result<()>;
     /// Loads a value from the provided slot.
     fn load(&self, slot: U256) -> Result<U256>;
+}
+
+/// Read-only `StorageOps` adapter bound to a specific contract address.
+///
+/// Wraps the thread-local `StorageCtx` so that `Storable::load` /
+/// `Set::load` / `Vec::load` can be called with a manually-computed slot
+/// against a known contract address. The typed `Slot`/`Mapping` handlers
+/// already provide this via their own `StorageOps` impl, but those carry a
+/// fixed base slot — the reader is for traversal paths (e.g. CallScope
+/// nested `Set<Address>` reads in `account_keychain`) that compute slots
+/// outside the handler hierarchy.
+///
+/// Writes intentionally fail: write paths must go through typed handlers so
+/// that gas accounting and packed-slot semantics stay correct.
+pub struct ContractStorageReader {
+    address: Address,
+}
+
+impl ContractStorageReader {
+    /// Create a reader bound to `address`.
+    #[inline]
+    pub const fn new(address: Address) -> Self {
+        Self { address }
+    }
+}
+
+impl StorageOps for ContractStorageReader {
+    #[inline]
+    fn load(&self, slot: U256) -> Result<U256> {
+        StorageCtx.sload(self.address, slot)
+    }
+
+    fn store(&mut self, _slot: U256, _value: U256) -> Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "ContractStorageReader is read-only; use Slot/Mapping handler for writes".into(),
+        ))
+    }
 }
 
 /// Trait providing access to a contract's address and storage context.
@@ -201,7 +226,7 @@ pub trait ContractStorage {
 ///
 /// Adapted from Tempo's `EvmPrecompileStorageProvider` with these key differences:
 /// - `chain_id` is passed explicitly for convenience
-/// - Gas accounting uses hardcoded `TempoGasCosts` constants (matching GasParams overrides in TempoEvm)
+/// - Gas accounting uses configurable [`GasParams`] matching the active handler context
 /// - `with_account_info` uses `load_account_code` + `JournaledAccountTr::account().info`
 /// - Checkpoint operations delegate to `EvmInternals` (available since alloy-evm 0.29.2)
 pub struct LeafageStorageProvider<'a> {
@@ -209,9 +234,12 @@ pub struct LeafageStorageProvider<'a> {
     gas_remaining: u64,
     gas_refunded: i64,
     gas_limit: u64,
+    gas_params: GasParams,
     chain_id: u64,
     spec: TempoHardfork,
     is_static: bool,
+    tip1060_storage_credits_enabled: bool,
+    tip1060_storage_credit_minting_enabled: bool,
 }
 
 impl<'a> LeafageStorageProvider<'a> {
@@ -231,14 +259,43 @@ impl<'a> LeafageStorageProvider<'a> {
         // Derive hardfork from block timestamp for archive mode support.
         let timestamp: u64 = internals.block_timestamp().saturating_to();
         let spec = TempoHardfork::from_timestamp(timestamp);
+        Self::new_with_spec(internals, gas_limit, chain_id, is_static, spec)
+    }
+
+    /// Creates a storage provider with an explicitly selected Tempo hardfork.
+    pub fn new_with_spec(
+        internals: EvmInternals<'a>,
+        gas_limit: u64,
+        chain_id: u64,
+        is_static: bool,
+        spec: TempoHardfork,
+    ) -> Self {
+        let gas_params = Self::gas_params_for_spec(spec);
+        Self::new_with_spec_and_gas_params(
+            internals, gas_limit, chain_id, is_static, spec, gas_params,
+        )
+    }
+
+    /// Creates a storage provider with explicitly supplied gas parameters.
+    pub fn new_with_spec_and_gas_params(
+        internals: EvmInternals<'a>,
+        gas_limit: u64,
+        chain_id: u64,
+        is_static: bool,
+        spec: TempoHardfork,
+        gas_params: GasParams,
+    ) -> Self {
         Self {
             internals,
             gas_remaining: gas_limit,
             gas_refunded: 0,
             gas_limit,
+            gas_params,
             chain_id,
             spec,
             is_static,
+            tip1060_storage_credits_enabled: spec.is_t7(),
+            tip1060_storage_credit_minting_enabled: true,
         }
     }
 
@@ -247,24 +304,20 @@ impl<'a> LeafageStorageProvider<'a> {
         Self::new(internals, u64::MAX, chain_id, false)
     }
 
-    /// SSTORE set cost (0 → non-zero), hardfork-aware.
-    /// TIP-1000 (T1+): 250k. Pre-T1 (standard Ethereum): 20k.
-    #[allow(dead_code)]
-    #[inline]
-    fn sstore_set_cost(&self) -> u64 {
-        if self.spec.is_t1() {
-            TempoGasCosts::SSTORE_SET // 250_000
-        } else {
-            20_000 // Standard Ethereum SSTORE_SET
-        }
+    /// Creates a maximum-gas storage provider with an explicit Tempo hardfork.
+    pub fn new_max_gas_with_spec(
+        internals: EvmInternals<'a>,
+        chain_id: u64,
+        spec: TempoHardfork,
+    ) -> Self {
+        Self::new_with_spec(internals, u64::MAX, chain_id, false, spec)
     }
 
     /// Constructs a [`GasParams`] matching the TempoEvm configuration for this hardfork.
-    /// Used for SSTORE gas/refund calculations to ensure exact parity with writer.
-    fn tempo_gas_params(&self) -> revm::context_interface::cfg::gas_params::GasParams {
+    fn gas_params_for_spec(spec: TempoHardfork) -> GasParams {
         use revm::context_interface::cfg::gas_params::{GasId, GasParams};
         let mut gp = GasParams::new_spec(revm::primitives::hardfork::SpecId::OSAKA);
-        if self.spec.is_t1() {
+        if spec.is_t1() {
             gp.override_gas([
                 (GasId::sstore_set_without_load_cost(), 250_000),
                 (GasId::create(), 500_000),
@@ -276,18 +329,14 @@ impl<'a> LeafageStorageProvider<'a> {
                 (GasId::new(255), 250_000),
             ]);
         }
-        gp
-    }
-
-    /// Code deposit cost per byte, hardfork-aware.
-    /// TIP-1000 (T1+): 1000/byte. Pre-T1 (standard Ethereum): 200/byte.
-    #[inline]
-    fn code_deposit_cost_per_byte(&self) -> u64 {
-        if self.spec.is_t1() {
-            TempoGasCosts::CODE_DEPOSIT_PER_BYTE // 1_000
-        } else {
-            200 // Standard Ethereum CODE_DEPOSIT_BYTE
+        if spec.is_t7() {
+            gp.override_gas([
+                (GasId::sstore_set_without_load_cost(), 5_000),
+                (GasId::sstore_set_refund(), 5_000),
+                (GasId::sstore_clearing_slot_refund(), 0),
+            ]);
         }
+        gp
     }
 }
 
@@ -312,14 +361,11 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
     #[inline]
     fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
-        // Gas: code_deposit_cost_per_byte * code_len (hardfork-aware)
-        let deposit_cost = self
-            .code_deposit_cost_per_byte()
-            .checked_mul(code.len() as u64)
-            .ok_or(TempoPrecompileError::OutOfGas)?;
+        // Gas: code-deposit cost per byte * code length (hardfork-aware).
+        let deposit_cost = self.gas_params.code_deposit_cost(code.len());
         self.deduct_gas(deposit_cost)?;
 
-        let _ = self.internals.set_code(address, code);
+        self.internals.set_code(address, code)?;
         Ok(())
     }
 
@@ -336,10 +382,10 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
             (result.data.account().info.clone(), result.is_cold)
         };
 
-        self.deduct_gas(WARM_STORAGE_READ_COST)?;
+        self.deduct_gas(self.gas_params.warm_storage_read_cost())?;
 
         if is_cold {
-            self.deduct_gas(COLD_ACCOUNT_ACCESS_COST_ADDITIONAL)?;
+            self.deduct_gas(self.gas_params.cold_account_additional_cost())?;
         }
 
         f(&info);
@@ -351,10 +397,10 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         let result = self.internals.sload(address, key)?;
 
         // Gas: WARM_STORAGE_READ_COST + cold storage additional cost if cold
-        self.deduct_gas(WARM_STORAGE_READ_COST)?;
+        self.deduct_gas(self.gas_params.warm_storage_read_cost())?;
 
         if result.is_cold {
-            self.deduct_gas(COLD_SLOAD_COST_ADDITIONAL)?;
+            self.deduct_gas(self.gas_params.cold_storage_additional_cost())?;
         }
 
         Ok(result.data)
@@ -362,18 +408,28 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
     #[inline]
     fn tload(&mut self, address: Address, key: U256) -> Result<U256> {
-        self.deduct_gas(WARM_STORAGE_READ_COST)?;
+        self.deduct_gas(self.gas_params.warm_storage_read_cost())?;
         Ok(self.internals.tload(address, key))
     }
 
     #[inline]
     fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
         let result = self.internals.sstore(address, key, value)?;
+        if self.tip1060_storage_credits_enabled {
+            account_storage_write(self, address, Some(key), &result).map_err(
+                |error| match error {
+                    AccountingError::OutOfGas => TempoPrecompileError::OutOfGas,
+                    AccountingError::Fatal => {
+                        TempoPrecompileError::Fatal("storage credit accounting failed".into())
+                    }
+                },
+            )?;
+        }
         let sstore_data = &result.data;
 
         // Use GasParams API for all sstore gas (static + dynamic + cold + refund)
         // to ensure exact parity with writer's gas_params.sstore_*() methods.
-        let gas_params = self.tempo_gas_params();
+        let gas_params = self.gas_params.clone();
 
         // Static gas (sstore_static_gas = WARM_STORAGE_READ_COST = 100 post-Berlin)
         self.deduct_gas(gas_params.sstore_static_gas())?;
@@ -391,16 +447,17 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
     #[inline]
     fn tstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
-        self.deduct_gas(WARM_STORAGE_READ_COST)?;
+        self.deduct_gas(self.gas_params.warm_storage_read_cost())?;
         self.internals.tstore(address, key, value);
         Ok(())
     }
 
     #[inline]
     fn emit_event(&mut self, address: Address, event: LogData) -> Result<()> {
-        let gas = LOG
-            .saturating_add(LOGTOPIC.saturating_mul(event.topics().len() as u64))
-            .saturating_add(LOGDATA.saturating_mul(event.data.len() as u64));
+        let gas = LOG.saturating_add(
+            self.gas_params
+                .log_cost(event.topics().len() as u8, event.data.len() as u64),
+        );
         self.deduct_gas(gas)?;
 
         self.internals.log(Log {
@@ -445,6 +502,14 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
         self.is_static
     }
 
+    fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        self.tip1060_storage_credits_enabled = enabled && self.spec.is_t7();
+    }
+
+    fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        self.tip1060_storage_credit_minting_enabled = enabled;
+    }
+
     #[inline]
     fn checkpoint(&mut self) -> JournalCheckpoint {
         self.internals.checkpoint()
@@ -458,6 +523,61 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     #[inline]
     fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
         self.internals.checkpoint_revert(checkpoint)
+    }
+}
+
+impl StorageCreditsBackend for LeafageStorageProvider<'_> {
+    fn gas_params(&self) -> revm::context_interface::cfg::gas_params::GasParams {
+        self.gas_params.clone()
+    }
+
+    fn remaining_gas(&self) -> u64 {
+        self.gas_remaining
+    }
+
+    fn charge_gas(&mut self, gas: u64) -> core::result::Result<(), AccountingError> {
+        self.gas_remaining = self
+            .gas_remaining
+            .checked_sub(gas)
+            .ok_or(AccountingError::OutOfGas)?;
+        Ok(())
+    }
+
+    fn sload_raw(
+        &mut self,
+        address: Address,
+        key: U256,
+        _skip_cold: bool,
+    ) -> core::result::Result<revm::interpreter::StateLoad<U256>, AccountingError> {
+        self.internals
+            .sload(address, key)
+            .map_err(|_| AccountingError::Fatal)
+    }
+
+    fn sstore_raw(
+        &mut self,
+        address: Address,
+        key: U256,
+        value: U256,
+    ) -> core::result::Result<
+        revm::interpreter::StateLoad<revm::interpreter::SStoreResult>,
+        AccountingError,
+    > {
+        self.internals
+            .sstore(address, key, value)
+            .map_err(|_| AccountingError::Fatal)
+    }
+
+    fn tload_raw(&mut self, address: Address, key: U256) -> U256 {
+        self.internals.tload(address, key)
+    }
+
+    fn tstore_raw(&mut self, address: Address, key: U256, value: U256) {
+        self.internals.tstore(address, key, value);
+    }
+
+    fn storage_credit_minting_enabled(&self) -> bool {
+        self.tip1060_storage_credit_minting_enabled
     }
 }
 
@@ -633,6 +753,14 @@ impl StorageCtx {
     /// Returns whether the current call context is static.
     pub fn is_static(&self) -> bool {
         Self::with_storage(|s| s.is_static())
+    }
+
+    pub fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        Self::with_storage(|s| s.set_tip1060_storage_credits(enabled))
+    }
+
+    pub fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        Self::with_storage(|s| s.set_tip1060_storage_credit_minting(enabled))
     }
 
     /// Creates a journal checkpoint and returns a RAII guard.
@@ -822,4 +950,160 @@ where
 {
     let mut provider = ReadOnlyStorageProvider::new(db, spec, chain_id);
     StorageCtx::enter(&mut provider, f)
+}
+
+/// One persistent storage access recorded by [`AccessLogProvider`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageAccess {
+    Load(Address, U256),
+    Store(Address, U256),
+}
+
+/// Test provider that records every SLOAD/SSTORE in order and, unlike the wrapped
+/// [`TestStorageProvider`](super::test_utils::TestStorageProvider), charges EIP-2929
+/// SLOAD gas (2100 cold / 100 warm) and account-load gas (2600 cold / 100 warm) so
+/// storage-controlled loops and account checks can run out of gas.
+#[cfg(test)]
+pub(crate) struct AccessLogProvider {
+    pub(crate) inner: super::test_utils::TestStorageProvider,
+    pub(crate) accesses: Vec<StorageAccess>,
+    warm: std::collections::HashSet<(Address, U256)>,
+    warm_accounts: std::collections::HashSet<Address>,
+}
+
+#[cfg(test)]
+impl AccessLogProvider {
+    pub(crate) fn new(spec: TempoHardfork) -> Self {
+        Self {
+            inner: super::test_utils::TestStorageProvider::new(spec),
+            accesses: Vec::new(),
+            warm: Default::default(),
+            warm_accounts: Default::default(),
+        }
+    }
+
+    /// Accesses to `address` recorded since the log was last cleared.
+    pub(crate) fn accesses_of(&self, address: Address) -> Vec<StorageAccess> {
+        self.accesses
+            .iter()
+            .copied()
+            .filter(|access| match access {
+                StorageAccess::Load(a, _) | StorageAccess::Store(a, _) => *a == address,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl PrecompileStorageProvider for AccessLogProvider {
+    fn chain_id(&self) -> u64 {
+        self.inner.chain_id()
+    }
+    fn timestamp(&self) -> U256 {
+        self.inner.timestamp()
+    }
+    fn beneficiary(&self) -> Address {
+        self.inner.beneficiary()
+    }
+    fn block_number(&self) -> u64 {
+        self.inner.block_number()
+    }
+    fn set_code(&mut self, address: Address, code: Bytecode) -> Result<()> {
+        self.inner.set_code(address, code)
+    }
+    fn with_account_info(
+        &mut self,
+        address: Address,
+        f: &mut dyn FnMut(&revm::state::AccountInfo),
+    ) -> Result<()> {
+        let cold = self.warm_accounts.insert(address);
+        self.inner.deduct_gas(if cold { 2_600 } else { 100 })?;
+        self.inner.with_account_info(address, f)
+    }
+    fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.accesses.push(StorageAccess::Load(address, key));
+        let cold = self.warm.insert((address, key));
+        self.inner.deduct_gas(if cold { 2_100 } else { 100 })?;
+        self.inner.sload(address, key)
+    }
+    fn tload(&mut self, address: Address, key: U256) -> Result<U256> {
+        self.inner.tload(address, key)
+    }
+    fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.accesses.push(StorageAccess::Store(address, key));
+        self.warm.insert((address, key));
+        self.inner.sstore(address, key, value)
+    }
+    fn tstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        self.inner.tstore(address, key, value)
+    }
+    fn emit_event(&mut self, address: Address, event: LogData) -> Result<()> {
+        self.inner.emit_event(address, event)
+    }
+    fn deduct_gas(&mut self, gas: u64) -> Result<()> {
+        self.inner.deduct_gas(gas)
+    }
+    fn refund_gas(&mut self, gas: i64) {
+        self.inner.refund_gas(gas)
+    }
+    fn gas_used(&self) -> u64 {
+        self.inner.gas_used()
+    }
+    fn gas_refunded(&self) -> i64 {
+        self.inner.gas_refunded()
+    }
+    fn spec(&self) -> TempoHardfork {
+        self.inner.spec()
+    }
+    fn is_static(&self) -> bool {
+        self.inner.is_static()
+    }
+    fn set_tip1060_storage_credits(&mut self, enabled: bool) {
+        self.inner.set_tip1060_storage_credits(enabled)
+    }
+    fn set_tip1060_storage_credit_minting(&mut self, enabled: bool) {
+        self.inner.set_tip1060_storage_credit_minting(enabled)
+    }
+    fn checkpoint(&mut self) -> JournalCheckpoint {
+        self.inner.checkpoint()
+    }
+    fn checkpoint_commit(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.checkpoint_commit(checkpoint)
+    }
+    fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.checkpoint_revert(checkpoint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+    use revm::database::EmptyDB;
+
+    #[test]
+    fn contract_storage_reader_load_returns_zero_from_empty_db() {
+        let addr = address!("0x1111111111111111111111111111111111111111");
+        let reader = ContractStorageReader::new(addr);
+        let value =
+            with_read_only_storage_ctx(&EmptyDB::default(), TempoHardfork::T3, 4217, || {
+                reader.load(U256::from(42u8))
+            })
+            .unwrap();
+        assert_eq!(value, U256::ZERO);
+    }
+
+    #[test]
+    fn contract_storage_reader_store_is_unreachable() {
+        let mut reader = ContractStorageReader::new(Address::ZERO);
+        let err = reader.store(U256::ZERO, U256::ONE).unwrap_err();
+        match err {
+            TempoPrecompileError::Fatal(msg) => assert!(
+                msg.contains("read-only"),
+                "expected read-only error, got {msg}",
+            ),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
 }

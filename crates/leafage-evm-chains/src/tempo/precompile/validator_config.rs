@@ -12,7 +12,7 @@
 //! |  3   | next_dkg_ceremony | u64                            |
 
 use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::sol_types::{SolError, SolInterface};
+use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
@@ -27,61 +27,50 @@ use super::{dispatch_call, input_cost, mutate_void, view, Precompile, VALIDATOR_
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IValidatorConfig {
-        function owner() external view returns (address);
-        function getValidators() external view returns (Validator[] memory);
-        function getNextFullDkgCeremony() external view returns (uint64);
-        function validatorsArray(uint256 index) external view returns (address);
-        function validators(address validator) external view returns (Validator memory);
-        function validatorCount() external view returns (uint64);
-
-        function addValidator(
-            address newValidatorAddress,
-            bytes32 publicKey,
-            bool active,
-            string memory inboundAddress,
-            string memory outboundAddress
-        ) external;
-        function updateValidator(
-            address newValidatorAddress,
-            bytes32 publicKey,
-            string memory inboundAddress,
-            string memory outboundAddress
-        ) external;
-        function changeValidatorStatus(address validator, bool active) external;
-        function changeValidatorStatusByIndex(uint256 index, bool active) external;
-        function changeOwner(address newOwner) external;
-        function setNextFullDkgCeremony(uint64 epoch) external;
-
-        struct Validator {
-            bytes32 publicKey;
-            bool active;
-            uint64 index;
-            address validatorAddress;
-            string inboundAddress;
-            string outboundAddress;
-        }
-
-        error Unauthorized();
-        error ValidatorAlreadyExists();
-        error ValidatorNotFound();
-        error InvalidPublicKey();
-        error NotHostPort(string field, string value, string reason);
-        error NotIpPort(string field, string value, string reason);
-    }
-}
+pub use tempo_contracts::precompiles::IValidatorConfig;
 
 // ===========================================================================
 // IP validation (inlined from tempo/ip_validation.rs)
 // ===========================================================================
 
+/// Mirrors writer `ip_validation::IpWithPortParseError` so revert strings match: its
+/// `Display` is the thiserror message and its derived `Debug` wraps the std error.
+#[derive(Debug)]
+pub(crate) enum IpWithPortParseError {
+    Parse(std::net::AddrParseError),
+}
+
+impl std::fmt::Display for IpWithPortParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("input was not of the form `<ip>:<port>`")
+    }
+}
+
+impl std::error::Error for IpWithPortParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let Self::Parse(err) = self;
+        Some(err)
+    }
+}
+
 /// Validates that `input` is of the form `<ip>:<port>`.
-fn ensure_address_is_ip_port(input: &str) -> std::result::Result<(), String> {
+pub(crate) fn ensure_address_is_ip_port(
+    input: &str,
+) -> std::result::Result<(), IpWithPortParseError> {
     input
         .parse::<std::net::SocketAddr>()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(IpWithPortParseError::Parse)
+}
+
+/// Revert `backtrace` text for an invalid address, as writer
+/// `validator_config/mod.rs:187-219`: stable `Display` from T2, legacy `Debug` before.
+fn ip_port_backtrace(err: IpWithPortParseError) -> String {
+    if StorageCtx.spec().is_t2() {
+        err.to_string()
+    } else {
+        format!("{err:?}")
+    }
 }
 
 // ===========================================================================
@@ -173,7 +162,11 @@ impl Storable for Validator {
         storage.store(slot, U256::from_be_bytes(self.public_key.0))?;
 
         // Slot+1: packed
-        let mut bytes1 = [0u8; 32];
+        let mut bytes1 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(1))?.to_be_bytes::<32>()
+        };
         // active at byte 31
         bytes1[31] = if self.active { 1 } else { 0 };
         // index at bytes 23..31
@@ -319,7 +312,7 @@ impl ValidatorConfig {
     /// Returns all registered validators in index order.
     pub fn get_validators(&self) -> Result<Vec<IValidatorConfig::Validator>> {
         let count = self.validators_array.len()?;
-        let mut validators = Vec::with_capacity(count);
+        let mut validators = Vec::new();
 
         for i in 0..count {
             let validator_address = self.validators_array[i].read()?;
@@ -360,13 +353,13 @@ impl ValidatorConfig {
             ));
         }
 
-        // Validate addresses (leafage always runs latest spec, use Display formatting)
+        // Validate addresses (error text is spec-dependent, see `ip_port_backtrace`)
         ensure_address_is_ip_port(&call.inboundAddress).map_err(|err| {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotHostPort {
                     field: "inboundAddress".to_string(),
-                    value: call.inboundAddress.clone(),
-                    reason: err,
+                    input: call.inboundAddress.clone(),
+                    backtrace: ip_port_backtrace(err),
                 }
                 .abi_encode()
                 .into(),
@@ -376,8 +369,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotIpPort {
                     field: "outboundAddress".to_string(),
-                    value: call.outboundAddress.clone(),
-                    reason: err,
+                    input: call.outboundAddress.clone(),
+                    backtrace: ip_port_backtrace(err),
                 }
                 .abi_encode()
                 .into(),
@@ -435,8 +428,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotHostPort {
                     field: "inboundAddress".to_string(),
-                    value: call.inboundAddress.clone(),
-                    reason: err,
+                    input: call.inboundAddress.clone(),
+                    backtrace: ip_port_backtrace(err),
                 }
                 .abi_encode()
                 .into(),
@@ -446,8 +439,8 @@ impl ValidatorConfig {
             TempoPrecompileError::Revert(
                 IValidatorConfig::NotIpPort {
                     field: "outboundAddress".to_string(),
-                    value: call.outboundAddress.clone(),
-                    reason: err,
+                    input: call.outboundAddress.clone(),
+                    backtrace: ip_port_backtrace(err),
                 }
                 .abi_encode()
                 .into(),
@@ -557,7 +550,16 @@ impl Precompile for ValidatorConfig {
 
         dispatch_call(
             calldata,
-            IValidatorConfig::IValidatorConfigCalls::abi_decode,
+            |selector| {
+                IValidatorConfig::IValidatorConfigCalls::valid_selector(selector)
+                    && (StorageCtx.spec().is_t1()
+                        || selector != IValidatorConfig::changeValidatorStatusByIndexCall::SELECTOR)
+            },
+            |data| {
+                crate::tempo::precompile::decode_precompile_call::<
+                    IValidatorConfig::IValidatorConfigCalls,
+                >(data, StorageCtx.spec())
+            },
             |call| match call {
                 // View functions
                 IValidatorConfig::IValidatorConfigCalls::owner(call) => {
@@ -600,7 +602,6 @@ impl Precompile for ValidatorConfig {
                     mutate_void(call, msg_sender, |s, c| self.change_validator_status(s, c))
                 }
                 IValidatorConfig::IValidatorConfigCalls::changeValidatorStatusByIndex(call) => {
-                    // Leafage always runs latest spec, so this is always available
                     mutate_void(call, msg_sender, |s, c| {
                         self.change_validator_status_by_index(s, c)
                     })
@@ -615,5 +616,63 @@ impl Precompile for ValidatorConfig {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+
+    #[test]
+    fn invalid_address_backtrace_uses_writer_format_per_fork() {
+        let owner = Address::repeat_byte(0x01);
+        for (spec, expected) in [
+            (TempoHardfork::T1, "Parse(AddrParseError(Socket))"),
+            (TempoHardfork::T2, "input was not of the form `<ip>:<port>`"),
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            let err = StorageCtx::enter(&mut provider, || {
+                let mut config = ValidatorConfig::new();
+                config.initialize(owner)?;
+                config.add_validator(
+                    owner,
+                    IValidatorConfig::addValidatorCall {
+                        newValidatorAddress: Address::repeat_byte(0x02),
+                        publicKey: B256::repeat_byte(0x03),
+                        active: true,
+                        inboundAddress: "not-an-address".to_string(),
+                        outboundAddress: "127.0.0.1:9000".to_string(),
+                    },
+                )
+            })
+            .unwrap_err();
+
+            let TempoPrecompileError::Revert(data) = err else {
+                panic!("unexpected error {err:?}");
+            };
+            let decoded = IValidatorConfig::NotHostPort::abi_decode(&data).unwrap();
+            assert_eq!(decoded.backtrace, expected, "{spec:?}");
+        }
+    }
+
+    #[test]
+    fn get_validators_with_huge_stored_length_runs_out_of_gas() {
+        let mut provider = AccessLogProvider::new(TempoHardfork::T1);
+        provider
+            .inner
+            .sstore(
+                VALIDATOR_CONFIG_ADDRESS,
+                U256::from(1),
+                U256::from(u32::MAX),
+            )
+            .unwrap();
+        provider.inner.set_gas_limit(100_000);
+
+        let result = StorageCtx::enter(&mut provider, || ValidatorConfig::new().get_validators());
+
+        assert_eq!(result.unwrap_err(), TempoPrecompileError::OutOfGas);
     }
 }

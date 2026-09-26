@@ -16,8 +16,9 @@
 //! |  4   | total_supply                   | Mapping<B256, U256>                         |
 //! |  5   | liquidity_balances             | Mapping<B256, Mapping<Address, U256>>       |
 //! |  6   | pending_fee_swap_reservation   | Mapping<B256, u128> (transient)             |
+//! |  7   | two_hop_intermediate           | Address (transient, T5+)                    |
 
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
 use revm::precompile::{PrecompileError, PrecompileResult};
 
@@ -26,9 +27,10 @@ use super::storage::StorageOps;
 use super::storage::{ContractStorage, StorageCtx};
 use super::storage_types::{Handler, Layout, LayoutCtx, Mapping, Slot, Storable, StorableType};
 use super::tip20::TIP20Token;
+use super::tip403_registry::AuthRole;
 use super::{
-    dispatch_call, input_cost, metadata, mutate, mutate_void, view, Precompile, DEFAULT_FEE_TOKEN,
-    TIP_FEE_MANAGER_ADDRESS,
+    DEFAULT_FEE_TOKEN, Precompile, TIP_FEE_MANAGER_ADDRESS, decode_precompile_call, dispatch_call,
+    input_cost, metadata, mutate, mutate_void, view,
 };
 
 // ===========================================================================
@@ -48,60 +50,7 @@ pub const MIN_LIQUIDITY: U256 = U256::from_limbs([1000, 0, 0, 0]);
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IFeeManager {
-        function userTokens(address user) external view returns (address);
-        function validatorTokens(address validator) external view returns (address);
-        function collectedFees(address validator, address token) external view returns (uint256);
-
-        function setValidatorToken(address token) external;
-        function setUserToken(address token) external;
-        function distributeFees(address validator, address token) external;
-
-        event ValidatorTokenSet(address indexed validator, address token);
-        event UserTokenSet(address indexed user, address token);
-        event FeesDistributed(address indexed validator, address token, uint256 amount);
-
-        error InvalidToken();
-        error CannotChangeWithinBlock();
-        error InsufficientLiquidity();
-        error PolicyForbids();
-    }
-
-    interface ITIPFeeAMM {
-        function M() external view returns (uint256);
-        function N() external view returns (uint256);
-        function SCALE() external view returns (uint256);
-        function MIN_LIQUIDITY() external view returns (uint256);
-
-        function getPoolId(address userToken, address validatorToken) external view returns (bytes32);
-        function getPool(address userToken, address validatorToken) external view returns (Pool memory);
-        function pools(bytes32 poolId) external view returns (Pool memory);
-        function totalSupply(bytes32 poolId) external view returns (uint256);
-        function liquidityBalances(bytes32 poolId, address user) external view returns (uint256);
-
-        function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) external returns (uint256);
-        function burn(address userToken, address validatorToken, uint256 liquidity, address to) external returns (uint256 amountUserToken, uint256 amountValidatorToken);
-        function rebalanceSwap(address userToken, address validatorToken, uint256 amountOut, address to) external returns (uint256);
-
-        struct Pool {
-            uint128 reserveUserToken;
-            uint128 reserveValidatorToken;
-        }
-
-        event Mint(address indexed sender, address to, address userToken, address validatorToken, uint256 amountValidatorToken, uint256 liquidity);
-        event Burn(address indexed sender, address userToken, address validatorToken, uint256 amountUserToken, uint256 amountValidatorToken, uint256 liquidity, address to);
-        event RebalanceSwap(address indexed userToken, address indexed validatorToken, address swapper, uint256 amountIn, uint256 amountOut);
-
-        error IdenticalAddresses();
-        error InvalidAmount();
-        error InsufficientLiquidity();
-        error InsufficientReserves();
-        error InvalidSwapCalculation();
-        error DivisionByZero();
-        error InvalidCurrency();
-    }
-}
+pub use tempo_contracts::precompiles::{IFeeManager, ITIPFeeAMM};
 
 // ===========================================================================
 // Pool / PoolKey types
@@ -139,7 +88,11 @@ impl Storable for Pool {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        let mut bytes = [0u8; 32];
+        let mut bytes = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes[0..16].copy_from_slice(&self.reserve_validator_token.to_be_bytes());
         bytes[16..32].copy_from_slice(&self.reserve_user_token.to_be_bytes());
         storage.store(slot, U256::from_be_bytes(bytes))
@@ -176,9 +129,7 @@ pub fn compute_amount_out(amount_in: U256) -> Result<U256> {
     amount_in
         .checked_mul(M)
         .map(|product| product / SCALE)
-        .ok_or_else(|| {
-            TempoPrecompileError::Fatal("underflow/overflow in compute_amount_out".into())
-        })
+        .ok_or_else(TempoPrecompileError::under_overflow)
 }
 
 // ===========================================================================
@@ -201,6 +152,8 @@ pub struct TipFeeManager {
     pub liquidity_balances: Mapping<B256, Mapping<Address, U256>>,
     // Slot 6: pending_fee_swap_reservation (transient storage)
     pub pending_fee_swap_reservation: Mapping<B256, u128>,
+    // Slot 7: selected TIP-1033 two-hop intermediate (transient storage)
+    pub two_hop_intermediate: Slot<Address>,
 
     pub address: Address,
     pub storage: StorageCtx,
@@ -217,6 +170,7 @@ impl TipFeeManager {
             total_supply: Mapping::new(U256::from(4), address),
             liquidity_balances: Mapping::new(U256::from(5), address),
             pending_fee_swap_reservation: Mapping::new(U256::from(6), address),
+            two_hop_intermediate: Slot::new(U256::from(7), address),
             address,
             storage: StorageCtx::default(),
         }
@@ -297,6 +251,17 @@ impl TipFeeManager {
 
         validate_usd_currency(call.token)?;
 
+        // T3+: skip the write + event if the token is already set to the
+        // requested value. Prevents permissionless callers from forcing
+        // redundant pool invalidation scans. Mirrors writer
+        // `tip_fee_manager/mod.rs:131-136`.
+        if self.storage.spec().is_t3() {
+            let current = self.user_tokens[sender].read()?;
+            if current == call.token {
+                return Ok(());
+            }
+        }
+
         self.user_tokens[sender].write(call.token)?;
 
         self.emit_event(IFeeManager::UserTokenSet {
@@ -305,77 +270,10 @@ impl TipFeeManager {
         })
     }
 
-    /// Collects fees from `fee_payer` before transaction execution.
-    ///
-    /// Transfers `max_amount` of `user_token` to the fee manager and checks pool liquidity.
-    pub fn collect_fee_pre_tx(
-        &mut self,
-        fee_payer: Address,
-        user_token: Address,
-        max_amount: U256,
-        beneficiary: Address,
-    ) -> Result<Address> {
-        let validator_token = self.get_validator_token(beneficiary)?;
-
-        let mut tip20_token = TIP20Token::from_address(user_token)?;
-        tip20_token.ensure_transfer_authorized(fee_payer, self.address)?;
-        tip20_token.transfer_fee_pre_tx(fee_payer, max_amount)?;
-
-        if user_token != validator_token {
-            let pool_id = PoolKey::new(user_token, validator_token).get_id();
-            let _amount_out_needed = self.check_sufficient_liquidity(pool_id, max_amount)?;
-            // T1C+ reservation handled in full Tempo node; leafage omits transient storage reservation
-        }
-
-        Ok(user_token)
-    }
-
-    /// Finalizes fee collection after transaction execution.
-    pub fn collect_fee_post_tx(
-        &mut self,
-        fee_payer: Address,
-        actual_spending: U256,
-        refund_amount: U256,
-        fee_token: Address,
-        beneficiary: Address,
-    ) -> Result<()> {
-        let mut tip20_token = TIP20Token::from_address(fee_token)?;
-        tip20_token.transfer_fee_post_tx(fee_payer, refund_amount, actual_spending)?;
-
-        let validator_token = self.get_validator_token(beneficiary)?;
-
-        if fee_token != validator_token && !actual_spending.is_zero() {
-            self.execute_fee_swap(fee_token, validator_token, actual_spending)?;
-        }
-
-        let amount = if fee_token == validator_token {
-            actual_spending
-        } else {
-            compute_amount_out(actual_spending)?
-        };
-
-        self.increment_collected_fees(beneficiary, validator_token, amount)?;
-        Ok(())
-    }
-
-    /// Increment collected fees for a validator/token pair.
-    fn increment_collected_fees(
-        &mut self,
-        validator: Address,
-        token: Address,
-        amount: U256,
-    ) -> Result<()> {
-        if amount.is_zero() {
-            return Ok(());
-        }
-        let collected_fees = self.collected_fees[validator][token].read()?;
-        self.collected_fees[validator][token].write(collected_fees.checked_add(amount).ok_or_else(
-            || TempoPrecompileError::Fatal("overflow in increment_collected_fees".into()),
-        )?)
-    }
-
     /// Transfers a validator's accumulated fee balance and zeroes the ledger.
     pub fn distribute_fees(&mut self, validator: Address, token: Address) -> Result<()> {
+        // Fee collection creates this ledger slot outside normal TIP-1060 charging.
+        self.storage.set_tip1060_storage_credit_minting(false);
         let amount = self.collected_fees[validator][token].read()?;
         if amount.is_zero() {
             return Ok(());
@@ -428,22 +326,6 @@ impl TipFeeManager {
         self.pools[pool_id].read()
     }
 
-    /// Checks that the pool has enough reserves for the fee swap.
-    pub fn check_sufficient_liquidity(&mut self, pool_id: B256, max_amount: U256) -> Result<u128> {
-        let amount_out_needed = compute_amount_out(max_amount)?;
-        let pool = self.pools[pool_id].read()?;
-
-        if amount_out_needed > U256::from(pool.reserve_validator_token) {
-            return Err(TempoPrecompileError::Revert(
-                ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
-            ));
-        }
-
-        amount_out_needed.try_into().map_err(|_| {
-            TempoPrecompileError::Fatal("overflow in check_sufficient_liquidity".into())
-        })
-    }
-
     /// Executes a rebalance swap.
     pub fn rebalance_swap(
         &mut self,
@@ -466,7 +348,7 @@ impl TipFeeManager {
             .checked_mul(N)
             .and_then(|product| product.checked_div(SCALE))
             .and_then(|result| result.checked_add(U256::from(1)))
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in rebalance_swap".into()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
 
         let amount_in_u128: u128 = amount_in.try_into().map_err(|_| {
             TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
@@ -491,16 +373,27 @@ impl TipFeeManager {
                 TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
             })?;
 
+        if self.storage.spec().is_t1c() {
+            let reserved = self.pending_fee_swap_reservation[pool_id].t_read()?;
+            if pool.reserve_validator_token < reserved {
+                return Err(TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
+                ));
+            }
+        }
+
         self.pools[pool_id].write(pool)?;
 
         // Transfer validator tokens from swapper into the pool
         TIP20Token::from_address(validator_token)?.system_transfer_from(
-            msg_sender,
             self.address,
+            msg_sender,
             amount_in,
         )?;
 
         // Transfer user tokens from pool to recipient
+        // Fee collection creates the corresponding pool balance slot for free.
+        self.storage.set_tip1060_storage_credit_minting(false);
         TIP20Token::from_address(user_token)?.transfer(
             self.address,
             super::tip20::ITIP20::transferCall {
@@ -544,6 +437,17 @@ impl TipFeeManager {
         validate_usd_currency(user_token)?;
         validate_usd_currency(validator_token)?;
 
+        let user_tip20 = TIP20Token::from_address(user_token)?;
+        let validator_tip20 = TIP20Token::from_address(validator_token)?;
+        if self.storage.spec().is_t8() {
+            user_tip20.ensure_authorized_as(&[
+                (msg_sender, AuthRole::sender()),
+                (self.address, AuthRole::recipient()),
+                (to, AuthRole::recipient()),
+            ])?;
+            validator_tip20.ensure_authorized_as(&[(to, AuthRole::recipient())])?;
+        }
+
         let pool_id = self.pool_id(user_token, validator_token);
         let mut pool = self.pools[pool_id].read()?;
         let mut total_supply_val = self.total_supply[pool_id].read()?;
@@ -552,7 +456,7 @@ impl TipFeeManager {
             let two = U256::from(2);
             let half_amount = amount_validator_token
                 .checked_div(two)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint".into()))?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
 
             if half_amount <= MIN_LIQUIDITY {
                 return Err(TempoPrecompileError::Revert(
@@ -562,7 +466,7 @@ impl TipFeeManager {
 
             total_supply_val = total_supply_val
                 .checked_add(MIN_LIQUIDITY)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint".into()))?;
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
             self.total_supply[pool_id].write(total_supply_val)?;
 
             half_amount.checked_sub(MIN_LIQUIDITY).ok_or_else(|| {
@@ -610,8 +514,8 @@ impl TipFeeManager {
 
         // Transfer validator tokens from sender into the pool
         TIP20Token::from_address(validator_token)?.system_transfer_from(
-            msg_sender,
             self.address,
+            msg_sender,
             amount_validator_token,
         )?;
 
@@ -628,15 +532,17 @@ impl TipFeeManager {
 
         self.pools[pool_id].write(pool)?;
 
-        self.total_supply[pool_id].write(total_supply_val.checked_add(liquidity).ok_or_else(
-            || TempoPrecompileError::Fatal("overflow in mint total_supply".into()),
-        )?)?;
+        self.total_supply[pool_id].write(
+            total_supply_val
+                .checked_add(liquidity)
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
+        )?;
 
         let balance = self.liquidity_balances[pool_id][to].read()?;
         self.liquidity_balances[pool_id][to].write(
             balance
                 .checked_add(liquidity)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in mint balance".into()))?,
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
         )?;
 
         self.emit_event(ITIPFeeAMM::Mint {
@@ -675,6 +581,13 @@ impl TipFeeManager {
         validate_usd_currency(user_token)?;
         validate_usd_currency(validator_token)?;
 
+        let user_tip20 = TIP20Token::from_address(user_token)?;
+        let validator_tip20 = TIP20Token::from_address(validator_token)?;
+        if self.storage.spec().is_t8() {
+            user_tip20.ensure_authorized_as(&[(msg_sender, AuthRole::sender())])?;
+            validator_tip20.ensure_authorized_as(&[(msg_sender, AuthRole::sender())])?;
+        }
+
         let pool_id = self.pool_id(user_token, validator_token);
         let balance = self.liquidity_balances[pool_id][msg_sender].read()?;
         if balance < liquidity {
@@ -689,21 +602,44 @@ impl TipFeeManager {
         let amount_user_token = liquidity
             .checked_mul(U256::from(pool.reserve_user_token))
             .and_then(|p| p.checked_div(total_supply_val))
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
         let amount_validator_token = liquidity
             .checked_mul(U256::from(pool.reserve_validator_token))
             .and_then(|p| p.checked_div(total_supply_val))
-            .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn amounts".into()))?;
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
+
+        let validator_amount: u128 = amount_validator_token.try_into().map_err(|_| {
+            TempoPrecompileError::Revert(ITIPFeeAMM::InvalidAmount {}.abi_encode().into())
+        })?;
+        let available_after_burn = pool
+            .reserve_validator_token
+            .checked_sub(validator_amount)
+            .ok_or_else(|| {
+                TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientReserves {}.abi_encode().into(),
+                )
+            })?;
+        if self.storage.spec().is_t1c() {
+            let reserved = self.pending_fee_swap_reservation[pool_id].t_read()?;
+            if available_after_burn < reserved {
+                return Err(TempoPrecompileError::Revert(
+                    ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
+                ));
+            }
+        }
 
         // Update balances and supply
         self.liquidity_balances[pool_id][msg_sender].write(
             balance
                 .checked_sub(liquidity)
-                .ok_or_else(|| TempoPrecompileError::Fatal("overflow in burn balance".into()))?,
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
         )?;
-        self.total_supply[pool_id].write(total_supply_val.checked_sub(liquidity).ok_or_else(
-            || TempoPrecompileError::Fatal("overflow in burn total_supply".into()),
-        )?)?;
+        let total_supply_val = self.total_supply[pool_id].read()?;
+        self.total_supply[pool_id].write(
+            total_supply_val
+                .checked_sub(liquidity)
+                .ok_or_else(TempoPrecompileError::under_overflow)?,
+        )?;
 
         // Update reserves
         let user_amount: u128 = amount_user_token.try_into().map_err(|_| {
@@ -758,48 +694,6 @@ impl TipFeeManager {
 
         Ok((amount_user_token, amount_validator_token))
     }
-
-    /// Executes a fee swap, converting `user_token` to `validator_token` at fixed rate.
-    pub fn execute_fee_swap(
-        &mut self,
-        user_token: Address,
-        validator_token: Address,
-        amount_in: U256,
-    ) -> Result<U256> {
-        let pool_id = self.pool_id(user_token, validator_token);
-        let mut pool = self.pools[pool_id].read()?;
-
-        let amount_out = compute_amount_out(amount_in)?;
-
-        if amount_out > U256::from(pool.reserve_validator_token) {
-            return Err(TempoPrecompileError::Revert(
-                ITIPFeeAMM::InsufficientLiquidity {}.abi_encode().into(),
-            ));
-        }
-
-        let amount_in_u128: u128 = amount_in
-            .try_into()
-            .map_err(|_| TempoPrecompileError::Fatal("overflow in execute_fee_swap".into()))?;
-        let amount_out_u128: u128 = amount_out
-            .try_into()
-            .map_err(|_| TempoPrecompileError::Fatal("overflow in execute_fee_swap".into()))?;
-
-        pool.reserve_user_token = pool
-            .reserve_user_token
-            .checked_add(amount_in_u128)
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in execute_fee_swap reserves".into())
-            })?;
-        pool.reserve_validator_token = pool
-            .reserve_validator_token
-            .checked_sub(amount_out_u128)
-            .ok_or_else(|| {
-                TempoPrecompileError::Fatal("overflow in execute_fee_swap reserves".into())
-            })?;
-
-        self.pools[pool_id].write(pool)?;
-        Ok(amount_out)
-    }
 }
 
 impl ContractStorage for TipFeeManager {
@@ -846,13 +740,20 @@ enum TipFeeManagerCall {
 }
 
 impl TipFeeManagerCall {
+    fn valid_selector(selector: [u8; 4]) -> bool {
+        IFeeManager::IFeeManagerCalls::valid_selector(selector)
+            || ITIPFeeAMM::ITIPFeeAMMCalls::valid_selector(selector)
+    }
+
     fn decode(calldata: &[u8]) -> core::result::Result<Self, alloy::sol_types::Error> {
         let selector: [u8; 4] = calldata[..4].try_into().expect("calldata len >= 4");
+        let spec = StorageCtx.spec();
 
         if IFeeManager::IFeeManagerCalls::valid_selector(selector) {
-            IFeeManager::IFeeManagerCalls::abi_decode(calldata).map(Self::FeeManager)
+            decode_precompile_call::<IFeeManager::IFeeManagerCalls>(calldata, spec)
+                .map(Self::FeeManager)
         } else {
-            ITIPFeeAMM::ITIPFeeAMMCalls::abi_decode(calldata).map(Self::Amm)
+            decode_precompile_call::<ITIPFeeAMM::ITIPFeeAMMCalls>(calldata, spec).map(Self::Amm)
         }
     }
 }
@@ -865,7 +766,7 @@ impl Precompile for TipFeeManager {
             .deduct_gas(input_cost(calldata.len()))
             .map_err(|_| PrecompileError::OutOfGas)?;
 
-        dispatch_call(calldata, TipFeeManagerCall::decode, |call| match call {
+        dispatch_call(calldata, TipFeeManagerCall::valid_selector, TipFeeManagerCall::decode, |call| match call {
             // IFeeManager view functions
             TipFeeManagerCall::FeeManager(IFeeManager::IFeeManagerCalls::userTokens(call)) => {
                 view(call, |c| self.user_tokens_view(c))
@@ -960,5 +861,254 @@ impl Precompile for TipFeeManager {
                 })
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::address;
+
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::PATH_USD_ADDRESS;
+    use crate::tempo::precompile::storage_credits::StorageCredits;
+    use crate::tempo::precompile::test_utils::TestStorageProvider;
+    use crate::tempo::precompile::tip20::{IRolesAuth, ISSUER_ROLE, ITIP20};
+    use crate::tempo::precompile::tip403_registry::{ITIP403Registry, TIP403Registry};
+
+    fn initialize_issuer_token(
+        token: Address,
+        admin: Address,
+        recipient: Address,
+        amount: U256,
+    ) -> Result<()> {
+        let mut tip20 = TIP20Token::from_address_unchecked(token);
+        tip20.initialize(
+            Address::ZERO,
+            "Fee Token",
+            "FEE",
+            "USD",
+            PATH_USD_ADDRESS,
+            admin,
+        )?;
+        tip20.grant_role(
+            admin,
+            IRolesAuth::grantRoleCall {
+                role: *ISSUER_ROLE,
+                account: admin,
+            },
+        )?;
+        tip20.mint(
+            admin,
+            ITIP20::mintCall {
+                to: recipient,
+                amount,
+            },
+        )
+    }
+
+    fn set_whitelist_policy(
+        registry: &mut TIP403Registry,
+        token: Address,
+        admin: Address,
+        accounts: &[Address],
+    ) -> Result<()> {
+        let policy_id = registry.create_policy(
+            admin,
+            ITIP403Registry::createPolicyCall {
+                admin,
+                policyType: ITIP403Registry::PolicyType::WHITELIST,
+            },
+        )?;
+        for account in accounts {
+            registry.modify_policy_whitelist(
+                admin,
+                ITIP403Registry::modifyPolicyWhitelistCall {
+                    policyId: policy_id,
+                    account: *account,
+                    allowed: true,
+                },
+            )?;
+        }
+        TIP20Token::from_address_unchecked(token).change_transfer_policy_id(
+            admin,
+            ITIP20::changeTransferPolicyIdCall {
+                newPolicyId: policy_id,
+            },
+        )
+    }
+
+    #[test]
+    fn fee_amm_mint_lp_policy_checks_activate_at_t8() {
+        let admin = Address::repeat_byte(0xc1);
+        let lp = Address::repeat_byte(0xc2);
+        let recipient = Address::repeat_byte(0xc3);
+        let user_token = address!("0x20c00000000000000000000000000000000000c4");
+        let validator_token = address!("0x20c00000000000000000000000000000000000c5");
+        let deposit = U256::from(10_000u64);
+
+        for hardfork in [TempoHardfork::T7, TempoHardfork::T8] {
+            let mut provider = TestStorageProvider::new(hardfork);
+            StorageCtx::enter(&mut provider, || {
+                initialize_issuer_token(user_token, admin, admin, U256::ZERO)?;
+                initialize_issuer_token(validator_token, admin, lp, deposit)?;
+                let mut registry = TIP403Registry::new();
+                registry.initialize()?;
+                set_whitelist_policy(&mut registry, user_token, admin, &[])?;
+
+                let result =
+                    TipFeeManager::new().mint(lp, user_token, validator_token, deposit, recipient);
+                if hardfork.is_t8() {
+                    assert_eq!(
+                        result.unwrap_err().selector(),
+                        ITIP20::PolicyForbids::SELECTOR
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn fee_amm_burn_checks_lp_sender_policy_from_t8() {
+        let admin = Address::repeat_byte(0xd1);
+        let lp = Address::repeat_byte(0xd2);
+        let recipient = Address::repeat_byte(0xd3);
+        let user_token = address!("0x20c00000000000000000000000000000000000d4");
+        let validator_token = address!("0x20c00000000000000000000000000000000000d5");
+        let deposit = U256::from(10_000u64);
+
+        for hardfork in [TempoHardfork::T7, TempoHardfork::T8] {
+            let mut provider = TestStorageProvider::new(hardfork);
+            StorageCtx::enter(&mut provider, || {
+                initialize_issuer_token(user_token, admin, admin, U256::ZERO)?;
+                initialize_issuer_token(validator_token, admin, lp, deposit)?;
+                let liquidity =
+                    TipFeeManager::new().mint(lp, user_token, validator_token, deposit, lp)?;
+
+                let mut registry = TIP403Registry::new();
+                registry.initialize()?;
+                for token in [user_token, validator_token] {
+                    set_whitelist_policy(
+                        &mut registry,
+                        token,
+                        admin,
+                        &[TIP_FEE_MANAGER_ADDRESS, recipient],
+                    )?;
+                }
+
+                let result = TipFeeManager::new().burn(
+                    lp,
+                    user_token,
+                    validator_token,
+                    liquidity / U256::from(2),
+                    recipient,
+                );
+                if hardfork.is_t8() {
+                    assert_eq!(
+                        result.unwrap_err().selector(),
+                        ITIP20::PolicyForbids::SELECTOR
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+                Result::<()>::Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn t7_distribute_fees_does_not_mint_credits_from_fee_ledger_clear() {
+        let admin = Address::repeat_byte(0xa1);
+        let validator = Address::repeat_byte(0xa2);
+        let token = address!("0x20c00000000000000000000000000000000000a3");
+        let amount = U256::from(100u64);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            initialize_issuer_token(token, admin, TIP_FEE_MANAGER_ADDRESS, amount)?;
+            let mut manager = TipFeeManager::new();
+            manager.collected_fees[validator][token].write(amount)?;
+            manager.distribute_fees(validator, token)?;
+
+            assert_eq!(manager.collected_fees[validator][token].read()?, U256::ZERO);
+            assert_eq!(
+                TIP20Token::from_address_unchecked(token)
+                    .balance_of(ITIP20::balanceOfCall { account: validator })?,
+                amount,
+            );
+            assert_eq!(StorageCredits::new().balance_of(manager.address)?, 0);
+            assert_eq!(StorageCredits::new().balance_of(token)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t7_rebalance_swap_does_not_mint_credit_from_fee_token_balance_clear() {
+        let admin = Address::repeat_byte(0xb1);
+        let swapper = Address::repeat_byte(0xb2);
+        let recipient = Address::repeat_byte(0xb3);
+        let user_token = address!("0x20c00000000000000000000000000000000000b4");
+        let validator_token = address!("0x20c00000000000000000000000000000000000b5");
+        let amount_out = U256::from(100u64);
+        let amount_in = amount_out * N / SCALE + U256::ONE;
+        let mut provider = TestStorageProvider::new(TempoHardfork::T7);
+
+        StorageCtx::enter(&mut provider, || {
+            initialize_issuer_token(user_token, admin, TIP_FEE_MANAGER_ADDRESS, amount_out)?;
+            initialize_issuer_token(validator_token, admin, swapper, amount_in)?;
+
+            let mut manager = TipFeeManager::new();
+            let pool_id = manager.pool_id(user_token, validator_token);
+            manager.pools[pool_id].write(Pool {
+                reserve_user_token: amount_out.to::<u128>(),
+                reserve_validator_token: 0,
+            })?;
+            assert_eq!(
+                manager.rebalance_swap(
+                    swapper,
+                    user_token,
+                    validator_token,
+                    amount_out,
+                    recipient,
+                )?,
+                amount_in,
+            );
+            assert_eq!(
+                TIP20Token::from_address_unchecked(user_token)
+                    .balance_of(ITIP20::balanceOfCall { account: recipient })?,
+                amount_out,
+            );
+            assert_eq!(StorageCredits::new().balance_of(user_token)?, 0);
+            Result::<()>::Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rebalance_swap_amount_in_overflow_reverts_with_panic() {
+        let mut provider = TestStorageProvider::new(TempoHardfork::T8);
+
+        let result = StorageCtx::enter(&mut provider, || {
+            TipFeeManager::new().rebalance_swap(
+                Address::repeat_byte(0x71),
+                address!("0x20c0000000000000000000000000000000000071"),
+                address!("0x20c0000000000000000000000000000000000072"),
+                U256::ONE << 255,
+                Address::repeat_byte(0x72),
+            )
+        });
+
+        // Official returns Panic(0x11), a revert callers can catch, not a fatal error.
+        assert_eq!(result.unwrap_err(), TempoPrecompileError::under_overflow());
+        assert_eq!(
+            compute_amount_out(U256::MAX).unwrap_err(),
+            TempoPrecompileError::under_overflow()
+        );
     }
 }

@@ -49,85 +49,7 @@ use super::{
 // Solidity ABI types
 // ===========================================================================
 
-alloy::sol! {
-    interface IValidatorConfigV2 {
-        function owner() external view returns (address);
-        function getActiveValidators() external view returns (Validator[] memory);
-        function getInitializedAtHeight() external view returns (uint64);
-        function validatorCount() external view returns (uint64);
-        function validatorByIndex(uint64 index) external view returns (Validator memory);
-        function validatorByAddress(address validatorAddress) external view returns (Validator memory);
-        function validatorByPublicKey(bytes32 publicKey) external view returns (Validator memory);
-        function getNextNetworkIdentityRotationEpoch() external view returns (uint64);
-        function isInitialized() external view returns (bool);
-
-        function addValidator(
-            address validatorAddress,
-            bytes32 publicKey,
-            string memory ingress,
-            string memory egress,
-            address feeRecipient,
-            bytes memory signature
-        ) external returns (uint64);
-        function deactivateValidator(uint64 idx) external;
-        function rotateValidator(
-            uint64 idx,
-            bytes32 publicKey,
-            string memory ingress,
-            string memory egress,
-            bytes memory signature
-        ) external;
-        function setFeeRecipient(uint64 idx, address feeRecipient) external;
-        function setIpAddresses(uint64 idx, string memory ingress, string memory egress) external;
-        function transferValidatorOwnership(uint64 idx, address newAddress) external;
-        function transferOwnership(address newOwner) external;
-        function setNetworkIdentityRotationEpoch(uint64 epoch) external;
-        function migrateValidator(uint64 idx) external;
-        function initializeIfMigrated() external;
-
-        struct Validator {
-            bytes32 publicKey;
-            address validatorAddress;
-            string ingress;
-            string egress;
-            address feeRecipient;
-            uint64 index;
-            uint64 addedAtHeight;
-            uint64 deactivatedAtHeight;
-        }
-
-        event ValidatorAdded(uint64 index, address validatorAddress, bytes32 publicKey, string ingress, string egress, address feeRecipient);
-        event ValidatorDeactivated(uint64 index, address validatorAddress);
-        event ValidatorRotated(uint64 index, uint64 deactivatedIndex, address validatorAddress, bytes32 oldPublicKey, bytes32 newPublicKey, string ingress, string egress, address caller);
-        event FeeRecipientUpdated(uint64 index, address feeRecipient, address caller);
-        event IpAddressesUpdated(uint64 index, string ingress, string egress, address caller);
-        event ValidatorOwnershipTransferred(uint64 index, address oldAddress, address newAddress, address caller);
-        event OwnershipTransferred(address oldOwner, address newOwner);
-        event NetworkIdentityRotationEpochSet(uint64 previousEpoch, uint64 nextEpoch);
-        event ValidatorMigrated(uint64 index, address validatorAddress, bytes32 publicKey);
-        event SkippedValidatorMigration(uint64 index, address validatorAddress, bytes32 publicKey);
-        event Initialized(uint64 height);
-
-        error NotInitialized();
-        error AlreadyInitialized();
-        error Unauthorized();
-        error ValidatorNotFound();
-        error ValidatorAlreadyDeactivated();
-        error InvalidPublicKey();
-        error PublicKeyAlreadyExists();
-        error InvalidValidatorAddress();
-        error AddressAlreadyHasValidator();
-        error NotIpPort(string value, string reason);
-        error NotIp(string value, string reason);
-        error IngressAlreadyExists(string ingress);
-        error InvalidSignature();
-        error InvalidSignatureFormat();
-        error InvalidOwner();
-        error InvalidMigrationIndex();
-        error MigrationNotComplete();
-        error EmptyV1ValidatorSet();
-    }
-}
+pub use tempo_contracts::precompiles::IValidatorConfigV2;
 
 // ===========================================================================
 // Error helpers
@@ -191,17 +113,23 @@ fn err_address_already_has_validator() -> TempoPrecompileError {
 
 fn err_not_ip_port(value: String, reason: String) -> TempoPrecompileError {
     TempoPrecompileError::Revert(
-        IValidatorConfigV2::NotIpPort { value, reason }
-            .abi_encode()
-            .into(),
+        IValidatorConfigV2::NotIpPort {
+            input: value,
+            backtrace: reason,
+        }
+        .abi_encode()
+        .into(),
     )
 }
 
 fn err_not_ip(value: String, reason: String) -> TempoPrecompileError {
     TempoPrecompileError::Revert(
-        IValidatorConfigV2::NotIp { value, reason }
-            .abi_encode()
-            .into(),
+        IValidatorConfigV2::NotIp {
+            input: value,
+            backtrace: reason,
+        }
+        .abi_encode()
+        .into(),
     )
 }
 
@@ -287,20 +215,19 @@ fn union_unique(namespace: &[u8], payload: &[u8]) -> Vec<u8> {
 // IP validation
 // ===========================================================================
 
-/// Validates that `input` is of the form `<ip>:<port>`.
+/// Validates that `input` is of the form `<ip>:<port>`. The error text is the writer's
+/// `IpWithPortParseError` message (V2 only runs from T2, so always `Display`).
 fn ensure_address_is_ip_port(input: &str) -> std::result::Result<(), String> {
-    input
-        .parse::<std::net::SocketAddr>()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    super::validator_config::ensure_address_is_ip_port(input).map_err(|err| err.to_string())
 }
 
-/// Validates that `input` is a bare IP address (no port).
+/// Validates that `input` is a bare IP address (no port). The error text is the
+/// writer's `ip_validation::IpParseError` message.
 fn ensure_address_is_ip(input: &str) -> std::result::Result<(), String> {
     input
         .parse::<std::net::IpAddr>()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|_| "input was not a valid IP address".to_string())
 }
 
 // ===========================================================================
@@ -309,10 +236,9 @@ fn ensure_address_is_ip(input: &str) -> std::result::Result<(), String> {
 
 /// Contract-level configuration: ownership, initialization state, and migration bookkeeping.
 ///
-/// Storage layout (packed into 2 slots):
-///   - slot+0: owner (Address, 20 bytes)
-///   - slot+1: is_init (bool, 1 byte @ offset 0) + init_at_height (u64, 8 bytes @ offset 1) +
-///             migration_skipped_count (u8, 1 byte @ offset 9) + v1_validator_count (u8, 1 byte @ offset 10)
+/// One packed slot, with byte offsets measured from the least-significant byte:
+/// owner @ 0, is_init @ 20, init_at_height @ 21,
+/// migration_skipped_count @ 29, v1_validator_count @ 30.
 #[derive(Debug, Clone)]
 struct Config {
     owner: Address,
@@ -363,8 +289,7 @@ impl Config {
 }
 
 impl StorableType for Config {
-    // Address (1 slot) + packed(bool+u64+u8+u8) (1 slot) = 2 slots
-    const LAYOUT: Layout = Layout::Slots(2);
+    const LAYOUT: Layout = Layout::Slots(1);
     type Handler = Slot<Self>;
 
     fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
@@ -379,13 +304,10 @@ impl Storable for Config {
         let bytes0 = word0.to_be_bytes::<32>();
         let owner = Address::from_slice(&bytes0[12..32]);
 
-        // Slot+1: packed fields
-        let word1 = storage.load(slot + U256::from(1))?;
-        let bytes1 = word1.to_be_bytes::<32>();
-        let is_init = bytes1[31] != 0;
-        let init_at_height = u64::from_be_bytes(bytes1[23..31].try_into().unwrap());
-        let migration_skipped_count = bytes1[22];
-        let v1_validator_count = bytes1[21];
+        let is_init = bytes0[11] != 0;
+        let init_at_height = u64::from_be_bytes(bytes0[3..11].try_into().unwrap());
+        let migration_skipped_count = bytes0[2];
+        let v1_validator_count = bytes0[1];
 
         Ok(Self {
             owner,
@@ -397,25 +319,25 @@ impl Storable for Config {
     }
 
     fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        // Slot+0: owner
-        let mut bytes0 = [0u8; 32];
+        // Match the official derive: pre-T4 preserves padding via SLOAD;
+        // T4+ starts each packed group from zero.
+        let mut bytes0 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot)?.to_be_bytes::<32>()
+        };
         bytes0[12..32].copy_from_slice(self.owner.as_slice());
+        bytes0[11] = u8::from(self.is_init);
+        bytes0[3..11].copy_from_slice(&self.init_at_height.to_be_bytes());
+        bytes0[2] = self.migration_skipped_count;
+        bytes0[1] = self.v1_validator_count;
         storage.store(slot, U256::from_be_bytes(bytes0))?;
-
-        // Slot+1: packed
-        let mut bytes1 = [0u8; 32];
-        bytes1[31] = if self.is_init { 1 } else { 0 };
-        bytes1[23..31].copy_from_slice(&self.init_at_height.to_be_bytes());
-        bytes1[22] = self.migration_skipped_count;
-        bytes1[21] = self.v1_validator_count;
-        storage.store(slot + U256::from(1), U256::from_be_bytes(bytes1))?;
 
         Ok(())
     }
 
     fn delete<S: StorageOps>(storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
         storage.store(slot, U256::ZERO)?;
-        storage.store(slot + U256::from(1), U256::ZERO)?;
         Ok(())
     }
 }
@@ -426,14 +348,13 @@ impl Storable for Config {
 
 /// A single entry in the `validators` vector.
 ///
-/// Storage layout (Storable, 7 slots):
+/// Storage layout (Storable, 6 slots):
 ///   - slot+0: public_key (B256)
 ///   - slot+1: validator_address (Address, 20 bytes @ offset 0)
 ///   - slot+2: ingress (String, dynamic)
 ///   - slot+3: egress (String, dynamic)
-///   - slot+4: fee_recipient (Address, 20 bytes @ offset 0)
-///   - slot+5: packed(index: u64 @ 0, active_idx: u64 @ 8, added_at_height: u64 @ 16, deactivated_at_height: u64 @ 24)
-///             Packed as 4 x u64 = 32 bytes in one slot
+///   - slot+4: fee_recipient (Address @ 0), index (u64 @ 20)
+///   - slot+5: active_idx (u64 @ 0), added_at_height (u64 @ 8), deactivated_at_height (u64 @ 16)
 #[derive(Debug, Clone)]
 struct ValidatorRecord {
     public_key: B256,
@@ -464,8 +385,8 @@ impl Default for ValidatorRecord {
 }
 
 impl StorableType for ValidatorRecord {
-    // B256(1) + Address(1) + String(1) + String(1) + Address(1) + packed_u64x4(1) = 6 slots
     const LAYOUT: Layout = Layout::Slots(6);
+    const IS_DYNAMIC: bool = true;
     type Handler = Slot<Self>;
 
     fn handle(slot: U256, _ctx: LayoutCtx, address: Address) -> Self::Handler {
@@ -494,19 +415,14 @@ impl Storable for ValidatorRecord {
         let word4 = storage.load(slot + U256::from(4))?;
         let bytes4 = word4.to_be_bytes::<32>();
         let fee_recipient = Address::from_slice(&bytes4[12..32]);
+        let index = u64::from_be_bytes(bytes4[4..12].try_into().unwrap());
 
-        // Slot+5: packed u64x4 (index, active_idx, added_at_height, deactivated_at_height)
-        // Packed right-to-left (Tempo #[derive(Storable)] packing):
-        //   index: 8 bytes at offset 0 (byte 24..32)
-        //   active_idx: 8 bytes at offset 8 (byte 16..24)
-        //   added_at_height: 8 bytes at offset 16 (byte 8..16)
-        //   deactivated_at_height: 8 bytes at offset 24 (byte 0..8)
+        // Slot+5: three lifecycle fields; the upper eight bytes are padding.
         let word5 = storage.load(slot + U256::from(5))?;
         let bytes5 = word5.to_be_bytes::<32>();
-        let index = u64::from_be_bytes(bytes5[24..32].try_into().unwrap());
-        let active_idx = u64::from_be_bytes(bytes5[16..24].try_into().unwrap());
-        let added_at_height = u64::from_be_bytes(bytes5[8..16].try_into().unwrap());
-        let deactivated_at_height = u64::from_be_bytes(bytes5[0..8].try_into().unwrap());
+        let active_idx = u64::from_be_bytes(bytes5[24..32].try_into().unwrap());
+        let added_at_height = u64::from_be_bytes(bytes5[16..24].try_into().unwrap());
+        let deactivated_at_height = u64::from_be_bytes(bytes5[8..16].try_into().unwrap());
 
         Ok(Self {
             public_key,
@@ -521,45 +437,55 @@ impl Storable for ValidatorRecord {
         })
     }
 
-    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
+    fn store<S: StorageOps>(&self, storage: &mut S, slot: U256, ctx: LayoutCtx) -> Result<()> {
         // Slot+0: public_key
         storage.store(slot, U256::from_be_bytes(self.public_key.0))?;
 
         // Slot+1: validator_address
-        let mut bytes1 = [0u8; 32];
+        let mut bytes1 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(1))?.to_be_bytes::<32>()
+        };
         bytes1[12..32].copy_from_slice(self.validator_address.as_slice());
         storage.store(slot + U256::from(1), U256::from_be_bytes(bytes1))?;
 
         // Slot+2: ingress
-        self.ingress
-            .store(storage, slot + U256::from(2), LayoutCtx::FULL)?;
+        self.ingress.store(storage, slot + U256::from(2), ctx)?;
 
         // Slot+3: egress
-        self.egress
-            .store(storage, slot + U256::from(3), LayoutCtx::FULL)?;
+        self.egress.store(storage, slot + U256::from(3), ctx)?;
 
         // Slot+4: fee_recipient
-        let mut bytes4 = [0u8; 32];
+        let mut bytes4 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(4))?.to_be_bytes::<32>()
+        };
         bytes4[12..32].copy_from_slice(self.fee_recipient.as_slice());
+        bytes4[4..12].copy_from_slice(&self.index.to_be_bytes());
         storage.store(slot + U256::from(4), U256::from_be_bytes(bytes4))?;
 
-        // Slot+5: packed u64x4
-        let mut bytes5 = [0u8; 32];
-        bytes5[24..32].copy_from_slice(&self.index.to_be_bytes());
-        bytes5[16..24].copy_from_slice(&self.active_idx.to_be_bytes());
-        bytes5[8..16].copy_from_slice(&self.added_at_height.to_be_bytes());
-        bytes5[0..8].copy_from_slice(&self.deactivated_at_height.to_be_bytes());
+        let mut bytes5 = if StorageCtx::default().spec().is_t4() {
+            [0u8; 32]
+        } else {
+            storage.load(slot + U256::from(5))?.to_be_bytes::<32>()
+        };
+        bytes5[24..32].copy_from_slice(&self.active_idx.to_be_bytes());
+        bytes5[16..24].copy_from_slice(&self.added_at_height.to_be_bytes());
+        bytes5[8..16].copy_from_slice(&self.deactivated_at_height.to_be_bytes());
         storage.store(slot + U256::from(5), U256::from_be_bytes(bytes5))?;
 
         Ok(())
     }
 
     fn delete<S: StorageOps>(storage: &mut S, slot: U256, _ctx: LayoutCtx) -> Result<()> {
-        for i in 0..6 {
-            storage.store(slot + U256::from(i), U256::ZERO)?;
-        }
+        // Dynamic deletion must read the original heads to find long-string tails.
         String::delete(storage, slot + U256::from(2), LayoutCtx::FULL)?;
         String::delete(storage, slot + U256::from(3), LayoutCtx::FULL)?;
+        for i in [0, 1, 4, 5] {
+            storage.store(slot + U256::from(i), U256::ZERO)?;
+        }
         Ok(())
     }
 }
@@ -637,14 +563,14 @@ impl ValidatorConfigV2 {
     }
 
     /// Returns the block height at which the contract was initialized.
-    /// Reads slot+1 (Config packed field at offset 1).
+    /// Reads Config slot 0, byte offset 21.
     pub fn get_initialized_at_height(&self) -> Result<u64> {
         let config: Config = self.config.read()?;
         Ok(config.init_at_height)
     }
 
     /// Returns whether V2 has been initialized.
-    /// Reads slot+1 (Config packed field at offset 0).
+    /// Reads Config slot 0, byte offset 20.
     pub fn is_initialized(&self) -> Result<bool> {
         let config: Config = self.config.read()?;
         Ok(config.is_init)
@@ -653,6 +579,15 @@ impl ValidatorConfigV2 {
     /// Returns the total number of validators ever added.
     pub fn validator_count(&self) -> Result<u64> {
         Ok(self.validators.len()? as u64)
+    }
+
+    /// Access one lifecycle field without reading or rewriting the full record.
+    fn lifecycle_field(&self, index: u64, offset: usize) -> Slot<u64> {
+        Slot::new_with_ctx(
+            self.validators[index as usize].slot() + U256::from(5),
+            LayoutCtx::packed(offset),
+            self.address,
+        )
     }
 
     fn get_active_validator(&self, idx: u64) -> Result<ValidatorRecord> {
@@ -709,7 +644,7 @@ impl ValidatorConfigV2 {
     /// Returns all validators ever added.
     pub fn get_validators(&self) -> Result<Vec<IValidatorConfigV2::Validator>> {
         let count = self.validator_count()?;
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::new();
         for i in 0..count {
             out.push(self.read_validator_at(i)?);
         }
@@ -719,7 +654,7 @@ impl ValidatorConfigV2 {
     /// Returns only active validators.
     pub fn get_active_validators(&self) -> Result<Vec<IValidatorConfigV2::Validator>> {
         let count = self.active_indices.len()?;
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::new();
         for i in 0..count {
             let global_idx1 = self.active_indices[i].read()?;
             out.push(self.read_validator_at(global_idx1 - 1)?);
@@ -747,9 +682,10 @@ impl ValidatorConfigV2 {
 
     /// Computes the keccak256 hash of the ingress IP:port for uniqueness checking.
     fn ingress_key(ingress: &str) -> Result<B256> {
-        let addr = ingress
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| err_not_ip_port(ingress.to_string(), e.to_string()))?;
+        let addr = ingress.parse::<std::net::SocketAddr>().map_err(|e| {
+            let err = super::validator_config::IpWithPortParseError::Parse(e);
+            err_not_ip_port(ingress.to_string(), err.to_string())
+        })?;
 
         let mut data = Vec::new();
         match addr {
@@ -831,11 +767,8 @@ impl ValidatorConfigV2 {
             return Err(err_invalid_validator_address());
         }
         let idx1 = self.address_to_index[addr].read()?;
-        if idx1 != 0 {
-            let deact = self.validators[(idx1 - 1) as usize].read()?;
-            if deact.deactivated_at_height == 0 {
-                return Err(err_address_already_has_validator());
-            }
+        if idx1 != 0 && self.lifecycle_field(idx1 - 1, 16).read()? == 0 {
+            return Err(err_address_already_has_validator());
         }
         Ok(())
     }
@@ -973,11 +906,7 @@ impl ValidatorConfigV2 {
 
         let block_height = self.storage.block_number();
 
-        // Write deactivated_at_height on the record
-        let mut record = self.validators[call.idx as usize].read()?;
-        record.deactivated_at_height = block_height;
-        record.active_idx = 0;
-        self.validators[call.idx as usize].write(record)?;
+        self.lifecycle_field(call.idx, 16).write(block_height)?;
 
         // Swap-and-pop for active_indices
         let active_index = (v.active_idx - 1) as usize;
@@ -987,11 +916,11 @@ impl ValidatorConfigV2 {
             let moved_val = self.active_indices[last_pos].read()?;
             self.active_indices[active_index].write(moved_val)?;
             // Update the moved validator's active_idx backpointer
-            let mut moved_record = self.validators[(moved_val - 1) as usize].read()?;
-            moved_record.active_idx = (active_index + 1) as u64;
-            self.validators[(moved_val - 1) as usize].write(moved_record)?;
+            self.lifecycle_field(moved_val - 1, 0)
+                .write((active_index + 1) as u64)?;
         }
         self.active_indices.pop()?;
+        self.lifecycle_field(call.idx, 0).write(0)?;
 
         self.emit_event(IValidatorConfigV2::ValidatorDeactivated {
             index: call.idx,
@@ -1074,15 +1003,14 @@ impl ValidatorConfigV2 {
         sender: Address,
         call: IValidatorConfigV2::setFeeRecipientCall,
     ) -> Result<()> {
-        let v = self.get_active_validator(call.idx)?;
+        let mut v = self.get_active_validator(call.idx)?;
         self.config
             .read()?
             .require_init()?
             .require_owner_or_validator(sender, v.validator_address)?;
 
-        let mut record = self.validators[call.idx as usize].read()?;
-        record.fee_recipient = call.feeRecipient;
-        self.validators[call.idx as usize].write(record)?;
+        v.fee_recipient = call.feeRecipient;
+        self.validators[call.idx as usize].write(v)?;
 
         self.emit_event(IValidatorConfigV2::FeeRecipientUpdated {
             index: call.idx,
@@ -1097,7 +1025,7 @@ impl ValidatorConfigV2 {
         sender: Address,
         call: IValidatorConfigV2::setIpAddressesCall,
     ) -> Result<()> {
-        let v = self.get_active_validator(call.idx)?;
+        let mut v = self.get_active_validator(call.idx)?;
         self.config
             .read()?
             .require_init()?
@@ -1106,10 +1034,9 @@ impl ValidatorConfigV2 {
         Self::validate_endpoints(&call.ingress, &call.egress)?;
         self.update_ingress_ip_tracking(&v.ingress, &call.ingress)?;
 
-        let mut record = self.validators[call.idx as usize].read()?;
-        record.ingress = call.ingress.clone();
-        record.egress = call.egress.clone();
-        self.validators[call.idx as usize].write(record)?;
+        v.ingress = call.ingress.clone();
+        v.egress = call.egress.clone();
+        self.validators[call.idx as usize].write(v)?;
 
         self.emit_event(IValidatorConfigV2::IpAddressesUpdated {
             index: call.idx,
@@ -1125,7 +1052,7 @@ impl ValidatorConfigV2 {
         sender: Address,
         call: IValidatorConfigV2::transferValidatorOwnershipCall,
     ) -> Result<()> {
-        let v = self.get_active_validator(call.idx)?;
+        let mut v = self.get_active_validator(call.idx)?;
         self.config
             .read()?
             .require_init()?
@@ -1133,9 +1060,8 @@ impl ValidatorConfigV2 {
         self.require_new_address(call.newAddress)?;
 
         let old_address = v.validator_address;
-        let mut record = self.validators[call.idx as usize].read()?;
-        record.validator_address = call.newAddress;
-        self.validators[call.idx as usize].write(record)?;
+        v.validator_address = call.newAddress;
+        self.validators[call.idx as usize].write(v)?;
 
         self.address_to_index[old_address].delete()?;
         self.address_to_index[call.newAddress].write(call.idx + 1)?;
@@ -1238,9 +1164,8 @@ impl ValidatorConfigV2 {
                 validatorAddress: v1_val.validatorAddress,
                 publicKey: v1_val.publicKey,
             })?;
-            let mut cfg: Config = s.config.read()?;
-            cfg.migration_skipped_count = skipped.saturating_add(1);
-            s.config.write(cfg)
+            Slot::<u8>::new_with_ctx(U256::ZERO, LayoutCtx::packed(29), s.address)
+                .write(skipped.saturating_add(1))
         };
 
         // Skip if public key is not a valid Ed25519 point
@@ -1261,11 +1186,8 @@ impl ValidatorConfigV2 {
 
         // Skip if address is a duplicate of an active validator
         let addr_idx = self.address_to_index[v1_val.validatorAddress].read()?;
-        if addr_idx != 0 {
-            let deact = self.validators[(addr_idx - 1) as usize].read()?;
-            if deact.deactivated_at_height == 0 {
-                return Err(err_address_already_has_validator());
-            }
+        if addr_idx != 0 && self.lifecycle_field(addr_idx - 1, 16).read()? == 0 {
+            return Err(err_address_already_has_validator());
         }
 
         let now_active = v1_val.active;
@@ -1363,7 +1285,12 @@ impl Precompile for ValidatorConfigV2 {
 
         dispatch_call(
             calldata,
-            IValidatorConfigV2::IValidatorConfigV2Calls::abi_decode,
+            IValidatorConfigV2::IValidatorConfigV2Calls::valid_selector,
+            |data| {
+                crate::tempo::precompile::decode_precompile_call::<
+                    IValidatorConfigV2::IValidatorConfigV2Calls,
+                >(data, StorageCtx.spec())
+            },
             |call| match call {
                 // View functions
                 IValidatorConfigV2::IValidatorConfigV2Calls::owner(call) => {
@@ -1431,5 +1358,65 @@ impl Precompile for ValidatorConfigV2 {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tempo::hardfork::TempoHardfork;
+    use crate::tempo::precompile::storage::{AccessLogProvider, PrecompileStorageProvider};
+
+    #[test]
+    fn invalid_endpoint_backtraces_use_writer_messages() {
+        let revert_data = |result: Result<()>| match result {
+            Err(TempoPrecompileError::Revert(data)) => data,
+            other => panic!("unexpected result {other:?}"),
+        };
+
+        let ingress = revert_data(ValidatorConfigV2::validate_endpoints("bad", "1.2.3.4"));
+        assert_eq!(
+            IValidatorConfigV2::NotIpPort::abi_decode(&ingress)
+                .unwrap()
+                .backtrace,
+            "input was not of the form `<ip>:<port>`"
+        );
+        let egress = revert_data(ValidatorConfigV2::validate_endpoints("1.2.3.4:1", "bad"));
+        assert_eq!(
+            IValidatorConfigV2::NotIp::abi_decode(&egress)
+                .unwrap()
+                .backtrace,
+            "input was not a valid IP address"
+        );
+    }
+
+    #[test]
+    fn validator_lists_with_huge_stored_length_run_out_of_gas() {
+        // Slot 1: validators length; slot 6: active_indices length.
+        for len_slot in [1u64, 6] {
+            let mut provider = AccessLogProvider::new(TempoHardfork::T2);
+            provider
+                .inner
+                .sstore(
+                    VALIDATOR_CONFIG_V2_ADDRESS,
+                    U256::from(len_slot),
+                    U256::from(u32::MAX),
+                )
+                .unwrap();
+            // Enough for the cold length read only: the first element read runs out of
+            // gas, so active_indices never evaluates `idx1 - 1` on an empty entry.
+            provider.inner.set_gas_limit(3_000);
+
+            let result = StorageCtx::enter(&mut provider, || {
+                let config = ValidatorConfigV2::new();
+                if len_slot == 1 {
+                    config.get_validators()
+                } else {
+                    config.get_active_validators()
+                }
+            });
+
+            assert_eq!(result.unwrap_err(), TempoPrecompileError::OutOfGas);
+        }
     }
 }
