@@ -1,10 +1,9 @@
 use alloy::primitives::keccak256;
 use auto_impl::auto_impl;
 use leafage_evm_types::{
-    AccountInfo, Address, BlockId, BlockInfo, BlockStorageDiff, Bytecode, H256, U256,
+    Address, BlockId, BlockInfo, BlockStateUpdate, Bytecode, StoredAccount, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
-use revm::DatabaseRef;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -12,8 +11,9 @@ use std::sync::Arc;
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
     type Error: std::error::Error + DBErrorMarker + Send + Sync + 'static;
-    /// Get basic account information.
-    fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error>;
+    /// Get the stored account. Its balance may need resolving against other
+    /// state of the same view, see [`StoredAccount::balance_view`].
+    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error>;
     /// Get account code by its hash
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error>;
     /// Get storage value of address at index.
@@ -21,13 +21,16 @@ pub trait StateDB {
     // History related
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error>;
 
-    /// Batched [`StateDB::basic`]: one result per input, same order.
+    /// Batched [`StateDB::raw_account`]: one result per input, same order.
     /// The scalar default keeps every implementation correct; backends
     /// that can serve point reads in one storage round trip override it.
-    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
+    fn raw_account_many(
+        &self,
+        addresses: &[H256],
+    ) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
         addresses
             .iter()
-            .map(|address| self.basic(*address))
+            .map(|address| self.raw_account(*address))
             .collect()
     }
 
@@ -69,11 +72,11 @@ pub trait BlockContext {
         Ok(Arc::new(self.block_info()?))
     }
 
-    fn state_diff(&self) -> Result<BlockStorageDiff, Self::Error> {
+    fn state_diff(&self) -> Result<BlockStateUpdate, Self::Error> {
         Ok(self.state_diff_arc()?.as_ref().clone())
     }
 
-    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+    fn state_diff_arc(&self) -> Result<Arc<BlockStateUpdate>, Self::Error> {
         Ok(Arc::new(self.state_diff()?))
     }
 }
@@ -105,110 +108,74 @@ pub trait BlockIndex {
     }
 }
 
-/// [`EvmStorageWrapper`] is a wrapper for [`StateDB`] to implement [`DatabaseRef`].
+/// [`EvmStorageWrapper`] maps plain addresses and storage slots to the
+/// hashed state keys of a [`StateDB`]. It returns stored accounts as-is;
+/// building revm's account view is up to the caller.
 #[derive(Clone, Debug)]
 pub struct EvmStorageWrapper<T> {
     pub db: T,
-    pub ovm_address: Option<H256>,
     pub normalize_state_key: bool,
 }
 
-impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
-    type Error = T::Error;
-    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let account = self.db.basic(keccak256(address.as_slice()))?;
-        if let Some(ovm_address) = self.ovm_address {
-            let balance = self
-                .db
-                .storage(ovm_address, keccak256(get_ovm_balance_key(address)))?;
-
-            if let Some(mut account) = account {
-                account.balance = balance;
-                return Ok(Some(account));
-            }
-
-            if balance != U256::ZERO {
-                let mut account = AccountInfo::default();
-                account.balance = balance;
-                return Ok(Some(account));
-            }
-        }
-        Ok(account)
+impl<T: StateDB> EvmStorageWrapper<T> {
+    pub fn raw_basic(&self, address: Address) -> Result<Option<StoredAccount>, T::Error> {
+        self.db.raw_account(keccak256(address.as_slice()))
     }
-    fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
-        self.db.code_by_hash(code_hash.0.into())
+
+    /// Batched [`Self::raw_basic`]: one result per input, same order.
+    pub fn raw_basic_many(
+        &self,
+        addresses: &[Address],
+    ) -> Result<Vec<Option<StoredAccount>>, T::Error> {
+        let hashed: Vec<H256> = addresses
+            .iter()
+            .map(|address| keccak256(address.as_slice()))
+            .collect();
+        self.db.raw_account_many(&hashed)
     }
-    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+
+    pub fn storage(&self, address: Address, index: U256) -> Result<U256, T::Error> {
+        let (address, index) = self.storage_key(address, index);
+        self.db.storage(address, index)
+    }
+
+    /// Batched [`Self::storage`] over `(address, index)` pairs: one result per
+    /// input, same order.
+    pub fn storage_many(&self, keys: &[(Address, U256)]) -> Result<Vec<U256>, T::Error> {
+        let hashed: Vec<(H256, H256)> = keys
+            .iter()
+            .map(|(address, index)| self.storage_key(*address, *index))
+            .collect();
+        self.db.storage_many(&hashed)
+    }
+
+    pub fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, T::Error> {
+        self.db.code_by_hash(code_hash)
+    }
+
+    /// Batched [`Self::code_by_hash`]: one result per input, same order.
+    pub fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, T::Error> {
+        self.db.code_by_hash_many(code_hashes)
+    }
+
+    pub fn block_hash(&self, number: u64) -> Result<H256, T::Error> {
+        self.db.block_hash(number)
+    }
+
+    /// Whether the batched reads above are served by a real batched storage
+    /// primitive.
+    pub fn supports_batched_reads(&self) -> bool {
+        self.db.supports_batched_reads()
+    }
+
+    fn storage_key(&self, address: Address, index: U256) -> (H256, H256) {
         let address = keccak256(address.as_slice());
         let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
             to_normalize_state_key(index)
         } else {
             index.to_be_bytes()
         });
-
-        self.db
-            .storage(address.into(), index.into())
-            .map(|n| n.into())
-    }
-    fn block_hash_ref(&self, number: u64) -> Result<H256, Self::Error> {
-        self.db.block_hash(number).map(|h| h.0.into())
-    }
-}
-
-impl<T: StateDB> EvmStorageWrapper<T> {
-    /// Batched [`DatabaseRef::basic_ref`]: one result per input, same
-    /// order. On OVM-configured chains every account read needs an extra
-    /// balance-slot read whose key derivation bypasses
-    /// normalize-state-key, so the batch falls back to the scalar path
-    /// there to keep that special case in exactly one place.
-    pub fn basic_many_ref(
-        &self,
-        addresses: &[Address],
-    ) -> Result<Vec<Option<AccountInfo>>, T::Error> {
-        if self.ovm_address.is_some() {
-            return addresses
-                .iter()
-                .map(|address| self.basic_ref(*address))
-                .collect();
-        }
-        let hashed: Vec<H256> = addresses
-            .iter()
-            .map(|address| keccak256(address.as_slice()))
-            .collect();
-        self.db.basic_many(&hashed)
-    }
-
-    /// Batched [`DatabaseRef::storage_ref`] over `(address, index)`
-    /// pairs: one result per input, same order. Applies the same
-    /// address keccak and normalize-state-key rules as the scalar path.
-    pub fn storage_many_ref(&self, keys: &[(Address, U256)]) -> Result<Vec<U256>, T::Error> {
-        let hashed: Vec<(H256, H256)> = keys
-            .iter()
-            .map(|(address, index)| {
-                let address = keccak256(address.as_slice());
-                let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
-                    to_normalize_state_key(*index)
-                } else {
-                    index.to_be_bytes()
-                });
-                (address, index)
-            })
-            .collect();
-        self.db.storage_many(&hashed)
-    }
-
-    /// Batched [`DatabaseRef::code_by_hash_ref`]: one result per input,
-    /// same order.
-    pub fn code_by_hash_many_ref(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, T::Error> {
-        self.db.code_by_hash_many(code_hashes)
-    }
-
-    /// Whether the `*_many_ref` reads above actually batch at the
-    /// storage layer: needs a backend with real batched point reads,
-    /// and no OVM balance override (which forces `basic_many_ref` onto
-    /// the scalar path).
-    pub fn supports_batched_reads(&self) -> bool {
-        self.ovm_address.is_none() && self.db.supports_batched_reads()
+        (address, index)
     }
 }
 
@@ -219,42 +186,6 @@ pub fn to_normalize_state_key(index: U256) -> [u8; 32] {
     let mut res = index.to_be_bytes();
     res[0] &= 0xfe;
     res
-}
-
-/// Calculates the OVM storage key for a balance, replicating the logic
-/// from the Go function `GetOVMBalanceKey`.
-///
-/// In the EVM, the storage address for a mapping entry `mapping(key => value)`
-/// located at storage slot `p` is computed as `keccak256(padded_key . padded_p)`.
-/// This function assumes the storage slot `p` is 0.
-///
-/// # Arguments
-///
-/// * `addr` - The H160 (20-byte) address for which to find the balance key.
-///
-/// # Returns
-///
-/// * An H256 (32-byte) hash representing the storage key.
-pub fn get_ovm_balance_key(addr: Address) -> H256 {
-    // 1. Prepare the address. The `key` in the mapping is the user's address.
-    //    It must be left-padded with zeros to a full 32 bytes.
-    let mut padded_addr = [0u8; 32];
-    padded_addr[12..].copy_from_slice(addr.as_slice());
-
-    // 2. Prepare the storage slot position. The Go function uses `common.Big0`,
-    //    which is a big integer of value 0. When padded to 32 bytes, this is
-    //    simply 32 zero bytes.
-    let position_slot = [0u8; 32];
-
-    // 3. Concatenate the padded address and the position slot into a single
-    //    64-byte array. The `keccak256` function expects a single byte slice.
-    let mut concatenated_data = [0u8; 64];
-    concatenated_data[..32].copy_from_slice(&padded_addr);
-    concatenated_data[32..].copy_from_slice(&position_slot);
-
-    // 4. Compute the Keccak-256 hash of the concatenated data. This function
-    //    returns an alloy_primitives::B256 type.
-    keccak256(&concatenated_data)
 }
 
 /// [`EvmStorageRead`] is a trait that provides specific [`StateDB`] at specific block height.
@@ -278,7 +209,7 @@ pub trait EvmStorageWrite {
     fn update_block(
         &self,
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
     ) -> Result<(), Self::Error>;
 
     fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error>;
@@ -297,21 +228,19 @@ mod tests {
     impl DBErrorMarker for MockErr {}
 
     /// Records every key reaching the underlying [`StateDB`], so the
-    /// tests can assert the batched wrappers derive exactly the same
-    /// keys as the scalar `DatabaseRef` methods.
+    /// tests can assert the batched reads derive exactly the same keys as
+    /// the scalar ones.
     #[derive(Debug, Default)]
     struct RecordingDB {
-        basic_keys: RefCell<Vec<H256>>,
+        account_keys: RefCell<Vec<H256>>,
         storage_keys: RefCell<Vec<(H256, H256)>>,
     }
 
     impl StateDB for RecordingDB {
         type Error = MockErr;
-        fn basic(&self, address: H256) -> Result<Option<AccountInfo>, MockErr> {
-            self.basic_keys.borrow_mut().push(address);
-            let mut info = AccountInfo::default();
-            info.nonce = 7;
-            Ok(Some(info))
+        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
+            self.account_keys.borrow_mut().push(address);
+            Ok(Some(StoredAccount::standard(U256::ZERO, 7, H256::ZERO)))
         }
         fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
             Ok(Bytecode::default())
@@ -330,59 +259,23 @@ mod tests {
         for normalize in [false, true] {
             let wrapper = EvmStorageWrapper {
                 db: RecordingDB::default(),
-                ovm_address: None,
                 normalize_state_key: normalize,
             };
             let address = Address::repeat_byte(0x11);
             let index = U256::from(0x8000_0001u64) << 248usize;
 
-            let scalar = wrapper.storage_ref(address, index).unwrap();
-            let batched = wrapper.storage_many_ref(&[(address, index)]).unwrap();
+            let scalar = wrapper.storage(address, index).unwrap();
+            let batched = wrapper.storage_many(&[(address, index)]).unwrap();
             assert_eq!(batched, vec![scalar]);
             let keys = wrapper.db.storage_keys.borrow();
             assert_eq!(keys[0], keys[1], "normalize={normalize}");
 
-            let scalar = wrapper.basic_ref(address).unwrap();
-            let batched = wrapper.basic_many_ref(&[address]).unwrap();
+            let scalar = wrapper.raw_basic(address).unwrap();
+            let batched = wrapper.raw_basic_many(&[address]).unwrap();
             assert_eq!(batched, vec![scalar]);
-            let keys = wrapper.db.basic_keys.borrow();
+            let keys = wrapper.db.account_keys.borrow();
             assert_eq!(keys[0], keys[1]);
         }
-    }
-
-    /// OVM chains fall back to the scalar path so the balance-slot
-    /// override (whose key derivation skips normalize-state-key) stays
-    /// in one place.
-    #[test]
-    fn batched_basic_keeps_ovm_balance_override() {
-        let ovm_address = H256::repeat_byte(0x42);
-        let wrapper = EvmStorageWrapper {
-            db: RecordingDB::default(),
-            ovm_address: Some(ovm_address),
-            normalize_state_key: true,
-        };
-        let address = Address::repeat_byte(0x11);
-
-        let batched = wrapper.basic_many_ref(&[address]).unwrap();
-        let account = batched[0].as_ref().unwrap();
-        // Balance overridden from the OVM storage slot, nonce untouched.
-        assert_eq!(account.balance, U256::from(42u64));
-        assert_eq!(account.nonce, 7);
-        // The balance slot is keyed by the raw (non-normalized) OVM key.
-        let keys = wrapper.db.storage_keys.borrow();
-        assert_eq!(
-            keys[0],
-            (ovm_address, keccak256(get_ovm_balance_key(address)).into())
-        );
-    }
-
-    #[test]
-    fn test_get_ovm_balance_key() {
-        let address = Address::from_str("0x455875815af7E846317D9E73e9Ea65d19EC58A82").unwrap();
-        let expected_key =
-            H256::from_str("0x0f3a88bb217e688cf0fede2f015e98298b832dcc3e2e4aa014ec244f1c785da6")
-                .unwrap();
-        assert_eq!(get_ovm_balance_key(address), expected_key);
     }
 
     #[test]

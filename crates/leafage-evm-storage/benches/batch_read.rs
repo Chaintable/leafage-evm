@@ -63,7 +63,7 @@ fn setup() -> Fixture {
     let mut storage_keys = Vec::with_capacity(KEYSPACE as usize);
     let mut parent = H256::ZERO;
     for chunk_start in (0..KEYSPACE).step_by(BLOCK_CHUNK as usize) {
-        let mut diff = BlockStorageDiff::default();
+        let mut diff: BlockStorageDiff = BlockStorageDiff::default();
         for n in chunk_start..chunk_start + BLOCK_CHUNK {
             let address = key(1, n);
             accounts.push(address);
@@ -86,7 +86,7 @@ fn setup() -> Fixture {
         let number = chunk_start / BLOCK_CHUNK + 1;
         let hash = key(4, number);
         state
-            .update_block(block_info(number, hash, parent), diff)
+            .update_block(block_info(number, hash, parent), diff.into())
             .unwrap();
         parent = hash;
     }

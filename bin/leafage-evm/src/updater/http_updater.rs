@@ -1,9 +1,11 @@
-use alloy_rlp::Decodable;
 use anyhow::Result;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_rpc::{EthApiClient, TraceApiClient};
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
-use leafage_evm_types::{Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, DebankOutPut, HeaderInfo};
+use leafage_evm_storage::{state_diff_codec, BlockContext, EvmStorageRead, EvmStorageWrite};
+use leafage_evm_types::{
+    decode_state_diff, Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStateUpdate, DebankOutPut,
+    HeaderInfo,
+};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -91,10 +93,9 @@ where
 
         while let Some(debank_output) = self.block_queue.pop_front() {
             let block_storage_diff = if debank_output.state_diff.is_empty() {
-                BlockStorageDiff::default()
+                BlockStateUpdate::default()
             } else {
-                let mut bytes = debank_output.state_diff.as_ref();
-                BlockStorageDiff::decode(&mut bytes)?
+                decode_state_diff(state_diff_codec(), &mut debank_output.state_diff.as_ref())?
             };
             let block_hash = debank_output.header.hash;
             let block_num = debank_output.header.number;
@@ -146,6 +147,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_rlp::Decodable;
+    use leafage_evm_types::BlockStorageDiff;
 
     #[tokio::test]
     async fn test_fetch_block_diff() {

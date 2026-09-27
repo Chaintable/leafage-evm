@@ -87,8 +87,7 @@
 //! The `BlockNumToBlockHash` index is unaffected either way — it keeps
 //! ascending [`encode_block_num`], as its readers decode the raw block number.
 
-use alloy_rlp::Encodable;
-use leafage_evm_types::{NewAccount, SlimAccount, H256};
+use leafage_evm_types::H256;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Length of the encoded `(address, block_num)` account key.
@@ -170,14 +169,4 @@ pub fn encode_storage_key(
     key[32..64].copy_from_slice(storage_key.as_slice());
     key[64..96].copy_from_slice(&encode_version_tail(block_num));
     key
-}
-
-/// RLP-encode the slim form of an account (balance, nonce, code_hash) used
-/// as the value for `AddressToAccount`.
-#[inline]
-pub fn encode_slim_account(account: NewAccount) -> Vec<u8> {
-    let slim: SlimAccount = account.into();
-    let mut buf = Vec::new();
-    slim.encode(&mut buf);
-    buf
 }

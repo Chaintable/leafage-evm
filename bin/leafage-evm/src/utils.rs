@@ -1,10 +1,12 @@
-use alloy_rlp::Decodable;
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use flate2::read;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_rpc::EthApiClient;
-use leafage_evm_types::{BlockInfo, BlockStorageDiff, DebankTransaction, H256};
+use leafage_evm_storage::state_diff_codec;
+use leafage_evm_types::{
+    decode_state_diff, BlockInfo, BlockStateUpdate, DebankTransaction, StateDiffCodec, H256,
+};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -126,7 +128,16 @@ fn state_diff_key(s3_chain_id: &str, block_info: &BlockInfo) -> H256 {
     }
 }
 
-/// Read one block's [`BlockStorageDiff`] source object from S3, addressed by
+/// Account format of a chain's state diffs and DB records, fixed by its evm
+/// type.
+pub fn state_diff_codec_for(evm_type: &str) -> StateDiffCodec {
+    match evm_type {
+        "blast" => StateDiffCodec::BlastV1,
+        _ => StateDiffCodec::Standard,
+    }
+}
+
+/// Read and decode one block's stateDiff object from S3, addressed by
 /// `diff_key`: the block hash on block-hash-keyed chains, the state root
 /// everywhere else. See [`state_diff_keyed_by_block_hash`].
 pub async fn s3_get_block_diff(
@@ -135,7 +146,7 @@ pub async fn s3_get_block_diff(
     s3_chain_id: &str,
     version: &str,
     diff_key: H256,
-) -> Result<BlockStorageDiff> {
+) -> Result<BlockStateUpdate> {
     let s3_key = if version.is_empty() {
         format!("{}/{}/stateDiff", s3_chain_id, diff_key)
     } else {
@@ -148,7 +159,7 @@ pub async fn s3_get_block_diff(
         .send()
         .await?;
     let bytes = s3_obj.body.collect().await?.into_bytes();
-    let block_storage_diff = BlockStorageDiff::decode(&mut bytes.as_ref())?;
+    let block_storage_diff = decode_state_diff(state_diff_codec(), &mut bytes.as_ref())?;
     // Correlate with the commit-side logs in StateDBWrapper::update_block via
     // the state root. Enable with RUST_LOG=state_diff=debug (or =trace for
     // per-account / per-slot detail).
@@ -163,10 +174,10 @@ pub async fn s3_get_block_diff(
         block_storage_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum::<usize>(),
         block_storage_diff.new_codes.len(),
     );
-    for account in &block_storage_diff.new_accounts {
+    for update in &block_storage_diff.new_accounts {
         trace!(target: "state_diff",
-            "fetched account: root {}, address {}, balance {}, nonce {}, code_hash {}",
-            block_storage_diff.hash, account.address, account.balance, account.nonce, account.code_hash);
+            "fetched account: root {}, address {}, account {:?}",
+            block_storage_diff.hash, update.address, update.account);
     }
     for address in &block_storage_diff.deleted_accounts {
         trace!(target: "state_diff",
@@ -412,7 +423,7 @@ async fn s3_fetch_block_diff(
     s3_chain_id: &str,
     version: &str,
     block_info: &BlockInfo,
-) -> Result<BlockStorageDiff> {
+) -> Result<BlockStateUpdate> {
     s3_get_block_diff(
         s3_client,
         bucket_name,
@@ -427,7 +438,7 @@ async fn s3_fetch_block_diff(
     ))
 }
 
-/// Compute the [`BlockStorageDiff`] for an already-resolved [`BlockInfo`].
+/// Compute the [`BlockStateUpdate`] for an already-resolved [`BlockInfo`].
 ///
 /// On block-hash-keyed chains the diff is always read from S3. Everywhere else
 /// the parent is fetched (by hash) and the state roots compared: an unchanged
@@ -438,7 +449,7 @@ async fn s3_resolve_block_diff(
     s3_chain_id: &str,
     version: &str,
     block_info: &BlockInfo,
-) -> Result<BlockStorageDiff> {
+) -> Result<BlockStateUpdate> {
     // Every block has its own object here, so there is nothing to infer from
     // the parent and no reason to read its Header.
     if state_diff_keyed_by_block_hash(s3_chain_id) {
@@ -474,14 +485,14 @@ async fn s3_resolve_block_diff_with_parent_state_root(
     version: &str,
     block_info: &BlockInfo,
     parent_state_root: H256,
-) -> Result<BlockStorageDiff> {
+) -> Result<BlockStateUpdate> {
     if state_diff_keyed_by_block_hash(s3_chain_id) {
         return s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await;
     }
     if parent_state_root != block_info.header.state_root {
         s3_fetch_block_diff(s3_client, bucket_name, s3_chain_id, version, block_info).await
     } else {
-        Ok(BlockStorageDiff {
+        Ok(BlockStateUpdate {
             hash: block_info.header.state_root,
             parent_hash: parent_state_root,
             ..Default::default()
@@ -497,7 +508,7 @@ pub async fn s3_get_block_info_and_diff_by_number(
     s3_chain_id: &str,
     version: &str,
     number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
         s3_client,
@@ -527,7 +538,7 @@ pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
     version: &str,
     number: u64,
     parent_state_root: H256,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
         s3_client,
@@ -550,7 +561,7 @@ pub async fn s3_get_block_info_and_diff_by_number_with_parent_state_root(
     Ok((block_info, block_diff))
 }
 
-/// Resolve a block to its [`BlockInfo`] and [`BlockStorageDiff`] strictly by
+/// Resolve a block to its [`BlockInfo`] and [`BlockStateUpdate`] strictly by
 /// hash, following the by-hash S3 layout instead of the by-number index. Used
 /// to backfill the chain tip along the exact parent-hash links carried by
 /// Kafka, so a reorg near the tip cannot make the by-number index resolve a
@@ -561,7 +572,7 @@ pub async fn s3_get_block_info_and_diff_by_hash(
     s3_chain_id: &str,
     version: &str,
     hash: H256,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info(s3_client, bucket_name, s3_chain_id, version, hash).await?;
     let block_diff =
         s3_resolve_block_diff(s3_client, bucket_name, s3_chain_id, version, &block_info).await?;
@@ -576,7 +587,7 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
     s3_chain_id: &str,
     version: &str,
     number: u64,
-) -> Result<(BlockInfo, BlockStorageDiff)> {
+) -> Result<(BlockInfo, BlockStateUpdate)> {
     let block_info = s3_get_block_info_by_number(
         rpc_client,
         s3_client,
@@ -637,6 +648,7 @@ mod tests {
         http::{Request, Response},
         Router,
     };
+    use leafage_evm_types::BlockStorageDiff;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -714,7 +726,7 @@ mod tests {
         block_info: &BlockInfo,
         parent_state_root: H256,
         diff: &BlockStorageDiff,
-    ) -> (BlockStorageDiff, Vec<String>) {
+    ) -> (BlockStateUpdate, Vec<String>) {
         let mut body = Vec::new();
         diff.encode(&mut body);
         let (client, requests, server) = diff_stub(body).await;
@@ -771,7 +783,7 @@ mod tests {
         let mut block_info = BlockInfo::default();
         block_info.header.state_root = block_root;
         block_info.header.hash = test_hash(3);
-        let expected = BlockStorageDiff {
+        let expected: BlockStorageDiff = BlockStorageDiff {
             hash: block_root,
             ..Default::default()
         };
@@ -784,7 +796,7 @@ mod tests {
             .unwrap();
 
         server.abort();
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected.into());
         assert_eq!(
             *requests.lock().unwrap(),
             vec![format!("/source/1/{block_root}/stateDiff")]
@@ -802,7 +814,7 @@ mod tests {
         let mut block_info = BlockInfo::default();
         block_info.header.state_root = block_root;
         block_info.header.hash = block_hash;
-        let expected = BlockStorageDiff {
+        let expected: BlockStorageDiff = BlockStorageDiff {
             hash: block_root,
             parent_hash: parent_root,
             ..Default::default()
@@ -810,7 +822,7 @@ mod tests {
 
         let (actual, paths) = resolve_against_stub("1", &block_info, parent_root, &expected).await;
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected.into());
         assert_eq!(paths, vec![format!("/source/1/{block_root}/stateDiff")]);
     }
 
@@ -827,7 +839,7 @@ mod tests {
 
         assert_eq!(
             actual,
-            BlockStorageDiff {
+            BlockStateUpdate {
                 hash: block_root,
                 parent_hash: block_root,
                 ..Default::default()
@@ -846,7 +858,7 @@ mod tests {
         let mut block_info = BlockInfo::default();
         block_info.header.state_root = block_root;
         block_info.header.hash = block_hash;
-        let expected = BlockStorageDiff {
+        let expected: BlockStorageDiff = BlockStorageDiff {
             hash: block_root,
             parent_hash: block_root,
             ..Default::default()
@@ -855,7 +867,7 @@ mod tests {
         let (actual, paths) =
             resolve_against_stub(HYPEREVM_S3_CHAIN_ID, &block_info, block_root, &expected).await;
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected.into());
         // Exactly one request, for the diff: no parent Header read.
         assert_eq!(paths, vec![format!("/source/999/{block_hash}/stateDiff")]);
     }

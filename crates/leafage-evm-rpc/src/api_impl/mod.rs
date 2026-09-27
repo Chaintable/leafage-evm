@@ -1,3 +1,6 @@
+mod account_resolver;
+pub(crate) use account_resolver::AccountResolver;
+
 mod api_impl;
 pub(crate) use api_impl::ApiImpl;
 

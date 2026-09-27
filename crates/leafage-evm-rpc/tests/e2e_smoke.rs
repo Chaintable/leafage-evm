@@ -66,7 +66,7 @@ async fn rpc_smoke_over_layered_state() {
             .unwrap()
             .unwrap(),
     )
-    .update_block(genesis, genesis_diff)
+    .update_block(genesis, genesis_diff.into())
     .unwrap();
 
     // Two empty diff layers on top keep reads walking the in-memory chain.
@@ -253,7 +253,7 @@ async fn multicall_prefetch_matches_scalar_semantics() {
             .unwrap()
             .unwrap(),
     )
-    .update_block(genesis, genesis_diff)
+    .update_block(genesis, genesis_diff.into())
     .unwrap();
 
     let tree =
@@ -267,7 +267,7 @@ async fn multicall_prefetch_matches_scalar_semantics() {
         nonce: 0,
         code_hash: H256::ZERO,
     });
-    tree.update_block(block_info(1, h(0xbb), h(0xaa)), layer1_diff)
+    tree.update_block(block_info(1, h(0xbb), h(0xaa)), layer1_diff.into())
         .unwrap();
     tree.update_block(block_info(2, h(0xcc), h(0xbb)), BlockStorageDiff::default())
         .unwrap();

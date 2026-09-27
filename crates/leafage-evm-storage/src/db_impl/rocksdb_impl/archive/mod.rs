@@ -23,9 +23,10 @@
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding, set_inverted_block_encoding,
+    encode_account_key, encode_block_num, encode_storage_key, inverted_block_encoding,
+    set_inverted_block_encoding,
 };
+use crate::db_impl::decode_account;
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{
     ingest_external_file_options, sst_writer_options, SstSink,
@@ -34,8 +35,8 @@ use crate::metrics::STORAGE_METRICS;
 use alloy::primitives::B64;
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
-    Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
-    H256, KECCAK256_EMPTY, U256,
+    encode_stored_account, Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, RawHeader,
+    StoredAccount, H256, U256,
 };
 use moka::sync::Cache as MokaCache;
 use rocksdb::{
@@ -1707,7 +1708,7 @@ fn skip_version_tails() -> bool {
 impl DataBaseRef {
     /// account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
-    fn account_iter_walking(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+    fn account_iter_walking(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), Error>> {
         // Records for the same address are consecutive. The newest version is
         // the FIRST record of the prefix under inverted (newest-first) encoding,
         // and the LAST record under legacy ascending encoding.
@@ -1769,11 +1770,7 @@ impl DataBaseRef {
                         } else if empty {
                             "skip(deleted = absent at head)".to_string()
                         } else {
-                            let acc = SlimAccount::decode(&mut value.as_ref()).unwrap();
-                            format!(
-                                "EMIT -> snapshot (nonce={}, balance={})",
-                                acc.nonce, acc.balance
-                            )
+                            format!("EMIT -> snapshot ({:?})", decode_account(value.as_ref()))
                         };
                         debug!(target: "migrate_debug",
                             "account key=0x{} tail=0x{} block={} newest={} -> {}",
@@ -1792,25 +1789,18 @@ impl DataBaseRef {
                     continue;
                 }
 
-                let mut raw_account_slice = value.as_ref();
+                let raw_account_slice = value.as_ref();
                 // Newest version is a deletion -> account absent at tip.
                 if raw_account_slice.is_empty() {
                     continue;
                 }
 
                 let address = H256::from_slice(&address_bytes);
-                let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
-                let account = NewAccount {
-                    address,
-                    balance: raw_account.balance,
-                    nonce: raw_account.nonce,
-                    code_hash: if raw_account.code_hash.is_zero() {
-                        KECCAK256_EMPTY.0.into()
-                    } else {
-                        raw_account.code_hash
-                    },
-                };
-                return Some(Ok((address, account)));
+                return Some(
+                    decode_account(raw_account_slice)
+                        .map(|account| (address, account))
+                        .map_err(Error::from),
+                );
             }
         })
     }
@@ -1894,33 +1884,24 @@ impl DataBaseRef {
     /// deep histories that is most of the column family.
     fn account_iter_skipping_tails(
         &self,
-    ) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+    ) -> impl Iterator<Item = Result<(H256, StoredAccount), Error>> {
         self.tip_of_each_prefix::<32>(StorageTypeColumn::AddressToAccount)
             .filter_map(|record| {
                 let (address_bytes, value) = match record {
                     Ok(record) => record,
                     Err(err) => return Some(Err(err)),
                 };
-                let mut raw_account_slice = value.as_ref();
+                let raw_account_slice = value.as_ref();
                 // Newest version is a deletion -> account absent at tip.
                 if raw_account_slice.is_empty() {
                     return None;
                 }
                 let address = H256::from_slice(&address_bytes);
-                let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
-                Some(Ok((
-                    address,
-                    NewAccount {
-                        address,
-                        balance: raw_account.balance,
-                        nonce: raw_account.nonce,
-                        code_hash: if raw_account.code_hash.is_zero() {
-                            KECCAK256_EMPTY.0.into()
-                        } else {
-                            raw_account.code_hash
-                        },
-                    },
-                )))
+                Some(
+                    decode_account(raw_account_slice)
+                        .map(|account| (address, account))
+                        .map_err(Error::from),
+                )
             })
     }
 
@@ -2050,8 +2031,8 @@ impl DataBaseRef {
 impl LatestStateDBIterator for DataBaseRef {
     /// account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
-        let iter: Box<dyn Iterator<Item = Result<(H256, NewAccount), Error>> + '_> =
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), Error>> {
+        let iter: Box<dyn Iterator<Item = Result<(H256, StoredAccount), Error>> + '_> =
             if skip_version_tails() {
                 Box::new(self.account_iter_skipping_tails())
             } else {
@@ -2347,7 +2328,7 @@ impl StateDB {
 }
 
 impl StateDBRead for StateDB {
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+    fn read_account(&self, address: H256) -> Result<Option<StoredAccount>, Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let target_key = encode_account_key(address, self.block_num);
@@ -2373,22 +2354,11 @@ impl StateDBRead for StateDB {
             if address_bytes != raw_key_bytes[..32] {
                 return Ok(None);
             }
-            let mut raw_val_bytes = account_iter.value().unwrap();
+            let raw_val_bytes = account_iter.value().unwrap();
             if raw_val_bytes.is_empty() {
                 return Ok(None);
             }
-            let account = SlimAccount::decode(&mut raw_val_bytes).unwrap();
-            let account = NewAccount {
-                address,
-                balance: account.balance,
-                nonce: account.nonce,
-                code_hash: if account.code_hash.is_zero() {
-                    KECCAK256_EMPTY.0.into()
-                } else {
-                    account.code_hash
-                },
-            };
-            Ok(Some(account))
+            Ok(Some(decode_account(raw_val_bytes)?))
         } else {
             Ok(None)
         }
@@ -2491,7 +2461,7 @@ impl StateDBWrite for StateDB {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), Error> {
         self.db
             .write_account(batch, address, block_num, raw_account)
@@ -2591,10 +2561,13 @@ impl StateDBWrite for Arc<DataBaseRef> {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), Error> {
         let account_key = encode_account_key(address, block_num);
-        let value = raw_account.map(encode_slim_account).unwrap_or_default();
+        let value = raw_account
+            .as_ref()
+            .map(encode_stored_account)
+            .unwrap_or_default();
         batch.account_writes.push((account_key, value));
         Ok(())
     }
@@ -2948,7 +2921,17 @@ mod rewind_tests {
     use super::*;
     use crate::db::StateDBWrapper;
     use crate::interface::EvmStorageWrite;
-    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+    use leafage_evm_types::{
+        AccountStorageDiff, BalanceView, BlockStateUpdate, BlockStorageDiff, IndexValuePair,
+        NewAccount, KECCAK256_EMPTY,
+    };
+
+    fn balance(account: &StoredAccount) -> U256 {
+        match account.balance_view() {
+            BalanceView::Standard(balance) => balance,
+            view => panic!("not a standard account: {view:?}"),
+        }
+    }
 
     fn make_block_info_at(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
         let mut raw = RawHeader::default();
@@ -2964,8 +2947,8 @@ mod rewind_tests {
         })
     }
 
-    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStorageDiff {
-        BlockStorageDiff {
+    fn make_diff(addr: H256, slot: H256, balance: u64, nonce: u64, value: u64) -> BlockStateUpdate {
+        let diff: BlockStorageDiff = BlockStorageDiff {
             new_accounts: vec![NewAccount {
                 address: addr,
                 balance: U256::from(balance),
@@ -2980,7 +2963,8 @@ mod rewind_tests {
                 }],
             }],
             ..Default::default()
-        }
+        };
+        diff.into()
     }
 
     /// Archive-mode counterpart of the snapshot rewind invariant test: an
@@ -3023,7 +3007,7 @@ mod rewind_tests {
 
             // Rewind the head pointer to block 1 with an empty diff.
             latest(&db)
-                .update_block(block1.clone(), BlockStorageDiff::default())
+                .update_block(block1.clone(), BlockStateUpdate::default())
                 .unwrap();
             let state = latest(&db);
             let head = state.last_committed_block().unwrap().unwrap();
@@ -3032,8 +3016,8 @@ mod rewind_tests {
 
             // A handle pinned at the rewound head sees block-1 values...
             let account = state.0.read_account(addr).unwrap().unwrap();
-            assert_eq!(account.balance, U256::from(100));
-            assert_eq!(account.nonce, 1);
+            assert_eq!(balance(&account), U256::from(100));
+            assert_eq!(account.nonce(), 1);
             assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(7));
 
             // ...while the block-2 versions remain queryable as history.
@@ -3043,7 +3027,7 @@ mod rewind_tests {
                     .unwrap(),
             );
             let account = state_at_2.0.read_account(addr).unwrap().unwrap();
-            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(balance(&account), U256::from(200));
             assert_eq!(
                 state_at_2.0.read_storage(addr, slot).unwrap(),
                 U256::from(9)
@@ -3056,7 +3040,7 @@ mod rewind_tests {
             assert_eq!(head.header.number, 2);
             assert_eq!(head.header.hash, block2.header.hash);
             let account = state.0.read_account(addr).unwrap().unwrap();
-            assert_eq!(account.balance, U256::from(200));
+            assert_eq!(balance(&account), U256::from(200));
             assert_eq!(state.0.read_storage(addr, slot).unwrap(), U256::from(9));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -3164,7 +3148,17 @@ mod inverted_encoding_tests {
     use super::*;
     use crate::db::{LatestStateDBIterator, StateDBRead, StateDBWrapper};
     use crate::interface::EvmStorageWrite;
-    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+    use leafage_evm_types::{
+        AccountStorageDiff, BalanceView, BlockStateUpdate, BlockStorageDiff, IndexValuePair,
+        NewAccount, KECCAK256_EMPTY,
+    };
+
+    fn balance(account: &StoredAccount) -> U256 {
+        match account.balance_view() {
+            BalanceView::Standard(balance) => balance,
+            view => panic!("not a standard account: {view:?}"),
+        }
+    }
 
     fn block_info(number: u64) -> BlockInfo {
         let mut raw = RawHeader::default();
@@ -3179,8 +3173,8 @@ mod inverted_encoding_tests {
         })
     }
 
-    fn slot_diff(addr: H256, slot: H256, balance: u64, value: u64) -> BlockStorageDiff {
-        BlockStorageDiff {
+    fn slot_diff(addr: H256, slot: H256, balance: u64, value: u64) -> BlockStateUpdate {
+        let diff: BlockStorageDiff = BlockStorageDiff {
             new_accounts: vec![NewAccount {
                 address: addr,
                 balance: U256::from(balance),
@@ -3195,7 +3189,8 @@ mod inverted_encoding_tests {
                 }],
             }],
             ..Default::default()
-        }
+        };
+        diff.into()
     }
 
     /// End-to-end versioned read/write round-trip, parameterized by encoding
@@ -3225,7 +3220,7 @@ mod inverted_encoding_tests {
                     5 => slot_diff(addr, slot, 100, 7),
                     10 => slot_diff(addr, slot, 200, 9),
                     20 => slot_diff(addr, slot, 300, 11),
-                    _ => BlockStorageDiff::default(),
+                    _ => BlockStateUpdate::default(),
                 };
                 let state = StateDBWrapper(
                     db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
@@ -3261,7 +3256,7 @@ mod inverted_encoding_tests {
                     "storage at height {h} (inverted={inverted})"
                 );
                 assert_eq!(
-                    at(h).read_account(addr).unwrap().unwrap().balance,
+                    balance(&at(h).read_account(addr).unwrap().unwrap()),
                     U256::from(bal),
                     "balance at height {h} (inverted={inverted})"
                 );
@@ -3273,7 +3268,7 @@ mod inverted_encoding_tests {
             let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
             assert_eq!(accounts.len(), 1);
             assert_eq!(accounts[0].0, addr);
-            assert_eq!(accounts[0].1.balance, U256::from(300));
+            assert_eq!(balance(&accounts[0].1), U256::from(300));
         }
         let _ = std::fs::remove_dir_all(&dir);
         // Restore the default so other tests aren't affected.
@@ -3308,7 +3303,7 @@ mod inverted_encoding_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let scanned = {
             let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
-            let write = |n: u64, diff: BlockStorageDiff| {
+            let write = |n: u64, diff: BlockStateUpdate| {
                 let state = StateDBWrapper(
                     db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
                         .unwrap()
@@ -3334,7 +3329,7 @@ mod inverted_encoding_tests {
             // the slot's newest value is zero. Neither may be scanned out.
             write(
                 9,
-                BlockStorageDiff {
+                BlockStateUpdate {
                     deleted_accounts: vec![gone],
                     storage_diffs: vec![AccountStorageDiff {
                         address: gone,
@@ -3346,7 +3341,7 @@ mod inverted_encoding_tests {
                     ..Default::default()
                 },
             );
-            write(10, BlockStorageDiff::default());
+            write(10, BlockStateUpdate::default());
             // One tail longer than MAX_TAIL_WALK, so the scan has to fall back
             // to a seek to get past it; the short tails above stay on the walk.
             for n in 11..=deep_tail_tip() {
@@ -3357,7 +3352,7 @@ mod inverted_encoding_tests {
                 .account_iter()
                 .map(|r| {
                     let (address, account) = r.unwrap();
-                    (address, account.balance)
+                    (address, balance(&account))
                 })
                 .collect();
             let storages = db.storage_iter().map(|r| r.unwrap()).collect();
@@ -3454,7 +3449,7 @@ mod inverted_encoding_tests {
                     5 => slot_diff(addr, slot, 100, 7),
                     10 => slot_diff(addr, slot, 200, 9),
                     20 => slot_diff(addr, slot, 300, 11),
-                    _ => BlockStorageDiff::default(),
+                    _ => BlockStateUpdate::default(),
                 };
                 let state = StateDBWrapper(
                     db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
@@ -3471,12 +3466,11 @@ mod inverted_encoding_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                 .unwrap();
-            let stale_acct = crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
-                address: addr,
-                balance: U256::from(100u64),
-                nonce: 1,
-                code_hash: KECCAK256_EMPTY.0.into(),
-            });
+            let stale_acct = encode_stored_account(&StoredAccount::standard(
+                U256::from(100u64),
+                1,
+                KECCAK256_EMPTY.0.into(),
+            ));
             db.db
                 .put_cf(
                     acct_cf,
@@ -3503,7 +3497,7 @@ mod inverted_encoding_tests {
             let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
             assert_eq!(accounts.len(), 1);
             assert_eq!(
-                accounts[0].1.balance,
+                balance(&accounts[0].1),
                 U256::from(300u64),
                 "account_iter must pick real newest balance, not stale u64::MAX sentinel"
             );
@@ -3545,7 +3539,7 @@ mod inverted_encoding_tests {
                     5 => slot_diff(addr, slot, 100, 7),
                     10 => slot_diff(addr, slot, 200, 9),
                     20 => slot_diff(addr, slot, 300, 11),
-                    _ => BlockStorageDiff::default(),
+                    _ => BlockStateUpdate::default(),
                 };
                 let state = StateDBWrapper(
                     db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
@@ -3560,12 +3554,11 @@ mod inverted_encoding_tests {
                 .db
                 .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                 .unwrap();
-            let stale_acct = crate::db_impl::archive_encoding::encode_slim_account(NewAccount {
-                address: addr,
-                balance: U256::from(999u64),
-                nonce: 1,
-                code_hash: KECCAK256_EMPTY.0.into(),
-            });
+            let stale_acct = encode_stored_account(&StoredAccount::standard(
+                U256::from(999u64),
+                1,
+                KECCAK256_EMPTY.0.into(),
+            ));
             db.db
                 .put_cf(
                     acct_cf,
@@ -3623,7 +3616,7 @@ mod inverted_encoding_tests {
                     "storage at height {h} after re-encode"
                 );
                 assert_eq!(
-                    at(h).read_account(addr).unwrap().unwrap().balance,
+                    balance(&at(h).read_account(addr).unwrap().unwrap()),
                     U256::from(bal),
                     "balance at height {h} after re-encode"
                 );
@@ -3634,7 +3627,7 @@ mod inverted_encoding_tests {
             assert_eq!(storages, vec![(addr, slot, U256::from(11u64))]);
             let accounts: Vec<_> = db.account_iter().map(|r| r.unwrap()).collect();
             assert_eq!(accounts.len(), 1);
-            assert_eq!(accounts[0].1.balance, U256::from(300u64));
+            assert_eq!(balance(&accounts[0].1), U256::from(300u64));
         }
         let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);

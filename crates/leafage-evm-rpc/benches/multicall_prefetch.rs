@@ -145,7 +145,10 @@ fn setup(enable_cache: bool, block_cache_mb: usize, sets: usize, addr: &str) -> 
             .unwrap()
             .unwrap(),
     )
-    .update_block(block_info(0, H256::repeat_byte(0xaa), H256::ZERO), genesis)
+    .update_block(
+        block_info(0, H256::repeat_byte(0xaa), H256::ZERO),
+        genesis.into(),
+    )
     .unwrap();
     // Move the freshly written state out of the memtable: memtable point
     // reads are so cheap that batching would show nothing.

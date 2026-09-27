@@ -6,7 +6,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_storage::{
     EvmStorageWrite, MultiStorage, StateDBProvider, StateDBRead, StateDBWrapper, StorageKind,
 };
-use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStorageDiff, H256};
+use leafage_evm_types::{BlockId, BlockNumberOrTag, BlockStateUpdate, H256};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
@@ -200,7 +200,7 @@ impl Command {
         // An empty diff makes update_block a pure pointer move: it re-inserts
         // the target's BlockInfo (snapshot mode prunes all but the newest)
         // and sets LatestBlockHash, without touching account/storage state.
-        state.update_block(target, BlockStorageDiff::default())?;
+        state.update_block(target, BlockStateUpdate::default())?;
         info!(
             target: "rewind",
             "rewound committed head to number {}, hash {}",
@@ -310,7 +310,9 @@ mod tests {
 
     #[tokio::test]
     async fn archive_head_only_then_default_truncation() {
-        use leafage_evm_types::{Block, BlockInfo, Header, NewAccount, RawHeader, U256};
+        use leafage_evm_types::{
+            BalanceView, Block, BlockInfo, BlockStorageDiff, Header, NewAccount, RawHeader, U256,
+        };
         for (kind, inverted, marked) in [
             (StorageKind::MDBX, false, false),
             (StorageKind::MDBX, true, false),
@@ -350,7 +352,8 @@ mod tests {
                                 code_hash: H256::ZERO,
                             }],
                             ..Default::default()
-                        },
+                        }
+                        .into(),
                     )
                     .unwrap();
             }
@@ -393,8 +396,8 @@ mod tests {
                     .read_account(H256::repeat_byte(10))
                     .unwrap()
                     .unwrap()
-                    .balance,
-                U256::from(2)
+                    .balance_view(),
+                BalanceView::Standard(U256::from(2))
             );
             drop(db);
             // Parse the default archive command afresh; H=C must remove head-only leftovers.
@@ -437,8 +440,8 @@ mod tests {
                     .read_account(H256::repeat_byte(10))
                     .unwrap()
                     .unwrap()
-                    .balance,
-                U256::from(1)
+                    .balance_view(),
+                BalanceView::Standard(U256::from(1))
             );
             drop(db);
             std::fs::remove_dir_all(dir).unwrap();

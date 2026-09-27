@@ -1,3 +1,4 @@
+use super::AccountResolver;
 use crate::api::PreApiServer;
 use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
@@ -7,7 +8,7 @@ use crate::error::{internal_rpc_err, rpc_error_with_code};
 use alloy::primitives::Bytes;
 use alloy::rpc::types::trace::geth::GethDefaultTracingOptions;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockContext, EvmStorageRead};
 use leafage_evm_types::{
     block_env_from_block, BlockId, BlockNumberOrTag, CallRequest, DebankErrorCode, DefaultFrame,
     PreErrorCode, PreResult, TransactionInfo, H256,
@@ -69,11 +70,11 @@ where
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address,
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut memory_db = CacheDB::new(AccountResolver::new(
+            state,
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        ));
 
         // Use geth config to enable step recording for struct logs
         let trace_cfg = TracingInspectorConfig::default_geth();
@@ -158,11 +159,11 @@ where
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address,
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut memory_db = CacheDB::new(AccountResolver::new(
+            state,
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        ));
         let mut tx_index: u64 = 0;
         let mut log_index = 0;
         let mut pre_results: Vec<PreResult> = Vec::new();

@@ -1,6 +1,6 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::state_tree::error::Error;
-use leafage_evm_types::{AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, H256, U256};
+use leafage_evm_types::{BlockInfo, BlockStateUpdate, Bytecode, StoredAccount, H256, U256};
 use moka::ops::compute::Op;
 use moka::sync::Cache;
 use std::collections::{HashMap, VecDeque};
@@ -130,7 +130,7 @@ impl LinkedDiffLayer {
 /// the tag check and the write.
 #[derive(Debug)]
 pub struct CacheDiskLayer {
-    accounts: FastCache<H256, (u64, Option<AccountInfo>)>,
+    accounts: FastCache<H256, (u64, Option<StoredAccount>)>,
     storages: FastCache<(H256, H256), (u64, U256)>,
     contracts: FastCache<H256, (u64, Bytecode)>,
     block_hashes: FastCache<u64, (u64, H256)>,
@@ -258,23 +258,23 @@ impl CacheDiskLayer {
 #[derive(Debug)]
 pub struct DiffLayer {
     pub block_info: Arc<BlockInfo>,
-    pub block_diff: Arc<BlockStorageDiff>,
-    pub accounts: FastMap<H256, Option<AccountInfo>>,
+    pub block_diff: Arc<BlockStateUpdate>,
+    pub accounts: FastMap<H256, Option<StoredAccount>>,
     pub storage: FastMap<(H256, H256), U256>,
     pub contracts: FastMap<H256, Bytecode>,
     pub next: RwLock<Arc<LinkedDiffLayer>>,
 }
 
-impl From<(BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer>)> for DiffLayer {
+impl From<(BlockInfo, BlockStateUpdate, Arc<LinkedDiffLayer>)> for DiffLayer {
     fn from(
-        (block_info, block_diff, db): (BlockInfo, BlockStorageDiff, Arc<LinkedDiffLayer>),
+        (block_info, block_diff, db): (BlockInfo, BlockStateUpdate, Arc<LinkedDiffLayer>),
     ) -> Self {
         Self::new(block_info, block_diff, db)
     }
 }
 
-impl Into<(BlockInfo, BlockStorageDiff)> for &DiffLayer {
-    fn into(self) -> (BlockInfo, BlockStorageDiff) {
+impl Into<(BlockInfo, BlockStateUpdate)> for &DiffLayer {
+    fn into(self) -> (BlockInfo, BlockStateUpdate) {
         self.storage_diff()
     }
 }
@@ -282,7 +282,7 @@ impl Into<(BlockInfo, BlockStorageDiff)> for &DiffLayer {
 impl DiffLayer {
     pub fn new(
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
         next: Arc<LinkedDiffLayer>,
     ) -> Self {
         let mut accounts = FastMap::default();
@@ -291,10 +291,8 @@ impl DiffLayer {
         for del_account in block_diff.deleted_accounts.iter() {
             accounts.insert(del_account.clone(), None);
         }
-        for new_account in block_diff.new_accounts.iter() {
-            let address = new_account.address;
-            let account_info: AccountInfo = new_account.clone().into();
-            accounts.insert(address, Some(account_info));
+        for update in block_diff.new_accounts.iter() {
+            accounts.insert(update.address, Some(update.account.clone()));
         }
         for account_diff in block_diff.storage_diffs.iter() {
             let address = account_diff.address;
@@ -317,7 +315,7 @@ impl DiffLayer {
         }
     }
 
-    fn storage_diff(&self) -> (BlockInfo, BlockStorageDiff) {
+    fn storage_diff(&self) -> (BlockInfo, BlockStateUpdate) {
         (
             self.block_info.as_ref().clone(),
             self.block_diff.as_ref().clone(),
@@ -473,7 +471,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
 impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
-    fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
+    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
         for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().accounts.get(&address) {
                 return Ok(value.clone());
@@ -484,7 +482,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                 match cache.accounts.get(&address) {
                     Some((_, value)) => Ok(value),
                     None => {
-                        let res = self.statedb.basic(address)?;
+                        let res = self.statedb.raw_account(address)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res.clone());
                             cache
@@ -499,7 +497,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     }
                 }
             }
-            _ => Ok(self.statedb.basic(address)?),
+            _ => Ok(self.statedb.raw_account(address)?),
         }
     }
 
@@ -562,7 +560,10 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
         }
     }
 
-    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<AccountInfo>>, Self::Error> {
+    fn raw_account_many(
+        &self,
+        addresses: &[H256],
+    ) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
         self.read_many_layered(
             addresses,
             |diff, key| diff.accounts.get(key).cloned(),
@@ -577,7 +578,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                         _ => Op::Put(new_val),
                     });
             },
-            |keys| self.statedb.basic_many(keys),
+            |keys| self.statedb.raw_account_many(keys),
         )
     }
 
@@ -658,7 +659,9 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
 mod tests {
     use super::*;
     use crate::interface::BlockIndex;
-    use leafage_evm_types::{AccountStorageDiff, BlockId, IndexValuePair, NewAccount};
+    use leafage_evm_types::{
+        AccountStorageDiff, BlockId, BlockStorageDiff, IndexValuePair, NewAccount,
+    };
     use std::sync::Mutex as StdMutex;
 
     #[derive(Debug, thiserror::Error)]
@@ -675,7 +678,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockDBInner {
         storage: HashMap<(H256, H256), U256>,
-        accounts: HashMap<H256, Option<AccountInfo>>,
+        accounts: HashMap<H256, Option<StoredAccount>>,
         last_block: Option<Arc<BlockInfo>>,
         reads: u64,
     }
@@ -688,7 +691,7 @@ mod tests {
 
     impl StateDB for MockDB {
         type Error = MockErr;
-        fn basic(&self, address: H256) -> Result<Option<AccountInfo>, MockErr> {
+        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
             let mut inner = self.inner.lock().unwrap();
             inner.reads += 1;
             Ok(inner.accounts.get(&address).cloned().flatten())
@@ -722,8 +725,8 @@ mod tests {
                 .clone()
                 .unwrap_or_default())
         }
-        fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, MockErr> {
-            Ok(Arc::new(BlockStorageDiff::default()))
+        fn state_diff_arc(&self) -> Result<Arc<BlockStateUpdate>, MockErr> {
+            Ok(Arc::new(BlockStateUpdate::default()))
         }
     }
 
@@ -732,7 +735,7 @@ mod tests {
         fn update_block(
             &self,
             block_info: BlockInfo,
-            block_diff: BlockStorageDiff,
+            block_diff: BlockStateUpdate,
         ) -> Result<(), MockErr> {
             let mut inner = self.inner.lock().unwrap();
             for account_diff in block_diff.storage_diffs.iter() {
@@ -742,10 +745,10 @@ mod tests {
                         .insert((account_diff.address, iv.index), iv.value);
                 }
             }
-            for account in block_diff.new_accounts.iter() {
+            for update in block_diff.new_accounts.iter() {
                 inner
                     .accounts
-                    .insert(account.address, Some(account.clone().into()));
+                    .insert(update.address, Some(update.account.clone()));
             }
             inner.last_block = Some(Arc::new(block_info));
             Ok(())
@@ -786,7 +789,7 @@ mod tests {
         )));
         let mut prev = cache;
         for n in 0..depth {
-            let mut diff = BlockStorageDiff::default();
+            let mut diff = BlockStorageDiff::<NewAccount>::default();
             diff.storage_diffs.push(AccountStorageDiff {
                 address: addr,
                 diffs: vec![IndexValuePair {
@@ -808,7 +811,11 @@ mod tests {
                 key(3000 + n - 1)
             };
             info.inner.header.inner.number = n + 1;
-            prev = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(info, diff, prev)));
+            prev = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
+                info,
+                diff.into(),
+                prev,
+            )));
         }
         (prev, addr)
     }
@@ -820,11 +827,14 @@ mod tests {
 
         for n in 0..4u64 {
             assert_eq!(db.storage(addr, key(1000 + n)).unwrap(), U256::from(n + 1));
-            assert_eq!(db.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
+            assert_eq!(
+                db.raw_account(key(2000 + n)).unwrap().unwrap().nonce(),
+                n + 1
+            );
         }
         // Absent key falls through to the bottom DB (zero).
         assert_eq!(db.storage(addr, key(9999)).unwrap(), U256::ZERO);
-        assert!(db.basic(key(9999)).unwrap().is_none());
+        assert!(db.raw_account(key(9999)).unwrap().is_none());
         // Block hashes resolve from layer metadata.
         assert_eq!(db.block_hash(3).unwrap(), key(3000 + 2));
     }
@@ -839,9 +849,10 @@ mod tests {
         {
             let mut inner = mock.inner.lock().unwrap();
             inner.storage.insert((addr, key(7000)), U256::from(70u64));
-            let mut info = AccountInfo::default();
-            info.nonce = 9;
-            inner.accounts.insert(key(7001), Some(info));
+            inner.accounts.insert(
+                key(7001),
+                Some(StoredAccount::standard(U256::ZERO, 9, H256::ZERO)),
+            );
         }
         let db = HybridStateDB::new(top, mock.clone(), Some(0));
 
@@ -861,11 +872,11 @@ mod tests {
         assert_eq!(mock.reads(), 2);
 
         let addresses = vec![key(2000), key(7001), key(8888), key(7001)];
-        let accounts = db.basic_many(&addresses).unwrap();
-        assert_eq!(accounts[0].as_ref().unwrap().nonce, 1);
-        assert_eq!(accounts[1].as_ref().unwrap().nonce, 9);
+        let accounts = db.raw_account_many(&addresses).unwrap();
+        assert_eq!(accounts[0].as_ref().unwrap().nonce(), 1);
+        assert_eq!(accounts[1].as_ref().unwrap().nonce(), 9);
         assert!(accounts[2].is_none());
-        assert_eq!(accounts[3].as_ref().unwrap().nonce, 9);
+        assert_eq!(accounts[3].as_ref().unwrap().nonce(), 9);
         assert_eq!(mock.reads(), 4);
 
         // Scalar reads agree and are now served from diff layers/cache.
@@ -873,11 +884,11 @@ mod tests {
             assert_eq!(*got, db.storage(k.0, k.1).unwrap());
         }
         for (a, got) in addresses.iter().zip(&accounts) {
-            assert_eq!(*got, db.basic(*a).unwrap());
+            assert_eq!(*got, db.raw_account(*a).unwrap());
         }
         // The batch refilled the shared cache: no further bottom reads.
         let _ = db.storage_many(&storage_keys).unwrap();
-        let _ = db.basic_many(&addresses).unwrap();
+        let _ = db.raw_account_many(&addresses).unwrap();
         assert_eq!(mock.reads(), 4);
     }
 
@@ -954,7 +965,10 @@ mod tests {
                 before.storage(addr, key(1000 + n)).unwrap(),
                 U256::from(n + 1)
             );
-            assert_eq!(before.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
+            assert_eq!(
+                before.raw_account(key(2000 + n)).unwrap().unwrap().nonce(),
+                n + 1
+            );
         }
 
         // A post-commit handle reads committed keys through the cache/db.
@@ -964,7 +978,10 @@ mod tests {
                 after.storage(addr, key(1000 + n)).unwrap(),
                 U256::from(n + 1)
             );
-            assert_eq!(after.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
+            assert_eq!(
+                after.raw_account(key(2000 + n)).unwrap().unwrap().nonce(),
+                n + 1
+            );
         }
     }
 }
@@ -990,7 +1007,7 @@ impl<StateDB: BlockContext> BlockContext for HybridStateDB<StateDB> {
         }
     }
 
-    fn state_diff_arc(&self) -> Result<Arc<BlockStorageDiff>, Self::Error> {
+    fn state_diff_arc(&self) -> Result<Arc<BlockStateUpdate>, Self::Error> {
         match self.flattened.head().as_ref() {
             LinkedDiffLayer::DiffLayer(diff) => Ok(diff.block_diff.clone()),
             LinkedDiffLayer::CacheDiskLayer(cache) => {

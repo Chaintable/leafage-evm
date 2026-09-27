@@ -1,7 +1,8 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root, DEFAULT_S3_READ_TIMEOUT_SECS,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, state_diff_codec_for,
+    DEFAULT_S3_READ_TIMEOUT_SECS,
 };
 use anyhow::Result;
 use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
@@ -9,11 +10,10 @@ use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
-    encode_account_key, encode_slim_account, encode_storage_key, ArchiveRocksDBStorage,
-    MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXSyncMode, StateDBWrite,
-    StorageKind,
+    encode_account_key, encode_storage_key, ArchiveRocksDBStorage, MDBXArchiveOptions,
+    MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXSyncMode, StateDBWrite, StorageKind,
 };
-use leafage_evm_types::{BlockInfo, BlockStorageDiff, NewCode, H256};
+use leafage_evm_types::{encode_stored_account, BlockInfo, BlockStateUpdate, NewCode, H256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -146,6 +146,11 @@ pub struct Command {
     /// unreadable.
     #[arg(long, default_value = "false")]
     inverted_block_encoding: bool,
+
+    /// The chain's evm type. Fixes the account format of the state diffs and
+    /// DB records; `blast` uses Blast raw yield accounts.
+    #[arg(long, default_value = "mainnet")]
+    evm_type: String,
 }
 
 /// Data fetched and pre-encoded for a single block, to be written by the
@@ -157,7 +162,7 @@ struct EncodedBlockData {
     block_num: u64,
     block_hash: H256,
     block_info: BlockInfo,
-    /// Pre-encoded account writes: `(address(32) || block_num(32), Some(rlp(SlimAccount)))`
+    /// Pre-encoded account writes: `(address(32) || block_num(32), Some(encode_stored_account))`
     /// or `(.., None)` for deletions.
     accounts: Vec<([u8; 64], Option<Vec<u8>>)>,
     /// Pre-encoded storage writes: `(address(32) || key(32) || block_num(32), value_be_bytes(32))`.
@@ -864,6 +869,7 @@ impl Command {
         // Fix the versioned-key encoding before any key is encoded (fetchers
         // call encode_account_key / encode_storage_key off the writer thread).
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        leafage_evm_storage::set_state_diff_codec(state_diff_codec_for(&self.evm_type));
 
         // Validate checkpoint_interval
         if self.checkpoint_interval == 0 {
@@ -1493,8 +1499,8 @@ impl Command {
 
     /// Fetch block data from RPC/S3 and pre-encode it for the writer.
     ///
-    /// Encoding (`encode_account_key`, `encode_storage_key`, RLP of
-    /// `SlimAccount`, `U256::to_be_bytes`) runs here so it scales with the
+    /// Encoding (`encode_account_key`, `encode_storage_key`,
+    /// `encode_stored_account`, `U256::to_be_bytes`) runs here so it scales with the
     /// fetcher concurrency rather than serializing on the single writer
     /// thread.
     #[allow(clippy::too_many_arguments)]
@@ -1551,7 +1557,7 @@ impl Command {
     /// Pre-encode a fetched block for either archive writer backend.
     fn encode_block(
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
     ) -> Result<EncodedBlockData> {
         let block_num = block_info.header.number;
         let block_hash = block_info.header.hash;
@@ -1562,9 +1568,9 @@ impl Command {
         for address in block_diff.deleted_accounts {
             accounts.push((encode_account_key(address, block_num), None));
         }
-        for account in block_diff.new_accounts {
-            let key = encode_account_key(account.address, block_num);
-            let value = encode_slim_account(account);
+        for update in block_diff.new_accounts {
+            let key = encode_account_key(update.address, block_num);
+            let value = encode_stored_account(&update.account);
             accounts.push((key, Some(value)));
         }
 

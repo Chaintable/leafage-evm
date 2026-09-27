@@ -163,7 +163,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             .unwrap()
             .unwrap(),
     )
-    .update_block(genesis, genesis_diff)
+    .update_block(genesis, genesis_diff.into())
     .unwrap();
 
     let tree =

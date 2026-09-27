@@ -9,7 +9,9 @@ mod tests {
     use crate::{
         set_inverted_block_encoding, EvmStorageWrite, MultiStorage, StateDBWrapper, StorageKind,
     };
-    use leafage_evm_types::{Block, BlockStorageDiff, Header, RawHeader};
+    use leafage_evm_types::{
+        Block, BlockStorageDiff, Header, NewAccount, RawHeader, KECCAK256_EMPTY,
+    };
 
     #[test]
     fn malformed_storage_does_not_publish_target() {
@@ -45,7 +47,8 @@ mod tests {
                             code_hash: KECCAK256_EMPTY,
                         }],
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .unwrap();
         }
