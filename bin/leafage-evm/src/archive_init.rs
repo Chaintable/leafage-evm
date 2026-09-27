@@ -2,7 +2,7 @@ use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
     s3_get_block_info_and_diff_by_number_with_parent_state_root, state_diff_codec_for,
-    DEFAULT_S3_READ_TIMEOUT_SECS,
+    DEFAULT_S3_READ_TIMEOUT_SECS, EVM_TYPES,
 };
 use anyhow::Result;
 use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
@@ -149,7 +149,11 @@ pub struct Command {
 
     /// The chain's evm type. Fixes the account format of the state diffs and
     /// DB records; `blast` uses Blast raw yield accounts.
-    #[arg(long, default_value = "mainnet")]
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(EVM_TYPES),
+        default_value = "mainnet"
+    )]
     evm_type: String,
 }
 

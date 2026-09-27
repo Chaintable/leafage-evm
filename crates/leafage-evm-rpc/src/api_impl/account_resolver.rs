@@ -20,12 +20,26 @@ pub struct AccountResolver<T> {
     ovm_address: Option<H256>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ResolveError<E> {
     #[error(transparent)]
     Backend(#[from] E),
     #[error("Blast balance of {0} overflows U256")]
     BlastBalanceOverflow(Address),
+}
+
+// Backend errors print as the backend error itself, so RPC messages built
+// with `{:?}` are the same as before the resolver existed.
+impl<E: std::fmt::Debug> std::fmt::Debug for ResolveError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(err) => err.fmt(f),
+            Self::BlastBalanceOverflow(address) => f
+                .debug_tuple("BlastBalanceOverflow")
+                .field(address)
+                .finish(),
+        }
+    }
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> DBErrorMarker for ResolveError<E> {}
@@ -116,22 +130,23 @@ impl<T: StateDB> AccountResolver<T> {
         };
         let balance = match account.balance_view() {
             BalanceView::Standard(balance) => balance,
-            BalanceView::Blast(ext) => {
-                let price = match *share_price {
-                    Some(price) => price,
-                    None => {
-                        let price = self
-                            .inner
-                            .db
-                            .storage(BLAST_SHARES_HASH, SHARE_PRICE_SLOT_HASH)?;
-                        *share_price = Some(price);
-                        price
-                    }
-                };
-                derive_balance(ext, price).ok_or(ResolveError::BlastBalanceOverflow(address))?
-            }
+            BalanceView::Blast(ext) => derive_balance(ext, || self.share_price(share_price))?
+                .ok_or(ResolveError::BlastBalanceOverflow(address))?,
         };
         Ok(Some(account.to_account_info(balance)))
+    }
+
+    /// The Blast sharePrice of this state view, read at most once per `cache`.
+    fn share_price(&self, cache: &mut Option<U256>) -> Result<U256, T::Error> {
+        if let Some(price) = *cache {
+            return Ok(price);
+        }
+        let price = self
+            .inner
+            .db
+            .storage(BLAST_SHARES_HASH, SHARE_PRICE_SLOT_HASH)?;
+        *cache = Some(price);
+        Ok(price)
     }
 }
 
@@ -333,6 +348,113 @@ mod tests {
             resolver.basic_ref(address),
             Err(ResolveError::BlastBalanceOverflow(a)) if a == address
         ));
+    }
+
+    /// End to end through the state tree's diff layers: the sharePrice comes
+    /// from real storage diffs, and an account that no later block touches
+    /// still follows each block's price.
+    #[test]
+    fn idle_blast_account_follows_the_share_price_through_the_state_tree() {
+        use leafage_evm_storage::{
+            EvmStorageRead, EvmStorageWrite, MultiStorage, StateDBProvider, StateDBWrapper,
+            StateTree, StateTreeConfig, StorageKind,
+        };
+        use leafage_evm_types::{
+            AccountStorageDiff, BlastBlockStorageDiff, BlastNewAccount, Block, BlockId, BlockInfo,
+            BlockStateUpdate, IndexValuePair,
+        };
+
+        fn block(number: u64) -> BlockInfo {
+            let mut info = BlockInfo {
+                inner: Block::empty(Default::default()),
+                other: Default::default(),
+            };
+            info.inner.header.hash = H256::with_last_byte(number as u8 + 1);
+            info.inner.header.inner.number = number;
+            info.inner.header.inner.parent_hash = if number == 0 {
+                H256::ZERO
+            } else {
+                H256::with_last_byte(number as u8)
+            };
+            info
+        }
+
+        fn price_diff(price: u64) -> AccountStorageDiff {
+            AccountStorageDiff {
+                address: BLAST_SHARES_HASH,
+                diffs: vec![IndexValuePair {
+                    index: SHARE_PRICE_SLOT_HASH,
+                    value: U256::from(price),
+                }],
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-resolver-state-tree-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Genesis carries no accounts and every later block stays in the
+        // diff layers, so no account record is decoded from disk.
+        let db = MultiStorage::open(&dir, 16, StorageKind::Rocksdb, false, false, false).unwrap();
+        StateDBWrapper(db.db_at(BlockId::latest()).unwrap().unwrap())
+            .update_block(block(0), BlockStateUpdate::default())
+            .unwrap();
+        let tree = StateTree::new(db, StateTreeConfig::new(64, 100, 100, 100, true)).unwrap();
+
+        let alice = Address::repeat_byte(0x11);
+        let block_1: BlockStateUpdate = BlastBlockStorageDiff {
+            new_accounts: vec![BlastNewAccount {
+                address: keccak256(alice),
+                nonce: 1,
+                flags: 0,
+                fixed: U256::ZERO,
+                shares: U256::from(13),
+                remainder: U256::from(17),
+                code_hash: KECCAK256_EMPTY,
+            }],
+            storage_diffs: vec![price_diff(5)],
+            ..Default::default()
+        }
+        .into();
+        let block_2: BlockStateUpdate = BlastBlockStorageDiff {
+            storage_diffs: vec![price_diff(6)],
+            ..Default::default()
+        }
+        .into();
+        tree.update_block(block(1), block_1).unwrap();
+        tree.update_block(block(2), block_2).unwrap();
+
+        for (number, price) in [(1u64, 5u64), (2, 6)] {
+            let state = tree.state_at(BlockId::number(number)).unwrap().unwrap();
+            let resolver = AccountResolver::new(state, None, false);
+            assert_eq!(
+                balance(&resolver, alice),
+                U256::from(price * 13 + 17),
+                "block {number}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fixed_blast_balances_do_not_read_the_share_price() {
+        let mut db = MockDB::default();
+        db.insert(Address::repeat_byte(1), blast(1, 42, 13, 17));
+        db.insert(Address::repeat_byte(2), blast(2, 43, 13, 17));
+        let resolver = AccountResolver::new(db, None, false);
+        assert_eq!(balance(&resolver, Address::repeat_byte(1)), U256::from(42));
+        assert_eq!(balance(&resolver, Address::repeat_byte(2)), U256::from(43));
+        assert!(resolver.inner.db.storage_reads.borrow().is_empty());
+    }
+
+    /// Existing RPC messages format backend errors with `{:?}`.
+    #[test]
+    fn backend_errors_debug_as_the_backend_error() {
+        let err: ResolveError<MockErr> = MockErr.into();
+        assert_eq!(format!("{err:?}"), format!("{MockErr:?}"));
+        assert_eq!(err.to_string(), MockErr.to_string());
     }
 
     /// OVM chains fall back to the scalar path so the balance-slot

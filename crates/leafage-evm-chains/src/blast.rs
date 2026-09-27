@@ -21,17 +21,21 @@ pub const SHARE_PRICE_SLOT_HASH: B256 =
 /// `flags` value of automatic-yield accounts.
 pub const YIELD_AUTOMATIC: u8 = 0;
 
-/// Balance of a Blast account at the given sharePrice. `share_price` must come
-/// from the same state view as `ext`. `None` if the product overflows U256,
-/// which blast-geth's big.Int arithmetic cannot represent in a U256 either.
-pub fn derive_balance(ext: &BlastAccountExt, share_price: U256) -> Option<U256> {
-    if ext.flags == YIELD_AUTOMATIC {
-        share_price
-            .checked_mul(ext.shares)?
-            .checked_add(ext.remainder)
-    } else {
-        Some(ext.fixed)
+/// Balance of a Blast account. `share_price` reads the sharePrice from the
+/// same state view as `ext`; it is only called for automatic-yield accounts.
+/// `Ok(None)` if the balance overflows U256, which blast-geth's big.Int
+/// arithmetic cannot represent in a U256 either.
+pub fn derive_balance<E>(
+    ext: &BlastAccountExt,
+    share_price: impl FnOnce() -> Result<U256, E>,
+) -> Result<Option<U256>, E> {
+    if ext.flags != YIELD_AUTOMATIC {
+        return Ok(Some(ext.fixed));
     }
+    let share_price = share_price()?;
+    Ok(share_price
+        .checked_mul(ext.shares)
+        .and_then(|value| value.checked_add(ext.remainder)))
 }
 
 #[cfg(test)]
@@ -48,6 +52,10 @@ mod tests {
         }
     }
 
+    fn at_price(ext: &BlastAccountExt, share_price: U256) -> Option<U256> {
+        derive_balance(ext, || Ok::<_, ()>(share_price)).unwrap()
+    }
+
     #[test]
     fn state_keys_match_their_preimages() {
         assert_eq!(BLAST_SHARES_HASH, keccak256(BLAST_SHARES_ADDRESS));
@@ -61,32 +69,46 @@ mod tests {
     fn automatic_accounts_follow_the_share_price() {
         let account = ext(0, 999, 13, 17);
         assert_eq!(
-            derive_balance(&account, U256::from(5)),
+            at_price(&account, U256::from(5)),
             Some(U256::from(5 * 13 + 17))
         );
         assert_eq!(
-            derive_balance(&account, U256::from(6)),
+            at_price(&account, U256::from(6)),
             Some(U256::from(6 * 13 + 17))
         );
-        assert_eq!(derive_balance(&account, U256::ZERO), Some(U256::from(17)));
+        assert_eq!(at_price(&account, U256::ZERO), Some(U256::from(17)));
     }
 
     #[test]
     fn other_modes_read_fixed() {
         for flags in [1, 2, 3, 255] {
             assert_eq!(
-                derive_balance(&ext(flags, 42, 13, 17), U256::from(5)),
+                at_price(&ext(flags, 42, 13, 17), U256::from(5)),
                 Some(U256::from(42))
             );
         }
+    }
+
+    /// Fixed-balance accounts never read the sharePrice, so a failing read
+    /// cannot fail them.
+    #[test]
+    fn other_modes_do_not_read_the_share_price() {
+        for flags in [1, 2, 255] {
+            let balance = derive_balance(&ext(flags, 42, 13, 17), || Err("unreadable"));
+            assert_eq!(balance, Ok(Some(U256::from(42))));
+        }
+        assert_eq!(
+            derive_balance(&ext(0, 42, 13, 17), || Err("unreadable")),
+            Err("unreadable")
+        );
     }
 
     #[test]
     fn overflow_is_reported() {
         let mut account = ext(0, 0, 0, 1);
         account.shares = U256::MAX;
-        assert_eq!(derive_balance(&account, U256::from(2)), None);
+        assert_eq!(at_price(&account, U256::from(2)), None);
         account.shares = U256::from(1);
-        assert_eq!(derive_balance(&account, U256::MAX), None);
+        assert_eq!(at_price(&account, U256::MAX), None);
     }
 }

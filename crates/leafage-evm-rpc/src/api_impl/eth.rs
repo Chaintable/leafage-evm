@@ -200,9 +200,19 @@ where
                 let user_addr = Address::from(h160_bytes);
 
                 // get address's native balance
-                let res = Self::get_balance_from_state(state, user_addr)
-                    .map(|u256| u256)
-                    .unwrap_or_default();
+                let res = match Self::get_balance_from_state(state, user_addr) {
+                    Ok(balance) => balance,
+                    Err(err) => {
+                        return SingleCallResult {
+                            code: MultiCallErrorCode::NativeMethodStateError as i32,
+                            err: err.message().to_string(),
+                            from_cache: false,
+                            result: Default::default(),
+                            gas_used: 0,
+                            time_cost: 0.0,
+                        };
+                    }
+                };
 
                 return SingleCallResult {
                     code: MultiCallErrorCode::Success as i32,

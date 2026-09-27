@@ -434,11 +434,22 @@ where
                 h160_bytes.copy_from_slice(&data[16..36]);
                 let user_addr = Address::from(h160_bytes);
                 // get address's native balance
-                let res = Self::get_balance_from_state(
+                let res = match Self::get_balance_from_state(
                     AccountResolver::new(state, ovm_address, normalize_state_key),
                     user_addr,
-                )
-                .unwrap_or_default();
+                ) {
+                    Ok(balance) => balance,
+                    Err(err) => {
+                        return DebankSingleCallResult {
+                            code: DebankErrorCode::DataBaseFailed as i32,
+                            err: err.message().to_string(),
+                            from_cache: false,
+                            result: Default::default(),
+                            gas_used: 0,
+                            time_cost: 0.0,
+                        };
+                    }
+                };
 
                 return DebankSingleCallResult {
                     code: 0,

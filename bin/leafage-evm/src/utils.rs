@@ -128,6 +128,26 @@ fn state_diff_key(s3_chain_id: &str, block_info: &BlockInfo) -> H256 {
     }
 }
 
+/// Accepted `--evm-type` values.
+pub const EVM_TYPES: [&str; 16] = [
+    "mainnet",
+    "arbitrum",
+    "op",
+    "blast",
+    "base",
+    "bsc",
+    "cosmos",
+    "mantlev2",
+    "tempo",
+    "citrea",
+    "iotex",
+    "moonbeam",
+    "moonriver",
+    "polygon",
+    "hemi",
+    "monad",
+];
+
 /// Account format of a chain's state diffs and DB records, fixed by its evm
 /// type.
 pub fn state_diff_codec_for(evm_type: &str) -> StateDiffCodec {

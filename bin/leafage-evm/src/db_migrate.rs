@@ -1,4 +1,4 @@
-use crate::utils::state_diff_codec_for;
+use crate::utils::{state_diff_codec_for, EVM_TYPES};
 use anyhow::{bail, Ok, Result};
 use clap::Parser;
 use leafage_evm_storage::{
@@ -35,7 +35,11 @@ pub struct Command {
 
     /// The chain's evm type. Fixes the account format of the state diffs and
     /// DB records; `blast` uses Blast raw yield accounts.
-    #[arg(long, default_value = "mainnet")]
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(EVM_TYPES),
+        default_value = "mainnet"
+    )]
     evm_type: String,
 
     /// The path to the dir which state database generated

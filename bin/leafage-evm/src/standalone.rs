@@ -6,6 +6,7 @@ use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
 use crate::utils::{
     parse_kafka_s3_config, state_diff_codec_for, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg,
+    EVM_TYPES,
 };
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
@@ -42,24 +43,7 @@ pub struct Command {
     /// Default: mainnet
     #[arg(
         long,
-        value_parser = [
-            "mainnet",
-            "arbitrum",
-            "op",
-            "blast",
-            "base",
-            "bsc",
-            "cosmos",
-            "mantlev2",
-            "tempo",
-            "citrea",
-            "iotex",
-            "moonbeam",
-            "moonriver",
-            "polygon",
-            "hemi",
-            "monad",
-        ],
+        value_parser = clap::builder::PossibleValuesParser::new(EVM_TYPES),
         default_value = "mainnet"
     )]
     evm_type: String,
@@ -973,5 +957,48 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_types::StateDiffCodec;
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Command::try_parse_from(
+            ["standalone", "--db-path", "/tmp/unused"]
+                .iter()
+                .chain(args),
+        )
+    }
+
+    #[test]
+    fn blast_evm_type_selects_blast_execution_and_codec() {
+        let command = parse(&["--evm-type", "blast", "--chain-cfg", "81457"]).unwrap();
+        let cfg = command.build_chain_cfg_env().unwrap();
+        assert!(matches!(cfg, MultiChainCfgEnv::Blast(ref env) if env.chain_id == 81457));
+        assert_eq!(
+            state_diff_codec_for(&command.evm_type),
+            StateDiffCodec::BlastV1
+        );
+        assert_eq!(state_diff_codec_for("op"), StateDiffCodec::Standard);
+    }
+
+    #[test]
+    fn blast_rejects_the_ovm_balance_override() {
+        let command = parse(&[
+            "--evm-type",
+            "blast",
+            "--ovm-address",
+            "0xdeaddeaddeaddeaddeaddeaddeaddeaddead0000",
+        ])
+        .unwrap();
+        assert!(command.build_chain_cfg_env().is_err());
+    }
+
+    #[test]
+    fn unknown_evm_type_is_rejected() {
+        assert!(parse(&["--evm-type", "blast-v1"]).is_err());
     }
 }
