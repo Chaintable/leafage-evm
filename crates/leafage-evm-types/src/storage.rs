@@ -42,20 +42,38 @@ pub struct DebankOutPut {
     pub state_diff: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable, Default)]
-pub struct BlockStorageDiff {
+/// Per-block state diff. `A` is the account entry: [`NewAccount`] on the wire
+/// for standard chains, a chain-specific wire type for chains with their own
+/// account model (e.g. [`crate::BlastNewAccount`]), and [`crate::AccountUpdate`]
+/// for the internal, non-RLP [`crate::BlockStateUpdate`].
+#[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
+pub struct BlockStorageDiff<A = NewAccount> {
     /// Block root hash.
     pub hash: H256,
     /// Parent block root hash.
     pub parent_hash: H256,
     /// New accounts
-    pub new_accounts: Vec<NewAccount>,
+    pub new_accounts: Vec<A>,
     /// Deleted accounts
     pub deleted_accounts: Vec<H256>,
     /// Account storage diff
     pub storage_diffs: Vec<AccountStorageDiff>,
     /// New codes
     pub new_codes: Vec<NewCode>,
+}
+
+// Hand-written so that `A` needs no `Default` bound.
+impl<A> Default for BlockStorageDiff<A> {
+    fn default() -> Self {
+        Self {
+            hash: H256::ZERO,
+            parent_hash: H256::ZERO,
+            new_accounts: Vec::new(),
+            deleted_accounts: Vec::new(),
+            storage_diffs: Vec::new(),
+            new_codes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, RlpDecodable, RlpEncodable)]
