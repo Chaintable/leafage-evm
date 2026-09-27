@@ -4,7 +4,9 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
+use crate::utils::{
+    parse_kafka_s3_config, state_diff_codec_for, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg,
+};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -44,6 +46,7 @@ pub struct Command {
             "mainnet",
             "arbitrum",
             "op",
+            "blast",
             "base",
             "bsc",
             "cosmos",
@@ -528,6 +531,22 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
             }
+            "blast" => {
+                if self.ovm_address.is_some() {
+                    return Err(anyhow!(
+                        "--ovm-address cannot be combined with --evm-type=blast: \
+                         Blast balances come from its own account fields"
+                    ));
+                }
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Blast(chain_cfg))
+            }
             "base" => {
                 // Base forked from the OP stack; execution is OP-equivalent
                 // (Beryl precompiles are layered on separately).
@@ -933,6 +952,7 @@ impl Command {
     pub async fn run(&mut self) -> Result<()> {
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        leafage_evm_storage::set_state_diff_codec(state_diff_codec_for(&self.evm_type));
         let (updater_handle, rpc_handle, resgitry_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
