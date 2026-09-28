@@ -54,6 +54,16 @@ jobs:
         with:
           registry-type: public
 
+      - name: Test estimateGas diagnostics
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          target: rpc-debug-tests
+          push: false
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
