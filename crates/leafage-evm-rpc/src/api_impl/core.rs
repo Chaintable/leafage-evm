@@ -13,6 +13,7 @@ use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::monad::MonadHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
+use leafage_evm_chains::rsk::RskHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
@@ -236,6 +237,7 @@ pub enum MultiChainCfgEnv {
     Monad(CfgEnv<MonadHardfork>),
     Moonbeam(CfgEnv<MoonbeamHardfork>),
     Polygon(CfgEnv<PolygonHardfork>),
+    Rsk(CfgEnv<RskHardfork>),
     Hemi(CfgEnv<HemiHardfork>),
     Tempo(CfgEnv<TempoHardfork>),
     Citrea(CfgEnv<CitreaHardfork>),
@@ -255,6 +257,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Monad(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Moonbeam(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Polygon(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Rsk(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Hemi(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,

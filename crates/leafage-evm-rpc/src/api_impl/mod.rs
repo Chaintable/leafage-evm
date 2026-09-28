@@ -40,6 +40,7 @@ mod iotex;
 mod monad;
 mod moonbeam;
 mod polygon;
+mod rsk;
 mod tempo;
 
 pub(crate) mod token_collector;
