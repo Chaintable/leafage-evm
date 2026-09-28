@@ -130,7 +130,7 @@ async fn native_balance_shortcut_reports_account_read_errors() {
     assert_eq!(eth.results[0].result, Bytes::from(balance.abi_encode()));
 
     // Unreadable record: both shortcuts report the failure.
-    set_state_diff_codec(StateDiffCodec::BlastV1);
+    set_state_diff_codec(StateDiffCodec::Blast);
     let debank = DebankApiClient::contract_multi_call(
         &client,
         vec![request.clone()],

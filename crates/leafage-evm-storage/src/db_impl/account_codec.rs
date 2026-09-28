@@ -12,12 +12,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 static STATE_DIFF_CODEC: AtomicU8 = AtomicU8::new(STANDARD);
 
 const STANDARD: u8 = 0;
-const BLAST_V1: u8 = 1;
+const BLAST: u8 = 1;
 
 pub fn set_state_diff_codec(codec: StateDiffCodec) {
     let value = match codec {
         StateDiffCodec::Standard => STANDARD,
-        StateDiffCodec::BlastV1 => BLAST_V1,
+        StateDiffCodec::Blast => BLAST,
     };
     STATE_DIFF_CODEC.store(value, Ordering::Relaxed);
 }
@@ -25,7 +25,7 @@ pub fn set_state_diff_codec(codec: StateDiffCodec) {
 pub fn state_diff_codec() -> StateDiffCodec {
     match STATE_DIFF_CODEC.load(Ordering::Relaxed) {
         STANDARD => StateDiffCodec::Standard,
-        BLAST_V1 => StateDiffCodec::BlastV1,
+        BLAST => StateDiffCodec::Blast,
         other => unreachable!("invalid state diff codec {other}"),
     }
 }

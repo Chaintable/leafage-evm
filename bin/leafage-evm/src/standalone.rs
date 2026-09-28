@@ -980,7 +980,7 @@ mod tests {
         assert!(matches!(cfg, MultiChainCfgEnv::Blast(ref env) if env.chain_id == 81457));
         assert_eq!(
             state_diff_codec_for(&command.evm_type),
-            StateDiffCodec::BlastV1
+            StateDiffCodec::Blast
         );
         assert_eq!(state_diff_codec_for("op"), StateDiffCodec::Standard);
     }

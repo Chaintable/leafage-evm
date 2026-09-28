@@ -18,7 +18,7 @@ pub enum StateDiffCodec {
     #[default]
     Standard,
     /// Blast raw yield accounts, see [`crate::BlastNewAccount`].
-    BlastV1,
+    Blast,
 }
 
 /// Decodes an RLP state diff of the given format, advancing `buf` past it
@@ -29,7 +29,7 @@ pub fn decode_state_diff(
 ) -> Result<BlockStateUpdate, alloy_rlp::Error> {
     Ok(match codec {
         StateDiffCodec::Standard => BlockStorageDiff::<NewAccount>::decode(buf)?.into(),
-        StateDiffCodec::BlastV1 => BlastBlockStorageDiff::decode(buf)?.into(),
+        StateDiffCodec::Blast => BlastBlockStorageDiff::decode(buf)?.into(),
     })
 }
 
@@ -73,7 +73,7 @@ pub fn decode_stored_account(
                 normalize_code_hash(slim.code_hash),
             )
         }
-        StateDiffCodec::BlastV1 => {
+        StateDiffCodec::Blast => {
             let slim = BlastSlimAccount::decode(&mut bytes)?;
             StoredAccount::with_ext(
                 slim.nonce,
@@ -144,7 +144,7 @@ mod tests {
             let account = blast_account(flags);
             let bytes = encode_stored_account(&account);
             assert_eq!(
-                decode_stored_account(StateDiffCodec::BlastV1, &bytes).unwrap(),
+                decode_stored_account(StateDiffCodec::Blast, &bytes).unwrap(),
                 account
             );
         }
@@ -155,7 +155,7 @@ mod tests {
         let standard =
             encode_stored_account(&StoredAccount::standard(U256::from(1), 1, H256::ZERO));
         let blast = encode_stored_account(&blast_account(0));
-        assert!(decode_stored_account(StateDiffCodec::BlastV1, &standard).is_err());
+        assert!(decode_stored_account(StateDiffCodec::Blast, &standard).is_err());
         assert!(decode_stored_account(StateDiffCodec::Standard, &blast).is_err());
     }
 
@@ -168,7 +168,7 @@ mod tests {
 
         let blast = StoredAccount::with_ext(1, H256::ZERO, AccountExt::Blast(blast_ext()));
         let decoded =
-            decode_stored_account(StateDiffCodec::BlastV1, &encode_stored_account(&blast)).unwrap();
+            decode_stored_account(StateDiffCodec::Blast, &encode_stored_account(&blast)).unwrap();
         assert_eq!(decoded.code_hash(), H256::from(KECCAK256_EMPTY.0));
     }
 
@@ -229,7 +229,7 @@ mod tests {
         );
 
         let blast =
-            decode_state_diff(StateDiffCodec::BlastV1, &mut blast_diff_bytes().as_slice()).unwrap();
+            decode_state_diff(StateDiffCodec::Blast, &mut blast_diff_bytes().as_slice()).unwrap();
         assert_eq!(blast.new_accounts[0].address, H256::repeat_byte(3));
         assert_eq!(
             blast.new_accounts[0].account,
@@ -239,11 +239,10 @@ mod tests {
 
     #[test]
     fn state_diff_of_the_other_format_is_rejected() {
-        assert!(decode_state_diff(
-            StateDiffCodec::BlastV1,
-            &mut standard_diff_bytes().as_slice()
-        )
-        .is_err());
+        assert!(
+            decode_state_diff(StateDiffCodec::Blast, &mut standard_diff_bytes().as_slice())
+                .is_err()
+        );
         assert!(
             decode_state_diff(StateDiffCodec::Standard, &mut blast_diff_bytes().as_slice())
                 .is_err()
@@ -255,6 +254,6 @@ mod tests {
     #[test]
     fn empty_bytes_are_an_error() {
         assert!(decode_state_diff(StateDiffCodec::Standard, &mut &[][..]).is_err());
-        assert!(decode_state_diff(StateDiffCodec::BlastV1, &mut &[][..]).is_err());
+        assert!(decode_state_diff(StateDiffCodec::Blast, &mut &[][..]).is_err());
     }
 }

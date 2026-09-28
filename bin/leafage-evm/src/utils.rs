@@ -152,7 +152,7 @@ pub const EVM_TYPES: [&str; 16] = [
 /// type.
 pub fn state_diff_codec_for(evm_type: &str) -> StateDiffCodec {
     match evm_type {
-        "blast" => StateDiffCodec::BlastV1,
+        "blast" => StateDiffCodec::Blast,
         _ => StateDiffCodec::Standard,
     }
 }

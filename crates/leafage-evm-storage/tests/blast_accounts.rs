@@ -1,7 +1,7 @@
 //! Blast raw accounts through every storage backend and the in-memory layers.
 //!
 //! The account codec is process-wide, so these tests live in their own binary
-//! and only ever run with it set to `BlastV1`.
+//! and only ever run with it set to `Blast`.
 
 use leafage_evm_storage::{
     set_inverted_block_encoding, set_state_diff_codec, EvmStorageRead, EvmStorageWrite,
@@ -85,7 +85,7 @@ fn block(number: u64) -> BlockInfo {
 }
 
 fn open(name: &str, kind: StorageKind, archive: bool) -> (MultiStorage, PathBuf) {
-    set_state_diff_codec(StateDiffCodec::BlastV1);
+    set_state_diff_codec(StateDiffCodec::Blast);
     set_inverted_block_encoding(false);
     let dir = std::env::temp_dir().join(format!(
         "leafage-blast-{name}-{kind:?}-{archive}-{}",
