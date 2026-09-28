@@ -196,21 +196,13 @@ fn blast_accounts_through_the_state_tree() {
 
     let state = tree.state_at(BlockId::latest()).unwrap().unwrap();
     assert_eq!(
-        state.raw_account(addr(1)).unwrap(),
+        state.basic(addr(1)).unwrap(),
         Some(stored(&blast(1, 1, 0, 0, 13)))
     );
+    assert_eq!(state.basic(addr(2)).unwrap(), Some(stored(&committed)));
+    assert_eq!(state.basic(addr(3)).unwrap(), Some(stored(&in_memory)));
     assert_eq!(
-        state.raw_account(addr(2)).unwrap(),
-        Some(stored(&committed))
-    );
-    assert_eq!(
-        state.raw_account(addr(3)).unwrap(),
-        Some(stored(&in_memory))
-    );
-    assert_eq!(
-        state
-            .raw_account_many(&[addr(3), addr(4), addr(2)])
-            .unwrap(),
+        state.basic_many(&[addr(3), addr(4), addr(2)]).unwrap(),
         vec![Some(stored(&in_memory)), None, Some(stored(&committed))]
     );
     drop(state);

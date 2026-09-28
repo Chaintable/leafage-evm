@@ -471,7 +471,7 @@ impl<DB: StateDB> HybridStateDB<DB> {
 impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
-    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
+    fn basic(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
         for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().accounts.get(&address) {
                 return Ok(value.clone());
@@ -482,7 +482,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                 match cache.accounts.get(&address) {
                     Some((_, value)) => Ok(value),
                     None => {
-                        let res = self.statedb.raw_account(address)?;
+                        let res = self.statedb.basic(address)?;
                         if let Some(h) = self.cache_view_height {
                             let new_val = (h, res.clone());
                             cache
@@ -497,7 +497,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     }
                 }
             }
-            _ => Ok(self.statedb.raw_account(address)?),
+            _ => Ok(self.statedb.basic(address)?),
         }
     }
 
@@ -560,10 +560,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
         }
     }
 
-    fn raw_account_many(
-        &self,
-        addresses: &[H256],
-    ) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
         self.read_many_layered(
             addresses,
             |diff, key| diff.accounts.get(key).cloned(),
@@ -578,7 +575,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                         _ => Op::Put(new_val),
                     });
             },
-            |keys| self.statedb.raw_account_many(keys),
+            |keys| self.statedb.basic_many(keys),
         )
     }
 
@@ -691,7 +688,7 @@ mod tests {
 
     impl StateDB for MockDB {
         type Error = MockErr;
-        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
+        fn basic(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
             let mut inner = self.inner.lock().unwrap();
             inner.reads += 1;
             Ok(inner.accounts.get(&address).cloned().flatten())
@@ -827,14 +824,11 @@ mod tests {
 
         for n in 0..4u64 {
             assert_eq!(db.storage(addr, key(1000 + n)).unwrap(), U256::from(n + 1));
-            assert_eq!(
-                db.raw_account(key(2000 + n)).unwrap().unwrap().nonce(),
-                n + 1
-            );
+            assert_eq!(db.basic(key(2000 + n)).unwrap().unwrap().nonce(), n + 1);
         }
         // Absent key falls through to the bottom DB (zero).
         assert_eq!(db.storage(addr, key(9999)).unwrap(), U256::ZERO);
-        assert!(db.raw_account(key(9999)).unwrap().is_none());
+        assert!(db.basic(key(9999)).unwrap().is_none());
         // Block hashes resolve from layer metadata.
         assert_eq!(db.block_hash(3).unwrap(), key(3000 + 2));
     }
@@ -872,7 +866,7 @@ mod tests {
         assert_eq!(mock.reads(), 2);
 
         let addresses = vec![key(2000), key(7001), key(8888), key(7001)];
-        let accounts = db.raw_account_many(&addresses).unwrap();
+        let accounts = db.basic_many(&addresses).unwrap();
         assert_eq!(accounts[0].as_ref().unwrap().nonce(), 1);
         assert_eq!(accounts[1].as_ref().unwrap().nonce(), 9);
         assert!(accounts[2].is_none());
@@ -884,11 +878,11 @@ mod tests {
             assert_eq!(*got, db.storage(k.0, k.1).unwrap());
         }
         for (a, got) in addresses.iter().zip(&accounts) {
-            assert_eq!(*got, db.raw_account(*a).unwrap());
+            assert_eq!(*got, db.basic(*a).unwrap());
         }
         // The batch refilled the shared cache: no further bottom reads.
         let _ = db.storage_many(&storage_keys).unwrap();
-        let _ = db.raw_account_many(&addresses).unwrap();
+        let _ = db.basic_many(&addresses).unwrap();
         assert_eq!(mock.reads(), 4);
     }
 
@@ -965,10 +959,7 @@ mod tests {
                 before.storage(addr, key(1000 + n)).unwrap(),
                 U256::from(n + 1)
             );
-            assert_eq!(
-                before.raw_account(key(2000 + n)).unwrap().unwrap().nonce(),
-                n + 1
-            );
+            assert_eq!(before.basic(key(2000 + n)).unwrap().unwrap().nonce(), n + 1);
         }
 
         // A post-commit handle reads committed keys through the cache/db.
@@ -978,10 +969,7 @@ mod tests {
                 after.storage(addr, key(1000 + n)).unwrap(),
                 U256::from(n + 1)
             );
-            assert_eq!(
-                after.raw_account(key(2000 + n)).unwrap().unwrap().nonce(),
-                n + 1
-            );
+            assert_eq!(after.basic(key(2000 + n)).unwrap().unwrap().nonce(), n + 1);
         }
     }
 }

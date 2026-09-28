@@ -11,9 +11,8 @@ use std::sync::Arc;
 #[auto_impl(&, Box, Arc)]
 pub trait StateDB {
     type Error: std::error::Error + DBErrorMarker + Send + Sync + 'static;
-    /// Get the stored account. Its balance may need resolving against other
-    /// state of the same view, see [`StoredAccount::balance_view`].
-    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error>;
+    /// Get basic account information.
+    fn basic(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error>;
     /// Get account code by its hash
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error>;
     /// Get storage value of address at index.
@@ -21,16 +20,13 @@ pub trait StateDB {
     // History related
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error>;
 
-    /// Batched [`StateDB::raw_account`]: one result per input, same order.
+    /// Batched [`StateDB::basic`]: one result per input, same order.
     /// The scalar default keeps every implementation correct; backends
     /// that can serve point reads in one storage round trip override it.
-    fn raw_account_many(
-        &self,
-        addresses: &[H256],
-    ) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
         addresses
             .iter()
-            .map(|address| self.raw_account(*address))
+            .map(|address| self.basic(*address))
             .collect()
     }
 
@@ -108,9 +104,9 @@ pub trait BlockIndex {
     }
 }
 
-/// [`EvmStorageWrapper`] maps plain addresses and storage slots to the
-/// hashed state keys of a [`StateDB`]. It returns stored accounts as-is;
-/// building revm's account view is up to the caller.
+/// [`EvmStorageWrapper`] is a wrapper for [`StateDB`] that maps plain
+/// addresses and storage slots to state keys. Accounts are returned as
+/// stored; building revm's account view is up to the caller.
 #[derive(Clone, Debug)]
 pub struct EvmStorageWrapper<T> {
     pub db: T,
@@ -118,12 +114,32 @@ pub struct EvmStorageWrapper<T> {
 }
 
 impl<T: StateDB> EvmStorageWrapper<T> {
-    pub fn raw_basic(&self, address: Address) -> Result<Option<StoredAccount>, T::Error> {
-        self.db.raw_account(keccak256(address.as_slice()))
+    pub fn basic_ref(&self, address: Address) -> Result<Option<StoredAccount>, T::Error> {
+        self.db.basic(keccak256(address.as_slice()))
     }
+    pub fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, T::Error> {
+        self.db.code_by_hash(code_hash.0.into())
+    }
+    pub fn storage_ref(&self, address: Address, index: U256) -> Result<U256, T::Error> {
+        let address = keccak256(address.as_slice());
+        let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
+            to_normalize_state_key(index)
+        } else {
+            index.to_be_bytes()
+        });
 
-    /// Batched [`Self::raw_basic`]: one result per input, same order.
-    pub fn raw_basic_many(
+        self.db
+            .storage(address.into(), index.into())
+            .map(|n| n.into())
+    }
+    pub fn block_hash_ref(&self, number: u64) -> Result<H256, T::Error> {
+        self.db.block_hash(number).map(|h| h.0.into())
+    }
+}
+
+impl<T: StateDB> EvmStorageWrapper<T> {
+    /// Batched [`Self::basic_ref`]: one result per input, same order.
+    pub fn basic_many_ref(
         &self,
         addresses: &[Address],
     ) -> Result<Vec<Option<StoredAccount>>, T::Error> {
@@ -131,51 +147,38 @@ impl<T: StateDB> EvmStorageWrapper<T> {
             .iter()
             .map(|address| keccak256(address.as_slice()))
             .collect();
-        self.db.raw_account_many(&hashed)
+        self.db.basic_many(&hashed)
     }
 
-    pub fn storage(&self, address: Address, index: U256) -> Result<U256, T::Error> {
-        let (address, index) = self.storage_key(address, index);
-        self.db.storage(address, index)
-    }
-
-    /// Batched [`Self::storage`] over `(address, index)` pairs: one result per
-    /// input, same order.
-    pub fn storage_many(&self, keys: &[(Address, U256)]) -> Result<Vec<U256>, T::Error> {
+    /// Batched [`Self::storage_ref`] over `(address, index)`
+    /// pairs: one result per input, same order. Applies the same
+    /// address keccak and normalize-state-key rules as the scalar path.
+    pub fn storage_many_ref(&self, keys: &[(Address, U256)]) -> Result<Vec<U256>, T::Error> {
         let hashed: Vec<(H256, H256)> = keys
             .iter()
-            .map(|(address, index)| self.storage_key(*address, *index))
+            .map(|(address, index)| {
+                let address = keccak256(address.as_slice());
+                let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
+                    to_normalize_state_key(*index)
+                } else {
+                    index.to_be_bytes()
+                });
+                (address, index)
+            })
             .collect();
         self.db.storage_many(&hashed)
     }
 
-    pub fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, T::Error> {
-        self.db.code_by_hash(code_hash)
-    }
-
-    /// Batched [`Self::code_by_hash`]: one result per input, same order.
-    pub fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, T::Error> {
+    /// Batched [`Self::code_by_hash_ref`]: one result per input,
+    /// same order.
+    pub fn code_by_hash_many_ref(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, T::Error> {
         self.db.code_by_hash_many(code_hashes)
     }
 
-    pub fn block_hash(&self, number: u64) -> Result<H256, T::Error> {
-        self.db.block_hash(number)
-    }
-
-    /// Whether the batched reads above are served by a real batched storage
-    /// primitive.
+    /// Whether the `*_many_ref` reads above actually batch at the
+    /// storage layer: needs a backend with real batched point reads.
     pub fn supports_batched_reads(&self) -> bool {
         self.db.supports_batched_reads()
-    }
-
-    fn storage_key(&self, address: Address, index: U256) -> (H256, H256) {
-        let address = keccak256(address.as_slice());
-        let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
-            to_normalize_state_key(index)
-        } else {
-            index.to_be_bytes()
-        });
-        (address, index)
     }
 }
 
@@ -232,14 +235,14 @@ mod tests {
     /// the scalar ones.
     #[derive(Debug, Default)]
     struct RecordingDB {
-        account_keys: RefCell<Vec<H256>>,
+        basic_keys: RefCell<Vec<H256>>,
         storage_keys: RefCell<Vec<(H256, H256)>>,
     }
 
     impl StateDB for RecordingDB {
         type Error = MockErr;
-        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
-            self.account_keys.borrow_mut().push(address);
+        fn basic(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
+            self.basic_keys.borrow_mut().push(address);
             Ok(Some(StoredAccount::standard(U256::ZERO, 7, H256::ZERO)))
         }
         fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
@@ -264,16 +267,16 @@ mod tests {
             let address = Address::repeat_byte(0x11);
             let index = U256::from(0x8000_0001u64) << 248usize;
 
-            let scalar = wrapper.storage(address, index).unwrap();
-            let batched = wrapper.storage_many(&[(address, index)]).unwrap();
+            let scalar = wrapper.storage_ref(address, index).unwrap();
+            let batched = wrapper.storage_many_ref(&[(address, index)]).unwrap();
             assert_eq!(batched, vec![scalar]);
             let keys = wrapper.db.storage_keys.borrow();
             assert_eq!(keys[0], keys[1], "normalize={normalize}");
 
-            let scalar = wrapper.raw_basic(address).unwrap();
-            let batched = wrapper.raw_basic_many(&[address]).unwrap();
+            let scalar = wrapper.basic_ref(address).unwrap();
+            let batched = wrapper.basic_many_ref(&[address]).unwrap();
             assert_eq!(batched, vec![scalar]);
-            let keys = wrapper.db.account_keys.borrow();
+            let keys = wrapper.db.basic_keys.borrow();
             assert_eq!(keys[0], keys[1]);
         }
     }

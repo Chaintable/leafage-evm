@@ -26,7 +26,7 @@ struct DiskMock;
 
 impl StateDB for DiskMock {
     type Error = MockErr;
-    fn raw_account(&self, _address: H256) -> Result<Option<StoredAccount>, MockErr> {
+    fn basic(&self, _address: H256) -> Result<Option<StoredAccount>, MockErr> {
         Ok(Some(StoredAccount::standard(
             U256::ZERO,
             0,
@@ -239,7 +239,7 @@ fn bench_walks(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("account_miss_to_cache", depth), |b| {
             b.iter(|| {
                 a = (a + 1) % PROBE_KEYS;
-                handle.raw_account(probes[a]).unwrap()
+                handle.basic(probes[a]).unwrap()
             })
         });
 

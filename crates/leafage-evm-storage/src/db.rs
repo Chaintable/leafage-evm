@@ -180,7 +180,7 @@ where
 {
     type Error = StorageError;
 
-    fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
+    fn basic(&self, address: H256) -> Result<Option<StoredAccount>, Self::Error> {
         self.0.read_account(address)
     }
     /// Get account code by its hash
@@ -202,10 +202,7 @@ where
         Ok(self.0.read_block_hash(number)?.into())
     }
 
-    fn raw_account_many(
-        &self,
-        addresses: &[H256],
-    ) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
+    fn basic_many(&self, addresses: &[H256]) -> Result<Vec<Option<StoredAccount>>, Self::Error> {
         self.0.read_account_many(addresses)
     }
 

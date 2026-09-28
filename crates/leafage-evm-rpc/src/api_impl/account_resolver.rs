@@ -70,7 +70,7 @@ impl<T: StateDB> AccountResolver<T> {
                 .map(|address| self.basic_ref(*address))
                 .collect();
         }
-        let accounts = self.inner.raw_basic_many(addresses)?;
+        let accounts = self.inner.basic_many_ref(addresses)?;
         let mut share_price = None;
         addresses
             .iter()
@@ -84,7 +84,7 @@ impl<T: StateDB> AccountResolver<T> {
         &self,
         keys: &[(Address, U256)],
     ) -> Result<Vec<U256>, ResolveError<T::Error>> {
-        Ok(self.inner.storage_many(keys)?)
+        Ok(self.inner.storage_many_ref(keys)?)
     }
 
     /// Batched [`DatabaseRef::code_by_hash_ref`]: one result per input, same order.
@@ -92,7 +92,7 @@ impl<T: StateDB> AccountResolver<T> {
         &self,
         code_hashes: &[H256],
     ) -> Result<Vec<Bytecode>, ResolveError<T::Error>> {
-        Ok(self.inner.code_by_hash_many(code_hashes)?)
+        Ok(self.inner.code_by_hash_many_ref(code_hashes)?)
     }
 
     /// Whether the `*_many_ref` reads batch at the storage layer. OVM chains
@@ -154,20 +154,20 @@ impl<T: StateDB> DatabaseRef for AccountResolver<T> {
     type Error = ResolveError<T::Error>;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let account = self.inner.raw_basic(address)?;
+        let account = self.inner.basic_ref(address)?;
         self.resolve(address, account, &mut None)
     }
 
     fn code_by_hash_ref(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
-        Ok(self.inner.code_by_hash(code_hash)?)
+        Ok(self.inner.code_by_hash_ref(code_hash)?)
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        Ok(self.inner.storage(address, index)?)
+        Ok(self.inner.storage_ref(address, index)?)
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<H256, Self::Error> {
-        Ok(self.inner.block_hash(number)?)
+        Ok(self.inner.block_hash_ref(number)?)
     }
 }
 
@@ -244,7 +244,7 @@ mod tests {
 
     impl StateDB for MockDB {
         type Error = MockErr;
-        fn raw_account(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
+        fn basic(&self, address: H256) -> Result<Option<StoredAccount>, MockErr> {
             Ok(self.accounts.get(&address).cloned())
         }
         fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
