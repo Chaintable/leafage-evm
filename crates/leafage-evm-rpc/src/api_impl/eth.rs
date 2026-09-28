@@ -1,3 +1,4 @@
+use super::AccountResolver;
 use crate::api::EthApiServer;
 use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError};
 use crate::api_impl::utils;
@@ -5,7 +6,7 @@ use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
     BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, DebankErrorCode, Header, JsonStorageKey,
@@ -103,11 +104,11 @@ where
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
         let mut block_env = block_env_from_block(&block);
-        let mut db = CacheDB::new(EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut db = CacheDB::new(AccountResolver::new(
+            state.clone(),
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        ));
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
@@ -199,9 +200,19 @@ where
                 let user_addr = Address::from(h160_bytes);
 
                 // get address's native balance
-                let res = Self::get_balance_from_state(state, user_addr)
-                    .map(|u256| u256)
-                    .unwrap_or_default();
+                let res = match Self::get_balance_from_state(state, user_addr) {
+                    Ok(balance) => balance,
+                    Err(err) => {
+                        return SingleCallResult {
+                            code: MultiCallErrorCode::NativeMethodStateError as i32,
+                            err: err.message().to_string(),
+                            from_cache: false,
+                            result: Default::default(),
+                            gas_used: 0,
+                            time_cost: 0.0,
+                        };
+                    }
+                };
 
                 return SingleCallResult {
                     code: MultiCallErrorCode::Success as i32,
@@ -314,11 +325,11 @@ where
         let block = state
             .block_info_arc()
             .map_err(|e| internal_rpc_err(e.to_string()))?;
-        let state = EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = AccountResolver::new(
+            state.clone(),
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        );
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
             block_num: block.header.number,
@@ -433,11 +444,11 @@ where
             }
         }
         Self::get_balance_from_state(
-            EvmStorageWrapper {
-                db: state.unwrap(),
-                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-            },
+            AccountResolver::new(
+                state.unwrap(),
+                self.inner.evm_cfg().ovm_address,
+                self.inner.evm_cfg().normalize_state_key,
+            ),
             address,
         )
         .map_err(|e| internal_rpc_err(e.to_string()))
@@ -512,11 +523,11 @@ where
                 ));
             }
         }
-        let state = EvmStorageWrapper {
-            db: state.unwrap(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = AccountResolver::new(
+            state.unwrap(),
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        );
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;
@@ -569,11 +580,11 @@ where
                 ));
             }
         }
-        let state = EvmStorageWrapper {
-            db: state.unwrap(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = AccountResolver::new(
+            state.unwrap(),
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        );
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
@@ -624,11 +635,11 @@ where
                 ));
             }
         }
-        let state = EvmStorageWrapper {
-            db: state.unwrap(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = AccountResolver::new(
+            state.unwrap(),
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        );
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| internal_rpc_err(e.to_string()))?;

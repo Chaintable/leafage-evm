@@ -106,7 +106,10 @@ fn setup() -> Fixture {
             .unwrap()
             .unwrap(),
     )
-    .update_block(block_info(0, H256::repeat_byte(0xaa), H256::ZERO), genesis)
+    .update_block(
+        block_info(0, H256::repeat_byte(0xaa), H256::ZERO),
+        genesis.into(),
+    )
     .unwrap();
     let tree =
         Arc::new(StateTree::new(db, StateTreeConfig::new(4, 10000, 10000, 10000, true)).unwrap());

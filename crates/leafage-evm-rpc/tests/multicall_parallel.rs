@@ -148,7 +148,7 @@ async fn run_differential(serial_addr: &'static str, parallel_addr: &'static str
     )
     .update_block(
         block_info(0, H256::repeat_byte(0xaa), H256::ZERO),
-        genesis_diff,
+        genesis_diff.into(),
     )
     .unwrap();
     let tree =

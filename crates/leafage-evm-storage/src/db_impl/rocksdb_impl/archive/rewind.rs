@@ -84,7 +84,10 @@ mod tests {
     use crate::{
         EvmStorageWrite, LatestStateDBIterator, MultiStorage, StateDBWrapper, StorageKind,
     };
-    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair, NewCode};
+    use leafage_evm_types::{
+        encode_stored_account, AccountStorageDiff, BalanceView, BlockStorageDiff, IndexValuePair,
+        NewAccount, NewCode, StoredAccount, KECCAK256_EMPTY,
+    };
 
     fn block(number: u64, hash: u8, parent: u8) -> BlockInfo {
         let mut header = RawHeader::default();
@@ -124,7 +127,7 @@ mod tests {
 
     fn commit(db: &MultiStorage, block: BlockInfo, diff: BlockStorageDiff) {
         StateDBWrapper(db.db_at(BlockId::latest()).unwrap().unwrap())
-            .update_block(block, diff)
+            .update_block(block, diff.into())
             .unwrap();
     }
 
@@ -218,15 +221,15 @@ mod tests {
                 .read_account(H256::repeat_byte(10))
                 .unwrap()
                 .unwrap()
-                .balance,
-            U256::from(5)
+                .balance_view(),
+            BalanceView::Standard(U256::from(5))
         );
         assert_eq!(
             latest
                 .read_account(H256::repeat_byte(10))
                 .unwrap()
                 .unwrap()
-                .code_hash,
+                .code_hash(),
             KECCAK256_EMPTY
         );
         assert!(latest
@@ -286,8 +289,8 @@ mod tests {
                 .read_account(H256::repeat_byte(10))
                 .unwrap()
                 .unwrap()
-                .balance,
-            U256::from(5)
+                .balance_view(),
+            BalanceView::Standard(U256::from(5))
         );
         assert!(new_head
             .read_account(H256::repeat_byte(11))
@@ -424,7 +427,7 @@ mod tests {
             .put_cf(
                 raw.db.cf_handle("4").unwrap(),
                 account_key,
-                encode_slim_account(account(10, 9)),
+                encode_stored_account(&StoredAccount::from(account(10, 9))),
             )
             .unwrap();
         raw.db
@@ -452,8 +455,8 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(
-            db.account_iter().next().unwrap().unwrap().1.balance,
-            U256::from(5)
+            db.account_iter().next().unwrap().unwrap().1.balance_view(),
+            BalanceView::Standard(U256::from(5))
         );
         assert_eq!(db.storage_iter().next().unwrap().unwrap().2, U256::from(5));
         drop(db);

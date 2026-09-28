@@ -1,3 +1,4 @@
+use crate::utils::{state_diff_codec_for, EVM_TYPES};
 use anyhow::{bail, Ok, Result};
 use clap::Parser;
 use leafage_evm_storage::{
@@ -31,6 +32,15 @@ pub struct Command {
     /// the wrong version per key and silently produce a corrupt snapshot.
     #[arg(long, default_value = "false")]
     inverted_block_encoding: bool,
+
+    /// The chain's evm type. Fixes the account format of the state diffs and
+    /// DB records; `blast` uses Blast raw yield accounts.
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(EVM_TYPES),
+        default_value = "mainnet"
+    )]
+    evm_type: String,
 
     /// The path to the dir which state database generated
     ///
@@ -107,6 +117,7 @@ impl Command {
         // the latest-state iterators (the only place db-migrate decodes
         // archive keys).
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        leafage_evm_storage::set_state_diff_codec(state_diff_codec_for(&self.evm_type));
         let db_source = DBSource::new(
             &self.src,
             self.src_kind,

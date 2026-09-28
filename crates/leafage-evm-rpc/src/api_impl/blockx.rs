@@ -14,6 +14,7 @@
 
 use super::debank::combine_error_message;
 use super::utils;
+use super::AccountResolver;
 use crate::api::{BlockxApiServer, DebankApiClient};
 use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError,
@@ -21,7 +22,7 @@ use crate::api_impl::core::{
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
-use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
     Address, BlockId, BlockNumberOrTag, BlockType, BsrbContext, BsrbOutcome, BsrbRead, BsrbRequest,
     BsrbResponse, Bytes, DebankBlockContext, DebankErrorCode, JsonStorageKey, H256,
@@ -93,11 +94,11 @@ where
         let state = self.debank_get_state_by_ctx_impl(Some(block_ctx.clone()))?;
         histogram!("leafage_state_batch_latency_seconds", "stage" => "state_at")
             .record(stage_start.elapsed().as_secs_f64());
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = AccountResolver::new(
+            state,
+            self.inner.evm_cfg().ovm_address,
+            self.inner.evm_cfg().normalize_state_key,
+        );
 
         // Per-kind logical item counts, before deduplication.
         let mut kind_counts = [0usize; 4];

@@ -13,7 +13,7 @@
 //! - `LatestBlockHash`: 1 -> block_hash (single record)
 //! - `BlockHashToBlockInfo`: block_hash(32) -> Block<H256> (JSON)
 //! - `BlockNumToBlockHash`: block_num(32) -> block_hash(32)
-//! - `AddressToAccount`: address(32) || block_num(32) -> SlimAccount (RLP)
+//! - `AddressToAccount`: address(32) || block_num(32) -> account value (`encode_stored_account`)
 //! - `AddressToStorage`: address(32) || key(32) || block_num(32) -> value(32)
 //! - `HashToCode`: code_hash(32) -> code_bytes
 //!
@@ -22,15 +22,13 @@
 use super::{default_page_size, DEFAULT_MAX_READERS, GIGABYTE, MEGABYTE, TERABYTE};
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding,
+    encode_account_key, encode_block_num, encode_storage_key, inverted_block_encoding,
 };
+use crate::db_impl::decode_account;
 use crate::db_impl::error::Error;
 use crate::metrics::STORAGE_METRICS;
-use alloy_rlp::Decodable;
 use leafage_evm_types::{
-    BlockId, BlockInfo, BlockNumberOrTag, Bytes, NewAccount, SlimAccount, H256, KECCAK256_EMPTY,
-    U256,
+    encode_stored_account, BlockId, BlockInfo, BlockNumberOrTag, Bytes, StoredAccount, H256, U256,
 };
 use libmdbx::{
     Cursor, DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode,
@@ -505,7 +503,7 @@ fn decode_block_hash(
 impl LatestStateDBIterator for DataBase {
     /// Account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, StoredAccount), Error>> {
         match create_cursor(&self.env, StorageTable::AddressToAccount) {
             Ok(cursor) => {
                 // Newest = FIRST record of each address prefix under inverted
@@ -552,22 +550,9 @@ impl LatestStateDBIterator for DataBase {
                         }
 
                         let address = H256::from_slice(&address_bytes);
-                        let mut raw_account_slice: &[u8] = &value;
-                        match SlimAccount::decode(&mut raw_account_slice) {
+                        match decode_account(&value) {
                             Ok(account) => {
-                                return Some(Ok((
-                                    address,
-                                    NewAccount {
-                                        address,
-                                        balance: account.balance,
-                                        nonce: account.nonce,
-                                        code_hash: if account.code_hash.is_zero() {
-                                            KECCAK256_EMPTY.0.into()
-                                        } else {
-                                            account.code_hash
-                                        },
-                                    },
-                                )));
+                                return Some(Ok((address, account)));
                             }
                             Err(e) => {
                                 return Some(Err(Error::UnSupported(format!(
@@ -773,7 +758,7 @@ impl StateDBRead for StateDB {
         self.db.read_block_hash(block_num)
     }
 
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+    fn read_account(&self, address: H256) -> Result<Option<StoredAccount>, Error> {
         let start = std::time::Instant::now();
 
         let txn =
@@ -802,21 +787,10 @@ impl StateDBRead for StateDB {
                     // Empty value means deleted account
                     Ok(None)
                 } else {
-                    let mut raw_account_slice: &[u8] = &value;
-                    let account = SlimAccount::decode(&mut raw_account_slice).map_err(|e| {
+                    let account = decode_account(&value).map_err(|e| {
                         Error::UnSupported(format!("Failed to decode account: {}", e))
                     })?;
-
-                    Ok(Some(NewAccount {
-                        address,
-                        balance: account.balance,
-                        nonce: account.nonce,
-                        code_hash: if account.code_hash.is_zero() {
-                            KECCAK256_EMPTY.0.into()
-                        } else {
-                            account.code_hash
-                        },
-                    }))
+                    Ok(Some(account))
                 }
             }
             None => Ok(None),
@@ -946,7 +920,7 @@ impl StateDBWrite for StateDB {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), Error> {
         self.db
             .write_account(batch, address, block_num, raw_account)
@@ -1097,10 +1071,10 @@ impl StateDBWrite for Arc<DataBase> {
         batch: &mut Self::DBWriteBatch,
         address: H256,
         block_num: u64,
-        raw_account: Option<NewAccount>,
+        raw_account: Option<StoredAccount>,
     ) -> Result<(), Error> {
         let key = encode_account_key(address, block_num);
-        let value = raw_account.map(encode_slim_account);
+        let value = raw_account.as_ref().map(encode_stored_account);
         batch.account_cache.push((key, value));
         Ok(())
     }

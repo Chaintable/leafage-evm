@@ -4,7 +4,7 @@ use anyhow::Result;
 use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::EvmStorageWrite;
-use leafage_evm_types::{BlockInfo, BlockStorageDiff};
+use leafage_evm_types::{BlockInfo, BlockStateUpdate};
 use std::time::Duration;
 use tracing::info;
 
@@ -50,7 +50,7 @@ where
         })
     }
 
-    async fn load_genesis(&self) -> Result<(BlockInfo, BlockStorageDiff)> {
+    async fn load_genesis(&self) -> Result<(BlockInfo, BlockStateUpdate)> {
         if !self.kafka_s3_cfg.bundle_bucket_name.is_empty() {
             let mut block = None;
             let _ = s3_read_bundle(

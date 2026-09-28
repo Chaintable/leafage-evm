@@ -8,8 +8,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use leafage_evm_storage::{CacheDiskLayer, DiffLayer, HybridStateDB, LinkedDiffLayer, StateDB};
 use leafage_evm_types::{
-    AccountInfo, AccountStorageDiff, BlockInfo, BlockStorageDiff, Bytecode, IndexValuePair,
-    NewAccount, H256, U256,
+    AccountStorageDiff, BlockInfo, BlockStorageDiff, Bytecode, IndexValuePair, NewAccount,
+    StoredAccount, H256, KECCAK256_EMPTY, U256,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,8 +26,12 @@ struct DiskMock;
 
 impl StateDB for DiskMock {
     type Error = MockErr;
-    fn basic(&self, _address: H256) -> Result<Option<AccountInfo>, MockErr> {
-        Ok(Some(AccountInfo::default()))
+    fn basic(&self, _address: H256) -> Result<Option<StoredAccount>, MockErr> {
+        Ok(Some(StoredAccount::standard(
+            U256::ZERO,
+            0,
+            KECCAK256_EMPTY,
+        )))
     }
     fn code_by_hash(&self, _code_hash: H256) -> Result<Bytecode, MockErr> {
         Ok(Bytecode::default())
@@ -86,7 +90,7 @@ fn build_chain_with_cache(depth: usize, cache_enabled: bool) -> Arc<LinkedDiffLa
     )));
     let mut prev = cache;
     for n in 0..depth {
-        let mut diff = BlockStorageDiff::default();
+        let mut diff: BlockStorageDiff = BlockStorageDiff::default();
         for a in 0..ACCOUNTS_PER_BLOCK {
             diff.new_accounts.push(NewAccount {
                 address: h256(NS_ACCOUNT | ((n as u64) << 32) | a as u64),
@@ -107,7 +111,11 @@ fn build_chain_with_cache(depth: usize, cache_enabled: bool) -> Arc<LinkedDiffLa
         let mut info = BlockInfo::default();
         info.inner.header.hash = h256(NS_HASH | n as u64);
         info.inner.header.inner.number = n as u64 + 1;
-        prev = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(info, diff, prev)));
+        prev = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
+            info,
+            diff.into(),
+            prev,
+        )));
     }
     prev
 }

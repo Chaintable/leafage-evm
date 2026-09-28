@@ -1,13 +1,13 @@
-use alloy_rlp::Decodable;
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
     error::SdkError, operation::get_object::GetObjectError, primitives::ByteStream, Client,
 };
 use clap::Args;
 use flate2::read::GzDecoder;
+use leafage_evm_storage::state_diff_codec;
 use leafage_evm_types::{
-    BlockInfo, BlockStorageDiff, BundleStorageDiffIndex, STATE_DIFF_ENTRY_CAPACITY,
-    STATE_DIFF_INDEX_BYTES,
+    decode_state_diff, BlockInfo, BlockStateUpdate, BundleStorageDiffIndex,
+    STATE_DIFF_ENTRY_CAPACITY, STATE_DIFF_INDEX_BYTES,
 };
 use std::{future::Future, io::Read};
 use tokio::{io::AsyncReadExt, time::sleep};
@@ -60,7 +60,7 @@ pub(crate) async fn s3_read_bundle<F, Fut>(
     mut process_block: F,
 ) -> Result<Option<BlockInfo>>
 where
-    F: FnMut(BlockInfo, BlockStorageDiff) -> Fut,
+    F: FnMut(BlockInfo, BlockStateUpdate) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     if start_block > end_block {
@@ -165,9 +165,10 @@ where
             let local_end = usize::try_from(entry_end - payload_start)
                 .context("StateDiff entry end does not fit usize")?;
             let mut entry_bytes = &bytes[local_start..local_end];
-            let block_diff = BlockStorageDiff::decode(&mut entry_bytes).with_context(|| {
-                format!("decode StateDiff bundle {bundle_id} entry {entry_position}")
-            })?;
+            let block_diff =
+                decode_state_diff(state_diff_codec(), &mut entry_bytes).with_context(|| {
+                    format!("decode StateDiff bundle {bundle_id} entry {entry_position}")
+                })?;
             if !entry_bytes.is_empty() {
                 bail!(
                     "StateDiff bundle {bundle_id} entry {entry_position} has {} trailing bytes",
@@ -472,6 +473,7 @@ pub(crate) mod tests {
         Router,
     };
     use flate2::{write::GzEncoder, Compression};
+    use leafage_evm_types::BlockStorageDiff;
     use leafage_evm_types::H256;
     use std::{
         collections::HashMap,
@@ -588,7 +590,7 @@ pub(crate) mod tests {
             .unwrap();
         let header = header_encoder.finish().unwrap();
 
-        let diff = BlockStorageDiff {
+        let diff: BlockStorageDiff = BlockStorageDiff {
             hash: state_root,
             ..Default::default()
         };
@@ -628,7 +630,7 @@ pub(crate) mod tests {
             block.header.state_root = test_hash(10_000 + number);
             headers.push(block.clone());
 
-            let diff = BlockStorageDiff {
+            let diff: BlockStorageDiff = BlockStorageDiff {
                 hash: block.header.state_root,
                 parent_hash: test_hash(10_000 + number - 1),
                 ..Default::default()

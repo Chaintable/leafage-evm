@@ -101,12 +101,15 @@ fn build_full_tree(db_path: &std::path::Path) -> Arc<StateTree<MultiStorage>> {
             .unwrap()
             .unwrap(),
     )
-    .update_block(block_info(0, h(0xaa), H256::ZERO), genesis_diff())
+    .update_block(block_info(0, h(0xaa), H256::ZERO), genesis_diff().into())
     .unwrap();
     let tree =
         Arc::new(StateTree::new(db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap());
-    tree.update_block(block_info(1, h(0xbb), h(0xaa)), storage_diff_block1())
-        .unwrap();
+    tree.update_block(
+        block_info(1, h(0xbb), h(0xaa)),
+        storage_diff_block1().into(),
+    )
+    .unwrap();
     tree.update_block(block_info(2, h(0xcc), h(0xbb)), BlockStorageDiff::default())
         .unwrap();
     tree
@@ -529,7 +532,7 @@ async fn batch_falls_back_to_historical_per_item() {
             .unwrap()
             .unwrap(),
     )
-    .update_block(block_info(0, h(0xaa), H256::ZERO), genesis_diff())
+    .update_block(block_info(0, h(0xaa), H256::ZERO), genesis_diff().into())
     .unwrap();
     let primary_tree = Arc::new(
         StateTree::new(primary_db, StateTreeConfig::new(4, 1000, 1000, 1000, true)).unwrap(),

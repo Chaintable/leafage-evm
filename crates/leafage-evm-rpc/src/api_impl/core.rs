@@ -228,6 +228,9 @@ pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
     Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
+    /// OP execution over Blast raw yield accounts; balances are resolved by
+    /// `AccountResolver`.
+    Blast(CfgEnv<OpSpecId>),
     Base(CfgEnv<BaseHardfork>),
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
@@ -247,6 +250,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Blast(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Base(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,

@@ -4,7 +4,10 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
+use crate::utils::{
+    parse_kafka_s3_config, state_diff_codec_for, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg,
+    EVM_TYPES,
+};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -40,23 +43,7 @@ pub struct Command {
     /// Default: mainnet
     #[arg(
         long,
-        value_parser = [
-            "mainnet",
-            "arbitrum",
-            "op",
-            "base",
-            "bsc",
-            "cosmos",
-            "mantlev2",
-            "tempo",
-            "citrea",
-            "iotex",
-            "moonbeam",
-            "moonriver",
-            "polygon",
-            "hemi",
-            "monad",
-        ],
+        value_parser = clap::builder::PossibleValuesParser::new(EVM_TYPES),
         default_value = "mainnet"
     )]
     evm_type: String,
@@ -528,6 +515,22 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Op(chain_cfg))
             }
+            "blast" => {
+                if self.ovm_address.is_some() {
+                    return Err(anyhow!(
+                        "--ovm-address cannot be combined with --evm-type=blast: \
+                         Blast balances come from its own account fields"
+                    ));
+                }
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Blast(chain_cfg))
+            }
             "base" => {
                 // Base forked from the OP stack; execution is OP-equivalent
                 // (Beryl precompiles are layered on separately).
@@ -933,6 +936,7 @@ impl Command {
     pub async fn run(&mut self) -> Result<()> {
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
+        leafage_evm_storage::set_state_diff_codec(state_diff_codec_for(&self.evm_type));
         let (updater_handle, rpc_handle, resgitry_handle) =
             self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
@@ -953,5 +957,48 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_types::StateDiffCodec;
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Command::try_parse_from(
+            ["standalone", "--db-path", "/tmp/unused"]
+                .iter()
+                .chain(args),
+        )
+    }
+
+    #[test]
+    fn blast_evm_type_selects_blast_execution_and_codec() {
+        let command = parse(&["--evm-type", "blast", "--chain-cfg", "81457"]).unwrap();
+        let cfg = command.build_chain_cfg_env().unwrap();
+        assert!(matches!(cfg, MultiChainCfgEnv::Blast(ref env) if env.chain_id == 81457));
+        assert_eq!(
+            state_diff_codec_for(&command.evm_type),
+            StateDiffCodec::Blast
+        );
+        assert_eq!(state_diff_codec_for("op"), StateDiffCodec::Standard);
+    }
+
+    #[test]
+    fn blast_rejects_the_ovm_balance_override() {
+        let command = parse(&[
+            "--evm-type",
+            "blast",
+            "--ovm-address",
+            "0xdeaddeaddeaddeaddeaddeaddeaddeaddead0000",
+        ])
+        .unwrap();
+        assert!(command.build_chain_cfg_env().is_err());
+    }
+
+    #[test]
+    fn unknown_evm_type_is_rejected() {
+        assert!(parse(&["--evm-type", "blast-v1"]).is_err());
     }
 }

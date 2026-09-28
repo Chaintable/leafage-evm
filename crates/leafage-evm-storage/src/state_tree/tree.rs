@@ -7,7 +7,7 @@ use crate::state_tree::layer::{
     CacheDiskLayer, DiffLayer, FlattenedLayerView, HybridStateDB, LinkedDiffLayer,
 };
 use arc_swap::ArcSwap;
-use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, H256};
+use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag, BlockStateUpdate, H256};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -127,7 +127,7 @@ where
         )));
         let bottom_layer = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
             info.clone(),
-            BlockStorageDiff::default(),
+            BlockStateUpdate::default(),
             cache_layer.clone(),
         )));
         let bottom_view = FlattenedLayerView::build(bottom_layer);
@@ -158,7 +158,7 @@ where
     fn update_block(
         &self,
         block_info: BlockInfo,
-        block_diff: BlockStorageDiff,
+        block_diff: BlockStateUpdate,
     ) -> Result<(), Self::Error> {
         let _update_guard = self.update_lock.lock().unwrap();
         let current_index = self.index.load_full();
@@ -411,23 +411,23 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         )
-        .update_block(genesis, BlockStorageDiff::default())
+        .update_block(genesis, BlockStateUpdate::default())
         .unwrap();
 
         let tree = StateTree::new(db, StateTreeConfig::new(2, 100, 100, 100, true)).unwrap();
         tree.update_block(
             block_info(1, hash(0xa1), hash(0xa0)),
-            BlockStorageDiff::default(),
+            BlockStateUpdate::default(),
         )
         .unwrap();
         tree.update_block(
             block_info(2, hash(0xa2), hash(0xa1)),
-            BlockStorageDiff::default(),
+            BlockStateUpdate::default(),
         )
         .unwrap();
         tree.update_block(
             block_info(3, hash(0xa3), hash(0xa2)),
-            BlockStorageDiff::default(),
+            BlockStateUpdate::default(),
         )
         .unwrap();
 
@@ -454,7 +454,7 @@ mod tests {
         // replacing the published latest view.
         tree.update_block(
             block_info(2, hash(0xb2), hash(0xa1)),
-            BlockStorageDiff::default(),
+            BlockStateUpdate::default(),
         )
         .unwrap();
         let index = tree.index.load();

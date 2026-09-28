@@ -166,7 +166,10 @@ fn setup(
             .unwrap()
             .unwrap(),
     )
-    .update_block(block_info(0, H256::repeat_byte(0xaa), H256::ZERO), genesis)
+    .update_block(
+        block_info(0, H256::repeat_byte(0xaa), H256::ZERO),
+        genesis.into(),
+    )
     .unwrap();
     if let MultiStorage::RocksDBState(inner) = &db {
         inner.flush_all();

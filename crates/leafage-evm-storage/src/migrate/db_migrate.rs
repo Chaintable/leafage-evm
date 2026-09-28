@@ -211,7 +211,7 @@ impl DBSource {
         );
         for item in self.src.account_iter() {
             let (address, account) = item?;
-            sink.put(address.as_slice(), &state_account_value(account))?;
+            sink.put(address.as_slice(), &state_account_value(&account))?;
             count += 1;
             if count % Self::PROGRESS_EVERY == 0 {
                 info!(target = "migrate", "migrated account count: {}", count);
@@ -306,8 +306,8 @@ mod tests {
     use crate::db::{StateDBRead, StateDBWrapper};
     use crate::EvmStorageWrite;
     use leafage_evm_types::{
-        AccountStorageDiff, Block, BlockInfo, BlockStorageDiff, Bytes, Header, IndexValuePair,
-        NewAccount, NewCode, RawHeader, H256, KECCAK256_EMPTY, U256,
+        AccountStorageDiff, BalanceView, Block, BlockInfo, BlockStorageDiff, Bytes, Header,
+        IndexValuePair, NewAccount, NewCode, RawHeader, H256, KECCAK256_EMPTY, U256,
     };
 
     fn block_info(number: u64) -> BlockInfo {
@@ -363,7 +363,7 @@ mod tests {
                         .unwrap()
                         .unwrap(),
                 );
-                state.update_block(block_info(number), diff).unwrap();
+                state.update_block(block_info(number), diff.into()).unwrap();
             };
 
             write(
@@ -438,8 +438,11 @@ mod tests {
             .unwrap();
 
         let migrated = state.read_account(kept).unwrap().unwrap();
-        assert_eq!(migrated.balance, U256::from(11));
-        assert_eq!(migrated.code_hash, code_hash);
+        assert_eq!(
+            migrated.balance_view(),
+            BalanceView::Standard(U256::from(11))
+        );
+        assert_eq!(migrated.code_hash(), code_hash);
         assert!(
             state.read_account(deleted).unwrap().is_none(),
             "account deleted at the tip must not be migrated"
