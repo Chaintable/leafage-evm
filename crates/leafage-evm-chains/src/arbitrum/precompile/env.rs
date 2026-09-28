@@ -1,7 +1,8 @@
-use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArbitrumPrecompileEnv {
+    pub execution_mode: crate::arbitrum::ArbitrumExecutionMode,
     pub current_arbos_version: u64,
     pub current_tx_l1_gas_fees: U256,
     pub current_tx_l1_gas_units: u64,
@@ -15,6 +16,7 @@ pub struct ArbitrumPrecompileEnv {
 impl Default for ArbitrumPrecompileEnv {
     fn default() -> Self {
         Self {
+            execution_mode: Default::default(),
             current_arbos_version: 0,
             current_tx_l1_gas_fees: U256::ZERO,
             current_tx_l1_gas_units: 0,

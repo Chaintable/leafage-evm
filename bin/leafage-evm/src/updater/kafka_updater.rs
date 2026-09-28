@@ -2,8 +2,7 @@ use crate::bundle::{bundle_end, s3_read_bundle};
 use crate::utils::{
     s3_get_block_diff, s3_get_block_info, s3_get_block_info_and_diff_by_hash,
     s3_get_block_info_and_diff_by_number,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root, state_diff_keyed_by_block_hash,
-    KafkaS3Config,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, KafkaS3Config, StateDiffKey,
 };
 use anyhow::{Context, Result};
 use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
@@ -42,6 +41,7 @@ struct BlockContextWithOffset {
 pub struct Updater<Tree> {
     rpc_client: Option<HttpClient>,
     kafka_s3_cfg: KafkaS3Config,
+    state_diff_key: StateDiffKey,
     consumer: StreamConsumer,
     s3_client: Client,
     tree: Tree,
@@ -104,7 +104,9 @@ where
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
         let read_from_bundle = !kafka_s3_cfg.bundle_bucket_name.is_empty();
 
+        let state_diff_key = kafka_s3_cfg.resolved_state_diff_key();
         Ok(Self {
+            state_diff_key,
             rpc_client,
             kafka_s3_cfg,
             consumer,
@@ -165,10 +167,7 @@ where
         presist_block
     }
 
-    async fn prepare_update(
-        &self,
-        messages: &Vec<BorrowedMessage<'_>>,
-    ) -> Result<Vec<KafkaBlockContext>> {
+    async fn prepare_update(&self, messages: &[impl Message]) -> Result<Vec<KafkaBlockContext>> {
         let mut msgs: Vec<(i64, KafkaBlockChangeNotification)> = vec![];
         let mut new_blocks = vec![];
         let mut get_block_info_join_set = JoinSet::new();
@@ -195,7 +194,7 @@ where
         let mut blockhash_to_block_info = HashMap::new();
         let mut blockhash_to_block_diff = HashMap::new();
 
-        let hash_keyed = state_diff_keyed_by_block_hash(&self.kafka_s3_cfg.s3_chain_id);
+        let hash_keyed = self.state_diff_key == StateDiffKey::BlockHash;
 
         // get block info first
         while let Some(res) = get_block_info_join_set.join_next().await {
@@ -250,6 +249,11 @@ where
                 let block_diff = match blockhash_to_block_diff.get(&new_block.hash) {
                     Some(block_diff) => block_diff.clone(),
                     None => {
+                        anyhow::ensure!(
+                            !hash_keyed,
+                            "missing StateDiff for block {}",
+                            new_block.hash
+                        );
                         let parent_block_info = &blockhash_to_block_info[&new_block.parent_hash];
                         BlockStorageDiff {
                             hash: block_info.header.state_root,
@@ -279,6 +283,7 @@ where
         end_block_number: u64,
     ) -> Result<()> {
         let mut get_block_info_diff_join_set = JoinSet::new();
+        let state_diff_key = self.state_diff_key;
         for block_number in start_block_number..=end_block_number {
             let rpc_client = self.rpc_client.clone();
             let client = self.s3_client.clone();
@@ -296,6 +301,7 @@ where
                         &outer_bucket_name,
                         &s3_chain_id,
                         &version,
+                        state_diff_key,
                         block_number,
                     )
                     .await,
@@ -339,6 +345,7 @@ where
                 &self.kafka_s3_cfg.bundle_bucket_name,
                 &self.kafka_s3_cfg.s3_chain_id,
                 &self.kafka_s3_cfg.version,
+                self.state_diff_key,
                 next_block_number,
                 current_bundle_end,
                 self.bundle_range_size_mib,
@@ -380,6 +387,7 @@ where
                     &self.kafka_s3_cfg.outer_bucket_name,
                     &self.kafka_s3_cfg.s3_chain_id,
                     &self.kafka_s3_cfg.version,
+                    self.state_diff_key,
                     next_block_number,
                     parent_state_root,
                 )
@@ -476,6 +484,7 @@ where
                     &self.kafka_s3_cfg.bucket_name,
                     &self.kafka_s3_cfg.s3_chain_id,
                     &self.kafka_s3_cfg.version,
+                    self.state_diff_key,
                     parent_hash,
                 )
                 .await?;
@@ -661,5 +670,145 @@ where
         });
 
         tx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::tests::{mock_client, MockS3};
+    use flate2::{write::GzEncoder, Compression};
+    use rdkafka::message::{OwnedMessage, Timestamp};
+    use std::io::Write;
+
+    struct UnusedTree;
+    impl EvmStorageRead for UnusedTree {
+        type Error = std::io::Error;
+        type StateDB = leafage_evm_storage::StateDBWrapper<leafage_evm_storage::MDBXStateDB>;
+        fn state_at(&self, _: BlockId) -> std::result::Result<Option<Self::StateDB>, Self::Error> {
+            panic!("prepare_update must not read the database");
+        }
+    }
+    impl EvmStorageWrite for UnusedTree {
+        type Error = std::io::Error;
+        fn update_block(
+            &self,
+            _: BlockInfo,
+            _: BlockStorageDiff,
+        ) -> std::result::Result<(), Self::Error> {
+            panic!("prepare_update must not write the database");
+        }
+        fn last_committed_block(&self) -> std::result::Result<Option<BlockInfo>, Self::Error> {
+            panic!("prepare_update must not read the database");
+        }
+    }
+
+    fn gzip(value: &impl serde::Serialize) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&serde_json::to_vec(value).unwrap())
+            .unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prepare_update_requires_each_block_hash_diff_before_caching_batch() {
+        let mut objects = HashMap::new();
+        let mut notification = KafkaBlockChangeNotification {
+            change_type: 1,
+            new_blocks: vec![],
+            drop_blocks: vec![],
+        };
+        for number in 1..=2 {
+            let mut block = BlockInfo::default();
+            block.header.number = number;
+            block.header.state_root = H256::ZERO;
+            block.header.hash = H256::from([200 + number as u8; 32]);
+            block.header.parent_hash = H256::from([199 + number as u8; 32]);
+            notification.new_blocks.push(KafkaBlockContext {
+                hash: block.header.hash,
+                parent_hash: block.header.parent_hash,
+                block_number: number,
+            });
+            objects.insert(
+                format!("42161/v1/{}/block", block.header.hash),
+                gzip(&block),
+            );
+            // Distinct payloads despite identical roots prove diffs are paired by block hash.
+            let diff = BlockStorageDiff {
+                deleted_accounts: vec![Default::default(); number as usize],
+                ..Default::default()
+            };
+            objects.insert(
+                format!("42161/v1/{}/stateDiff", block.header.hash),
+                alloy_rlp::encode(diff),
+            );
+        }
+        let state = MockS3::with_objects(objects);
+        let source_objects = state.objects.clone();
+        let requests = state.requests.clone();
+        let (client, server) = mock_client(state).await;
+        let updater = Updater {
+            rpc_client: None,
+            kafka_s3_cfg: KafkaS3Config {
+                s3_chain_id: "42161".into(),
+                version: "v1".into(),
+                bucket_name: "source".into(),
+                state_diff_key: Some(StateDiffKey::BlockHash),
+                ..Default::default()
+            },
+            state_diff_key: StateDiffKey::BlockHash,
+            consumer: ClientConfig::new()
+                .set("group.id", "statediff-test")
+                .create()
+                .unwrap(),
+            s3_client: client,
+            tree: UnusedTree,
+            max_diff_depth: 8,
+            hash_to_blockctx: Mutex::new(HashMap::new()),
+            read_from_kafka: true,
+            init_task_queue_size: 2,
+            catchup_safe_depth: 2,
+            bundle_range_size_mib: 32,
+            read_from_bundle: AtomicBool::new(false),
+        };
+        let messages = vec![OwnedMessage::new(
+            Some(gzip(&notification)),
+            None,
+            "test".into(),
+            Timestamp::NotAvailable,
+            0,
+            42,
+            None,
+        )];
+        assert_eq!(
+            updater.prepare_update(&messages).await.unwrap(),
+            notification.new_blocks
+        );
+        {
+            let contexts = updater.hash_to_blockctx.lock().unwrap();
+            assert_eq!(contexts.len(), 2);
+            for block in &notification.new_blocks {
+                assert_eq!(
+                    contexts[&block.hash].block_diff.deleted_accounts.len(),
+                    block.block_number as usize
+                );
+                assert_eq!(contexts[&block.hash].offset, 42);
+            }
+        }
+        updater.hash_to_blockctx.lock().unwrap().clear();
+        requests.lock().unwrap().clear();
+        source_objects.lock().unwrap().remove(&format!(
+            "42161/v1/{}/stateDiff",
+            notification.new_blocks[1].hash
+        ));
+        assert!(updater.prepare_update(&messages).await.is_err());
+        assert!(updater.hash_to_blockctx.lock().unwrap().is_empty());
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(key, _)| !key.contains(&H256::ZERO.to_string())));
+        server.abort();
     }
 }

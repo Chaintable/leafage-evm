@@ -1,10 +1,25 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-/// Per-chain configuration for Arbitrum Orbit (Nitro) replicas, parsed from
+/// Execution engine selection. Classic and Nitro share a chain ID, so this
+/// must be explicit rather than inferred from chain ID or an empty header.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArbitrumExecutionMode {
+    #[default]
+    Nitro,
+    Classic,
+}
+
+/// Per-chain configuration for Arbitrum replicas, parsed from
 /// `--evm-custom-config`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ArbitrumEvmConfig {
+    /// Classic enables historical call simulation from account StateDiffs.
+    /// It does not provide AVM gas accounting or missing private ArbOS state.
+    #[serde(default)]
+    pub execution_mode: ArbitrumExecutionMode,
+
     /// Mirrors Nitro's
     /// `ChainConfig.ArbitrumChainParams.AllowDebugPrecompiles`.
     ///
@@ -46,4 +61,27 @@ pub struct ArbitrumEvmConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub chain_config: Option<Box<RawValue>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn classic_mode_is_explicit_and_nitro_remains_default() {
+        assert_eq!(
+            serde_json::from_str::<ArbitrumEvmConfig>("{}")
+                .unwrap()
+                .execution_mode,
+            ArbitrumExecutionMode::Nitro
+        );
+        assert_eq!(
+            serde_json::from_str::<ArbitrumEvmConfig>(r#"{"execution_mode":"classic"}"#)
+                .unwrap()
+                .execution_mode,
+            ArbitrumExecutionMode::Classic
+        );
+        assert!(
+            serde_json::from_str::<ArbitrumEvmConfig>(r#"{"execution_mode":"clasic"}"#).is_err()
+        );
+    }
 }

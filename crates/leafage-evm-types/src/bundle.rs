@@ -75,6 +75,13 @@ pub struct BundleStorageDiffIndex {
 }
 
 impl BundleStorageDiffIndex {
+    /// Whether this entry came from a source StateDiff object rather than
+    /// being synthesized by the compactor from unchanged state roots.
+    pub fn has_source_diff(&self, position: usize) -> BundleStorageDiffResult<bool> {
+        self.payload_range(position)?;
+        Ok(self.bitmap[position / 8] & (1 << (position % 8)) != 0)
+    }
+
     pub fn payload_size(&self) -> BundleStorageDiffResult<usize> {
         let last_used_offset = self
             .offset

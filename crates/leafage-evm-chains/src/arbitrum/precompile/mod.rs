@@ -7,6 +7,7 @@ mod arb_sys;
 mod arbos_acts;
 mod arbos_test;
 mod chain_config;
+mod classic;
 mod debug;
 mod env;
 mod filtered_transactions;
@@ -118,11 +119,18 @@ pub struct ArbitrumPrecompiles {
 }
 
 impl ArbitrumPrecompiles {
+    pub fn is_classic(&self) -> bool {
+        self.env.execution_mode == crate::arbitrum::ArbitrumExecutionMode::Classic
+    }
+
     pub fn new(spec: ArbitrumHardfork) -> Self {
         Self::new_with_env(spec, ArbitrumPrecompileEnv::default())
     }
 
-    pub fn new_with_env(spec: ArbitrumHardfork, env: ArbitrumPrecompileEnv) -> Self {
+    pub fn new_with_env(spec: ArbitrumHardfork, mut env: ArbitrumPrecompileEnv) -> Self {
+        if env.execution_mode == crate::arbitrum::ArbitrumExecutionMode::Classic {
+            env.current_arbos_version = 0;
+        }
         let mut eth = EthPrecompiles::new(spec.into());
         eth.precompiles = Self::eth_precompiles(env.current_arbos_version);
         Self { eth, env }
@@ -239,6 +247,9 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
         context: &mut ArbitrumContext<DB>,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
+        if self.is_classic() {
+            return classic::run(&mut self.eth, context, inputs);
+        }
         let address = inputs.bytecode_address;
         let Some(precompile) = ArbitrumPrecompile::from_address(address)
             .filter(|precompile| precompile.is_active(self.env.current_arbos_version))
@@ -332,6 +343,10 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
     fn warm_addresses(&self) -> Box<impl Iterator<Item = RevmAddress>> {
         let mut addresses: Vec<_> =
             PrecompileProvider::<ArbitrumContext<DB>>::warm_addresses(&self.eth).collect();
+        if self.is_classic() {
+            addresses.extend(classic::addresses());
+            return Box::new(addresses.into_iter());
+        }
         let arbos_version = self.env.current_arbos_version;
         addresses.extend(
             ArbitrumPrecompile::ALL
@@ -343,6 +358,10 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
     }
 
     fn contains(&self, address: &RevmAddress) -> bool {
+        if self.is_classic() {
+            return classic::addresses().any(|a| a == *address)
+                || PrecompileProvider::<ArbitrumContext<DB>>::contains(&self.eth, address);
+        }
         ArbitrumPrecompile::from_address(*address)
             .is_some_and(|precompile| precompile.is_active(self.env.current_arbos_version))
             || PrecompileProvider::<ArbitrumContext<DB>>::contains(&self.eth, address)

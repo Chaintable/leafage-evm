@@ -23,7 +23,7 @@ use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
 use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv, ArbitrumRetryTx};
-use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
+use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumExecutionMode, ArbitrumHardfork};
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, DebankErrorCode};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output};
@@ -47,6 +47,7 @@ fn precompile_env(
 ) -> ArbitrumPrecompileEnv {
     let retryable = tx.retryable_redeem_tx();
     ArbitrumPrecompileEnv {
+        execution_mode: custom_cfg.map(|c| c.execution_mode).unwrap_or_default(),
         current_tx_l1_gas_fees: U256::ZERO,
         current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,
@@ -63,9 +64,39 @@ fn precompile_env(
 }
 
 impl<DB> ArbitrumApiImpl<DB> {
+    pub(super) fn is_classic(&self) -> bool {
+        self.evm_cfg.custom_cfg.as_ref().is_some_and(|config| {
+            config.execution_mode == ArbitrumExecutionMode::Classic
+        })
+    }
+
+    fn execution_env(
+        &self,
+        block_env: &BlockEnv,
+        tx: &ArbitrumTxEnv,
+    ) -> (BlockEnv, ArbitrumExecutionContext) {
+        if !self.is_classic() {
+            return Self::execution_env_for_tx(block_env, tx);
+        }
+        let mut env = block_env.clone();
+        let mut context = ArbitrumExecutionContext::default();
+        context.set_current_l2_context(block_env.number, 0);
+        env.beneficiary = Address::ZERO;
+        env.difficulty = U256::from(2_500_000_000_000_000u64);
+        env.prevrandao = None;
+        env.basefee = 0;
+        (env, context)
+    }
+
     fn cfg_for_tx(&self, tx: &ArbitrumTxEnv) -> CfgEnv<ArbitrumHardfork> {
         let mut cfg = self.evm_cfg.cfg.clone();
-        if tx.context.current_arbos_version != 0 {
+        if self.is_classic() {
+            ArbitrumHardfork::Berlin.apply_cfg(&mut cfg);
+            cfg.disable_eip7623 = true;
+            cfg.disable_eip3607 = true;
+            cfg.disable_nonce_check = true;
+            cfg.disable_base_fee = true;
+        } else if tx.context.current_arbos_version != 0 {
             ArbitrumHardfork::from_arbos_version(tx.context.current_arbos_version)
                 .apply_cfg(&mut cfg);
         }
@@ -110,6 +141,9 @@ impl<DB> ArbitrumApiImpl<DB> {
     }
 
     fn tx_context_for_block(&self, block: &BlockInfo) -> ArbitrumTxContext {
+        if self.is_classic() {
+            return ArbitrumTxContext::default();
+        }
         let legacy_zero_base_fee_until =
             configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref());
         let (current_l1_block_number, current_arbos_version) =
@@ -133,7 +167,7 @@ impl<DB> ArbitrumApiImpl<DB> {
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
+        let (evm_block_env, execution_context) = self.execution_env(block_env, &tx);
         let precompile_env = precompile_env(&tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
@@ -163,7 +197,7 @@ impl<DB> ArbitrumApiImpl<DB> {
     where
         StateDB::Error: Sync + Send + 'static,
     {
-        let (evm_block_env, execution_context) = Self::execution_env_for_tx(block_env, &tx);
+        let (evm_block_env, execution_context) = self.execution_env(block_env, &tx);
         let precompile_env = precompile_env(&tx, self.evm_cfg.custom_cfg.as_ref());
         let mut evm = create_arbitrum_evm_from_state(
             evm_block_env,
@@ -562,6 +596,31 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn classic_ignores_nitro_header_metadata_and_version() {
+        let mut api = test_api(ArbitrumHardfork::Osaka);
+        api.evm_cfg.custom_cfg = Some(ArbitrumEvmConfig {
+            execution_mode: ArbitrumExecutionMode::Classic,
+            ..Default::default()
+        });
+        let tx = tx_at_arbos_version(60);
+        assert_eq!(api.cfg_for_tx(&tx).spec, ArbitrumHardfork::Berlin);
+        let block_env = BlockEnv {
+            number: U256::from(4198902),
+            basefee: 99,
+            ..Default::default()
+        };
+        let (env, ctx) = api.execution_env(&block_env, &tx);
+        assert_eq!(env.beneficiary, Address::ZERO);
+        assert_eq!(env.difficulty, U256::from(2_500_000_000_000_000u64));
+        assert_eq!(env.basefee, 0);
+        assert_eq!(ctx.current_l2_block_number(), Some(block_env.number));
+        assert_eq!(
+            precompile_env(&tx, api.evm_cfg.custom_cfg.as_ref()).execution_mode,
+            ArbitrumExecutionMode::Classic
+        );
     }
 
     #[test]
