@@ -7,8 +7,11 @@
 //! ABI-selector decoder registry), leafage-evm is a read-only node and only needs the
 //! essential error plumbing for storage operations.
 
-use alloy::primitives::Bytes;
+use alloy::primitives::{Bytes, FixedBytes};
+use alloy::sol_types::{Panic, SolError};
 use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+
+use super::UnknownFunctionSelector;
 
 /// Top-level error type for Tempo precompile operations in leafage-evm.
 ///
@@ -50,10 +53,28 @@ impl std::error::Error for TempoPrecompileError {}
 pub type Result<T> = std::result::Result<T, TempoPrecompileError>;
 
 impl TempoPrecompileError {
+    /// Returns the ABI selector carried by a business-logic error.
+    pub fn selector(&self) -> FixedBytes<4> {
+        match self {
+            Self::UnknownFunctionSelector(selector) => FixedBytes::new(*selector),
+            Self::Revert(data) => data
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(FixedBytes::new)
+                .unwrap_or_default(),
+            Self::OutOfGas | Self::Fatal(_) => FixedBytes::ZERO,
+        }
+    }
+
     /// Returns true if this error represents a system-level failure that must be propagated
     /// rather than swallowed, because state may be inconsistent.
     pub fn is_system_error(&self) -> bool {
-        matches!(self, Self::OutOfGas | Self::Fatal(_))
+        match self {
+            Self::OutOfGas | Self::Fatal(_) => true,
+            // Official `Panic` and `StorageDeltaUnderflow`, both encoded as `Panic(uint256)`.
+            Self::Revert(data) => data.starts_with(&Panic::SELECTOR),
+            Self::UnknownFunctionSelector(_) => false,
+        }
     }
 
     /// Creates an arithmetic under/overflow panic error (Panic(0x11)).
@@ -77,10 +98,13 @@ impl TempoPrecompileError {
             Self::OutOfGas => Err(PrecompileError::OutOfGas),
             Self::Fatal(msg) => Err(PrecompileError::Fatal(msg)),
             Self::UnknownFunctionSelector(selector) => {
-                // Encode as a simple 4-byte revert
                 Ok(PrecompileOutput::new_reverted(
                     gas_used,
-                    Bytes::copy_from_slice(&selector),
+                    UnknownFunctionSelector {
+                        selector: FixedBytes::new(selector),
+                    }
+                    .abi_encode()
+                    .into(),
                 ))
             }
             Self::Revert(data) => Ok(PrecompileOutput::new_reverted(gas_used, data)),
@@ -124,5 +148,20 @@ impl<T> IntoPrecompileResult<T> for TempoPrecompileError {
         _encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult {
         TempoPrecompileError::into_precompile_result(self, gas_used)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_errors_include_panics() {
+        assert!(TempoPrecompileError::OutOfGas.is_system_error());
+        assert!(TempoPrecompileError::Fatal("db".into()).is_system_error());
+        assert!(TempoPrecompileError::under_overflow().is_system_error());
+        assert!(!TempoPrecompileError::UnknownFunctionSelector([1, 2, 3, 4]).is_system_error());
+        assert!(!TempoPrecompileError::Revert(Bytes::from_static(&[1, 2, 3, 4])).is_system_error());
+        assert!(!TempoPrecompileError::Revert(Bytes::new()).is_system_error());
     }
 }
