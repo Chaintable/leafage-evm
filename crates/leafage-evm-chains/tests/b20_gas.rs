@@ -38,6 +38,9 @@ struct MockPort {
     code_accounts: HashSet<Address>,
     gas: Gas,
     params: GasParams,
+    caller: Address,
+    chain_id: u64,
+    timestamp: U256,
 }
 
 impl MockPort {
@@ -53,9 +56,23 @@ impl MockPort {
             code_accounts: HashSet::new(),
             gas: Gas::new(gas_limit),
             params: GasParams::new_spec(SpecId::PRAGUE),
+            caller: SENDER,
+            chain_id: 8453,
+            timestamp: U256::from(1_786_968_339u64),
         };
         port.warm_accounts.insert(TOKEN);
         port.code_accounts.insert(TOKEN);
+        port
+    }
+
+    /// A port for `token` on Base Sepolia after Cobalt, calling as `caller`.
+    fn sepolia_cobalt(gas_limit: u64, token: Address, caller: Address) -> Self {
+        let mut port = Self::new(gas_limit);
+        port.caller = caller;
+        port.chain_id = 84532;
+        port.timestamp = U256::from(1_790_222_750u64);
+        port.warm_accounts.insert(token);
+        port.code_accounts.insert(token);
         port
     }
 
@@ -115,16 +132,16 @@ impl B20Port for MockPort {
     }
 
     fn caller(&self) -> Address {
-        SENDER
+        self.caller
     }
     fn call_value(&self) -> U256 {
         U256::ZERO
     }
     fn chain_id(&self) -> u64 {
-        8453
+        self.chain_id
     }
     fn timestamp(&self) -> U256 {
-        U256::from(1_786_968_339u64)
+        self.timestamp
     }
     fn is_static(&self) -> bool {
         false
@@ -360,4 +377,119 @@ fn policy_gated_transfer_matches_base_mainnet_gas() {
         }
     }
     assert_eq!(hi, 15219, "policy-gated transfer must match Base mainnet gas");
+}
+
+/// Cobalt gas, checked against Base Sepolia, where Cobalt activated at 1_790_186_400.
+///
+/// Measured at block 47,227,231 against the asset token `0xb200…c4c266da4035da4d13`
+/// ("Summit Commerce Corp."), with the same `eth_call` binary search as above. Its packed
+/// transfer policies are real blocklists (sender = receiver = 0x4f, executor = 0x45), so the
+/// transfers pay the registry membership reads; every other slot this suite touches reads zero.
+///
+/// What each number pins beyond Beryl:
+/// - `DOMAIN_SEPARATOR` 2338 = Beryl's 2206 + the three metered keccaks (36 + 36 + 60).
+/// - `permit` with `v = 0` still pays the full hashing *and* the 3000 recovery charge, because
+///   Cobalt bills recovery before it checks `v`.
+/// - `transfer` reads the packed policy slot once (Beryl re-reads it warm, +100).
+/// - `uiMultiplier` reads the pending schedule slot before the multiplier slot.
+#[test]
+fn cobalt_gas_matches_base_sepolia() {
+    const SEPOLIA_TOKEN: Address = address!("0xb200000000000000000000c4c266da4035da4d13");
+    const ROOT_B20: U256 = U256::from_limbs([
+        0xbb5f01ed48434000,
+        0x4c938c3196430e10,
+        0x4aff64ea9b247419,
+        0xc78b71fee795ddd7,
+    ]);
+    let caller = address!("0x1111111111111111111111111111111111111111");
+    let dead = address!("0x000000000000000000000000000000000000dEaD");
+    let seize_exempt =
+        b256!("edb5da348cfb67af08746d3afd1be81034b50d5c8576f31aff688f39dfd540ed");
+
+    let seed = |port: &mut MockPort| {
+        // name "Summit Commerce Corp." (short form: bytes, then 2 * len in the last byte).
+        let name = U256::from_str_radix(
+            "53756d6d697420436f6d6d6572636520436f72702e000000000000000000002a",
+            16,
+        )
+        .unwrap();
+        port.storage.insert((SEPOLIA_TOKEN, ROOT_B20), name);
+        let policies = U256::from(0x4fu64) | (U256::from(0x4fu64) << 64) | (U256::from(0x45u64) << 128);
+        port.storage.insert((SEPOLIA_TOKEN, ROOT_B20 + U256::from(9u64)), policies);
+    };
+    let min_gas = |calldata: &[u8], who: Address| {
+        let completes = |limit: u64| {
+            let mut port = MockPort::sepolia_cobalt(limit, SEPOLIA_TOKEN, who);
+            seed(&mut port);
+            !matches!(dispatch(&mut port, SEPOLIA_TOKEN, true, calldata), Err(B20Error::OutOfGas))
+        };
+        let (mut lo, mut hi) = (0u64, 200_000u64);
+        assert!(completes(hi));
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if completes(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    };
+
+    let cases: Vec<(&str, Vec<u8>, Address, u64)> = vec![
+        ("SEIZE_ROLE", IB20::SEIZE_ROLECall {}.abi_encode(), caller, 106),
+        ("DOMAIN_SEPARATOR", IB20::DOMAIN_SEPARATORCall {}.abi_encode(), caller, 2338),
+        ("uiMultiplier", IB20Asset::uiMultiplierCall {}.abi_encode(), caller, 4306),
+        ("newUIMultiplier", IB20Asset::newUIMultiplierCall {}.abi_encode(), caller, 4406),
+        ("totalSupplyUI", IB20Asset::totalSupplyUICall {}.abi_encode(), caller, 6406),
+        (
+            "balanceOfUI",
+            IB20Asset::balanceOfUICall { account: caller }.abi_encode(),
+            caller,
+            6412,
+        ),
+        (
+            "policyId(SEIZE_EXEMPT_POLICY)",
+            IB20::policyIdCall { policyScope: seize_exempt }.abi_encode(),
+            caller,
+            2212,
+        ),
+        (
+            "transfer",
+            IB20::transferCall { to: dead, amount: U256::ZERO }.abi_encode(),
+            caller,
+            15119,
+        ),
+        (
+            "transferFrom",
+            IB20::transferFromCall { from: caller, to: dead, amount: U256::ZERO }.abi_encode(),
+            dead,
+            21181,
+        ),
+        (
+            "seizeWithMemo without SEIZE_ROLE",
+            IB20::seizeWithMemoCall { from: caller, to: dead, amount: U256::ZERO, memo: B256::ZERO }
+                .abi_encode(),
+            caller,
+            4330,
+        ),
+        (
+            "permit with v = 0",
+            IB20::permitCall {
+                owner: caller,
+                spender: dead,
+                value: U256::ZERO,
+                deadline: U256::MAX,
+                v: 0,
+                r: B256::ZERO,
+                s: B256::ZERO,
+            }
+            .abi_encode(),
+            caller,
+            7594,
+        ),
+    ];
+    for (name, calldata, who, expected) in cases {
+        assert_eq!(min_gas(&calldata, who), expected, "{name}: minimum gas must match Base Sepolia");
+    }
 }
