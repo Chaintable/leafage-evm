@@ -1,6 +1,7 @@
 use alloy::primitives::address;
 use revm::precompile::{
-    Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+    eth_precompile_fn, EthPrecompileOutput, EthPrecompileResult, Precompile, PrecompileHalt,
+    PrecompileId,
 };
 use revm::primitives::Bytes;
 use std::borrow::Cow;
@@ -8,17 +9,19 @@ use std::borrow::Cow;
 // 4600 ~ 1.33 * 3450 (p256r1 base gas cost), reflecting ~33% higher zk cycle count for schnorr
 const SCHNORRVERIFY_BASE: u64 = 4600;
 const INPUT_LENGTH: usize = 128;
+eth_precompile_fn!(schnorr_verify_run_precompile, schnorr_verify_run);
+
 pub const SCHNORR_VERIFY: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("CITREA_SCHNORR_VERIFY")),
     address!("0x0000000000000000000000000000000000000200"),
-    schnorr_verify_run,
+    schnorr_verify_run_precompile,
 );
 
 /// BIP340 Schnorr verify. Input: pubkey_x(32) | msg_hash(32) | sig(64) = 128 bytes.
 /// Returns 32-byte big-endian 1 on success, empty bytes on failure.
-fn schnorr_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn schnorr_verify_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     if gas_limit < SCHNORRVERIFY_BASE {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
 
     let result = verify_sig(input).map_or_else(Bytes::new, |_| {
@@ -27,7 +30,7 @@ fn schnorr_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         Bytes::from(out.to_vec())
     });
 
-    Ok(PrecompileOutput::new(SCHNORRVERIFY_BASE, result))
+    Ok(EthPrecompileOutput::new(SCHNORRVERIFY_BASE, result))
 }
 
 fn verify_sig(input: &[u8]) -> Option<()> {
@@ -52,7 +55,7 @@ mod tests {
         let input = [0u8; 128];
         assert_eq!(
             schnorr_verify_run(&input, SCHNORRVERIFY_BASE - 1),
-            Err(PrecompileError::OutOfGas)
+            Err(PrecompileHalt::OutOfGas)
         );
     }
 

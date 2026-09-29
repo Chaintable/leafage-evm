@@ -13,8 +13,8 @@ use revm::handler::instructions::EthInstructions;
 use revm::interpreter::{
     instructions::{contract, host},
     interpreter::EthInterpreter,
-    interpreter_types::{InputsTr, LoopControl, RuntimeFlag},
-    Instruction, InstructionContext, InstructionResult, InterpreterAction,
+    interpreter_types::{InputsTr, RuntimeFlag},
+    Instruction, InstructionContext, InstructionExecResult, InstructionResult,
 };
 use revm::primitives::hardfork::SpecId;
 use revm::{Database, DatabaseRef};
@@ -180,34 +180,37 @@ pub(super) fn install_instruction_metering<DB>(
     replace(instructions, opcode::SELFDESTRUCT, selfdestruct::<DB>);
 }
 
+type InstructionFn<DB> =
+    fn(InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>) -> InstructionExecResult;
+
 fn replace<DB>(
     instructions: &mut EthInstructions<EthInterpreter, ArbitrumContext<DB>>,
     opcode: u8,
-    instruction: fn(InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>),
+    instruction: InstructionFn<DB>,
 ) where
     DB: Database + DatabaseRef,
 {
-    let static_gas = instructions.instruction_table[opcode as usize].static_gas();
-    instructions.insert_instruction(opcode, Instruction::new(instruction, static_gas));
+    let static_gas = instructions.gas_table()[opcode as usize];
+    instructions.insert_instruction(opcode, Instruction::new(instruction), static_gas);
 }
 
 fn run_stock<DB>(
     context: &mut InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-    instruction: fn(InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>),
-) where
+    instruction: InstructionFn<DB>,
+) -> InstructionExecResult
+where
     DB: Database + DatabaseRef,
 {
     instruction(InstructionContext {
         interpreter: &mut *context.interpreter,
         host: &mut *context.host,
-    });
+    })
 }
 
-fn failed(interpreter: &mut revm::interpreter::Interpreter<EthInterpreter>) -> bool {
-    matches!(
-        interpreter.bytecode.action().as_ref(),
-        Some(InterpreterAction::Return(result)) if !result.result.is_ok()
-    )
+/// Stock instructions halt by returning `Err`; `Suspend` (new frame),
+/// `Stop`/`Return`/`SelfDestruct` are successful outcomes.
+fn failed(result: &InstructionExecResult) -> bool {
+    matches!(result, Err(result) if !result.is_ok())
 }
 
 fn journal_len<DB: Database>(context: &ArbitrumContext<DB>) -> usize {
@@ -223,17 +226,18 @@ fn warmed_accounts<DB: Database>(context: &ArbitrumContext<DB>, start: usize) ->
 
 fn meter_account_load<DB>(
     mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-    instruction: fn(InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>),
-) where
+    instruction: InstructionFn<DB>,
+) -> InstructionExecResult
+where
     DB: Database + DatabaseRef,
 {
     if context.host.chain().multi_gas_arbos_version().is_none() {
         return run_stock(&mut context, instruction);
     }
     let start = journal_len(context.host);
-    run_stock(&mut context, instruction);
-    if failed(context.interpreter) {
-        return;
+    let result = run_stock(&mut context, instruction);
+    if failed(&result) {
+        return result;
     }
     let cold_reads = warmed_accounts(context.host, start);
     let additional = context
@@ -245,30 +249,39 @@ fn meter_account_load<DB>(
         ArbResourceKind::StorageAccessRead,
         cold_reads.saturating_mul(additional),
     );
+    result
 }
 
-fn balance<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn balance<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_account_load(context, host::balance);
+    meter_account_load(context, host::balance)
 }
 
-fn extcodesize<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn extcodesize<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_account_load(context, host::extcodesize);
+    meter_account_load(context, host::extcodesize)
 }
 
-fn extcodehash<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn extcodehash<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_account_load(context, host::extcodehash);
+    meter_account_load(context, host::extcodehash)
 }
 
-fn extcodecopy<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn extcodecopy<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
@@ -288,9 +301,9 @@ where
         .saturating_to::<usize>();
     let copy_cost = context.host.cfg().gas_params().extcodecopy(len);
     let start = journal_len(context.host);
-    run_stock(&mut context, host::extcodecopy);
-    if failed(context.interpreter) {
-        return;
+    let result = run_stock(&mut context, host::extcodecopy);
+    if failed(&result) {
+        return result;
     }
 
     let cold_reads = warmed_accounts(context.host, start);
@@ -305,9 +318,12 @@ where
             .saturating_mul(additional)
             .saturating_add(copy_cost),
     );
+    result
 }
 
-fn sload<DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn sload<DB>(
+    mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
@@ -315,9 +331,9 @@ where
         return run_stock(&mut context, host::sload);
     }
     let start = journal_len(context.host);
-    run_stock(&mut context, host::sload);
-    if failed(context.interpreter) {
-        return;
+    let result = run_stock(&mut context, host::sload);
+    if failed(&result) {
+        return result;
     }
     let cold_reads = context.host.journal().journal[start..]
         .iter()
@@ -332,9 +348,12 @@ where
         ArbResourceKind::StorageAccessRead,
         cold_reads.saturating_mul(additional),
     );
+    result
 }
 
-fn sstore<DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn sstore<DB>(
+    mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
@@ -351,9 +370,9 @@ where
     };
     let target = context.interpreter.input.target_address();
     let start = journal_len(context.host);
-    run_stock(&mut context, host::sstore);
-    if failed(context.interpreter) {
-        return;
+    let result = run_stock(&mut context, host::sstore);
+    if failed(&result) {
+        return result;
     }
 
     let entries = &context.host.journal().journal[start..];
@@ -381,7 +400,7 @@ where
         .and_then(|account| account.storage.get(&key))
         .map(|slot| slot.original_value())
     else {
-        return;
+        return result;
     };
 
     let cost = ArbMultiGas::sstore_cost(
@@ -392,9 +411,12 @@ where
         is_cold,
     );
     context.host.chain_mut().record_multi_gas_cost(cost);
+    result
 }
 
-fn log<const N: usize, DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn log<const N: usize, DB>(
+    mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
@@ -411,9 +433,9 @@ where
         .copied()
         .unwrap_or_default()
         .saturating_to::<u64>();
-    run_stock(&mut context, host::log::<N, _>);
-    if failed(context.interpreter) {
-        return;
+    let result = run_stock(&mut context, host::log::<N, _>);
+    if failed(&result) {
+        return result;
     }
     const LOG_TOPIC_HISTORY_GAS: u64 = 32 * 8;
     const LOG_DATA_GAS: u64 = 8;
@@ -423,41 +445,59 @@ where
             .saturating_mul(LOG_TOPIC_HISTORY_GAS)
             .saturating_add(len.saturating_mul(LOG_DATA_GAS)),
     );
+    result
 }
 
-fn call<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn call<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_call(context, contract::call, true);
+    meter_call(context, contract::call::<{ opcode::CALL }, _, _>, true)
 }
 
-fn callcode<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn callcode<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_call(context, contract::call_code, false);
+    meter_call(context, contract::call::<{ opcode::CALLCODE }, _, _>, false)
 }
 
-fn delegatecall<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn delegatecall<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_call(context, contract::delegate_call, false);
+    meter_call(
+        context,
+        contract::call::<{ opcode::DELEGATECALL }, _, _>,
+        false,
+    )
 }
 
-fn staticcall<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn staticcall<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
-    meter_call(context, contract::static_call, false);
+    meter_call(
+        context,
+        contract::call::<{ opcode::STATICCALL }, _, _>,
+        false,
+    )
 }
 
 fn meter_call<DB>(
     mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-    instruction: fn(InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>),
+    instruction: InstructionFn<DB>,
     charges_new_account: bool,
-) where
+) -> InstructionExecResult
+where
     DB: Database + DatabaseRef,
 {
     if context.host.chain().multi_gas_arbos_version().is_none() {
@@ -470,9 +510,9 @@ fn meter_call<DB>(
         .flatten()
         .unwrap_or_default();
     let start = journal_len(context.host);
-    run_stock(&mut context, instruction);
-    if failed(context.interpreter) {
-        return;
+    let result = run_stock(&mut context, instruction);
+    if failed(&result) {
+        return result;
     }
 
     let cold_accounts = warmed_accounts(context.host, start);
@@ -498,9 +538,12 @@ fn meter_call<DB>(
     let chain = context.host.chain_mut();
     chain.record_multi_gas(ArbResourceKind::StorageAccessRead, storage_read);
     chain.record_multi_gas(ArbResourceKind::StorageGrowth, storage_growth);
+    result
 }
 
-fn selfdestruct<DB>(mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn selfdestruct<DB>(
+    mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
@@ -508,37 +551,18 @@ where
         return run_stock(&mut context, host::selfdestruct);
     }
     if context.interpreter.runtime_flag.is_static() {
-        context
-            .interpreter
-            .halt(InstructionResult::StateChangeDuringStaticCall);
-        return;
+        return Err(InstructionResult::StateChangeDuringStaticCall);
     }
-    let target = match context.interpreter.stack.pop() {
-        Ok(target) => word_to_address(target),
-        Err(result) => {
-            context.interpreter.halt(result);
-            return;
-        }
-    };
+    let target = word_to_address(context.interpreter.stack.pop()?);
     let spec = context.interpreter.runtime_flag.spec_id();
     let gas_params = context.host.cfg().gas_params().clone();
     let cold_cost = gas_params.selfdestruct_cold_cost();
     let skip_cold_load = context.interpreter.gas.remaining() < cold_cost;
-    let result = match context.host.selfdestruct(
+    let result = context.host.selfdestruct(
         context.interpreter.input.target_address(),
         target,
         skip_cold_load,
-    ) {
-        Ok(result) => result,
-        Err(revm::context_interface::host::LoadError::ColdLoadSkipped) => {
-            context.interpreter.halt_oog();
-            return;
-        }
-        Err(revm::context_interface::host::LoadError::DBError) => {
-            context.interpreter.halt_fatal();
-            return;
-        }
-    };
+    )?;
     let topup = if spec.is_enabled_in(SpecId::SPURIOUS_DRAGON) {
         result.data.had_value && !result.data.target_exists
     } else {
@@ -547,10 +571,19 @@ where
     if !context
         .interpreter
         .gas
-        .record_cost(gas_params.selfdestruct_cost(topup, result.is_cold))
+        .record_regular_cost(gas_params.selfdestruct_cost(topup, result.is_cold))
     {
-        context.interpreter.halt_oog();
-        return;
+        return Err(InstructionResult::OutOfGas);
+    }
+    // EIP-8037 state gas for the new account, mirroring stock `host::selfdestruct`.
+    if context.host.is_amsterdam_eip8037_enabled()
+        && topup
+        && !context
+            .interpreter
+            .gas
+            .record_state_cost(gas_params.new_account_state_gas())
+    {
+        return Err(InstructionResult::OutOfGas);
     }
     if result.is_cold {
         context.host.chain_mut().record_multi_gas(
@@ -576,7 +609,7 @@ where
             .gas
             .record_refund(gas_params.selfdestruct_refund());
     }
-    context.interpreter.halt(InstructionResult::SelfDestruct);
+    Err(InstructionResult::SelfDestruct)
 }
 
 fn word_to_address(word: U256) -> Address {

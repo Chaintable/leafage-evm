@@ -13,9 +13,11 @@ use alloy::{
     sol_types::{sol, SolCall},
 };
 use revm::{
+    bytecode::Bytecode,
     context_interface::cfg::gas,
     handler::FrameResult,
     interpreter::{CallInput, CallInputs, CallScheme, CallValue},
+    primitives::KECCAK_EMPTY,
 };
 
 pub(crate) const CALL_FROM_ADDRESS: Address = address!("1800000000000000000000000000000000000003");
@@ -68,13 +70,18 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
             input: CallInput::Bytes(decoded.data),
             return_memory_offset: 0..0,
             gas_limit: child_gas_limit,
+            // The synthetic child runs without an EIP-8037 reservoir; the intercepted
+            // frame keeps its own and gets it back on completion.
+            reservoir: 0,
             bytecode_address: decoded.target,
-            known_bytecode: None,
+            // Placeholder: the Arc EVM fills in the target's code after its metered load.
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: decoded.target,
             caller: decoded.sender,
             value: CallValue::Transfer(U256::ZERO),
             scheme: CallScheme::Call,
             is_static: false,
+            charged_new_account_state_gas: false,
         },
         overhead,
     ))
@@ -138,13 +145,15 @@ mod tests {
             input: CallInput::Bytes(input.into()),
             return_memory_offset: 0..0,
             gas_limit,
+            reservoir: 0,
             bytecode_address: CALL_FROM_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: CALL_FROM_ADDRESS,
             caller: CALLER,
             value: CallValue::Transfer(U256::ZERO),
             scheme: CallScheme::Call,
             is_static: false,
+            charged_new_account_state_gas: false,
         }
     }
 
@@ -183,7 +192,11 @@ mod tests {
         assert_eq!(init.child_inputs.bytecode_address, TARGET);
         assert_eq!(init.child_inputs.gas_limit, available - available / 64);
         assert_eq!(init.child_inputs.input, CallInput::Bytes(data.into()));
-        assert_eq!(init.child_inputs.known_bytecode, None);
+        assert_eq!(init.child_inputs.reservoir, 0);
+        assert_eq!(
+            init.child_inputs.known_bytecode,
+            (KECCAK_EMPTY, Bytecode::default())
+        );
     }
 
     #[test]

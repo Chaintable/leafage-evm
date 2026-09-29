@@ -1087,6 +1087,7 @@ where
                 index: Some(tx_index),
                 block_hash: Some(block.header.hash),
                 block_number: Some(block.header.number),
+                block_timestamp: Some(block.header.timestamp),
                 base_fee: block.header.base_fee_per_gas,
             };
             tx_index += 1;
@@ -1248,7 +1249,7 @@ where
         };
 
         highest_gas_limit = tx.gas_limit();
-        let mut gas_used = res.gas_used();
+        let mut gas_used = res.tx_gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
 
         let optimistic_gas_limit = (gas_used + gas_refund + CALL_STIPEND_GAS) * 64 / 63;
@@ -1259,7 +1260,7 @@ where
                 .inner
                 .transact_for_estimation(&block_env, &memory_db, tx.clone())
                 .map_err(|e| e.to_rpc_error())?;
-            gas_used = res.gas_used();
+            gas_used = res.tx_gas_used();
             update_estimated_gas_range(
                 &res,
                 optimistic_gas_limit,

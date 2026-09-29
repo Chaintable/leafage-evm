@@ -74,6 +74,8 @@ pub struct Command {
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
+    /// Mainnet-derived evm-types use the legacy revm 36 `SpecId` numbering
+    /// (e.g. 17 = Cancun, 18 = Prague, 19 = Osaka, 20 = Amsterdam).
     /// if not specified, the default spec_id is u8::MAX
     #[arg(long, default_value = "255")]
     spec_id: u8,
@@ -486,6 +488,53 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Re
         .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
 }
 
+/// Map a `--spec-id` in the legacy revm 36 `SpecId` numbering to the current `SpecId`.
+///
+/// revm 39 dropped FRONTIER_THAWING / DAO_FORK / CONSTANTINOPLE / MUIR_GLACIER /
+/// ARROW_GLACIER / GRAY_GLACIER and shifted the remaining discriminants. Deployed
+/// manifests still carry the old numbers, so the CLI keeps that numbering; removed
+/// forks map to the retained fork whose execution rules revm already applied to them.
+///
+/// CONSTANTINOPLE (7) has no equivalent: revm 36 enabled SHL/SHR/SAR/EXTCODEHASH there
+/// but gated CREATE2 on PETERSBURG, so it is rejected (use 8) instead of silently
+/// changing behavior.
+fn legacy_mainnet_spec(spec_id: u8) -> Option<MainnetSpecId> {
+    use MainnetSpecId::*;
+    Some(match spec_id {
+        0 | 1 => FRONTIER,
+        2 | 3 => HOMESTEAD,
+        4 => TANGERINE,
+        5 => SPURIOUS_DRAGON,
+        6 => BYZANTIUM,
+        8 => PETERSBURG,
+        9 | 10 => ISTANBUL,
+        11 => BERLIN,
+        12..=14 => LONDON,
+        15 => MERGE,
+        16 => SHANGHAI,
+        17 => CANCUN,
+        18 => PRAGUE,
+        19 => OSAKA,
+        20 => AMSTERDAM,
+        _ => return None,
+    })
+}
+
+/// Resolve `--spec-id` (legacy mainnet numbering) for evm-types whose spec is derived from
+/// [`MainnetSpecId`]; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
+fn resolve_mainnet_spec<T: From<MainnetSpecId>>(
+    spec_id: u8,
+    default: T,
+    type_label: &str,
+) -> Result<T> {
+    if spec_id == u8::MAX {
+        return Ok(default);
+    }
+    legacy_mainnet_spec(spec_id)
+        .map(T::from)
+        .ok_or_else(|| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
+}
+
 impl Command {
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
@@ -494,7 +543,7 @@ impl Command {
         let gas_cap = self.rpc_gas_cap;
         match evm_type.as_str() {
             "mainnet" => {
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "mainnet")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -528,7 +577,8 @@ impl Command {
             "arbitrum" => {
                 // RPC execution replaces this fallback with the target block's
                 // ArbOS-derived hardfork whenever Nitro header metadata is available.
-                let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
+                let spec =
+                    resolve_mainnet_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -546,7 +596,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::KARST);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -558,7 +608,7 @@ impl Command {
             "base" => {
                 // Base forked from the OP stack; execution is OP-equivalent
                 // (Beryl precompiles are layered on separately).
-                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
+                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::KARST));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -578,7 +628,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Bsc(chain_cfg))
             }
             "cosmos" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM.into());
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -595,7 +645,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Cosmos((chain_cfg, custom_evm_cfg)))
             }
             "iotex" => {
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "iotex")?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "iotex")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -607,7 +657,7 @@ impl Command {
             }
             "rsk" => {
                 // RSK's instruction set is Cancun minus the blob opcodes, see `RskHardfork`.
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::CANCUN, "rsk")?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::CANCUN, "rsk")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -652,7 +702,7 @@ impl Command {
             // token metadata, which leafage does not need. Both map to the same
             // MoonbeamHardfork executor.
             "moonbeam" | "moonriver" => {
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, &evm_type)?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, &evm_type)?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -663,7 +713,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Moonbeam(chain_cfg))
             }
             "mantlev2" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::KARST.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -686,7 +736,7 @@ impl Command {
             }
             "citrea" => {
                 let mut chain_cfg =
-                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
+                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::OSAKA));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -696,7 +746,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Citrea(chain_cfg))
             }
             "hemi" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(HemiHardfork::from(OpSpecId::OSAKA));
+                let mut chain_cfg = CfgEnv::new_with_spec(HemiHardfork::from(OpSpecId::KARST));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -1059,5 +1109,28 @@ mod tests {
             .await
             .expect_err("invalid metrics address should stop startup");
         assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
+    }
+
+    #[test]
+    fn legacy_spec_id_keeps_revm36_numbering() {
+        assert_eq!(legacy_mainnet_spec(1), Some(MainnetSpecId::FRONTIER));
+        assert_eq!(legacy_mainnet_spec(7), None);
+        assert_eq!(legacy_mainnet_spec(8), Some(MainnetSpecId::PETERSBURG));
+        assert_eq!(legacy_mainnet_spec(12), Some(MainnetSpecId::LONDON));
+        assert_eq!(legacy_mainnet_spec(14), Some(MainnetSpecId::LONDON));
+        assert_eq!(legacy_mainnet_spec(15), Some(MainnetSpecId::MERGE));
+        assert_eq!(legacy_mainnet_spec(17), Some(MainnetSpecId::CANCUN));
+        assert_eq!(legacy_mainnet_spec(18), Some(MainnetSpecId::PRAGUE));
+        assert_eq!(legacy_mainnet_spec(19), Some(MainnetSpecId::OSAKA));
+        assert_eq!(legacy_mainnet_spec(20), Some(MainnetSpecId::AMSTERDAM));
+        assert_eq!(legacy_mainnet_spec(21), None);
+        assert_eq!(
+            resolve_mainnet_spec(18, ArbitrumHardfork::Prague, "arbitrum").unwrap(),
+            ArbitrumHardfork::from(MainnetSpecId::PRAGUE)
+        );
+        assert_eq!(
+            resolve_mainnet_spec(u8::MAX, MainnetSpecId::OSAKA, "mainnet").unwrap(),
+            MainnetSpecId::OSAKA
+        );
     }
 }

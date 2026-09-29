@@ -261,7 +261,11 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 
@@ -300,7 +304,11 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             let is_blocked = status != UNBLOCKLISTED_STATUS;
 
             let output = is_blocked.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 
@@ -436,7 +444,11 @@ precompile!(run_native_coin_control, precompile_input, hardfork_flags; {
             )?;
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 });

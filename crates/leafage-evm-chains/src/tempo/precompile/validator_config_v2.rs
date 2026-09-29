@@ -32,7 +32,7 @@
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
 use ed25519_consensus::{Signature as Ed25519Signature, VerificationKey as Ed25519VerificationKey};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
@@ -1345,9 +1345,10 @@ impl ContractStorage for ValidatorConfigV2 {
 
 impl Precompile for ValidatorConfigV2 {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         // Pre-T2: behave like an empty contract (call succeeds, no execution).
         // V2 is not initialized until T2 activates. Without this check, leafage
@@ -1358,6 +1359,7 @@ impl Precompile for ValidatorConfigV2 {
             return Ok(PrecompileOutput::new(
                 self.storage.gas_used(),
                 Default::default(),
+                0,
             ));
         }
 

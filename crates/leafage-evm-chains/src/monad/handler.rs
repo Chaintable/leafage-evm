@@ -80,8 +80,9 @@ impl<DB: Database, INSP> Handler for MonadHandler<DB, INSP> {
         _evm: &mut Self::Evm,
         exec_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
         _eip7702_refund: i64,
-    ) {
+    ) -> Result<(), Self::Error> {
         exec_result.gas_mut().set_refund(0);
+        Ok(())
     }
 
     /// `compute_gas_refund == 0`: unused gas is not returned to the sender.

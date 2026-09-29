@@ -31,7 +31,9 @@
 /// The generated function takes `(PrecompileInput, ArcHardforkFlags)` and returns
 /// `Result<PrecompileOutput, PrecompileError>`. Arms that return
 /// `PrecompileErrorOrRevert::Revert(...)` are converted into an `Ok(PrecompileOutput)`
-/// carrying the revert payload; `PrecompileErrorOrRevert::Error(...)` becomes `Err`.
+/// carrying the revert payload, `PrecompileErrorOrRevert::OutOfGas` into an out-of-gas
+/// halt, and `PrecompileErrorOrRevert::Error(...)` (fatal) becomes `Err`. Every output
+/// hands the input's EIP-8037 reservoir back unchanged.
 /// If the calldata is shorter than 4 bytes or the selector is unknown, the macro
 /// charges `PRECOMPILE_EARLY_REVERT_GAS_PENALTY` and returns a revert.
 ///
@@ -61,7 +63,7 @@
 ///                 hardfork_flags,
 ///             )?;
 ///
-///             Ok(PrecompileOutput::new(gas_counter.used(), new_value.abi_encode().into()))
+///             Ok(PrecompileOutput::new(gas_counter.used(), new_value.abi_encode().into(), 0))
 ///         })()
 ///     },
 ///     ICounter::getCountCall => |_input| {
@@ -77,7 +79,7 @@
 ///                 hardfork_flags,
 ///             )?;
 ///
-///             Ok(PrecompileOutput::new(gas_counter.used(), output))
+///             Ok(PrecompileOutput::new(gas_counter.used(), output, 0))
 ///         })()
 ///     },
 /// });
@@ -102,11 +104,12 @@ macro_rules! precompile {
             $hardfork_flags: crate::arc::ArcHardforkFlags,
         ) -> Result<revm::precompile::PrecompileOutput, revm::precompile::PrecompileError> {
             let input_bytes = $precompile_input.data;
+            let reservoir = $precompile_input.reservoir;
             let gas_counter = revm::interpreter::Gas::new($precompile_input.gas);
 
             if input_bytes.len() < 4 {
                 return $crate::arc::precompile::helpers::PrecompileErrorOrRevert::new_reverted_with_penalty(
-                    gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Input too short").into();
+                    gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Input too short").into_result(reservoir);
             }
 
             let selector: [u8; 4] = input_bytes[0..4].try_into().unwrap();
@@ -120,13 +123,16 @@ macro_rules! precompile {
                 ),*
                 _ => {
                     return $crate::arc::precompile::helpers::PrecompileErrorOrRevert::new_reverted_with_penalty(
-                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Invalid selector").into();
+                        gas_counter, PRECOMPILE_EARLY_REVERT_GAS_PENALTY, "Invalid selector").into_result(reservoir);
                 },
             };
 
             match result {
-                Ok(output) => Ok(output),
-                Err(err_or_revert) => err_or_revert.into(),
+                Ok(mut output) => {
+                    output.reservoir = reservoir;
+                    Ok(output)
+                }
+                Err(err_or_revert) => err_or_revert.into_result(reservoir),
             }
         }
     };

@@ -37,7 +37,7 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 use std::sync::LazyLock;
 
 use super::error::{Result, TempoPrecompileError};
@@ -1799,14 +1799,15 @@ impl TIP20Call {
 
 impl Precompile for TIP20Token {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         // Ensure that the token is initialized (has bytecode)
         if !self.is_initialized().unwrap_or(false) {
             return TempoPrecompileError::Revert(ITIP20::Uninitialized {}.abi_encode().into())
-                .into_precompile_result(self.storage.gas_used());
+                .into_precompile_result(self.storage.gas_used(), 0);
         }
 
         dispatch_call(calldata, TIP20Call::decode, |call| match call {

@@ -2,8 +2,8 @@ use super::abi::IArbStatistics;
 use super::state::ArbStorage;
 use super::util::{dispatch, finish_call};
 use super::{ArbPrecompileInput, ArbitrumContext};
+use crate::arbitrum::precompile::result::PrecompileResult;
 use alloy::primitives::U256;
-use revm::precompile::PrecompileResult;
 use revm::Database;
 
 pub(super) struct ArbStatistics;

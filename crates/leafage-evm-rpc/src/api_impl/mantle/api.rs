@@ -19,16 +19,15 @@ type MantleApiImpl<DB> = ApiImpl<DB, MantleHardfork, NoneEvmCustomConfig>;
 
 /// Scales all `ResultGas` fields by `token_ratio` to convert from EVM-gas to MNT-gas.
 ///
-/// All fields (including `floor_gas` and `intrinsic_gas`) must be scaled because
+/// All fields (including `floor_gas` and `state_gas_spent`) must be scaled because
 /// they are in the canonical EVM-gas dimension and the output is in MNT-gas (= EVM-gas * ratio).
-/// Equivalence: `scaled.used() == unscaled.used() * ratio` (same as revm 33 `gas_used * ratio`).
+/// Equivalence: `scaled.tx_gas_used() == unscaled.tx_gas_used() * ratio` (same as revm 33 `gas_used * ratio`).
 fn scale_result_gas(gas: ResultGas, ratio: u64) -> ResultGas {
-    ResultGas::new(
-        gas.limit() * ratio,
-        gas.spent() * ratio,
+    ResultGas::new_with_state_gas(
+        gas.total_gas_spent() * ratio,
         gas.inner_refunded() * ratio,
         gas.floor_gas() * ratio,
-        gas.intrinsic_gas() * ratio,
+        gas.state_gas_spent_final() * ratio,
     )
 }
 
@@ -191,37 +190,43 @@ mod tests {
     use super::scale_result_gas;
     use revm::context::result::ResultGas;
 
+    fn gas(total_gas_spent: u64, refunded: u64, floor_gas: u64) -> ResultGas {
+        ResultGas::default()
+            .with_total_gas_spent(total_gas_spent)
+            .with_refunded(refunded)
+            .with_floor_gas(floor_gas)
+    }
+
     #[test]
     fn test_ratio_scaling_equals_used_times_ratio() {
-        // Verify: scaled.used() == unscaled.used() * ratio (revm 33 equivalence)
+        // Verify: scaled.tx_gas_used() == unscaled.tx_gas_used() * ratio (revm 33 equivalence)
         let ratio = 3u64;
 
         // Case 1: normal execution (spent > floor)
-        let evm_gas = ResultGas::new(50000, 40000, 2000, 30000, 21000);
-        assert_eq!(evm_gas.used(), 38000);
+        let evm_gas = gas(40000, 2000, 30000);
+        assert_eq!(evm_gas.tx_gas_used(), 38000);
         let scaled = scale_result_gas(evm_gas, ratio);
-        assert_eq!(scaled.used(), 38000 * ratio, "normal: scaled.used() == unscaled.used() * ratio");
+        assert_eq!(scaled.tx_gas_used(), 38000 * ratio, "normal: scaled.tx_gas_used() == unscaled.tx_gas_used() * ratio");
 
         // Case 2: floor kicks in (spent - refund < floor)
-        let evm_gas = ResultGas::new(50000, 25000, 0, 30000, 21000);
-        assert_eq!(evm_gas.used(), 30000);
+        let evm_gas = gas(25000, 0, 30000);
+        assert_eq!(evm_gas.tx_gas_used(), 30000);
         let scaled = scale_result_gas(evm_gas, ratio);
-        assert_eq!(scaled.used(), 30000 * ratio, "floor: scaled.used() == floor * ratio");
+        assert_eq!(scaled.tx_gas_used(), 30000 * ratio, "floor: scaled.tx_gas_used() == floor * ratio");
 
         // Case 3: heavy refund
-        let evm_gas = ResultGas::new(50000, 45000, 20000, 30000, 21000);
-        assert_eq!(evm_gas.used(), 30000);
+        let evm_gas = gas(45000, 20000, 30000);
+        assert_eq!(evm_gas.tx_gas_used(), 30000);
         let scaled = scale_result_gas(evm_gas, ratio);
-        assert_eq!(scaled.used(), 30000 * ratio, "refund+floor: scaled.used() == floor * ratio");
+        assert_eq!(scaled.tx_gas_used(), 30000 * ratio, "refund+floor: scaled.tx_gas_used() == floor * ratio");
     }
 
     #[test]
     fn test_ratio_1_is_identity() {
-        let evm_gas = ResultGas::new(100000, 60000, 5000, 30000, 21000);
+        let evm_gas = gas(60000, 5000, 30000);
         let scaled = scale_result_gas(evm_gas, 1);
-        assert_eq!(scaled.used(), evm_gas.used());
-        assert_eq!(scaled.limit(), evm_gas.limit());
-        assert_eq!(scaled.spent(), evm_gas.spent());
+        assert_eq!(scaled.tx_gas_used(), evm_gas.tx_gas_used());
+        assert_eq!(scaled.total_gas_spent(), evm_gas.total_gas_spent());
     }
 
     #[test]
@@ -229,32 +234,30 @@ mod tests {
         // Proves: NOT scaling floor_gas under-charges the user.
         // ratio=2, execution cheap, floor kicks in.
         let ratio = 2u64;
-        let evm_gas = ResultGas::new(50000, 10000, 0, 30000, 21000);
+        let evm_gas = gas(10000, 0, 30000);
         // EVM: used = max(10000, 30000) = 30000
         // MNT: should pay 30000 * 2 = 60000
 
         // Production function (scales floor):
         let scaled = scale_result_gas(evm_gas, ratio);
-        assert_eq!(scaled.used(), 60000, "production: floor*ratio=60000");
+        assert_eq!(scaled.tx_gas_used(), 60000, "production: floor*ratio=60000");
 
         // Hypothetical bug (don't scale floor):
-        let wrong = ResultGas::new(
-            evm_gas.limit() * ratio,
-            evm_gas.spent() * ratio,
+        let wrong = gas(
+            evm_gas.total_gas_spent() * ratio,
             evm_gas.inner_refunded() * ratio,
-            evm_gas.floor_gas(),      // BUG: not scaled
-            evm_gas.intrinsic_gas(),
+            evm_gas.floor_gas(), // BUG: not scaled
         );
-        assert_eq!(wrong.used(), 30000, "bug: unscaled floor=30000, under-charges");
-        assert_ne!(wrong.used(), scaled.used(), "bug gives different result than production");
+        assert_eq!(wrong.tx_gas_used(), 30000, "bug: unscaled floor=30000, under-charges");
+        assert_ne!(wrong.tx_gas_used(), scaled.tx_gas_used(), "bug gives different result than production");
     }
 
     #[test]
     fn test_floor_zero_scaling_irrelevant() {
         // When floor=0 (EIP-7623 not active), scaling doesn't matter.
         let ratio = 5u64;
-        let evm_gas = ResultGas::new(100000, 50000, 3000, 0, 21000);
+        let evm_gas = gas(50000, 3000, 0);
         let scaled = scale_result_gas(evm_gas, ratio);
-        assert_eq!(scaled.used(), (50000 - 3000) * ratio);
+        assert_eq!(scaled.tx_gas_used(), (50000 - 3000) * ratio);
     }
 }

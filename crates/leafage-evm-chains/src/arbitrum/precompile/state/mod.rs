@@ -20,7 +20,7 @@ use alloy::primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable, Header};
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::{Block, journaled_state::account::JournaledAccountTr};
-use revm::precompile::PrecompileError;
+use crate::arbitrum::precompile::result::PrecompileError;
 use revm::primitives::KECCAK_EMPTY;
 use revm::{Database, DatabaseRef};
 

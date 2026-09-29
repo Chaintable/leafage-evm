@@ -15,7 +15,9 @@ use revm::context_interface::context::ContextError;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::StackTr;
-use revm::interpreter::{Instruction, InstructionContext, push};
+use revm::interpreter::{
+    Instruction, InstructionContext, InstructionExecResult, InstructionResult, push,
+};
 use revm::primitives::U256;
 use revm::{Database, DatabaseRef};
 
@@ -32,8 +34,8 @@ where
     DB: Database + DatabaseRef,
 {
     let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
-    instructions.insert_instruction(opcode::GASPRICE, Instruction::new(gasprice, 2));
-    instructions.insert_instruction(opcode::BLOCKHASH, Instruction::new(blockhash, 20));
+    instructions.insert_instruction(opcode::GASPRICE, Instruction::new(gasprice), 2);
+    instructions.insert_instruction(opcode::BLOCKHASH, Instruction::new(blockhash), 20);
     super::multigas::install_instruction_metering(&mut instructions);
     instructions
 }
@@ -76,7 +78,9 @@ where
 /// collected. Below ArbOS 3 it returns the message's gas price, which nitro's
 /// state transition has already clamped to the basefee (tips are always
 /// dropped below ArbOS 9).
-fn gasprice<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn gasprice<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
@@ -87,7 +91,7 @@ where
             Ok(collect_tips) => collect_tips,
             Err(error) => {
                 *host.error() = Err(ContextError::Db(error));
-                return context.interpreter.halt_fatal();
+                return Err(InstructionResult::FatalExternalError);
             }
         };
         if collect_tips {
@@ -99,32 +103,36 @@ where
         nitro_message_gas_price(host.tx(), basefee).min(basefee)
     };
     push!(context.interpreter, U256::from(price));
+    Ok(())
 }
 
 /// Nitro `opBlockhash`: the 256-block window is anchored at the ArbOS-recorded
 /// L1 block number and hashes come from ArbOS `Blockhashes` state, not the L2
 /// header chain.
-fn blockhash<DB>(context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>)
+fn blockhash<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
 where
     DB: Database + DatabaseRef,
 {
     let Some(([], number)) = StackTr::popn_top(&mut context.interpreter.stack) else {
-        return context.interpreter.halt_underflow();
+        return Err(InstructionResult::StackUnderflow);
     };
 
     let Some(upper) = context.host.db().blockhashes_l1_block_number() else {
-        return context.interpreter.halt_fatal();
+        return Err(InstructionResult::FatalExternalError);
     };
     let requested = number.saturating_to::<u64>();
     let lower = upper.saturating_sub(256);
     if requested >= lower && requested < upper {
         let Some(hash) = context.host.db().l1_block_hash(requested) else {
-            return context.interpreter.halt_fatal();
+            return Err(InstructionResult::FatalExternalError);
         };
         *number = U256::from_be_bytes(hash.0);
     } else {
         *number = U256::ZERO;
     }
+    Ok(())
 }
 
 #[cfg(test)]

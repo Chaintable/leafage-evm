@@ -84,9 +84,19 @@ where
         &mut self,
         handler: &mut CitreaHandler<DB, INSP>,
     ) -> Result<(ExecutionResult, usize), EVMError<DB::Error>> {
+        // Mirrors `Handler::run_without_catch_error`.
         let init_and_floor_gas = handler.validate(self)?;
-        let eip7702_refund = handler.pre_execution(self)? as i64;
-        let mut exec_result = handler.execution(self, &init_and_floor_gas)?;
+        let mut gas = handler.tx_gas(self, &init_and_floor_gas);
+        let pre_execution = handler.pre_execution(self, &mut gas)?;
+        let eip7702_refund = pre_execution.map(|pe| pe.eip7702_refund).unwrap_or(0) as i64;
+        let mut exec_result = None;
+        if let Some(pre_execution) = pre_execution {
+            exec_result = handler.execution(self, pre_execution.checkpoint, &mut gas)?;
+        }
+        let mut exec_result = match exec_result {
+            Some(exec_result) => exec_result,
+            None => handler.runtime_oog_result(self, &init_and_floor_gas, &mut gas)?,
+        };
         let result_gas =
             handler.post_execution(self, &mut exec_result, init_and_floor_gas, eip7702_refund)?;
 

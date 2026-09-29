@@ -103,7 +103,11 @@ precompile!(run_pq, precompile_input, hardfork_flags; {
 
             let is_valid = verifying_key.verify(args.message.as_ref(), &signature).is_ok();
 
-            Ok(PrecompileOutput::new(gas_counter.used(), is_valid.abi_encode().into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                is_valid.abi_encode().into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 });

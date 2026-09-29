@@ -2,8 +2,8 @@ use super::abi::IArbFunctionTable;
 use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call};
 use super::{ArbPrecompileInput, ArbitrumContext};
+use crate::arbitrum::precompile::result::PrecompileResult;
 use alloy::primitives::U256;
-use revm::precompile::PrecompileResult;
 use revm::Database;
 
 pub(super) struct ArbFunctionTable;
@@ -57,13 +57,13 @@ mod tests {
     use super::*;
     use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
+    use crate::arbitrum::precompile::result::PrecompileOutput;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::primitives::{Address, U256};
     use alloy::sol_types::SolCall;
     use leafage_evm_types::{BlockEnv, CfgEnv};
     use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
-    use revm::precompile::PrecompileOutput;
     use revm::{Context, MainContext};
 
     const TWO_WORD_COPY_GAS: u64 = 6;

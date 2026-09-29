@@ -4,9 +4,9 @@ use super::util::{dispatch, empty_revert, finish_call, log_gas};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_FILTERED_TRANSACTIONS_MANAGER_ADDRESS};
 use crate::arbitrum::arbos_state;
 use crate::arbitrum::evm::ArbResourceKind;
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256};
 use revm::context::{ContextTr, JournalTr};
-use revm::precompile::{PrecompileError, PrecompileResult};
 use revm::Database;
 
 pub(super) struct ArbFilteredTransactionsManager;
@@ -148,6 +148,7 @@ mod tests {
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
     use leafage_evm_types::{BlockEnv, CfgEnv};
+    use revm::bytecode::Bytecode;
     use revm::context::JournalTr;
     use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
@@ -155,6 +156,7 @@ mod tests {
     use revm::interpreter::{
         CallInput, CallInputs, CallScheme, CallValue, InstructionResult, InterpreterResult,
     };
+    use revm::primitives::KECCAK_EMPTY;
     use revm::{Context, MainContext};
 
     const WRAPPER_ACCESS_GAS: u64 = STORAGE_READ_GAS * 2;
@@ -242,12 +244,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 1_000_000,
             bytecode_address: ARB_FILTERED_TRANSACTIONS_MANAGER_ADDRESS,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address,
             caller,
             value: CallValue::Transfer(value),
             scheme,
             is_static,
+            charged_new_account_state_gas: false,
         };
 
         PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
@@ -271,7 +275,7 @@ mod tests {
         let result = provider_call(&input, filterer, &mut context);
 
         assert_eq!(result.result, InstructionResult::Return);
-        assert_eq!(result.gas.spent(), 0);
+        assert_eq!(result.gas.total_gas_spent(), 0);
         assert!(result.output.is_empty());
         assert!(is_filtered(&mut context, tx_hash));
 
@@ -298,7 +302,7 @@ mod tests {
         let result = provider_call(&input, filterer, &mut context);
 
         assert_eq!(result.result, InstructionResult::Return);
-        assert_eq!(result.gas.spent(), 0);
+        assert_eq!(result.gas.total_gas_spent(), 0);
         assert!(!is_filtered(&mut context, tx_hash));
 
         let logs = context.journal_mut().take_logs();
@@ -327,7 +331,7 @@ mod tests {
 
         assert_eq!(result.result, InstructionResult::Return);
         assert!(ret);
-        assert_eq!(result.gas.spent(), WRAPPER_ACCESS_GAS);
+        assert_eq!(result.gas.total_gas_spent(), WRAPPER_ACCESS_GAS);
     }
 
     #[test]
@@ -341,7 +345,7 @@ mod tests {
         let result = provider_call(&input, caller, &mut context);
 
         assert_eq!(result.result, InstructionResult::Revert);
-        assert_eq!(result.gas.spent(), WRAPPER_ACCESS_GAS);
+        assert_eq!(result.gas.total_gas_spent(), WRAPPER_ACCESS_GAS);
         assert!(!is_filtered(&mut context, tx_hash));
         assert!(context.journal_mut().take_logs().is_empty());
     }
@@ -365,13 +369,13 @@ mod tests {
             ARB_FILTERED_TRANSACTIONS_MANAGER_ADDRESS,
         );
         assert_eq!(static_result.result, InstructionResult::Revert);
-        assert_eq!(static_result.gas.spent(), 0);
+        assert_eq!(static_result.gas.total_gas_spent(), 0);
         assert!(!is_filtered(&mut context, tx_hash));
 
         let unknown_selector = [0xff, 0xff, 0xff, 0xff];
         let unknown_result = provider_call(&unknown_selector, filterer, &mut context);
         assert_eq!(unknown_result.result, InstructionResult::Revert);
-        assert_eq!(unknown_result.gas.spent(), 0);
+        assert_eq!(unknown_result.gas.total_gas_spent(), 0);
         assert!(context.journal_mut().take_logs().is_empty());
     }
 
@@ -394,7 +398,7 @@ mod tests {
         );
 
         assert_eq!(result.result, InstructionResult::Revert);
-        assert_eq!(result.gas.spent(), WRAPPER_ACCESS_GAS);
+        assert_eq!(result.gas.total_gas_spent(), WRAPPER_ACCESS_GAS);
         assert!(!is_filtered(&mut context, tx_hash));
     }
 

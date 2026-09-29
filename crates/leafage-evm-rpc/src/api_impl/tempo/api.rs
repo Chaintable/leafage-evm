@@ -284,20 +284,18 @@ where
                 .map(|acc| !acc.is_empty_code_hash())
                 .unwrap_or(false);
             if !has_code {
-                use revm::state::{Account, AccountInfo, AccountStatus};
+                use revm::state::{Account, AccountInfo};
                 use revm::bytecode::Bytecode;
                 let code = Bytecode::new_legacy(alloy::primitives::Bytes::from_static(&[0xef]));
-                let mut acc = Account {
-                    info: AccountInfo {
+                let acc = Account::default()
+                    .with_info(AccountInfo {
                         code_hash: code.hash_slow(),
                         code: Some(code),
                         nonce: 1,
                         ..Default::default()
-                    },
-                    status: AccountStatus::Touched,
-                    ..Default::default()
-                };
-                acc.mark_created();
+                    })
+                    .with_touched_mark()
+                    .with_created_mark();
                 let mut changes = revm::state::EvmState::default();
                 changes.insert(VALIDATOR_CONFIG_V2_ADDRESS, acc);
                 state.commit(changes);

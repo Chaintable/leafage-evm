@@ -3,47 +3,57 @@
 use leafage_evm_types::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+    eth_precompile_fn, u64_to_address, EthPrecompileOutput, EthPrecompileResult, Precompile,
+    PrecompileHalt, PrecompileId,
 };
 use std::borrow::Cow;
 use tendermint::lite::light_client;
+
+eth_precompile_fn!(
+    tendermint_header_validation_run_precompile,
+    tendermint_header_validation_run
+);
+eth_precompile_fn!(
+    tendermint_header_validation_run_nano_precompile,
+    tendermint_header_validation_run_nano
+);
 
 /// Tendermint precompile for BSC.
 pub(crate) const TENDERMINT_HEADER_VALIDATION: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_TENDERMINT_HEADER_VALIDATION")),
     u64_to_address(100),
-    tendermint_header_validation_run,
+    tendermint_header_validation_run_precompile,
 );
 
 /// Tendermint precompile for BSC after Nano hardfork.
 pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_TENDERMINT_HEADER_VALIDATION_NANO")),
     u64_to_address(100),
-    tendermint_header_validation_run_nano,
+    tendermint_header_validation_run_nano_precompile,
 );
 
 /// Run the Tendermint header validation precompile after Nano hardfork.
-fn tendermint_header_validation_run_nano(input: &[u8], _gas_limit: u64) -> PrecompileResult {
-    Err(PrecompileError::other("suspended"))
+fn tendermint_header_validation_run_nano(input: &[u8], _gas_limit: u64) -> EthPrecompileResult {
+    Err(PrecompileHalt::other("suspended"))
 }
 
 /// Run the Tendermint header validation precompile.
-fn tendermint_header_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn tendermint_header_validation_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     const TENDERMINT_HEADER_VALIDATION_BASE: u64 = 3_000;
 
     if TENDERMINT_HEADER_VALIDATION_BASE > gas_limit {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
 
     let mut output = vec![0u8, 0, 0];
     let mut bytes = BytesRef::Flexible(&mut output);
     let res = light_client::TmHeaderVerifier::execute(input, &mut bytes);
     match res {
-        Ok(()) => Ok(PrecompileOutput::new(
+        Ok(()) => Ok(EthPrecompileOutput::new(
             TENDERMINT_HEADER_VALIDATION_BASE,
             Bytes::from(output),
         )),
-        Err(str) => Err(PrecompileError::other(str)),
+        Err(str) => Err(PrecompileHalt::other(str)),
     }
 }
 

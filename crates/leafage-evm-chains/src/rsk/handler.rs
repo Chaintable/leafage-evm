@@ -45,10 +45,16 @@ impl<DB: Database, INSP> Handler for RskHandler<DB, INSP> {
 
     /// `TransactionExecutor.refundGas`: refunds are capped at half of the gas
     /// used. RSK has no EIP-3529, which lowered the cap to a fifth.
-    fn refund(&self, _evm: &mut Self::Evm, exec_result: &mut FrameResult, eip7702_refund: i64) {
+    fn refund(
+        &self,
+        _evm: &mut Self::Evm,
+        exec_result: &mut FrameResult,
+        eip7702_refund: i64,
+    ) -> Result<(), Self::Error> {
         let gas = exec_result.gas_mut();
         gas.record_refund(eip7702_refund);
-        gas.set_final_refund(false);
+        gas.set_final_refund(2);
+        Ok(())
     }
 }
 

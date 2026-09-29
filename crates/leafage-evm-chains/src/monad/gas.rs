@@ -54,7 +54,7 @@ pub(crate) fn monad_gas_params(hardfork: MonadHardfork) -> GasParams {
         (GasId::sstore_set_refund(), 0),
         (GasId::sstore_reset_refund(), 0),
         (GasId::selfdestruct_refund(), 0),
-        (GasId::tx_eip7702_auth_refund(), 0),
+        (GasId::tx_eip7702_regular_refund(), 0),
     ]);
     if hardfork.is_pricing_v1_enabled() {
         gas_params.override_gas([

@@ -31,7 +31,8 @@ use revm::interpreter::instructions::{contract, control, host, memory, system};
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::{InputsTr, MemoryTr, RuntimeFlag, StackTr};
 use revm::interpreter::{
-    Host, Instruction, InstructionContext, InstructionResult, Interpreter, InterpreterTypes,
+    Host, Instruction, InstructionContext, InstructionExecResult, InstructionResult, Interpreter,
+    InterpreterTypes,
 };
 use revm::primitives::U256;
 
@@ -53,10 +54,10 @@ pub(crate) fn monad_instructions<DB: revm::database::Database>(
 fn replace<DB: revm::database::Database>(
     instructions: &mut EthInstructions<EthInterpreter, MonadContext<DB>>,
     opcode: u8,
-    f: fn(InstructionContext<'_, MonadContext<DB>, EthInterpreter>),
+    f: fn(InstructionContext<'_, MonadContext<DB>, EthInterpreter>) -> InstructionExecResult,
 ) {
-    let static_gas = instructions.instruction_table[opcode as usize].static_gas();
-    instructions.insert_instruction(opcode, Instruction::new(f, static_gas));
+    let static_gas = instructions.gas_table()[opcode as usize];
+    instructions.insert_instruction(opcode, Instruction::new(f), static_gas);
 }
 
 fn install_create_guard<DB: revm::database::Database>(
@@ -117,25 +118,24 @@ fn peek<WIRE: InterpreterTypes>(interpreter: &Interpreter<WIRE>, from_top: usize
         .map(|index| data[index])
 }
 
-/// `Context::expand_memory` under MIP-3. Returns `false` after halting the
-/// interpreter. When it returns `true` the memory already covers
-/// `offset + len` and the expansion cost has been charged, so the stock revm
-/// instruction that runs afterwards will not charge again.
+/// `Context::expand_memory` under MIP-3. Returns the halt reason on failure.
+/// When it returns `Ok` the memory already covers `offset + len` and the
+/// expansion cost has been charged, so the stock revm instruction that runs
+/// afterwards will not charge again.
 fn mip3_expand<WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     offset: U256,
     len: U256,
-) -> bool {
+) -> InstructionExecResult {
     if len.is_zero() {
-        return true;
+        return Ok(());
     }
     let (Ok(len), Ok(offset)) = (usize::try_from(len), usize::try_from(offset)) else {
-        interpreter.halt(InstructionResult::InvalidOperandOOG);
-        return false;
+        return Err(InstructionResult::InvalidOperandOOG);
     };
     let new_words = num_words(offset.saturating_add(len));
     if new_words <= interpreter.gas.memory().words_num {
-        return true;
+        return Ok(());
     }
     let new_size = new_words.saturating_mul(32);
     let total_size = interpreter
@@ -143,8 +143,7 @@ fn mip3_expand<WIRE: InterpreterTypes>(
         .local_memory_offset()
         .saturating_add(new_size);
     if total_size > MIP3_MEMORY_LIMIT {
-        interpreter.halt(InstructionResult::MemoryLimitOOG);
-        return false;
+        return Err(InstructionResult::MemoryLimitOOG);
     }
     let new_cost = mip3_memory_cost(new_words);
     let expansion_cost = interpreter
@@ -152,12 +151,11 @@ fn mip3_expand<WIRE: InterpreterTypes>(
         .memory_mut()
         .set_words_num(new_words, new_cost)
         .unwrap_or(0);
-    if !interpreter.gas.record_cost(expansion_cost) {
-        interpreter.halt(InstructionResult::MemoryOOG);
-        return false;
+    if !interpreter.gas.record_regular_cost(expansion_cost) {
+        return Err(InstructionResult::MemoryOOG);
     }
     interpreter.memory.resize(new_size);
-    true
+    Ok(())
 }
 
 /// Expand for the `(offset, len)` pair found at the given stack depths.
@@ -165,13 +163,12 @@ fn expand_range<WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     offset_from_top: usize,
     len_from_top: usize,
-) -> bool {
+) -> InstructionExecResult {
     let (Some(offset), Some(len)) = (
         peek(interpreter, offset_from_top),
         peek(interpreter, len_from_top),
     ) else {
-        interpreter.halt_underflow();
-        return false;
+        return Err(InstructionResult::StackUnderflow);
     };
     mip3_expand(interpreter, offset, len)
 }
@@ -181,10 +178,9 @@ fn expand_fixed<WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     offset_from_top: usize,
     len: u64,
-) -> bool {
+) -> InstructionExecResult {
     let Some(offset) = peek(interpreter, offset_from_top) else {
-        interpreter.halt_underflow();
-        return false;
+        return Err(InstructionResult::StackUnderflow);
     };
     mip3_expand(interpreter, offset, U256::from(len))
 }
@@ -193,12 +189,10 @@ macro_rules! mip3_instruction {
     ($name:ident, $inner:expr, |$interpreter:ident| $expand:expr) => {
         fn $name<WIRE: InterpreterTypes, H: Host + ?Sized>(
             context: InstructionContext<'_, H, WIRE>,
-        ) {
+        ) -> InstructionExecResult {
             {
                 let $interpreter: &mut Interpreter<WIRE> = context.interpreter;
-                if !$expand {
-                    return;
-                }
+                $expand?;
             }
             $inner(context)
         }
@@ -227,26 +221,26 @@ mip3_instruction!(mip3_extcodecopy, host::extcodecopy, |i| expand_range(
     i, 1, 3
 ));
 // [gas, to, value, in_offset, in_len, out_offset, out_len]
-mip3_instruction!(mip3_call, contract::call, |i| expand_range(i, 3, 4)
-    && expand_range(i, 5, 6));
-mip3_instruction!(mip3_call_code, contract::call_code, |i| expand_range(
-    i, 3, 4
-) && expand_range(
-    i, 5, 6
-));
+mip3_instruction!(mip3_call, contract::call::<CALL, _, _>, |i| {
+    expand_range(i, 3, 4).and_then(|()| expand_range(i, 5, 6))
+});
+mip3_instruction!(mip3_call_code, contract::call::<CALLCODE, _, _>, |i| {
+    expand_range(i, 3, 4).and_then(|()| expand_range(i, 5, 6))
+});
 // [gas, to, in_offset, in_len, out_offset, out_len]
 mip3_instruction!(
     mip3_delegate_call,
-    contract::delegate_call,
-    |i| expand_range(i, 2, 3) && expand_range(i, 4, 5)
+    contract::call::<DELEGATECALL, _, _>,
+    |i| { expand_range(i, 2, 3).and_then(|()| expand_range(i, 4, 5)) }
 );
-mip3_instruction!(mip3_static_call, contract::static_call, |i| expand_range(
-    i, 2, 3
-)
-    && expand_range(i, 4, 5));
+mip3_instruction!(mip3_static_call, contract::call::<STATICCALL, _, _>, |i| {
+    expand_range(i, 2, 3).and_then(|()| expand_range(i, 4, 5))
+});
 
 // [dst, src, len]
-fn mip3_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+fn mip3_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) -> InstructionExecResult {
     {
         let interpreter: &mut Interpreter<WIRE> = context.interpreter;
         let (Some(dst), Some(src), Some(len)) = (
@@ -254,12 +248,9 @@ fn mip3_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
             peek(interpreter, 1),
             peek(interpreter, 2),
         ) else {
-            interpreter.halt_underflow();
-            return;
+            return Err(InstructionResult::StackUnderflow);
         };
-        if !mip3_expand(interpreter, dst.max(src), len) {
-            return;
-        }
+        mip3_expand(interpreter, dst.max(src), len)?;
     }
     memory::mcopy(context)
 }
@@ -267,10 +258,8 @@ fn mip3_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
 // [offset, len, topics...]
 fn mip3_log<const N: usize, WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
-) {
-    if !expand_range(context.interpreter, 0, 1) {
-        return;
-    }
+) -> InstructionExecResult {
+    expand_range(context.interpreter, 0, 1)?;
     host::log::<N, H>(context)
 }
 
@@ -288,42 +277,32 @@ fn is_eip7702_delegation(code: &[u8]) -> bool {
 // [value, offset, len(, salt)]
 fn create_guarded<const IS_CREATE2: bool, const MIP3: bool, DB: revm::database::Database>(
     context: InstructionContext<'_, MonadContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     let hardfork = *context.host.cfg().spec();
     if context.interpreter.runtime_flag.is_static() {
-        context
-            .interpreter
-            .halt(InstructionResult::CallNotAllowedInsideStatic);
-        return;
+        return Err(InstructionResult::CallNotAllowedInsideStatic);
     }
     if hardfork.is_delegated_create_blocked() {
         let target = context.interpreter.input.target_address();
         match context.host.load_account_code(target) {
             Some(code) if is_eip7702_delegation(&code.data) => {
-                context.interpreter.halt(InstructionResult::NotActivated);
-                return;
+                return Err(InstructionResult::NotActivated);
             }
             Some(_) => {}
-            None => {
-                context.interpreter.halt_fatal();
-                return;
-            }
+            None => return Err(InstructionResult::FatalExternalError),
         }
     }
     // `traits::max_initcode_size()` at the opcode level (48 KiB before
     // MONAD_FOUR) differs from the transaction level limit in `cfg`.
     if let Some(len) = peek(context.interpreter, 2) {
         if len > U256::from(hardfork.max_initcode_size()) {
-            context
-                .interpreter
-                .halt(InstructionResult::CreateInitCodeSizeLimit);
-            return;
+            return Err(InstructionResult::CreateInitCodeSizeLimit);
         }
     }
-    if MIP3 && !expand_range(context.interpreter, 1, 2) {
-        return;
+    if MIP3 {
+        expand_range(context.interpreter, 1, 2)?;
     }
-    contract::create::<EthInterpreter, IS_CREATE2, MonadContext<DB>>(context)
+    contract::create::<IS_CREATE2, EthInterpreter, MonadContext<DB>>(context)
 }
 
 // ---------------------------------------------------------------------------
@@ -332,41 +311,42 @@ fn create_guarded<const IS_CREATE2: bool, const MIP3: bool, DB: revm::database::
 
 /// `runtime::sload` with `mip_8_active`: the cold surcharge is decided by the
 /// page tracker, not by the slot access list.
-fn mip8_sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+fn mip8_sload<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) -> InstructionExecResult {
     let InstructionContext { interpreter, host } = context;
     let Some(([], index)) = interpreter.stack.popn_top::<0>() else {
-        interpreter.halt_underflow();
-        return;
+        return Err(InstructionResult::StackUnderflow);
     };
     let target = interpreter.input.target_address();
     if access_page(&mut HostPageStore(host), target, *index)
-        && !interpreter.gas.record_cost(COLD_STORAGE_ADDITIONAL_COST_V1)
+        && !interpreter
+            .gas
+            .record_regular_cost(COLD_STORAGE_ADDITIONAL_COST_V1)
     {
-        interpreter.halt_oog();
-        return;
+        return Err(InstructionResult::OutOfGas);
     }
-    let Some(storage) = host.sload(target, *index) else {
-        interpreter.halt_fatal();
-        return;
-    };
+    let storage = host
+        .sload(target, *index)
+        .ok_or(InstructionResult::FatalExternalError)?;
     *index = storage.data;
+    Ok(())
 }
 
 /// `runtime::sstore` with `mip_8_active`.
-fn mip8_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+fn mip8_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) -> InstructionExecResult {
     let InstructionContext { interpreter, host } = context;
     if interpreter.runtime_flag.is_static() {
-        interpreter.halt(InstructionResult::StateChangeDuringStaticCall);
-        return;
+        return Err(InstructionResult::StateChangeDuringStaticCall);
     }
     let Some([index, value]) = interpreter.stack.popn::<2>() else {
-        interpreter.halt_underflow();
-        return;
+        return Err(InstructionResult::StackUnderflow);
     };
     // EIP-2200 sentry, checked against the gas left before the base cost.
     if interpreter.gas.remaining() <= host.gas_params().call_stipend() {
-        interpreter.halt(InstructionResult::ReentrancySentryOOG);
-        return;
+        return Err(InstructionResult::ReentrancySentryOOG);
     }
     let target = interpreter.input.target_address();
 
@@ -374,10 +354,9 @@ fn mip8_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
     if access_page(&mut HostPageStore(host), target, index) {
         gas += COLD_STORAGE_ADDITIONAL_COST_V1;
     }
-    let Some(load) = host.sstore(target, index, value) else {
-        interpreter.halt_fatal();
-        return;
-    };
+    let load = host
+        .sstore(target, index, value)
+        .ok_or(InstructionResult::FatalExternalError)?;
     let status = storage_status(
         load.data.original_value,
         load.data.present_value,
@@ -391,9 +370,10 @@ fn mip8_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
     if grew_state {
         gas += MIP8_PAGE_GROWTH_COST;
     }
-    if !interpreter.gas.record_cost(gas) {
-        interpreter.halt_oog();
+    if !interpreter.gas.record_regular_cost(gas) {
+        return Err(InstructionResult::OutOfGas);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -431,13 +411,13 @@ mod tests {
             SSTORE,
         ] {
             assert_eq!(
-                monad.instruction_table[op as usize].static_gas(),
-                stock.instruction_table[op as usize].static_gas(),
+                monad.gas_table()[op as usize],
+                stock.gas_table()[op as usize],
                 "opcode {op:#x}"
             );
         }
-        assert_eq!(monad.instruction_table[SLOAD as usize].static_gas(), 100);
-        assert_eq!(monad.instruction_table[SSTORE as usize].static_gas(), 0);
+        assert_eq!(monad.gas_table()[SLOAD as usize], 100);
+        assert_eq!(monad.gas_table()[SSTORE as usize], 0);
     }
 
     #[test]

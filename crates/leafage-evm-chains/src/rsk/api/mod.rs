@@ -217,21 +217,24 @@ fn call_too_deep(frame_init: &FrameInit) -> Option<FrameResult> {
     if frame_init.depth <= MAX_CALL_DEPTH {
         return None;
     }
-    let result = |gas_limit| InterpreterResult {
+    // Mirrors revm's own depth check: the child's gas (and reservoir) goes back untouched.
+    let result = |gas_limit, reservoir| InterpreterResult {
         result: InstructionResult::CallTooDeep,
-        gas: Gas::new(gas_limit),
+        gas: Gas::new_with_regular_gas_and_reservoir(gas_limit, reservoir),
         output: Default::default(),
     };
     match &frame_init.frame_input {
         FrameInput::Call(inputs) => Some(FrameResult::Call(CallOutcome {
-            result: result(inputs.gas_limit),
+            result: result(inputs.gas_limit, inputs.reservoir),
             memory_offset: inputs.return_memory_offset.clone(),
             was_precompile_called: false,
             precompile_call_logs: Vec::new(),
+            charged_new_account_state_gas: inputs.charged_new_account_state_gas,
         })),
         FrameInput::Create(inputs) => Some(FrameResult::Create(CreateOutcome {
-            result: result(inputs.gas_limit()),
+            result: result(inputs.gas_limit(), inputs.reservoir()),
             address: None,
+            charged_create_state_gas: inputs.charged_create_state_gas(),
         })),
         FrameInput::Empty => None,
     }
@@ -250,12 +253,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 0,
             bytecode_address: addr,
-            known_bytecode: None,
+            known_bytecode: Default::default(),
             target_address: addr,
             caller: Address::ZERO,
             value: CallValue::default(),
             scheme: CallScheme::Call,
             is_static: false,
+            reservoir: 0,
+            charged_new_account_state_gas: false,
         }))
     }
 

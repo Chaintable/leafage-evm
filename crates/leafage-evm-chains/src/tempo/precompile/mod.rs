@@ -123,12 +123,14 @@ macro_rules! tempo_precompile {
         alloy_evm::precompiles::DynPrecompile::new_stateful(
             revm::precompile::PrecompileId::Custom($id.into()),
             move |$input| {
+                let reservoir = $input.reservoir;
                 if !$input.is_direct_call() {
-                    return Ok(revm::precompile::PrecompileOutput::new_reverted(
+                    return Ok(revm::precompile::PrecompileOutput::revert(
                         0,
                         $crate::tempo::precompile::DelegateCallNotAllowed {}
                             .abi_encode()
                             .into(),
+                        reservoir,
                     ));
                 }
                 let mut storage =
@@ -142,15 +144,19 @@ macro_rules! tempo_precompile {
                     let result = $impl.call($input.data, $input.caller);
                     // Fill gas accounting from the storage context
                     let refund = $crate::tempo::precompile::StorageCtx.gas_refunded();
-                    // Persist refund for TempoPrecompiles::run() to propagate
-                    // to the Gas struct (alloy-evm's PrecompilesMap discards it).
+                    // Persist refund for TempoPrecompiles::run() to drain.
                     $crate::tempo::precompile::storage::set_last_precompile_refund(refund);
                     result.map(|mut output| {
                         output.gas_used =
                             $crate::tempo::precompile::StorageCtx.gas_used();
-                        if !output.reverted {
-                            output.gas_refunded = refund;
-                        }
+                        // Precompile SSTORE refunds are intentionally NOT reported via
+                        // `output.gas_refunded`: since revm 37 the precompile provider
+                        // folds that field into the frame's gas, whereas the Tempo writer
+                        // (pre-T4) never propagated precompile refunds. Keep it at 0.
+                        output.gas_refunded = 0;
+                        // Tempo precompiles never charge EIP-8037 state gas, so the
+                        // reservoir is handed back unchanged.
+                        output.reservoir = reservoir;
                         output
                     })
                 })
@@ -169,13 +175,13 @@ pub use alloy::sol_types::SolError as _SolError;
 /// Dispatches a parameterless view call, encoding the return via `T`.
 #[inline]
 pub fn metadata<T: SolCall>(f: impl FnOnce() -> Result<T::Return>) -> PrecompileResult {
-    f().into_precompile_result(0, |ret| T::abi_encode_returns(&ret).into())
+    f().into_precompile_result(0, 0, |ret| T::abi_encode_returns(&ret).into())
 }
 
 /// Dispatches a read-only call with decoded arguments, encoding the return via `T`.
 #[inline]
 pub fn view<T: SolCall>(call: T, f: impl FnOnce(T) -> Result<T::Return>) -> PrecompileResult {
-    f(call).into_precompile_result(0, |ret| T::abi_encode_returns(&ret).into())
+    f(call).into_precompile_result(0, 0, |ret| T::abi_encode_returns(&ret).into())
 }
 
 /// Dispatches a state-mutating call that returns ABI-encoded data.
@@ -188,12 +194,13 @@ pub fn mutate<T: SolCall>(
     f: impl FnOnce(Address, T) -> Result<T::Return>,
 ) -> PrecompileResult {
     if StorageCtx.is_static() {
-        return Ok(PrecompileOutput::new_reverted(
+        return Ok(PrecompileOutput::revert(
             0,
             StaticCallNotAllowed {}.abi_encode().into(),
+            0,
         ));
     }
-    f(sender, call).into_precompile_result(0, |ret| T::abi_encode_returns(&ret).into())
+    f(sender, call).into_precompile_result(0, 0, |ret| T::abi_encode_returns(&ret).into())
 }
 
 /// Dispatches a state-mutating call that returns no data.
@@ -206,24 +213,25 @@ pub fn mutate_void<T: SolCall>(
     f: impl FnOnce(Address, T) -> Result<()>,
 ) -> PrecompileResult {
     if StorageCtx.is_static() {
-        return Ok(PrecompileOutput::new_reverted(
+        return Ok(PrecompileOutput::revert(
             0,
             StaticCallNotAllowed {}.abi_encode().into(),
+            0,
         ));
     }
-    f(sender, call).into_precompile_result(0, |()| Bytes::new())
+    f(sender, call).into_precompile_result(0, 0, |()| Bytes::new())
 }
 
 /// Fills gas accounting fields on a [`PrecompileOutput`] from the storage context.
+///
+/// Only `gas_used` is filled: precompile refunds are not propagated (see
+/// `tempo_precompile!`), and the reservoir is set by the macro.
 #[inline]
 pub fn fill_precompile_output(
     mut output: PrecompileOutput,
     storage: &StorageCtx,
 ) -> PrecompileOutput {
     output.gas_used = storage.gas_used();
-    if !output.reverted {
-        output.gas_refunded = storage.gas_refunded();
-    }
     output
 }
 
@@ -236,7 +244,7 @@ pub fn dispatch_call<T>(
 
     if calldata.len() < 4 {
         return Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
+            PrecompileOutput::revert(0, Bytes::new(), 0),
             &storage,
         ));
     }
@@ -250,14 +258,14 @@ pub fn dispatch_call<T>(
                 .map(|res| fill_precompile_output(res, &storage))
         }
         Err(_) => Ok(fill_precompile_output(
-            PrecompileOutput::new_reverted(0, Bytes::new()),
+            PrecompileOutput::revert(0, Bytes::new(), 0),
             &storage,
         )),
     }
 }
 
 pub fn unknown_selector(selector: [u8; 4], gas: u64) -> PrecompileResult {
-    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas)
+    TempoPrecompileError::UnknownFunctionSelector(selector).into_precompile_result(gas, 0)
 }
 
 // ===========================================================================

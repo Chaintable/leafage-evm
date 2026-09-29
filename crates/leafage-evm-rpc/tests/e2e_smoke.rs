@@ -103,7 +103,7 @@ async fn rpc_smoke_over_layered_state() {
     tree.update_block(block_info(2, h(0xcc), h(0xbb)), BlockStorageDiff::default())
         .unwrap();
 
-    let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
+    let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
     cfg.disable_balance_check = true;
     cfg.disable_eip3607 = true;
     cfg.disable_block_gas_limit = true;

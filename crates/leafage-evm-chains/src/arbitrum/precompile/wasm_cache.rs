@@ -3,11 +3,11 @@ use super::state::{ArbStorage, StylusProgramError, WasmProgram};
 use super::util::{dispatch, empty_revert, finish_call, topic_address};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_WASM_CACHE_ADDRESS};
 use crate::arbitrum::evm::ArbResourceKind;
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256};
 use alloy::sol_types::{SolError, SolValue};
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::Block;
-use revm::precompile::{PrecompileError, PrecompileResult};
 use revm::{Database, DatabaseRef};
 
 pub(super) struct ArbWasmCache;
@@ -264,10 +264,12 @@ impl ArbWasmCache {
             storage.burn_out();
             return empty_revert(gas_limit, gas_limit);
         }
-        Ok(revm::precompile::PrecompileOutput::new_reverted(
-            storage.gas_used,
-            bytes,
-        ))
+        Ok(
+            crate::arbitrum::precompile::result::PrecompileOutput::new_reverted(
+                storage.gas_used,
+                bytes,
+            ),
+        )
     }
 
     fn copy_gas(byte_count: usize) -> u64 {
@@ -308,6 +310,7 @@ mod tests {
     use crate::arbitrum::arbos_state;
     use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
+    use crate::arbitrum::precompile::result::PrecompileOutput;
     use crate::arbitrum::tx::ArbitrumTxEnv;
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
@@ -316,7 +319,6 @@ mod tests {
     use revm::context::{ContextTr, JournalTr};
     use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
-    use revm::precompile::PrecompileOutput;
     use revm::state::AccountInfo;
     use revm::{Context, MainContext};
 

@@ -22,6 +22,11 @@ use std::{
 pub(crate) struct SubcallContinuation {
     pub(crate) precompile: Arc<dyn SubcallPrecompile>,
     pub(crate) gas_limit: u64,
+    /// The intercepted frame's EIP-8037 reservoir, handed back untouched: the synthetic
+    /// child runs without a reservoir (state gas spills into regular gas).
+    pub(crate) reservoir: u64,
+    /// The intercepted frame's `charged_new_account_state_gas` flag, carried to its result.
+    pub(crate) charged_new_account_state_gas: bool,
     pub(crate) init_subcall_gas_overhead: u64,
     pub(crate) return_memory_offset: Range<usize>,
     pub(crate) continuation_data: SubcallContinuationData,

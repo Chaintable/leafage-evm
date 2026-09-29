@@ -8,7 +8,7 @@
 //! essential error plumbing for storage operations.
 
 use alloy::primitives::Bytes;
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 /// Top-level error type for Tempo precompile operations in leafage-evm.
 ///
@@ -69,21 +69,27 @@ impl TempoPrecompileError {
 
     /// ABI-encodes this error and wraps it as a reverted [`PrecompileResult`].
     ///
+    /// `reservoir` is the EIP-8037 state gas reservoir handed back unchanged
+    /// (Tempo never charges state gas from precompiles).
+    ///
     /// # Errors
-    /// - `PrecompileError::OutOfGas` -- if the variant is [`OutOfGas`](Self::OutOfGas)
     /// - `PrecompileError::Fatal` -- if the variant is [`Fatal`](Self::Fatal)
-    pub fn into_precompile_result(self, gas_used: u64) -> PrecompileResult {
+    ///
+    /// [`OutOfGas`](Self::OutOfGas) maps to a non-fatal `PrecompileHalt::OutOfGas` halt,
+    /// equivalent to the pre-revm-37 `Err(PrecompileError::OutOfGas)`.
+    pub fn into_precompile_result(self, gas_used: u64, reservoir: u64) -> PrecompileResult {
         match self {
-            Self::OutOfGas => Err(PrecompileError::OutOfGas),
+            Self::OutOfGas => Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir)),
             Self::Fatal(msg) => Err(PrecompileError::Fatal(msg)),
             Self::UnknownFunctionSelector(selector) => {
                 // Encode as a simple 4-byte revert
-                Ok(PrecompileOutput::new_reverted(
+                Ok(PrecompileOutput::revert(
                     gas_used,
                     Bytes::copy_from_slice(&selector),
+                    reservoir,
                 ))
             }
-            Self::Revert(data) => Ok(PrecompileOutput::new_reverted(gas_used, data)),
+            Self::Revert(data) => Ok(PrecompileOutput::revert(gas_used, data, reservoir)),
         }
     }
 }
@@ -100,6 +106,7 @@ pub trait IntoPrecompileResult<T> {
     fn into_precompile_result(
         self,
         gas_used: u64,
+        reservoir: u64,
         encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult;
 }
@@ -108,11 +115,12 @@ impl<T> IntoPrecompileResult<T> for Result<T> {
     fn into_precompile_result(
         self,
         gas_used: u64,
+        reservoir: u64,
         encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult {
         match self {
-            Ok(res) => Ok(PrecompileOutput::new(gas_used, encode_ok(res))),
-            Err(err) => err.into_precompile_result(gas_used),
+            Ok(res) => Ok(PrecompileOutput::new(gas_used, encode_ok(res), reservoir)),
+            Err(err) => err.into_precompile_result(gas_used, reservoir),
         }
     }
 }
@@ -121,8 +129,9 @@ impl<T> IntoPrecompileResult<T> for TempoPrecompileError {
     fn into_precompile_result(
         self,
         gas_used: u64,
+        reservoir: u64,
         _encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult {
-        TempoPrecompileError::into_precompile_result(self, gas_used)
+        TempoPrecompileError::into_precompile_result(self, gas_used, reservoir)
     }
 }

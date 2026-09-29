@@ -16,7 +16,8 @@ use revm::{
         interpreter::EthInterpreter,
         interpreter_action::InterpreterAction,
         interpreter_types::{InputsTr, LoopControl, RuntimeFlag, StackTr},
-        require_non_staticcall, Instruction, InstructionContext, InstructionResult, StateLoad,
+        require_non_staticcall, state_gas, Instruction, InstructionContext, InstructionExecResult,
+        InstructionResult, StateLoad,
     },
     primitives::{hardfork::SpecId, Address},
 };
@@ -33,60 +34,65 @@ enum TargetWarmthPolicy {
     Transaction,
 }
 
+/// Static gas of Arc's SELFDESTRUCT, installed into the gas table with the instruction.
+pub(crate) const ARC_SELFDESTRUCT_STATIC_GAS: u16 = 5_000;
+
 pub(crate) fn arc_selfdestruct_instruction<DB: Database>(
     hardfork_flags: ArcHardforkFlags,
 ) -> Instruction<EthInterpreter, ArcContext<DB>> {
     if hardfork_flags.is_active(ArcHardfork::Zero8) {
-        Instruction::new(arc_selfdestruct_zero8::<DB>, 5_000)
+        Instruction::new(arc_selfdestruct_zero8::<DB>)
     } else if hardfork_flags.is_active(ArcHardfork::Zero7) {
-        Instruction::new(arc_selfdestruct_zero7::<DB>, 5_000)
+        Instruction::new(arc_selfdestruct_zero7::<DB>)
     } else {
-        Instruction::new(arc_selfdestruct::<DB>, 5_000)
+        Instruction::new(arc_selfdestruct::<DB>)
     }
 }
 
 /// Pre-Zero7 SELFDESTRUCT with fail-open blocklist reads.
 pub(crate) fn arc_selfdestruct<DB: Database>(
     context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     arc_selfdestruct_impl(
         context,
         BlocklistReadPolicy::FailOpen,
         TargetWarmthPolicy::AccessListOnly,
-    );
+    )
 }
 
 /// Zero7+ SELFDESTRUCT with fail-closed blocklist reads.
 pub(crate) fn arc_selfdestruct_zero7<DB: Database>(
     context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     arc_selfdestruct_impl(
         context,
         BlocklistReadPolicy::FailClosed,
         TargetWarmthPolicy::AccessListOnly,
-    );
+    )
 }
 
 /// Zero8+ SELFDESTRUCT with transaction-wide target warmth.
 pub(crate) fn arc_selfdestruct_zero8<DB: Database>(
     context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     arc_selfdestruct_impl(
         context,
         BlocklistReadPolicy::FailClosed,
         TargetWarmthPolicy::Transaction,
-    );
+    )
 }
 
 fn arc_selfdestruct_impl<DB: Database>(
     mut context: InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
     blocklist_read_policy: BlocklistReadPolicy,
     target_warmth_policy: TargetWarmthPolicy,
-) {
+) -> InstructionExecResult {
+    // revm 43's run loop only stops on `Err`: every halt/revert below sets the
+    // interpreter action first and then returns `Err` so the loop exits with it.
     require_non_staticcall!(context.interpreter);
     let Some([target]) = StackTr::popn(&mut context.interpreter.stack) else {
         context.interpreter.halt_underflow();
-        return;
+        return Err(InstructionResult::StackUnderflow);
     };
     let target = target.into_address();
     let source = context.interpreter.input.target_address();
@@ -98,19 +104,16 @@ fn arc_selfdestruct_impl<DB: Database>(
     let target_cold_override = match source_balance.as_ref() {
         Some(balance) if !balance.is_zero() => {
             if target.is_zero() {
-                revert(&mut context, ERR_ZERO_ADDRESS);
-                return;
+                return revert(&mut context, ERR_ZERO_ADDRESS);
             }
-            let Ok(is_target_cold) = check_accounts(
+            let is_target_cold = check_accounts(
                 &mut context,
                 source,
                 target,
                 skip_cold_load,
                 blocklist_read_policy,
                 target_warmth_policy,
-            ) else {
-                return;
-            };
+            )?;
             Some(is_target_cold)
         }
         Some(_) => None,
@@ -118,7 +121,7 @@ fn arc_selfdestruct_impl<DB: Database>(
             context
                 .interpreter
                 .halt(InstructionResult::FatalExternalError);
-            return;
+            return Err(InstructionResult::FatalExternalError);
         }
     };
 
@@ -132,11 +135,11 @@ fn arc_selfdestruct_impl<DB: Database>(
         Ok(result) => result,
         Err(LoadError::ColdLoadSkipped) => {
             context.interpreter.halt_oog();
-            return;
+            return Err(InstructionResult::OutOfGas);
         }
         Err(LoadError::DBError) => {
             context.interpreter.halt_fatal();
-            return;
+            return Err(InstructionResult::FatalExternalError);
         }
     };
 
@@ -157,9 +160,17 @@ fn arc_selfdestruct_impl<DB: Database>(
         .host
         .gas_params()
         .selfdestruct_cost(should_charge_topup, result.is_cold);
-    if !context.interpreter.gas.record_cost(gas_cost) {
+    if !context.interpreter.gas.record_regular_cost(gas_cost) {
         context.interpreter.halt_oog();
-        return;
+        return Err(InstructionResult::OutOfGas);
+    }
+
+    // State gas for new account creation (EIP-8037), as in revm's SELFDESTRUCT.
+    if context.host.is_amsterdam_eip8037_enabled() && should_charge_topup {
+        state_gas!(
+            context.interpreter,
+            context.host.gas_params().new_account_state_gas()
+        );
     }
 
     if !result.previously_destroyed {
@@ -169,6 +180,7 @@ fn arc_selfdestruct_impl<DB: Database>(
             .record_refund(context.host.gas_params().selfdestruct_refund());
     }
     context.interpreter.halt(InstructionResult::SelfDestruct);
+    Err(InstructionResult::SelfDestruct)
 }
 
 fn is_blocklisted<DB: Database>(
@@ -219,32 +231,30 @@ fn check_accounts<DB: Database>(
     skip_cold_load: bool,
     blocklist_read_policy: BlocklistReadPolicy,
     target_warmth_policy: TargetWarmthPolicy,
-) -> Result<bool, ()> {
+) -> InstructionExecResult<bool> {
     if source == target {
         context.interpreter.halt(InstructionResult::Revert);
-        return Err(());
+        return Err(InstructionResult::Revert);
     }
     let target_blocklisted = match is_blocklisted(context, target, blocklist_read_policy) {
         Ok(is_blocklisted) => is_blocklisted,
         Err(_) => {
             context.interpreter.halt_fatal();
-            return Err(());
+            return Err(InstructionResult::FatalExternalError);
         }
     };
     if target_blocklisted {
-        revert(context, ERR_BLOCKED_ADDRESS);
-        return Err(());
+        return revert(context, ERR_BLOCKED_ADDRESS).map(|()| false);
     }
     let source_blocklisted = match is_blocklisted(context, source, blocklist_read_policy) {
         Ok(is_blocklisted) => is_blocklisted,
         Err(_) => {
             context.interpreter.halt_fatal();
-            return Err(());
+            return Err(InstructionResult::FatalExternalError);
         }
     };
     if source_blocklisted {
-        revert(context, ERR_BLOCKED_ADDRESS);
-        return Err(());
+        return revert(context, ERR_BLOCKED_ADDRESS).map(|()| false);
     }
 
     let is_cold = match target_warmth_policy {
@@ -257,7 +267,7 @@ fn check_accounts<DB: Database>(
                 .is_err()
             {
                 context.interpreter.halt_oog();
-                return Err(());
+                return Err(InstructionResult::OutOfGas);
             }
             match context.host.journal_mut().load_account(target) {
                 Ok(account) => account.is_cold,
@@ -266,7 +276,7 @@ fn check_accounts<DB: Database>(
                     // FatalExternalError that has no context error.
                     *context.host.error() = Err(err.into());
                     context.interpreter.halt_fatal();
-                    return Err(());
+                    return Err(InstructionResult::FatalExternalError);
                 }
             }
         }
@@ -280,11 +290,11 @@ fn check_accounts<DB: Database>(
                 Ok(account) => account.is_cold,
                 Err(LoadError::ColdLoadSkipped) => {
                     context.interpreter.halt_oog();
-                    return Err(());
+                    return Err(InstructionResult::OutOfGas);
                 }
                 Err(LoadError::DBError) => {
                     context.interpreter.halt_fatal();
-                    return Err(());
+                    return Err(InstructionResult::FatalExternalError);
                 }
             }
         }
@@ -292,22 +302,23 @@ fn check_accounts<DB: Database>(
 
     match context.host.journal_mut().load_account(target) {
         Ok(account) if account.is_selfdestructed() => {
-            revert(context, ERR_SELFDESTRUCTED_BALANCE_INCREASED);
-            Err(())
+            revert(context, ERR_SELFDESTRUCTED_BALANCE_INCREASED).map(|()| false)
         }
         Ok(_) => Ok(is_cold),
         Err(err) => {
             *context.host.error() = Err(err.into());
             context.interpreter.halt_fatal();
-            Err(())
+            Err(InstructionResult::FatalExternalError)
         }
     }
 }
 
+/// Sets a revert action with an Arc error message; always returns `Err` so the
+/// interpreter loop stops on it.
 fn revert<DB: Database>(
     context: &mut InstructionContext<'_, ArcContext<DB>, EthInterpreter>,
     message: &str,
-) {
+) -> InstructionExecResult {
     context
         .interpreter
         .bytecode
@@ -316,6 +327,7 @@ fn revert<DB: Database>(
             revert_message(message),
             context.interpreter.gas,
         ));
+    Err(InstructionResult::Revert)
 }
 
 #[cfg(test)]
@@ -350,7 +362,7 @@ mod tests {
 
     const SOURCE: Address = address!("1000000000000000000000000000000000000001");
     const TARGET: Address = address!("2000000000000000000000000000000000000002");
-    const STATIC_GAS_COST: u64 = 5_000;
+    const STATIC_GAS_COST: u64 = ARC_SELFDESTRUCT_STATIC_GAS as u64;
 
     struct HostTestEnv<DB: Database> {
         host: ArcContext<DB>,
@@ -360,7 +372,7 @@ mod tests {
         fn new(db: DB) -> Self {
             let mut host = ArcContext::new(db, MainnetSpecId::OSAKA);
             host.cfg.amsterdam_eip7708_disabled = true;
-            host.cfg.amsterdam_eip7708_delayed_burn_disabled = true;
+            host.cfg.amsterdam_eip8246_delayed_clear_disabled = true;
             host.journaled_state.set_eip7708_config(true, true);
             Self { host }
         }
@@ -404,7 +416,7 @@ mod tests {
                 target,
                 gas_limit,
                 preload_ncc,
-                Instruction::new(arc_selfdestruct::<DB>, STATIC_GAS_COST),
+                Instruction::new(arc_selfdestruct::<DB>),
             )
         }
 
@@ -455,12 +467,17 @@ mod tests {
             assert!(interpreter
                 .stack
                 .push(U256::from_be_slice(target.into_word().as_ref())));
-            assert!(interpreter.gas.record_cost(STATIC_GAS_COST));
+            assert!(interpreter.gas.record_regular_cost(STATIC_GAS_COST));
 
-            instruction.execute(InstructionContext {
+            // Mirror revm's run loop: an `Err` without an action halts with that result.
+            if let Err(result) = instruction.execute(InstructionContext {
                 interpreter: &mut interpreter,
                 host: &mut self.host,
-            });
+            }) {
+                if interpreter.bytecode.action().is_none() {
+                    interpreter.halt(result);
+                }
+            }
             match interpreter.take_next_action() {
                 InterpreterAction::Return(result) => result,
                 _ => panic!("SELFDESTRUCT must halt the interpreter"),
@@ -554,7 +571,7 @@ mod tests {
         let result = env.simulate(SOURCE, TARGET, u64::MAX);
 
         assert_eq!(result.result, InstructionResult::SelfDestruct);
-        assert_eq!(result.gas.spent(), 32_600);
+        assert_eq!(result.gas.total_gas_spent(), 32_600);
         assert_eq!(result.gas.refunded(), 0);
         assert_eq!(env.balance(SOURCE), U256::ZERO);
         assert_eq!(env.balance(TARGET), amount);
@@ -569,7 +586,7 @@ mod tests {
         let mut zero = HostTestEnv::new(InMemoryDB::default());
         let zero_result = zero.simulate(SOURCE, TARGET, u64::MAX);
         assert_eq!(zero_result.result, InstructionResult::SelfDestruct);
-        assert_eq!(zero_result.gas.spent(), 7_600);
+        assert_eq!(zero_result.gas.total_gas_spent(), 7_600);
         assert_eq!(zero_result.gas.refunded(), 0);
         assert!(zero.host.journal_mut().take_logs().is_empty());
 
@@ -577,7 +594,7 @@ mod tests {
         warm.set_balance(TARGET, U256::ONE);
         let warm_result = warm.simulate(SOURCE, TARGET, u64::MAX);
         assert_eq!(warm_result.result, InstructionResult::SelfDestruct);
-        assert_eq!(warm_result.gas.spent(), STATIC_GAS_COST);
+        assert_eq!(warm_result.gas.total_gas_spent(), STATIC_GAS_COST);
         assert_eq!(warm_result.gas.refunded(), 0);
     }
 
@@ -589,7 +606,7 @@ mod tests {
         let result = env.simulate(SOURCE, TARGET, initial_gas);
 
         assert_eq!(result.result, InstructionResult::OutOfGas);
-        assert_eq!(result.gas.spent(), initial_gas);
+        assert_eq!(result.gas.total_gas_spent(), initial_gas);
         assert_eq!(env.balance(SOURCE), U256::ONE);
         assert!(env.host.journal_mut().take_logs().is_empty());
     }
@@ -616,7 +633,7 @@ mod tests {
             let result = env.simulate_with_flags(SOURCE, TARGET, initial_gas, flags);
 
             assert_eq!(result.result, InstructionResult::SelfDestruct);
-            assert_eq!(result.gas.spent(), STATIC_GAS_COST);
+            assert_eq!(result.gas.total_gas_spent(), STATIC_GAS_COST);
             assert_eq!(env.balance(SOURCE), U256::ZERO);
             assert_eq!(env.balance(TARGET), U256::from(2));
         }
@@ -970,14 +987,22 @@ mod tests {
         let mut handler = ArcHandler::new(evm.execution_spec().arc_flags);
 
         let init_and_floor_gas = handler.validate(&mut evm).unwrap();
-        let eip7702_refund = handler.pre_execution(&mut evm).unwrap() as i64;
+        let mut gas = handler.tx_gas(&mut evm, &init_and_floor_gas);
+        let pre_execution = handler
+            .pre_execution(&mut evm, &mut gas)
+            .unwrap()
+            .expect("no EIP-2780 runtime out-of-gas before Amsterdam");
+        let eip7702_refund = pre_execution.eip7702_refund as i64;
         assert_eq!(
             evm.ctx().journaled_state.db().ncc_reads,
             [blocklist_storage_slot(sender)],
             "the top-level sender blocklist read must succeed before execution"
         );
 
-        let mut frame_result = handler.execution(&mut evm, &init_and_floor_gas).unwrap();
+        let mut frame_result = handler
+            .execution(&mut evm, pre_execution.checkpoint, &mut gas)
+            .unwrap()
+            .expect("first frame must be created before Amsterdam");
 
         assert_eq!(
             evm.ctx().journaled_state.db().ncc_reads,

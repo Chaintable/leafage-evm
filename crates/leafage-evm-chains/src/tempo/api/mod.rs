@@ -20,7 +20,7 @@ use revm::{
         InterpreterResult,
     },
     precompile::{PrecompileSpecId, Precompiles},
-    primitives::Address,
+    primitives::{Address, AddressSet},
     Context, Inspector, Journal,
 };
 
@@ -29,11 +29,10 @@ use revm::{
 ///
 /// Standard Ethereum precompiles are pure functions and never produce gas refunds.
 /// Tempo's custom precompiles (TIP20, FeeManager, etc.) perform SSTORE through the
-/// journal, tracking refunds in [`PrecompileOutput::gas_refunded`]. The upstream
-/// `PrecompilesMap::run()` records `gas_used` but not `gas_refunded` — which is correct
-/// for standard precompiles. This wrapper adds the missing `record_refund()` call
-/// so that SSTORE clear refunds (e.g., balance slot non-zero → zero) propagate to
-/// the execution result's `ResultGas`.
+/// journal. Since revm 37 `PrecompilesMap::run()` folds `PrecompileOutput::gas_refunded`
+/// into the frame gas, so `tempo_precompile!` keeps that field at 0 (the pre-T4 writer
+/// never propagated precompile refunds); the refund is only stashed in a thread-local
+/// that this wrapper drains.
 pub struct TempoPrecompiles(PrecompilesMap);
 
 impl TempoPrecompiles {
@@ -56,15 +55,15 @@ impl<DB: Database> PrecompileProvider<TempoContext<DB>> for TempoPrecompiles {
     ) -> Result<Option<InterpreterResult>, String> {
         let result = self.0.run(context, inputs)?;
         // Drain the thread-local refund set by the precompile macro.
-        // We intentionally do NOT call record_refund() here — the writer
-        // also uses PrecompilesMap which doesn't propagate precompile
-        // SSTORE refunds to the Gas struct. Matching writer behavior means
-        // used() == spent() for precompile calls.
+        // We intentionally do NOT call record_refund() here — the (pre-T4)
+        // writer doesn't propagate precompile SSTORE refunds to the Gas
+        // struct. Matching writer behavior means used() == spent() for
+        // precompile calls.
         let _ = take_last_precompile_refund();
         Ok(result)
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
+    fn warm_addresses(&self) -> &AddressSet {
         PrecompileProvider::<TempoContext<DB>>::warm_addresses(&self.0)
     }
 
@@ -124,7 +123,7 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                 (GasId::new_account_cost(), 250_000),
                 (GasId::new_account_cost_for_selfdestruct(), 250_000),
                 (GasId::code_deposit_cost(), 1_000),
-                (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                (GasId::tx_eip7702_regular_gas(), 12_500),
                 // TIP-1000: Auth account creation cost (EIP-7702 auth with nonce==0).
                 // Custom GasId(255), same as Tempo writer: crates/revm/src/gas_params.rs
                 (GasId::new(255), 250_000),
@@ -139,7 +138,7 @@ impl<DB: Database, I> TempoEvm<DB, I> {
             // Register MILLIS_TIMESTAMP (0x4F) opcode — active pre-T1C only.
             // Ported from Tempo writer: crates/revm/src/instructions.rs
             const MILLIS_TIMESTAMP_OPCODE: u8 = 0x4F;
-            const MILLIS_TIMESTAMP_GAS: u64 = 2;
+            const MILLIS_TIMESTAMP_GAS: u16 = 2;
             instructions.insert_instruction(
                 MILLIS_TIMESTAMP_OPCODE,
                 Instruction::new(
@@ -152,9 +151,10 @@ impl<DB: Database, I> TempoEvm<DB, I> {
                             ctx.interpreter,
                             ctx.host.block.timestamp_millis()
                         );
+                        Ok(())
                     },
-                    MILLIS_TIMESTAMP_GAS,
                 ),
+                MILLIS_TIMESTAMP_GAS,
             );
         }
 
@@ -527,7 +527,7 @@ mod tests {
         // Pre-T1A
         let mut evm_pre = TempoEvm::new(make_env(1000), make_db(), NoOpInspector, false);
         let result_pre = evm_pre.transact(make_tx()).expect("pre-T1A transact");
-        let gas_pre = result_pre.result.gas_used();
+        let gas_pre = result_pre.result.tx_gas_used();
 
         // Post-T1A
         let mut evm_post = TempoEvm::new(
@@ -537,7 +537,7 @@ mod tests {
             false,
         );
         let result_post = evm_post.transact(make_tx()).expect("post-T1A transact");
-        let gas_post = result_post.result.gas_used();
+        let gas_post = result_post.result.tx_gas_used();
 
         // Post-T1A SSTORE set should cost ~250k instead of ~20k
         // Diff should be ~230k (250000 - 19900)
@@ -614,7 +614,7 @@ mod tests {
             false,
         );
         let result = evm.transact(tx).expect("AA single call transact");
-        let gas_used = result.result.gas_used();
+        let gas_used = result.result.tx_gas_used();
 
         // Base stipend = 21000, no per-call cold cost (single call), no calldata.
         // Execution gas is minimal (CALL to empty account).
@@ -645,7 +645,7 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_1 = evm_1.transact(tx_1).expect("1-call").result.gas_used();
+        let gas_1 = evm_1.transact(tx_1).expect("1-call").result.tx_gas_used();
 
         let mut evm_3 = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -653,7 +653,7 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_3 = evm_3.transact(tx_3).expect("3-call").result.gas_used();
+        let gas_3 = evm_3.transact(tx_3).expect("3-call").result.tx_gas_used();
 
         // 3-call should cost more due to 2 * cold_account_cost (2600 each).
         assert!(
@@ -680,7 +680,7 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_n0 = evm_n0.transact(tx_n0).expect("nonce=0").result.gas_used();
+        let gas_n0 = evm_n0.transact(tx_n0).expect("nonce=0").result.tx_gas_used();
 
         let mut evm_n1 = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -688,7 +688,7 @@ mod tests {
             NoOpInspector,
             false,
         );
-        let gas_n1 = evm_n1.transact(tx_n1).expect("nonce=1").result.gas_used();
+        let gas_n1 = evm_n1.transact(tx_n1).expect("nonce=1").result.tx_gas_used();
 
         // nonce=0 should cost ~250k more (TIP-1000 new_account_cost).
         let diff = gas_n0.saturating_sub(gas_n1);
@@ -721,7 +721,7 @@ mod tests {
             .transact(tx_normal)
             .expect("normal nonce")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         let mut evm_exp = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -733,7 +733,7 @@ mod tests {
             .transact(tx_expiring)
             .expect("expiring nonce")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         // Expiring nonce should cost EXPIRING_NONCE_GAS (13k) more than existing nonce key (5k).
         let diff = gas_exp.saturating_sub(gas_normal);
@@ -766,7 +766,7 @@ mod tests {
             .transact(tx_n0)
             .expect("pre-T1 nonce=0")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         let mut evm_n1 = TempoEvm::new(
             make_env_aa(1000), // Pre-T1
@@ -778,7 +778,7 @@ mod tests {
             .transact(tx_n1)
             .expect("pre-T1 nonce=1")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         // Pre-T1: no TIP-1000 nonce surcharge, so gas should be identical.
         assert_eq!(
@@ -810,7 +810,7 @@ mod tests {
             .transact(tx_data)
             .expect("with data")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         let mut evm_empty = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -822,7 +822,7 @@ mod tests {
             .transact(tx_empty)
             .expect("empty data")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         // 100 non-zero bytes = 100 * 4 = 400 tokens, * token_cost.
         assert!(
@@ -937,7 +937,7 @@ mod tests {
         // doesn't call record_refund). So used() == spent() for precompile calls.
         // The GasParams-based sstore gas calculation ensures spent() matches writer.
         assert_eq!(
-            gas.used(),
+            gas.tx_gas_used(),
             gas.spent_sub_refunded(),
             "precompile gas: used() should equal spent_sub_refunded() (no refund propagation)"
         );
@@ -1087,7 +1087,7 @@ mod tests {
             .transact(tx_pre)
             .expect("T1C transact")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         let mut evm_post = TempoEvm::new(
             make_env_aa(post_t2_ts),
@@ -1099,7 +1099,7 @@ mod tests {
             .transact(tx_post)
             .expect("T2 transact")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         // T2 existing nonce key costs 5200 vs T1C 5000 → exactly +200.
         let diff = gas_post.saturating_sub(gas_pre);
@@ -1458,7 +1458,7 @@ mod tests {
             .transact(make_tx(single_call))
             .expect("single call")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         let mut evm_3 = TempoEvm::new(
             make_env_aa(1_770_908_400 + 100),
@@ -1470,7 +1470,7 @@ mod tests {
             .transact(make_tx(triple_call))
             .expect("triple call")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         assert!(
             gas_3 > gas_1,
@@ -1516,7 +1516,7 @@ mod tests {
             .transact(make_tx(calldata.clone()))
             .expect("cold")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         // WITH pre-warm: insert VCV2 into CacheDB before EVM construction
         let mut db2 = CacheDB::new(revm::database::EmptyDB::default());
@@ -1544,7 +1544,7 @@ mod tests {
             .transact(make_tx(calldata))
             .expect("warm")
             .result
-            .gas_used();
+            .tx_gas_used();
 
         eprintln!("VCV2 T2 gas: cold={gas_cold} warm={gas_warm}");
         // Code/account presence does NOT affect precompile gas — dispatch by address.
