@@ -3,7 +3,7 @@ use crate::api_impl::core::{Api, EvmExecutor, TxSetter};
 use crate::api_impl::debank::MIN_TRANSACTION_GAS;
 use crate::api_impl::{utils, ApiImpl};
 use alloy::eips::eip7702::Authorization;
-use alloy::primitives::{address, hex, keccak256};
+use alloy::primitives::{address, hex, keccak256, TxKind};
 use alloy::rpc::types::state::{AccountOverride, StateOverride};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::signers::{local::PrivateKeySigner, SignerSync};
@@ -25,6 +25,7 @@ use leafage_evm_types::{
 use revm::bytecode::opcode;
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::database::{CacheDB, InMemoryDB};
+use revm::handler::SYSTEM_ADDRESS;
 use revm::{context::TxEnv, state::AccountInfo, DatabaseRef};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1185,6 +1186,102 @@ async fn arc_simulation_keeps_nested_zero_value_precompile_trace_and_event() {
     assert_eq!(event.parent_trace_id, precompile.id);
     assert_eq!(event.pos_in_parent_trace, 0);
     assert_eq!(event.id, event.debank_id());
+
+    fixture.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
+    let fixture =
+        build_arc_fixture_at_timestamp(100, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+    let addresses = fixture.addresses;
+    let native_coin_authority: Address = "0x1800000000000000000000000000000000000000"
+        .parse()
+        .unwrap();
+    let transfer = |from: Address, to: Address| {
+        vec![
+            H256::left_padding_from(from.as_slice()).to_string(),
+            H256::left_padding_from(to.as_slice()).to_string(),
+        ]
+    };
+    let value_call = |to: Address| CallRequest {
+        inner: TransactionRequest::default()
+            .from(addresses.funded)
+            .to(to)
+            .value(U256::from(5)),
+        tempo: None,
+    };
+    // The created contract selfdestructs its endowment to `beneficiary` right away.
+    let beneficiary = Address::repeat_byte(0x99);
+    let created = addresses.funded.create(0);
+    let mut init_code = vec![opcode::PUSH20];
+    init_code.extend_from_slice(beneficiary.as_slice());
+    init_code.push(opcode::SELFDESTRUCT);
+    let mut create = TransactionRequest::default()
+        .from(addresses.funded)
+        .value(U256::from(9))
+        .gas_limit(200_000)
+        .input(TransactionInput::new(init_code.into()));
+    create.to = Some(TxKind::Create);
+
+    for (request, expected) in [
+        (
+            value_call(addresses.empty),
+            vec![transfer(addresses.funded, addresses.empty)],
+        ),
+        (
+            value_call(addresses.counter),
+            vec![transfer(addresses.funded, addresses.counter)],
+        ),
+        (
+            CallRequest {
+                inner: create,
+                tempo: None,
+            },
+            vec![
+                transfer(addresses.funded, created),
+                transfer(created, beneficiary),
+            ],
+        ),
+        (
+            request_with_input(
+                addresses.native_fiat_token,
+                native_coin_authority,
+                burn_input(addresses.drain_target, U256::from(3)),
+            ),
+            vec![transfer(addresses.drain_target, Address::ZERO)],
+        ),
+    ] {
+        let simulated = fixture
+            .api
+            .simulate_transactions(vec![request], anchor_context(), None)
+            .await
+            .unwrap();
+        let result = &simulated.results[0];
+        assert_eq!(result.code, 0, "{result:#?}");
+        let events: Vec<_> = result
+            .events
+            .iter()
+            .map(|event| {
+                (
+                    event.contract_id,
+                    event.selector.clone(),
+                    event.topics.clone(),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|topics| {
+                (
+                    SYSTEM_ADDRESS,
+                    keccak256("Transfer(address,address,uint256)").to_string(),
+                    topics,
+                )
+            })
+            .collect();
+        assert_eq!(events, expected, "{result:#?}");
+    }
 
     fixture.close();
 }
