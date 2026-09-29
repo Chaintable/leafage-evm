@@ -494,6 +494,10 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Re
 /// ARROW_GLACIER / GRAY_GLACIER and shifted the remaining discriminants. Deployed
 /// manifests still carry the old numbers, so the CLI keeps that numbering; removed
 /// forks map to the retained fork whose execution rules revm already applied to them.
+///
+/// CONSTANTINOPLE (7) has no equivalent: revm 36 enabled SHL/SHR/SAR/EXTCODEHASH there
+/// but gated CREATE2 on PETERSBURG, so it is rejected (use 8) instead of silently
+/// changing behavior.
 fn legacy_mainnet_spec(spec_id: u8) -> Option<MainnetSpecId> {
     use MainnetSpecId::*;
     Some(match spec_id {
@@ -502,7 +506,7 @@ fn legacy_mainnet_spec(spec_id: u8) -> Option<MainnetSpecId> {
         4 => TANGERINE,
         5 => SPURIOUS_DRAGON,
         6 => BYZANTIUM,
-        7 | 8 => PETERSBURG,
+        8 => PETERSBURG,
         9 | 10 => ISTANBUL,
         11 => BERLIN,
         12..=14 => LONDON,
@@ -1110,7 +1114,8 @@ mod tests {
     #[test]
     fn legacy_spec_id_keeps_revm36_numbering() {
         assert_eq!(legacy_mainnet_spec(1), Some(MainnetSpecId::FRONTIER));
-        assert_eq!(legacy_mainnet_spec(7), Some(MainnetSpecId::PETERSBURG));
+        assert_eq!(legacy_mainnet_spec(7), None);
+        assert_eq!(legacy_mainnet_spec(8), Some(MainnetSpecId::PETERSBURG));
         assert_eq!(legacy_mainnet_spec(12), Some(MainnetSpecId::LONDON));
         assert_eq!(legacy_mainnet_spec(14), Some(MainnetSpecId::LONDON));
         assert_eq!(legacy_mainnet_spec(15), Some(MainnetSpecId::MERGE));
