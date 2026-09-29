@@ -12,9 +12,13 @@ use revm::{
         result::{EVMError, ExecutionResult, ResultAndState, ResultGas},
         Cfg, ContextTr, JournalTr,
     },
-    handler::{post_execution, pre_execution, EthFrame, FrameResult, Handler, MainnetHandler},
+    context_interface::journaled_state::JournalCheckpoint,
+    handler::{
+        post_execution, pre_execution, pre_execution::PreExecutionOutput, EthFrame, FrameResult,
+        Handler, MainnetHandler,
+    },
     inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorHandler},
-    interpreter::{interpreter::EthInterpreter, Gas, InitialAndFloorGas},
+    interpreter::{interpreter::EthInterpreter, Gas, GasTracker, InitialAndFloorGas},
     primitives::U256,
     state::EvmState,
     DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
@@ -116,24 +120,23 @@ impl<DB: revm::database::Database, INSP> Default for TempoHandler<DB, INSP> {
 }
 
 impl<DB: Database, INSP> TempoHandler<DB, INSP> {
+    /// Pre-execution with Tempo's inline key authorization, which may raise
+    /// `init_gas` after validation. Caller validation already ran in
+    /// [`Handler::validate`].
     fn pre_execution_with_initial_gas(
         &self,
         evm: &mut TempoEvm<DB, INSP>,
         init_gas: Option<&mut InitialAndFloorGas>,
-    ) -> Result<u64, TempoEvmError<DB::Error>> {
-        if evm
-            .ctx()
-            .tx
-            .tempo_fields
-            .as_ref()
-            .is_some_and(|fields| !fields.nonce_key.is_zero())
-        {
-            evm.ctx_mut().cfg.disable_nonce_check = true;
-        }
-
-        self.validate_against_state_and_deduct_caller(evm)?;
+    ) -> Result<PreExecutionOutput, TempoEvmError<DB::Error>> {
         self.load_accounts(evm)?;
-        let gas = self.apply_eip7702_auth_list(evm)?;
+        // Committed by `execution`; kept for revm's pre-execution/execution contract.
+        let checkpoint = evm.ctx_mut().journal_mut().checkpoint();
+        // EIP-2780 stays disabled, so applying the authorization list charges no gas.
+        let eip7702_refund = self
+            .apply_eip7702_auth_list(evm, &mut GasTracker::new(0, 0, 0))?
+            .ok_or_else(|| {
+                EVMError::Custom("authorization list ran out of gas with EIP-2780 disabled".into())
+            })?;
 
         validate_existing_keychain_transaction(evm)?;
 
@@ -177,7 +180,44 @@ impl<DB: Database, INSP> TempoHandler<DB, INSP> {
             set_keychain_transaction_key(evm, key_id);
         }
 
-        Ok(gas)
+        Ok(PreExecutionOutput {
+            eip7702_refund,
+            checkpoint,
+        })
+    }
+
+    /// Runs the tail of [`Handler::run_without_catch_error`] after validation,
+    /// with `execute` being the standard or the inspector-aware execution.
+    fn run_after_validation(
+        &mut self,
+        evm: &mut TempoEvm<DB, INSP>,
+        mut init_gas: InitialAndFloorGas,
+        execute: impl FnOnce(
+            &mut Self,
+            &mut TempoEvm<DB, INSP>,
+            JournalCheckpoint,
+            &mut GasTracker,
+        ) -> Result<Option<FrameResult>, TempoEvmError<DB::Error>>,
+    ) -> Result<ExecutionResult<revm::context::result::HaltReason>, TempoEvmError<DB::Error>> {
+        let pre_execution = self.pre_execution_with_initial_gas(evm, Some(&mut init_gas))?;
+        let mut gas = self.tx_gas(evm, &init_gas);
+        let mut exec_result =
+            if let Some(oog) = oog_frame_result_if_intrinsic_exceeds_limit(evm, &init_gas) {
+                // Execution is skipped; the pre-execution changes stay applied.
+                evm.ctx_mut().journal_mut().checkpoint_commit();
+                oog
+            } else {
+                execute(self, evm, pre_execution.checkpoint, &mut gas)?.ok_or_else(|| {
+                    EVMError::Custom("execution ran out of gas with EIP-2780 disabled".into())
+                })?
+            };
+        let result_gas = self.post_execution(
+            evm,
+            &mut exec_result,
+            init_gas,
+            pre_execution.eip7702_refund as i64,
+        )?;
+        self.execution_result(evm, exec_result, result_gas)
     }
 }
 
@@ -190,13 +230,8 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         &mut self,
         evm: &mut Self::Evm,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        let mut init_gas = self.validate(evm)?;
-        let eip7702_refund =
-            self.pre_execution_with_initial_gas(evm, Some(&mut init_gas))? as i64;
-        let mut exec_result = self.execution(evm, &init_gas)?;
-        let result_gas =
-            self.post_execution(evm, &mut exec_result, init_gas, eip7702_refund)?;
-        self.execution_result(evm, exec_result, result_gas)
+        let init_gas = self.validate(evm)?;
+        self.run_after_validation(evm, init_gas, Self::execution)
     }
 
     /// Validates the transaction environment for Tempo.
@@ -350,19 +385,21 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 (0, 0)
             };
 
+            // EIP-2780 is an Amsterdam feature and stays disabled on Tempo.
             let mut init_gas = gas_params.initial_tx_gas(
                 tx.input(),
                 tx.kind().is_create(),
                 acc,
                 storage,
                 tx.authorization_list.len() as u64,
+                None,
             );
 
             // TIP-1000: EIP-7702 authorization_list entries with nonce==0
             // require additional auth_account_creation cost (250k gas).
             for auth in &evm.ctx().tx.base.authorization_list {
                 if auth.nonce() == 0 {
-                    init_gas.initial_gas +=
+                    init_gas.initial_regular_gas +=
                         gas_params.get(TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID);
                 }
             }
@@ -370,15 +407,15 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             // TIP-1000: nonce == 0 requires additional new_account_cost (250k gas).
             let hardfork = evm.ctx().cfg.spec;
             if hardfork.is_t1() && evm.ctx().tx.base.nonce == 0 {
-                init_gas.initial_gas += evm.ctx().cfg.gas_params.get(GasId::new_account_cost());
+                init_gas.initial_regular_gas += evm.ctx().cfg.gas_params.get(GasId::new_account_cost());
             }
 
             // Re-validate gas_limit after adding surcharges.
-            if gas_limit < init_gas.initial_gas {
+            if gas_limit < init_gas.initial_regular_gas {
                 return Err(EVMError::Transaction(
                     InvalidTransaction::CallGasCostMoreThanGasLimit {
                         gas_limit,
-                        initial_gas: init_gas.initial_gas,
+                        initial_gas: init_gas.initial_regular_gas,
                     }
                     .into(),
                 ));
@@ -414,8 +451,12 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     /// Leafage doesn't need actual fee deduction, but must do the same sload to
     /// warm the slot and match writer's gas behavior exactly.
     #[inline]
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
-        self.pre_execution_with_initial_gas(evm, None)
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        _gas: &mut GasTracker,
+    ) -> Result<Option<PreExecutionOutput>, Self::Error> {
+        self.pre_execution_with_initial_gas(evm, None).map(Some)
     }
 
     /// Tempo keeps the account protocol nonce unchanged for CALL transactions
@@ -424,10 +465,13 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     /// Writer never touches native balance: fees are paid in TIP-20 through the
     /// fee manager, which RPC simulations do not charge (reth sets
     /// `disable_fee_charge`). Ported from writer: handler.rs:1034-1043, :1222-1229.
+    ///
+    /// Since revm 38 this runs in the validation phase, before `pre_execution`.
     #[inline]
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
+        _init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
         use revm::context_interface::transaction::Transaction;
 
@@ -437,6 +481,9 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .tempo_fields
             .as_ref()
             .is_some_and(|fields| !fields.nonce_key.is_zero());
+        if uses_2d_nonce {
+            evm.ctx_mut().cfg.disable_nonce_check = true;
+        }
 
         let (_, tx, cfg, journal, _, _) = evm.ctx_mut().all_mut();
         let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
@@ -461,7 +508,11 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     /// Entries without delegation fields (gas-only) are skipped.
     /// T1+: no refund (matching writer behavior).
     #[inline]
-    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn apply_eip7702_auth_list(
+        &self,
+        evm: &mut Self::Evm,
+        gas: &mut GasTracker,
+    ) -> Result<Option<u64>, Self::Error> {
         let has_aa_authorizations = evm
             .ctx()
             .tx
@@ -473,7 +524,7 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         if !has_aa_authorizations {
             // No AA authorization list — use the default path (handles type 0x04).
             return MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-                .apply_eip7702_auth_list(evm);
+                .apply_eip7702_auth_list(evm, gas);
         }
 
         // Build delegation entries from auth_list items that have authority + delegate.
@@ -504,11 +555,10 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .collect();
 
         let chain_id = evm.ctx().cfg.chain_id;
-        let refund_per_auth = evm.ctx().cfg.gas_params.tx_eip7702_auth_refund();
+        let refund_per_auth = evm.ctx().cfg.gas_params.tx_eip7702_auth_refund_regular();
 
-        let refunded = revm::handler::pre_execution::apply_auth_list::<_, Self::Error>(
+        let refunded_accounts = revm::handler::pre_execution::apply_auth_list::<_, Self::Error>(
             chain_id,
-            refund_per_auth,
             delegations.iter(),
             evm.ctx_mut().journal_mut(),
         )?;
@@ -516,9 +566,9 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         // TIP-1000: no refund on T1+ (matching writer handler.rs:660).
         let hardfork = evm.ctx().cfg.spec;
         if hardfork.is_t1() {
-            return Ok(0);
+            return Ok(Some(0));
         }
-        Ok(refunded)
+        Ok(Some(refund_per_auth.saturating_mul(refunded_accounts)))
     }
 
     /// Overridden execution: dispatches to batch path when `aa_calls` is present.
@@ -526,11 +576,13 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
     fn execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
-        if let Some(oog) = oog_frame_result_if_intrinsic_exceeds_limit(evm, init_and_floor_gas) {
-            return Ok(oog);
-        }
+        _checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
+        // Tempo keeps the EIP-2780 runtime gas phase disabled: first-frame
+        // creation charges nothing, so the checkpoint opened in pre-execution
+        // commits immediately (writer: handler.rs `execution`).
+        evm.ctx_mut().journal_mut().checkpoint_commit();
 
         let calls = evm
             .ctx()
@@ -540,15 +592,18 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .filter(|f| !f.aa_calls.is_empty())
             .map(|f| f.aa_calls.clone());
 
+        let run_loop = |evm: &mut TempoEvm<DB, INSP>, first_frame_input| {
+            MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
+                .run_exec_loop(evm, first_frame_input)
+        };
         if let Some(calls) = calls {
-            execute_multi_call(evm, init_and_floor_gas, calls, |evm, zero_init| {
-                MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
-                    .execution(evm, zero_init)
+            execute_multi_call(evm, gas, calls, |evm, call_gas| {
+                execute_single_call(evm, call_gas, run_loop)
             })
         } else {
-            MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-                .execution(evm, init_and_floor_gas)
+            execute_single_call(evm, gas, run_loop)
         }
+        .map(Some)
     }
 
     #[inline]
@@ -567,10 +622,14 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
         if hardfork.is_t7() {
             exec_result.gas_mut().record_refund(eip7702_gas_refund);
         } else {
-            self.refund(evm, exec_result, eip7702_gas_refund);
+            self.refund(evm, exec_result, eip7702_gas_refund)?;
         }
 
-        let result_gas = post_execution::build_result_gas(exec_result.gas(), init_and_floor_gas);
+        let result_gas = post_execution::build_result_gas(
+            exec_result.instruction_result().is_halt(),
+            exec_result.gas(),
+            init_and_floor_gas,
+        );
         self.eip7623_check_gas_floor(evm, exec_result, init_and_floor_gas);
         self.reimburse_caller(evm, exec_result)?;
         self.reward_beneficiary(evm, exec_result)?;
@@ -1240,7 +1299,7 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
             .tx
             .base
             .gas_limit
-            .saturating_sub(init_gas.as_deref().unwrap().initial_gas)
+            .saturating_sub(init_gas.as_deref().unwrap().initial_regular_gas)
     } else {
         u64::MAX
     };
@@ -1342,7 +1401,7 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
         Ok(()) => {
             if checkpoint.is_some() {
                 let init_gas = init_gas.as_deref_mut().unwrap();
-                init_gas.initial_gas = init_gas.initial_gas.saturating_add(gas_used);
+                init_gas.initial_regular_gas = init_gas.initial_regular_gas.saturating_add(gas_used);
                 evm.ctx_mut().journal_mut().checkpoint_commit();
             }
             Ok(())
@@ -1352,7 +1411,7 @@ fn apply_signed_key_authorization<DB: Database, INSP>(
                 .journal_mut()
                 .checkpoint_revert(checkpoint.unwrap());
             // Execution then halts with OOG (oog_frame_result_if_intrinsic_exceeds_limit).
-            init_gas.unwrap().initial_gas = u64::MAX;
+            init_gas.unwrap().initial_regular_gas = u64::MAX;
             Ok(())
         }
         Err(error) => {
@@ -1387,7 +1446,7 @@ fn oog_frame_result_if_intrinsic_exceeds_limit<DB: Database, INSP>(
     init_and_floor_gas: &InitialAndFloorGas,
 ) -> Option<FrameResult> {
     let gas_limit = evm.ctx().tx.base.gas_limit;
-    if gas_limit >= init_and_floor_gas.initial_gas {
+    if gas_limit >= init_and_floor_gas.initial_regular_gas {
         return None;
     }
     let first_kind = evm
@@ -1398,30 +1457,61 @@ fn oog_frame_result_if_intrinsic_exceeds_limit<DB: Database, INSP>(
         .and_then(|fields| fields.aa_calls.first())
         .map_or(evm.ctx().tx.base.kind, |call| call.to);
     Some(if first_kind.is_call() {
-        FrameResult::new_call_oog(gas_limit, 0..0)
+        FrameResult::new_call_oog(gas_limit, 0..0, 0)
     } else {
-        FrameResult::new_create_oog(gas_limit)
+        FrameResult::new_create_oog(gas_limit, 0)
     })
+}
+
+/// Executes one AA sub-call against `gas` (the per-call transaction-level gas).
+///
+/// Mirrors `Handler::execution` without the EIP-2780 checkpoint handling:
+/// first frame creation, the (standard or inspector) exec loop, then
+/// `last_frame_result` to settle the frame into `gas`.
+fn execute_single_call<DB: Database, INSP>(
+    evm: &mut TempoEvm<DB, INSP>,
+    gas: &mut GasTracker,
+    run_loop: impl FnOnce(
+        &mut TempoEvm<DB, INSP>,
+        revm::interpreter::interpreter_action::FrameInit,
+    ) -> Result<FrameResult, TempoEvmError<DB::Error>>,
+) -> Result<FrameResult, TempoEvmError<DB::Error>> {
+    let mut handler =
+        MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default();
+    // `None` only happens when the EIP-2780 runtime gas phase runs out of gas,
+    // which Tempo keeps disabled.
+    let first_frame_input = handler.first_frame_input(evm, gas)?.ok_or_else(|| {
+        EVMError::Custom("first frame creation ran out of gas with EIP-2780 disabled".into())
+    })?;
+    let mut frame_result = run_loop(evm, first_frame_input)?;
+    handler.last_frame_result(evm, &mut frame_result, gas)?;
+    Ok(frame_result)
 }
 
 /// Executes a batch of AA calls atomically.
 ///
 /// Shared between `execution()` (non-inspect) and `inspect_execution()` (inspect).
 /// The `exec_single` closure determines how each sub-call is executed:
-/// - Non-inspect: `MainnetHandler::execution()`
+/// - Non-inspect: `run_exec_loop`
 /// - Inspect: `inspect_run_exec_loop()` (inspector-aware frame loop)
+///
+/// Each sub-call gets its own transaction-level [`GasTracker`] whose limit is the
+/// batch's remaining gas (matching the temporary `tx.gas_limit`) plus the current
+/// reservoir.
 fn execute_multi_call<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
-    init_and_floor_gas: &InitialAndFloorGas,
+    gas: &GasTracker,
     calls: Vec<TempoCall>,
     exec_single: impl Fn(
         &mut TempoEvm<DB, INSP>,
-        &InitialAndFloorGas,
+        &mut GasTracker,
     ) -> Result<FrameResult, TempoEvmError<DB::Error>>,
 ) -> Result<FrameResult, TempoEvmError<DB::Error>> {
     let gas_limit = evm.ctx().tx.base.gas_limit;
-    let mut remaining_gas = gas_limit.saturating_sub(init_and_floor_gas.initial_gas);
+    let mut remaining_gas = gas.remaining();
+    let mut reservoir = gas.reservoir();
     let mut accumulated_gas_refund: i64 = 0;
+    let mut accumulated_state_gas_spent: i64 = 0;
 
     if let Some(frame_result) = prevalidate_keychain_call_scopes(evm, &calls, &mut remaining_gas)? {
         return Ok(frame_result);
@@ -1444,8 +1534,9 @@ fn execute_multi_call<DB: Database, INSP>(
             tx.base.gas_limit = remaining_gas;
         }
 
-        let zero_init = InitialAndFloorGas::new(0, 0);
-        let result = exec_single(evm, &zero_init);
+        // No additional initial gas: the batch intrinsic gas was deducted upfront.
+        let mut call_gas = GasTracker::new(remaining_gas, remaining_gas, reservoir);
+        let result = exec_single(evm, &mut call_gas);
 
         {
             let tx = &mut evm.ctx_mut().tx;
@@ -1476,7 +1567,7 @@ fn execute_multi_call<DB: Database, INSP>(
                 }
             }
 
-            let gas_spent_by_failed = frame_result.gas().spent();
+            let gas_spent_by_failed = frame_result.gas().total_gas_spent();
             let total_gas_spent = (gas_limit - remaining_gas) + gas_spent_by_failed;
 
             let mut corrected_gas = Gas::new(gas_limit);
@@ -1486,15 +1577,21 @@ fn execute_multi_call<DB: Database, INSP>(
                 corrected_gas.spend_all();
             }
             corrected_gas.set_refund(0);
+            // The whole batch is rolled back, so no state gas remains charged and
+            // the reservoir returns to its pre-batch value (always 0 on Tempo, where
+            // EIP-8037 is disabled).
+            corrected_gas.set_reservoir(gas.reservoir());
             *frame_result.gas_mut() = corrected_gas;
 
             return Ok(frame_result);
         }
 
-        let gas_spent = frame_result.gas().spent();
-        let gas_refunded = frame_result.gas().refunded();
-        accumulated_gas_refund = accumulated_gas_refund.saturating_add(gas_refunded);
-        remaining_gas = remaining_gas.saturating_sub(gas_spent);
+        accumulated_gas_refund =
+            accumulated_gas_refund.saturating_add(frame_result.gas().refunded());
+        accumulated_state_gas_spent =
+            accumulated_state_gas_spent.saturating_add(frame_result.gas().state_gas_spent());
+        remaining_gas = frame_result.gas().remaining();
+        reservoir = frame_result.gas().reservoir();
 
         final_result = Some(frame_result);
     }
@@ -1508,6 +1605,8 @@ fn execute_multi_call<DB: Database, INSP>(
     let mut corrected_gas = Gas::new(gas_limit);
     corrected_gas.set_spent(total_gas_spent);
     corrected_gas.set_refund(accumulated_gas_refund);
+    corrected_gas.set_state_gas_spent(accumulated_state_gas_spent);
+    corrected_gas.set_reservoir(reservoir);
     *result.gas_mut() = corrected_gas;
 
     Ok(result)
@@ -1574,16 +1673,15 @@ fn prevalidate_keychain_call_scopes<DB: Database, INSP>(
             Ok(None)
         }
         Err(error) => {
-            let interpreter_result = match error.into_precompile_result(gas_used) {
-                Ok(output) => {
+            let interpreter_result = match error.into_precompile_result(gas_used, 0) {
+                Ok(output) if output.status.is_revert() => {
                     *remaining_gas = remaining_gas.saturating_sub(output.gas_used);
                     let mut gas = Gas::new(evm.ctx().tx.base.gas_limit);
                     gas.set_spent(evm.ctx().tx.base.gas_limit - *remaining_gas);
                     InterpreterResult::new(InstructionResult::Revert, output.bytes, gas)
                 }
-                Err(PrecompileError::OutOfGas) => {
-                    InterpreterResult::new_oog(evm.ctx().tx.base.gas_limit)
-                }
+                // `TempoPrecompileError::OutOfGas` is the only halt it produces.
+                Ok(_) => InterpreterResult::new_oog(evm.ctx().tx.base.gas_limit, 0),
                 Err(PrecompileError::Fatal(reason)) => return Err(EVMError::Custom(reason)),
                 Err(error) => return Err(EVMError::Custom(error.to_string())),
             };
@@ -1648,11 +1746,11 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
 
     if hardfork.is_t1() {
         if nonce_key == TEMPO_EXPIRING_NONCE_KEY {
-            batch_gas.initial_gas += EXPIRING_NONCE_GAS;
+            batch_gas.initial_regular_gas += EXPIRING_NONCE_GAS;
         } else if nonce == 0 {
-            batch_gas.initial_gas += gas_params.get(GasId::new_account_cost());
+            batch_gas.initial_regular_gas += gas_params.get(GasId::new_account_cost());
         } else if !nonce_key.is_zero() {
-            batch_gas.initial_gas += hardfork.gas_existing_nonce_key();
+            batch_gas.initial_regular_gas += hardfork.gas_existing_nonce_key();
         }
     } else if !nonce_key.is_zero() {
         nonce_2d_gas = if nonce == 0 {
@@ -1663,7 +1761,7 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
     }
 
     if hardfork.is_t0() {
-        batch_gas.initial_gas += nonce_2d_gas;
+        batch_gas.initial_regular_gas += nonce_2d_gas;
     }
 
     // A CREATE using a non-zero nonce key does not consume the protocol nonce
@@ -1684,23 +1782,23 @@ fn validate_aa_initial_tx_gas<DB: Database, INSP>(
             .info
             .nonce;
         if protocol_nonce == 0 {
-            batch_gas.initial_gas += gas_params.get(GasId::new_account_cost());
+            batch_gas.initial_regular_gas += gas_params.get(GasId::new_account_cost());
         }
     }
 
     // Writer: handler.rs:2432-2440. The EIP-7623 floor is checked by the caller.
-    if gas_limit < batch_gas.initial_gas {
+    if gas_limit < batch_gas.initial_regular_gas {
         return Err(EVMError::Transaction(
             revm::context::result::InvalidTransaction::CallGasCostMoreThanGasLimit {
                 gas_limit,
-                initial_gas: batch_gas.initial_gas,
+                initial_gas: batch_gas.initial_regular_gas,
             }
             .into(),
         ));
     }
 
     if !hardfork.is_t0() {
-        batch_gas.initial_gas += nonce_2d_gas;
+        batch_gas.initial_regular_gas += nonce_2d_gas;
     }
 
     Ok(batch_gas)
@@ -1949,21 +2047,21 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
     let mut gas = InitialAndFloorGas::default();
 
     // 1. Base stipend (21k).
-    gas.initial_gas += gas_params.tx_base_stipend();
+    gas.initial_regular_gas += gas_params.tx_base_stipend();
 
     // 2. Signature verification gas.
-    gas.initial_gas += tempo_sig_gas(fields);
+    gas.initial_regular_gas += tempo_sig_gas(fields);
 
     // 3. Per-call cold account access.
     let cold_account_cost =
         gas_params.warm_storage_read_cost() + gas_params.cold_account_additional_cost();
-    gas.initial_gas += cold_account_cost * calls.len().saturating_sub(1) as u64;
+    gas.initial_regular_gas += cold_account_cost * calls.len().saturating_sub(1) as u64;
 
     // 4. Authorization list costs (tempo_authorization_list only, same as writer).
     // Writer uses aa_env.tempo_authorization_list for ALL auth costs in AA path,
     // NOT TxEnv.authorization_list.
     let auth_list = &fields.auth_list;
-    gas.initial_gas +=
+    gas.initial_regular_gas +=
         auth_list.len() as u64 * gas_params.tx_eip7702_per_empty_account_cost();
 
     for auth in auth_list {
@@ -1976,14 +2074,14 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
         } else {
             primitive_sig_gas(auth.sig_type, 0)
         };
-        gas.initial_gas += if auth.is_keychain {
+        gas.initial_regular_gas += if auth.is_keychain {
             auth_sig_gas + KEYCHAIN_VALIDATION_GAS
         } else {
             auth_sig_gas
         };
         // TIP-1000: auth with nonce==0 incurs 250k account creation cost.
         if auth.nonce == 0 {
-            gas.initial_gas += gas_params.get(TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID);
+            gas.initial_regular_gas += gas_params.get(TIP1000_AUTH_ACCOUNT_CREATION_GAS_ID);
         }
     }
 
@@ -1994,7 +2092,7 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
             || primitive_sig_gas(ka.sig_type, 0),
             |signed| primitive_signature_gas(&signed.signature),
         );
-        gas.initial_gas +=
+        gas.initial_regular_gas +=
             key_auth_gas(
                 ka_sig_gas,
                 ka.num_limits,
@@ -2018,11 +2116,11 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
         total_tokens += tokens;
 
         if call.to.is_create() {
-            gas.initial_gas += gas_params.create_cost();
-            gas.initial_gas += gas_params.tx_initcode_cost(call.input.len());
+            gas.initial_regular_gas += gas_params.create_cost();
+            gas.initial_regular_gas += gas_params.tx_initcode_cost(call.input.len());
         }
     }
-    gas.initial_gas += total_tokens * gas_params.tx_token_cost();
+    gas.initial_regular_gas += total_tokens * gas_params.tx_token_cost();
 
     // 7. Access list costs (from base TxEnv).
     let tx = &evm.ctx().tx;
@@ -2030,12 +2128,12 @@ fn calculate_aa_batch_intrinsic_gas<DB: Database, INSP>(
         let (accounts, storages) = access_list.fold((0u64, 0u64), |(acc, stor), item| {
             (acc + 1, stor + item.storage_slots().count() as u64)
         });
-        gas.initial_gas += accounts * gas_params.tx_access_list_address_cost();
-        gas.initial_gas += storages * gas_params.tx_access_list_storage_key_cost();
+        gas.initial_regular_gas += accounts * gas_params.tx_access_list_address_cost();
+        gas.initial_regular_gas += storages * gas_params.tx_access_list_storage_key_cost();
     }
 
     // 8. Floor gas (EIP-7623).
-    gas.floor_gas = gas_params.tx_floor_cost(total_tokens);
+    gas.floor_gas = gas_params.tx_floor_cost_with_tokens(total_tokens);
 
     Ok(gas)
 }
@@ -2051,13 +2149,8 @@ where
         &mut self,
         evm: &mut Self::Evm,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        let mut init_gas = self.validate(evm)?;
-        let eip7702_refund =
-            self.pre_execution_with_initial_gas(evm, Some(&mut init_gas))? as i64;
-        let mut frame_result = self.inspect_execution(evm, &init_gas)?;
-        let result_gas =
-            self.post_execution(evm, &mut frame_result, init_gas, eip7702_refund)?;
-        self.execution_result(evm, frame_result, result_gas)
+        let init_gas = self.validate(evm)?;
+        self.run_after_validation(evm, init_gas, Self::inspect_execution)
     }
 
     /// Inspector-aware execution for AA batch tracing.
@@ -2072,11 +2165,12 @@ where
     fn inspect_execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
-        if let Some(oog) = oog_frame_result_if_intrinsic_exceeds_limit(evm, init_and_floor_gas) {
-            return Ok(oog);
-        }
+        _checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
+        // See `Handler::execution`: EIP-2780 is disabled, commit the
+        // pre-execution checkpoint immediately.
+        evm.ctx_mut().journal_mut().checkpoint_commit();
 
         let calls = evm
             .ctx()
@@ -2086,31 +2180,18 @@ where
             .filter(|f| !f.aa_calls.is_empty())
             .map(|f| f.aa_calls.clone());
 
+        let run_loop = |evm: &mut TempoEvm<DB, INSP>, first_frame_input| {
+            TempoHandler::<DB, INSP>::new().inspect_run_exec_loop(evm, first_frame_input)
+        };
         if let Some(calls) = calls {
             // AA batch: each sub-call goes through inspector-aware execution.
-            execute_multi_call(evm, init_and_floor_gas, calls, |evm, zero_init| {
-                // Use inspect_execution (inspector-aware) for each sub-call.
-                let gas_limit = evm.ctx().tx.base.gas_limit - zero_init.initial_gas;
-                let first_frame_input =
-                    MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
-                        .first_frame_input(evm, gas_limit)?;
-                let mut frame_result =
-                    TempoHandler::<DB, INSP>::new().inspect_run_exec_loop(evm, first_frame_input)?;
-                MainnetHandler::<TempoEvm<DB, INSP>, TempoEvmError<DB::Error>, EthFrame>::default()
-                    .last_frame_result(evm, &mut frame_result)?;
-                Ok(frame_result)
+            execute_multi_call(evm, gas, calls, |evm, call_gas| {
+                execute_single_call(evm, call_gas, run_loop)
             })
         } else {
-            // Standard single call: default inspect_execution.
-            let gas_limit = evm.ctx().tx.base.gas_limit - init_and_floor_gas.initial_gas;
-            let first_frame_input =
-                MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-                    .first_frame_input(evm, gas_limit)?;
-            let mut frame_result = self.inspect_run_exec_loop(evm, first_frame_input)?;
-            MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default()
-                .last_frame_result(evm, &mut frame_result)?;
-            Ok(frame_result)
+            execute_single_call(evm, gas, run_loop)
         }
+        .map(Some)
     }
 }
 
@@ -2565,7 +2646,7 @@ mod tests {
             let mut init_gas = InitialAndFloorGas::new(initial, 0);
             apply_signed_key_authorization(&mut evm, Some(&mut init_gas)).unwrap();
             // Pre-T4 AuthorizedKey store includes the packed-group SLOAD.
-            assert_eq!(init_gas.initial_gas - initial, 250_675);
+            assert_eq!(init_gas.initial_regular_gas - initial, 250_675);
             assert_eq!(key_status(&mut evm, root, child), (true, false));
         }
     }
@@ -2608,7 +2689,7 @@ mod tests {
 
         let mut init_gas = InitialAndFloorGas::new(100_000, 0);
         apply_signed_key_authorization(&mut evm, Some(&mut init_gas)).unwrap();
-        assert_eq!(init_gas.initial_gas, u64::MAX);
+        assert_eq!(init_gas.initial_regular_gas, u64::MAX);
         assert_eq!(key_status(&mut evm, root, child), (false, false));
     }
 
@@ -2677,7 +2758,7 @@ mod tests {
                 "{to:?}: {:?}",
                 result.result
             );
-            assert_eq!(result.result.gas_used(), gas_limit, "{to:?}");
+            assert_eq!(result.result.tx_gas_used(), gas_limit, "{to:?}");
             // CALL bumps the protocol nonce before execution; CREATE never
             // reaches frame creation.
             let expected_nonce = if to.is_call() { 1 } else { 0 };
@@ -3526,7 +3607,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            gas_kc.initial_gas - gas_no_kc.initial_gas,
+            gas_kc.initial_regular_gas - gas_no_kc.initial_regular_gas,
             KEYCHAIN_VALIDATION_GAS,
             "keychain auth should add exactly {} gas",
             KEYCHAIN_VALIDATION_GAS
@@ -3569,10 +3650,11 @@ mod tests {
         });
 
         let handler = TempoHandler::<_, NoOpInspector>::new();
-        let refund = handler.apply_eip7702_auth_list(&mut evm).unwrap();
+        let mut gas = GasTracker::new(0, 0, 0);
+        let refund = handler.apply_eip7702_auth_list(&mut evm, &mut gas).unwrap();
 
         // T1+ → no refund
-        assert_eq!(refund, 0, "T1+ should return 0 refund");
+        assert_eq!(refund, Some(0), "T1+ should return 0 refund");
 
         // Verify authority's code is set to EIP-7702 delegation.
         use revm::context_interface::JournalTr;
@@ -3602,7 +3684,8 @@ mod tests {
 
         let handler = TempoHandler::<_, NoOpInspector>::new();
         // Should not panic and should delegate to MainnetHandler (which returns 0 for non-0x04)
-        let result = handler.apply_eip7702_auth_list(&mut evm);
+        let mut gas = GasTracker::new(0, 0, 0);
+        let result = handler.apply_eip7702_auth_list(&mut evm, &mut gas);
         assert!(result.is_ok());
     }
 
@@ -4406,7 +4489,7 @@ mod tests {
         let fresh_gas = handler.validate_initial_tx_gas(&mut fresh).unwrap();
         let existing_gas = handler.validate_initial_tx_gas(&mut existing).unwrap();
         assert_eq!(
-            fresh_gas.initial_gas - existing_gas.initial_gas,
+            fresh_gas.initial_regular_gas - existing_gas.initial_regular_gas,
             fresh.ctx().cfg.gas_params.get(GasId::new_account_cost()),
         );
     }
@@ -4438,7 +4521,7 @@ mod tests {
         let fresh_gas = handler.validate_initial_tx_gas(&mut fresh).unwrap();
         let existing_gas = handler.validate_initial_tx_gas(&mut existing).unwrap();
         assert_eq!(
-            fresh_gas.initial_gas - existing_gas.initial_gas,
+            fresh_gas.initial_regular_gas - existing_gas.initial_regular_gas,
             fresh.ctx().cfg.gas_params.get(GasId::new_account_cost()),
         );
     }
@@ -4462,7 +4545,7 @@ mod tests {
 
         let handler = TempoHandler::<_, NoOpInspector>::new();
         let actual = handler.validate_initial_tx_gas(&mut evm).unwrap();
-        assert_eq!(actual.initial_gas - base.initial_gas, EXPIRING_NONCE_GAS);
+        assert_eq!(actual.initial_regular_gas - base.initial_regular_gas, EXPIRING_NONCE_GAS);
     }
 
     #[test]
@@ -4554,7 +4637,7 @@ mod tests {
         //              = 3000 + 0 + 27000 = 30000
         let expected_diff = KEY_AUTH_BASE_GAS + ECRECOVER_GAS;
         assert_eq!(
-            gas_with.initial_gas - gas_none.initial_gas,
+            gas_with.initial_regular_gas - gas_none.initial_regular_gas,
             expected_diff,
             "key_auth (secp256k1, 0 limits) should add {} gas",
             expected_diff
@@ -4610,7 +4693,7 @@ mod tests {
         // With 3 limits: 3 * 22000 = 66000 more than 0 limits.
         let expected_diff = 3 * KEY_AUTH_PER_LIMIT_GAS;
         assert_eq!(
-            gas_3.initial_gas - gas_0.initial_gas,
+            gas_3.initial_regular_gas - gas_0.initial_regular_gas,
             expected_diff,
             "3 limits should add {} gas (3 * {})",
             expected_diff,
@@ -4676,7 +4759,7 @@ mod tests {
             let intrinsic = |fields: &TempoTxFields| {
                 calculate_aa_batch_intrinsic_gas(fields, &gas_params, &evm, hardfork)
                     .unwrap()
-                    .initial_gas
+                    .initial_regular_gas
             };
             let legacy = intrinsic(&fields(None));
             let real = intrinsic(&fields(Some(signed.clone())));
@@ -4823,7 +4906,7 @@ mod tests {
                 (GasId::new_account_cost(), 250_000),
                 (GasId::new_account_cost_for_selfdestruct(), 250_000),
                 (GasId::code_deposit_cost(), 1_000),
-                (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                (GasId::tx_eip7702_regular_gas(), 12_500),
                 (GasId::new(255), 250_000),
             ]);
         }

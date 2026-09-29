@@ -27,7 +27,7 @@ use std::collections::HashSet;
 
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::StorageOps;
@@ -1850,9 +1850,10 @@ impl ContractStorage for AccountKeychain {
 
 impl Precompile for AccountKeychain {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         let selector = calldata
             .get(..4)
@@ -1876,7 +1877,7 @@ impl Precompile for AccountKeychain {
                         return err_legacy_authorize_key_selector_changed(
                             IAccountKeychain::authorizeKey_1Call::SELECTOR,
                         )
-                        .into_precompile_result(self.storage.gas_used());
+                        .into_precompile_result(self.storage.gas_used(), 0);
                     }
                     mutate_void(call, msg_sender, |sender, c| self.authorize_key(sender, c))
                 }
@@ -2052,7 +2053,7 @@ mod tests {
             AccountKeychain::new().call(&calldata, Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert!(output.bytes.is_empty());
     }
 
@@ -2078,7 +2079,7 @@ mod tests {
         StorageCtx::enter(&mut t2, || {
             let mut keychain = AccountKeychain::new();
             let output = keychain.call(&legacy, account).unwrap();
-            assert!(!output.reverted);
+            assert!(output.is_success());
             assert_eq!(
                 IAccountKeychain::getRemainingLimitCall::abi_decode_returns(&output.bytes)
                     .unwrap(),
@@ -2086,7 +2087,7 @@ mod tests {
             );
 
             let output = keychain.call(&with_period, account).unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_unknown_selector(
                 &output.bytes,
                 IAccountKeychain::getRemainingLimitWithPeriodCall::SELECTOR,
@@ -2097,14 +2098,14 @@ mod tests {
         StorageCtx::enter(&mut t3, || {
             let mut keychain = AccountKeychain::new();
             let output = keychain.call(&legacy, account).unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_unknown_selector(
                 &output.bytes,
                 IAccountKeychain::getRemainingLimitCall::SELECTOR,
             );
 
             let output = keychain.call(&with_period, account).unwrap();
-            assert!(!output.reverted);
+            assert!(output.is_success());
             let result =
                 IAccountKeychain::getRemainingLimitWithPeriodCall::abi_decode_returns(
                     &output.bytes,
@@ -2468,7 +2469,7 @@ mod tests {
                     keychain.set_tx_origin(account)?;
                     let output = keychain.call(calldata, account).unwrap();
                     if index == 0 {
-                        assert!(output.reverted);
+                        assert!(output.status.is_revert());
                         let error =
                             IAccountKeychain::LegacyAuthorizeKeySelectorChanged::abi_decode(
                                 &output.bytes,
@@ -2479,7 +2480,7 @@ mod tests {
                             FixedBytes::new(IAccountKeychain::authorizeKey_1Call::SELECTOR)
                         );
                     } else {
-                        assert!(!output.reverted, "{spec:?}: {index}");
+                        assert!(output.is_success(), "{spec:?}: {index}");
                         assert!(keychain.keys[account][key_id].read()?.expiry > 0);
                     }
 
@@ -2487,7 +2488,7 @@ mod tests {
                         let mut malformed = calldata[..4].to_vec();
                         malformed.extend(trailing);
                         let output = keychain.call(&malformed, account).unwrap();
-                        assert!(output.reverted);
+                        assert!(output.status.is_revert());
                         assert!(output.bytes.is_empty(), "selector must reach ABI decoding");
                     }
                     Ok(())
@@ -2528,13 +2529,17 @@ mod tests {
     #[test]
     fn short_calldata_halts_before_t1_and_reverts_from_t1() {
         let mut genesis = TestStorageProvider::new(TempoHardfork::Genesis);
-        let error = StorageCtx::enter(&mut genesis, || {
+        let output = StorageCtx::enter(&mut genesis, || {
             AccountKeychain::new().call(&[], Address::ZERO)
         })
-        .unwrap_err();
+        .unwrap();
         assert_eq!(
-            error,
-            PrecompileError::other_static("Invalid input: missing function selector"),
+            output.status,
+            revm::precompile::PrecompileStatus::Halt(
+                revm::precompile::PrecompileHalt::other_static(
+                    "Invalid input: missing function selector"
+                )
+            ),
         );
 
         let mut t1 = TestStorageProvider::new(TempoHardfork::T1);
@@ -2542,7 +2547,7 @@ mod tests {
             AccountKeychain::new().call(&[], Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert!(output.bytes.is_empty());
     }
 
@@ -2574,7 +2579,7 @@ mod tests {
             let output = StorageCtx::enter(&mut provider, || {
                 AccountKeychain::new().call(&selector, Address::ZERO)
             }).unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_unknown_selector(&output.bytes, selector);
         }
     }
@@ -2595,7 +2600,7 @@ mod tests {
             let mut keychain = AccountKeychain::new();
             keychain.set_tx_origin(account)?;
             let output = keychain.call(&calldata, account).unwrap();
-            assert!(!output.reverted);
+            assert!(output.is_success());
             assert_eq!(keychain.keys[account][key_id].read()?.expiry, 100);
             Ok(())
         })
@@ -2633,13 +2638,13 @@ mod tests {
                 unrestricted_restrictions(), None,
             )?;
             let rejected = keychain.call(&withdrawn, account).unwrap();
-            assert!(rejected.reverted);
+            assert!(rejected.status.is_revert());
             assert_unknown_selector(&rejected.bytes, IWithdrawnKeychain::setAllowedCallsCall::SELECTOR);
             let before = keychain.get_allowed_calls(IAccountKeychain::getAllowedCallsCall { account, keyId: key_id })?;
             assert!(!before.isScoped);
 
             let output = keychain.call(&calldata, account).unwrap();
-            assert!(!output.reverted);
+            assert!(output.is_success());
             let stored = keychain.get_allowed_calls(IAccountKeychain::getAllowedCallsCall { account, keyId: key_id })?;
             assert!(stored.isScoped);
             assert_eq!(stored.scopes.len(), 1);
@@ -2663,7 +2668,7 @@ mod tests {
             AccountKeychain::new().call(&calldata, Address::repeat_byte(0x92))
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_unknown_selector(
             &output.bytes,
             IWithdrawnKeychain::setAllowedCallsCall::SELECTOR,
@@ -2703,7 +2708,7 @@ mod tests {
                 let output = keychain
                     .call(&calldata, Address::repeat_byte(0xa3))
                     .unwrap();
-                assert!(output.reverted);
+                assert!(output.status.is_revert());
                 assert_unknown_selector(&output.bytes, IWithdrawnKeychain::setAllowedCallsCall::SELECTOR);
             }
         });
@@ -2723,10 +2728,10 @@ mod tests {
                 AccountKeychain::new().call(&calldata, Address::repeat_byte(0xb2))
             });
             if out_of_gas {
-                assert!(matches!(result, Err(PrecompileError::OutOfGas)));
+                assert!(matches!(result, Ok(ref output) if output.status == revm::precompile::PrecompileStatus::Halt(revm::precompile::PrecompileHalt::OutOfGas)));
             } else {
                 let output = result.unwrap();
-                assert!(output.reverted);
+                assert!(output.status.is_revert());
                 assert_eq!(output.gas_used, input_gas);
                 assert_unknown_selector(
                     &output.bytes,
@@ -3005,7 +3010,7 @@ mod tests {
             AccountKeychain::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_unknown_selector(&output.bytes, IAccountKeychain::isAdminKeyCall::SELECTOR);
     }
 
@@ -3190,7 +3195,7 @@ mod tests {
             AccountKeychain::new().call(&call.abi_encode(), Address::repeat_byte(0x50))
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_unknown_selector(
             &output.bytes,
             IAccountKeychain::authorizeKey_2Call::SELECTOR,

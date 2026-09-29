@@ -17,7 +17,7 @@
 
 use alloy::primitives::{Address, Bytes, B256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::account_keychain::AccountKeychain;
@@ -197,14 +197,16 @@ impl Precompile for SignatureVerifier {
             return unknown_selector(selector, 0);
         }
 
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         if calldata.len() > MAX_CALLDATA_LEN {
-            return Ok(revm::precompile::PrecompileOutput::new_reverted(
+            return Ok(revm::precompile::PrecompileOutput::revert(
                 self.storage.gas_used(),
                 ISignatureVerifier::InvalidFormat {}.abi_encode().into(),
+                0,
             ));
         }
 
@@ -272,7 +274,7 @@ mod tests {
         });
 
         let output = result.expect("precompile call returns Ok");
-        assert!(output.reverted, "pre-T3 must revert");
+        assert!(output.status.is_revert(), "pre-T3 must revert");
     }
 
     #[test]
@@ -292,7 +294,7 @@ mod tests {
                 SignatureVerifier::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert_eq!(output.reverted, high);
+            assert_eq!(output.status.is_revert(), high);
             if high {
                 assert_eq!(
                     output.bytes.as_ref(),
@@ -335,7 +337,7 @@ mod tests {
         });
 
         let output = result.expect("oversized call returns an ABI revert");
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_eq!(&output.bytes[..4], &ISignatureVerifier::InvalidFormat::SELECTOR);
     }
 
@@ -350,7 +352,7 @@ mod tests {
             SignatureVerifier::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(result.reverted);
+        assert!(result.status.is_revert());
         let error = UnknownFunctionSelector::abi_decode(&result.bytes).unwrap();
         assert_eq!(
             error.selector,
@@ -451,7 +453,7 @@ mod tests {
         });
 
         let output = result.expect("precompile call returns Ok");
-        assert!(output.reverted, "invalid sig format must revert");
+        assert!(output.status.is_revert(), "invalid sig format must revert");
         // Revert data should be the InvalidFormat selector.
         let invalid_format_selector = ISignatureVerifier::InvalidFormat::SELECTOR;
         assert_eq!(&output.bytes[..4], &invalid_format_selector);
@@ -464,7 +466,7 @@ mod tests {
             SignatureVerifier::new().call(&[0u8; 3], Address::ZERO)
         });
         let output = result.expect("precompile call returns Ok");
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
     }
 
     #[test]
@@ -506,7 +508,7 @@ mod tests {
             SignatureVerifier::new().call(&calldata, Address::ZERO)
         });
         let output = result.expect("precompile call ok");
-        assert!(!output.reverted, "verify with correct signer must succeed");
+        assert!(output.is_success(), "verify with correct signer must succeed");
 
         let returns = ISignatureVerifier::verifyCall::abi_decode_returns(&output.bytes)
             .expect("decode verify return");
@@ -524,7 +526,7 @@ mod tests {
                 SignatureVerifier::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_eq!(
                 output.bytes.as_ref(),
                 UnknownFunctionSelector {

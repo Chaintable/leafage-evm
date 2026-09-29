@@ -17,7 +17,7 @@
 
 use alloy::primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
@@ -295,9 +295,10 @@ impl Precompile for AddressRegistry {
             return unknown_selector(selector, 0);
         }
 
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         let spec = self.storage.spec();
         dispatch_call(
@@ -452,7 +453,7 @@ mod tests {
         });
 
         let output = result.expect("call ok");
-        assert!(output.reverted, "pre-T3 must revert");
+        assert!(output.status.is_revert(), "pre-T3 must revert");
     }
 
     #[test]
@@ -524,14 +525,14 @@ mod tests {
             AddressRegistry::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(pre_t5.reverted);
+        assert!(pre_t5.status.is_revert());
 
         provider.set_spec(TempoHardfork::T5);
         let t5 = StorageCtx::enter(&mut provider, || {
             AddressRegistry::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(!t5.reverted);
+        assert!(t5.is_success());
         assert!(bool::abi_decode(&t5.bytes).unwrap());
     }
 
@@ -544,7 +545,7 @@ mod tests {
             AddressRegistry::new().call(&calldata, Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_eq!(
             output.bytes.as_ref(),
             super::super::UnknownFunctionSelector {

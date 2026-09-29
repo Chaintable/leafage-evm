@@ -1,10 +1,10 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, DEFAULT_S3_READ_TIMEOUT_SECS,
 };
 use anyhow::Result;
-use aws_sdk_s3::Client;
+use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -874,7 +874,14 @@ impl Command {
         }
 
         // Initialize S3 client
-        let s3_config = aws_config::load_from_env().await;
+        let s3_config = aws_config::from_env()
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(DEFAULT_S3_READ_TIMEOUT_SECS))
+                    .build(),
+            )
+            .load()
+            .await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
         // Initialize RPC client

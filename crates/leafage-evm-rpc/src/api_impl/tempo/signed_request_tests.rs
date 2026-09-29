@@ -106,7 +106,7 @@ fn review_sponsor_warms_its_own_balance_and_controls_allowance() {
         .unwrap();
     let mut json = request();
     let plain = api.transact(&block(), &db, tx(json.clone(), &db)).unwrap();
-    assert_eq!(plain.gas().used(), 271_644);
+    assert_eq!(plain.gas().tx_gas_used(), 271_644);
     json["feePayerSignature"] = signature();
     // A signed sponsor takes precedence over the nonstandard legacy override.
     json["feePayer"] = json!(CALLER);
@@ -114,7 +114,7 @@ fn review_sponsor_warms_its_own_balance_and_controls_allowance() {
     let payer = sponsored.tempo_fields.as_ref().unwrap().fee_payer.unwrap();
     assert_ne!(payer, CALLER);
     let result = api.transact(&block(), &db, sponsored).unwrap();
-    assert_eq!(result.gas().used(), 273_644);
+    assert_eq!(result.gas().tx_gas_used(), 273_644);
     assert_eq!(result.output(), plain.output());
 
     json["maxFeePerGas"] = json!("0xe8d4a51000"); // 1e12
@@ -623,8 +623,8 @@ fn review_real_authorization_signature_gas_and_keychain_versions() {
                 ),
             )
             .unwrap();
-        let base = *baseline.get_or_insert(result.gas().used());
-        assert_eq!(result.gas().used(), base + extra);
+        let base = *baseline.get_or_insert(result.gas().tx_gas_used());
+        assert_eq!(result.gas().tx_gas_used(), base + extra);
     }
     for (version, timestamp, accepted) in [
         ("v1", 1_773_327_599, true),

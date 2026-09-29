@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use alloy::primitives::{aliases::U96, keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::address_registry::AddressRegistry;
 use super::error::{Result, TempoPrecompileError};
@@ -791,9 +791,10 @@ impl Precompile for TIP20ChannelReserve {
                 .unwrap_or([0; 4]);
             return unknown_selector(selector, 0);
         }
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         let spec = self.storage.spec();
         dispatch_call(
@@ -1018,7 +1019,7 @@ mod tests {
             TIP20ChannelReserve::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
     }
 
     #[test]
@@ -1202,7 +1203,7 @@ mod tests {
             TIP20ChannelReserve::new().call(&calldata, Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_eq!(
             output.bytes.as_ref(),
             super::super::UnknownFunctionSelector {

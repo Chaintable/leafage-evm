@@ -1066,7 +1066,7 @@ mod tests {
             if field == "keyType" {
                 let result = api.transact(&block, EmptyDB::default(), tx).unwrap();
                 assert!(result.is_success());
-                assert_eq!(result.gas().used(), 276_000);
+                assert_eq!(result.gas().tx_gas_used(), 276_000);
             }
         }
         for (field, value, expected) in [

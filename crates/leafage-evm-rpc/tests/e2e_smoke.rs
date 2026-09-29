@@ -60,6 +60,32 @@ async fn rpc_smoke_over_layered_state() {
         nonce: 0,
         code_hash: H256::ZERO,
     });
+    // At gasPrice 1 wei, a 100 ETH balance affords more than u64::MAX gas.
+    let whale = Address::repeat_byte(0x44);
+    genesis_diff.new_accounts.push(NewAccount {
+        address: keccak256(whale.as_slice()),
+        balance: U256::from(100 * ONE_ETH),
+        nonce: 0,
+        code_hash: H256::ZERO,
+    });
+    // `GAS; PUSH4 20_000_000; LT; PUSH1 15; JUMPI; PUSH1 0; PUSH1 0;
+    // REVERT; JUMPDEST; STOP`: succeeds only with more than 20M gas
+    // left, above the EIP-7825 per-tx cap of 2^24.
+    let gas_gate = Address::repeat_byte(0x33);
+    let gas_gate_code = Bytes::from(vec![
+        0x5a, 0x63, 0x01, 0x31, 0x2d, 0x00, 0x10, 0x60, 0x0f, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd,
+        0x5b, 0x00,
+    ]);
+    genesis_diff.new_codes.push(NewCode {
+        code_hash: keccak256(&gas_gate_code),
+        code: gas_gate_code.clone(),
+    });
+    genesis_diff.new_accounts.push(NewAccount {
+        address: keccak256(gas_gate.as_slice()),
+        balance: U256::ZERO,
+        nonce: 1,
+        code_hash: keccak256(&gas_gate_code),
+    });
     let genesis = block_info(0, h(0xaa), H256::ZERO);
     StateDBWrapper(
         db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
@@ -77,7 +103,7 @@ async fn rpc_smoke_over_layered_state() {
     tree.update_block(block_info(2, h(0xcc), h(0xbb)), BlockStorageDiff::default())
         .unwrap();
 
-    let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM);
+    let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
     cfg.disable_balance_check = true;
     cfg.disable_eip3607 = true;
     cfg.disable_block_gas_limit = true;
@@ -164,6 +190,50 @@ async fn rpc_smoke_over_layered_state() {
         .await
         .unwrap();
     assert_eq!(gas, U256::from(21_000u64));
+
+    // A request gas above the estimate cap is clamped to the cap, so a
+    // call that needs 20M gas fails instead of estimating past 2^24.
+    let gas_gate_req = CallRequest {
+        inner: TransactionRequest::default()
+            .from(alice)
+            .to(gas_gate)
+            .gas_limit(30_000_000),
+        tempo: None,
+    };
+    let res = DebankApiClient::estimate_gas(&client, gas_gate_req, None, None).await;
+    assert!(res.is_err(), "estimated past the cap: {res:?}");
+
+    // gas = u64::MAX with gasPrice = 1 wei from a 100 ETH account: the
+    // caller allowance saturates instead of panicking, and the estimate
+    // matches the same call without gas fields. The non-empty input
+    // skips the plain-transfer shortcut so the allowance is computed.
+    let whale_call = TransactionRequest::default()
+        .from(whale)
+        .to(bob)
+        .input(TransactionInput::new(Bytes::from(vec![0x01])));
+    let baseline = DebankApiClient::estimate_gas(
+        &client,
+        CallRequest {
+            inner: whale_call.clone(),
+            tempo: None,
+        },
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let max_gas = DebankApiClient::estimate_gas(
+        &client,
+        CallRequest {
+            inner: whale_call.gas_limit(u64::MAX).gas_price(1),
+            tempo: None,
+        },
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(max_gas, baseline);
 
     handle.stop().unwrap();
     let _ = std::fs::remove_dir_all(&db_path);

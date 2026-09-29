@@ -1,68 +1,90 @@
 use leafage_evm_types::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+    eth_precompile_fn, u64_to_address, EthPrecompileOutput, EthPrecompileResult, Precompile,
+    PrecompileHalt, PrecompileId,
 };
 use std::borrow::Cow;
 use tendermint::lite::iavl_proof;
+
+eth_precompile_fn!(
+    iavl_proof_validation_run_precompile,
+    iavl_proof_validation_run
+);
+eth_precompile_fn!(
+    iavl_proof_validation_run_nano_precompile,
+    iavl_proof_validation_run_nano
+);
+eth_precompile_fn!(
+    iavl_proof_validation_run_moran_precompile,
+    iavl_proof_validation_run_moran
+);
+eth_precompile_fn!(
+    iavl_proof_validation_run_planck_precompile,
+    iavl_proof_validation_run_planck
+);
+eth_precompile_fn!(
+    iavl_proof_validation_run_plato_precompile,
+    iavl_proof_validation_run_plato
+);
 
 /// Iavl proof validation precompile for BSC.
 pub(crate) const IAVL_PROOF_VALIDATION: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_IAVL_PROOF_VALIDATION")),
     u64_to_address(101),
-    iavl_proof_validation_run,
+    iavl_proof_validation_run_precompile,
 );
 
 /// Iavl proof validation precompile for BSC after Nano hardfork.
 pub(crate) const IAVL_PROOF_VALIDATION_NANO: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_IAVL_PROOF_VALIDATION_NANO")),
     u64_to_address(101),
-    iavl_proof_validation_run_nano,
+    iavl_proof_validation_run_nano_precompile,
 );
 
 /// Iavl proof validation precompile for BSC after Moran hardfork.
 pub(crate) const IAVL_PROOF_VALIDATION_MORAN: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_IAVL_PROOF_VALIDATION_MORAN")),
     u64_to_address(101),
-    iavl_proof_validation_run_moran,
+    iavl_proof_validation_run_moran_precompile,
 );
 
 /// Iavl proof validation precompile for BSC after Planck hardfork.
 pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_IAVL_PROOF_VALIDATION_PLANCK")),
     u64_to_address(101),
-    iavl_proof_validation_run_planck,
+    iavl_proof_validation_run_planck_precompile,
 );
 
 /// Iavl proof validation precompile for BSC after Plato hardfork.
 pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_IAVL_PROOF_VALIDATION_PLATO")),
     u64_to_address(101),
-    iavl_proof_validation_run_plato,
+    iavl_proof_validation_run_plato_precompile,
 );
 
 /// Run Iavl proof validation.
-fn iavl_proof_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn iavl_proof_validation_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, false, false, false)
 }
 
 /// Run Iavl proof validation with Nano hardfork.
-fn iavl_proof_validation_run_nano(_input: &[u8], _gas_limit: u64) -> PrecompileResult {
-    Err(PrecompileError::other("suspended"))
+fn iavl_proof_validation_run_nano(_input: &[u8], _gas_limit: u64) -> EthPrecompileResult {
+    Err(PrecompileHalt::other("suspended"))
 }
 
 /// Run Iavl proof validation with Moran hardfork.
-fn iavl_proof_validation_run_moran(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_moran(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, true, false, false)
 }
 
 /// Run Iavl proof validation with Planck hardfork.
-fn iavl_proof_validation_run_planck(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_planck(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, false, true, false)
 }
 
 /// Run Iavl proof validation with Plato hardfork.
-fn iavl_proof_validation_run_plato(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_plato(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, false, false, true)
 }
 
@@ -73,22 +95,22 @@ fn iavl_proof_validation_run_inner(
     is_moran: bool,
     is_planck: bool,
     is_plato: bool,
-) -> PrecompileResult {
+) -> EthPrecompileResult {
     const IAVL_PROOF_VALIDATION_BASE: u64 = 3_000;
 
     if IAVL_PROOF_VALIDATION_BASE > gas_limit {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
 
     let mut output = [0u8; 32];
     let mut bytes = BytesRef::Fixed(&mut output);
     let res = iavl_proof::execute(input, &mut bytes, is_moran, is_planck, is_plato);
     match res {
-        Ok(()) => Ok(PrecompileOutput::new(
+        Ok(()) => Ok(EthPrecompileOutput::new(
             IAVL_PROOF_VALIDATION_BASE,
             Bytes::copy_from_slice(&output[..]),
         )),
-        Err(str) => Err(PrecompileError::other(str)),
+        Err(str) => Err(PrecompileHalt::other(str)),
     }
 }
 
@@ -134,7 +156,7 @@ mod tests {
 
         assert_eq!(
             res.err(),
-            Some(PrecompileError::other("invalid merkle proof"))
+            Some(PrecompileHalt::other("invalid merkle proof"))
         );
     }
 
@@ -157,7 +179,7 @@ mod tests {
 
             assert_eq!(
                 res.err(),
-                Some(PrecompileError::other("invalid merkle proof"))
+                Some(PrecompileHalt::other("invalid merkle proof"))
             );
         });
 
@@ -166,7 +188,7 @@ mod tests {
 
         assert_eq!(
             res.err(),
-            Some(PrecompileError::other("invalid merkle proof"))
+            Some(PrecompileHalt::other("invalid merkle proof"))
         );
     }
 

@@ -37,7 +37,7 @@
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::{SolCall, SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 use std::sync::LazyLock;
 
 use super::error::{Result, TempoPrecompileError};
@@ -2016,20 +2016,21 @@ impl TIP20Call {
 
 impl Precompile for TIP20Token {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         // Ensure that the token is initialized (has bytecode). Like official, a failed
         // account load only counts as "uninitialized" before T4.
         let initialized = match self.is_initialized() {
             Ok(initialized) => initialized,
             Err(_) if !self.storage.spec().is_t4() => false,
-            Err(err) => return err.into_precompile_result(self.storage.gas_used()),
+            Err(err) => return err.into_precompile_result(self.storage.gas_used(), 0),
         };
         if !initialized {
             return TempoPrecompileError::Revert(ITIP20::Uninitialized {}.abi_encode().into())
-                .into_precompile_result(self.storage.gas_used());
+                .into_precompile_result(self.storage.gas_used(), 0);
         }
 
         // Fork-gated selectors are rejected before ABI decode, like official `dispatch!`.
@@ -2273,7 +2274,7 @@ mod tests {
                 .call(&ITIP20::logoURICall {}.abi_encode(), admin)
         })
         .unwrap();
-        assert!(pre_t5.reverted);
+        assert!(pre_t5.status.is_revert());
         assert_eq!(
             provider.storage(PATH_USD_ADDRESS, U256::from(5)),
             U256::ZERO
@@ -2290,14 +2291,14 @@ mod tests {
             )
         })
         .unwrap();
-        assert!(!set_result.reverted);
+        assert!(set_result.is_success());
 
         let view_result = StorageCtx::enter(&mut provider, || {
             TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
                 .call(&ITIP20::logoURICall {}.abi_encode(), admin)
         })
         .unwrap();
-        assert!(!view_result.reverted);
+        assert!(view_result.is_success());
         assert_eq!(String::abi_decode(&view_result.bytes).unwrap(), uri);
     }
 
@@ -2358,7 +2359,7 @@ mod tests {
                 if spec >= activation {
                     continue;
                 }
-                assert!(output.reverted, "{selector:?} at {spec:?}");
+                assert!(output.status.is_revert(), "{selector:?} at {spec:?}");
                 assert_eq!(
                     UnknownFunctionSelector::abi_decode(&output.bytes)
                         .unwrap()
@@ -2387,7 +2388,7 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert!(!nonce.reverted);
+        assert!(nonce.is_success());
         assert_eq!(U256::abi_decode(&nonce.bytes).unwrap(), U256::ZERO);
     }
 
@@ -2494,11 +2495,11 @@ mod tests {
         };
 
         let pre_t4 = call(TempoHardfork::T3).unwrap();
-        assert!(pre_t4.reverted);
+        assert!(pre_t4.status.is_revert());
         assert_eq!(pre_t4.bytes, ITIP20::Uninitialized {}.abi_encode());
         assert!(matches!(
             call(TempoHardfork::T4),
-            Err(PrecompileError::OutOfGas)
+            Ok(ref output) if output.status == revm::precompile::PrecompileStatus::Halt(revm::precompile::PrecompileHalt::OutOfGas)
         ));
     }
 

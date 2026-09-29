@@ -16,14 +16,18 @@ use revm::{
         result::{EVMError, ExecutionResult, HaltReason, Output, ResultGas, SuccessReason},
     },
     context_interface::{
-        Cfg, JournalTr, journaled_state::account::JournaledAccountTr, result::InvalidTransaction,
+        Cfg, JournalTr,
+        journaled_state::{JournalCheckpoint, account::JournaledAccountTr},
+        result::InvalidTransaction,
         transaction::TransactionType,
     },
+    context_interface::cfg::gas::GasTracker,
     handler::{
-        EvmTr, FrameResult, FrameTr, Handler, post_execution, pre_execution, validation,
+        EvmTr, FrameResult, FrameTr, Handler, execution, post_execution, pre_execution,
+        validation,
     },
     inspector::{Inspector, InspectorHandler},
-    interpreter::{Gas, InitialAndFloorGas, interpreter::EthInterpreter},
+    interpreter::{InitialAndFloorGas, interpreter::EthInterpreter},
     primitives::hardfork::SpecId,
 };
 
@@ -33,11 +37,20 @@ const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
 const ARBOS_VERSION_MULTI_GAS: u64 = 60;
 const ARBOS_VERSION_MULTI_GAS_REFUND_FIX: u64 = 61;
 
-pub struct ArbitrumHandler<DB: Database + DatabaseRef, INSP>(core::marker::PhantomData<(DB, INSP)>);
+pub struct ArbitrumHandler<DB: Database + DatabaseRef, INSP> {
+    /// Total intrinsic gas of the running transaction, captured after
+    /// validation. revm 43's `Handler::execution` no longer receives the
+    /// `InitialAndFloorGas`, but nitro's start-tx / gas-charging hooks need it.
+    intrinsic_gas: u64,
+    _phantom: core::marker::PhantomData<(DB, INSP)>,
+}
 
 impl<DB: Database + DatabaseRef, INSP> ArbitrumHandler<DB, INSP> {
     pub fn new() -> Self {
-        Self(core::marker::PhantomData)
+        Self {
+            intrinsic_gas: 0,
+            _phantom: core::marker::PhantomData,
+        }
     }
 }
 
@@ -410,7 +423,12 @@ where
             return Ok(());
         };
         let basefee = U256::from(Self::l2_basefee(evm.ctx()));
-        let single_gas_cost = basefee.saturating_mul(U256::from(exec_result.gas().used()));
+        let single_gas_cost = basefee.saturating_mul(U256::from(
+            exec_result
+                .gas()
+                .used()
+                .saturating_sub(exec_result.gas().reservoir()),
+        ));
         if single_gas_cost <= multi_gas_cost {
             return Ok(());
         }
@@ -446,26 +464,21 @@ where
         Ok(single_gas_cost.saturating_sub(multi_gas_cost))
     }
 
-    fn finish_frame_result(
+    /// Nitro's gas-charging hook runs before the first frame is created: the
+    /// poster gas is spent on the transaction-level gas and, for gas
+    /// estimation, the gas above the computation limit is held back from the
+    /// frame. Held gas is returned to the transaction after the frame settles.
+    fn charge_tx_gas(
+        &self,
         evm: &mut ArbitrumEvm<DB, INSP>,
-        frame_result: &mut FrameResult,
-        held_gas: u64,
-    ) {
-        let instruction_result = frame_result.interpreter_result().result;
-        let gas = frame_result.gas_mut();
-        let execution_remaining = gas.remaining();
-        let refunded = gas.refunded();
-
-        *gas = Gas::new_spent(evm.ctx().tx().gas_limit());
-        gas.erase_cost(held_gas);
-
-        if instruction_result.is_ok_or_revert() {
-            gas.erase_cost(execution_remaining);
-        }
-
-        if instruction_result.is_ok() {
-            gas.record_refund(refunded);
-        }
+        gas: &mut GasTracker,
+    ) -> Result<u64, EVMError<<DB as Database>::Error>> {
+        let intrinsic_gas = self.intrinsic_gas;
+        let arbos_version = Self::start_tx_hook(evm, intrinsic_gas);
+        let mut gas_limit = gas.remaining();
+        let held_gas = self.gas_charging_hook(evm, &mut gas_limit, intrinsic_gas, arbos_version)?;
+        gas.set_remaining(gas_limit);
+        Ok(held_gas)
     }
 
     fn start_tx_hook(evm: &mut ArbitrumEvm<DB, INSP>, intrinsic_gas: u64) -> u64 {
@@ -499,7 +512,6 @@ where
             .submit_retryable_tx()
             .cloned()
             .ok_or_else(|| EVMError::Custom("missing submit-retryable transaction".to_owned()))?;
-        let gas_limit = submit.gas;
         let outcome = ArbRetryableState::new(evm.ctx_mut()).submit_retryable(&submit)?;
         let logs = evm.ctx_mut().journal_mut().take_logs();
         evm.ctx_mut().journal_mut().commit_tx();
@@ -517,14 +529,14 @@ where
                 }
                 Ok(ExecutionResult::Success {
                     reason: SuccessReason::Return,
-                    gas: ResultGas::new(gas_limit, gas_used, 0, 0, 0),
+                    gas: ResultGas::default().with_total_gas_spent(gas_used),
                     logs,
                     output: Output::Call(Bytes::copy_from_slice(ticket_id.as_slice())),
                 })
             }
             SubmitRetryableOutcome::Halt { reason } => Ok(ExecutionResult::Halt {
                 reason,
-                gas: ResultGas::new(gas_limit, 0, 0, 0, 0),
+                gas: ResultGas::default(),
                 logs,
             }),
         }
@@ -550,8 +562,18 @@ where
         Self::prepare_retryable_redeem(evm)?;
 
         let init_and_floor_gas = self.validate(evm)?;
-        let eip7702_refund = self.pre_execution(evm)? as i64;
-        let mut exec_result = self.execution(evm, &init_and_floor_gas)?;
+        self.intrinsic_gas = init_and_floor_gas.initial_total_gas();
+        let mut gas = self.tx_gas(evm, &init_and_floor_gas);
+        let pre_execution = self.pre_execution(evm, &mut gas)?;
+        let eip7702_refund = pre_execution.map(|pe| pe.eip7702_refund).unwrap_or(0) as i64;
+        let mut exec_result = None;
+        if let Some(pre_execution) = pre_execution {
+            exec_result = self.execution(evm, pre_execution.checkpoint, &mut gas)?;
+        }
+        let mut exec_result = match exec_result {
+            Some(exec_result) => exec_result,
+            None => self.runtime_oog_result(evm, &init_and_floor_gas, &mut gas)?,
+        };
         let result_gas =
             self.post_execution(evm, &mut exec_result, init_and_floor_gas, eip7702_refund)?;
         self.execution_result(evm, exec_result, result_gas)
@@ -566,6 +588,7 @@ where
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
+        _init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
         evm.ctx_mut().chain_mut().clear_tx_fee_context();
         let fee_context = Self::initialize_tx_fee_context(evm.ctx_mut())?;
@@ -598,35 +621,21 @@ where
     fn execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
-        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas);
+        checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
+        let held_gas = self.charge_tx_gas(evm, gas)?;
 
-        let mut gas_limit = evm
-            .ctx()
-            .tx()
-            .gas_limit()
-            .saturating_sub(init_and_floor_gas.initial_gas);
-        let held_gas = self.gas_charging_hook(
-            evm,
-            &mut gas_limit,
-            init_and_floor_gas.initial_gas,
-            arbos_version,
-        )?;
+        let Some(first_frame_input) = self.first_frame_input(evm, gas)? else {
+            execution::runtime_oog_unwind(evm.ctx(), checkpoint)?;
+            return Ok(None);
+        };
+        evm.ctx().journal_mut().checkpoint_commit();
 
-        let first_frame_input = self.first_frame_input(evm, gas_limit)?;
         let mut frame_result = self.run_exec_loop(evm, first_frame_input)?;
-        Self::finish_frame_result(evm, &mut frame_result, held_gas);
-        Ok(frame_result)
-    }
-
-    fn last_frame_result(
-        &mut self,
-        evm: &mut Self::Evm,
-        frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
-    ) -> Result<(), Self::Error> {
-        Self::finish_frame_result(evm, frame_result, 0);
-        Ok(())
+        self.last_frame_result(evm, &mut frame_result, gas)?;
+        frame_result.gas_mut().erase_cost(held_gas);
+        Ok(Some(frame_result))
     }
 
     fn refund(
@@ -634,7 +643,7 @@ where
         evm: &mut Self::Evm,
         exec_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
         eip7702_refund: i64,
-    ) {
+    ) -> Result<(), Self::Error> {
         let spec: SpecId = (*evm.ctx().cfg().spec()).into();
         let gas = exec_result.gas_mut();
         gas.record_refund(eip7702_refund);
@@ -644,10 +653,15 @@ where
         } else {
             2
         };
-        let refundable_spent = gas.spent().saturating_sub(Self::poster_gas(evm));
+        // EIP-8037: the unused state-gas reservoir is not spent gas.
+        let refundable_spent = gas
+            .total_gas_spent()
+            .saturating_sub(gas.reservoir())
+            .saturating_sub(Self::poster_gas(evm));
         let max_refund = refundable_spent / max_refund_quotient;
         let refund = (gas.refunded() as u64).min(max_refund);
         gas.set_refund(refund as i64);
+        Ok(())
     }
 
     fn eip7623_check_gas_floor(
@@ -657,8 +671,8 @@ where
         init_and_floor_gas: InitialAndFloorGas,
     ) {
         let gas = exec_result.gas();
-        let gross_gas_used = gas.spent();
-        let net_gas_used = gas.spent_sub_refunded();
+        let gross_gas_used = gas.total_gas_spent().saturating_sub(gas.reservoir());
+        let net_gas_used = gross_gas_used.saturating_sub(gas.refunded() as u64);
         let refund = gas.refunded() as u64;
         evm.ctx_mut()
             .chain_mut()
@@ -684,7 +698,11 @@ where
 
         let effective_gas_price = Self::tx_fee_context(evm.ctx())?.settlement_gas_price();
         let gas = exec_result.gas();
-        let refund_gas = gas.remaining().saturating_add(gas.refunded() as u64);
+        // EIP-8037: the unused state-gas reservoir is reimbursed as well.
+        let refund_gas = gas
+            .remaining()
+            .saturating_add(gas.reservoir())
+            .saturating_add(gas.refunded() as u64);
         let refund = U256::from(effective_gas_price.saturating_mul(refund_gas as u128));
         let caller = evm.ctx().tx().caller();
 
@@ -714,7 +732,11 @@ where
         let basefee = Self::l2_basefee(evm.ctx());
         let arbos_version = evm.ctx().chain().current_arbos_version();
         let poster_gas = Self::poster_gas(evm);
-        let compute_gas = exec_result.gas().used().saturating_sub(poster_gas);
+        let compute_gas = exec_result
+            .gas()
+            .used()
+            .saturating_sub(exec_result.gas().reservoir())
+            .saturating_sub(poster_gas);
         let network_fee = U256::from(
             effective_gas_price
                 .min(basefee)
@@ -784,11 +806,17 @@ where
 
         let retryable = evm.ctx().tx().retryable_redeem_tx().cloned();
         if let Some(retryable) = retryable {
-            let gas_left = result_gas
-                .remaining()
+            let gas_left = evm
+                .ctx()
+                .tx()
+                .gas_limit()
+                .saturating_sub(result_gas.total_gas_spent())
                 .saturating_add(result_gas.inner_refunded());
-            let multi_gas_refund =
-                Self::retryable_multi_gas_refund(evm.ctx_mut(), &retryable, result_gas.used())?;
+            let multi_gas_refund = Self::retryable_multi_gas_refund(
+                evm.ctx_mut(),
+                &retryable,
+                result_gas.tx_gas_used(),
+            )?;
             ArbRetryableState::new(evm.ctx_mut()).finish_redeem(
                 &retryable,
                 result.interpreter_result().result.is_ok(),
@@ -829,6 +857,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::interpreter::Gas;
     use crate::arbitrum::evm::ArbitrumExecutionContext;
     use crate::arbitrum::hardforks::ArbitrumHardfork;
     use crate::arbitrum::precompile::ArbitrumPrecompileEnv;
@@ -1046,7 +1075,7 @@ mod tests {
             panic!("submit-retryable hook must return success");
         };
         assert_eq!(output.data().as_ref(), ticket_id.as_slice());
-        assert_eq!(gas.spent(), 100_000);
+        assert_eq!(gas.total_gas_spent(), 100_000);
         assert_eq!(logs.len(), 2);
         assert_eq!(
             evm.ctx_mut().chain_mut().take_scheduled_retryables().len(),
@@ -1066,7 +1095,7 @@ mod tests {
         let ExecutionResult::Success { logs, gas, .. } = result else {
             panic!("submit-retryable hook must return success");
         };
-        assert_eq!(gas.spent(), 0);
+        assert_eq!(gas.total_gas_spent(), 0);
         assert_eq!(logs.len(), 1);
         assert!(evm
             .ctx_mut()
@@ -1108,7 +1137,7 @@ mod tests {
             panic!("callvalue failure must halt the submit-retryable transaction");
         };
         assert_eq!(reason, HaltReason::OutOfFunds);
-        assert_eq!(gas.spent(), 0);
+        assert_eq!(gas.total_gas_spent(), 0);
         assert!(logs.is_empty());
         assert!(evm
             .ctx_mut()
@@ -1163,7 +1192,7 @@ mod tests {
             .expect("execute scheduled redeem");
 
         assert!(result.is_success());
-        assert_eq!(result.gas_used(), 21_000);
+        assert_eq!(result.gas().tx_gas_used(), 21_000);
         let journal = evm.ctx_mut().journal_mut();
         let from_balance = journal.load_account(from).unwrap().data.info.balance;
         let refund_balance = journal.load_account(refund_to).unwrap().data.info.balance;
@@ -1314,7 +1343,7 @@ mod tests {
             .set_current_poster_charge(ArbPosterCharge::default());
 
         let mut gas = Gas::new(100);
-        assert!(gas.record_cost(40));
+        assert!(gas.record_regular_cost(40));
         let mut result = FrameResult::Call(CallOutcome::new(
             InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
             0..0,
@@ -1784,7 +1813,7 @@ mod tests {
         let poster = ArbitrumHandler::<TestDb, ()>::poster_gas(&evm);
 
         assert!(result.result.is_success());
-        assert_eq!(result.result.gas_used(), 21_000 + poster);
+        assert_eq!(result.result.gas().tx_gas_used(), 21_000 + poster);
     }
 
     /// Pins the `inspect_execution` override: both execution paths must run the
@@ -1894,7 +1923,7 @@ mod tests {
 
         assert_eq!(inspect_poster, transact_poster);
         assert_eq!(inspect_multi_gas, transact_multi_gas);
-        assert_eq!(inspect_result.gas_used(), transact_result.result.gas_used());
+        assert_eq!(inspect_result.gas().tx_gas_used(), transact_result.result.gas().tx_gas_used());
     }
 
     #[test]
@@ -1937,7 +1966,7 @@ mod tests {
             .leave_multi_gas_unattributed(10);
 
         let mut gas = Gas::new(100);
-        assert!(gas.record_cost(100));
+        assert!(gas.record_regular_cost(100));
         gas.record_refund(20);
         let mut result = FrameResult::Call(CallOutcome::new(
             InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
@@ -1972,7 +2001,7 @@ mod tests {
             .leave_multi_gas_unattributed(10);
 
         let mut gas = Gas::new(100);
-        assert!(gas.record_cost(100));
+        assert!(gas.record_regular_cost(100));
         let mut result = FrameResult::Call(CallOutcome::new(
             InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
             0..0,
@@ -2002,7 +2031,7 @@ mod tests {
             .record_multi_gas(ArbResourceKind::Computation, 120);
 
         let mut gas = Gas::new(100);
-        assert!(gas.record_cost(100));
+        assert!(gas.record_regular_cost(100));
         let mut result = FrameResult::Call(CallOutcome::new(
             InterpreterResult::new(InstructionResult::Return, Bytes::new(), gas),
             0..0,
@@ -2070,8 +2099,18 @@ where
         Self::prepare_retryable_redeem(evm)?;
 
         let init_and_floor_gas = self.validate(evm)?;
-        let eip7702_refund = self.pre_execution(evm)? as i64;
-        let mut frame_result = self.inspect_execution(evm, &init_and_floor_gas)?;
+        self.intrinsic_gas = init_and_floor_gas.initial_total_gas();
+        let mut gas = self.tx_gas(evm, &init_and_floor_gas);
+        let pre_execution = self.pre_execution(evm, &mut gas)?;
+        let eip7702_refund = pre_execution.map(|pe| pe.eip7702_refund).unwrap_or(0) as i64;
+        let mut exec_result = None;
+        if let Some(pre_execution) = pre_execution {
+            exec_result = self.inspect_execution(evm, pre_execution.checkpoint, &mut gas)?;
+        }
+        let mut frame_result = match exec_result {
+            Some(exec_result) => exec_result,
+            None => self.runtime_oog_result(evm, &init_and_floor_gas, &mut gas)?,
+        };
         let result_gas =
             self.post_execution(evm, &mut frame_result, init_and_floor_gas, eip7702_refund)?;
         self.execution_result(evm, frame_result, result_gas)
@@ -2085,25 +2124,20 @@ where
     fn inspect_execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
-        let arbos_version = Self::start_tx_hook(evm, init_and_floor_gas.initial_gas);
+        checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
+        let held_gas = self.charge_tx_gas(evm, gas)?;
 
-        let mut gas_limit = evm
-            .ctx()
-            .tx()
-            .gas_limit()
-            .saturating_sub(init_and_floor_gas.initial_gas);
-        let held_gas = self.gas_charging_hook(
-            evm,
-            &mut gas_limit,
-            init_and_floor_gas.initial_gas,
-            arbos_version,
-        )?;
+        let Some(first_frame_input) = self.first_frame_input(evm, gas)? else {
+            execution::runtime_oog_unwind(evm.ctx(), checkpoint)?;
+            return Ok(None);
+        };
+        evm.ctx().journal_mut().checkpoint_commit();
 
-        let first_frame_input = self.first_frame_input(evm, gas_limit)?;
         let mut frame_result = self.inspect_run_exec_loop(evm, first_frame_input)?;
-        Self::finish_frame_result(evm, &mut frame_result, held_gas);
-        Ok(frame_result)
+        self.last_frame_result(evm, &mut frame_result, gas)?;
+        frame_result.gas_mut().erase_cost(held_gas);
+        Ok(Some(frame_result))
     }
 }

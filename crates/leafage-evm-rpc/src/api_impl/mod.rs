@@ -26,6 +26,7 @@ pub use core::MultiChainCfgEnv;
 pub(crate) use core::{ApiCore, EvmExecutor, GasFeeHandler};
 
 mod mainnet;
+mod arc;
 
 mod arbitrum;
 mod base;
@@ -37,8 +38,10 @@ mod mantle;
 mod warmup;
 mod cosmos;
 mod iotex;
+mod monad;
 mod moonbeam;
 mod polygon;
+mod rsk;
 mod tempo;
 
 pub(crate) mod token_collector;

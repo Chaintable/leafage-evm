@@ -79,3 +79,10 @@ impl Block for TempoBlockEnv {
         self.inner.blob_excess_gas_and_price()
     }
 }
+
+impl alloy_evm::env::BlockEnvironment for TempoBlockEnv {
+    #[inline]
+    fn inner_mut(&mut self) -> &mut BlockEnv {
+        &mut self.inner
+    }
+}

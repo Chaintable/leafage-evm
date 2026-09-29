@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.96.0
+ARG RUST_VERSION=1.97.1
 
 # libstylus.so, built from Chaintable/nitro and published as a COPY-only image.
 ARG LIBSTYLUS_REV=v3.11.1-ct.5
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-chef --locked --version 0.1.68
+RUN cargo install cargo-chef --locked --version 0.1.78
 
 WORKDIR /app
 

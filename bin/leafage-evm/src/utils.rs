@@ -8,16 +8,18 @@ use leafage_evm_types::{BlockInfo, BlockStorageDiff, DebankTransaction, H256};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::{io::Read, str::FromStr};
 use tracing::{debug, trace};
 
+pub(crate) const DEFAULT_S3_READ_TIMEOUT_SECS: u64 = 20;
+
 static S3_BLOCK_CACHE: LazyLock<RwLock<LruCache<H256, BlockInfo>>> =
     LazyLock::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(1024).unwrap())));
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KafkaS3Config {
     pub topic: String,
     pub brokers: String,
@@ -31,6 +33,30 @@ pub struct KafkaS3Config {
     pub s3_chain_id: String,
     #[serde(default)]
     pub version: String,
+    /// AWS SDK operation timeout, including retries but excluding response body reads.
+    #[serde(default = "default_s3_read_timeout_secs")]
+    pub s3_read_timeout_secs: NonZeroU64,
+}
+
+fn default_s3_read_timeout_secs() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_S3_READ_TIMEOUT_SECS).unwrap()
+}
+
+impl Default for KafkaS3Config {
+    fn default() -> Self {
+        Self {
+            topic: String::new(),
+            brokers: String::new(),
+            partition: 0,
+            bucket_name: String::new(),
+            bundle_bucket_name: String::new(),
+            outer_bucket_name: String::new(),
+            offset_dir: String::new(),
+            s3_chain_id: String::new(),
+            version: String::new(),
+            s3_read_timeout_secs: default_s3_read_timeout_secs(),
+        }
+    }
 }
 
 /// Parse a [`KafkaS3Config`] CLI argument: an absolute file path or inline JSON.
@@ -612,6 +638,30 @@ mod tests {
         Router,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn s3_timeout_config_defaults_and_rejects_zero() {
+        let mut json = serde_json::json!({
+            "topic": "blocks", "brokers": "localhost:9092", "partition": 0,
+            "bucket_name": "source", "outer_bucket_name": "outer", "s3_chain_id": "4663"
+        });
+        let config = parse_kafka_s3_config(&json.to_string()).unwrap();
+        assert_eq!(
+            config.s3_read_timeout_secs.get(),
+            DEFAULT_S3_READ_TIMEOUT_SECS
+        );
+        assert_eq!(
+            KafkaS3Config::default().s3_read_timeout_secs.get(),
+            DEFAULT_S3_READ_TIMEOUT_SECS
+        );
+
+        json["s3_read_timeout_secs"] = serde_json::json!(120);
+        let config = parse_kafka_s3_config(&json.to_string()).unwrap();
+        assert_eq!(config.s3_read_timeout_secs.get(), 120);
+
+        json["s3_read_timeout_secs"] = serde_json::json!(0);
+        assert!(parse_kafka_s3_config(&json.to_string()).is_err());
+    }
 
     type DiffServerState = (Vec<u8>, Arc<Mutex<Vec<String>>>);
 

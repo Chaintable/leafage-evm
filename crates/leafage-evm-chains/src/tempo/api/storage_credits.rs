@@ -1,13 +1,10 @@
 //! T7 SSTORE opcode hook for TIP-1060 storage credits.
 
 use alloy_evm::Database;
-use revm::{
-    context_interface::host::LoadError,
-    interpreter::{
-        interpreter::EthInterpreter,
-        interpreter_types::{InputsTr, RuntimeFlag, StackTr},
-        Host, InstructionContext, InstructionResult,
-    },
+use revm::interpreter::{
+    instructions::host::{sstore_default_gas_accounting, sstore_with_gas_accounting},
+    interpreter::EthInterpreter,
+    InstructionContext, InstructionResult,
 };
 
 use super::{TempoContext, TempoEvm, TempoEvmError};
@@ -18,65 +15,24 @@ use crate::tempo::precompile::{
     STORAGE_CREDITS_ADDRESS,
 };
 
+/// Tempo SSTORE with TIP-1060 storage-credit accounting before the default
+/// dynamic gas and refund (writer: gas_credits.rs `sstore`).
 pub(crate) fn sstore<DB: Database>(
     context: InstructionContext<'_, TempoContext<DB>, EthInterpreter>,
-) {
-    revm::interpreter::require_non_staticcall!(context.interpreter);
-    let Some([index, value]) = StackTr::popn(&mut context.interpreter.stack) else {
-        context.interpreter.halt_underflow();
-        return;
-    };
-
-    let target = context.interpreter.input.target_address();
-    if context.interpreter.gas.remaining() <= context.host.gas_params().call_stipend() {
-        context
-            .interpreter
-            .halt(InstructionResult::ReentrancySentryOOG);
-        return;
-    }
-
-    revm::interpreter::gas!(
-        context.interpreter,
-        context.host.gas_params().sstore_static_gas()
-    );
-
-    let additional_cold_cost = context.host.gas_params().cold_storage_additional_cost();
-    let skip_cold = context.interpreter.gas.remaining() < additional_cold_cost;
-    let state_load = match context
-        .host
-        .sstore_skip_cold_load(target, index, value, skip_cold)
-    {
-        Ok(load) => load,
-        Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
-        Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
-    };
-
-    if let Err(error) = account_opcode_storage_write(
-        context.host,
-        &mut context.interpreter.gas,
-        target,
-        &state_load,
-    ) {
-        match error {
-            AccountingError::OutOfGas => context.interpreter.halt_oog(),
-            AccountingError::Fatal => context.interpreter.halt_fatal(),
-        }
-        return;
-    }
-
-    revm::interpreter::gas!(
-        context.interpreter,
-        context
-            .host
-            .gas_params()
-            .sstore_dynamic_gas(true, &state_load.data, state_load.is_cold)
-    );
-    context.interpreter.gas.record_refund(
-        context
-            .host
-            .gas_params()
-            .sstore_refund(true, &state_load.data),
-    );
+) -> Result<(), InstructionResult> {
+    sstore_with_gas_accounting(context, |context, target, state_load| {
+        account_opcode_storage_write(
+            context.host,
+            &mut context.interpreter.gas,
+            target,
+            state_load,
+        )
+        .map_err(|error| match error {
+            AccountingError::OutOfGas => InstructionResult::OutOfGas,
+            AccountingError::Fatal => InstructionResult::FatalExternalError,
+        })?;
+        sstore_default_gas_accounting(context, target, state_load)
+    })
 }
 
 /// Settles successful transaction Refund-mode creations against persistent credits.
@@ -86,24 +42,15 @@ pub(crate) fn apply_refund<DB: Database, I>(
 ) -> Result<(), TempoEvmError<DB::Error>> {
     use revm::context_interface::{ContextTr, JournalTr};
 
+    // Take the transaction-local storage-credit slots before settling them.
     let transient_entries: Vec<_> = evm
         .inner
         .ctx
         .journaled_state
         .transient_storage
-        .iter()
-        .filter_map(|((address, key), value)| {
-            (*address == STORAGE_CREDITS_ADDRESS).then_some((*key, *value))
-        })
-        .collect();
-
-    for (key, _) in &transient_entries {
-        evm.inner
-            .ctx
-            .journaled_state
-            .transient_storage
-            .remove(&(STORAGE_CREDITS_ADDRESS, *key));
-    }
+        .remove(&STORAGE_CREDITS_ADDRESS)
+        .map(|slots| slots.into_iter().collect())
+        .unwrap_or_default();
 
     let mut settled_total = 0u64;
     for (key, word) in transient_entries {

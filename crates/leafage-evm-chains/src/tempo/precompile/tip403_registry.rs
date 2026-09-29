@@ -17,7 +17,7 @@
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::super::address::TempoAddressExt;
 use super::super::hardfork::TempoHardfork;
@@ -1309,9 +1309,10 @@ const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
 
 impl Precompile for TIP403Registry {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         let spec = self.storage.spec();
         dispatch_call(
@@ -1680,7 +1681,7 @@ mod tests {
                 TIP403Registry::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
         }
 
         provider.set_spec(TempoHardfork::T9);
@@ -1688,7 +1689,7 @@ mod tests {
             TIP403Registry::new().call(&lookup.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(!lookup_output.reverted);
+        assert!(lookup_output.is_success());
         assert_eq!(
             ITIP403Registry::tokenTransferPolicyIdCall::abi_decode_returns(&lookup_output.bytes)
                 .unwrap(),
@@ -1702,7 +1703,7 @@ mod tests {
             TIP403Registry::new().call(&migrate.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(!migrate_output.reverted);
+        assert!(migrate_output.is_success());
         assert_eq!(
             ITIP403Registry::migrateTransferPolicyIdsCall::abi_decode_returns(
                 &migrate_output.bytes
@@ -1858,7 +1859,7 @@ mod tests {
             TIP403Registry::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         let error = UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
         assert_eq!(
             error.selector,
@@ -1896,7 +1897,7 @@ mod tests {
                 TIP403Registry::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_eq!(
                 output.bytes.as_ref(),
                 UnknownFunctionSelector {
@@ -1953,7 +1954,7 @@ mod tests {
                 if spec.is_t2() {
                     assert_ne!(output.bytes.as_ref(), unknown.as_slice());
                 } else {
-                    assert!(output.reverted);
+                    assert!(output.status.is_revert());
                     assert_eq!(output.bytes.as_ref(), unknown.as_slice());
                     assert!(provider.events(TIP403_REGISTRY_ADDRESS).is_empty());
                 }

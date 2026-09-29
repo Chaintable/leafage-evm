@@ -2,7 +2,7 @@
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::address_registry::AddressRegistry;
 use super::error::{Result, TempoPrecompileError};
@@ -288,9 +288,10 @@ impl Precompile for ReceivePolicyGuard {
                 .unwrap_or([0; 4]);
             return unknown_selector(selector, 0);
         }
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         dispatch_call(
             calldata,
@@ -367,7 +368,7 @@ mod tests {
             ReceivePolicyGuard::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
     }
 
     #[test]
@@ -384,7 +385,7 @@ mod tests {
             })
             .unwrap();
 
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             let error = UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
             assert_eq!(error.selector, FixedBytes::new(selector));
         }

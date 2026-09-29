@@ -46,6 +46,8 @@ use tracing::{info, trace};
 
 const LATEST_BLOCK_HASH_KEY: &[u8] = &[1u8];
 
+mod rewind;
+
 // ===== Table Definition =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,6 +189,10 @@ impl MDBXWriteBatch {
     }
 }
 
+fn mdbx_error(error: libmdbx::Error) -> Error {
+    Error::UnSupported(format!("MDBX archive: {error}"))
+}
+
 // ===== DataBase Implementation =====
 
 impl DataBase {
@@ -196,6 +202,25 @@ impl DataBase {
 
     /// Open database with custom options for performance tuning
     pub fn open_with_options<P: AsRef<Path>>(path: P, options: MDBXOptions) -> Self {
+        Self::open_inner(path, options, false).expect("Failed to open archive MDBX")
+    }
+
+    pub(crate) fn open_for_rewind(path: &Path) -> Result<Self, Error> {
+        Self::open_inner(
+            path,
+            MDBXOptions {
+                sync_mode: SyncMode::Durable,
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    fn open_inner<P: AsRef<Path>>(
+        path: P,
+        options: MDBXOptions,
+        exclusive: bool,
+    ) -> Result<Self, Error> {
         let path = path.as_ref();
 
         let mut inner_env = Environment::builder();
@@ -213,6 +238,7 @@ impl DataBase {
         inner_env.set_geometry(geometry);
 
         inner_env.set_flags(EnvironmentFlags {
+            exclusive,
             mode: Mode::ReadWrite {
                 sync_mode: options.sync_mode,
             },
@@ -228,71 +254,35 @@ impl DataBase {
 
         let mut dbis = HashMap::new();
 
-        let env = inner_env
-            .open(path)
-            .expect("Failed to open MDBX environment");
+        let env = inner_env.open(path).map_err(mdbx_error)?;
 
         info!(
             target = "mdbx_archive",
             "Opened MDBX archive database at {:?}", path
         );
 
-        // Create tables
-        let txn = env.begin_rw_txn().expect("Failed to begin transaction");
-        let t = txn
-            .create_db(
-                Some(StorageTable::LatestBlockHash.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create LatestBlockHash table");
-        dbis.insert(StorageTable::LatestBlockHash.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::BlockHashToBlockInfo.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create BlockHashToBlockInfo table");
-        dbis.insert(StorageTable::BlockHashToBlockInfo.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::BlockNumToBlockHash.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create BlockNumToBlockHash table");
-        dbis.insert(StorageTable::BlockNumToBlockHash.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::AddressToAccount.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create AddressToAccount table");
-        dbis.insert(StorageTable::AddressToAccount.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::AddressToStorage.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create AddressToStorage table");
-        dbis.insert(StorageTable::AddressToStorage.to_str(), t.dbi());
-
-        let t = txn
-            .create_db(
-                Some(StorageTable::HashToCode.to_str()),
-                DatabaseFlags::empty(),
-            )
-            .expect("Failed to create HashToCode table");
-        dbis.insert(StorageTable::HashToCode.to_str(), t.dbi());
-
-        txn.commit().expect("Failed to commit transaction");
-
-        Self {
+        let txn = env.begin_rw_txn().map_err(mdbx_error)?;
+        for table in [
+            StorageTable::LatestBlockHash,
+            StorageTable::BlockHashToBlockInfo,
+            StorageTable::BlockNumToBlockHash,
+            StorageTable::AddressToAccount,
+            StorageTable::AddressToStorage,
+            StorageTable::HashToCode,
+        ] {
+            let t = if exclusive {
+                txn.open_db(Some(table.to_str()))
+            } else {
+                txn.create_db(Some(table.to_str()), DatabaseFlags::empty())
+            }
+            .map_err(mdbx_error)?;
+            dbis.insert(table.to_str(), t.dbi());
+        }
+        txn.commit().map_err(mdbx_error)?;
+        Ok(Self {
             env,
             dbis: Arc::new(dbis),
-        }
+        })
     }
 
     /// Manually sync/flush data to disk.

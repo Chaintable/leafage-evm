@@ -29,7 +29,7 @@
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 use std::{
     collections::HashSet,
     ops::{Deref, Index, IndexMut},
@@ -3093,9 +3093,10 @@ const SCHEDULED_SELECTORS: &[([u8; 4], TempoHardfork)] = &[
 
 impl Precompile for StablecoinDEX {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         let spec = self.storage.spec();
         dispatch_call(
@@ -3593,14 +3594,14 @@ mod tests {
             StablecoinDEX::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(before.reverted);
+        assert!(before.status.is_revert());
 
         provider.set_spec(TempoHardfork::T7);
         let after = StorageCtx::enter(&mut provider, || {
             StablecoinDEX::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(!after.reverted);
+        assert!(after.is_success());
     }
 
     fn test_order(order_id: u128, book_key: B256) -> Order {
@@ -3807,7 +3808,7 @@ mod tests {
                 StablecoinDEX::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert!(result.reverted);
+            assert!(result.status.is_revert());
         }
 
         provider.set_spec(TempoHardfork::T8);
@@ -3820,7 +3821,7 @@ mod tests {
                 StablecoinDEX::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert!(!result.reverted);
+            assert!(result.is_success());
         }
 
         StorageCtx::enter(&mut provider, || {
@@ -4477,7 +4478,7 @@ mod tests {
                 StablecoinDEX::new().call(&calldata, Address::ZERO)
             })
             .unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_eq!(
                 output.bytes.as_ref(),
                 super::super::UnknownFunctionSelector {

@@ -2,7 +2,7 @@
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx};
@@ -82,9 +82,10 @@ impl Precompile for CurrentCommittee {
             return unknown_selector(selector, 0);
         }
 
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         dispatch_call(
             calldata,
@@ -144,11 +145,11 @@ mod tests {
             let unauthorized = committee
                 .call(&call.abi_encode(), Address::repeat_byte(1))
                 .unwrap();
-            assert!(unauthorized.reverted);
+            assert!(unauthorized.status.is_revert());
             ICurrentCommittee::Unauthorized::abi_decode(&unauthorized.bytes).unwrap();
 
             let system = committee.call(&call.abi_encode(), Address::ZERO).unwrap();
-            assert!(!system.reverted);
+            assert!(system.is_success());
 
             let members = committee.get_committee_members()?;
             assert_eq!(members.epoch, call.epoch);
@@ -209,6 +210,6 @@ mod tests {
         })
         .unwrap();
 
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
     }
 }

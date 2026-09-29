@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, B256, IntoLogData, U256, keccak256};
 use alloy::sol_types::{SolError, SolInterface, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 use super::error::{Result, TempoPrecompileError};
 use super::storage::{ContractStorage, StorageCtx, StorageOps};
@@ -371,9 +371,10 @@ impl ContractStorage for ZoneFactory {
 
 impl Precompile for ZoneFactory {
     fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         dispatch_call(
             calldata,
@@ -1216,7 +1217,7 @@ mod tests {
             let owner = factory
                 .call(&IZoneFactory::ownerCall {}.abi_encode(), Address::ZERO)
                 .unwrap();
-            assert!(!owner.reverted);
+            assert!(owner.is_success());
             assert_eq!(
                 IZoneFactory::ownerCall::abi_decode_returns(&owner.bytes).unwrap(),
                 OWNER
@@ -1236,7 +1237,7 @@ mod tests {
                 IZoneFactory::transferOwnershipCall { newOwner: ADMIN }.abi_encode(),
             ] {
                 let output = factory.call(&calldata, OWNER).unwrap();
-                assert!(!output.reverted);
+                assert!(output.is_success());
             }
             assert_eq!(factory.next_zone_id()?, 2);
             assert_eq!(factory.owner()?, ADMIN);
@@ -1252,7 +1253,7 @@ mod tests {
             )
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         super::super::StaticCallNotAllowed::abi_decode(&output.bytes).unwrap();
     }
 }

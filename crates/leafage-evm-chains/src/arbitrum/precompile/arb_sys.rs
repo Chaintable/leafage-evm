@@ -10,7 +10,7 @@ use alloy::primitives::{Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolError, SolEvent};
 use revm::context::{Cfg, ContextTr, Transaction};
 use revm::context_interface::Block;
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileOutput, PrecompileResult};
 use revm::Database;
 
 pub(super) struct ArbSys;
@@ -434,7 +434,7 @@ mod tests {
     use revm::context::{JournalTr, TxEnv};
     use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
-    use revm::precompile::PrecompileOutput;
+    use crate::arbitrum::precompile::result::PrecompileOutput;
     use revm::state::AccountInfo;
     use revm::{Context, MainContext};
 

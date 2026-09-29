@@ -100,9 +100,9 @@ where
         let (gas_used, return_value) = match &exec_res {
             ExecutionResult::Success {
                 gas, output, ..
-            } => (gas.used(), output.data().clone()),
-            ExecutionResult::Revert { gas, output, .. } => (gas.used(), output.clone()),
-            ExecutionResult::Halt { gas, .. } => (gas.used(), Bytes::new()),
+            } => (gas.tx_gas_used(), output.data().clone()),
+            ExecutionResult::Revert { gas, output, .. } => (gas.tx_gas_used(), output.clone()),
+            ExecutionResult::Halt { gas, .. } => (gas.tx_gas_used(), Bytes::new()),
         };
 
         // Build geth traces with default options
@@ -177,6 +177,7 @@ where
                 index: Some(tx_index),
                 block_hash: Some(block.header.hash),
                 block_number: Some(block.header.number),
+                block_timestamp: Some(block.header.timestamp),
                 base_fee: block.header.base_fee_per_gas,
             };
             tx_index += 1;

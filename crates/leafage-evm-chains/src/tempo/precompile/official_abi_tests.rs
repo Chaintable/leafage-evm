@@ -195,7 +195,7 @@ fn official_has_role_order_is_used_by_dispatch() {
                     .abi_encode()
                 );
                 let output = token.call(&data, admin).unwrap();
-                assert!(!output.reverted);
+                assert!(output.is_success());
                 assert_eq!(output.bytes.as_ref(), expected.abi_encode());
             }
             let legacy = raw_call(
@@ -203,7 +203,7 @@ fn official_has_role_order_is_used_by_dispatch() {
                 (DEFAULT_ADMIN_ROLE, admin).abi_encode(),
             );
             let output = token.call(&legacy, admin).unwrap();
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_eq!(&output.bytes[..4], &UnknownFunctionSelector::SELECTOR);
         });
     }
@@ -232,7 +232,7 @@ fn trailing_calldata_is_dispatched_only_from_t12() {
                 let mut data = has_role.clone();
                 data.extend_from_slice(suffix);
                 let output = token.call(&data, admin).unwrap();
-                assert_eq!(output.reverted, !fork.is_t12(), "{fork:?}");
+                assert_eq!(output.status.is_revert(), !fork.is_t12(), "{fork:?}");
                 if fork.is_t12() {
                     assert_eq!(output.bytes.as_ref(), true.abi_encode());
                 }
@@ -240,7 +240,7 @@ fn trailing_calldata_is_dispatched_only_from_t12() {
                 let mut data = owner.clone();
                 data.extend_from_slice(suffix);
                 let output = config.call(&data, admin).unwrap();
-                assert_eq!(output.reverted, !fork.is_t12(), "{fork:?}");
+                assert_eq!(output.status.is_revert(), !fork.is_t12(), "{fork:?}");
                 if fork.is_t12() {
                     assert_eq!(output.bytes.as_ref(), admin.abi_encode());
                 }
@@ -287,7 +287,7 @@ fn official_validator_index_is_uint64_and_activates_at_t1() {
                 .abi_encode()
             );
             let output = config.call(&data, owner).unwrap();
-            assert_eq!(output.reverted, !fork.is_t1());
+            assert_eq!(output.status.is_revert(), !fork.is_t1());
             assert_eq!(config.validators(validator).unwrap().active, !fork.is_t1());
             if !fork.is_t1() {
                 assert_eq!(&output.bytes[..4], &UnknownFunctionSelector::SELECTOR);
@@ -299,13 +299,13 @@ fn official_validator_index_is_uint64_and_activates_at_t1() {
                     (u64::MAX, false).abi_encode(),
                 );
                 let output = config.call(&max, owner).unwrap();
-                assert!(output.reverted);
+                assert!(output.status.is_revert());
                 assert_eq!(
                     &output.bytes[..4],
                     &IValidatorConfig::ValidatorNotFound::SELECTOR
                 );
                 let output = config.call(&data, validator).unwrap();
-                assert!(output.reverted);
+                assert!(output.status.is_revert());
                 assert_eq!(
                     &output.bytes[..4],
                     &IValidatorConfig::Unauthorized::SELECTOR
@@ -371,7 +371,7 @@ fn official_factory_logo_overload_preserves_gate_state_and_events() {
                 TIP20Factory::new().call(&data, creator).unwrap()
             });
             if !fork.is_t5() {
-                assert!(output.reverted);
+                assert!(output.status.is_revert());
                 assert_eq!(&output.bytes[..4], &UnknownFunctionSelector::SELECTOR);
                 let malformed = StorageCtx::enter(&mut provider, || {
                     TIP20Factory::new().call(&data[..4], creator).unwrap()
@@ -380,7 +380,7 @@ fn official_factory_logo_overload_preserves_gate_state_and_events() {
                 assert!(provider.account(token_address).is_none());
                 continue;
             }
-            assert!(!output.reverted, "{fork:?}: {output:?}");
+            assert!(output.is_success(), "{fork:?}: {output:?}");
             assert_eq!(Address::abi_decode(&output.bytes).unwrap(), token_address);
             StorageCtx::enter(&mut provider, || {
                 let token = TIP20Token::from_address(token_address).unwrap();
@@ -417,7 +417,7 @@ fn official_factory_logo_overload_preserves_gate_state_and_events() {
             let duplicate = StorageCtx::enter(&mut provider, || {
                 TIP20Factory::new().call(&data, creator).unwrap()
             });
-            assert!(duplicate.reverted);
+            assert!(duplicate.status.is_revert());
             assert_eq!(
                 &duplicate.bytes[..4],
                 &ITIP20Factory::TokenAlreadyExists::SELECTOR
@@ -454,7 +454,7 @@ fn official_factory_rejects_bad_logo_before_creating_state_and_static_calls() {
                     .call(&call.abi_encode(), creator)
                     .unwrap()
             });
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             assert_eq!(&output.bytes[..4], &selector);
             assert!(provider.account(address).is_none());
             assert!(provider.events(address).is_empty());
@@ -471,7 +471,7 @@ fn official_factory_rejects_bad_logo_before_creating_state_and_static_calls() {
                 .call(&call.abi_encode(), creator)
                 .unwrap()
         });
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert_eq!(&output.bytes[..4], &super::StaticCallNotAllowed::SELECTOR);
         assert!(provider.account(address).is_none());
     }

@@ -156,10 +156,10 @@ impl CpuRecorder {
         }
 
         let cpu_time_diff = cpu_time.saturating_sub(oldest.cpu_time);
+        // Scale to percent before dividing so whole-tick inputs stay exact.
         Some(
-            cpu_time_diff as f64
-                / (ticks_per_second as f64 * core_count as f64 * elapsed.as_secs_f64())
-                * 100.0,
+            cpu_time_diff as f64 * 100.0
+                / (ticks_per_second as f64 * core_count as f64 * elapsed.as_secs_f64()),
         )
     }
 }

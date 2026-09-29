@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use alloy::primitives::{Address, U256};
 use alloy::sol_types::{SolError, SolInterface};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
 use revm::{
     context_interface::cfg::GasParams,
     interpreter::{Gas, Host, SStoreResult, StateLoad},
@@ -214,7 +214,7 @@ impl<H: Host> StorageCreditsBackend for OpcodeStorageCreditsBackend<'_, H> {
 
     fn charge_gas(&mut self, gas: u64) -> core::result::Result<(), AccountingError> {
         self.gas
-            .record_cost(gas)
+            .record_regular_cost(gas)
             .then_some(())
             .ok_or(AccountingError::OutOfGas)
     }
@@ -480,9 +480,10 @@ impl Precompile for StorageCredits {
             return unknown_selector(selector, 0);
         }
 
-        self.storage
-            .deduct_gas(input_cost(calldata.len()))
-            .map_err(|_| PrecompileError::OutOfGas)?;
+        if self.storage.deduct_gas(input_cost(calldata.len())).is_err() {
+            // Reservoir is filled in by `tempo_precompile!` from the call input.
+            return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, 0));
+        }
 
         dispatch_call(
             calldata,
@@ -569,7 +570,7 @@ mod tests {
             StorageCredits::new().call(&call.abi_encode(), Address::ZERO)
         })
         .unwrap();
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
     }
 
     #[test]
@@ -586,7 +587,7 @@ mod tests {
             })
             .unwrap();
 
-            assert!(output.reverted);
+            assert!(output.status.is_revert());
             let error = UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
             assert_eq!(error.selector, FixedBytes::new(selector));
         }
@@ -603,7 +604,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(output.reverted);
+        assert!(output.status.is_revert());
         assert!(output.bytes.is_empty());
     }
 }

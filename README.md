@@ -30,6 +30,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
 | Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
 | IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| RSK (Rootstock)                               | [Chaintable/rskj](https://github.com/Chaintable/rskj)                                            |
 | Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
 | Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
 | Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
@@ -60,6 +61,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | WEMIX                                         | [Chaintable/go-wemix](https://github.com/Chaintable/go-wemix)                                    |
 | Polygon PoS                                   | [Chaintable/bor](https://github.com/Chaintable/bor)                                              |
 | Sonic                                         | [Chaintable/sonic](https://github.com/Chaintable/sonic)                                          |
+| Monad                                         | [Chaintable/monad-bft-x](https://github.com/Chaintable/monad-bft-x)                              |
 
 ## Supported JSON-RPC Methods
 
@@ -169,11 +171,14 @@ When using Kafka + S3 mode, provide a JSON config file:
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
-  "version": "v1"
+  "version": "v1",
+  "s3_read_timeout_secs": 20
 }
 ```
 
 `bundle_bucket_name` is optional; omit it or leave it empty to keep the legacy per-block S3 path.
+
+`s3_read_timeout_secs` is a positive integer, defaulting to 20. It sets the AWS SDK operation timeout for GET and LIST calls, including bundle GET/range requests and SDK retries. Response body consumption after `send()` returns is outside this timeout; the SDK's existing stalled-stream protection remains unchanged. Errors propagate to the existing caller handling. `archive-init` uses the same default 20-second operation timeout.
 
 Both `standalone` and `archive-init` accept `--bundle-range-size <MIB>` to tune the compacted StateDiff request size. The limit applies only when grouping multiple entries; a single entry larger than the configured value is fetched by itself.
 

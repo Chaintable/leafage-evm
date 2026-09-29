@@ -1,10 +1,11 @@
 use crate::bundle::s3_read_bundle;
 use crate::utils::{s3_get_block_info_and_diff_by_number_for_genesis, KafkaS3Config};
 use anyhow::Result;
-use aws_sdk_s3::Client;
+use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::EvmStorageWrite;
 use leafage_evm_types::{BlockInfo, BlockStorageDiff};
+use std::time::Duration;
 use tracing::info;
 
 /// [`Initializer`] is used to initialize the storage to the genesis block
@@ -31,7 +32,14 @@ where
             let client = HttpClientBuilder::default().build(rpc_url.as_ref())?;
             rpc_client = Some(client);
         }
-        let s3_config = aws_config::load_from_env().await;
+        let s3_config = aws_config::from_env()
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(kafka_s3_cfg.s3_read_timeout_secs.get()))
+                    .build(),
+            )
+            .load()
+            .await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
         Ok(Self {
             rpc_client,
