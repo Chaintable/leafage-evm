@@ -113,8 +113,7 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
         Ok(balance
             .checked_div(alloy::primitives::U256::from(tx.gas_price()))
             .unwrap_or_default()
-            .try_into()
-            .unwrap())
+            .saturating_to::<u64>())
     }
 
     fn estimate_l1_overhead<StateDB>(
@@ -287,5 +286,36 @@ mod tests {
             handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA),
             eip7825::TX_GAS_LIMIT_CAP
         );
+    }
+
+    #[test]
+    fn default_gas_allowance_saturates_at_u64_max() {
+        use alloy::primitives::{Address, U256};
+        use revm::{database::InMemoryDB, state::AccountInfo};
+
+        let caller = Address::repeat_byte(0x11);
+        for (balance, gas_price, expected) in [
+            (U256::from(1_000_000), 5, 200_000),
+            // A tiny gas price with a large balance must not overflow u64.
+            (U256::MAX, 1, u64::MAX),
+        ] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance,
+                    ..Default::default()
+                },
+            );
+            let tx = TxEnv::builder()
+                .caller(caller)
+                .gas_price(gas_price)
+                .build()
+                .unwrap();
+            let allowance = DefaultGasFeeHandler
+                .gas_allowance(&CallRequest::default(), &tx, &db, &BlockEnv::default())
+                .unwrap();
+            assert_eq!(allowance, expected);
+        }
     }
 }
