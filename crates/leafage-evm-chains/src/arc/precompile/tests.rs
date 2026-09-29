@@ -136,8 +136,14 @@ fn direct_call<DB: AlloyDatabase>(
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
-            known_bytecode: None,
+            // Frames here target registered precompiles, which have no code.
+            known_bytecode: (
+                revm::primitives::KECCAK_EMPTY,
+                revm::bytecode::Bytecode::default(),
+            ),
+            reservoir: 0,
             scheme: revm::interpreter::CallScheme::Call,
+            charged_new_account_state_gas: false,
         })),
         memory: SharedMemory::default(),
         depth: 1,
@@ -179,8 +185,14 @@ fn direct_delegatecall<DB: AlloyDatabase>(
             gas_limit,
             is_static: false,
             return_memory_offset: 0..0,
-            known_bytecode: None,
+            // Frames here target registered precompiles, which have no code.
+            known_bytecode: (
+                revm::primitives::KECCAK_EMPTY,
+                revm::bytecode::Bytecode::default(),
+            ),
+            reservoir: 0,
             scheme: revm::interpreter::CallScheme::DelegateCall,
+            charged_new_account_state_gas: false,
         })),
         memory: SharedMemory::default(),
         depth: 1,
@@ -208,7 +220,7 @@ fn call_instruction(result: &FrameResult) -> InstructionResult {
 
 fn call_gas_spent(result: &FrameResult) -> u64 {
     match result {
-        FrameResult::Call(outcome) => outcome.result.gas.spent(),
+        FrameResult::Call(outcome) => outcome.result.gas.total_gas_spent(),
         FrameResult::Create(_) => panic!("expected CALL result"),
     }
 }
@@ -314,6 +326,8 @@ fn provider_uses_cold_dynamic_lookup_and_keeps_standard_p256() {
         <PrecompilesMap as PrecompileProvider<ArcContext<InMemoryDB>>>::warm_addresses(
             &precompiles,
         )
+        .iter()
+        .copied()
         .collect();
     assert!(warm.contains(&P256_ADDRESS));
     assert!(!warm.contains(&NATIVE_COIN_AUTHORITY_ADDRESS));

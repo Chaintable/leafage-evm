@@ -15,7 +15,7 @@ use revm::{
     },
     handler::{EthFrame, EvmTr, FrameTr, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
-    interpreter::interpreter::EthInterpreter,
+    interpreter::{interpreter::EthInterpreter, InitialAndFloorGas},
 };
 
 /// Arc transaction handler shared by normal and inspected execution.
@@ -68,7 +68,14 @@ impl<DB: Database, I> Handler for ArcHandler<DB, I> {
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
 
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    // revm 43 validates against state and deducts the caller in `validate`, before
+    // `pre_execution`; the blocklist check keeps running right ahead of it, as it did
+    // at the start of the old `pre_execution`.
+    fn validate_against_state_and_deduct_caller(
+        &self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &mut InitialAndFloorGas,
+    ) -> Result<(), Self::Error> {
         let (caller, kind, value) = {
             let ctx = evm.ctx();
             let tx = ctx.tx();
@@ -79,7 +86,8 @@ impl<DB: Database, I> Handler for ArcHandler<DB, I> {
             .journal_mut()
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
         self.check_transaction_blocklist(evm, caller, kind, value)?;
-        self.mainnet.pre_execution(evm)
+        self.mainnet
+            .validate_against_state_and_deduct_caller(evm, init_and_floor_gas)
     }
 
     fn reward_beneficiary(
@@ -95,7 +103,10 @@ impl<DB: Database, I> Handler for ArcHandler<DB, I> {
                 ctx.tx().effective_gas_price(basefee),
             )
         };
-        let total_fee = U256::from(effective_gas_price) * U256::from(exec_result.gas().used());
+        // Exclude reservoir gas (EIP-8037) like upstream; it is zero before Amsterdam.
+        let gas = exec_result.gas();
+        let effective_used = gas.used().saturating_sub(gas.reservoir());
+        let total_fee = U256::from(effective_gas_price) * U256::from(effective_used);
 
         if self.hardfork_flags.is_active(ArcHardfork::Zero8) {
             let account = evm.ctx_mut().journal_mut().load_account(beneficiary)?;
@@ -229,7 +240,7 @@ mod tests {
             .ctx_mut()
             .set_tx(value_call(caller, recipient, U256::ZERO));
         let err = ArcHandler::new(flags)
-            .pre_execution(&mut sender_blocked)
+            .validate(&mut sender_blocked)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -242,9 +253,7 @@ mod tests {
         zero_value
             .ctx_mut()
             .set_tx(value_call(caller, recipient, U256::ZERO));
-        assert!(ArcHandler::new(flags)
-            .pre_execution(&mut zero_value)
-            .is_ok());
+        assert!(ArcHandler::new(flags).validate(&mut zero_value).is_ok());
 
         let mut receiver_blocked = evm_with_balance(caller, U256::from(1_000_000));
         blocklist(&mut receiver_blocked, recipient);
@@ -252,7 +261,7 @@ mod tests {
             .ctx_mut()
             .set_tx(value_call(caller, recipient, U256::ONE));
         assert!(matches!(
-            ArcHandler::new(flags).pre_execution(&mut receiver_blocked),
+            ArcHandler::new(flags).validate(&mut receiver_blocked),
             Err(EVMError::Transaction(InvalidTransaction::Str(message)))
                 if message == ERR_BLOCKED_ADDRESS
         ));
@@ -267,11 +276,8 @@ mod tests {
         evm.ctx_mut()
             .set_tx(value_call(caller, recipient, U256::ONE));
 
-        let intrinsic = ArcHandler::new(flags)
-            .validate_initial_tx_gas(&mut evm)
-            .unwrap();
-        assert_eq!(intrinsic.initial_gas, 21_000);
-        ArcHandler::new(flags).pre_execution(&mut evm).unwrap();
+        let intrinsic = ArcHandler::new(flags).validate(&mut evm).unwrap();
+        assert_eq!(intrinsic.initial_total_gas(), 21_000);
 
         assert!(
             !evm.ctx_mut()
@@ -305,7 +311,7 @@ mod tests {
             InterpreterResult::new(
                 InstructionResult::Return,
                 Default::default(),
-                Gas::new_spent(21_000),
+                Gas::new_spent_with_reservoir(21_000, 0),
             ),
             0..0,
         ));
@@ -355,7 +361,7 @@ mod tests {
             InterpreterResult::new(
                 InstructionResult::Return,
                 Default::default(),
-                Gas::new_spent(21_000),
+                Gas::new_spent_with_reservoir(21_000, 0),
             ),
             0..0,
         ));
@@ -404,7 +410,7 @@ mod tests {
                 InterpreterResult::new(
                     InstructionResult::Return,
                     Default::default(),
-                    Gas::new_spent(21_000),
+                    Gas::new_spent_with_reservoir(21_000, 0),
                 ),
                 0..0,
             ));

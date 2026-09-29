@@ -5,7 +5,7 @@ use super::{
         ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
         NATIVE_COIN_CONTROL_ADDRESS,
     },
-    opcode::arc_selfdestruct_instruction,
+    opcode::{arc_selfdestruct_instruction, ARC_SELFDESTRUCT_STATIC_GAS},
     precompile::{extend_arc_precompiles, subcall::SubcallPrecompile},
     ArcChainConfig, ArcExecutionSpec, ArcHardfork,
 };
@@ -205,8 +205,9 @@ struct NativeTransfer {
 }
 
 fn init_subcall_revert(message: &str, call_inputs: &CallInputs) -> FrameResult {
-    let mut gas = Gas::new(call_inputs.gas_limit);
-    if !gas.record_cost(SUBCALL_DISPATCH_COST) {
+    let mut gas =
+        Gas::new_with_regular_gas_and_reservoir(call_inputs.gas_limit, call_inputs.reservoir);
+    if !gas.record_regular_cost(SUBCALL_DISPATCH_COST) {
         gas.spend_all();
     }
     FrameResult::Call(CallOutcome {
@@ -214,11 +215,13 @@ fn init_subcall_revert(message: &str, call_inputs: &CallInputs) -> FrameResult {
         memory_offset: call_inputs.return_memory_offset.clone(),
         was_precompile_called: true,
         precompile_call_logs: Default::default(),
+        charged_new_account_state_gas: call_inputs.charged_new_account_state_gas,
     })
 }
 
 fn init_subcall_static_revert(call_inputs: &CallInputs) -> FrameResult {
-    let mut gas = Gas::new(call_inputs.gas_limit);
+    let mut gas =
+        Gas::new_with_regular_gas_and_reservoir(call_inputs.gas_limit, call_inputs.reservoir);
     gas.spend_all();
     FrameResult::Call(CallOutcome {
         result: InterpreterResult::new(
@@ -229,15 +232,21 @@ fn init_subcall_static_revert(call_inputs: &CallInputs) -> FrameResult {
         memory_offset: call_inputs.return_memory_offset.clone(),
         was_precompile_called: true,
         precompile_call_logs: Default::default(),
+        charged_new_account_state_gas: call_inputs.charged_new_account_state_gas,
     })
 }
 
-fn subcall_oog(gas: Gas, return_memory_offset: std::ops::Range<usize>) -> FrameResult {
+fn subcall_oog(
+    gas: Gas,
+    return_memory_offset: std::ops::Range<usize>,
+    charged_new_account_state_gas: bool,
+) -> FrameResult {
     FrameResult::Call(CallOutcome {
         result: InterpreterResult::new(InstructionResult::OutOfGas, Default::default(), gas),
         memory_offset: return_memory_offset,
         was_precompile_called: true,
         precompile_call_logs: Default::default(),
+        charged_new_account_state_gas,
     })
 }
 
@@ -263,7 +272,7 @@ fn load_account_with_code_metered<J: JournalTr>(
             } else {
                 revm::interpreter::gas::WARM_STORAGE_READ_COST
             };
-            if !gas.record_cost(cost) {
+            if !gas.record_regular_cost(cost) {
                 return Ok(None);
             }
             Ok(Some(info.account.into_owned()))
@@ -321,10 +330,11 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         execution_spec: ArcExecutionSpec,
     ) -> Self {
         let mut cfg = env.cfg_env;
-        // Arc owns Zero5 native transfer logs. Keep both REVM Amsterdam EIP-7708 paths off
-        // even if this EVM is later constructed with a newer Ethereum base spec.
+        // Arc owns Zero5 native transfer logs. Keep REVM's Amsterdam EIP-7708 logs and
+        // EIP-8246 delayed clearing off even if this EVM is later constructed with a newer
+        // Ethereum base spec.
         cfg.amsterdam_eip7708_disabled = true;
-        cfg.amsterdam_eip7708_delayed_burn_disabled = true;
+        cfg.amsterdam_eip8246_delayed_clear_disabled = true;
         let spec = cfg.spec;
         let mut precompiles =
             PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec)));
@@ -333,10 +343,11 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         instructions.insert_instruction(
             SELFDESTRUCT,
             arc_selfdestruct_instruction::<DB>(execution_spec.arc_flags),
+            ARC_SELFDESTRUCT_STATIC_GAS,
         );
         let mut journaled_state = Journal::new(db);
         // Arc implements Zero5 transfer logs itself while its Ethereum base spec remains Osaka.
-        // Disable REVM's future Amsterdam EIP-7708 paths, including delayed-burn tracking.
+        // Disable REVM's future Amsterdam EIP-7708 logs and EIP-8246 delayed clearing.
         journaled_state.set_eip7708_config(true, true);
         Self {
             inner: RevmEvm {
@@ -632,6 +643,8 @@ impl<DB: Database, I> ArcEvm<DB, I> {
 
         let return_memory_offset = inputs.return_memory_offset.clone();
         let parent_gas_limit = inputs.gas_limit;
+        let parent_reservoir = inputs.reservoir;
+        let charged_new_account_state_gas = inputs.charged_new_account_state_gas;
         let depth = frame_input.depth;
         let mut child_inputs = init_result.child_inputs;
 
@@ -641,10 +654,14 @@ impl<DB: Database, I> ArcEvm<DB, I> {
             .ctx
             .journal_mut()
             .load_account(child_inputs.caller)?;
-        let mut gas = Gas::new(parent_gas_limit);
-        if !gas.record_cost(init_result.gas_overhead) {
+        let mut gas = Gas::new_with_regular_gas_and_reservoir(parent_gas_limit, parent_reservoir);
+        if !gas.record_regular_cost(init_result.gas_overhead) {
             gas.spend_all();
-            return Ok(ItemOrResult::Result(subcall_oog(gas, return_memory_offset)));
+            return Ok(ItemOrResult::Result(subcall_oog(
+                gas,
+                return_memory_offset,
+                charged_new_account_state_gas,
+            )));
         }
 
         let Some(target) = load_account_with_code_metered(
@@ -654,9 +671,19 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         )?
         else {
             gas.spend_all();
-            return Ok(ItemOrResult::Result(subcall_oog(gas, return_memory_offset)));
+            return Ok(ItemOrResult::Result(subcall_oog(
+                gas,
+                return_memory_offset,
+                charged_new_account_state_gas,
+            )));
         };
 
+        // revm 43 always executes `known_bytecode`. Before, a missing value made frame init
+        // load the target's code; the target is already loaded (and metered) above, so use it.
+        child_inputs.known_bytecode = (
+            target.code_hash,
+            target.code.clone().unwrap_or_default(),
+        );
         if let Some(delegate_address) = target.code.as_ref().and_then(Bytecode::eip7702_address) {
             let Some(delegate) = load_account_with_code_metered(
                 self.inner.ctx.journal_mut(),
@@ -665,10 +692,14 @@ impl<DB: Database, I> ArcEvm<DB, I> {
             )?
             else {
                 gas.spend_all();
-                return Ok(ItemOrResult::Result(subcall_oog(gas, return_memory_offset)));
+                return Ok(ItemOrResult::Result(subcall_oog(
+                    gas,
+                    return_memory_offset,
+                    charged_new_account_state_gas,
+                )));
             };
             if let Some(code) = delegate.code {
-                child_inputs.known_bytecode = Some((delegate.code_hash, code));
+                child_inputs.known_bytecode = (delegate.code_hash, code);
             }
         }
 
@@ -693,7 +724,9 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         let continuation = SubcallContinuation {
             precompile,
             gas_limit: parent_gas_limit,
-            init_subcall_gas_overhead: gas.spent(),
+            reservoir: parent_reservoir,
+            charged_new_account_state_gas,
+            init_subcall_gas_overhead: gas.total_gas_spent(),
             return_memory_offset,
             continuation_data: init_result.continuation_data,
             checkpoint,
@@ -708,7 +741,7 @@ impl<DB: Database, I> ArcEvm<DB, I> {
                     (
                         child_result.instruction_result(),
                         child_result.interpreter_result().output.clone(),
-                        child_result.gas().spent(),
+                        child_result.gas().total_gas_spent(),
                         child_result.gas().limit(),
                     )
                 });
@@ -749,7 +782,7 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         let completion_gas = completion.as_ref().map_or(0, |result| result.gas_overhead);
         let metered_gas_used = continuation
             .init_subcall_gas_overhead
-            .checked_add(child_gas.spent())
+            .checked_add(child_gas.total_gas_spent())
             .expect("subcall gas overflow after child execution")
             .checked_add(completion_gas)
             .expect("subcall gas overflow during completion");
@@ -758,13 +791,20 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         } else {
             metered_gas_used
         };
-        let mut gas = Gas::new(continuation.gas_limit);
-        if !gas.record_cost(gas_used) {
+        let mut gas = Gas::new_with_regular_gas_and_reservoir(
+            continuation.gas_limit,
+            continuation.reservoir,
+        );
+        if !gas.record_regular_cost(gas_used) {
             gas.spend_all();
             if child_succeeded {
                 self.revert_subcall_checkpoint(continuation.checkpoint);
             }
-            return Ok(subcall_oog(gas, continuation.return_memory_offset));
+            return Ok(subcall_oog(
+                gas,
+                continuation.return_memory_offset,
+                continuation.charged_new_account_state_gas,
+            ));
         }
 
         match completion {
@@ -777,6 +817,7 @@ impl<DB: Database, I> ArcEvm<DB, I> {
                     memory_offset: continuation.return_memory_offset,
                     was_precompile_called: true,
                     precompile_call_logs: Default::default(),
+                    charged_new_account_state_gas: continuation.charged_new_account_state_gas,
                 }))
             }
             failure => {
@@ -795,6 +836,7 @@ impl<DB: Database, I> ArcEvm<DB, I> {
                     memory_offset: continuation.return_memory_offset,
                     was_precompile_called: true,
                     precompile_call_logs: Default::default(),
+                    charged_new_account_state_gas: continuation.charged_new_account_state_gas,
                 }))
             }
         }
@@ -912,7 +954,7 @@ impl<DB: Database, I> EvmTr for ArcEvm<DB, I> {
                             (
                                 result.instruction_result(),
                                 result.interpreter_result().output.clone(),
-                                result.gas().spent(),
+                                result.gas().total_gas_spent(),
                                 result.gas().limit(),
                             )
                         });
@@ -1108,6 +1150,7 @@ mod tests {
     use alloy::sol_types::{sol, SolCall};
     use alloy_evm::precompiles::DynPrecompile;
     use revm::interpreter::{CallInput, CallInputs, CallValue, CreateInputs, SharedMemory};
+    use revm::primitives::KECCAK_EMPTY;
     use revm::{
         bytecode::{opcode, Bytecode},
         context_interface::block::BlobExcessGasAndPrice,
@@ -1182,13 +1225,16 @@ mod tests {
                 scheme,
                 target_address: to,
                 bytecode_address: to,
-                known_bytecode: None,
+                // The helper targets EOAs and precompiles, which have no code.
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
                 value: CallValue::Transfer(value),
                 input: CallInput::Bytes(Bytes::new()),
                 gas_limit: 100_000,
+                reservoir: 0,
                 is_static: false,
                 caller: from,
                 return_memory_offset: 0..0,
+                charged_new_account_state_gas: false,
             })),
             memory: SharedMemory::default(),
             depth: 1,
@@ -1203,7 +1249,7 @@ mod tests {
     ) -> FrameInit {
         FrameInit {
             frame_input: FrameInput::Create(Box::new(CreateInputs::new(
-                from, scheme, value, init_code, 100_000,
+                from, scheme, value, init_code, 100_000, 0,
             ))),
             memory: SharedMemory::default(),
             depth: 1,
@@ -1225,7 +1271,7 @@ mod tests {
         };
         assert_eq!(outcome.result.output, revert_message(message));
         assert_eq!(
-            outcome.result.gas.spent(),
+            outcome.result.gas.total_gas_spent(),
             0,
             "Arc blocklist reads are unmetered"
         );
@@ -1318,13 +1364,15 @@ mod tests {
                 scheme: CallScheme::Call,
                 target_address: CALL_FROM_ADDRESS,
                 bytecode_address: CALL_FROM_ADDRESS,
-                known_bytecode: None,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
                 value: CallValue::Transfer(U256::ZERO),
                 input: CallInput::Bytes(call_from_input(sender, target, data)),
                 gas_limit,
+                reservoir: 0,
                 is_static: false,
                 caller,
                 return_memory_offset: 0..0,
+                charged_new_account_state_gas: false,
             })),
             memory: SharedMemory::default(),
             depth: 1,
@@ -1540,9 +1588,9 @@ mod tests {
         let evm = arc_evm(InMemoryDB::default());
 
         assert!(evm.ctx().cfg.amsterdam_eip7708_disabled);
-        assert!(evm.ctx().cfg.amsterdam_eip7708_delayed_burn_disabled);
+        assert!(evm.ctx().cfg.amsterdam_eip8246_delayed_clear_disabled);
         assert!(evm.ctx().journaled_state.cfg.eip7708_disabled);
-        assert!(evm.ctx().journaled_state.cfg.eip7708_delayed_burn_disabled);
+        assert!(evm.ctx().journaled_state.cfg.eip8246_delayed_clear_disabled);
         assert!(evm
             .ctx()
             .journaled_state
@@ -1723,9 +1771,9 @@ mod tests {
                                 data: LogData::new_unchecked(Vec::new(), Bytes::new()),
                             });
                             Ok(if revert {
-                                PrecompileOutput::new_reverted(0, Bytes::new())
+                                PrecompileOutput::revert(0, Bytes::new(), input.reservoir)
                             } else {
-                                PrecompileOutput::new(0, Bytes::new())
+                                PrecompileOutput::new(0, Bytes::new(), input.reservoir)
                             })
                         },
                     ))
@@ -2185,7 +2233,7 @@ mod tests {
             panic!("unauthorized CallFrom must finish immediately")
         };
         assert_eq!(outcome.result.output, revert_message("unauthorized caller"));
-        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+        assert_eq!(outcome.result.gas.total_gas_spent(), SUBCALL_DISPATCH_COST);
     }
 
     #[test]
@@ -2200,7 +2248,7 @@ mod tests {
             outcome.result.output,
             revert_message("subcall precompiles only support CALL scheme")
         );
-        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+        assert_eq!(outcome.result.gas.total_gas_spent(), SUBCALL_DISPATCH_COST);
 
         let mut static_call = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
         let FrameInput::Call(inputs) = &mut static_call.frame_input else {
@@ -2212,7 +2260,7 @@ mod tests {
             outcome.result.output,
             revert_message("subcall precompiles cannot be invoked in static context")
         );
-        assert_eq!(outcome.result.gas.spent(), 100_000);
+        assert_eq!(outcome.result.gas.total_gas_spent(), 100_000);
 
         let mut with_value = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
         let FrameInput::Call(inputs) = &mut with_value.frame_input else {
@@ -2224,7 +2272,7 @@ mod tests {
             outcome.result.output,
             revert_message("subcall precompiles do not support value transfers")
         );
-        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+        assert_eq!(outcome.result.gas.total_gas_spent(), SUBCALL_DISPATCH_COST);
 
         let spoofed = call_from_frame(
             MEMO_ADDRESS,
@@ -2238,12 +2286,12 @@ mod tests {
             outcome.result.output,
             revert_message("sender spoofing requires tx.origin as sender")
         );
-        assert_eq!(outcome.result.gas.spent(), SUBCALL_DISPATCH_COST);
+        assert_eq!(outcome.result.gas.total_gas_spent(), SUBCALL_DISPATCH_COST);
 
         let valid = call_from_frame(MEMO_ADDRESS, SOURCE, TARGET, Bytes::new(), 100_000);
         let outcome = run_call_from_frame(valid, SOURCE);
         assert!(outcome.result.result.is_ok());
-        assert_eq!(outcome.result.gas.spent(), 2_800);
+        assert_eq!(outcome.result.gas.total_gas_spent(), 2_800);
         let decoded = ITestCallFrom::callFromCall::abi_decode_returns(&outcome.result.output)
             .expect("CallFrom returns valid ABI output");
         assert!(decoded.success);

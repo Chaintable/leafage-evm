@@ -1351,7 +1351,7 @@ async fn arc_estimate_fee_mode_does_not_reserve_business_funds() {
         assert_eq!(calls.results[0].code == 0, normal.is_success());
         assert_eq!(
             calls.results[0].gas_used,
-            i64::try_from(normal.gas_used()).unwrap()
+            i64::try_from(normal.tx_gas_used()).unwrap()
         );
         let simulated = fixture
             .api
@@ -1359,7 +1359,7 @@ async fn arc_estimate_fee_mode_does_not_reserve_business_funds() {
             .await
             .unwrap();
         assert_eq!(simulated.results[0].code == 0, normal.is_success());
-        assert_eq!(simulated.results[0].gas_used, normal.gas_used());
+        assert_eq!(simulated.results[0].gas_used, normal.tx_gas_used());
     }
     fixture.close();
 }
@@ -1433,7 +1433,7 @@ async fn arc_estimate_fee_mode_preserves_prices_and_discards_refund_state() {
             if let ExecutionResult::Success { gas, .. } = &estimated {
                 assert!(gas.inner_refunded() > 0);
             }
-            assert_eq!(normal.gas_used(), estimated.gas_used());
+            assert_eq!(normal.tx_gas_used(), estimated.tx_gas_used());
             assert_eq!(
                 output_words(&success_output(estimated)),
                 vec![

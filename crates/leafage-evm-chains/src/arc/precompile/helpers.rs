@@ -22,7 +22,7 @@ use revm::context_interface::cfg::gas::CALL_STIPEND;
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::journaled_state::TransferError;
 use revm::interpreter::Gas;
-use revm::precompile::{PrecompileError, PrecompileOutput};
+use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileOutput, PrecompileResult};
 use revm::primitives::{address, KECCAK_EMPTY};
 use revm::state::AccountInfo;
 
@@ -86,29 +86,49 @@ pub fn revert_message_to_bytes(msg: &str) -> Bytes {
 ///
 pub(crate) const PRECOMPILE_EARLY_REVERT_GAS_PENALTY: u64 = 200;
 
-/// Enum to represent either a reverted precompile output or an error
+/// Enum to represent a reverted precompile output, an out-of-gas halt, or a fatal error
 pub(crate) enum PrecompileErrorOrRevert {
     Revert(PrecompileOutput),
+    /// Non-fatal out-of-gas: the precompile call halts and consumes all its gas.
+    OutOfGas,
+    /// Fatal error (e.g. database failure) that aborts the whole execution.
     Error(PrecompileError),
 }
 
 impl PrecompileErrorOrRevert {
     pub(crate) fn new_reverted(gas_counter: Gas, msg: &str) -> Self {
-        Self::Revert(PrecompileOutput::new_reverted(
+        Self::Revert(PrecompileOutput::revert(
             gas_counter.used(),
             revert_message_to_bytes(msg),
+            gas_counter.reservoir(),
         ))
     }
 
     pub(crate) fn new_reverted_with_penalty(gas_counter: Gas, gas_penalty: u64, msg: &str) -> Self {
         let mut gas_with_penalty = gas_counter;
-        if !gas_with_penalty.record_cost(gas_penalty) {
-            return Self::Error(PrecompileError::OutOfGas);
+        if !gas_with_penalty.record_regular_cost(gas_penalty) {
+            return Self::OutOfGas;
         }
-        Self::Revert(PrecompileOutput::new_reverted(
+        Self::Revert(PrecompileOutput::revert(
             gas_with_penalty.used(),
             revert_message_to_bytes(msg),
+            gas_with_penalty.reservoir(),
         ))
+    }
+
+    /// Converts into the precompile result, handing `reservoir` back to the frame.
+    ///
+    /// Keeps the pre-revm-37 semantics: a revert keeps its unspent gas, out of gas halts
+    /// (consuming all gas), and a fatal error aborts execution.
+    pub(crate) fn into_result(self, reservoir: u64) -> PrecompileResult {
+        match self {
+            Self::Revert(mut output) => {
+                output.reservoir = reservoir;
+                Ok(output)
+            }
+            Self::OutOfGas => Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir)),
+            Self::Error(error) => Err(error),
+        }
     }
 }
 
@@ -152,8 +172,8 @@ pub(crate) fn record_cost_or_out_of_gas(
     gas_counter: &mut Gas,
     cost: u64,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    if !gas_counter.record_cost(cost) {
-        return Err(PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas));
+    if !gas_counter.record_regular_cost(cost) {
+        return Err(PrecompileErrorOrRevert::OutOfGas);
     }
     Ok(())
 }
@@ -163,18 +183,9 @@ pub(crate) fn check_gas_remaining(
     cost: u64,
 ) -> Result<(), PrecompileErrorOrRevert> {
     if gas_counter.remaining() < cost {
-        return Err(PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas));
+        return Err(PrecompileErrorOrRevert::OutOfGas);
     }
     Ok(())
-}
-
-impl From<PrecompileErrorOrRevert> for Result<PrecompileOutput, PrecompileError> {
-    fn from(val: PrecompileErrorOrRevert) -> Self {
-        match val {
-            PrecompileErrorOrRevert::Revert(output) => Ok(output.reverted()),
-            PrecompileErrorOrRevert::Error(error) => Err(error),
-        }
-    }
 }
 
 /// Build a revert that charges [`PRECOMPILE_EARLY_REVERT_GAS_PENALTY`]
@@ -341,7 +352,7 @@ pub(crate) fn write(
     // EIP-2200 reentrancy sentry: refuse SSTORE when remaining gas does not
     // exceed the call stipend.
     if hardfork_flags.is_active(ArcHardfork::Zero6) && gas_counter.remaining() <= CALL_STIPEND {
-        return Err(PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas));
+        return Err(PrecompileErrorOrRevert::OutOfGas);
     }
 
     let value = U256::from_be_slice(input);

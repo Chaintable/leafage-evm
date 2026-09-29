@@ -298,7 +298,11 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
             }
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 
@@ -408,7 +412,11 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
 
             // Return response
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 
@@ -513,7 +521,11 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
 
             // Return response
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
     INativeCoinAuthority::totalSupplyCall => |input| {
@@ -541,7 +553,11 @@ precompile!(run_native_coin_authority, precompile_input, hardfork_flags; {
 
             // Return response
             let output = total_supply.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 });

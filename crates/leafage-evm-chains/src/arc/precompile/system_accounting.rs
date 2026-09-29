@@ -173,7 +173,11 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
             )?;
 
             let output = true.abi_encode();
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
     ISystemAccounting::getGasValuesCall => |input| {
@@ -204,7 +208,11 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
             let gas_values = unpack_gas_values_from_storage(B256::from_slice(slot_value.as_ref()));
             let output = gas_values.abi_encode();
 
-            Ok(PrecompileOutput::new(gas_counter.used(), output.into()))
+            Ok(PrecompileOutput::new(
+                gas_counter.used(),
+                output.into(),
+                precompile_input.reservoir,
+            ))
         })()
     },
 });
