@@ -1,24 +1,19 @@
 use alloy::{
-    primitives::{address, b256, keccak256, Address, Bytes, Log, B256, U256},
+    primitives::{b256, keccak256, Address, Log, B256, U256},
     sol,
-    sol_types::{SolEvent, SolValue},
+    sol_types::SolEvent,
 };
 use revm::handler::SYSTEM_ADDRESS;
 
-/// Arc NativeCoinControl precompile address.
-pub(crate) const NATIVE_COIN_CONTROL_ADDRESS: Address =
-    address!("1800000000000000000000000000000000000001");
+// Single source shared with the precompiles, so EVM-level checks cannot drift from them.
+pub(crate) use super::precompile::{
+    revert_message_to_bytes as revert_message, ERR_BLOCKED_ADDRESS,
+    ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS, NATIVE_COIN_CONTROL_ADDRESS,
+};
 
 /// Solidity mapping slot for `NativeCoinControl.isBlocklisted`.
 const BLOCKLIST_MAPPING_SLOT: B256 =
     b256!("0000000000000000000000000000000000000000000000000000000000000002");
-
-pub(crate) const ERR_BLOCKED_ADDRESS: &str = "Blocked address";
-pub(crate) const ERR_ZERO_ADDRESS: &str = "Zero address not allowed";
-pub(crate) const ERR_SELFDESTRUCTED_BALANCE_INCREASED: &str =
-    "Cannot increase the balance of selfdestructed account";
-
-const REVERT_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
 
 sol! {
     #[derive(Debug, PartialEq, Eq)]
@@ -36,14 +31,6 @@ pub(crate) fn blocklist_storage_slot(address: Address) -> U256 {
 #[inline]
 pub(crate) fn is_blocklisted_status(status: U256) -> bool {
     !status.is_zero()
-}
-
-pub(crate) fn revert_message(message: &str) -> Bytes {
-    let encoded = message.abi_encode();
-    let mut data = Vec::with_capacity(REVERT_SELECTOR.len().saturating_add(encoded.len()));
-    data.extend_from_slice(&REVERT_SELECTOR);
-    data.extend_from_slice(&encoded);
-    data.into()
 }
 
 pub(crate) fn eip7708_transfer_log(from: Address, to: Address, amount: U256) -> Log {
@@ -97,7 +84,7 @@ mod tests {
     fn revert_message_is_solidity_error_string() {
         let encoded = revert_message(ERR_BLOCKED_ADDRESS);
 
-        assert_eq!(&encoded[..4], &REVERT_SELECTOR);
+        assert_eq!(&encoded[..4], &[0x08, 0xc3, 0x79, 0xa0]);
         assert!(encoded.len() >= 4 + 32 + 32 + ERR_BLOCKED_ADDRESS.len());
     }
 }

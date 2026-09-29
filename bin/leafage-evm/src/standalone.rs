@@ -505,6 +505,16 @@ impl Command {
             }
             "arc" => {
                 let arc_config = ArcChainConfig::mainnet();
+                if chain_id != arc_config.chain_id() {
+                    bail!(
+                        "arc evm-type only supports --chain-cfg {}, got {}",
+                        arc_config.chain_id(),
+                        chain_id
+                    );
+                }
+                if self.spec_id != u8::MAX {
+                    bail!("arc evm-type does not accept --spec-id; its spec follows the Arc hardfork schedule");
+                }
                 let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -980,6 +990,20 @@ mod tests {
             assert!(cfg.disable_block_gas_limit);
             assert!(cfg.disable_base_fee);
             assert_eq!(arc_config, ArcChainConfig::mainnet());
+        }
+    }
+
+    #[test]
+    fn arc_rejects_non_mainnet_chain_cfg_and_spec_id() {
+        for args in [
+            &["--evm-type", "arc", "--chain-cfg", "5043"][..],
+            &["--evm-type", "arc"][..],
+            &["--evm-type", "arc", "--chain-cfg", "arc", "--spec-id", "20"][..],
+        ] {
+            let error = parse_command(args)
+                .build_chain_cfg_env()
+                .expect_err("Arc must reject parameters it cannot honor");
+            assert!(error.to_string().contains("arc"), "{args:?}: {error}");
         }
     }
 

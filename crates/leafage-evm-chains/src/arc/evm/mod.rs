@@ -868,7 +868,8 @@ impl<DB: Database, I> EvmTr for ArcEvm<DB, I> {
 
                 // CallFrom currently requires zero value, so this is normally a no-op. Keep the
                 // Arc transfer checks in front of the interception so future subcall precompiles
-                // cannot bypass blocklist or EIP-7708 behavior by allowing value.
+                // cannot bypass the blocklist by allowing value. The EIP-7708 log is dropped here,
+                // as in arc-node; a subcall precompile that allows value must emit it itself.
                 match self.before_frame_init(&mut frame_input)? {
                     BeforeFrameInit::Revert(result) => {
                         return Ok(ItemOrResult::Result(result));

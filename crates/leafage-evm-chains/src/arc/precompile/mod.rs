@@ -16,8 +16,12 @@ use alloy::primitives::Address;
 use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
 use revm::precompile::PrecompileId;
 
+pub(crate) use helpers::{
+    revert_message_to_bytes, ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED,
+    ERR_ZERO_ADDRESS,
+};
 use native_coin_authority::NATIVE_COIN_AUTHORITY_ADDRESS;
-use native_coin_control::NATIVE_COIN_CONTROL_ADDRESS;
+pub(crate) use native_coin_control::NATIVE_COIN_CONTROL_ADDRESS;
 use pq::PQ_ADDRESS;
 use system_accounting::SYSTEM_ACCOUNTING_ADDRESS;
 
