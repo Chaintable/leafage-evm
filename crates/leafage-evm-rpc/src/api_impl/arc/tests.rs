@@ -1211,18 +1211,27 @@ async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
             .value(U256::from(5)),
         tempo: None,
     };
-    // The created contract selfdestructs its endowment to `beneficiary` right away.
-    let beneficiary = Address::repeat_byte(0x99);
+    let create = |init_code: Vec<u8>| {
+        let mut inner = TransactionRequest::default()
+            .from(addresses.funded)
+            .value(U256::from(9))
+            .gas_limit(200_000)
+            .input(TransactionInput::new(init_code.into()));
+        inner.to = Some(TxKind::Create);
+        CallRequest { inner, tempo: None }
+    };
     let created = addresses.funded.create(0);
-    let mut init_code = vec![opcode::PUSH20];
-    init_code.extend_from_slice(beneficiary.as_slice());
-    init_code.push(opcode::SELFDESTRUCT);
-    let mut create = TransactionRequest::default()
-        .from(addresses.funded)
-        .value(U256::from(9))
-        .gas_limit(200_000)
-        .input(TransactionInput::new(init_code.into()));
-    create.to = Some(TxKind::Create);
+    // Receives value from the created contract, by SELFDESTRUCT or by a nested CALL.
+    let recipient = Address::repeat_byte(0x99);
+    let mut selfdestruct = vec![opcode::PUSH20];
+    selfdestruct.extend_from_slice(recipient.as_slice());
+    selfdestruct.push(opcode::SELFDESTRUCT);
+    let mut nested_call = vec![opcode::PUSH0; 4];
+    nested_call.extend_from_slice(&[opcode::PUSH1, 2, opcode::PUSH20]);
+    nested_call.extend_from_slice(recipient.as_slice());
+    nested_call.extend_from_slice(&[opcode::GAS, opcode::CALL, opcode::POP, opcode::STOP]);
+    // A value call to a precompile journals its log before the frame runs.
+    let identity = Address::with_last_byte(4);
 
     for (request, expected) in [
         (
@@ -1234,13 +1243,21 @@ async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
             vec![transfer(addresses.funded, addresses.counter)],
         ),
         (
-            CallRequest {
-                inner: create,
-                tempo: None,
-            },
+            value_call(identity),
+            vec![transfer(addresses.funded, identity)],
+        ),
+        (
+            create(selfdestruct),
             vec![
                 transfer(addresses.funded, created),
-                transfer(created, beneficiary),
+                transfer(created, recipient),
+            ],
+        ),
+        (
+            create(nested_call),
+            vec![
+                transfer(addresses.funded, created),
+                transfer(created, recipient),
             ],
         ),
         (

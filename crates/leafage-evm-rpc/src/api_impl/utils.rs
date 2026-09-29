@@ -676,10 +676,18 @@ mod tests {
             ]
         );
 
-        // A reverted top-level frame keeps the same pairing.
-        let (result, (nodes, _)) = inspect(reverter);
+        // A reverted top-level frame keeps the same pairing, and its own log stays in the
+        // events.
+        let (result, (nodes, events)) = inspect(reverter);
         assert!(!result.is_success(), "{result:?}");
         assert_eq!(nodes[0].logs.len(), 1);
         assert_logs_match_frames(&nodes);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.contract_id, event.selector.clone()))
+                .collect::<Vec<_>>(),
+            vec![(reverter, tag(5))]
+        );
     }
 }
