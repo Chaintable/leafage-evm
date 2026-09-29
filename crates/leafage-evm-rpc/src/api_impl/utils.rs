@@ -7,7 +7,7 @@ use leafage_evm_types::{
 use revm::context::BlockEnv;
 use revm::database::{CacheDB, DatabaseRef};
 use revm::primitives::Address;
-use revm::state::{Account, AccountStatus, EvmStorageSlot};
+use revm::state::{Account, AccountStatus, EvmStorageSlot, TransactionId};
 use revm::{Database, DatabaseCommit};
 use revm_inspectors::tracing::types::{CallTraceNode, TraceMemberOrder};
 use revm_inspectors::tracing::CallTraceArena;
@@ -180,13 +180,10 @@ where
     }
 
     // Create a new account marked as touched
-    let mut acc = Account {
-        info: info.clone(),
-        original_info: Box::new(info),
-        status: AccountStatus::Touched,
-        storage: HashMap::default(),
-        transaction_id: 0,
-    };
+    let mut acc = Account::default();
+    acc.info = info;
+    acc.set_current_info_as_original();
+    acc.status = AccountStatus::Touched;
 
     let storage_diff = match (account_override.state, account_override.state_diff) {
         (Some(_), Some(_)) => {
@@ -203,10 +200,9 @@ where
             // Destroy the account to ensure that its storage is cleared
             db.commit(HashMap::from_iter([(
                 account,
-                Account {
-                    status: AccountStatus::SelfDestructed | AccountStatus::Touched,
-                    ..Default::default()
-                },
+                Account::default()
+                    .with_selfdestruct_mark()
+                    .with_touched_mark(),
             )]));
             // Mark the account as created to ensure that old storage is not read
             acc.mark_created();
@@ -231,7 +227,7 @@ where
                     // we use inverted value here to ensure that storage is treated as changed
                     original_value: (!value).into(),
                     present_value: value.into(),
-                    transaction_id: 0,
+                    transaction_id: TransactionId::ZERO,
                     is_cold: false,
                 },
             );
@@ -497,26 +493,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_blocking_with_cancel() {
-        let val = Arc::new(AtomicU64::new(0));
-        let val_clone = val.clone();
-        let _ = timeout(
+        // Dropping the caller's future (here: on timeout) must cancel the token the
+        // blocking task polls. Assert on the observed cancellation rather than on how
+        // many iterations fit into the timeout, which depends on scheduler timing.
+        const MAX_ITERATIONS: u64 = 500;
+        let iterations = Arc::new(AtomicU64::new(0));
+        let iterations_clone = iterations.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let res = timeout(
             Duration::from_millis(50),
             spawn_blocking_with_cancel(move |token| {
-                for _ in 0..10 {
-                    println!(
-                        "val: {}, canceled: {}",
-                        val_clone.load(atomic::Ordering::Relaxed),
-                        token.is_cancelled()
-                    );
-                    if token.is_cancelled() {
-                        return;
-                    }
-                    val_clone.fetch_add(1, atomic::Ordering::SeqCst);
+                while !token.is_cancelled()
+                    && iterations_clone.load(atomic::Ordering::SeqCst) < MAX_ITERATIONS
+                {
+                    iterations_clone.fetch_add(1, atomic::Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                done_tx.send(token.is_cancelled()).unwrap();
             }),
         )
         .await;
-        assert_eq!(val.load(atomic::Ordering::SeqCst), 5);
+        assert!(res.is_err(), "task must still be running when the timeout fires");
+
+        let cancelled = tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .expect("blocking task did not finish");
+        assert!(cancelled, "blocking task must observe cancellation");
+        assert!(iterations.load(atomic::Ordering::SeqCst) < MAX_ITERATIONS);
     }
 }

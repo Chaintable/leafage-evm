@@ -4,14 +4,17 @@ use alloy_sol_types::{sol, SolInterface, SolValue};
 use bech32::{Bech32m, Hrp};
 use leafage_evm_types::Bytes;
 use revm::precompile::{
-    Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+    eth_precompile_fn, EthPrecompileOutput, EthPrecompileResult, Precompile, PrecompileHalt,
+    PrecompileId,
 };
 use std::borrow::Cow;
+
+eth_precompile_fn!(bech32_run_precompile, bech32_run);
 
 pub const BECH32: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("COSMOS_BECH32")),
     address!("0x0000000000000000000000000000000000000400"),
-    bech32_run,
+    bech32_run_precompile,
 );
 
 const BECH32PRECOMPILE_BASE_GAS: u64 = 6000;
@@ -42,67 +45,67 @@ interface Bech32I {
     ) external returns (address addr);
 });
 
-fn bech32_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bech32_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     if gas_limit < BECH32PRECOMPILE_BASE_GAS {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
     if input.len() < 4 {
-        return Err(PrecompileError::other("invalid input"));
+        return Err(PrecompileHalt::other("invalid input"));
     }
     let call = Bech32ICalls::abi_decode(&input);
     match call {
         Ok(Bech32ICalls::hexToBech32(call)) => hex_to_bech32(call),
         Ok(Bech32ICalls::bech32ToHex(call)) => bech32_to_hex(call),
-        Err(err) => Err(PrecompileError::other(format!("{:?}", err))),
+        Err(err) => Err(PrecompileHalt::other(format!("{:?}", err))),
     }
 }
 
-fn hex_to_bech32(call: hexToBech32Call) -> PrecompileResult {
+fn hex_to_bech32(call: hexToBech32Call) -> EthPrecompileResult {
     let hexToBech32Call { addr, prefix } = call;
     if prefix.trim().is_empty() {
-        return Err(PrecompileError::other("invalid bech32 human readable prefix (HRP). Please provide a either an account, validator or consensus address prefix"));
+        return Err(PrecompileHalt::other("invalid bech32 human readable prefix (HRP). Please provide a either an account, validator or consensus address prefix"));
     }
     valid_address(&addr)?;
-    let hrp = Hrp::parse(&prefix).map_err(|err| PrecompileError::other(err.to_string()))?;
+    let hrp = Hrp::parse(&prefix).map_err(|err| PrecompileHalt::other(err.to_string()))?;
     let bech32_str = bech32::encode::<Bech32m>(hrp, &addr.to_vec())
-        .map_err(|err| PrecompileError::other(err.to_string()))?;
+        .map_err(|err| PrecompileHalt::other(err.to_string()))?;
     let ret = (bech32_str,);
-    Ok(PrecompileOutput::new(
+    Ok(EthPrecompileOutput::new(
         BECH32PRECOMPILE_BASE_GAS,
         Bytes::from(ret.abi_encode()),
     ))
 }
 
-fn bech32_to_hex(call: bech32ToHexCall) -> PrecompileResult {
+fn bech32_to_hex(call: bech32ToHexCall) -> EthPrecompileResult {
     let bech32ToHexCall { bech32Address } = call;
     if bech32Address.trim().is_empty() {
-        return Err(PrecompileError::other(format!(
+        return Err(PrecompileHalt::other(format!(
             "invalid bech32 address: {bech32Address}"
         )));
     }
     let (_, decoded_data) = bech32::decode(&bech32Address)
-        .map_err(|err| PrecompileError::other(format!("decoding bech32 failed: {}", err)))?;
+        .map_err(|err| PrecompileHalt::other(format!("decoding bech32 failed: {}", err)))?;
     let address = Address::from_slice(&decoded_data);
     valid_address(&address)?;
     let ret = (address,);
-    Ok(PrecompileOutput::new(
+    Ok(EthPrecompileOutput::new(
         BECH32PRECOMPILE_BASE_GAS,
         Bytes::from(ret.abi_encode()),
     ))
 }
 
-fn valid_address(addr: &Address) -> PrecompileResult {
+fn valid_address(addr: &Address) -> EthPrecompileResult {
     if addr.is_empty() {
-        return Err(PrecompileError::other("address cannot be empty"));
+        return Err(PrecompileHalt::other("address cannot be empty"));
     }
     if addr.len() > 255 {
-        return Err(PrecompileError::other(format!(
+        return Err(PrecompileHalt::other(format!(
             "address max length is {}, got {}",
             255,
             addr.len()
         )));
     }
-    Ok(PrecompileOutput::new(0, Default::default()))
+    Ok(EthPrecompileOutput::new(0, Default::default()))
 }
 
 #[cfg(test)]

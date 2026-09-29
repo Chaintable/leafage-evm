@@ -64,21 +64,14 @@ impl From<MainnetSpecId> for ArbitrumHardfork {
     fn from(spec: MainnetSpecId) -> Self {
         match spec {
             MainnetSpecId::FRONTIER
-            | MainnetSpecId::FRONTIER_THAWING
             | MainnetSpecId::HOMESTEAD
-            | MainnetSpecId::DAO_FORK
             | MainnetSpecId::TANGERINE
             | MainnetSpecId::SPURIOUS_DRAGON
             | MainnetSpecId::BYZANTIUM
-            | MainnetSpecId::CONSTANTINOPLE
             | MainnetSpecId::PETERSBURG
             | MainnetSpecId::ISTANBUL
-            | MainnetSpecId::MUIR_GLACIER
             | MainnetSpecId::BERLIN => Self::Berlin,
-            MainnetSpecId::LONDON
-            | MainnetSpecId::ARROW_GLACIER
-            | MainnetSpecId::GRAY_GLACIER
-            | MainnetSpecId::MERGE => Self::London,
+            MainnetSpecId::LONDON | MainnetSpecId::MERGE => Self::London,
             MainnetSpecId::SHANGHAI => Self::Shanghai,
             MainnetSpecId::CANCUN => Self::Cancun,
             MainnetSpecId::PRAGUE => Self::Prague,
@@ -140,7 +133,7 @@ mod tests {
     #[test]
     fn accepts_cli_spec_ids_as_mainnet_compatibility_input() {
         assert_eq!(
-            ArbitrumHardfork::try_from(MainnetSpecId::FRONTIER_THAWING as u8),
+            ArbitrumHardfork::try_from(MainnetSpecId::HOMESTEAD as u8),
             Ok(ArbitrumHardfork::Berlin)
         );
         assert_eq!(

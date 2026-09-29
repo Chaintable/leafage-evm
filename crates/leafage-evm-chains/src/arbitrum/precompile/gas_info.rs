@@ -3,7 +3,7 @@ use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call, low_u64_as_i64, signed_word};
 use super::{ArbPrecompileInput, ArbitrumContext};
 use crate::arbitrum::arbos_state;
-use revm::precompile::PrecompileResult;
+use crate::arbitrum::precompile::result::PrecompileResult;
 use revm::Database;
 
 const ARBOS_VERSION_10: u64 = 10;

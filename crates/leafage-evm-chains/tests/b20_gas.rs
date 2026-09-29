@@ -77,7 +77,7 @@ impl MockPort {
     }
 
     fn charge(&mut self, cost: u64) -> B20Result<()> {
-        if self.gas.record_cost(cost) {
+        if self.gas.record_regular_cost(cost) {
             Ok(())
         } else {
             Err(B20Error::OutOfGas)

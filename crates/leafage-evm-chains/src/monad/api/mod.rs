@@ -259,9 +259,11 @@ where
         } = &mut self.inner;
         let frame = frame_stack.get();
 
-        let mut action = frame
-            .interpreter
-            .run_plain(instruction.instruction_table(), ctx);
+        let mut action = frame.interpreter.run_plain(
+            instruction.instruction_table(),
+            instruction.gas_table(),
+            ctx,
+        );
         let outcome = apply_reserve_balance_rule(ctx, frame, &mut action)?;
         self.reserve_balance_violation |= outcome == ReserveRuleOutcome::Violated;
 
@@ -384,6 +386,7 @@ where
             &mut frame.interpreter,
             &mut *inspector,
             instruction.instruction_table(),
+            instruction.gas_table(),
         );
         let outcome = apply_reserve_balance_rule(ctx, frame, &mut action)?;
         self.reserve_balance_violation |= outcome == ReserveRuleOutcome::Violated;

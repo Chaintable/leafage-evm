@@ -229,7 +229,11 @@ where
         let instructions = &mut self.inner.instruction;
         let action = frame
             .interpreter
-            .run_plain(instructions.instruction_table(), context);
+            .run_plain(
+                instructions.instruction_table(),
+                instructions.gas_table(),
+                context,
+            );
         stylus::process_next_action(context, frame, action).inspect(|item| {
             if item.is_result() {
                 frame.set_finished(true);
@@ -377,6 +381,7 @@ where
                 &mut frame.interpreter,
                 inspector,
                 instructions.instruction_table(),
+                instructions.gas_table(),
             );
             let mut result = stylus::process_next_action(ctx, frame, action);
             if let Ok(ItemOrResult::Result(frame_result)) = &mut result {

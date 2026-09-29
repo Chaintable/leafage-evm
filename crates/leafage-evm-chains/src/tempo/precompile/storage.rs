@@ -272,7 +272,7 @@ impl<'a> LeafageStorageProvider<'a> {
                 (GasId::new_account_cost(), 250_000),
                 (GasId::new_account_cost_for_selfdestruct(), 250_000),
                 (GasId::code_deposit_cost(), 1_000),
-                (GasId::tx_eip7702_per_empty_account_cost(), 12_500),
+                (GasId::tx_eip7702_regular_gas(), 12_500),
                 (GasId::new(255), 250_000),
             ]);
         }
@@ -301,12 +301,10 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
     }
 
     fn beneficiary(&self) -> Address {
-        use revm::context::Block;
         self.internals.block_env().beneficiary()
     }
 
     fn block_number(&self) -> u64 {
-        use revm::context::Block;
         self.internals.block_env().number().to::<u64>()
     }
 

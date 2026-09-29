@@ -3,10 +3,10 @@ use super::state::ArbStorage;
 use super::util::{copy_gas, dispatch, empty_revert, finish_call, topic_address, topic_u256};
 use super::{ArbPrecompileInput, ArbitrumContext, ARB_DEBUG_ADDRESS};
 use crate::arbitrum::evm::ArbResourceKind;
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileOutput, PrecompileResult};
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::SolValue;
 use revm::context::{ContextTr, JournalTr};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use revm::state::Bytecode;
 use revm::Database;
 

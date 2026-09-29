@@ -89,7 +89,7 @@ impl Env {
 
 fn gas_used(result: &ExecutionResult) -> u64 {
     assert!(result.is_success(), "unexpected result: {result:?}");
-    result.gas_used()
+    result.tx_gas_used()
 }
 
 /// `CALL(GAS, target, value, 0, 0, 0, 0); POP; STOP` — 5 PUSH1 + PUSH20 + GAS
@@ -208,7 +208,7 @@ fn call_forwards_all_the_remaining_gas() {
         ),
         "unexpected result: {result:?}"
     );
-    assert_eq!(result.gas_used(), GAS_LIMIT);
+    assert_eq!(result.tx_gas_used(), GAS_LIMIT);
 }
 
 /// `VM.doSUICIDE`: 5 000 + 25 000 for a beneficiary that is not in the state

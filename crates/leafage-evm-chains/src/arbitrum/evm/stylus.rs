@@ -308,7 +308,7 @@ where
     let over_page_limit = prepared.arbos_version >= ARBOS_PAGE_LIMIT
         && prepared.page_limit > 0
         && new_open > prepared.page_limit;
-    if over_page_limit || !gas.record_cost(precharge) {
+    if over_page_limit || !gas.record_regular_cost(precharge) {
         gas.spend_all();
         if arbos_version >= ARBOS_MULTI_GAS_REFUND_FIX {
             evm.inner.ctx.chain_mut().attribute_wasm_computation(
@@ -461,7 +461,7 @@ where
 
     // 7. Thread gas + refund back onto the frame result.
     let wasm_used = supplied.saturating_sub(call_gas);
-    let _ = gas.record_cost(wasm_used);
+    let _ = gas.record_regular_cost(wasm_used);
     gas.record_refund(refund);
     let (result, output) = match stylus_frame_disposition(outcome.outcome, outcome.output) {
         StylusFrameDisposition::Complete {
@@ -495,7 +495,7 @@ where
         }
         let excess = gas.remaining().saturating_sub(gas_limit - evm_cost);
         if excess > 0 {
-            let _ = gas.record_cost(excess);
+            let _ = gas.record_regular_cost(excess);
         }
     }
     evm.inner.ctx.chain_mut().attribute_wasm_computation(
@@ -1192,17 +1192,43 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
             ),
         };
 
+        // revm 43 requires the callee bytecode up front; this is the raw code
+        // of `bytecode_address`, which revm previously loaded in frame init
+        // when `known_bytecode` was `None`.
+        let known_bytecode = match self
+            .ctx()
+            .journal_mut()
+            .load_account_with_code(bytecode_address)
+        {
+            Ok(account) => (
+                account.info.code_hash(),
+                account.info.code.clone().unwrap_or_default(),
+            ),
+            Err(error) => {
+                self.latch_fatal_error(ContextError::Db(error));
+                return (
+                    vec![CALL_STATUS_FAILURE],
+                    Vec::new(),
+                    base_cost.saturating_add(call_gas),
+                );
+            }
+        };
         let inputs = CallInputs {
             input: CallInput::Bytes(calldata),
             return_memory_offset: 0..0,
             gas_limit: call_gas,
             bytecode_address,
-            known_bytecode: None,
+            known_bytecode,
             target_address,
             caller,
             value: call_value,
             scheme,
             is_static,
+            // Stylus hostio subcalls do not implement EIP-8037 state gas: the
+            // child gets no reservoir (state gas spills into its regular gas,
+            // which `returnable_gas` settles) and no upfront state charge.
+            reservoir: 0,
+            charged_new_account_state_gas: false,
         };
 
         match drive_subframe::<D, _, _>(self.evm, FrameInput::Call(Box::new(inputs))) {
@@ -1288,7 +1314,8 @@ impl<D: FrameDriver<DB, I>, DB: Database + DatabaseRef, I> StylusHostio<'_, D, D
         let after_base = gas - base_cost;
         let one_64th = after_base / 64;
         let child_gas = after_base - one_64th;
-        let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, child_gas);
+        // No EIP-8037 reservoir for Stylus hostio subframes (see `contract_call`).
+        let inputs = CreateInputs::new(self.contract, scheme, endowment, init_code, child_gas, 0);
 
         match drive_subframe::<D, _, _>(self.evm, FrameInput::Create(Box::new(inputs))) {
             Ok(FrameResult::Create(outcome)) => {
@@ -1727,12 +1754,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 1_000_000,
             bytecode_address: address,
-            known_bytecode: Some((code_hash, bytecode)),
+            known_bytecode: (code_hash, bytecode),
             target_address: address,
             caller,
             value: CallValue::Apparent(U256::ZERO),
             scheme: CallScheme::Call,
             is_static: false,
+            reservoir: 0,
+            charged_new_account_state_gas: false,
         };
         assert!(matches!(
             evm.frame_init(FrameInit {
@@ -1757,12 +1786,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 100_000,
             bytecode_address,
-            known_bytecode: Some((bytecode.hash_slow(), bytecode)),
+            known_bytecode: (bytecode.hash_slow(), bytecode),
             target_address: target,
             caller: Address::with_last_byte(1),
             value: CallValue::Apparent(U256::ZERO),
             scheme,
             is_static: false,
+            reservoir: 0,
+            charged_new_account_state_gas: false,
         }
     }
 
@@ -1799,12 +1830,12 @@ mod tests {
                     let mut gas = Gas::new(inputs.gas_limit);
                     let (result, output) = match marker {
                         0 => {
-                            assert!(gas.record_cost(1_234));
+                            assert!(gas.record_regular_cost(1_234));
                             gas.record_refund(77);
                             (InstructionResult::Return, Bytes::from_static(b"ok"))
                         }
                         1 => {
-                            assert!(gas.record_cost(1_234));
+                            assert!(gas.record_regular_cost(1_234));
                             gas.record_refund(88);
                             (InstructionResult::Revert, Bytes::from_static(b"revert"))
                         }
@@ -1827,12 +1858,12 @@ mod tests {
                     let mut gas = Gas::new(inputs.gas_limit());
                     let (result, output) = match marker {
                         0 => {
-                            assert!(gas.record_cost(1_234));
+                            assert!(gas.record_regular_cost(1_234));
                             gas.record_refund(77);
                             (InstructionResult::Return, Bytes::new())
                         }
                         1 => {
-                            assert!(gas.record_cost(1_234));
+                            assert!(gas.record_regular_cost(1_234));
                             gas.record_refund(88);
                             (InstructionResult::Revert, Bytes::from_static(b"revert"))
                         }
@@ -2246,6 +2277,7 @@ mod tests {
             U256::ZERO,
             Bytes::from_static(&[0x00]),
             100_000,
+            0,
         );
         let init = child_frame_init(&mut evm, FrameInput::Create(Box::new(create)));
         assert!(matches!(
