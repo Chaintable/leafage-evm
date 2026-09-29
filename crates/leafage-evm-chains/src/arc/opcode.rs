@@ -261,7 +261,10 @@ fn check_accounts<DB: Database>(
             }
             match context.host.journal_mut().load_account(target) {
                 Ok(account) => account.is_cold,
-                Err(_) => {
+                Err(err) => {
+                    // Direct journal access bypasses Host error recording; REVM panics on a
+                    // FatalExternalError that has no context error.
+                    *context.host.error() = Err(err.into());
                     context.interpreter.halt_fatal();
                     return Err(());
                 }
@@ -293,7 +296,8 @@ fn check_accounts<DB: Database>(
             Err(())
         }
         Ok(_) => Ok(is_cold),
-        Err(_) => {
+        Err(err) => {
+            *context.host.error() = Err(err.into());
             context.interpreter.halt_fatal();
             Err(())
         }

@@ -4,7 +4,9 @@ use alloy::{
     sol_types::SolCall,
 };
 use alloy_evm::EvmEnv;
-use leafage_evm_chains::arc::{ArcChainConfig, ArcEvmFactory};
+use leafage_evm_chains::arc::{
+    ArcChainConfig, ArcEvmFactory, ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+};
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};
 use revm::{
     bytecode::Bytecode,
@@ -20,6 +22,8 @@ use revm::{
 const ACCOUNTING: Address = address!("1800000000000000000000000000000000000002");
 const WRAPPER: Address = address!("000000000000000000000000000000000000ca11");
 const CALLER: Address = address!("000000000000000000000000000000000000ca12");
+const SOURCE: Address = address!("000000000000000000000000000000000000ca13");
+const TARGET: Address = address!("000000000000000000000000000000000000dead");
 sol! { function getGasValues(uint64 blockNumber) external; }
 
 #[derive(Debug)]
@@ -35,11 +39,16 @@ impl DBErrorMarker for ReadFailure {}
 struct FaultDb {
     inner: InMemoryDB,
     fail: bool,
+    fail_account: Option<Address>,
     failures: usize,
 }
 impl Database for FaultDb {
     type Error = ReadFailure;
     fn basic(&mut self, a: Address) -> Result<Option<AccountInfo>, ReadFailure> {
+        if self.fail_account == Some(a) {
+            self.failures += 1;
+            return Err(ReadFailure);
+        }
         Ok(self.inner.basic(a).unwrap())
     }
     fn code_by_hash(&mut self, h: B256) -> Result<Bytecode, ReadFailure> {
@@ -100,6 +109,7 @@ fn precompile_db_failure_must_abort_outer_transaction() {
                 FaultDb {
                     inner: db,
                     fail,
+                    fail_account: None,
                     failures: 0,
                 },
                 NoOpInspector {},
@@ -142,6 +152,77 @@ fn precompile_db_failure_must_abort_outer_transaction() {
             assert_eq!(
                 U256::from_be_slice(result.result.output().unwrap()),
                 U256::ONE
+            );
+        }
+    }
+}
+
+#[test]
+fn selfdestruct_target_db_failure_returns_database_error() {
+    // SELFDESTRUCT(TARGET) from a funded contract; the opcode performs TARGET's first load.
+    let mut code = vec![0x73];
+    code.extend_from_slice(TARGET.as_slice());
+    code.push(0xff);
+    let activation = ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET;
+    for timestamp in [activation - 1, activation] {
+        for inspect in [false, true] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                CALLER,
+                AccountInfo {
+                    balance: U256::from(1_000_000),
+                    ..Default::default()
+                },
+            );
+            db.insert_account_info(
+                SOURCE,
+                AccountInfo {
+                    balance: U256::from(100),
+                    nonce: 1,
+                    code: Some(Bytecode::new_raw(Bytes::from(code.clone()))),
+                    ..Default::default()
+                },
+            );
+            let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+            cfg.chain_id = 5042;
+            let block = BlockEnv {
+                number: U256::ONE,
+                timestamp: U256::from(timestamp),
+                gas_limit: 30_000_000,
+                prevrandao: Some(B256::ZERO),
+                ..Default::default()
+            };
+            let mut evm = ArcEvmFactory::new(ArcChainConfig::mainnet())
+                .create(
+                    EvmEnv::new(cfg, block),
+                    FaultDb {
+                        inner: db,
+                        fail: false,
+                        fail_account: Some(TARGET),
+                        failures: 0,
+                    },
+                    NoOpInspector {},
+                )
+                .unwrap();
+            let tx = TxEnv {
+                caller: CALLER,
+                kind: TxKind::Call(SOURCE),
+                gas_limit: 200_000,
+                chain_id: Some(5042),
+                ..Default::default()
+            };
+            let result = if inspect {
+                evm.inspect(tx, NoOpInspector {})
+            } else {
+                evm.transact(tx)
+            };
+            assert_eq!(evm.ctx().journaled_state.db().failures, 1);
+            assert!(
+                matches!(
+                    result,
+                    Err(revm::context::result::EVMError::Database(ReadFailure))
+                ),
+                "timestamp {timestamp}, inspect {inspect}: {result:?}"
             );
         }
     }
