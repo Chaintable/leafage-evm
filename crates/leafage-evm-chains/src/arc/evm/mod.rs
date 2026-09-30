@@ -7,7 +7,7 @@ use super::{
     },
     opcode::{arc_selfdestruct_instruction, ARC_SELFDESTRUCT_STATIC_GAS},
     precompile::{extend_arc_precompiles, subcall::SubcallPrecompile},
-    ArcChainConfig, ArcExecutionSpec, ArcHardfork,
+    ArcChainConfig, ArcExecutionSpec, ArcHardfork, ArcHardforkFlags,
 };
 use alloy::primitives::{Address, Bytes, Log};
 use alloy_evm::{precompiles::PrecompilesMap, Database, EvmEnv};
@@ -126,7 +126,13 @@ impl ArcEvmFactory {
     ) -> Result<ArcEvm<DB, I>, ArcEvmFactoryError> {
         self.validate_cfg(&env.cfg_env)?;
         let execution_spec = self.execution_spec(&env.block_env)?;
-        Ok(ArcEvm::new(env, db, inspector, execution_spec))
+        Ok(ArcEvm::new(
+            env,
+            db,
+            inspector,
+            self.chain_config,
+            execution_spec,
+        ))
     }
 
     fn validate_cfg(&self, cfg: &CfgEnv<MainnetSpecId>) -> Result<(), ArcEvmFactoryError> {
@@ -149,6 +155,26 @@ impl ArcEvmFactory {
     }
 }
 
+/// Precompiles and instructions whose behavior depends on the active Arc hardforks.
+fn arc_precompiles_and_instructions<DB: Database>(
+    spec: MainnetSpecId,
+    arc_flags: ArcHardforkFlags,
+) -> (
+    PrecompilesMap,
+    EthInstructions<EthInterpreter, ArcContext<DB>>,
+) {
+    let mut precompiles =
+        PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec)));
+    extend_arc_precompiles(&mut precompiles, arc_flags);
+    let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+    instructions.insert_instruction(
+        SELFDESTRUCT,
+        arc_selfdestruct_instruction::<DB>(arc_flags),
+        ARC_SELFDESTRUCT_STATIC_GAS,
+    );
+    (precompiles, instructions)
+}
+
 /// Arc query EVM wrapper.
 ///
 /// Its separate type prevents Arc RPCs from being implemented by the generic
@@ -163,6 +189,7 @@ pub struct ArcEvm<DB: revm::Database, I> {
         PrecompilesMap,
         EthFrame,
     >,
+    chain_config: ArcChainConfig,
     execution_spec: ArcExecutionSpec,
     subcall_registry: SubcallRegistry,
     subcall_continuations: HashMap<usize, SubcallContinuation>,
@@ -327,6 +354,7 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         env: EvmEnv<MainnetSpecId>,
         db: DB,
         inspector: I,
+        chain_config: ArcChainConfig,
         execution_spec: ArcExecutionSpec,
     ) -> Self {
         let mut cfg = env.cfg_env;
@@ -335,16 +363,8 @@ impl<DB: Database, I> ArcEvm<DB, I> {
         // Ethereum base spec.
         cfg.amsterdam_eip7708_disabled = true;
         cfg.amsterdam_eip8246_delayed_clear_disabled = true;
-        let spec = cfg.spec;
-        let mut precompiles =
-            PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec)));
-        extend_arc_precompiles(&mut precompiles, execution_spec.arc_flags);
-        let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
-        instructions.insert_instruction(
-            SELFDESTRUCT,
-            arc_selfdestruct_instruction::<DB>(execution_spec.arc_flags),
-            ARC_SELFDESTRUCT_STATIC_GAS,
-        );
+        let (precompiles, instructions) =
+            arc_precompiles_and_instructions::<DB>(cfg.spec, execution_spec.arc_flags);
         let mut journaled_state = Journal::new(db);
         // Arc implements Zero5 transfer logs itself while its Ethereum base spec remains Osaka.
         // Disable REVM's future Amsterdam EIP-7708 logs and EIP-8246 delayed clearing.
@@ -365,11 +385,35 @@ impl<DB: Database, I> ArcEvm<DB, I> {
                 precompiles,
                 frame_stack: Default::default(),
             },
+            chain_config,
             execution_spec,
             subcall_registry: SubcallRegistry::for_hardforks(execution_spec.arc_flags),
             subcall_continuations: HashMap::new(),
             subcall_trace_completion_hook: None,
         }
+    }
+
+    /// Resolves the Arc hardforks for the current block and rebuilds the precompiles,
+    /// SELFDESTRUCT and subcall registry that depend on them.
+    fn refresh_execution_spec(&mut self) {
+        let block = &self.inner.ctx.block;
+        // The factory rejects numbers and timestamps beyond u64; `set_block` cannot fail,
+        // so saturate instead.
+        let execution_spec = self.chain_config.execution_spec_at(
+            block.number.saturating_to(),
+            block.timestamp.saturating_to(),
+        );
+        if execution_spec == self.execution_spec {
+            return;
+        }
+        let (precompiles, instructions) = arc_precompiles_and_instructions::<DB>(
+            self.inner.ctx.cfg.spec,
+            execution_spec.arc_flags,
+        );
+        self.inner.precompiles = precompiles;
+        self.inner.instruction = instructions;
+        self.subcall_registry = SubcallRegistry::for_hardforks(execution_spec.arc_flags);
+        self.execution_spec = execution_spec;
     }
 
     /// Installs an observer for transparent subcall completion metadata.
@@ -1145,6 +1189,7 @@ mod tests {
         },
         ArcHardfork, ArcHardforkFlags, ARC_MAINNET_CHAIN_ID,
         ARC_ZERO7_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
+        ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET,
     };
     use alloy::primitives::{address, keccak256, Address, Bytes, LogData, B256};
     use alloy::sol_types::{sol, SolCall};
@@ -1568,6 +1613,107 @@ mod tests {
             factory.execution_spec(&block),
             Err(ArcEvmFactoryError::Timestamp(_))
         ));
+    }
+
+    #[test]
+    fn set_block_applies_the_arc_hardforks_of_the_new_block() {
+        sol! {
+            interface ITestNativeCoinAuthority {
+                function transfer(address from, address to, uint256 amount) external returns (bool);
+            }
+        }
+        const NATIVE_FIAT_TOKEN: Address = address!("3600000000000000000000000000000000000000");
+        const NATIVE_COIN_AUTHORITY: Address = address!("1800000000000000000000000000000000000000");
+        const DESTRUCTOR: Address = address!("3000000000000000000000000000000000000003");
+        const DRAINED: Address = address!("4000000000000000000000000000000000000004");
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            SOURCE,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+        // Zero7 registers CallFrom for Memo.
+        insert_contract(
+            &mut db,
+            MEMO_ADDRESS,
+            U256::ZERO,
+            forwarding_call_code(CALL_FROM_ADDRESS),
+        );
+        insert_contract(&mut db, TARGET, U256::ONE, return_caller_code());
+        // Zero8 SELFDESTRUCT counts the BALANCE warmth; before it, the low-gas cold check fails.
+        let mut destructor = vec![opcode::PUSH20];
+        destructor.extend_from_slice(TARGET.as_slice());
+        destructor.extend_from_slice(&[opcode::BALANCE, opcode::POP, opcode::PUSH20]);
+        destructor.extend_from_slice(TARGET.as_slice());
+        destructor.push(opcode::SELFDESTRUCT);
+        insert_contract(&mut db, DESTRUCTOR, U256::ONE, destructor.into());
+        // Zero8 NCA may drain an account to empty; before it, the transfer reverts.
+        db.insert_account_info(
+            DRAINED,
+            AccountInfo {
+                balance: U256::from(10),
+                ..Default::default()
+            },
+        );
+
+        let tx = |caller, to, gas_limit, data| TxEnv {
+            caller,
+            kind: TxKind::Call(to),
+            gas_limit,
+            data,
+            chain_id: Some(ARC_MAINNET_CHAIN_ID),
+            ..Default::default()
+        };
+        let txs = [
+            tx(
+                SOURCE,
+                MEMO_ADDRESS,
+                300_000,
+                call_from_input(SOURCE, TARGET, Bytes::new()),
+            ),
+            // Intrinsic, PUSH20, cold BALANCE, POP, PUSH20 and the static SELFDESTRUCT cost,
+            // leaving 100 gas for the target access.
+            tx(
+                SOURCE,
+                DESTRUCTOR,
+                21_000 + 3 + 2_600 + 2 + 3 + 5_000 + 100,
+                Bytes::new(),
+            ),
+            tx(
+                NATIVE_FIAT_TOKEN,
+                NATIVE_COIN_AUTHORITY,
+                300_000,
+                ITestNativeCoinAuthority::transferCall {
+                    from: DRAINED,
+                    to: SOURCE,
+                    amount: U256::from(10),
+                }
+                .abi_encode()
+                .into(),
+            ),
+        ];
+
+        let factory = ArcEvmFactory::new(ArcChainConfig::mainnet());
+        let pre_zero7 = evm_env();
+        let zero8 = evm_env_at(ARC_ZERO8_HARDFORK_TIMESTAMP_ACTIVATION_MAINNET);
+        let run = |created_at: &EvmEnv<MainnetSpecId>, block: &BlockEnv, tx: &TxEnv| {
+            let mut evm = factory
+                .create(created_at.clone(), db.clone(), NoOpInspector {})
+                .unwrap();
+            evm.set_block(block.clone());
+            assert_eq!(evm.execution_spec(), factory.execution_spec(block).unwrap());
+            evm.transact(tx.clone()).unwrap()
+        };
+        for tx in &txs {
+            let before = run(&pre_zero7, &pre_zero7.block_env, tx);
+            let after = run(&zero8, &zero8.block_env, tx);
+            assert_ne!(before, after, "{tx:?} must differ across Zero7/Zero8");
+            assert_eq!(run(&pre_zero7, &zero8.block_env, tx), after, "{tx:?}");
+            assert_eq!(run(&zero8, &pre_zero7.block_env, tx), before, "{tx:?}");
+        }
     }
 
     #[test]
