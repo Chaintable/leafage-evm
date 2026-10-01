@@ -6,13 +6,14 @@ mod compact;
 mod db_migrate;
 mod force_compact;
 mod initializer;
+mod pprof;
 mod register;
 mod rewind;
+mod rpc_merge;
 mod runner;
 mod standalone;
 mod updater;
 mod utils;
-mod pprof;
 mod warm;
 
 use clap::Parser;
