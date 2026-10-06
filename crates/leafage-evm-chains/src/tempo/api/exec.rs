@@ -259,10 +259,11 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
 
         // Standard validation (chain_id, gas limits, tx type, etc.).
         // REVM rejects nonce u64::MAX because protocol nonces are incremented after
-        // execution. T12 expiring nonces are opaque discriminators and never
-        // incremented, so validate the rest with a temporary in-range value
+        // execution. Expiring nonces are never incremented, so validate the rest with a
+        // temporary in-range value. Before T12 the pre-execution expiring nonce check
+        // still rejects the discriminator with ExpiringNonceNonceNotZero
         // (writer: handler.rs `validate_env`).
-        let accepts_max_expiring_nonce = evm.ctx().cfg.spec.is_t12()
+        let is_max_expiring_nonce = evm.ctx().cfg.spec.is_t1()
             && evm.ctx().tx.base.nonce == u64::MAX
             && evm
                 .ctx()
@@ -270,12 +271,12 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
                 .tempo_fields
                 .as_ref()
                 .is_some_and(|fields| fields.nonce_key == TEMPO_EXPIRING_NONCE_KEY);
-        if accepts_max_expiring_nonce {
+        if is_max_expiring_nonce {
             evm.ctx_mut().tx.base.nonce = 0;
         }
         let validation =
             MainnetHandler::<Self::Evm, Self::Error, EthFrame>::default().validate_env(evm);
-        if accepts_max_expiring_nonce {
+        if is_max_expiring_nonce {
             evm.ctx_mut().tx.base.nonce = u64::MAX;
         }
         validation?;
@@ -4212,26 +4213,13 @@ mod tests {
 
             let mut t11 = make_cached_evm_with_spec(TempoHardfork::T11);
             let t11_error = t11.transact(tx.clone()).unwrap_err();
-            if nonce == u64::MAX {
-                // Like the writer, REVM's validate_env rejects u64::MAX before T12.
-                assert!(
-                    matches!(
-                        t11_error,
-                        EVMError::Transaction(TempoInvalidTransaction::EthInvalidTransaction(
-                            revm::context::result::InvalidTransaction::NonceOverflowInTransaction
-                        ))
-                    ),
-                    "nonce {nonce}: {t11_error:?}"
-                );
-            } else {
-                assert!(
-                    matches!(
-                        t11_error,
-                        EVMError::Transaction(TempoInvalidTransaction::ExpiringNonceNonceNotZero)
-                    ),
-                    "nonce {nonce}: {t11_error:?}"
-                );
-            }
+            assert!(
+                matches!(
+                    t11_error,
+                    EVMError::Transaction(TempoInvalidTransaction::ExpiringNonceNonceNotZero)
+                ),
+                "nonce {nonce}: {t11_error:?}"
+            );
 
             let mut t12 = make_cached_evm_with_spec(TempoHardfork::T12);
             let result = t12.transact(tx).unwrap();
