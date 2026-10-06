@@ -1,7 +1,6 @@
 //! Leafage compatibility wrapper around the pinned official Tempo protocol definitions.
-//! Mainnet schedule comes from tempo-hardfork, except the T12 timestamp (see
-//! `MAINNET_T12_TIMESTAMP`); Default remains the legacy T10 value.
-//! Genesis folds upstream Genesis/T0, and REVM36 conversion remains local.
+//! Mainnet schedule comes from tempo-hardfork; Default remains the legacy T10 value.
+//! Genesis folds upstream Genesis/T0, and the REVM spec conversion remains local.
 
 use tempo_hardfork::TempoHardfork as OfficialHardfork;
 
@@ -26,24 +25,11 @@ pub enum TempoHardfork {
     T12,
 }
 
-/// Mainnet T12 activation, copied from the official release `presto.json`.
-/// The pinned tempo-hardfork (v1.14.0) defines T12 without a schedule and later
-/// revisions require alloy core >= 1.7.3, so the timestamp is kept here.
-/// `None` until Tempo publishes the T12 release.
-const MAINNET_T12_TIMESTAMP: Option<u64> = None;
-
 impl TempoHardfork {
     /// Uses the official mainnet schedule, never latest() or the process clock.
     pub fn from_timestamp(timestamp: u64) -> Self {
-        Self::from_timestamp_with_t12(timestamp, MAINNET_T12_TIMESTAMP)
-    }
-
-    fn from_timestamp_with_t12(timestamp: u64, t12_timestamp: Option<u64>) -> Self {
-        let mut fork = OfficialHardfork::from_chain_and_timestamp(4217, timestamp)
+        let fork = OfficialHardfork::from_chain_and_timestamp(4217, timestamp)
             .expect("official Tempo mainnet schedule exists");
-        if fork == OfficialHardfork::T11 && t12_timestamp.is_some_and(|t12| timestamp >= t12) {
-            fork = OfficialHardfork::T12;
-        }
         Self::try_from(fork).expect("scheduled fork must be supported by the pinned adapter")
     }
 
@@ -193,9 +179,11 @@ mod tests {
     const MAINNET_T9_TIME: u64 = 1_786_024_800;
     const MAINNET_T10_TIME: u64 = 1_787_320_800;
     const MAINNET_T11_TIME: u64 = 1_789_048_800;
+    // T12 activates on mainnet: 2026-10-13 14:00 UTC (official v1.16.0).
+    const MAINNET_T12_TIME: u64 = 1_791_900_000;
 
     #[test]
-    fn official_mapping_preserves_legacy_default_and_covers_every_pinned_fork() {
+    fn official_mapping_preserves_legacy_default_and_covers_every_scheduled_fork() {
         assert_eq!(TempoHardfork::default(), TempoHardfork::T10);
         assert_eq!(
             TempoHardfork::try_from(OfficialHardfork::T0),
@@ -211,47 +199,29 @@ mod tests {
         );
         assert_eq!(
             OfficialHardfork::from_chain_and_timestamp(4217, u64::MAX),
-            Some(OfficialHardfork::T11)
+            Some(OfficialHardfork::T12)
         );
         assert_eq!(
             OfficialHardfork::from_chain_and_timestamp(999, u64::MAX),
             None
         );
         for fork in OfficialHardfork::VARIANTS {
-            let local = TempoHardfork::try_from(*fork).expect("every pinned fork is mapped");
-            assert_eq!(
-                local.as_official(),
-                if *fork == OfficialHardfork::Genesis {
-                    OfficialHardfork::T0
-                } else {
-                    *fork
+            match TempoHardfork::try_from(*fork) {
+                Ok(local) => assert_eq!(
+                    local.as_official(),
+                    if *fork == OfficialHardfork::Genesis {
+                        OfficialHardfork::T0
+                    } else {
+                        *fork
+                    }
+                ),
+                // Forks after T12 are not implemented and must stay unscheduled on mainnet.
+                Err(unsupported) => {
+                    assert!(unsupported.is_t13(), "{unsupported:?}");
+                    assert_eq!(unsupported.mainnet_activation_timestamp(), None);
                 }
-            );
+            }
         }
-    }
-
-    #[test]
-    fn local_t12_timestamp_matches_any_official_schedule() {
-        if let Some(official) = OfficialHardfork::T12.mainnet_activation_timestamp() {
-            assert_eq!(MAINNET_T12_TIMESTAMP, Some(official));
-        }
-    }
-
-    #[test]
-    fn t12_activates_only_from_local_timestamp_after_t11() {
-        let t12 = MAINNET_T11_TIME + 1_000_000;
-        let at = |timestamp| TempoHardfork::from_timestamp_with_t12(timestamp, Some(t12));
-
-        assert_eq!(at(t12 - 1), TempoHardfork::T11);
-        assert_eq!(at(t12), TempoHardfork::T12);
-        assert_eq!(at(t12 + 1), TempoHardfork::T12);
-        assert_eq!(at(u64::MAX), TempoHardfork::T12);
-        assert_eq!(at(MAINNET_T11_TIME - 1), TempoHardfork::T10);
-        assert_eq!(at(MAINNET_T11_TIME), TempoHardfork::T11);
-        assert_eq!(
-            TempoHardfork::from_timestamp_with_t12(u64::MAX, None),
-            TempoHardfork::T11
-        );
     }
 
     #[test]
@@ -351,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn from_timestamp_t5_through_t11_boundaries() {
+    fn from_timestamp_t5_through_t12_boundaries() {
         let boundaries = [
             (MAINNET_T5_TIME, TempoHardfork::T4, TempoHardfork::T5),
             (MAINNET_T6_TIME, TempoHardfork::T5, TempoHardfork::T6),
@@ -360,6 +330,7 @@ mod tests {
             (MAINNET_T9_TIME, TempoHardfork::T8, TempoHardfork::T9),
             (MAINNET_T10_TIME, TempoHardfork::T9, TempoHardfork::T10),
             (MAINNET_T11_TIME, TempoHardfork::T10, TempoHardfork::T11),
+            (MAINNET_T12_TIME, TempoHardfork::T11, TempoHardfork::T12),
         ];
 
         for (timestamp, before, active) in boundaries {
@@ -369,7 +340,7 @@ mod tests {
         }
 
         // Future timestamps select the latest scheduled fork, never an unscheduled one.
-        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T11);
+        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T12);
     }
 
     #[test]
