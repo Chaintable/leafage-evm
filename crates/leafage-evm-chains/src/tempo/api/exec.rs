@@ -502,16 +502,16 @@ impl<DB: Database, INSP> Handler for TempoHandler<DB, INSP> {
             .tempo_fields
             .as_ref()
             .is_some_and(|fields| !fields.nonce_key.is_zero());
-        if uses_2d_nonce {
-            evm.ctx_mut().cfg.disable_nonce_check = true;
-        }
 
         let (_, tx, cfg, journal, _, _) = evm.ctx_mut().all_mut();
         let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
-        pre_execution::validate_account_nonce_and_code_with_components(
+        // 2D and expiring nonces skip the protocol nonce check for this transaction
+        // only; the EVM config is left untouched (writer: handler.rs:1032-1038).
+        pre_execution::validate_account_nonce_and_code(
             &caller.account().info,
-            tx,
-            cfg,
+            tx.nonce(),
+            cfg.is_eip3607_disabled(),
+            cfg.is_nonce_check_disabled() || uses_2d_nonce,
         )?;
         caller.touch();
         if !uses_2d_nonce && tx.kind().is_call() {
@@ -2398,6 +2398,35 @@ mod tests {
                 .is_cold
         };
         assert!(default_balance_is_cold);
+    }
+
+    /// A 2D-nonce transaction skips the protocol nonce check without leaving
+    /// `disable_nonce_check` set for later transactions on the same EVM.
+    #[test]
+    fn two_d_nonce_skips_nonce_check_without_mutating_cfg() {
+        let mut evm = make_evm_with_spec(TempoHardfork::T11);
+        assert!(!evm.inner.ctx.cfg.disable_nonce_check);
+        let caller = Address::repeat_byte(0x61);
+        evm.inner.ctx.tx.base.caller = caller;
+        evm.inner.ctx.tx.base.nonce = 5;
+        evm.inner.ctx.tx.tempo_fields = Some(TempoTxFields {
+            nonce_key: U256::from(7),
+            ..Default::default()
+        });
+        let handler = TempoHandler::<EmptyDB, NoOpInspector>::new();
+        handler
+            .validate_against_state_and_deduct_caller(&mut evm, &mut InitialAndFloorGas::default())
+            .expect("2D nonce skips the protocol nonce check");
+        assert!(!evm.inner.ctx.cfg.disable_nonce_check);
+
+        evm.inner.ctx.tx.tempo_fields = None;
+        assert!(matches!(
+            handler
+                .validate_against_state_and_deduct_caller(&mut evm, &mut InitialAndFloorGas::default()),
+            Err(EVMError::Transaction(TempoInvalidTransaction::EthInvalidTransaction(
+                revm::context::result::InvalidTransaction::NonceTooHigh { tx: 5, state: 0 }
+            )))
+        ));
     }
 
     /// Ported from official v1.16.0 tip20 `burn_at_bridge_caught_failure_restores_access_key_limit`:
