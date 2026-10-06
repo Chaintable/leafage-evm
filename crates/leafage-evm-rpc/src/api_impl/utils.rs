@@ -267,7 +267,6 @@ fn build_trace_node(
     debank_node.trace.id = debank_node.trace.debank_id();
 
     let id = debank_node.trace.id.clone();
-    let contract_id = node.execution_address();
 
     for pos in node.ordering.iter() {
         match &pos {
@@ -293,7 +292,6 @@ fn build_trace_node(
             TraceMemberOrder::Log(i) => {
                 let mut child_event: DebankEvent = (&node.logs[*i]).into();
                 child_event.pos_in_parent_trace = debank_node.children.len();
-                child_event.contract_id = contract_id;
                 child_event.tx_id = tx_id;
                 child_event.parent_trace_id = id.clone();
                 child_event.id = child_event.debank_id();
@@ -523,5 +521,173 @@ mod tests {
         .expect("blocking task did not finish");
         assert!(cancelled, "blocking task must observe cancellation");
         assert!(iterations.load(atomic::Ordering::SeqCst) < MAX_ITERATIONS);
+    }
+
+    /// Events take the log's own address. On mainnet every log comes from `LOG*`, whose
+    /// address is the frame's execution address under every call scheme, so events keep
+    /// the address they had when it was taken from the frame.
+    #[test]
+    fn mainnet_event_emitter_is_the_frame_execution_address() {
+        use crate::api_impl::core::EvmExecutor;
+        use crate::api_impl::{api_impl::NoneEvmCustomConfig, ApiImpl};
+        use leafage_evm_types::{CfgEnv, MainnetSpecId};
+        use revm::context::TxEnv;
+        use revm::database::InMemoryDB;
+        use revm::primitives::{keccak256, B256};
+        use revm_inspectors::tracing::TracingInspectorConfig;
+
+        // PUSH1 tag, PUSH0, PUSH0, LOG1, then `suffix`.
+        fn log1(tag: u8, suffix: &[u8]) -> Vec<u8> {
+            let mut code = vec![0x60, tag, 0x5f, 0x5f, 0xa1];
+            code.extend_from_slice(suffix);
+            code
+        }
+        // CALL / CALLCODE / DELEGATECALL `to` with no value, input or output.
+        fn call(opcode: u8, to: Address) -> Vec<u8> {
+            let stack_args = if opcode == 0xf4 { 4 } else { 5 };
+            let mut code = vec![0x5f; stack_args];
+            code.push(0x73);
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, opcode, 0x50]);
+            code
+        }
+        // CREATE, or CREATE2 with `salt`, of a 6-byte init code stored at memory[26..32].
+        fn create(init_code: &[u8], salt: Option<u8>) -> Vec<u8> {
+            let mut code = vec![0x65];
+            code.extend_from_slice(init_code);
+            code.extend_from_slice(&[0x5f, 0x52]);
+            if let Some(salt) = salt {
+                code.extend_from_slice(&[0x60, salt]);
+            }
+            code.extend_from_slice(&[0x60, 0x06, 0x60, 0x1a, 0x5f]);
+            code.extend_from_slice(&[if salt.is_some() { 0xf5 } else { 0xf0 }, 0x50]);
+            code
+        }
+
+        let caller = Address::repeat_byte(0x11);
+        let root = Address::repeat_byte(0x10);
+        let callee = Address::repeat_byte(0x20);
+        let delegate = Address::repeat_byte(0x30);
+        let callcode = Address::repeat_byte(0x40);
+        let reverter = Address::repeat_byte(0x50);
+        let create_init = log1(6, &[0x00]);
+        let create2_init = log1(7, &[0x00]);
+        let root_code = [
+            log1(1, &[]),
+            call(0xf1, callee),
+            call(0xf4, delegate),
+            call(0xf2, callcode),
+            call(0xf1, reverter),
+            create(&create_init, None),
+            create(&create2_init, Some(1)),
+            vec![0x00],
+        ]
+        .concat();
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+        for (address, code) in [
+            (root, root_code),
+            (callee, log1(2, &[0x00])),
+            (delegate, log1(3, &[0x00])),
+            (callcode, log1(4, &[0x00])),
+            (reverter, log1(5, &[0x5f, 0x5f, 0xfd])),
+        ] {
+            let code = Bytecode::new_raw(code.into());
+            db.insert_account_info(
+                address,
+                AccountInfo {
+                    nonce: 1,
+                    code_hash: code.hash_slow(),
+                    code: Some(code),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let api = ApiImpl::<(), MainnetSpecId, NoneEvmCustomConfig>::new(
+            (),
+            CfgEnv::new_with_spec(MainnetSpecId::OSAKA),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            100,
+            None,
+            None,
+            None,
+        );
+        let inspect = |to: Address| {
+            let tx = TxEnv::builder()
+                .caller(caller)
+                .to(to)
+                .gas_limit(1_000_000)
+                .build()
+                .unwrap();
+            api.inspect_tx_commit(
+                &BlockEnv::default(),
+                db.clone(),
+                TracingInspectorConfig::default_parity().set_record_logs(true),
+                |inspector| {
+                    let arena = inspector.into_traces();
+                    let nodes = arena.nodes().to_vec();
+                    (nodes, build_debank_traces(H256::ZERO, arena).1)
+                },
+                tx,
+            )
+            .unwrap()
+        };
+        let assert_logs_match_frames = |nodes: &[CallTraceNode]| {
+            for node in nodes {
+                for log in &node.logs {
+                    assert_eq!(log.address, node.execution_address(), "{node:#?}");
+                }
+            }
+        };
+
+        let (result, (nodes, events)) = inspect(root);
+        assert!(result.is_success(), "{result:?}");
+        assert_logs_match_frames(&nodes);
+        let tag = |tag: u8| B256::with_last_byte(tag).to_string();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.contract_id, event.selector.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (root, tag(1)),
+                (callee, tag(2)),
+                (root, tag(3)),
+                (root, tag(4)),
+                (root.create(1), tag(6)),
+                (
+                    root.create2(B256::with_last_byte(1), keccak256(&create2_init)),
+                    tag(7)
+                ),
+            ]
+        );
+
+        // A reverted top-level frame keeps the same pairing, and its own log stays in the
+        // events.
+        let (result, (nodes, events)) = inspect(reverter);
+        assert!(!result.is_success(), "{result:?}");
+        assert_eq!(nodes[0].logs.len(), 1);
+        assert_logs_match_frames(&nodes);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.contract_id, event.selector.clone()))
+                .collect::<Vec<_>>(),
+            vec![(reverter, tag(5))]
+        );
     }
 }

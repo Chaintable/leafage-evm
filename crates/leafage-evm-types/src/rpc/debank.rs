@@ -437,6 +437,7 @@ impl From<&CallLog> for DebankEvent {
         };
 
         DebankEvent {
+            contract_id: log.address,
             selector,
             topics,
             data: log.raw_log.data.clone(),
