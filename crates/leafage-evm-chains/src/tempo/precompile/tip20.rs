@@ -2475,6 +2475,102 @@ mod tests {
         }
     }
 
+    // Ported from official v1.16.0
+    // `burn_at_charges_the_holder_access_key_and_resets_periodic_limits`.
+    #[test]
+    fn burn_at_charges_the_holder_access_key_and_resets_periodic_limits() {
+        use alloy::sol_types::SolEvent;
+        use crate::tempo::precompile::account_keychain::{AccountKeychain, IAccountKeychain};
+        use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+
+        let admin = Address::repeat_byte(0xa7);
+        let holder = Address::repeat_byte(0xc7);
+        let bridge = Address::repeat_byte(0xb7);
+        let key = Address::repeat_byte(0xd7);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+        provider.set_timestamp(U256::from(1000));
+        StorageCtx::enter(&mut provider, || {
+            let mut token = burn_test_token(admin);
+            grant(&mut token, admin, *BURN_AT_ROLE, bridge);
+            token
+                .mint(admin, ITIP20::mintCall { to: holder, amount: U256::from(300) })
+                .unwrap();
+            token
+                .mint(admin, ITIP20::mintCall { to: bridge, amount: U256::from(200) })
+                .unwrap();
+            let mut keychain = AccountKeychain::new();
+            keychain.initialize().unwrap();
+            keychain.set_tx_origin(holder).unwrap();
+            keychain
+                .authorize_key_with_restrictions(
+                    holder,
+                    key,
+                    IAccountKeychain::SignatureType::Secp256k1,
+                    IAccountKeychain::KeyRestrictions {
+                        expiry: u64::MAX,
+                        enforceLimits: true,
+                        limits: vec![IAccountKeychain::TokenLimit {
+                            token: PATH_USD_ADDRESS,
+                            amount: U256::from(100),
+                            period: 60,
+                        }],
+                        allowAnyCalls: true,
+                        allowedCalls: vec![],
+                    },
+                    None,
+                )
+                .unwrap();
+            keychain.set_transaction_key(key).unwrap();
+        });
+
+        let before = provider.events(ACCOUNT_KEYCHAIN_ADDRESS).len();
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                .burn_at(bridge, ITIP20::burnAtCall { from: holder, amount: U256::from(100) })
+                .unwrap();
+        });
+        assert_eq!(
+            &provider.events(ACCOUNT_KEYCHAIN_ADDRESS)[before..],
+            &[IAccountKeychain::AccessKeySpend {
+                account: holder,
+                publicKey: key,
+                token: PATH_USD_ADDRESS,
+                amount: U256::from(100),
+                remainingLimit: U256::ZERO,
+            }
+            .encode_log_data()]
+        );
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            assert_eq!(
+                token.burn_at(bridge, ITIP20::burnAtCall { from: holder, amount: U256::ONE }),
+                Err(revert(IAccountKeychain::SpendingLimitExceeded {}))
+            );
+            // Burning a different account must not charge the transaction origin's exhausted limit.
+            token
+                .burn_at(bridge, ITIP20::burnAtCall { from: bridge, amount: U256::from(200) })
+                .unwrap();
+        });
+
+        provider.set_timestamp(U256::from(1060));
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                .burn_at(bridge, ITIP20::burnAtCall { from: holder, amount: U256::from(40) })
+                .unwrap();
+            assert_eq!(
+                AccountKeychain::new()
+                    .get_remaining_limit(IAccountKeychain::getRemainingLimitCall {
+                        account: holder,
+                        keyId: key,
+                        token: PATH_USD_ADDRESS,
+                    })
+                    .unwrap(),
+                U256::from(60)
+            );
+        });
+    }
+
     // Ported from official v1.16.0 `burn_at_and_burn_blocked_share_protected_addresses`.
     #[test]
     fn burn_at_and_burn_blocked_share_protected_addresses() {

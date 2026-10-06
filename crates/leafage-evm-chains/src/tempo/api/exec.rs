@@ -2400,6 +2400,181 @@ mod tests {
         assert!(default_balance_is_cold);
     }
 
+    /// Ported from official v1.16.0 tip20 `burn_at_bridge_caught_failure_restores_access_key_limit`:
+    /// a bridge (Multicall3 with BURN_AT_ROLE) burns from the transaction origin, whose access key
+    /// has a 100 limit. A successful bridged burn of 10 charges the key (control); a burn of 50 then
+    /// charges the limit before failing on balance, and the caught failure must roll the charge
+    /// back together with the burn.
+    #[test]
+    fn burn_at_bridge_caught_failure_restores_access_key_limit() {
+        use crate::tempo::precompile::account_keychain::{AccountKeychain, IAccountKeychain};
+        use crate::tempo::precompile::tip20::{
+            IRolesAuth, TIP20Token, BURN_AT_ROLE, ISSUER_ROLE, ITIP20,
+        };
+        use crate::tempo::precompile::{LeafageStorageProvider, StorageCtx, PATH_USD_ADDRESS};
+        use alloy::sol_types::{SolCall, SolError, SolEvent};
+        use revm::bytecode::Bytecode;
+        use revm::database::CacheDB;
+        use revm::primitives::{Bytes, TxKind, B256};
+        use revm::state::AccountInfo;
+        use tempo_contracts::{Multicall3, MULTICALL3_ADDRESS};
+
+        let holder = Address::repeat_byte(0x11);
+        let key = Address::repeat_byte(0x12);
+        let mut cfg = CfgEnv::new_with_spec(TempoHardfork::T12);
+        cfg.chain_id = 4217;
+        let mut block_env = BlockEnv::default();
+        block_env.timestamp = U256::from(1_791_900_000u64 + 100); // mainnet T12
+        block_env.gas_limit = 100_000_000;
+        let mut evm = TempoEvm::new(
+            EvmEnv::new(cfg, block_env),
+            CacheDB::new(EmptyDB::default()),
+            NoOpInspector,
+            false,
+        );
+        assert_eq!(evm.inner.ctx.cfg.spec, TempoHardfork::T12);
+
+        let with_storage = |evm: &mut TempoEvm<CacheDB<EmptyDB>, NoOpInspector>,
+                            f: &mut dyn FnMut() -> crate::tempo::precompile::Result<()>| {
+            let internals = alloy_evm::EvmInternals::from_context(&mut evm.inner.ctx);
+            let mut storage =
+                LeafageStorageProvider::new_max_gas_with_spec(internals, 4217, TempoHardfork::T12);
+            StorageCtx::enter(&mut storage, || f()).unwrap();
+        };
+        with_storage(&mut evm, &mut || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            token.initialize(Address::ZERO, "Path USD", "pathUSD", "USD", PATH_USD_ADDRESS, holder)?;
+            for (role, account) in [(*ISSUER_ROLE, holder), (*BURN_AT_ROLE, MULTICALL3_ADDRESS)] {
+                token.grant_role(holder, IRolesAuth::grantRoleCall { role, account })?;
+            }
+            token.mint(holder, ITIP20::mintCall { to: holder, amount: U256::from(40) })?;
+            let mut keychain = AccountKeychain::new();
+            keychain.initialize()?;
+            keychain.set_tx_origin(holder)?;
+            keychain.authorize_key_with_restrictions(
+                holder,
+                key,
+                IAccountKeychain::SignatureType::Secp256k1,
+                IAccountKeychain::KeyRestrictions {
+                    expiry: u64::MAX,
+                    enforceLimits: true,
+                    limits: vec![IAccountKeychain::TokenLimit {
+                        token: PATH_USD_ADDRESS,
+                        amount: U256::from(100),
+                        period: 0,
+                    }],
+                    allowAnyCalls: true,
+                    allowedCalls: vec![],
+                },
+                None,
+            )
+        });
+        let setup = evm.inner.ctx.journal_mut().finalize();
+        evm.inner.ctx.db_mut().commit(setup);
+        let code = Bytecode::new_raw(Multicall3::DEPLOYED_BYTECODE.clone());
+        evm.inner.ctx.db_mut().insert_account_info(
+            MULTICALL3_ADDRESS,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+
+        // The holder signs with the access key; Multicall3 calls burnAt(holder, amount).
+        let bridge_burn = |amount: u64, allow_failure: bool, nonce: u64| {
+            let data: Bytes = Multicall3::aggregate3Call {
+                calls: vec![Multicall3::Call3 {
+                    target: PATH_USD_ADDRESS,
+                    allowFailure: allow_failure,
+                    callData: ITIP20::burnAtCall { from: holder, amount: U256::from(amount) }
+                        .abi_encode()
+                        .into(),
+                }],
+            }
+            .abi_encode()
+            .into();
+            TempoTxEnv {
+                base: revm::context::TxEnv {
+                    caller: holder,
+                    gas_limit: 1_000_000,
+                    kind: TxKind::Call(MULTICALL3_ADDRESS),
+                    data: data.clone(),
+                    nonce,
+                    chain_id: Some(4217),
+                    ..Default::default()
+                },
+                tempo_fields: Some(TempoTxFields {
+                    aa_calls: vec![TempoCall {
+                        to: TxKind::Call(MULTICALL3_ADDRESS),
+                        value: U256::ZERO,
+                        input: data,
+                    }],
+                    is_keychain: true,
+                    key_id: Some(key),
+                    sig_type: TempoSigType::Secp256k1,
+                    ..Default::default()
+                }),
+                resolved_fee_token: None,
+                tx_hash: B256::ZERO,
+                stateful_simulation_replay_id: None,
+                unique_tx_identifier: None,
+                gas_estimation: false,
+            }
+        };
+        let spend_logs = |result: &revm::context::result::ExecutionResult| {
+            result
+                .logs()
+                .iter()
+                .filter_map(|log| IAccountKeychain::AccessKeySpend::decode_log(log).ok())
+                .filter(|log| log.data.token == PATH_USD_ADDRESS)
+                .count()
+        };
+
+        // Control: a successful bridged burn charges the holder's access key.
+        let charged = evm.transact_commit(bridge_burn(10, false, 0)).unwrap();
+        assert!(charged.is_success(), "{charged:?}");
+        assert_eq!(spend_logs(&charged), 1);
+
+        let result = evm.transact_commit(bridge_burn(50, true, 1)).unwrap();
+        assert!(result.is_success(), "{result:?}");
+        let calls =
+            Multicall3::aggregate3Call::abi_decode_returns(result.output().unwrap()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].success);
+        assert_eq!(
+            calls[0].returnData.as_ref(),
+            ITIP20::InsufficientBalance {
+                available: U256::from(30),
+                required: U256::from(50),
+                token: PATH_USD_ADDRESS,
+            }
+            .abi_encode()
+        );
+        assert!(result.logs().iter().all(|log| log.address != PATH_USD_ADDRESS));
+        assert_eq!(spend_logs(&result), 0);
+
+        with_storage(&mut evm, &mut || {
+            let token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall { account: holder })?,
+                U256::from(30)
+            );
+            assert_eq!(token.total_supply()?, U256::from(30));
+            assert_eq!(
+                AccountKeychain::new().get_remaining_limit(
+                    IAccountKeychain::getRemainingLimitCall {
+                        account: holder,
+                        keyId: key,
+                        token: PATH_USD_ADDRESS,
+                    }
+                )?,
+                U256::from(90)
+            );
+            Ok(())
+        });
+    }
+
     fn expiring_nonce_tx(valid_before: u64, replay_hash: revm::primitives::B256) -> TempoTxEnv {
         use crate::tempo::tx::{TempoCall, TempoTxFields};
         use revm::primitives::{Bytes, TxKind};
