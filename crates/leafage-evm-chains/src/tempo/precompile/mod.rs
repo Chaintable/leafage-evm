@@ -272,9 +272,27 @@ pub fn view<T: SolCall>(call: T, f: impl FnOnce(T) -> Result<T::Return>) -> Prec
     f(call).into_precompile_result(0, 0, |ret| T::abi_encode_returns(&ret).into())
 }
 
+/// Rejects a state-mutating call made in a static context: pre-T12 with a
+/// [`StaticCallNotAllowed`] revert, from T12 with an exceptional halt
+/// (writer: precompiles dispatch.rs `reject_static_call`).
+#[inline]
+fn reject_static_call() -> PrecompileResult {
+    if !StorageCtx.spec().is_t12() {
+        return Ok(PrecompileOutput::revert(
+            0,
+            StaticCallNotAllowed {}.abi_encode().into(),
+            0,
+        ));
+    }
+    Ok(PrecompileOutput::halt(
+        PrecompileHalt::other_static("state change during static call"),
+        0,
+    ))
+}
+
 /// Dispatches a state-mutating call that returns ABI-encoded data.
 ///
-/// Rejects static calls with [`StaticCallNotAllowed`].
+/// Rejects static calls (see [`reject_static_call`]).
 #[inline]
 pub fn mutate<T: SolCall>(
     call: T,
@@ -282,18 +300,14 @@ pub fn mutate<T: SolCall>(
     f: impl FnOnce(Address, T) -> Result<T::Return>,
 ) -> PrecompileResult {
     if StorageCtx.is_static() {
-        return Ok(PrecompileOutput::revert(
-            0,
-            StaticCallNotAllowed {}.abi_encode().into(),
-            0,
-        ));
+        return reject_static_call();
     }
     f(sender, call).into_precompile_result(0, 0, |ret| T::abi_encode_returns(&ret).into())
 }
 
 /// Dispatches a state-mutating call that returns no data.
 ///
-/// Rejects static calls with [`StaticCallNotAllowed`].
+/// Rejects static calls (see [`reject_static_call`]).
 #[inline]
 pub fn mutate_void<T: SolCall>(
     call: T,
@@ -301,11 +315,7 @@ pub fn mutate_void<T: SolCall>(
     f: impl FnOnce(Address, T) -> Result<()>,
 ) -> PrecompileResult {
     if StorageCtx.is_static() {
-        return Ok(PrecompileOutput::revert(
-            0,
-            StaticCallNotAllowed {}.abi_encode().into(),
-            0,
-        ));
+        return reject_static_call();
     }
     f(sender, call).into_precompile_result(0, 0, |()| Bytes::new())
 }
@@ -817,6 +827,63 @@ mod tests {
                 assert_eq!(input_cost(32), one_word);
                 assert_eq!(input_cost(33), two_words);
             });
+        }
+    }
+
+    // Mirrors official v1.16.0 lib.rs `test_precompile_static_calls` (TIP-20, T11 vs T12).
+    #[test]
+    fn static_call_mutation_reverts_before_t12_and_halts_from_t12() {
+        use revm::precompile::PrecompileStatus;
+
+        let admin = Address::repeat_byte(0xa6);
+        for spec in [
+            crate::tempo::hardfork::TempoHardfork::T11,
+            crate::tempo::hardfork::TempoHardfork::T12,
+        ] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                tip20::TIP20Token::from_address_unchecked(PATH_USD_ADDRESS).initialize(
+                    Address::ZERO,
+                    "Path USD",
+                    "pathUSD",
+                    "USD",
+                    PATH_USD_ADDRESS,
+                    admin,
+                )
+            })
+            .unwrap();
+            provider.set_static(true);
+            let call = |calldata: Vec<u8>, provider: &mut TestStorageProvider| {
+                StorageCtx::enter(provider, || {
+                    tip20::TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                        .call(&calldata, admin)
+                })
+                .unwrap()
+            };
+
+            let transfer = call(
+                tip20::ITIP20::transferCall { to: admin, amount: U256::ZERO }.abi_encode(),
+                &mut provider,
+            );
+            if spec.is_t12() {
+                assert_eq!(
+                    transfer.status,
+                    PrecompileStatus::Halt(PrecompileHalt::other_static(
+                        "state change during static call"
+                    ))
+                );
+                assert!(transfer.bytes.is_empty());
+            } else {
+                assert!(transfer.status.is_revert());
+                StaticCallNotAllowed::abi_decode(&transfer.bytes).unwrap();
+            }
+
+            // Views stay callable in a static context.
+            let balance = call(
+                tip20::ITIP20::balanceOfCall { account: admin }.abi_encode(),
+                &mut provider,
+            );
+            assert!(balance.is_success(), "{spec:?}");
         }
     }
 
