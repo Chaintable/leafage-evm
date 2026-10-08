@@ -19,7 +19,7 @@ use super::helpers::{
 };
 use super::macros::precompile;
 use alloy::primitives::{address, Address};
-use alloy::sol_types::{sol, SolCall, SolValue};
+use alloy::sol_types::{abi, sol, SolCall, SolType, SolValue};
 use revm::interpreter::gas::KECCAK256WORD;
 use revm::interpreter::Gas;
 use revm::precompile::PrecompileOutput;
@@ -55,27 +55,41 @@ sol! {
     }
 }
 
+/// The `(bytes, bytes, bytes)` parameter tuple of [`IPQ::verifySlhDsaSha2128sCall`].
+type CallParams<'a> = <IPQ::verifySlhDsaSha2128sCall as SolCall>::Parameters<'a>;
+
+/// Token form of [`CallParams`]: three `PackedSeqToken`s that borrow from the input.
+type CallTokens<'a> = <IPQ::verifySlhDsaSha2128sCall as SolCall>::Token<'a>;
+
 precompile!(run_pq, precompile_input, hardfork_flags; {
     IPQ::verifySlhDsaSha2128sCall => |input| {
         (|| -> Result<PrecompileOutput, PrecompileErrorOrRevert> {
             let _ = hardfork_flags;
             let mut gas_counter = Gas::new(precompile_input.gas);
 
-            let args = IPQ::verifySlhDsaSha2128sCall::abi_decode_raw_validate(input).map_err(|_| {
-                PrecompileErrorOrRevert::new_reverted_with_penalty(
-                    gas_counter,
-                    PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
-                    ERR_EXECUTION_REVERTED,
-                )
-            })?;
+            // Tokenize and type-check without copying: same checks as
+            // `abi_decode_raw_validate`, but the byte arguments stay borrowed from the input
+            // until the gas below has been charged (arc-node v0.8.1, circlefin/arc-node#486).
+            let tokens = abi::decode_sequence::<CallTokens<'_>>(input)
+                .and_then(|tokens| CallParams::<'_>::type_check(&tokens).map(|()| tokens))
+                .map_err(|_| {
+                    PrecompileErrorOrRevert::new_reverted_with_penalty(
+                        gas_counter,
+                        PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+                        ERR_EXECUTION_REVERTED,
+                    )
+                })?;
 
             // Charge base gas, then per-word message gas, then validate inputs
             record_cost_or_out_of_gas(&mut gas_counter, VERIFY_BASE_GAS)?;
 
             // GAS_PER_MSG_WORD (6) < 32, so the product cannot exceed u64::MAX
             #[allow(clippy::arithmetic_side_effects)]
-            let msg_word_gas = (args.message.len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
+            let msg_word_gas = (tokens.1.as_slice().len() as u64).div_ceil(32) * GAS_PER_MSG_WORD;
             record_cost_or_out_of_gas(&mut gas_counter, msg_word_gas)?;
+
+            // Paid for: copy the byte arguments out of the input.
+            let args = IPQ::verifySlhDsaSha2128sCall::new(CallParams::<'_>::detokenize(tokens));
 
             // SLH-DSA-SHA2-128s constants from FIPS 205
             const VK_LEN: usize = 32;

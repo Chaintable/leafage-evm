@@ -1567,3 +1567,125 @@ fn pq_charges_before_length_validation_and_classifies_malformed_and_oog() {
     assert_eq!(call_instruction(&oog), InstructionResult::PrecompileOOG);
     assert!(evm.ctx().journaled_state.logs.is_empty());
 }
+
+/// Calldata whose three dynamic offsets alias one `shared_len`-byte array. The ABI decoder
+/// accepts it; `vk` and `sig` then fail their length checks, after base and message gas.
+fn pq_aliased_call(shared_len: usize) -> Bytes {
+    let mut calldata = IPQ::verifySlhDsaSha2128sCall::SELECTOR.to_vec();
+    for _ in 0..3 {
+        calldata.extend_from_slice(&U256::from(0x60).to_be_bytes::<32>());
+    }
+    calldata.extend_from_slice(&U256::from(shared_len).to_be_bytes::<32>());
+    calldata.resize(calldata.len() + shared_len.div_ceil(32) * 32, 0);
+    calldata.into()
+}
+
+#[test]
+fn pq_aliased_input_reverts_or_runs_out_of_gas_at_each_charge() {
+    for (shared_len, error) in [
+        (0, "Invalid verifying key length"),
+        (32, "Invalid signature length"),
+        (4096, "Invalid verifying key length"),
+    ] {
+        let exact_gas = 230_000 + (shared_len as u64).div_ceil(32) * 6;
+        for gas in [0, 229_999, exact_gas - 1] {
+            let mut evm = arc_evm(InMemoryDB::default());
+            let result = direct_call(
+                &mut evm,
+                USER,
+                PQ_ADDRESS,
+                pq_aliased_call(shared_len),
+                gas,
+                U256::ZERO,
+            );
+            assert_eq!(
+                call_instruction(&result),
+                InstructionResult::PrecompileOOG,
+                "shared_len={shared_len} gas={gas}"
+            );
+        }
+
+        let mut evm = arc_evm(InMemoryDB::default());
+        let result = direct_call(
+            &mut evm,
+            USER,
+            PQ_ADDRESS,
+            pq_aliased_call(shared_len),
+            exact_gas,
+            U256::ZERO,
+        );
+        assert_eq!(call_instruction(&result), InstructionResult::Revert);
+        assert_eq!(call_gas_spent(&result), exact_gas);
+        assert_eq!(
+            call_output(&result),
+            revert_message_to_bytes(error).as_ref()
+        );
+    }
+}
+
+#[test]
+fn pq_zero_gas_call_does_not_copy_byte_arguments() {
+    // Copying the three aliased arguments before charging gas would allocate 3 MiB for a call
+    // that pays nothing (arc-node v0.8.1, circlefin/arc-node#486).
+    const BODY_LEN: usize = 1 << 20;
+    let data = pq_aliased_call(BODY_LEN);
+    let mut evm = arc_evm(InMemoryDB::default());
+
+    let before = alloc_counter::allocated_on_this_thread();
+    let result = direct_call(&mut evm, USER, PQ_ADDRESS, data, 0, U256::ZERO);
+    let allocated = alloc_counter::allocated_on_this_thread() - before;
+
+    assert_eq!(call_instruction(&result), InstructionResult::PrecompileOOG);
+    assert!(
+        allocated < BODY_LEN,
+        "zero-gas PQ call allocated {allocated} bytes; the byte arguments are copied before gas is charged"
+    );
+}
+
+/// Global allocator for this crate's test binary that counts bytes requested on the current
+/// thread, so tests running on other threads do not disturb the count. Every operation is
+/// forwarded to `System` unchanged.
+mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn allocated_on_this_thread() -> usize {
+        ALLOCATED.with(Cell::get)
+    }
+
+    fn record(bytes: usize) {
+        // The slot is gone while the thread shuts down; those allocations are not counted.
+        let _ =
+            ALLOCATED.try_with(|allocated| allocated.set(allocated.get().saturating_add(bytes)));
+    }
+
+    struct CountingAllocator;
+
+    // SAFETY: every call is forwarded to `System` with the caller's arguments unchanged; the
+    // counter is a const-initialized thread-local `Cell` and never touches the allocation.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            // SAFETY: same contract as this function's caller.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: same contract as this function's caller.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record(new_size);
+            // SAFETY: same contract as this function's caller.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+}
