@@ -597,9 +597,9 @@ fn adopted_abis_match_frozen_schema_with_only_reviewed_differences() {
             serde_json::to_value(super::zone_factory::IZonePortal::abi::contract()).unwrap(),
         ),
     ];
-    // Independently frozen, reviewed differences against v1.14.0; not regenerated at test time.
+    // Independently frozen, reviewed differences against v1.16.0; not regenerated at test time.
     let delta: Value =
-        serde_json::from_str(include_str!("fixtures/abi-v1.14-reviewed-delta.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/abi-v1.16-reviewed-delta.json")).unwrap();
     for (name, abi) in actual {
         let actual = normalized_abi(abi);
         let expected = normalized_abi(baseline[name].clone());

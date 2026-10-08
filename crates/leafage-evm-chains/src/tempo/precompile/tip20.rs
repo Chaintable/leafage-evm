@@ -87,6 +87,8 @@ pub static UNPAUSE_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"UNPAUSE_R
 pub static ISSUER_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"ISSUER_ROLE"));
 /// Role hash that prevents an account from burning tokens.
 pub static BURN_BLOCKED_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"BURN_BLOCKED_ROLE"));
+/// Role hash for burning from any unprotected account (TIP-1006, T12+).
+pub static BURN_AT_ROLE: LazyLock<B256> = LazyLock::new(|| keccak256(b"BURN_AT_ROLE"));
 
 /// Returns true if the address has the TIP20 prefix.
 pub fn is_tip20_prefix(token: Address) -> bool {
@@ -450,6 +452,11 @@ impl TIP20Token {
     /// Returns the BURN_BLOCKED_ROLE constant.
     pub fn burn_blocked_role() -> B256 {
         *BURN_BLOCKED_ROLE
+    }
+
+    /// Returns the BURN_AT_ROLE constant (TIP-1006).
+    pub fn burn_at_role() -> B256 {
+        *BURN_AT_ROLE
     }
 
     /// Returns the token balance of `account`.
@@ -1528,16 +1535,8 @@ impl TIP20Token {
         }
         self.check_role(msg_sender, *BURN_BLOCKED_ROLE)?;
 
-        if check_protected
-            && (owner == TIP_FEE_MANAGER_ADDRESS
-                || owner == STABLECOIN_DEX_ADDRESS
-                || (self.storage.spec().is_t5()
-                    && (owner == super::TIP20_CHANNEL_RESERVE_ADDRESS || owner == self.address))
-                || (self.storage.spec().is_t6() && owner == RECEIVE_POLICY_GUARD_ADDRESS))
-        {
-            return Err(TempoPrecompileError::Revert(
-                ITIP20::ProtectedAddress {}.abi_encode().into(),
-            ));
+        if check_protected {
+            self.check_burn_address(owner)?;
         }
 
         // TIP403Registry: verify sender is NOT authorized (burn_blocked targets blacklisted accounts)
@@ -1577,6 +1576,59 @@ impl TIP20Token {
             from: owner,
             amount,
         })
+    }
+
+    /// Burns from an unprotected account without checking its transfer policy (TIP-1006).
+    ///
+    /// Requires `BURN_AT_ROLE` and an unpaused token. When `from` is the transaction origin,
+    /// the burn consumes the access key's spending limit even if a bridge is the caller.
+    pub fn burn_at(&mut self, msg_sender: Address, call: ITIP20::burnAtCall) -> Result<()> {
+        self.check_not_paused()?;
+        self.check_role(msg_sender, *BURN_AT_ROLE)?;
+        self.check_burn_address(call.from)?;
+        super::account_keychain::AccountKeychain::new().authorize_transfer(
+            call.from,
+            self.address,
+            call.amount,
+        )?;
+
+        self._transfer(call.from, Address::ZERO, call.amount)?;
+        let total_supply = self.total_supply()?;
+        let new_supply = total_supply.checked_sub(call.amount).ok_or_else(|| {
+            TempoPrecompileError::Revert(
+                ITIP20::InsufficientBalance {
+                    available: total_supply,
+                    required: call.amount,
+                    token: self.address,
+                }
+                .abi_encode()
+                .into(),
+            )
+        })?;
+        self.set_total_supply(new_supply)?;
+
+        self.emit_event(ITIP20::BurnAt {
+            burner: msg_sender,
+            from: call.from,
+            amount: call.amount,
+        })
+    }
+
+    /// Rejects pooled custody balances whose destruction would leave outstanding claims
+    /// unbacked; shared by `burnBlocked` and `burnAt`.
+    fn check_burn_address(&self, from: Address) -> Result<()> {
+        let spec = self.storage.spec();
+        if from == TIP_FEE_MANAGER_ADDRESS
+            || from == STABLECOIN_DEX_ADDRESS
+            || (spec.is_t5() && (from == super::TIP20_CHANNEL_RESERVE_ADDRESS || from == self.address))
+            || (spec.is_t6() && from == RECEIVE_POLICY_GUARD_ADDRESS)
+            || (spec.is_t12() && from.as_slice().starts_with(&Address::ZONE_PORTAL_PREFIX))
+        {
+            return Err(TempoPrecompileError::Revert(
+                ITIP20::ProtectedAddress {}.abi_encode().into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Releases guarded funds. A resume skips the receive-policy check; a reroute revalidates it.
@@ -1985,7 +2037,7 @@ enum TIP20Call {
 
 /// Selectors outside their official `#[schedule]` window (tip20/dispatch.rs):
 /// `logoURI` / `setLogoURI` since T5, EIP-2612 `permit` / `nonces` /
-/// `DOMAIN_SEPARATOR` since T2.
+/// `DOMAIN_SEPARATOR` since T2, TIP-1006 `burnAt` / `BURN_AT_ROLE` since T12.
 fn selector_is_disabled(spec: crate::tempo::hardfork::TempoHardfork, selector: [u8; 4]) -> bool {
     ((selector == ITIP20::logoURICall::SELECTOR || selector == ITIP20::setLogoURICall::SELECTOR)
         && !spec.is_t5())
@@ -1993,6 +2045,9 @@ fn selector_is_disabled(spec: crate::tempo::hardfork::TempoHardfork, selector: [
             || selector == ITIP20::noncesCall::SELECTOR
             || selector == ITIP20::DOMAIN_SEPARATORCall::SELECTOR)
             && !spec.is_t2())
+        || ((selector == ITIP20::burnAtCall::SELECTOR
+            || selector == ITIP20::BURN_AT_ROLECall::SELECTOR)
+            && !spec.is_t12())
 }
 
 impl TIP20Call {
@@ -2095,6 +2150,9 @@ impl Precompile for TIP20Token {
             TIP20Call::TIP20(ITIP20::ITIP20Calls::BURN_BLOCKED_ROLE(call)) => {
                 view(call, |_| Ok(Self::burn_blocked_role()))
             }
+            TIP20Call::TIP20(ITIP20::ITIP20Calls::BURN_AT_ROLE(call)) => {
+                view(call, |_| Ok(Self::burn_at_role()))
+            }
 
             // State-changing functions
             TIP20Call::TIP20(ITIP20::ITIP20Calls::transferFrom(call)) => {
@@ -2145,6 +2203,9 @@ impl Precompile for TIP20Token {
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::burnBlocked(call)) => {
                 mutate_void(call, msg_sender, |s, c| self.burn_blocked(s, c))
+            }
+            TIP20Call::TIP20(ITIP20::ITIP20Calls::burnAt(call)) => {
+                mutate_void(call, msg_sender, |s, c| self.burn_at(s, c))
             }
             TIP20Call::TIP20(ITIP20::ITIP20Calls::transferWithMemo(call)) => {
                 mutate_void(call, msg_sender, |s, c| self.transfer_with_memo(s, c))
@@ -2249,6 +2310,355 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    /// PATH_USD with `admin` as default admin and issuer.
+    fn burn_test_token(admin: Address) -> TIP20Token {
+        let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+        token
+            .initialize(Address::ZERO, "Path USD", "pathUSD", "USD", PATH_USD_ADDRESS, admin)
+            .unwrap();
+        grant(&mut token, admin, *ISSUER_ROLE, admin);
+        token
+    }
+
+    fn grant(token: &mut TIP20Token, admin: Address, role: B256, account: Address) {
+        token
+            .grant_role(admin, IRolesAuth::grantRoleCall { role, account })
+            .unwrap();
+    }
+
+    fn revert(error: impl SolError) -> TempoPrecompileError {
+        TempoPrecompileError::Revert(error.abi_encode().into())
+    }
+
+    // Ported from official v1.16.0 tip20/mod.rs `burn_at_selectors_activate_at_t12`.
+    #[test]
+    fn burn_at_selectors_activate_at_t12() {
+        let admin = Address::repeat_byte(0xa1);
+        for spec in [TempoHardfork::T11, TempoHardfork::T12] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = burn_test_token(admin);
+                grant(&mut token, admin, *BURN_AT_ROLE, admin);
+                token
+                    .mint(admin, ITIP20::mintCall { to: admin, amount: U256::from(10) })
+                    .unwrap();
+                let role = token
+                    .call(&ITIP20::BURN_AT_ROLECall {}.abi_encode(), admin)
+                    .unwrap();
+                let burn = token
+                    .call(
+                        &ITIP20::burnAtCall { from: admin, amount: U256::ONE }.abi_encode(),
+                        admin,
+                    )
+                    .unwrap();
+                if spec.is_t12() {
+                    assert!(role.is_success());
+                    assert_eq!(
+                        ITIP20::BURN_AT_ROLECall::abi_decode_returns(&role.bytes).unwrap(),
+                        keccak256("BURN_AT_ROLE")
+                    );
+                    assert!(burn.is_success());
+                    assert_eq!(token.get_balance(admin).unwrap(), U256::from(9));
+                } else {
+                    for output in [role, burn] {
+                        assert!(output.status.is_revert());
+                        UnknownFunctionSelector::abi_decode(&output.bytes).unwrap();
+                    }
+                    assert_eq!(token.get_balance(admin).unwrap(), U256::from(10));
+                    assert_eq!(token.total_supply().unwrap(), U256::from(10));
+                }
+            });
+        }
+    }
+
+    // Ported from official v1.16.0 `burn_at_requires_its_own_role_and_respects_pause`.
+    #[test]
+    fn burn_at_requires_its_own_role_and_respects_pause() {
+        let admin = Address::repeat_byte(0xa2);
+        let burner = Address::repeat_byte(0xb2);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+        StorageCtx::enter(&mut provider, || {
+            let mut token = burn_test_token(admin);
+            grant(&mut token, admin, *BURN_BLOCKED_ROLE, burner);
+            grant(&mut token, admin, *PAUSE_ROLE, admin);
+            grant(&mut token, admin, *UNPAUSE_ROLE, admin);
+            token
+                .mint(admin, ITIP20::mintCall { to: admin, amount: U256::from(10) })
+                .unwrap();
+            let call = ITIP20::burnAtCall { from: admin, amount: U256::ZERO };
+            // Neither the issuer nor the blocked-burn role grants arbitrary burning authority.
+            for caller in [admin, burner] {
+                assert_eq!(
+                    token.burn_at(caller, call.clone()),
+                    Err(revert(IRolesAuth::Unauthorized {}))
+                );
+            }
+            grant(&mut token, admin, *BURN_AT_ROLE, burner);
+            token.burn_at(burner, call.clone()).unwrap();
+            token.pause(admin, ITIP20::pauseCall {}).unwrap();
+            assert_eq!(
+                token.burn_at(burner, call.clone()),
+                Err(revert(ITIP20::ContractPaused {}))
+            );
+            token.unpause(admin, ITIP20::unpauseCall {}).unwrap();
+            token
+                .revoke_role(
+                    admin,
+                    IRolesAuth::revokeRoleCall { role: *BURN_AT_ROLE, account: burner },
+                )
+                .unwrap();
+            assert_eq!(
+                token.burn_at(burner, call),
+                Err(revert(IRolesAuth::Unauthorized {}))
+            );
+            assert_eq!(token.get_balance(admin).unwrap(), U256::from(10));
+            assert_eq!(token.total_supply().unwrap(), U256::from(10));
+        });
+    }
+
+    // Ported from official v1.16.0 `burn_at_ignores_policy_and_emits_caller_and_holder`.
+    #[test]
+    fn burn_at_ignores_policy_and_emits_caller_and_holder() {
+        use alloy::sol_types::SolEvent;
+        use crate::tempo::precompile::tip403_registry::{ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID};
+
+        let admin = Address::repeat_byte(0xa3);
+        let holder = Address::repeat_byte(0xc3);
+        let burner = Address::repeat_byte(0xb3);
+        for policy in [ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID] {
+            let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = burn_test_token(admin);
+                grant(&mut token, admin, *BURN_AT_ROLE, burner);
+                token
+                    .mint(admin, ITIP20::mintCall { to: holder, amount: U256::from(100) })
+                    .unwrap();
+                token
+                    .change_transfer_policy_id(
+                        admin,
+                        ITIP20::changeTransferPolicyIdCall { newPolicyId: policy },
+                    )
+                    .unwrap();
+            });
+            for amount in [U256::ZERO, U256::from(100)] {
+                let before = provider.events(PATH_USD_ADDRESS).len();
+                StorageCtx::enter(&mut provider, || {
+                    let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                    token
+                        .burn_at(burner, ITIP20::burnAtCall { from: holder, amount })
+                        .unwrap();
+                    assert_eq!(token.get_balance(holder).unwrap(), U256::from(100) - amount);
+                    assert_eq!(token.total_supply().unwrap(), U256::from(100) - amount);
+                });
+                assert_eq!(
+                    &provider.events(PATH_USD_ADDRESS)[before..],
+                    &[
+                        ITIP20::Transfer { from: holder, to: Address::ZERO, amount }
+                            .encode_log_data(),
+                        ITIP20::BurnAt { burner, from: holder, amount }.encode_log_data(),
+                    ]
+                );
+            }
+            StorageCtx::enter(&mut provider, || {
+                let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+                assert_eq!(
+                    token.burn_at(burner, ITIP20::burnAtCall { from: holder, amount: U256::ONE }),
+                    Err(revert(ITIP20::InsufficientBalance {
+                        available: U256::ZERO,
+                        required: U256::ONE,
+                        token: PATH_USD_ADDRESS,
+                    })),
+                );
+            });
+        }
+    }
+
+    // Ported from official v1.16.0
+    // `burn_at_charges_the_holder_access_key_and_resets_periodic_limits`.
+    #[test]
+    fn burn_at_charges_the_holder_access_key_and_resets_periodic_limits() {
+        use alloy::sol_types::SolEvent;
+        use crate::tempo::precompile::account_keychain::{AccountKeychain, IAccountKeychain};
+        use crate::tempo::precompile::ACCOUNT_KEYCHAIN_ADDRESS;
+
+        let admin = Address::repeat_byte(0xa7);
+        let holder = Address::repeat_byte(0xc7);
+        let bridge = Address::repeat_byte(0xb7);
+        let key = Address::repeat_byte(0xd7);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+        provider.set_timestamp(U256::from(1000));
+        StorageCtx::enter(&mut provider, || {
+            let mut token = burn_test_token(admin);
+            grant(&mut token, admin, *BURN_AT_ROLE, bridge);
+            token
+                .mint(admin, ITIP20::mintCall { to: holder, amount: U256::from(300) })
+                .unwrap();
+            token
+                .mint(admin, ITIP20::mintCall { to: bridge, amount: U256::from(200) })
+                .unwrap();
+            let mut keychain = AccountKeychain::new();
+            keychain.initialize().unwrap();
+            keychain.set_tx_origin(holder).unwrap();
+            keychain
+                .authorize_key_with_restrictions(
+                    holder,
+                    key,
+                    IAccountKeychain::SignatureType::Secp256k1,
+                    IAccountKeychain::KeyRestrictions {
+                        expiry: u64::MAX,
+                        enforceLimits: true,
+                        limits: vec![IAccountKeychain::TokenLimit {
+                            token: PATH_USD_ADDRESS,
+                            amount: U256::from(100),
+                            period: 60,
+                        }],
+                        allowAnyCalls: true,
+                        allowedCalls: vec![],
+                    },
+                    None,
+                )
+                .unwrap();
+            keychain.set_transaction_key(key).unwrap();
+        });
+
+        let before = provider.events(ACCOUNT_KEYCHAIN_ADDRESS).len();
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                .burn_at(bridge, ITIP20::burnAtCall { from: holder, amount: U256::from(100) })
+                .unwrap();
+        });
+        assert_eq!(
+            &provider.events(ACCOUNT_KEYCHAIN_ADDRESS)[before..],
+            &[IAccountKeychain::AccessKeySpend {
+                account: holder,
+                publicKey: key,
+                token: PATH_USD_ADDRESS,
+                amount: U256::from(100),
+                remainingLimit: U256::ZERO,
+            }
+            .encode_log_data()]
+        );
+
+        StorageCtx::enter(&mut provider, || {
+            let mut token = TIP20Token::from_address_unchecked(PATH_USD_ADDRESS);
+            assert_eq!(
+                token.burn_at(bridge, ITIP20::burnAtCall { from: holder, amount: U256::ONE }),
+                Err(revert(IAccountKeychain::SpendingLimitExceeded {}))
+            );
+            // Burning a different account must not charge the transaction origin's exhausted limit.
+            token
+                .burn_at(bridge, ITIP20::burnAtCall { from: bridge, amount: U256::from(200) })
+                .unwrap();
+        });
+
+        provider.set_timestamp(U256::from(1060));
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address_unchecked(PATH_USD_ADDRESS)
+                .burn_at(bridge, ITIP20::burnAtCall { from: holder, amount: U256::from(40) })
+                .unwrap();
+            assert_eq!(
+                AccountKeychain::new()
+                    .get_remaining_limit(IAccountKeychain::getRemainingLimitCall {
+                        account: holder,
+                        keyId: key,
+                        token: PATH_USD_ADDRESS,
+                    })
+                    .unwrap(),
+                U256::from(60)
+            );
+        });
+    }
+
+    // Ported from official v1.16.0 `burn_at_and_burn_blocked_share_protected_addresses`.
+    #[test]
+    fn burn_at_and_burn_blocked_share_protected_addresses() {
+        use crate::tempo::precompile::tip403_registry::REJECT_ALL_POLICY_ID;
+        use alloy::primitives::address;
+
+        let admin = Address::repeat_byte(0xa4);
+        let mut provider = TestStorageProvider::new(TempoHardfork::T12);
+        StorageCtx::enter(&mut provider, || {
+            let mut token = burn_test_token(admin);
+            grant(&mut token, admin, *BURN_AT_ROLE, admin);
+            grant(&mut token, admin, *BURN_BLOCKED_ROLE, admin);
+            token
+                .change_transfer_policy_id(
+                    admin,
+                    ITIP20::changeTransferPolicyIdCall { newPolicyId: REJECT_ALL_POLICY_ID },
+                )
+                .unwrap();
+            for from in [
+                PATH_USD_ADDRESS,
+                TIP_FEE_MANAGER_ADDRESS,
+                STABLECOIN_DEX_ADDRESS,
+                super::super::TIP20_CHANNEL_RESERVE_ADDRESS,
+                RECEIVE_POLICY_GUARD_ADDRESS,
+                // The entire reserved prefix, including undeployed portals and the zero suffix.
+                address!("5AD0000000000000000000000000000000000000"),
+                address!("5AD0000000000000000000000000000000000001"),
+                address!("5AD000000000000000000000ffffffffffffffff"),
+            ] {
+                for amount in [U256::ZERO, U256::ONE] {
+                    assert_eq!(
+                        token.burn_at(admin, ITIP20::burnAtCall { from, amount }),
+                        Err(revert(ITIP20::ProtectedAddress {})),
+                        "{from}"
+                    );
+                    assert_eq!(
+                        token.burn_blocked(admin, ITIP20::burnBlockedCall { from, amount }),
+                        Err(revert(ITIP20::ProtectedAddress {})),
+                        "{from}"
+                    );
+                }
+            }
+            // Adjacent prefixes are ordinary balances, not protected protocol custody.
+            token
+                .burn_at(
+                    admin,
+                    ITIP20::burnAtCall {
+                        from: address!("5AD0000000000000000000010000000000000001"),
+                        amount: U256::ZERO,
+                    },
+                )
+                .unwrap();
+        });
+    }
+
+    // Ported from official v1.16.0 `burn_blocked_portal_protection_preserves_pre_t12_behavior`.
+    #[test]
+    fn burn_blocked_portal_protection_preserves_pre_t12_behavior() {
+        use crate::tempo::precompile::tip403_registry::REJECT_ALL_POLICY_ID;
+        use alloy::primitives::address;
+
+        let admin = Address::repeat_byte(0xa5);
+        let portal = address!("5AD0000000000000000000000000000000000001");
+        for spec in [TempoHardfork::T11, TempoHardfork::T12] {
+            let mut provider = TestStorageProvider::new(spec);
+            StorageCtx::enter(&mut provider, || {
+                let mut token = burn_test_token(admin);
+                grant(&mut token, admin, *BURN_BLOCKED_ROLE, admin);
+                token
+                    .mint(admin, ITIP20::mintCall { to: portal, amount: U256::from(10) })
+                    .unwrap();
+                token
+                    .change_transfer_policy_id(
+                        admin,
+                        ITIP20::changeTransferPolicyIdCall { newPolicyId: REJECT_ALL_POLICY_ID },
+                    )
+                    .unwrap();
+                let result = token
+                    .burn_blocked(admin, ITIP20::burnBlockedCall { from: portal, amount: U256::ONE });
+                if spec.is_t12() {
+                    assert_eq!(result, Err(revert(ITIP20::ProtectedAddress {})));
+                    assert_eq!(token.get_balance(portal).unwrap(), U256::from(10));
+                } else {
+                    result.unwrap();
+                    assert_eq!(token.get_balance(portal).unwrap(), U256::from(9));
+                }
+            });
+        }
     }
 
     #[test]

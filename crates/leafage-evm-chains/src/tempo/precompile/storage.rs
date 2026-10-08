@@ -412,6 +412,11 @@ impl PrecompileStorageProvider for LeafageStorageProvider<'_> {
 
     #[inline]
     fn sstore(&mut self, address: Address, key: U256, value: U256) -> Result<()> {
+        // T12+: EIP-2200 sentry. SSTORE fails if the frame only has the call stipend
+        // remaining (writer: storage/evm.rs `sstore_inner`).
+        if self.spec.is_t12() && self.gas_remaining <= self.gas_params.call_stipend() {
+            return Err(TempoPrecompileError::OutOfGas);
+        }
         let result = self.internals.sstore(address, key, value)?;
         if self.tip1060_storage_credits_enabled {
             account_storage_write(self, address, Some(key), &result).map_err(
@@ -1090,6 +1095,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(value, U256::ZERO);
+    }
+
+    // Mirrors official v1.16.0 storage/evm.rs `test_sstore_reentrancy_sentry_blocks_dirty_write`.
+    #[test]
+    fn sstore_stipend_sentry_blocks_dirty_write_from_t12() {
+        use crate::tempo::api::TempoEvm;
+        use alloy_evm::{EvmEnv, EvmInternals};
+        use revm::context::{BlockEnv, CfgEnv};
+        use revm::database::CacheDB;
+        use revm::inspector::NoOpInspector;
+
+        let address = address!("0x5555555555555555555555555555555555555555");
+        let key = U256::from(42);
+        for spec in [TempoHardfork::T11, TempoHardfork::T12] {
+            let mut cfg = CfgEnv::new_with_spec(spec);
+            cfg.chain_id = 4217;
+            let env = EvmEnv::new(cfg, BlockEnv::default());
+            let mut evm =
+                TempoEvm::new(env, CacheDB::new(EmptyDB::default()), NoOpInspector, false);
+            let call_stipend = evm.inner.ctx.cfg.gas_params.call_stipend();
+            let mut with_gas = |gas: u64, f: &mut dyn FnMut(&mut LeafageStorageProvider<'_>)| {
+                let internals = EvmInternals::from_context(&mut evm.inner.ctx);
+                let mut provider =
+                    LeafageStorageProvider::new_with_spec(internals, gas, 4217, false, spec);
+                f(&mut provider);
+            };
+
+            with_gas(u64::MAX, &mut |p| p.sstore(address, key, U256::ONE).unwrap());
+            with_gas(call_stipend, &mut |p| {
+                let result = p.sstore(address, key, U256::from(2));
+                if spec.is_t12() {
+                    assert_eq!(result, Err(TempoPrecompileError::OutOfGas));
+                } else {
+                    result.expect("pre-T12 SSTORE at stipend keeps the historical behavior");
+                }
+            });
+            let expected = if spec.is_t12() { U256::ONE } else { U256::from(2) };
+            with_gas(u64::MAX, &mut |p| {
+                assert_eq!(p.sload(address, key).unwrap(), expected, "{spec:?}")
+            });
+        }
     }
 
     #[test]

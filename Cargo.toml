@@ -95,9 +95,9 @@ alloy-sol-types = "1.7.3"
 # alloy-contract 的 Rust 代码没直接 use，但 `sol!` 宏展开会生成 alloy_contract::* 的引用。
 alloy-contract = "2.5.0"
 
-# Protocol definitions from the official v1.14.0 release; SDK 1.11.0 lacks T11 activation.
-tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "1ec5653e39c97e02807dddf5e7106e979f3ad909", default-features = false, features = ["std"] }
-tempo-hardfork = { git = "https://github.com/tempoxyz/tempo", rev = "1ec5653e39c97e02807dddf5e7106e979f3ad909", default-features = false, features = ["std"] }
+# Protocol definitions from the official v1.16.0 (T12) release; crates.io only has 1.11.0.
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "74b69155ebaf6178bf7e3d59d18a2440164302d9", default-features = false, features = ["std"] }
+tempo-hardfork = { git = "https://github.com/tempoxyz/tempo", rev = "74b69155ebaf6178bf7e3d59d18a2440164302d9", default-features = false, features = ["std"] }
 
 # op（仅供 vendored op-revm 使用）
 op-alloy-consensus = { version = "2.0.0", default-features = false }
