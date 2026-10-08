@@ -5,7 +5,7 @@ use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use revm::Database;
 use revm::context::ContextTr;
-use revm::precompile::{PrecompileError, PrecompileResult};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use revm::primitives::KECCAK_EMPTY;
 
 pub(super) struct ArbInfo;

@@ -20,8 +20,10 @@ pub enum B20Error {
     OutOfGas,
     /// A state-mutating operation was attempted inside a static call.
     StaticCallViolation,
-    /// Arithmetic under/overflow — encoded as Solidity `Panic(0x11)`.
-    UnderOverflow,
+    /// A Solidity panic carrying its code: `0x11` arithmetic under/overflow, `0x21` enum
+    /// conversion. Base classifies panics as system errors, so they propagate through an
+    /// announcement's internal calls instead of being wrapped.
+    Panic(u8),
     /// Unrecoverable storage/database failure. Not a revert: it aborts execution.
     Fatal(String),
 }
@@ -30,6 +32,8 @@ pub enum B20Error {
 const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 /// Solidity panic code for arithmetic under/overflow.
 const PANIC_UNDER_OVERFLOW: u8 = 0x11;
+/// Solidity panic code for an out-of-range enum conversion.
+const PANIC_ENUM_CONVERSION: u8 = 0x21;
 
 impl B20Error {
     /// Builds a revert carrying `err` ABI-encoded.
@@ -44,21 +48,26 @@ impl B20Error {
 
     /// Builds the arithmetic under/overflow panic.
     pub fn under_overflow() -> Self {
-        Self::UnderOverflow
+        Self::Panic(PANIC_UNDER_OVERFLOW)
+    }
+
+    /// Builds the enum-conversion panic.
+    pub fn enum_conversion() -> Self {
+        Self::Panic(PANIC_ENUM_CONVERSION)
     }
 
     /// Returns the ABI-encoded revert payload for the revert-shaped variants.
     ///
-    /// `UnderOverflow` encodes as Solidity's `Panic(0x11)`, matching what the EVM
-    /// produces for a checked-arithmetic failure in Solidity.
+    /// `Panic(code)` encodes as Solidity's `Panic(uint256)`, matching what the EVM produces
+    /// for the equivalent Solidity failure.
     pub fn revert_output(&self) -> Option<Bytes> {
         match self {
             Self::Revert(data) => Some(data.clone()),
-            Self::UnderOverflow => {
+            Self::Panic(code) => {
                 let mut out = Vec::with_capacity(36);
                 out.extend_from_slice(&PANIC_SELECTOR);
                 out.extend_from_slice(&[0u8; 31]);
-                out.push(PANIC_UNDER_OVERFLOW);
+                out.push(*code);
                 Some(out.into())
             }
             Self::OutOfGas | Self::StaticCallViolation | Self::Fatal(_) => None,
@@ -77,6 +86,12 @@ mod tests {
         assert_eq!(&out[..4], &PANIC_SELECTOR);
         assert_eq!(out[35], 0x11);
         assert!(out[4..35].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn enum_conversion_encodes_solidity_panic_0x21() {
+        let out = B20Error::enum_conversion().revert_output().unwrap();
+        assert_eq!(out[35], 0x21);
     }
 
     #[test]

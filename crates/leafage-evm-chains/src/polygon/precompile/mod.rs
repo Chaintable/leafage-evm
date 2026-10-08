@@ -103,7 +103,7 @@ mod tests {
             precompiles
                 .get(&u64_to_address(0x100))
                 .unwrap()
-                .execute(&[], u64::MAX)
+                .execute(&[], u64::MAX, 0)
                 .unwrap()
                 .gas_used,
             6_900
@@ -120,7 +120,7 @@ mod tests {
             precompiles
                 .get(&u64_to_address(0x100))
                 .unwrap()
-                .execute(&[], u64::MAX)
+                .execute(&[], u64::MAX, 0)
                 .unwrap()
                 .gas_used,
             3_450

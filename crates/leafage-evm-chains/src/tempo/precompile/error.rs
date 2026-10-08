@@ -7,8 +7,11 @@
 //! ABI-selector decoder registry), leafage-evm is a read-only node and only needs the
 //! essential error plumbing for storage operations.
 
-use alloy::primitives::Bytes;
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
+use alloy::primitives::{Bytes, FixedBytes};
+use alloy::sol_types::{Panic, SolError};
+use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileOutput, PrecompileResult};
+
+use super::UnknownFunctionSelector;
 
 /// Top-level error type for Tempo precompile operations in leafage-evm.
 ///
@@ -50,10 +53,28 @@ impl std::error::Error for TempoPrecompileError {}
 pub type Result<T> = std::result::Result<T, TempoPrecompileError>;
 
 impl TempoPrecompileError {
+    /// Returns the ABI selector carried by a business-logic error.
+    pub fn selector(&self) -> FixedBytes<4> {
+        match self {
+            Self::UnknownFunctionSelector(selector) => FixedBytes::new(*selector),
+            Self::Revert(data) => data
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(FixedBytes::new)
+                .unwrap_or_default(),
+            Self::OutOfGas | Self::Fatal(_) => FixedBytes::ZERO,
+        }
+    }
+
     /// Returns true if this error represents a system-level failure that must be propagated
     /// rather than swallowed, because state may be inconsistent.
     pub fn is_system_error(&self) -> bool {
-        matches!(self, Self::OutOfGas | Self::Fatal(_))
+        match self {
+            Self::OutOfGas | Self::Fatal(_) => true,
+            // Official `Panic` and `StorageDeltaUnderflow`, both encoded as `Panic(uint256)`.
+            Self::Revert(data) => data.starts_with(&Panic::SELECTOR),
+            Self::UnknownFunctionSelector(_) => false,
+        }
     }
 
     /// Creates an arithmetic under/overflow panic error (Panic(0x11)).
@@ -69,21 +90,30 @@ impl TempoPrecompileError {
 
     /// ABI-encodes this error and wraps it as a reverted [`PrecompileResult`].
     ///
+    /// `reservoir` is the EIP-8037 state gas reservoir handed back unchanged
+    /// (Tempo never charges state gas from precompiles).
+    ///
     /// # Errors
-    /// - `PrecompileError::OutOfGas` -- if the variant is [`OutOfGas`](Self::OutOfGas)
     /// - `PrecompileError::Fatal` -- if the variant is [`Fatal`](Self::Fatal)
-    pub fn into_precompile_result(self, gas_used: u64) -> PrecompileResult {
+    ///
+    /// [`OutOfGas`](Self::OutOfGas) maps to a non-fatal `PrecompileHalt::OutOfGas` halt,
+    /// equivalent to the pre-revm-37 `Err(PrecompileError::OutOfGas)`.
+    pub fn into_precompile_result(self, gas_used: u64, reservoir: u64) -> PrecompileResult {
         match self {
-            Self::OutOfGas => Err(PrecompileError::OutOfGas),
+            Self::OutOfGas => Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir)),
             Self::Fatal(msg) => Err(PrecompileError::Fatal(msg)),
             Self::UnknownFunctionSelector(selector) => {
-                // Encode as a simple 4-byte revert
-                Ok(PrecompileOutput::new_reverted(
+                Ok(PrecompileOutput::revert(
                     gas_used,
-                    Bytes::copy_from_slice(&selector),
+                    UnknownFunctionSelector {
+                        selector: FixedBytes::new(selector),
+                    }
+                    .abi_encode()
+                    .into(),
+                    reservoir,
                 ))
             }
-            Self::Revert(data) => Ok(PrecompileOutput::new_reverted(gas_used, data)),
+            Self::Revert(data) => Ok(PrecompileOutput::revert(gas_used, data, reservoir)),
         }
     }
 }
@@ -100,6 +130,7 @@ pub trait IntoPrecompileResult<T> {
     fn into_precompile_result(
         self,
         gas_used: u64,
+        reservoir: u64,
         encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult;
 }
@@ -108,11 +139,12 @@ impl<T> IntoPrecompileResult<T> for Result<T> {
     fn into_precompile_result(
         self,
         gas_used: u64,
+        reservoir: u64,
         encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult {
         match self {
-            Ok(res) => Ok(PrecompileOutput::new(gas_used, encode_ok(res))),
-            Err(err) => err.into_precompile_result(gas_used),
+            Ok(res) => Ok(PrecompileOutput::new(gas_used, encode_ok(res), reservoir)),
+            Err(err) => err.into_precompile_result(gas_used, reservoir),
         }
     }
 }
@@ -121,8 +153,24 @@ impl<T> IntoPrecompileResult<T> for TempoPrecompileError {
     fn into_precompile_result(
         self,
         gas_used: u64,
+        reservoir: u64,
         _encode_ok: impl FnOnce(T) -> Bytes,
     ) -> PrecompileResult {
-        TempoPrecompileError::into_precompile_result(self, gas_used)
+        TempoPrecompileError::into_precompile_result(self, gas_used, reservoir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_errors_include_panics() {
+        assert!(TempoPrecompileError::OutOfGas.is_system_error());
+        assert!(TempoPrecompileError::Fatal("db".into()).is_system_error());
+        assert!(TempoPrecompileError::under_overflow().is_system_error());
+        assert!(!TempoPrecompileError::UnknownFunctionSelector([1, 2, 3, 4]).is_system_error());
+        assert!(!TempoPrecompileError::Revert(Bytes::from_static(&[1, 2, 3, 4])).is_system_error());
+        assert!(!TempoPrecompileError::Revert(Bytes::new()).is_system_error());
     }
 }

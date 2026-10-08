@@ -9,6 +9,7 @@ use alloy::primitives::{b256, B256, U256};
 use super::abi::IB20;
 use super::error::{B20Error, Result};
 use super::layout::PolicySlot;
+use super::version::B20Version;
 
 // --- Role identifiers ---
 
@@ -33,6 +34,9 @@ pub const METADATA_ROLE: B256 =
 /// `keccak256("OPERATOR_ROLE")` — asset-only, gates `announce` and `updateMultiplier`.
 pub const OPERATOR_ROLE: B256 =
     b256!("97667070c54ef182b0f5858b034beac1b6f3089aa2d3188bb1e8929f4fa9b929");
+/// `keccak256("SEIZE_ROLE")` — Cobalt, gates `seizeWithMemo`.
+pub const SEIZE_ROLE: B256 =
+    b256!("3469b8b0d89e9604f8510ed143f74a8336d22955d4f83e23bf53d9414e27f432");
 /// The default admin role is the zero identifier.
 pub const DEFAULT_ADMIN_ROLE: B256 = B256::ZERO;
 
@@ -51,8 +55,25 @@ pub const TRANSFER_EXECUTOR_POLICY: B256 =
 pub const MINT_RECEIVER_POLICY: B256 =
     b256!("a0d5ae037e66a09119acf080a1d807abb9b6d03b6b9130eb19f7c1e6bdb8ffc8");
 
-/// Maps a policy scope identifier to its packed storage slot, if it is a known scope.
-pub fn policy_slot_for(scope: B256) -> Option<PolicySlot> {
+/// Policy scope whose members are *exempt* from seizure (Cobalt). An account is seizable only
+/// when this policy does not authorize it, so the unset always-allow default keeps seize closed.
+pub const SEIZE_EXEMPT_POLICY: B256 =
+    b256!("edb5da348cfb67af08746d3afd1be81034b50d5c8576f31aff688f39dfd540ed");
+/// Policy scope checked against seize destinations (Cobalt).
+pub const SEIZE_RECEIVER_POLICY: B256 =
+    b256!("bf15b19caf5c77422c038bc25f26b8b815c3a14f6d04c6616076b81bcfe07b3d");
+
+/// Maps a policy scope identifier to its packed storage slot, if it is a scope `version`'s
+/// surface accepts. The seize scopes only exist from Cobalt; on Beryl they are unknown.
+pub fn policy_slot_for(scope: B256, version: B20Version) -> Option<PolicySlot> {
+    if version.is_cobalt() {
+        if scope == SEIZE_EXEMPT_POLICY {
+            return Some(PolicySlot::SeizeExempt);
+        }
+        if scope == SEIZE_RECEIVER_POLICY {
+            return Some(PolicySlot::SeizeReceiver);
+        }
+    }
     if scope == TRANSFER_SENDER_POLICY {
         Some(PolicySlot::TransferSender)
     } else if scope == TRANSFER_RECEIVER_POLICY {
@@ -67,8 +88,8 @@ pub fn policy_slot_for(scope: B256) -> Option<PolicySlot> {
 }
 
 /// Resolves a policy scope, reverting with `UnsupportedPolicyType` when unknown.
-pub fn require_policy_slot(scope: B256) -> Result<PolicySlot> {
-    policy_slot_for(scope)
+pub fn require_policy_slot(scope: B256, version: B20Version) -> Result<PolicySlot> {
+    policy_slot_for(scope, version)
         .ok_or_else(|| B20Error::revert(IB20::UnsupportedPolicyType { policyScope: scope }))
 }
 
@@ -79,12 +100,24 @@ pub fn pause_mask(feature: IB20::PausableFeature) -> U256 {
     U256::ONE.checked_shl(usize::from(feature as u8)).unwrap_or(U256::ZERO)
 }
 
-/// The three valid pausable features, in enum order.
-pub const PAUSABLE_FEATURES: [IB20::PausableFeature; 3] = [
-    IB20::PausableFeature::TRANSFER,
-    IB20::PausableFeature::MINT,
-    IB20::PausableFeature::BURN,
-];
+/// The pausable features `version` recognizes, in enum order. Cobalt appends `SEIZE`.
+pub fn pausable_features(version: B20Version) -> &'static [IB20::PausableFeature] {
+    const V1: [IB20::PausableFeature; 3] = [
+        IB20::PausableFeature::TRANSFER,
+        IB20::PausableFeature::MINT,
+        IB20::PausableFeature::BURN,
+    ];
+    const V2: [IB20::PausableFeature; 4] = [
+        IB20::PausableFeature::TRANSFER,
+        IB20::PausableFeature::MINT,
+        IB20::PausableFeature::BURN,
+        IB20::PausableFeature::SEIZE,
+    ];
+    match version {
+        B20Version::V1 => &V1,
+        B20Version::V2 => &V2,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -100,15 +133,33 @@ mod tests {
         assert_eq!(UNPAUSE_ROLE, keccak256("UNPAUSE_ROLE"));
         assert_eq!(METADATA_ROLE, keccak256("METADATA_ROLE"));
         assert_eq!(OPERATOR_ROLE, keccak256("OPERATOR_ROLE"));
+        assert_eq!(SEIZE_ROLE, keccak256("SEIZE_ROLE"));
+    }
+
+    /// The seize-from scope was renamed from `SEIZE_HOLDER_POLICY` before Cobalt shipped
+    /// (Base #4845); the old preimage must not resolve.
+    #[test]
+    fn seize_scopes_match_their_keccak_preimages() {
+        assert_eq!(SEIZE_EXEMPT_POLICY, keccak256("SEIZE_EXEMPT_POLICY"));
+        assert_eq!(SEIZE_RECEIVER_POLICY, keccak256("SEIZE_RECEIVER_POLICY"));
+        assert_eq!(policy_slot_for(keccak256("SEIZE_HOLDER_POLICY"), B20Version::V2), None);
+    }
+
+    #[test]
+    fn seize_scopes_exist_only_from_cobalt() {
+        for scope in [SEIZE_EXEMPT_POLICY, SEIZE_RECEIVER_POLICY] {
+            assert_eq!(policy_slot_for(scope, B20Version::V1), None);
+            assert!(policy_slot_for(scope, B20Version::V2).is_some());
+        }
     }
 
     #[test]
     fn policy_scopes_resolve_to_distinct_slots() {
-        assert_eq!(policy_slot_for(TRANSFER_SENDER_POLICY), Some(PolicySlot::TransferSender));
-        assert_eq!(policy_slot_for(TRANSFER_RECEIVER_POLICY), Some(PolicySlot::TransferReceiver));
-        assert_eq!(policy_slot_for(TRANSFER_EXECUTOR_POLICY), Some(PolicySlot::TransferExecutor));
-        assert_eq!(policy_slot_for(MINT_RECEIVER_POLICY), Some(PolicySlot::MintReceiver));
-        assert_eq!(policy_slot_for(B256::repeat_byte(0xff)), None);
+        assert_eq!(policy_slot_for(TRANSFER_SENDER_POLICY, B20Version::V1), Some(PolicySlot::TransferSender));
+        assert_eq!(policy_slot_for(TRANSFER_RECEIVER_POLICY, B20Version::V1), Some(PolicySlot::TransferReceiver));
+        assert_eq!(policy_slot_for(TRANSFER_EXECUTOR_POLICY, B20Version::V1), Some(PolicySlot::TransferExecutor));
+        assert_eq!(policy_slot_for(MINT_RECEIVER_POLICY, B20Version::V1), Some(PolicySlot::MintReceiver));
+        assert_eq!(policy_slot_for(B256::repeat_byte(0xff), B20Version::V2), None);
     }
 
     #[test]
@@ -116,5 +167,6 @@ mod tests {
         assert_eq!(pause_mask(IB20::PausableFeature::TRANSFER), U256::from(1));
         assert_eq!(pause_mask(IB20::PausableFeature::MINT), U256::from(2));
         assert_eq!(pause_mask(IB20::PausableFeature::BURN), U256::from(4));
+        assert_eq!(pause_mask(IB20::PausableFeature::SEIZE), U256::from(8));
     }
 }

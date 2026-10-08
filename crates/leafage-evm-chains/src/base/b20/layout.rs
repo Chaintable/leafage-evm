@@ -8,11 +8,16 @@
 //! Every read/write goes through [`B20Port`], so each one is metered exactly as the
 //! equivalent `SLOAD`/`SSTORE` would be. Slot arithmetic itself is free — Base does not
 //! charge keccak gas for mapping derivation.
+//!
+//! Each accessor is one storage access even when fields share a slot: Base's generated
+//! accessors re-read the whole word per field, so two packed fields read back to back cost a
+//! cold and then a warm SLOAD, and the port must do the same to charge the same gas.
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 
 use super::error::{B20Error, Result};
 use super::port::B20Port;
+use super::version::B20Version;
 
 // --- ERC-7201 namespace roots (verified against Base reth) ---
 
@@ -56,6 +61,8 @@ const OFF_MINT_POLICY: u64 = 10;
 const OFF_PAUSED: u64 = 11;
 const OFF_SUPPLY_CAP: u64 = 12;
 const OFF_NONCES: u64 = 13;
+/// Slot 14 (Cobalt) packs the seize-exempt and seize-receiver policy IDs at byte offsets 0 / 8.
+const OFF_SEIZE_POLICIES: u64 = 14;
 
 // --- `base.b20.asset` field offsets ---
 
@@ -63,6 +70,11 @@ const OFF_ASSET_DECIMALS: u64 = 0;
 const OFF_ASSET_MULTIPLIER: u64 = 1;
 const OFF_ASSET_USED_ANNOUNCEMENT_IDS: u64 = 2;
 const OFF_ASSET_EXTRA_METADATA: u64 = 3;
+/// Slot 4 (Cobalt) packs the ERC-8056 schedule: `pending_multiplier: u128` at byte 0 and
+/// `pending_effective_at: u64` at byte 16.
+const OFF_ASSET_PENDING: u64 = 4;
+const PENDING_MULTIPLIER_BYTES: usize = 0;
+const PENDING_EFFECTIVE_AT_BYTES: usize = 16;
 
 // --- `base.b20.stablecoin` field offsets ---
 
@@ -80,6 +92,8 @@ const POLICY_SENDER_BYTES: usize = 0;
 const POLICY_RECEIVER_BYTES: usize = 8;
 const POLICY_EXECUTOR_BYTES: usize = 16;
 const POLICY_MINT_BYTES: usize = 0;
+const POLICY_SEIZE_EXEMPT_BYTES: usize = 0;
+const POLICY_SEIZE_RECEIVER_BYTES: usize = 8;
 
 /// Which packed policy field to touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +106,10 @@ pub enum PolicySlot {
     TransferExecutor,
     /// Mint receiver policy, slot 10 byte 0.
     MintReceiver,
+    /// Seize-exempt policy (Cobalt), slot 14 byte 0.
+    SeizeExempt,
+    /// Seize receiver policy (Cobalt), slot 14 byte 8.
+    SeizeReceiver,
 }
 
 impl PolicySlot {
@@ -101,6 +119,8 @@ impl PolicySlot {
             Self::TransferReceiver => (OFF_TRANSFER_POLICIES, POLICY_RECEIVER_BYTES),
             Self::TransferExecutor => (OFF_TRANSFER_POLICIES, POLICY_EXECUTOR_BYTES),
             Self::MintReceiver => (OFF_MINT_POLICY, POLICY_MINT_BYTES),
+            Self::SeizeExempt => (OFF_SEIZE_POLICIES, POLICY_SEIZE_EXEMPT_BYTES),
+            Self::SeizeReceiver => (OFF_SEIZE_POLICIES, POLICY_SEIZE_RECEIVER_BYTES),
         }
     }
 }
@@ -144,9 +164,35 @@ fn insert_u64(current: U256, value: u64, offset_bytes: usize) -> U256 {
 
 /// Extracts a `u64` from a slot word at `offset_bytes` from the low-order end.
 #[inline]
-fn extract_u64(word: U256, offset_bytes: usize) -> u64 {
+pub(crate) fn extract_u64(word: U256, offset_bytes: usize) -> u64 {
     let shift = offset_bytes * 8;
     ((word >> shift) & U256::from(u64::MAX)).to::<u64>()
+}
+
+/// Packs a `u128` into a slot word at `offset_bytes` from the low-order end.
+#[inline]
+fn insert_u128(current: U256, value: u128, offset_bytes: usize) -> U256 {
+    let shift = offset_bytes * 8;
+    let mask = U256::from(u128::MAX) << shift;
+    (current & !mask) | ((U256::from(value) << shift) & mask)
+}
+
+/// Extracts a `u128` from a slot word at `offset_bytes` from the low-order end.
+#[inline]
+fn extract_u128(word: U256, offset_bytes: usize) -> u128 {
+    let shift = offset_bytes * 8;
+    ((word >> shift) & U256::from(u128::MAX)).to::<u128>()
+}
+
+/// The sender / receiver / executor transfer policy IDs, read together from slot 9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferPolicyIds {
+    /// `TRANSFER_SENDER_POLICY` ID.
+    pub sender: u64,
+    /// `TRANSFER_RECEIVER_POLICY` ID.
+    pub receiver: u64,
+    /// `TRANSFER_EXECUTOR_POLICY` ID.
+    pub executor: u64,
 }
 
 // --- Typed store ---
@@ -156,12 +202,19 @@ pub struct B20Store<'a, P: B20Port> {
     port: &'a mut P,
     address: Address,
     is_asset: bool,
+    version: B20Version,
 }
 
 impl<'a, P: B20Port> B20Store<'a, P> {
-    /// Binds a store to `address`, dispatching variant-specific fields via `is_asset`.
-    pub fn new(port: &'a mut P, address: Address, is_asset: bool) -> Self {
-        Self { port, address, is_asset }
+    /// Binds a store to `address`, dispatching variant-specific fields via `is_asset` and
+    /// fork-dependent behavior via `version`.
+    pub fn new(port: &'a mut P, address: Address, is_asset: bool, version: B20Version) -> Self {
+        Self { port, address, is_asset, version }
+    }
+
+    /// The B20 logic version active for this call.
+    pub fn version(&self) -> B20Version {
+        self.version
     }
 
     /// The token address backing this store.
@@ -304,6 +357,17 @@ impl<'a, P: B20Port> B20Store<'a, P> {
         Ok(extract_u64(word, byte_offset))
     }
 
+    /// All three transfer policy IDs from their shared slot, in one SLOAD (Cobalt's
+    /// `transfer_policy_ids`). Beryl reads each ID separately via [`Self::policy_id`].
+    pub fn transfer_policy_ids(&mut self) -> Result<TransferPolicyIds> {
+        let word = self.load(field_slot(ROOT_B20, OFF_TRANSFER_POLICIES))?;
+        Ok(TransferPolicyIds {
+            sender: extract_u64(word, POLICY_SENDER_BYTES),
+            receiver: extract_u64(word, POLICY_RECEIVER_BYTES),
+            executor: extract_u64(word, POLICY_EXECUTOR_BYTES),
+        })
+    }
+
     /// Overwrites the policy ID configured for `slot_kind`, preserving the rest of the slot.
     pub fn set_policy_id(&mut self, slot_kind: PolicySlot, policy_id: u64) -> Result<()> {
         let (offset, byte_offset) = slot_kind.location();
@@ -384,6 +448,29 @@ impl<'a, P: B20Port> B20Store<'a, P> {
         self.store(field_slot(ROOT_ASSET, OFF_ASSET_MULTIPLIER), multiplier)
     }
 
+    /// Scheduled ERC-8056 multiplier target (Cobalt); zero when never scheduled.
+    pub fn pending_multiplier(&mut self) -> Result<u128> {
+        let word = self.load(field_slot(ROOT_ASSET, OFF_ASSET_PENDING))?;
+        Ok(extract_u128(word, PENDING_MULTIPLIER_BYTES))
+    }
+
+    /// Timestamp at which the scheduled multiplier takes effect (Cobalt); zero when never
+    /// scheduled.
+    pub fn pending_effective_at(&mut self) -> Result<u64> {
+        let word = self.load(field_slot(ROOT_ASSET, OFF_ASSET_PENDING))?;
+        Ok(extract_u64(word, PENDING_EFFECTIVE_AT_BYTES))
+    }
+
+    /// Writes the schedule in one read-modify-write of its shared slot, preserving the slot's
+    /// unused upper bytes — Base's `write_pending`.
+    pub fn set_pending(&mut self, multiplier: u128, effective_at: u64) -> Result<()> {
+        let slot = field_slot(ROOT_ASSET, OFF_ASSET_PENDING);
+        let current = self.load(slot)?;
+        let word = insert_u128(current, multiplier, PENDING_MULTIPLIER_BYTES);
+        let word = insert_u64(word, effective_at, PENDING_EFFECTIVE_AT_BYTES);
+        self.store(slot, word)
+    }
+
     /// Whether announcement `id` has already been consumed.
     pub fn is_announcement_id_used(&mut self, id: &str) -> Result<bool> {
         let slot =
@@ -404,10 +491,14 @@ impl<'a, P: B20Port> B20Store<'a, P> {
         self.read_string(slot)
     }
 
-    /// Sets (or, with an empty `value`, clears) the extra-metadata entry for `key`.
+    /// Sets the extra-metadata entry for `key`, or deletes it when `value` is empty.
     pub fn set_extra_metadata(&mut self, key: &str, value: &str) -> Result<()> {
         let slot = string_mapping_slot(field_slot(ROOT_ASSET, OFF_ASSET_EXTRA_METADATA), key);
-        self.write_string(slot, value)
+        if value.is_empty() {
+            self.delete_string(slot)
+        } else {
+            self.write_string(slot, value)
+        }
     }
 
     // --- stablecoin extension ---
@@ -442,47 +533,70 @@ impl<'a, P: B20Port> B20Store<'a, P> {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// Writes a Solidity `string` at `slot`, clearing any previous long-form tail.
+    /// Writes a Solidity `string` at `slot` — Base's `store_bytes_like`.
+    ///
+    /// Beryl writes the new value only: shrinking a long string leaves its old tail words in
+    /// place, and nothing is read first. Cobalt (`dynamic_storage_tail_cleanup`) checks
+    /// writability, reads the old length on *every* write — an extra SLOAD even when nothing
+    /// shrinks — and zeroes the stale tail words before writing the new value.
     pub fn write_string(&mut self, slot: U256, value: &str) -> Result<()> {
-        // Length of the value currently stored, so a shrink clears the stale tail words.
-        let previous = self.load(slot)?;
-        let prev_long = previous.to_be_bytes::<32>()[31] & 1 == 1;
-        let prev_len: usize = if prev_long {
-            ((previous - U256::ONE) / U256::from(2u64)).saturating_to()
-        } else {
-            (previous.to_be_bytes::<32>()[31] / 2) as usize
-        };
-
         let bytes = value.as_bytes();
+        let new_chunks = if bytes.len() <= 31 { 0 } else { bytes.len().div_ceil(32) };
         let data_base = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
 
-        if bytes.len() < 32 {
+        if self.version.is_cobalt() {
+            if self.port.is_static() {
+                return Err(B20Error::StaticCallViolation);
+            }
+            let previous = self.load(slot)?;
+            if is_long_string(previous) {
+                let old_chunks = long_string_len(previous).div_ceil(32);
+                for i in new_chunks..old_chunks {
+                    self.store(data_base.wrapping_add(U256::from(i as u64)), U256::ZERO)?;
+                }
+            }
+        }
+
+        if bytes.len() <= 31 {
             let mut word = [0u8; 32];
             word[..bytes.len()].copy_from_slice(bytes);
             word[31] = (bytes.len() * 2) as u8;
-            self.store(slot, U256::from_be_bytes(word))?;
+            self.store(slot, U256::from_be_bytes(word))
         } else {
             self.store(slot, U256::from(bytes.len() * 2 + 1))?;
             for (i, chunk) in bytes.chunks(32).enumerate() {
                 let mut word = [0u8; 32];
                 word[..chunk.len()].copy_from_slice(chunk);
-                self.store(
-                    data_base.wrapping_add(U256::from(i as u64)),
-                    U256::from_be_bytes(word),
-                )?;
+                self.store(data_base.wrapping_add(U256::from(i as u64)), U256::from_be_bytes(word))?;
             }
+            Ok(())
         }
+    }
 
-        // Zero any tail words the previous longer value occupied.
-        if prev_long {
-            let prev_words = prev_len.div_ceil(32);
-            let new_words = if bytes.len() < 32 { 0 } else { bytes.len().div_ceil(32) };
-            for i in new_words..prev_words {
+    /// Deletes a Solidity `string` at `slot`: zeroes a long value's data words, then the head
+    /// slot — Base's `delete_bytes_like`, identical on every fork.
+    pub fn delete_string(&mut self, slot: U256) -> Result<()> {
+        let previous = self.load(slot)?;
+        if is_long_string(previous) {
+            let data_base = U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0);
+            for i in 0..long_string_len(previous).div_ceil(32) {
                 self.store(data_base.wrapping_add(U256::from(i as u64)), U256::ZERO)?;
             }
         }
-        Ok(())
+        self.store(slot, U256::ZERO)
     }
+}
+
+/// Whether a string head slot holds the long form (`2 * len + 1`).
+#[inline]
+fn is_long_string(head: U256) -> bool {
+    head.to_be_bytes::<32>()[31] & 1 == 1
+}
+
+/// Byte length encoded in a long-form string head slot.
+#[inline]
+fn long_string_len(head: U256) -> usize {
+    ((head - U256::ONE) / U256::from(2u64)).saturating_to()
 }
 
 /// Checked subtraction that reverts with Solidity's arithmetic panic on underflow.

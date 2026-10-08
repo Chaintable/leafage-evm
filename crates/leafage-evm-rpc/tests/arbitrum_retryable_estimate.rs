@@ -3,7 +3,7 @@ use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::sol_types::SolCall;
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_chains::arbitrum::arbos_state::ARBOS_STATE_ADDRESS;
-use leafage_evm_chains::arbitrum::precompile::NODE_INTERFACE_ADDRESS;
+use leafage_evm_chains::arbitrum::precompile::{ARB_RETRYABLE_TX_ADDRESS, NODE_INTERFACE_ADDRESS};
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_rpc::{ApiBuilder, DebankApiClient, EthApiClient, MultiChainCfgEnv};
 use leafage_evm_storage::{
@@ -254,7 +254,27 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
         .traces
         .iter()
         .any(|trace| trace.to_addr == target));
-    assert_eq!(simulation.results[0].events.len(), 3);
+    // The submission logs sit on the NodeInterface virtual root but are emitted by
+    // ArbRetryableTx; the retry's own log comes from the target.
+    assert_eq!(
+        simulation.results[0]
+            .events
+            .iter()
+            .map(|event| (event.contract_id, event.selector.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ARB_RETRYABLE_TX_ADDRESS,
+                keccak256("TicketCreated(bytes32)").to_string()
+            ),
+            (
+                ARB_RETRYABLE_TX_ADDRESS,
+                keccak256("RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)")
+                    .to_string()
+            ),
+            (target, String::new()),
+        ]
+    );
     let read_trace = simulation.results[1]
         .traces
         .iter()

@@ -5,11 +5,11 @@ use super::{
     ArbPrecompileInput, ArbitrumContext, ARB_RETRYABLE_TX_ADDRESS, RETRYABLE_LIFETIME_SECONDS,
 };
 use crate::arbitrum::evm::ArbResourceKind;
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileOutput, PrecompileResult};
 use crate::arbitrum::tx::ArbitrumRetryTx;
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolCall, SolInterface, SolValue};
 use revm::context::{Cfg, ContextTr, JournalTr};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use revm::Database;
 
 pub(super) struct ArbRetryableTx;

@@ -22,11 +22,11 @@ use alloy_evm::Database;
 use once_cell::race::OnceBox;
 use revm::bytecode::Bytecode;
 use revm::context::{ContextTr, JournalTr, LocalContextTr};
-use revm::handler::{EthPrecompiles, PrecompileProvider};
+use revm::handler::{precompile_output_to_interpreter_result, EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
-use revm::precompile::{secp256r1, PrecompileError, Precompiles};
+use revm::precompile::{secp256r1, Precompiles};
 use revm::primitives::hardfork::SpecId;
-use revm::primitives::{address, Address, Bytes};
+use revm::primitives::{address, Address, AddressSet, Bytes};
 
 /// `staking::STAKING_CA`
 pub const STAKING_CONTRACT_ADDRESS: Address = address!("0000000000000000000000000000000000001000");
@@ -69,20 +69,38 @@ pub(crate) fn eth_precompiles(hardfork: MonadHardfork) -> &'static Precompiles {
     }
 }
 
+/// `0x1000` is always a precompile address, `0x1001` from MONAD_NINE.
+fn monad_addresses(hardfork: MonadHardfork) -> impl Iterator<Item = Address> {
+    [
+        Some(STAKING_CONTRACT_ADDRESS),
+        hardfork
+            .is_reserve_balance_enabled()
+            .then_some(RESERVE_BALANCE_CONTRACT_ADDRESS),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 #[derive(Debug, Clone)]
 pub struct MonadPrecompiles {
     eth: EthPrecompiles,
     hardfork: MonadHardfork,
+    /// Ethereum precompile addresses plus the Monad contract addresses.
+    warm_addresses: AddressSet,
 }
 
 impl MonadPrecompiles {
     pub fn new(hardfork: MonadHardfork) -> Self {
+        let precompiles = eth_precompiles(hardfork);
+        let mut warm_addresses = precompiles.addresses_set().clone();
+        warm_addresses.extend(monad_addresses(hardfork));
         Self {
             eth: EthPrecompiles {
-                precompiles: eth_precompiles(hardfork),
+                precompiles,
                 spec: hardfork.into(),
             },
             hardfork,
+            warm_addresses,
         }
     }
 
@@ -91,14 +109,7 @@ impl MonadPrecompiles {
     }
 
     fn monad_addresses(&self) -> impl Iterator<Item = Address> {
-        [
-            Some(STAKING_CONTRACT_ADDRESS),
-            self.hardfork
-                .is_reserve_balance_enabled()
-                .then_some(RESERVE_BALANCE_CONTRACT_ADDRESS),
-        ]
-        .into_iter()
-        .flatten()
+        monad_addresses(self.hardfork)
     }
 
     /// Run an Ethereum precompile with a pricing v1 gas multiplier: the
@@ -114,38 +125,23 @@ impl MonadPrecompiles {
             return Ok(None);
         };
         let input = call_input_bytes(context, inputs);
-        let mut result = InterpreterResult {
-            result: InstructionResult::Return,
-            gas: Gas::new(inputs.gas_limit),
-            output: Bytes::new(),
-        };
-        match precompile.execute(&input, inputs.gas_limit / factor) {
-            Ok(output) => {
-                let gas_used = output.gas_used.saturating_mul(factor);
-                let underflow = result.gas.record_cost(gas_used);
-                assert!(underflow, "Gas underflow is not possible");
-                result.result = if output.reverted {
-                    InstructionResult::Revert
-                } else {
-                    InstructionResult::Return
-                };
-                result.output = output.bytes;
-            }
-            Err(PrecompileError::Fatal(e)) => return Err(e),
-            Err(e) => {
-                result.result = if e.is_oog() {
-                    InstructionResult::PrecompileOOG
-                } else {
-                    InstructionResult::PrecompileError
-                };
-                if !e.is_oog() && context.journal().depth() == 1 {
-                    context
-                        .local_mut()
-                        .set_precompile_error_context(e.to_string());
-                }
+        // Fatal errors abort the transaction; halts are reported through the output status.
+        let mut output = precompile
+            .execute(&input, inputs.gas_limit / factor, inputs.reservoir)
+            .map_err(|e| e.to_string())?;
+        if let Some(halt) = output.halt_reason() {
+            if !halt.is_oog() && context.journal().depth() == 1 {
+                context
+                    .local_mut()
+                    .set_precompile_error_context(halt.to_string());
             }
         }
-        Ok(Some(result))
+        // `gas_used <= gas_limit / factor`, so the scaled charge never exceeds `gas_limit`.
+        output.gas_used = output.gas_used.saturating_mul(factor);
+        Ok(Some(precompile_output_to_interpreter_result(
+            output,
+            inputs.gas_limit,
+        )))
     }
 }
 
@@ -162,10 +158,10 @@ fn call_input_bytes<CTX: ContextTr>(context: &mut CTX, inputs: &CallInputs) -> B
 
 /// `check_call_monad_precompile`: `msg.kind != EVMC_CALL || msg.flags != 0`
 /// is `EVMC_REJECTED`, all gas of the call is consumed.
-pub(crate) fn rejected(gas_limit: u64) -> InterpreterResult {
+pub(crate) fn rejected(gas_limit: u64, reservoir: u64) -> InterpreterResult {
     InterpreterResult {
         result: InstructionResult::PrecompileError,
-        gas: Gas::new_spent(gas_limit),
+        gas: Gas::new_spent_with_reservoir(gas_limit, reservoir),
         output: Bytes::new(),
     }
 }
@@ -182,7 +178,7 @@ impl MonadPrecompiles {
         context: &mut MonadContext<DB>,
         inputs: &CallInputs,
     ) -> Result<bool, String> {
-        if !self.hardfork.is_staking_enabled() || inputs.known_bytecode.is_none() {
+        if !self.hardfork.is_staking_enabled() {
             return Ok(false);
         }
         // The account was loaded by the CALL instruction, this is a cache hit.
@@ -242,19 +238,13 @@ impl<DB: Database> PrecompileProvider<MonadContext<DB>> for MonadPrecompiles {
             return self.run_scaled(context, inputs, factor);
         }
         if self.delegates_to_monad_precompile(context, inputs)? {
-            return Ok(Some(rejected(inputs.gas_limit)));
+            return Ok(Some(rejected(inputs.gas_limit, inputs.reservoir)));
         }
         Ok(None)
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        Box::new(
-            self.eth
-                .precompiles
-                .addresses()
-                .cloned()
-                .chain(self.monad_addresses()),
-        )
+    fn warm_addresses(&self) -> &AddressSet {
+        &self.warm_addresses
     }
 
     fn contains(&self, address: &Address) -> bool {
@@ -294,7 +284,7 @@ mod tests {
             prague
                 .get(&u64_to_address(0x100))
                 .unwrap()
-                .execute(&[], u64::MAX)
+                .execute(&[], u64::MAX, 0)
                 .unwrap()
                 .gas_used,
             6_900

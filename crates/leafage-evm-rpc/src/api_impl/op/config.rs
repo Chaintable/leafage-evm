@@ -20,7 +20,7 @@ struct OpCustomConfig {
 
 /// Builds the OP `CfgEnv` from `--evm-custom-config`.
 ///
-/// `op_spec_id` is an OP fork name (e.g. "Jovian"); omitted keeps Osaka.
+/// `op_spec_id` is an OP fork name (e.g. "Jovian"); omitted keeps Karst (Osaka rules).
 /// Without an initcode override, revm uses 2 * code size, matching geth.
 pub fn build_op_custom_config(json: Option<&str>) -> Result<CfgEnv<OpSpecId>> {
     let json = json.unwrap_or("{}");
@@ -39,7 +39,7 @@ pub fn build_op_custom_config(json: Option<&str>) -> Result<CfgEnv<OpSpecId>> {
             })
         })
         .transpose()?
-        .unwrap_or(OpSpecId::OSAKA);
+        .unwrap_or(OpSpecId::KARST);
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.limit_contract_code_size = custom.limit_contract_code_size;
     if let Some(limit) = custom.limit_contract_initcode_size {
@@ -65,17 +65,17 @@ mod tests {
     fn op_spec_id_takes_fork_names() {
         use OpSpecId::*;
         for spec in [
-            BEDROCK, REGOLITH, CANYON, ECOTONE, FJORD, GRANITE, HOLOCENE, ISTHMUS, JOVIAN, INTEROP,
-            OSAKA,
+            BEDROCK, REGOLITH, CANYON, ECOTONE, FJORD, GRANITE, HOLOCENE, ISTHMUS, JOVIAN, KARST,
+            LAGOON,
         ] {
             let name: &str = spec.into();
             let cfg = config(&format!(r#"{{"op_spec_id":"{name}"}}"#));
             assert_eq!(cfg.spec, spec);
             assert_eq!(cfg.gas_params, CfgEnv::new_with_spec(spec).gas_params);
         }
-        assert_eq!(build_op_custom_config(None).unwrap().spec, OSAKA);
+        assert_eq!(build_op_custom_config(None).unwrap().spec, KARST);
         for json in ["{}", r#"{"op_spec_id":null}"#] {
-            assert_eq!(config(json).spec, OSAKA);
+            assert_eq!(config(json).spec, KARST);
         }
     }
 

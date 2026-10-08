@@ -31,9 +31,9 @@ use super::{
     ARB_OWNER_PUBLIC_ADDRESS, ARB_RETRYABLE_TX_ADDRESS, ARB_STATISTICS_ADDRESS, ARB_SYS_ADDRESS,
     ARB_WASM_ADDRESS, ARB_WASM_CACHE_ADDRESS,
 };
+use crate::arbitrum::precompile::result::PrecompileResult;
 use alloy::primitives::Address;
 use alloy::sol_types::SolInterface;
-use revm::precompile::PrecompileResult;
 use revm::{Database, DatabaseRef};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
