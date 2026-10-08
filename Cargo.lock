@@ -4983,6 +4983,7 @@ dependencies = [
  "alloy-hardforks",
  "alloy-rlp",
  "alloy-sol-types",
+ "base64 0.22.1",
  "bech32",
  "blake3",
  "bls_on_arkworks",
@@ -5012,6 +5013,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "slh-dsa",
+ "tempo-contracts",
+ "tempo-hardfork",
  "tendermint",
  "tracing",
 ]
@@ -5031,6 +5034,7 @@ dependencies = [
  "http-body 1.0.1",
  "hyper 1.6.0",
  "jsonrpsee",
+ "k256",
  "leafage-evm-chains",
  "leafage-evm-storage",
  "leafage-evm-types",
@@ -8438,6 +8442,29 @@ dependencies = [
  "once_cell",
  "rustix 1.0.8",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "tempo-contracts"
+version = "1.11.0"
+source = "git+https://github.com/tempoxyz/tempo?rev=74b69155ebaf6178bf7e3d59d18a2440164302d9#74b69155ebaf6178bf7e3d59d18a2440164302d9"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "serde",
+ "tempo-hardfork",
+]
+
+[[package]]
+name = "tempo-hardfork"
+version = "1.11.0"
+source = "git+https://github.com/tempoxyz/tempo?rev=74b69155ebaf6178bf7e3d59d18a2440164302d9#74b69155ebaf6178bf7e3d59d18a2440164302d9"
+dependencies = [
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-hardforks",
+ "paste",
+ "serde",
 ]
 
 [[package]]

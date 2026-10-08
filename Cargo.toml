@@ -95,6 +95,10 @@ alloy-sol-types = "1.7.3"
 # alloy-contract 的 Rust 代码没直接 use，但 `sol!` 宏展开会生成 alloy_contract::* 的引用。
 alloy-contract = "2.5.0"
 
+# Protocol definitions from the official v1.16.0 (T12) release; crates.io only has 1.11.0.
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "74b69155ebaf6178bf7e3d59d18a2440164302d9", default-features = false, features = ["std"] }
+tempo-hardfork = { git = "https://github.com/tempoxyz/tempo", rev = "74b69155ebaf6178bf7e3d59d18a2440164302d9", default-features = false, features = ["std"] }
+
 # op（仅供 vendored op-revm 使用）
 op-alloy-consensus = { version = "2.0.0", default-features = false }
 alloy-eips = { version = "2.5.0", default-features = false }
@@ -116,6 +120,7 @@ secp256k1 = "0.30"
 p256 = "0.13"
 elliptic-curve = "0.13"
 sha2 = "0.10"
+base64 = { version = "0.22", features = ["alloc"], default-features = false }
 slh-dsa = "=0.2.0-rc.5"
 bech32 = "0.11"
 ed25519-consensus = { version = "2.1", default-features = false }

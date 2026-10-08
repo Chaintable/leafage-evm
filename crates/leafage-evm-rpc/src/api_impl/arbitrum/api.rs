@@ -471,7 +471,11 @@ where
 {
     type Tx = ArbitrumTxEnv;
 
-    fn consensus_tx_gas_limit_cap(&self, _spec: revm::primitives::hardfork::SpecId) -> u64 {
+    fn consensus_tx_gas_limit_cap(
+        &self,
+        _spec: revm::primitives::hardfork::SpecId,
+        _block_env: &BlockEnv,
+    ) -> u64 {
         u64::MAX
     }
 
