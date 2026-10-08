@@ -76,18 +76,15 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
 
-    fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
+    /// Resolve the chain's per-transaction gas cap at the requested execution
+    /// block. Chains whose forks map to the same Ethereum spec can select their
+    /// own schedule from `block_env`.
+    fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId, _block_env: &BlockEnv) -> u64 {
         if spec.is_enabled_in(EthSpecId::OSAKA) {
             eip7825::TX_GAS_LIMIT_CAP
         } else {
             u64::MAX
         }
-    }
-
-    /// Resolve chain-specific limits at the requested execution block. Chains
-    /// whose forks map to the same Ethereum spec can select their own schedule.
-    fn consensus_tx_gas_limit_cap_at_block(&self, spec: EthSpecId, _block_env: &BlockEnv) -> u64 {
-        self.consensus_tx_gas_limit_cap(spec)
     }
 
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
@@ -309,11 +306,11 @@ mod tests {
     fn default_consensus_cap_keeps_mainnet_eip7825_boundary() {
         let handler = DefaultGasFeeHandler;
         assert_eq!(
-            handler.consensus_tx_gas_limit_cap(EthSpecId::PRAGUE),
+            handler.consensus_tx_gas_limit_cap(EthSpecId::PRAGUE, &BlockEnv::default()),
             u64::MAX
         );
         assert_eq!(
-            handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA),
+            handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA, &BlockEnv::default()),
             eip7825::TX_GAS_LIMIT_CAP
         );
     }

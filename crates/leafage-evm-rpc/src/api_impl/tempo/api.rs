@@ -803,7 +803,7 @@ where
 
     type Tx = TempoTxEnv;
 
-    fn consensus_tx_gas_limit_cap_at_block(
+    fn consensus_tx_gas_limit_cap(
         &self,
         _spec: revm::primitives::hardfork::SpecId,
         block_env: &BlockEnv,
