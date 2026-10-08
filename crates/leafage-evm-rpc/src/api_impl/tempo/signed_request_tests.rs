@@ -651,3 +651,60 @@ fn review_real_authorization_signature_gas_and_keychain_versions() {
         );
     }
 }
+
+#[test]
+fn review_malformed_tempo_fields_rejected_only_by_tempo() {
+    use crate::api_impl::api_impl::NoneEvmCustomConfig;
+    let mainnet = ApiImpl::<_, leafage_evm_types::MainnetSpecId, NoneEvmCustomConfig>::new(
+        (),
+        revm::context::CfgEnv::new_with_spec(leafage_evm_types::MainnetSpecId::CANCUN),
+        None,
+        None,
+        None,
+        None,
+        true,
+        false,
+        String::new(),
+        0,
+        None,
+        None,
+        None,
+    );
+    let db = InMemoryDB::default();
+    for (field, value, message) in [
+        ("validBefore", json!("0x0"), "expected non-zero quantity"),
+        ("keyType", json!("garbage"), "unsupported signature type"),
+        ("nonceKey", json!("bad"), ""),
+        (
+            "aaAuthorizationList",
+            json!([{"sigType":"garbage"}]),
+            "unsupported signature type",
+        ),
+        (
+            "keyAuthorization",
+            json!({"expiry":"0x0"}),
+            "expected non-zero quantity",
+        ),
+    ] {
+        let mut json = request();
+        json[field] = value;
+        let request: CallRequest = serde_json::from_value(json).unwrap();
+        let error = tests::review_api()
+            .create_txn_env(&Default::default(), &block(), request.clone(), &db, 4217)
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            jsonrpsee::types::error::INVALID_PARAMS_CODE,
+            "{field}"
+        );
+        assert!(
+            error.message().contains(message),
+            "{field}: {}",
+            error.message()
+        );
+        // Other chains ignore Tempo-named fields, as they did before Tempo validation.
+        mainnet
+            .create_txn_env(&Default::default(), &block(), request, &db, 4217)
+            .unwrap();
+    }
+}

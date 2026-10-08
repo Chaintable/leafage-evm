@@ -477,6 +477,12 @@ where
         };
         use revm::primitives::TxKind;
 
+        // The shared CallRequest keeps malformed Tempo fields for other chains to
+        // ignore; Tempo rejects them instead of running an ordinary transaction.
+        if let Some(invalid) = request.tempo.as_ref().and_then(|te| te.invalid.as_ref()) {
+            return Err(invalid_params_rpc_err(invalid.error.clone()));
+        }
+
         // Reject ambiguous signed bytes before recovering the payer or filling defaults.
         // Like the official Call deserializer, inner calls take input over data unchecked.
         request

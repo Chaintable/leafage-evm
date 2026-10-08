@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, Signature, B256, U256};
 use alloy::rpc::types::TransactionRequest;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 // ---------------------------------------------------------------------------
 // CallScope / SelectorRule (TIP-1011, T3+)
@@ -125,6 +126,105 @@ pub struct TempoCallExtension {
         skip_serializing_if = "Option::is_none"
     )]
     pub valid_before: Option<u64>,
+
+    /// Set when the Tempo fields are present but malformed. All other fields
+    /// are then left empty, and only the Tempo adapter rejects the request.
+    #[serde(skip)]
+    pub invalid: Option<InvalidTempoFields>,
+}
+
+/// Malformed Tempo fields of a [`super::CallRequest`]. The raw values are
+/// serialized unchanged, so a request forwarded to a historical node is still
+/// rejected there instead of running as an ordinary transaction.
+#[derive(Clone, Debug)]
+pub struct InvalidTempoFields {
+    pub error: String,
+    raw: Map<String, Value>,
+}
+
+/// JSON names of the [`TempoCallExtension`] fields; the test
+/// `tempo_field_names_match_extension` keeps the two in sync.
+const TEMPO_FIELD_NAMES: &[&str] = &[
+    "calls",
+    "nonceKey",
+    "keyType",
+    "keyData",
+    "keyId",
+    "keyAuthorization",
+    "aaAuthorizationList",
+    "feeToken",
+    "feePayer",
+    "feePayerSignature",
+    "validAfter",
+    "validBefore",
+];
+
+/// Collects only the Tempo-named entries of the flattened request, so other
+/// chains do not copy their own fields.
+struct TempoFieldsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for TempoFieldsVisitor {
+    type Value = Map<String, Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a call request object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut fields = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if TEMPO_FIELD_NAMES.contains(&key.as_str()) {
+                fields.insert(key, map.next_value()?);
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(fields)
+    }
+}
+
+pub(super) fn deserialize_call_extension<'de, D>(
+    deserializer: D,
+) -> Result<Option<TempoCallExtension>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let fields = Value::Object(deserializer.deserialize_map(TempoFieldsVisitor)?);
+    let extension = match TempoCallExtension::deserialize(&fields) {
+        Ok(extension) => extension,
+        Err(error) => {
+            let Value::Object(raw) = fields else {
+                unreachable!("Tempo fields are collected into an object")
+            };
+            TempoCallExtension {
+                invalid: Some(InvalidTempoFields {
+                    error: error.to_string(),
+                    raw,
+                }),
+                ..Default::default()
+            }
+        }
+    };
+    Ok(Some(extension))
+}
+
+pub(super) fn serialize_call_extension<S>(
+    extension: &Option<TempoCallExtension>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match extension
+        .as_ref()
+        .and_then(|extension| extension.invalid.as_ref())
+    {
+        Some(invalid) => invalid.raw.serialize(serializer),
+        None => extension.serialize(serializer),
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -346,5 +446,35 @@ mod tests {
         assert!(info.witness.is_none());
         assert!(info.signature.is_none());
         assert!(!info.is_admin);
+    }
+
+    /// Every serialized extension field must be listed in TEMPO_FIELD_NAMES,
+    /// otherwise a malformed value in it would be dropped instead of rejected.
+    #[test]
+    fn tempo_field_names_match_extension() {
+        let extension = TempoCallExtension {
+            tempo_calls: Some(vec![]),
+            nonce_key: Some(U256::ZERO),
+            key_type: Some("p256".to_string()),
+            key_data: Some(Bytes::new()),
+            key_id: Some(Address::ZERO),
+            key_authorization: Some(TempoKeyAuthGasInfo::default()),
+            tempo_authorization_list: Some(vec![]),
+            fee_token: Some(Address::ZERO),
+            fee_payer: Some(Address::ZERO),
+            fee_payer_signature: Some(Signature::new(U256::ONE, U256::ONE, false)),
+            valid_after: Some(1),
+            valid_before: Some(2),
+            invalid: None,
+        };
+        let serialized = serde_json::to_value(extension).unwrap();
+        let mut names: Vec<_> = serialized.as_object().unwrap().keys().cloned().collect();
+        let mut expected: Vec<_> = TEMPO_FIELD_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected);
     }
 }

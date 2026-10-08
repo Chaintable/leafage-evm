@@ -3,9 +3,9 @@ pub use call::CallRequest;
 
 mod tempo;
 pub use tempo::{
-    CallScope, SelectorRule, TempoAuthGasInfo, TempoCallExtension, TempoKeyAuthGasInfo,
-    TempoP256SignatureInfo, TempoPrimitiveSignatureInfo, TempoTokenLimitInfo,
-    TempoWebAuthnSignatureInfo,
+    CallScope, InvalidTempoFields, SelectorRule, TempoAuthGasInfo, TempoCallExtension,
+    TempoKeyAuthGasInfo, TempoP256SignatureInfo, TempoPrimitiveSignatureInfo,
+    TempoTokenLimitInfo, TempoWebAuthnSignatureInfo,
 };
 
 mod key;

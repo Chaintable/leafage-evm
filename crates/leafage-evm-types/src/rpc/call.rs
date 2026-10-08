@@ -10,20 +10,14 @@ pub struct CallRequest {
     #[serde(flatten)]
     pub inner: TransactionRequest,
 
-    #[serde(flatten, deserialize_with = "deserialize_tempo_extension")]
+    /// Malformed Tempo fields never fail parsing here, so other chains ignore
+    /// them; the Tempo adapter rejects them through `TempoCallExtension::invalid`.
+    #[serde(
+        flatten,
+        deserialize_with = "super::tempo::deserialize_call_extension",
+        serialize_with = "super::tempo::serialize_call_extension"
+    )]
     pub tempo: Option<TempoCallExtension>,
-}
-
-// Deserializing a flattened Option directly swallows malformed Tempo fields.
-// Keep the optional API shape, but propagate field errors instead of executing
-// the request as an ordinary Ethereum transaction.
-fn deserialize_tempo_extension<'de, D>(
-    deserializer: D,
-) -> Result<Option<TempoCallExtension>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    TempoCallExtension::deserialize(deserializer).map(Some)
 }
 
 impl Deref for CallRequest {
@@ -44,14 +38,27 @@ mod tests {
     use super::*;
     use alloy::primitives::{Address, Bytes, U256};
 
+    /// Parses a request, which never fails on Tempo fields, and returns the
+    /// recorded Tempo field error.
+    fn tempo_error(json: serde_json::Value) -> Option<String> {
+        let request: CallRequest =
+            serde_json::from_value(json).expect("Tempo fields must not fail parsing");
+        request
+            .tempo
+            .and_then(|tempo| tempo.invalid)
+            .map(|invalid| invalid.error)
+    }
+
     #[test]
-    fn review_zero_validity_and_unknown_signature_types_are_rejected() {
+    fn review_zero_validity_and_unknown_signature_types_are_marked_invalid() {
         for field in ["validAfter", "validBefore"] {
             for zero in [serde_json::json!(0), serde_json::json!("0x0")] {
+                let error = tempo_error(serde_json::json!({field: zero}));
                 assert!(
-                    serde_json::from_value::<CallRequest>(serde_json::json!({field: zero}))
-                        .is_err(),
-                    "{field} must be non-zero"
+                    error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("expected non-zero quantity")),
+                    "{field} must be non-zero: {error:?}"
                 );
             }
         }
@@ -62,16 +69,13 @@ mod tests {
             serde_json::json!({"keyAuthorization":{"expiry":"0x0"}}),
             serde_json::json!({"keyAuthorization":{"expiry":0}}),
         ] {
-            assert!(
-                serde_json::from_value::<CallRequest>(request.clone()).is_err(),
-                "{request}"
-            );
+            assert!(tempo_error(request.clone()).is_some(), "{request}");
         }
         for key_type in ["secp256k1", "p256", "webAuthn", "P256"] {
-            assert!(serde_json::from_value::<CallRequest>(
-                serde_json::json!({"keyType":key_type,"validAfter":null})
-            )
-            .is_ok());
+            assert_eq!(
+                tempo_error(serde_json::json!({"keyType":key_type,"validAfter":null})),
+                None
+            );
         }
     }
 
@@ -94,7 +98,7 @@ mod tests {
             serde_json::json!({"nonceKey":"bad"}),
             serde_json::json!({"feeToken":"bad"}),
         ] {
-            assert!(serde_json::from_value::<CallRequest>(invalid).is_err());
+            assert!(tempo_error(invalid.clone()).is_some(), "{invalid}");
         }
     }
 
@@ -214,5 +218,28 @@ mod tests {
         assert_eq!(t1.fee_token, t2.fee_token);
         assert_eq!(t1.valid_after, t2.valid_after);
         assert_eq!(t1.valid_before, t2.valid_before);
+    }
+
+    /// Malformed Tempo fields stay verbatim, so forwarding the request (for
+    /// example to a historical node) cannot drop them.
+    #[test]
+    fn review_malformed_tempo_fields_round_trip_unchanged() {
+        let json = serde_json::json!({
+            "from": "0x0000000000000000000000000000000000000001",
+            "to": "0x0000000000000000000000000000000000000002",
+            "keyType": "garbage",
+            "validBefore": "0x0",
+            "feeToken": "0x0000000000000000000000000000000000000004"
+        });
+        let request: CallRequest = serde_json::from_value(json.clone()).unwrap();
+        let tempo = request.tempo.as_ref().unwrap();
+        assert!(tempo.invalid.is_some());
+        assert!(tempo.fee_token.is_none() && tempo.key_type.is_none());
+
+        let serialized = serde_json::to_value(&request).unwrap();
+        for key in ["keyType", "validBefore", "feeToken", "from", "to"] {
+            assert_eq!(serialized[key], json[key], "{key}");
+        }
+        assert!(tempo_error(serialized).is_some());
     }
 }
