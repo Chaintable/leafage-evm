@@ -23,6 +23,7 @@ impl<DB: Database, I> ExecuteEvm for ArcEvm<DB, I> {
 
     fn set_block(&mut self, block: Self::Block) {
         self.inner.set_block(block);
+        self.refresh_execution_spec();
     }
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
