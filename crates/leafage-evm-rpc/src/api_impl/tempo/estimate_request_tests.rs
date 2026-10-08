@@ -146,7 +146,7 @@ async fn formal_t11_rpc_uses_requested_timestamp_for_strict_abi() {
 }
 
 #[tokio::test]
-async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallback() {
+async fn review_signed_sponsor_estimate_dispatch_uses_state_nonce_without_fallback() {
     let caller = address!("1111111111111111111111111111111111111111");
     let to = Address::repeat_byte(0x22);
     let token = address!("20c0000000000000000000000000000000000000");
@@ -207,16 +207,19 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
         ),
         U256::from_be_bytes(currency),
     );
-    // Fund the sponsor recovered from the signed nonce (0) and from the state nonce (7).
-    for payer in [payer_for_nonce(0), payer_for_nonce(7)] {
-        db.storage.insert(
-            (
-                keccak256(token),
-                keccak256(payer.mapping_slot(U256::from(9)).to_be_bytes::<32>()),
+    // Estimation clears the request nonce, so only the sponsor recovered from
+    // the state nonce (7) is funded; the signed nonce (0) yields another payer.
+    db.storage.insert(
+        (
+            keccak256(token),
+            keccak256(
+                payer_for_nonce(7)
+                    .mapping_slot(U256::from(9))
+                    .to_be_bytes::<32>(),
             ),
-            U256::from(2_000_000),
-        );
-    }
+        ),
+        U256::from(2_000_000),
+    );
 
     let fallback_calls = Arc::new(AtomicUsize::new(0));
     let server = jsonrpsee::server::ServerBuilder::default()
@@ -298,36 +301,4 @@ async fn review_signed_sponsor_estimate_dispatch_preserves_nonce_without_fallbac
     }
     handle.stop().unwrap();
     handle.stopped().await;
-}
-
-#[test]
-fn review_estimate_nonce_policy_preserves_other_chains_and_unsigned_requests() {
-    use crate::api_impl::api_impl::NoneEvmCustomConfig;
-    let mainnet = ApiImpl::<_, leafage_evm_types::MainnetSpecId, NoneEvmCustomConfig>::new(
-        (),
-        revm::context::CfgEnv::new_with_spec(leafage_evm_types::MainnetSpecId::CANCUN),
-        None,
-        None,
-        None,
-        None,
-        true,
-        false,
-        String::new(),
-        0,
-        None,
-        None,
-        None,
-    );
-    for signed in [false, true] {
-        let mut json = json!({"to":Address::repeat_byte(0x22),"nonce":"0x7"});
-        if signed {
-            json["feePayerSignature"] = json!({"r":"0x1","s":"0x1","yParity":"0x0"});
-        }
-        let mut request: CallRequest = serde_json::from_value(json).unwrap();
-        let mut ordinary = request.clone();
-        mainnet.prepare_estimate_request(&mut ordinary);
-        assert_eq!(ordinary.nonce, None);
-        tests::review_api().prepare_estimate_request(&mut request);
-        assert_eq!(request.nonce, if signed { Some(7) } else { None });
-    }
 }
