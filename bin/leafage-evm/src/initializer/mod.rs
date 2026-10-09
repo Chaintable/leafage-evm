@@ -4,7 +4,7 @@ pub use http_initializer::Initializer as HttpInitializer;
 mod kafka_initializer;
 pub use kafka_initializer::Initializer as KafkaInitializer;
 
-use crate::utils::KafkaS3Config;
+use crate::utils::{KafkaS3Config, StateDiffKey};
 use anyhow::{Ok, Result};
 use leafage_evm_storage::EvmStorageWrite;
 
@@ -12,6 +12,7 @@ pub async fn initialize_check<DB: EvmStorageWrite + Send + Sync + 'static>(
     db: DB,
     rpc_url: Option<String>,
     kafka_s3_cfg: Option<KafkaS3Config>,
+    state_diff_key: StateDiffKey,
     genesis_number: u64,
 ) -> Result<()> {
     if db.last_committed_block()?.is_none() {
@@ -21,8 +22,14 @@ pub async fn initialize_check<DB: EvmStorageWrite + Send + Sync + 'static>(
                 initializer.init().await?;
             }
             (rpc_url, Some(kafka_s3_cfg)) => {
-                let mut initializer =
-                    KafkaInitializer::new(db, rpc_url, kafka_s3_cfg, genesis_number).await?;
+                let mut initializer = KafkaInitializer::new(
+                    db,
+                    rpc_url,
+                    kafka_s3_cfg,
+                    state_diff_key,
+                    genesis_number,
+                )
+                .await?;
                 initializer.init().await?;
             }
             (None, None) => {

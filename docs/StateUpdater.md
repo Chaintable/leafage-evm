@@ -80,10 +80,12 @@ S3 keys are `{chain_id}/[{version}/]{block_hash}/block` for block info and
 State diffs are keyed by state root, so blocks that leave the root unchanged
 share one object and are skipped rather than fetched.
 
-HyperEVM (chain `999`) is the exception: it reports a zero state root on every
-block, so its diffs are keyed by `{block_hash}` and fetched for every block.
-See `docs/DataSpec.md` for why, and `state_diff_keyed_by_block_hash()` in
-`bin/leafage-evm/src/utils.rs` for the gate.
+HyperEVM (S3 chain `999`) defaults to block-hash addressing: it reports a zero
+state root on every block, so its diffs are keyed by `{block_hash}` and fetched
+for every block. Use `standalone --statediff-key state-root|block-hash` to
+override the chain default, including `block-hash` for Arb Classic. See
+`docs/DataSpec.md` for details and `StateDiffKey::resolve()` in
+`bin/leafage-evm/src/utils.rs` for default selection.
 
 ### Offset Management
 
