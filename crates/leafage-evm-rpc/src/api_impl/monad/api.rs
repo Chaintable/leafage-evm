@@ -42,7 +42,7 @@ where
 
     /// Monad does not enforce EIP-7825; consensus rejects transactions above
     /// the TFM gas limit instead.
-    fn consensus_tx_gas_limit_cap(&self, _spec: EthSpecId) -> u64 {
+    fn consensus_tx_gas_limit_cap(&self, _spec: EthSpecId, _block_env: &BlockEnv) -> u64 {
         TFM_MAX_TX_GAS_LIMIT
     }
 }

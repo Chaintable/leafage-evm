@@ -151,7 +151,7 @@ where
     {
         return Ok(InterpreterResult {
             result: InstructionResult::PrecompileError,
-            gas: Gas::new_spent(gas_limit),
+            gas: Gas::new_spent_with_reservoir(gas_limit, inputs.reservoir),
             output: Bytes::new(),
         });
     }
@@ -159,7 +159,7 @@ where
     if gas_limit < cost {
         return Ok(InterpreterResult {
             result: InstructionResult::PrecompileOOG,
-            gas: Gas::new_spent(gas_limit),
+            gas: Gas::new_spent_with_reservoir(gas_limit, inputs.reservoir),
             output: Bytes::new(),
         });
     }
@@ -170,9 +170,9 @@ where
         .map_err(|error| error.to_string())?;
     match execute(journal, inputs.caller, inputs.call_value()) {
         Ok(output) => {
-            let mut gas = Gas::new(gas_limit);
+            let mut gas = Gas::new_with_regular_gas_and_reservoir(gas_limit, inputs.reservoir);
             // `gas_limit >= cost` was checked above.
-            let _ = gas.record_cost(cost);
+            let _ = gas.record_regular_cost(cost);
             Ok(InterpreterResult {
                 result: InstructionResult::Return,
                 gas,
@@ -181,7 +181,7 @@ where
         }
         Err(Failure::Revert(message)) => Ok(InterpreterResult {
             result: InstructionResult::Revert,
-            gas: Gas::new_spent(gas_limit),
+            gas: Gas::new_spent_with_reservoir(gas_limit, inputs.reservoir),
             output: Bytes::from_static(message.as_bytes()),
         }),
         Err(Failure::Fatal(error)) => Err(error),

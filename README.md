@@ -30,6 +30,7 @@ Any EVM-compatible chain can potentially be supported. The following chains are 
 | Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
 | Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
 | IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| RSK (Rootstock)                               | [Chaintable/rskj](https://github.com/Chaintable/rskj)                                            |
 | Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
 | Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
 | Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
@@ -170,7 +171,8 @@ When using Kafka + S3 mode, provide a JSON config file:
   "outer_bucket_name": "block-info-bucket",
   "offset_dir": "/path/to/offset",
   "s3_chain_id": "1",
-  "version": "v1"
+  "version": "v1",
+  "s3_read_timeout_secs": 20
 }
 ```
 
@@ -181,6 +183,8 @@ Both `standalone` and `archive-init` accept the optional `--statediff-key` flag 
 When omitted, the historical default is preserved: S3 chain ID `"999"` uses block hashes; all others use state roots. Explicit values override this default, including on chain 999. The resolved strategy is logged at startup. Match the producer's setting and keep it consistent when resuming the same dataset; chain ID 42161 does not distinguish Classic from Nitro.
 
 Block-hash mode requires a source diff for every block, including genesis and blocks with unchanged/zero state roots. Missing or malformed objects fail the read without falling back to a state-root key. Bundle entries marked as synthesized are rejected before applying any block in the requested range; disable bundle reads to read the original per-block objects, or regenerate the bundle with real diffs. Roots inside each diff remain state roots.
+
+`s3_read_timeout_secs` is a positive integer, defaulting to 20. It sets the AWS SDK operation timeout for GET and LIST calls, including bundle GET/range requests and SDK retries. Response body consumption after `send()` returns is outside this timeout; the SDK's existing stalled-stream protection remains unchanged. Errors propagate to the existing caller handling. `archive-init` uses the same default 20-second operation timeout.
 
 Both `standalone` and `archive-init` accept `--bundle-range-size <MIB>` to tune the compacted StateDiff request size. The limit applies only when grouping multiple entries; a single entry larger than the configured value is fetched by itself.
 

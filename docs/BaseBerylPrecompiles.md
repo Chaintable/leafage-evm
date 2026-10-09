@@ -146,6 +146,42 @@ Re-run those probes against a real Base node after any change to the charge sequ
 `ops.rs` or `layout.rs`; the ordering of guards decides both the error a failing call
 reports and the gas a succeeding one costs.
 
+## Cobalt (V2)
+
+Cobalt (Base reth v1.4.2; mainnet `1_790_791_200` = 2026-09-30 18:00 UTC, Sepolia
+`1_790_186_400` = 2026-09-23 18:00 UTC) replaces the token logic in place: the same addresses
+and state, read by V2 logic. `B20Version::resolve(chain_id, timestamp)` picks the version per
+call, as Base's `AssetVersions` / `StablecoinVersions` / `UpgradeGatedStorageFeatures` do.
+
+| Area | Change | Storage |
+| --- | --- | --- |
+| Seize | `seizeWithMemo`, `SEIZE_ROLE`, `SEIZE_EXEMPT_POLICY`, `SEIZE_RECEIVER_POLICY`, pause feature `SEIZE` (bit 8), `AccountNotSeizable`, `Seized` | core slot 14: exempt @0, receiver @8 |
+| ERC-8056 multiplier (asset) | `updateUIMultiplier`, `cancelUIMultiplierUpdate`, `newUIMultiplier`, `effectiveAt`, `uiMultiplier`, `toUIAmount`, `fromUIAmount`, `balanceOfUI`, `totalSupplyUI`, `MAX_UI_MULTIPLIER`, `supportsInterface`. The multiplier flips lazily once `effectiveAt` passes; `updateMultiplier` is capped at `uint128` and clears the schedule | asset slot 4: `pending_multiplier: u128` @0, `pending_effective_at: u64` @16 |
+| Composite policies | registry types UNION (2) / INTERSECT (3), evaluated live over 2–4 simple children, short-circuiting | registry offset 4: `Mapping<u64, uint64[]>` |
+| Transfers | zero-address checks before any policy SLOAD; the packed transfer-policy slot read once | — |
+| Permit | metered: keccak at the EVM schedule for the domain separator (also via `DOMAIN_SEPARATOR()`) and digest, plus 3000 for recovery charged before `v` is checked | — |
+| Strings | every write reads the old length first and zeroes a shrunk long value's stale tail | — |
+
+Beryl fixes that came with the port (each pinned by Base's own goldens):
+
+- Stablecoin `updatePolicy` reads the old ID before the existence check (Base #4596); the
+  asset checks existence first.
+- `permit` re-reads the nonce when incrementing it (Base's `increment_nonce`).
+- String writes do not read or clear before Cobalt — the old code did both.
+- An empty `extraMetadata` value deletes the entry; calldata shorter than 4 bytes reverts
+  `0x00000000`.
+
+Known residual: before Cobalt, Base's `AbiDecodeFailed` revert appends alloy's decoder message
+after the selector; leafage returns the selector alone (what Base returns from Cobalt on).
+
+### Cobalt validation
+
+- `src/base/b20/golden.rs` reproduces Base's `golden_gas_footprints` tables for asset and
+  stablecoin, V1 and V2 — per-op SLOAD / SSTORE / metered-keccak counts, copied verbatim.
+- `tests/b20_gas.rs::cobalt_gas_matches_base_sepolia` pins 11 calls to the exact minimum gas
+  Base Sepolia accepted (block 47,227,231, token `0xb200…c4c266da4035da4d13`), including a
+  transfer through real blocklist registry reads and the metered permit and domain separator.
+
 ## References
 
 - Base reth: `crates/common/precompiles/src/{common/core_storage.rs,common/ops/*,b20_asset/*,b20_stablecoin/*,policy/*,lookup.rs,provider.rs}`,

@@ -2,7 +2,7 @@ use super::abi::IArbosTest;
 use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call};
 use super::{ArbPrecompileInput, ArbitrumContext};
-use revm::precompile::PrecompileResult;
+use crate::arbitrum::precompile::result::PrecompileResult;
 use revm::Database;
 
 pub(super) struct ArbosTest;

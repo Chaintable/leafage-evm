@@ -103,7 +103,7 @@ where
                 let account = account_changes.entry(address).or_default();
                 account.storage_changes.insert(key);
             }
-            JournalEntry::CodeChange { address } => {
+            JournalEntry::CodeChange { address, .. } => {
                 let account = account_changes.entry(address).or_default();
                 account.account_info_changed = true;
             }

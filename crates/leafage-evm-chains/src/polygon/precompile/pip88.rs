@@ -6,7 +6,8 @@ use revm::precompile::{
         MAP_FP2_TO_G2_ADDRESS, MAP_FP_TO_G1_ADDRESS, PAIRING_ADDRESS, PAIRING_INPUT_LENGTH,
     },
     bls12_381_utils::msm_required_gas,
-    bn254, u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileResult,
+    bn254, eth_precompile_fn, u64_to_address, EthPrecompileResult, Precompile, PrecompileHalt,
+    PrecompileId,
 };
 
 const BLAKE2F_INPUT_LENGTH: usize = 213;
@@ -26,32 +27,69 @@ const BLS12_PAIRING_PER_PAIR_GAS: u64 = 94_540;
 const BLS12_MAP_G1_GAS: u64 = 15_400;
 const BLS12_MAP_G2_GAS: u64 = 66_640;
 
-const BN254_ADD: Precompile =
-    Precompile::new(PrecompileId::Bn254Add, bn254::add::ADDRESS, bn254_add);
-const BN254_MUL: Precompile =
-    Precompile::new(PrecompileId::Bn254Mul, bn254::mul::ADDRESS, bn254_mul);
-const BN254_PAIR: Precompile =
-    Precompile::new(PrecompileId::Bn254Pairing, bn254::pair::ADDRESS, bn254_pair);
-const BLAKE2F: Precompile = Precompile::new(PrecompileId::Blake2F, u64_to_address(9), blake2f);
-const BLS12_G1_ADD: Precompile =
-    Precompile::new(PrecompileId::Bls12G1Add, G1_ADD_ADDRESS, bls12_g1_add);
-const BLS12_G1_MSM: Precompile =
-    Precompile::new(PrecompileId::Bls12G1Msm, G1_MSM_ADDRESS, bls12_g1_msm);
-const BLS12_G2_ADD: Precompile =
-    Precompile::new(PrecompileId::Bls12G2Add, G2_ADD_ADDRESS, bls12_g2_add);
-const BLS12_G2_MSM: Precompile =
-    Precompile::new(PrecompileId::Bls12G2Msm, G2_MSM_ADDRESS, bls12_g2_msm);
-const BLS12_PAIRING: Precompile =
-    Precompile::new(PrecompileId::Bls12Pairing, PAIRING_ADDRESS, bls12_pairing);
+eth_precompile_fn!(bn254_add_precompile, bn254_add);
+eth_precompile_fn!(bn254_mul_precompile, bn254_mul);
+eth_precompile_fn!(bn254_pair_precompile, bn254_pair);
+eth_precompile_fn!(blake2f_precompile, blake2f);
+eth_precompile_fn!(bls12_g1_add_precompile, bls12_g1_add);
+eth_precompile_fn!(bls12_g1_msm_precompile, bls12_g1_msm);
+eth_precompile_fn!(bls12_g2_add_precompile, bls12_g2_add);
+eth_precompile_fn!(bls12_g2_msm_precompile, bls12_g2_msm);
+eth_precompile_fn!(bls12_pairing_precompile, bls12_pairing);
+eth_precompile_fn!(bls12_map_g1_precompile, bls12_map_g1);
+eth_precompile_fn!(bls12_map_g2_precompile, bls12_map_g2);
+
+const BN254_ADD: Precompile = Precompile::new(
+    PrecompileId::Bn254Add,
+    bn254::add::ADDRESS,
+    bn254_add_precompile,
+);
+const BN254_MUL: Precompile = Precompile::new(
+    PrecompileId::Bn254Mul,
+    bn254::mul::ADDRESS,
+    bn254_mul_precompile,
+);
+const BN254_PAIR: Precompile = Precompile::new(
+    PrecompileId::Bn254Pairing,
+    bn254::pair::ADDRESS,
+    bn254_pair_precompile,
+);
+const BLAKE2F: Precompile =
+    Precompile::new(PrecompileId::Blake2F, u64_to_address(9), blake2f_precompile);
+const BLS12_G1_ADD: Precompile = Precompile::new(
+    PrecompileId::Bls12G1Add,
+    G1_ADD_ADDRESS,
+    bls12_g1_add_precompile,
+);
+const BLS12_G1_MSM: Precompile = Precompile::new(
+    PrecompileId::Bls12G1Msm,
+    G1_MSM_ADDRESS,
+    bls12_g1_msm_precompile,
+);
+const BLS12_G2_ADD: Precompile = Precompile::new(
+    PrecompileId::Bls12G2Add,
+    G2_ADD_ADDRESS,
+    bls12_g2_add_precompile,
+);
+const BLS12_G2_MSM: Precompile = Precompile::new(
+    PrecompileId::Bls12G2Msm,
+    G2_MSM_ADDRESS,
+    bls12_g2_msm_precompile,
+);
+const BLS12_PAIRING: Precompile = Precompile::new(
+    PrecompileId::Bls12Pairing,
+    PAIRING_ADDRESS,
+    bls12_pairing_precompile,
+);
 const BLS12_MAP_G1: Precompile = Precompile::new(
     PrecompileId::Bls12MapFpToGp1,
     MAP_FP_TO_G1_ADDRESS,
-    bls12_map_g1,
+    bls12_map_g1_precompile,
 );
 const BLS12_MAP_G2: Precompile = Precompile::new(
     PrecompileId::Bls12MapFp2ToGp2,
     MAP_FP2_TO_G2_ADDRESS,
-    bls12_map_g2,
+    bls12_map_g2_precompile,
 );
 
 pub(super) fn precompiles() -> [Precompile; 11] {
@@ -70,15 +108,15 @@ pub(super) fn precompiles() -> [Precompile; 11] {
     ]
 }
 
-fn bn254_add(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bn254_add(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     bn254::run_add(input, BN254_ADD_GAS, gas_limit)
 }
 
-fn bn254_mul(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bn254_mul(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     bn254::run_mul(input, BN254_MUL_GAS, gas_limit)
 }
 
-fn bn254_pair(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bn254_pair(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     bn254::run_pair(
         input,
         BN254_PAIR_PER_POINT_GAS,
@@ -87,15 +125,15 @@ fn bn254_pair(input: &[u8], gas_limit: u64) -> PrecompileResult {
     )
 }
 
-fn blake2f(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn blake2f(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     if input.len() != BLAKE2F_INPUT_LENGTH {
-        return Err(PrecompileError::Blake2WrongLength);
+        return Err(PrecompileHalt::Blake2WrongLength);
     }
 
     let rounds = u32::from_be_bytes(input[..4].try_into().unwrap()) as u64;
     let gas = rounds * GFROUND;
     if gas > gas_limit {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
 
     let mut output = blake2::run(input, gas_limit)?;
@@ -103,7 +141,7 @@ fn blake2f(input: &[u8], gas_limit: u64) -> PrecompileResult {
     Ok(output)
 }
 
-fn bls12_g1_add(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_g1_add(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     run_repriced(
         input,
         gas_limit,
@@ -112,7 +150,7 @@ fn bls12_g1_add(input: &[u8], gas_limit: u64) -> PrecompileResult {
     )
 }
 
-fn bls12_g1_msm(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_g1_msm(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     let gas = bls_msm_gas(
         input.len(),
         G1_MSM_INPUT_LENGTH,
@@ -122,7 +160,7 @@ fn bls12_g1_msm(input: &[u8], gas_limit: u64) -> PrecompileResult {
     run_repriced(input, gas_limit, gas, bls12_381::g1_msm::g1_msm)
 }
 
-fn bls12_g2_add(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_g2_add(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     run_repriced(
         input,
         gas_limit,
@@ -131,7 +169,7 @@ fn bls12_g2_add(input: &[u8], gas_limit: u64) -> PrecompileResult {
     )
 }
 
-fn bls12_g2_msm(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_g2_msm(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     let gas = bls_msm_gas(
         input.len(),
         G2_MSM_INPUT_LENGTH,
@@ -141,13 +179,13 @@ fn bls12_g2_msm(input: &[u8], gas_limit: u64) -> PrecompileResult {
     run_repriced(input, gas_limit, gas, bls12_381::g2_msm::g2_msm)
 }
 
-fn bls12_pairing(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_pairing(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     let gas = (input.len() / PAIRING_INPUT_LENGTH) as u64 * BLS12_PAIRING_PER_PAIR_GAS
         + BLS12_PAIRING_BASE_GAS;
     run_repriced(input, gas_limit, gas, bls12_381::pairing::pairing)
 }
 
-fn bls12_map_g1(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_map_g1(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     run_repriced(
         input,
         gas_limit,
@@ -156,7 +194,7 @@ fn bls12_map_g1(input: &[u8], gas_limit: u64) -> PrecompileResult {
     )
 }
 
-fn bls12_map_g2(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn bls12_map_g2(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     run_repriced(
         input,
         gas_limit,
@@ -169,10 +207,10 @@ fn run_repriced(
     input: &[u8],
     gas_limit: u64,
     gas: u64,
-    run: fn(&[u8], u64) -> PrecompileResult,
-) -> PrecompileResult {
+    run: fn(&[u8], u64) -> EthPrecompileResult,
+) -> EthPrecompileResult {
     if gas > gas_limit {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
 
     let mut output = run(input, gas_limit)?;
@@ -203,15 +241,15 @@ mod tests {
     #[test]
     fn reprices_bn254_and_blake2f_gas() {
         assert_eq!(
-            precompile(0x06).execute(&[], u64::MAX).unwrap().gas_used,
+            precompile(0x06).execute(&[], u64::MAX, 0).unwrap().gas_used,
             BN254_ADD_GAS
         );
         assert_eq!(
-            precompile(0x07).execute(&[], u64::MAX).unwrap().gas_used,
+            precompile(0x07).execute(&[], u64::MAX, 0).unwrap().gas_used,
             BN254_MUL_GAS
         );
         assert_eq!(
-            precompile(0x08).execute(&[], u64::MAX).unwrap().gas_used,
+            precompile(0x08).execute(&[], u64::MAX, 0).unwrap().gas_used,
             BN254_PAIR_BASE_GAS
         );
 
@@ -219,7 +257,7 @@ mod tests {
         blake2_input[..4].copy_from_slice(&12u32.to_be_bytes());
         assert_eq!(
             precompile(0x09)
-                .execute(&blake2_input, u64::MAX)
+                .execute(&blake2_input, u64::MAX, 0)
                 .unwrap()
                 .gas_used,
             12 * GFROUND

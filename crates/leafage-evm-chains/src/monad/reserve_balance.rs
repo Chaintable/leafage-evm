@@ -74,10 +74,11 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
             **address != STAKING_CONTRACT_ADDRESS && account.transaction_id == transaction_id
         })
         .filter_map(|(address, account)| {
+            let original_info = account.original_info();
             let code_hash = if use_recent_code {
                 account.info.code_hash
             } else {
-                account.original_info.code_hash
+                original_info.code_hash
             };
             // Contracts that self destruct during init never get a code hash.
             if is_empty_code_hash(code_hash)
@@ -90,7 +91,7 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
             Some(Candidate {
                 address: *address,
                 code_hash,
-                original_balance: account.original_info.balance,
+                original_balance: original_info.balance,
                 balance: account.info.balance,
             })
         })
@@ -111,7 +112,7 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
                     .inner
                     .state
                     .get(&candidate.address)
-                    .and_then(|account| account.original_info.code.clone())
+                    .and_then(|account| account.original_info().code)
             };
             let code = match code {
                 Some(code) => code,
@@ -247,7 +248,7 @@ pub(crate) fn reject_on_reserve_violation<DB: Database>(
 /// output.
 pub(crate) fn mark_reserve_violation(result: &mut InterpreterResult) {
     result.result = InstructionResult::OutOfFunds;
-    result.gas = Gas::new_spent(result.gas.limit());
+    result.gas = Gas::new_spent_with_reservoir(result.gas.limit(), result.gas.reservoir());
     result.output = Bytes::new();
 }
 

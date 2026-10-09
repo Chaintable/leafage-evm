@@ -27,6 +27,9 @@ use crate::db_impl::archive_encoding::{
     inverted_block_encoding, set_inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
+use crate::db_impl::rocksdb_impl::sst::{
+    ingest_external_file_options, sst_writer_options, SstSink,
+};
 use crate::metrics::STORAGE_METRICS;
 use alloy::primitives::B64;
 use alloy_rlp::{Decodable, Encodable};
@@ -37,8 +40,8 @@ use leafage_evm_types::{
 use moka::sync::Cache as MokaCache;
 use rocksdb::{
     BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
-    CompactOptions, IngestExternalFileOptions, IteratorMode, Options, ReadOptions, SliceTransform,
-    SstFileWriter, WriteBatch, WriteOptions, DB,
+    CompactOptions, Direction, IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter,
+    WriteBatch, WriteOptions, DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
@@ -635,71 +638,6 @@ fn archive_cf_descriptors(
     ]
 }
 
-/// Streams **strictly-ascending** `(key, value)` pairs into a series of rolled
-/// SST files for later `ingest_external_file`. Keys must be globally ascending
-/// across all `put` calls; the file is rolled whenever it exceeds `roll_bytes`
-/// (any split of an ascending stream yields non-overlapping files, which ingest
-/// can place across levels instead of piling into L0).
-struct SstSink<'a> {
-    opts: &'a Options,
-    tmp_dir: std::path::PathBuf,
-    name: String,
-    roll_bytes: u64,
-    seq: u64,
-    writer: Option<SstFileWriter<'a>>,
-    cur_path: std::path::PathBuf,
-    has_rows: bool,
-    paths: Vec<std::path::PathBuf>,
-}
-
-impl<'a> SstSink<'a> {
-    fn new(opts: &'a Options, tmp_dir: std::path::PathBuf, name: String, roll_bytes: u64) -> Self {
-        Self {
-            opts,
-            tmp_dir,
-            name,
-            roll_bytes,
-            seq: 0,
-            writer: None,
-            cur_path: std::path::PathBuf::new(),
-            has_rows: false,
-            paths: Vec::new(),
-        }
-    }
-
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        if self.writer.is_none() {
-            let p = self
-                .tmp_dir
-                .join(format!("{}_{:06}.sst", self.name, self.seq));
-            self.seq += 1;
-            let w = SstFileWriter::create(self.opts);
-            w.open(&p)?;
-            self.writer = Some(w);
-            self.cur_path = p;
-            self.has_rows = false;
-        }
-        let w = self.writer.as_mut().unwrap();
-        w.put(key, value)?;
-        self.has_rows = true;
-        if w.file_size() >= self.roll_bytes {
-            self.writer.take().unwrap().finish()?;
-            self.paths.push(std::mem::take(&mut self.cur_path));
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<Vec<std::path::PathBuf>, Error> {
-        if let Some(mut w) = self.writer.take() {
-            if self.has_rows {
-                w.finish()?;
-                self.paths.push(self.cur_path);
-            }
-        }
-        Ok(self.paths)
-    }
-}
-
 /// Split the leading-byte keyspace `0..=255` into `jobs` contiguous shards,
 /// each `(lo, hi)` covering first-byte `[lo, hi)` (`hi = None` = to the end).
 /// Account/storage keys begin with a uniformly-distributed 32-byte hash, so
@@ -840,8 +778,7 @@ fn reencode_versioned_cf(
                         if since_report >= 50_000 {
                             processed.fetch_add(since_report, Ordering::Relaxed);
                             since_report = 0;
-                            let key_w =
-                                u32::from_be_bytes(key[0..4].try_into().unwrap()) as u64;
+                            let key_w = u32::from_be_bytes(key[0..4].try_into().unwrap()) as u64;
                             let pos = key_w.saturating_sub(lo_w) as f64 / range_w as f64;
                             progress_bps[i]
                                 .store((pos.clamp(0.0, 1.0) * 10_000.0) as u32, Ordering::Relaxed);
@@ -890,7 +827,7 @@ fn reencode_versioned_cf(
 
     if !paths.is_empty() {
         let cf = dst.cf_handle(name).unwrap();
-        dst.ingest_external_file_cf_opts(cf, &DataBaseRef::ingest_external_file_options(), paths)
+        dst.ingest_external_file_cf_opts(cf, &ingest_external_file_options(), paths)
             .map_err(Error::RocksDB)?;
     }
     Ok((
@@ -1242,7 +1179,7 @@ impl DataBaseRef {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         std::fs::create_dir_all(&tmp_dir)
             .map_err(|e| Error::UnSupported(format!("create SST staging dir: {e}")))?;
-        let sst_opts = Self::sst_writer_options();
+        let sst_opts = sst_writer_options();
         const ROLL_BYTES: u64 = 512 * 1024 * 1024;
 
         // 1) Non-versioned CFs: copy verbatim (src is already key-ascending).
@@ -1268,7 +1205,7 @@ impl DataBaseRef {
             let paths = sink.finish()?;
             if !paths.is_empty() {
                 let cf = dst.cf_handle(col.to_str()).unwrap();
-                dst.ingest_external_file_cf_opts(cf, &Self::ingest_external_file_options(), paths)
+                dst.ingest_external_file_cf_opts(cf, &ingest_external_file_options(), paths)
                     .map_err(Error::RocksDB)?;
             }
             info!(target: "migrate", "reencode: copied {} {} records", n, col);
@@ -1471,32 +1408,6 @@ impl DataBaseRef {
         }
     }
 
-    /// SstFileWriter Options used for archive bulk-load. Compression matches the
-    /// L0/L1 setting of the large CFs (LZ4) so RocksDB does not transcode the
-    /// ingested file when cascading. The default BytewiseComparator matches the
-    /// CF comparator. Block-table layout is left default; bloom/index are
-    /// regenerated by the final manual `compact()` when files cascade out of L0.
-    fn sst_writer_options() -> Options {
-        let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts
-    }
-
-    /// Default IngestExternalFileOptions for archive bulk-load. `move_files=true`
-    /// renames the file into RocksDB's data directory instead of copying — the
-    /// caller is responsible for ensuring the source path is on the same
-    /// filesystem as the database. Other options are left at RocksDB defaults
-    /// (`snapshot_consistency=true`, `allow_global_seqno=true`,
-    /// `allow_blocking_flush=true`, `ingest_behind=false`); these are correct
-    /// for the bulk-load workload, where we do not write to the target CFs'
-    /// memtables and depend on global seqno assignment for correct read-merge
-    /// of any duplicate keys produced by crash-resume re-ingest.
-    fn ingest_external_file_options() -> IngestExternalFileOptions {
-        let mut opts = IngestExternalFileOptions::default();
-        opts.set_move_files(true);
-        opts
-    }
-
     /// Build an SST file at `path` containing the `AddressToAccount` writes.
     ///
     /// REQUIRES: `sorted_writes` is strictly increasing by key (per
@@ -1508,7 +1419,7 @@ impl DataBaseRef {
         path: P,
         sorted_writes: &[([u8; 64], Vec<u8>)],
     ) -> Result<(), Error> {
-        let opts = Self::sst_writer_options();
+        let opts = sst_writer_options();
         let mut writer = SstFileWriter::create(&opts);
         writer.open(path.as_ref())?;
         for (k, v) in sorted_writes {
@@ -1525,7 +1436,7 @@ impl DataBaseRef {
         path: P,
         sorted_writes: &[([u8; 96], [u8; 32])],
     ) -> Result<(), Error> {
-        let opts = Self::sst_writer_options();
+        let opts = sst_writer_options();
         let mut writer = SstFileWriter::create(&opts);
         writer.open(path.as_ref())?;
         for (k, v) in sorted_writes {
@@ -1545,7 +1456,7 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
             .unwrap();
-        let opts = Self::ingest_external_file_options();
+        let opts = ingest_external_file_options();
         self.db.ingest_external_file_cf_opts(cf, &opts, paths)?;
         Ok(())
     }
@@ -1556,7 +1467,7 @@ impl DataBaseRef {
             .db
             .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
             .unwrap();
-        let opts = Self::ingest_external_file_options();
+        let opts = ingest_external_file_options();
         self.db.ingest_external_file_cf_opts(cf, &opts, paths)?;
         Ok(())
     }
@@ -1745,10 +1656,58 @@ impl DataBaseRef {
     }
 }
 
-impl LatestStateDBIterator for DataBaseRef {
+/// Read options for the latest-state scans in [`LatestStateDBIterator`].
+///
+/// `total_order_seek` is what lets those scans seek past a key's older
+/// versions: the versioned CFs carry a fixed-prefix extractor, and without it
+/// a seek is only promised to find keys sharing the prefix it was built for.
+/// `readahead` is for the walking variants, which read every record on disk.
+fn latest_state_scan_read_options(readahead: bool) -> ReadOptions {
+    let mut read_options = ReadOptions::default();
+    read_options.set_verify_checksums(false);
+    read_options.set_total_order_seek(true);
+    if readahead {
+        read_options.set_readahead_size(16 * 1024 * 1024);
+    }
+    read_options
+}
+
+/// The smallest key that sorts after every key beginning with `prefix`, or
+/// `None` when `prefix` is all `0xff` and nothing sorts after it.
+fn key_after_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut key = prefix.to_vec();
+    while let Some(last) = key.pop() {
+        if last != u8::MAX {
+            key.push(last + 1);
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// How much of a key's version tail the latest-state scans read before they
+/// seek past the rest of it. `next()` inside an open block is far cheaper than
+/// a fresh seek — on an archive whose keys hold a single version, seeking after
+/// every record measured about 6x slower than plain forward iteration — so a
+/// short tail is cheaper read than skipped, and only a longer one earns a seek.
+const MAX_TAIL_WALK: usize = 8;
+
+/// Whether the latest-state scans may seek past a key's older versions instead
+/// of reading them. Only the inverted (newest-first) encoding puts the record
+/// they keep first; under legacy encoding the newest is the last one, which
+/// cannot be found without reading the tail. The version-level debug hook logs
+/// each record a scan sees, including the ones it discards, so it keeps the
+/// walk as well.
+fn skip_version_tails() -> bool {
+    inverted_block_encoding() && MIGRATE_DEBUG_ADDR_HASH.is_none()
+}
+
+/// The two latest-state scans, in the variant that reads every version
+/// ([`skip_version_tails`] explains when each is used).
+impl DataBaseRef {
     /// account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
-    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+    fn account_iter_walking(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
         // Records for the same address are consecutive. The newest version is
         // the FIRST record of the prefix under inverted (newest-first) encoding,
         // and the LAST record under legacy ascending encoding.
@@ -1759,7 +1718,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                latest_state_scan_read_options(true),
                 IteratorMode::Start,
             )
             .peekable();
@@ -1856,29 +1815,118 @@ impl LatestStateDBIterator for DataBaseRef {
         })
     }
 
-    /// code hash -> code
-    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Error>> {
-        self.db
-            .iterator_cf_opt(
-                self.db
-                    .cf_handle(StorageTypeColumn::HashToCode.to_str())
-                    .unwrap(),
-                rocksdb_read_options(),
-                IteratorMode::Start,
-            )
-            .map(|item| {
-                if item.is_err() {
-                    return Err(Error::RocksDB(item.unwrap_err()));
+    /// The first record of every distinct `PREFIX_LEN`-byte key prefix in
+    /// `column`, with each prefix's version tail skipped. Under inverted
+    /// (newest-first) encoding that first record is the newest version, which
+    /// is the one the latest-state scans keep; [`skip_version_tails`] is what
+    /// decides that they may use this.
+    ///
+    /// Skipping a tail walks it and falls back to a seek, so that a prefix with
+    /// a single version stays sequential ([`MAX_TAIL_WALK`] has the numbers)
+    /// while a deep history still costs one seek instead of its whole length.
+    fn tip_of_each_prefix<const PREFIX_LEN: usize>(
+        &self,
+        column: StorageTypeColumn,
+    ) -> impl Iterator<Item = Result<([u8; PREFIX_LEN], Box<[u8]>), Error>> {
+        // `db` is `&'static`, so the returned iterator borrows nothing of `self`.
+        let db = self.db;
+        let mut iter = db.iterator_cf_opt(
+            db.cf_handle(column.to_str()).unwrap(),
+            latest_state_scan_read_options(false),
+            IteratorMode::Start,
+        );
+        // The first record of the next prefix, already read while walking the
+        // previous prefix's tail.
+        let mut pending: Option<Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> = None;
+        // Set once the scan has passed the last prefix it can seek beyond.
+        let mut done = false;
+
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            let (key, value) = match pending.take().or_else(|| iter.next())? {
+                Ok(item) => item,
+                Err(err) => return Some(Err(Error::RocksDB(err))),
+            };
+            let prefix: [u8; PREFIX_LEN] = key[..PREFIX_LEN].try_into().unwrap();
+
+            let mut walked = 0usize;
+            loop {
+                match iter.next() {
+                    None => {
+                        done = true;
+                        break;
+                    }
+                    Some(Err(err)) => {
+                        // Surfaced on the next call, after this record.
+                        pending = Some(Err(err));
+                        break;
+                    }
+                    Some(Ok((next_key, next_value))) => {
+                        if next_key[..PREFIX_LEN] != prefix[..] {
+                            pending = Some(Ok((next_key, next_value)));
+                            break;
+                        }
+                        walked += 1;
+                        if walked >= MAX_TAIL_WALK {
+                            match key_after_prefix(&prefix) {
+                                Some(next_prefix) => iter
+                                    .set_mode(IteratorMode::From(&next_prefix, Direction::Forward)),
+                                // Nothing sorts after an all-0xff prefix:
+                                // everything left in the CF is an older version
+                                // of it.
+                                None => done = true,
+                            }
+                            break;
+                        }
+                    }
                 }
-                let (key, value) = item.unwrap();
-                let code_hash = H256::from_slice(key.as_ref());
-                Ok((code_hash, Bytes::from(value)))
+            }
+
+            Some(Ok((prefix, value)))
+        })
+    }
+
+    /// `account_iter` over an inverted (newest-first) archive: the first record
+    /// of an address is the one the snapshot keeps, so the rest of that
+    /// address's versions are skipped rather than decoded. On an archive with
+    /// deep histories that is most of the column family.
+    fn account_iter_skipping_tails(
+        &self,
+    ) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+        self.tip_of_each_prefix::<32>(StorageTypeColumn::AddressToAccount)
+            .filter_map(|record| {
+                let (address_bytes, value) = match record {
+                    Ok(record) => record,
+                    Err(err) => return Some(Err(err)),
+                };
+                let mut raw_account_slice = value.as_ref();
+                // Newest version is a deletion -> account absent at tip.
+                if raw_account_slice.is_empty() {
+                    return None;
+                }
+                let address = H256::from_slice(&address_bytes);
+                let raw_account = SlimAccount::decode(&mut raw_account_slice).unwrap();
+                Some(Ok((
+                    address,
+                    NewAccount {
+                        address,
+                        balance: raw_account.balance,
+                        nonce: raw_account.nonce,
+                        code_hash: if raw_account.code_hash.is_zero() {
+                            KECCAK256_EMPTY.0.into()
+                        } else {
+                            raw_account.code_hash
+                        },
+                    },
+                )))
             })
     }
 
     /// account address | storage index -> storage value
     /// Returns the latest state for each (address, index) pair (the record with highest block_num)
-    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
+    fn storage_iter_walking(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
         // Records for the same (address, index) are consecutive. The newest is
         // the FIRST record of the prefix under inverted encoding, the LAST under
         // legacy ascending encoding.
@@ -1889,7 +1937,7 @@ impl LatestStateDBIterator for DataBaseRef {
                 self.db
                     .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
                     .unwrap(),
-                rocksdb_read_options(),
+                latest_state_scan_read_options(true),
                 IteratorMode::Start,
             )
             .peekable();
@@ -1970,6 +2018,78 @@ impl LatestStateDBIterator for DataBaseRef {
                 return Some(Ok((address, storage_key, storage_value)));
             }
         })
+    }
+
+    /// `storage_iter` over an inverted (newest-first) archive; the counterpart
+    /// of [`account_iter_skipping_tails`](Self::account_iter_skipping_tails),
+    /// keyed by address ‖ index instead of address alone.
+    fn storage_iter_skipping_tails(
+        &self,
+    ) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
+        // The prefix here is address || index.
+        self.tip_of_each_prefix::<64>(StorageTypeColumn::AddressToStorage)
+            .filter_map(|record| {
+                let (prefix, value) = match record {
+                    Ok(record) => record,
+                    Err(err) => return Some(Err(err)),
+                };
+                let storage_value = U256::from_be_slice(value.as_ref());
+                // Newest version is zero -> slot empty at tip.
+                if storage_value == U256::ZERO {
+                    return None;
+                }
+                Some(Ok((
+                    H256::from_slice(&prefix[..32]),
+                    H256::from_slice(&prefix[32..64]),
+                    storage_value,
+                )))
+            })
+    }
+}
+
+impl LatestStateDBIterator for DataBaseRef {
+    /// account address -> raw account
+    /// Returns the latest state for each address (the record with highest block_num)
+    fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+        let iter: Box<dyn Iterator<Item = Result<(H256, NewAccount), Error>> + '_> =
+            if skip_version_tails() {
+                Box::new(self.account_iter_skipping_tails())
+            } else {
+                Box::new(self.account_iter_walking())
+            };
+        iter
+    }
+
+    /// code hash -> code
+    fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Error>> {
+        self.db
+            .iterator_cf_opt(
+                self.db
+                    .cf_handle(StorageTypeColumn::HashToCode.to_str())
+                    .unwrap(),
+                rocksdb_read_options(),
+                IteratorMode::Start,
+            )
+            .map(|item| {
+                if item.is_err() {
+                    return Err(Error::RocksDB(item.unwrap_err()));
+                }
+                let (key, value) = item.unwrap();
+                let code_hash = H256::from_slice(key.as_ref());
+                Ok((code_hash, Bytes::from(value)))
+            })
+    }
+
+    /// account address | storage index -> storage value
+    /// Returns the latest state for each (address, index) pair (the record with highest block_num)
+    fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
+        let iter: Box<dyn Iterator<Item = Result<(H256, H256, U256), Error>> + '_> =
+            if skip_version_tails() {
+                Box::new(self.storage_iter_skipping_tails())
+            } else {
+                Box::new(self.storage_iter_walking())
+            };
+        iter
     }
 }
 
@@ -3168,6 +3288,143 @@ mod inverted_encoding_tests {
     #[test]
     fn test_versioned_read_greatest_leq_height_legacy() {
         run_versioned_roundtrip(false);
+    }
+
+    /// Tip state of a small archive, scanned with the latest-state iterators.
+    /// Under inverted encoding those seek from an address's newest record
+    /// straight to the next address, so this covers what a seek could get
+    /// wrong: dropping the address it lands on, stopping at an address nothing
+    /// sorts after (`0xff..`), or surfacing a record that is no longer the tip.
+    fn scan_tip_state(inverted: bool) -> (Vec<(H256, U256)>, Vec<(H256, H256, U256)>) {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(inverted);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-scan-{}-{}",
+            inverted,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scanned = {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let write = |n: u64, diff: BlockStorageDiff| {
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            };
+
+            let (first, next_to_first, gone, last) = scan_addresses();
+            let (slot, next_slot) = scan_slots();
+
+            // Every address gets a version tail, so a scan that keeps reading
+            // instead of seeking still has to pick the newest record.
+            write(1, slot_diff(first, slot, 10, 1));
+            write(2, slot_diff(next_to_first, slot, 20, 2));
+            write(3, slot_diff(gone, slot, 30, 4));
+            write(4, slot_diff(last, slot, 30, 3));
+            write(5, slot_diff(first, slot, 11, 5));
+            write(6, slot_diff(first, next_slot, 11, 7));
+            write(7, slot_diff(next_to_first, slot, 12, 9));
+            write(8, slot_diff(last, slot, 33, 3));
+            // Gone at the tip: the account's newest record is a deletion and
+            // the slot's newest value is zero. Neither may be scanned out.
+            write(
+                9,
+                BlockStorageDiff {
+                    deleted_accounts: vec![gone],
+                    storage_diffs: vec![AccountStorageDiff {
+                        address: gone,
+                        diffs: vec![IndexValuePair {
+                            index: slot,
+                            value: U256::ZERO,
+                        }],
+                    }],
+                    ..Default::default()
+                },
+            );
+            write(10, BlockStorageDiff::default());
+            // One tail longer than MAX_TAIL_WALK, so the scan has to fall back
+            // to a seek to get past it; the short tails above stay on the walk.
+            for n in 11..=deep_tail_tip() {
+                write(n, slot_diff(first, slot, 100 + n, 200 + n));
+            }
+
+            let accounts = db
+                .account_iter()
+                .map(|r| {
+                    let (address, account) = r.unwrap();
+                    (address, account.balance)
+                })
+                .collect();
+            let storages = db.storage_iter().map(|r| r.unwrap()).collect();
+            (accounts, storages)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+        scanned
+    }
+
+    /// Ascending by key. `first` and `next_to_first` differ only in their last
+    /// byte, so a seek that overshoots by one key drops `next_to_first`; `last`
+    /// is the address nothing sorts after.
+    fn scan_addresses() -> (H256, H256, H256, H256) {
+        (
+            H256::repeat_byte(0x11),
+            adjacent(H256::repeat_byte(0x11)),
+            H256::repeat_byte(0x22),
+            H256::repeat_byte(0xff),
+        )
+    }
+
+    /// The very next key after `key`, i.e. its last byte incremented.
+    fn adjacent(key: H256) -> H256 {
+        let mut bytes: [u8; 32] = key.into();
+        bytes[31] += 1;
+        H256::from(bytes)
+    }
+
+    /// The last block of the deep version tail `scan_tip_state` writes for
+    /// `first`: long enough that the scans have to seek past it rather than
+    /// walk it out.
+    fn deep_tail_tip() -> u64 {
+        10 + 2 * super::MAX_TAIL_WALK as u64
+    }
+
+    /// Two slots of one address, likewise adjacent.
+    fn scan_slots() -> (H256, H256) {
+        let slot = H256::repeat_byte(0x01);
+        (slot, adjacent(slot))
+    }
+
+    #[test]
+    fn test_latest_state_scans_return_tip_state_under_both_encodings() {
+        let (first, next_to_first, gone, last) = scan_addresses();
+        let (slot, next_slot) = scan_slots();
+        let want_accounts = vec![
+            (first, U256::from(100 + deep_tail_tip())),
+            (next_to_first, U256::from(12)),
+            (last, U256::from(33)),
+        ];
+        let want_storages = vec![
+            (first, slot, U256::from(200 + deep_tail_tip())),
+            (first, next_slot, U256::from(7)),
+            (next_to_first, slot, U256::from(9)),
+            (last, slot, U256::from(3)),
+        ];
+
+        for inverted in [true, false] {
+            let (accounts, storages) = scan_tip_state(inverted);
+            assert_eq!(accounts, want_accounts, "accounts (inverted={inverted})");
+            assert_eq!(storages, want_storages, "storages (inverted={inverted})");
+            assert!(
+                !accounts.iter().any(|(address, _)| *address == gone),
+                "deleted account surfaced (inverted={inverted})"
+            );
+        }
     }
 
     /// Legacy DBs built before #104 carry orphaned dual-write "latest" pointers
