@@ -2,8 +2,8 @@ use super::abi::IArbAggregator;
 use super::state::ArbStorage;
 use super::util::{dispatch, empty_revert, finish_call};
 use super::{ArbPrecompileInput, ArbitrumContext, BATCH_POSTER_ADDRESS};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use alloy::primitives::U256;
-use revm::precompile::{PrecompileError, PrecompileResult};
 use revm::Database;
 
 pub(super) struct ArbAggregator;

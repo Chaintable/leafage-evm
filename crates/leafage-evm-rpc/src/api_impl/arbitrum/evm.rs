@@ -161,7 +161,7 @@ mod tests {
         );
         let result = evm.transact(tx).expect("transact").result;
         assert!(result.is_success(), "expected success, got {result:?}");
-        result.gas_used()
+        result.tx_gas_used()
     }
 
     /// Nitro applies the EIP-7623 floor only when the ArbOS feature flag is

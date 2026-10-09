@@ -205,12 +205,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 0,
             bytecode_address: addr,
-            known_bytecode: None,
+            known_bytecode: Default::default(),
             target_address: addr,
             caller: Address::ZERO,
             value: CallValue::default(),
             scheme: CallScheme::Call,
             is_static: false,
+            reservoir: 0,
+            charged_new_account_state_gas: false,
         }))
     }
 

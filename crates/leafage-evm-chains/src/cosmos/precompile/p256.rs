@@ -6,15 +6,21 @@ use p256::elliptic_curve::sec1::FromEncodedPoint;
 use p256::elliptic_curve::PrimeField;
 use p256::{AffinePoint, EncodedPoint, FieldBytes, FieldElement, PublicKey, Scalar};
 use revm::precompile::{
-    Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+    eth_precompile_fn, EthPrecompileOutput, EthPrecompileResult, Precompile, PrecompileHalt,
+    PrecompileId,
 };
 use revm::primitives::{Bytes, U256};
 use std::borrow::Cow;
 
+eth_precompile_fn!(
+    secp256r1_signature_verification_run_precompile,
+    secp256r1_signature_verification_run
+);
+
 pub const P256_VERIFY: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("COSMOS_P256_VERIFY")),
     address!("0x0000000000000000000000000000000000000100"),
-    secp256r1_signature_verification_run,
+    secp256r1_signature_verification_run_precompile,
 );
 
 const VERIFY_GAS: u64 = 3_450;
@@ -31,12 +37,12 @@ const INPUT_LENGTH: usize = 160;
 ///
 /// Output data: 32 bytes of result data and error
 ///   - If the signature verification process succeeds, it returns 1 in 32 bytes format
-fn secp256r1_signature_verification_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn secp256r1_signature_verification_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     if gas_limit < VERIFY_GAS {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
     if input.len() != INPUT_LENGTH {
-        return Err(PrecompileError::other("invalid input"));
+        return Err(PrecompileHalt::other("invalid input"));
     }
     let hash = &input[..32];
     let r = &input[32..64];
@@ -44,16 +50,16 @@ fn secp256r1_signature_verification_run(input: &[u8], gas_limit: u64) -> Precomp
     let x = &input[96..128];
     let y = &input[128..160];
     let Some(r) = Scalar::from_repr_vartime(FieldBytes::clone_from_slice(r)) else {
-        return Err(PrecompileError::other("invalid r"));
+        return Err(PrecompileHalt::other("invalid r"));
     };
     let Some(s) = Scalar::from_repr_vartime(FieldBytes::clone_from_slice(s)) else {
-        return Err(PrecompileError::other("invalid s"));
+        return Err(PrecompileHalt::other("invalid s"));
     };
     let Ok(x) = FieldElement::from_slice(x) else {
-        return Err(PrecompileError::other("invalid x"));
+        return Err(PrecompileHalt::other("invalid x"));
     };
     let Ok(y) = FieldElement::from_slice(y) else {
-        return Err(PrecompileError::other("invalid y"));
+        return Err(PrecompileHalt::other("invalid y"));
     };
     secp256r1_verify(hash, r, s, x, y)
 }
@@ -64,21 +70,21 @@ fn secp256r1_verify(
     s: Scalar,
     x: FieldElement,
     y: FieldElement,
-) -> PrecompileResult {
+) -> EthPrecompileResult {
     // parse publicKey
     let encoded_point = EncodedPoint::from_affine_coordinates(&x.to_repr(), &y.to_repr(), false);
     let Some(affine_point): Option<_> = AffinePoint::from_encoded_point(&encoded_point).into()
     else {
-        return Err(PrecompileError::other("invalid x or y"));
+        return Err(PrecompileHalt::other("invalid x or y"));
     };
     let Ok(public_key) = PublicKey::from_affine(affine_point) else {
-        return Err(PrecompileError::other("invalid pubkey"));
+        return Err(PrecompileHalt::other("invalid pubkey"));
     };
     let verifying_key = VerifyingKey::from(public_key);
 
     // generate signature
     let Ok(signature) = Signature::from_scalars(r, s) else {
-        return Err(PrecompileError::other("invalid signature"));
+        return Err(PrecompileHalt::other("invalid signature"));
     };
 
     // verify signature
@@ -89,7 +95,7 @@ fn secp256r1_verify(
         }
         Err(_) => Default::default(),
     };
-    Ok(PrecompileOutput::new(VERIFY_GAS, Bytes::from(padding)))
+    Ok(EthPrecompileOutput::new(VERIFY_GAS, Bytes::from(padding)))
 }
 
 #[cfg(test)]

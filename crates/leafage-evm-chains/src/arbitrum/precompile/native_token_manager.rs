@@ -6,7 +6,7 @@ use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log, U256};
 use alloy::sol_types::SolValue;
 use revm::context::{ContextTr, JournalTr};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use revm::Database;
 
 pub(super) struct ArbNativeTokenManager;
@@ -124,7 +124,7 @@ mod tests {
     use revm::context::JournalTr;
     use revm::database::in_memory_db::CacheDB;
     use revm::database::EmptyDB;
-    use revm::precompile::PrecompileOutput;
+    use crate::arbitrum::precompile::result::PrecompileOutput;
     use revm::state::AccountInfo;
     use revm::{Context, MainContext};
 

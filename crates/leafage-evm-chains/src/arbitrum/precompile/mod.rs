@@ -17,6 +17,7 @@ mod native_token_manager;
 mod owner;
 mod owner_public;
 mod registry;
+mod result;
 mod retryable_tx;
 mod state;
 mod statistics;
@@ -48,8 +49,9 @@ use once_cell::race::OnceBox;
 use revm::context::{ContextTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, CallScheme, InterpreterResult};
-use revm::precompile::{PrecompileError, PrecompileResult, Precompiles, secp256r1};
-use revm::primitives::Address as RevmAddress;
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
+use revm::precompile::{Precompiles, secp256r1};
+use revm::primitives::{Address as RevmAddress, AddressSet};
 use revm::{Context, Journal};
 use revm::{Database, DatabaseRef};
 use std::boxed::Box;
@@ -116,6 +118,9 @@ pub type ArbitrumContext<DB> = Context<
 pub struct ArbitrumPrecompiles {
     eth: EthPrecompiles,
     env: ArbitrumPrecompileEnv,
+    /// Standard + active Arbitrum precompile addresses. Both depend only on
+    /// `env.current_arbos_version`, which is fixed at construction.
+    warm_addresses: AddressSet,
 }
 
 impl ArbitrumPrecompiles {
@@ -133,7 +138,29 @@ impl ArbitrumPrecompiles {
         }
         let mut eth = EthPrecompiles::new(spec.into());
         eth.precompiles = Self::eth_precompiles(env.current_arbos_version);
-        Self { eth, env }
+        let warm_addresses = if env.execution_mode == crate::arbitrum::ArbitrumExecutionMode::Classic {
+            let mut addresses = eth.precompiles.addresses_set().clone();
+            addresses.extend(classic::addresses());
+            addresses
+        } else {
+            Self::build_warm_addresses(eth.precompiles, env.current_arbos_version)
+        };
+        Self {
+            eth,
+            env,
+            warm_addresses,
+        }
+    }
+
+    fn build_warm_addresses(eth: &Precompiles, arbos_version: u64) -> AddressSet {
+        let mut addresses = eth.addresses_set().clone();
+        addresses.extend(
+            ArbitrumPrecompile::ALL
+                .into_iter()
+                .filter(|precompile| precompile.is_active(arbos_version))
+                .map(ArbitrumPrecompile::address),
+        );
+        addresses
     }
 
     fn eth_precompiles(arbos_version: u64) -> &'static Precompiles {
@@ -182,7 +209,7 @@ impl ArbitrumPrecompiles {
             0
         };
         if context_gas > inputs.gas_limit {
-            return Err(revm::precompile::PrecompileError::OutOfGas);
+            return Err(PrecompileError::OutOfGas);
         }
         let precompile_gas_limit = inputs.gas_limit - context_gas;
 
@@ -259,7 +286,7 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
 
         if matches!(precompile, ArbitrumPrecompile::ArbDebug) && !self.env.allow_debug_precompiles {
             let result = empty_revert(inputs.gas_limit, inputs.gas_limit);
-            return Ok(Some(to_interpreter_result(inputs.gas_limit, result)?));
+            return Ok(Some(to_interpreter_result(inputs.gas_limit, inputs.reservoir, result)?));
         }
 
         let data = match &inputs.input {
@@ -337,24 +364,11 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
             )
         };
 
-        Ok(Some(to_interpreter_result(inputs.gas_limit, result)?))
+        Ok(Some(to_interpreter_result(inputs.gas_limit, inputs.reservoir, result)?))
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = RevmAddress>> {
-        let mut addresses: Vec<_> =
-            PrecompileProvider::<ArbitrumContext<DB>>::warm_addresses(&self.eth).collect();
-        if self.is_classic() {
-            addresses.extend(classic::addresses());
-            return Box::new(addresses.into_iter());
-        }
-        let arbos_version = self.env.current_arbos_version;
-        addresses.extend(
-            ArbitrumPrecompile::ALL
-                .into_iter()
-                .filter(move |precompile| precompile.is_active(arbos_version))
-                .map(ArbitrumPrecompile::address),
-        );
-        Box::new(addresses.into_iter())
+    fn warm_addresses(&self) -> &AddressSet {
+        &self.warm_addresses
     }
 
     fn contains(&self, address: &RevmAddress) -> bool {
@@ -390,6 +404,8 @@ mod tests {
     use revm::handler::PrecompileProvider;
     use revm::interpreter::{CallValue, InstructionResult};
     use revm::precompile::u64_to_address;
+    use revm::bytecode::Bytecode;
+    use revm::primitives::KECCAK_EMPTY;
     use revm::{Context, MainContext};
 
     fn context() -> ArbitrumContext<CacheDB<EmptyDB>> {
@@ -447,7 +463,7 @@ mod tests {
             );
             let contains =
                 PrecompileProvider::<ArbitrumContext<EmptyDB>>::warm_addresses(&precompiles)
-                    .any(|warm| warm == address);
+                    .contains(&address);
             contains
         };
 
@@ -491,7 +507,7 @@ mod tests {
             );
             let contains =
                 PrecompileProvider::<ArbitrumContext<EmptyDB>>::warm_addresses(&precompiles)
-                    .any(|warm| warm == address);
+                    .contains(&address);
             contains
         };
 
@@ -542,12 +558,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 100_000,
             bytecode_address: kzg,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: kzg,
             caller: Address::from([1; 20]),
             value: CallValue::default(),
             scheme: CallScheme::Call,
             is_static: false,
+            charged_new_account_state_gas: false,
         };
 
         let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
@@ -595,12 +613,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 100_000,
             bytecode_address: ARB_GAS_INFO_ADDRESS,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: ARB_GAS_INFO_ADDRESS,
             caller: Address::from([1; 20]),
             value: CallValue::default(),
             scheme: CallScheme::Call,
             is_static: false,
+            charged_new_account_state_gas: false,
         };
 
         let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
@@ -637,12 +657,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 100_000,
             bytecode_address: ARB_SYS_ADDRESS,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: ARB_SYS_ADDRESS,
             caller: Address::from([1; 20]),
             value: CallValue::default(),
             scheme: CallScheme::Call,
             is_static: false,
+            charged_new_account_state_gas: false,
         };
 
         let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
@@ -654,7 +676,7 @@ mod tests {
         .expect("ArbSys should be handled");
 
         assert_eq!(result.result, InstructionResult::Return);
-        assert_eq!(result.gas.spent(), STORAGE_READ_GAS + copy_gas(32));
+        assert_eq!(result.gas.total_gas_spent(), STORAGE_READ_GAS + copy_gas(32));
     }
 
     #[test]
@@ -666,12 +688,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit,
             bytecode_address: address,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: address,
             caller,
             value: CallValue::default(),
             scheme: CallScheme::StaticCall,
             is_static: true,
+            charged_new_account_state_gas: false,
         };
         let mut precompiles = ArbitrumPrecompiles::new_with_env(
             ArbitrumHardfork::Prague,
@@ -747,12 +771,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 100_000,
             bytecode_address: ARB_OWNER_ADDRESS,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: ARB_OWNER_ADDRESS,
             caller,
             value: CallValue::default(),
             scheme: CallScheme::StaticCall,
             is_static: true,
+            charged_new_account_state_gas: false,
         };
         let mut precompiles = ArbitrumPrecompiles::new_with_env(
             ArbitrumHardfork::Prague,
@@ -825,12 +851,14 @@ mod tests {
                 return_memory_offset: 0..0,
                 gas_limit: 100_000,
                 bytecode_address: p256,
-                known_bytecode: None,
+                reservoir: 0,
+                known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
                 target_address: p256,
                 caller: Address::from([1; 20]),
                 value: CallValue::default(),
                 scheme: CallScheme::Call,
                 is_static: false,
+                charged_new_account_state_gas: false,
             };
 
             let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
@@ -842,7 +870,7 @@ mod tests {
             .expect("P256 should be active");
 
             assert_eq!(result.result, InstructionResult::Return);
-            result.gas.spent()
+            result.gas.total_gas_spent()
         };
 
         assert_eq!(p256_gas(30), 3_450);
@@ -865,12 +893,14 @@ mod tests {
             return_memory_offset: 0..0,
             gas_limit: 10_000_000,
             bytecode_address: ARB_OWNER_ADDRESS,
-            known_bytecode: None,
+            reservoir: 0,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::default()),
             target_address: ARB_OWNER_ADDRESS,
             caller: Address::from([1; 20]),
             value: CallValue::default(),
             scheme: CallScheme::Call,
             is_static: false,
+            charged_new_account_state_gas: false,
         };
 
         let result = PrecompileProvider::<ArbitrumContext<CacheDB<EmptyDB>>>::run(
@@ -883,7 +913,7 @@ mod tests {
 
         assert_eq!(result.result, InstructionResult::Revert);
         assert!(result.gas.remaining() < inputs.gas_limit);
-        assert!(result.gas.spent() < inputs.gas_limit);
+        assert!(result.gas.total_gas_spent() < inputs.gas_limit);
     }
 
     #[test]

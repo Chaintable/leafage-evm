@@ -1,7 +1,8 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
-    s3_get_block_info_and_diff_by_number_with_parent_state_root, StateDiffKey, DEFAULT_S3_READ_TIMEOUT_SECS,
+    s3_get_block_info_and_diff_by_number_with_parent_state_root, StateDiffKey,
+    DEFAULT_S3_READ_TIMEOUT_SECS,
 };
 use anyhow::Result;
 use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
@@ -673,8 +674,7 @@ fn spawn_rocksdb_ingest_dispatcher(
     worker_count: usize,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> =
-            tokio::task::JoinSet::new();
+        let mut tasks: tokio::task::JoinSet<Result<BatchCompletion>> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -703,8 +703,7 @@ fn spawn_rocksdb_ingest_dispatcher(
             }
         }
         while let Some(res) = tasks.join_next().await {
-            let comp = res
-                .map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
+            let comp = res.map_err(|e| anyhow::anyhow!("ingest worker join failed: {e}"))??;
             if completion_tx.send(comp).await.is_err() {
                 return Err(anyhow::anyhow!(
                     "watermark advancer dropped completion channel"
@@ -979,10 +978,8 @@ impl Command {
                 }
                 std::fs::create_dir_all(&tmp_dir)?;
 
-                let (block_tx, block_rx) =
-                    mpsc::channel::<EncodedBlockData>(self.max_tasks);
-                let (batch_tx, batch_rx) =
-                    mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
+                let (block_tx, block_rx) = mpsc::channel::<EncodedBlockData>(self.max_tasks);
+                let (batch_tx, batch_rx) = mpsc::channel::<BatchPayload>(INGEST_WORKER_COUNT + 1);
                 let (completion_tx, completion_rx) =
                     mpsc::channel::<BatchCompletion>(INGEST_WORKER_COUNT + 1);
 
@@ -1579,11 +1576,7 @@ impl Command {
             accounts.push((key, Some(value)));
         }
 
-        let storage_count: usize = block_diff
-            .storage_diffs
-            .iter()
-            .map(|d| d.diffs.len())
-            .sum();
+        let storage_count: usize = block_diff.storage_diffs.iter().map(|d| d.diffs.len()).sum();
         let mut storage = Vec::with_capacity(storage_count);
         for account_diff in block_diff.storage_diffs {
             for pair in account_diff.diffs {

@@ -327,19 +327,19 @@ impl<DB> ArbitrumApiImpl<DB> {
                     Output::Call(bytes) => bytes.clone(),
                     Output::Create(bytes, _) => bytes.clone(),
                 };
-                (true, Some(InstructionResult::Return), output, gas.spent())
+                (true, Some(InstructionResult::Return), output, gas.total_gas_spent())
             }
             ExecutionResult::Revert { output, gas, .. } => (
                 false,
                 Some(InstructionResult::Revert),
                 output.clone(),
-                gas.spent(),
+                gas.total_gas_spent(),
             ),
             ExecutionResult::Halt { gas, .. } => (
                 false,
                 Some(InstructionResult::FatalExternalError),
                 Bytes::new(),
-                gas.spent(),
+                gas.total_gas_spent(),
             ),
         };
 
@@ -505,7 +505,11 @@ where
 {
     type Tx = ArbitrumTxEnv;
 
-    fn consensus_tx_gas_limit_cap(&self, _spec: revm::primitives::hardfork::SpecId) -> u64 {
+    fn consensus_tx_gas_limit_cap(
+        &self,
+        _spec: revm::primitives::hardfork::SpecId,
+        _block_env: &BlockEnv,
+    ) -> u64 {
         u64::MAX
     }
 
@@ -663,7 +667,7 @@ mod tests {
                 "wrong initcode cost at ArbOS {version}",
             );
             assert_eq!(
-                cfg.gas_params.tx_eip7702_auth_refund(),
+                cfg.gas_params.tx_eip7702_auth_refund_regular(),
                 auth_refund,
                 "wrong EIP-7702 refund at ArbOS {version}",
             );
@@ -892,7 +896,7 @@ mod tests {
         )
         .expect("execute EIP-7702 transaction");
 
-        assert_eq!(result.gas_used(), 36_800);
+        assert_eq!(result.tx_gas_used(), 36_800);
     }
 
     #[test]
@@ -1131,7 +1135,7 @@ mod tests {
         let output = Bytes::from_static(&[1, 2, 3]);
         let result = ExecutionResult::Success {
             reason: SuccessReason::Return,
-            gas: ResultGas::new(10_000, 123, 0, 0, 0),
+            gas: ResultGas::default().with_total_gas_spent(123),
             logs: Vec::new(),
             output: Output::Call(output.clone()),
         };
@@ -1163,7 +1167,7 @@ mod tests {
         );
         let result = ExecutionResult::Success {
             reason: SuccessReason::Return,
-            gas: ResultGas::new(10_000, 123, 0, 0, 0),
+            gas: ResultGas::default().with_total_gas_spent(123),
             logs: Vec::new(),
             output: Output::Call(Bytes::from_static(&[1, 2, 3])),
         };
@@ -1199,7 +1203,7 @@ mod tests {
         );
         let result = ExecutionResult::Success {
             reason: SuccessReason::Return,
-            gas: ResultGas::new(10_000, 123, 0, 0, 0),
+            gas: ResultGas::default().with_total_gas_spent(123),
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         };

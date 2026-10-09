@@ -3,6 +3,7 @@ use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
+use leafage_evm_chains::arc::ArcChainConfig;
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::bsc::BscHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
@@ -13,6 +14,7 @@ use leafage_evm_chains::mantle::MantleHardfork;
 use leafage_evm_chains::monad::MonadHardfork;
 use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
+use leafage_evm_chains::rsk::RskHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
 use revm::context::result::{EVMError, InvalidTransaction};
@@ -74,7 +76,10 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
 
-    fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId) -> u64 {
+    /// Resolve the chain's per-transaction gas cap at the requested execution
+    /// block. Chains whose forks map to the same Ethereum spec can select their
+    /// own schedule from `block_env`.
+    fn consensus_tx_gas_limit_cap(&self, spec: EthSpecId, _block_env: &BlockEnv) -> u64 {
         if spec.is_enabled_in(EthSpecId::OSAKA) {
             eip7825::TX_GAS_LIMIT_CAP
         } else {
@@ -112,8 +117,7 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
         Ok(balance
             .checked_div(alloy::primitives::U256::from(tx.gas_price()))
             .unwrap_or_default()
-            .try_into()
-            .unwrap())
+            .saturating_to::<u64>())
     }
 
     fn estimate_l1_overhead<StateDB>(
@@ -173,6 +177,24 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static;
 
+    /// Execute an isolated gas-estimation probe. Chains may override execution
+    /// settings without changing ordinary calls or committed simulations.
+    fn transact_for_estimation<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        self.transact(block_env, state, tx)
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
@@ -192,6 +214,9 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 
 pub(crate) trait TxSetter {
     fn set_gas_limit(&mut self, gas_limit: u64);
+
+    /// Assign chain-specific replay context to one entry in a stateful RPC batch.
+    fn set_stateful_simulation_context(&mut self, _block_hash: H256, _index: u64) {}
 
     /// Mark this transaction as a gas-estimation run. Chains whose gas
     /// accounting depends on the run mode (Arbitrum's L1 poster padding)
@@ -226,6 +251,7 @@ impl<C> Clone for Api<C> {
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    Arc((CfgEnv<MainnetSpecId>, ArcChainConfig)),
     Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
     Base(CfgEnv<BaseHardfork>),
@@ -236,6 +262,7 @@ pub enum MultiChainCfgEnv {
     Monad(CfgEnv<MonadHardfork>),
     Moonbeam(CfgEnv<MoonbeamHardfork>),
     Polygon(CfgEnv<PolygonHardfork>),
+    Rsk(CfgEnv<RskHardfork>),
     Hemi(CfgEnv<HemiHardfork>),
     Tempo(CfgEnv<TempoHardfork>),
     Citrea(CfgEnv<CitreaHardfork>),
@@ -245,6 +272,7 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Arc(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Base(cfg) => cfg.chain_id,
@@ -255,6 +283,7 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Monad(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Moonbeam(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Polygon(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Rsk(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Hemi(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Tempo(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
@@ -277,12 +306,111 @@ mod tests {
     fn default_consensus_cap_keeps_mainnet_eip7825_boundary() {
         let handler = DefaultGasFeeHandler;
         assert_eq!(
-            handler.consensus_tx_gas_limit_cap(EthSpecId::PRAGUE),
+            handler.consensus_tx_gas_limit_cap(EthSpecId::PRAGUE, &BlockEnv::default()),
             u64::MAX
         );
         assert_eq!(
-            handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA),
+            handler.consensus_tx_gas_limit_cap(EthSpecId::OSAKA, &BlockEnv::default()),
             eip7825::TX_GAS_LIMIT_CAP
         );
+    }
+
+    #[test]
+    fn default_estimation_execution_keeps_mainnet_fee_charging() {
+        use crate::api_impl::{api_impl::NoneEvmCustomConfig, ApiImpl};
+        use alloy::primitives::{Address, Bytes, U256};
+        use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+
+        let api = ApiImpl::<(), MainnetSpecId, NoneEvmCustomConfig>::new(
+            (),
+            CfgEnv::new_with_spec(EthSpecId::OSAKA),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            100,
+            None,
+            None,
+            None,
+        );
+        let caller = Address::repeat_byte(0x11);
+        let target = Address::repeat_byte(0x22);
+        let mut state = InMemoryDB::default();
+        state.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                nonce: 7,
+                ..Default::default()
+            },
+        );
+        // Return the caller's balance during execution, after reserving fees.
+        let code = Bytecode::new_raw(Bytes::from_static(&[
+            0x33, 0x31, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+        ]));
+        state.insert_account_info(
+            target,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+        let block_env = BlockEnv {
+            basefee: 3,
+            ..Default::default()
+        };
+        let tx = TxEnv::builder()
+            .caller(caller)
+            .to(target)
+            .nonce(7)
+            .gas_limit(50_000)
+            .gas_price(5)
+            .value(U256::from(7))
+            .build()
+            .unwrap();
+        let normal = api.transact(&block_env, &state, tx.clone()).unwrap();
+        let estimated = api.transact_for_estimation(&block_env, &state, tx).unwrap();
+        assert_eq!(estimated, normal);
+        assert_eq!(
+            estimated.output().unwrap().as_ref(),
+            U256::from(749_993).to_be_bytes::<32>()
+        );
+        assert!(!api.evm_cfg.cfg.disable_fee_charge);
+    }
+
+    #[test]
+    fn default_gas_allowance_saturates_at_u64_max() {
+        use alloy::primitives::{Address, U256};
+        use revm::{database::InMemoryDB, state::AccountInfo};
+
+        let caller = Address::repeat_byte(0x11);
+        for (balance, gas_price, expected) in [
+            (U256::from(1_000_000), 5, 200_000),
+            // A tiny gas price with a large balance must not overflow u64.
+            (U256::MAX, 1, u64::MAX),
+        ] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance,
+                    ..Default::default()
+                },
+            );
+            let tx = TxEnv::builder()
+                .caller(caller)
+                .gas_price(gas_price)
+                .build()
+                .unwrap();
+            let allowance = DefaultGasFeeHandler
+                .gas_allowance(&CallRequest::default(), &tx, &db, &BlockEnv::default())
+                .unwrap();
+            assert_eq!(allowance, expected);
+        }
     }
 }

@@ -30,6 +30,7 @@ leafage-evm 是一个基于 [alloy](https://github.com/alloy-rs/alloy) 和 [revm
 | Oasys                                         | [Chaintable/oasys-validator](https://github.com/Chaintable/oasys-validator)                      |
 | Kava                                          | [Chaintable/kava](https://github.com/Chaintable/kava)                                            |
 | IoTeX                                         | [Chaintable/iotex-core-x](https://github.com/Chaintable/iotex-core-x)                            |
+| RSK (Rootstock)                               | [Chaintable/rskj](https://github.com/Chaintable/rskj)                                            |
 | Scrl                                          | [Chaintable/go-ethereum-scrl](https://github.com/Chaintable/go-ethereum-scrl)                    |
 | Bera                                          | [Chaintable/bera-geth](https://github.com/Chaintable/bera-geth)                                  |
 | Story                                         | [Chaintable/story-geth](https://github.com/Chaintable/story-geth)                                |
@@ -175,7 +176,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 
 `bundle_bucket_name` 为可选项；省略或留空时继续使用原有的逐块 S3 读取逻辑。
 
-Kafka + S3 JSON 可选字段 `state_diff_key` 支持 `"state-root"`、`"block-hash"`。读取按 block hash 上传的 Arb Classic 数据时，添加 `"state_diff_key": "block-hash"`。Archive 初始化使用 `archive-init --statediff-key block-hash`，并配置相同的源 bucket、S3 chain ID 和 version。该策略覆盖 genesis、实时消费、追赶、重启恢复与 parent hash 回溯；不增加 standalone 独立 flag，也不修改 Kafka 消息。
+`standalone` 和 `archive-init` 均支持可选 flag `--statediff-key`，取值为 `state-root` 或 `block-hash`。读取按 block hash 上传的 Arb Classic 数据时，使用 `standalone --statediff-key block-hash`；Archive 初始化使用 `archive-init --statediff-key block-hash`，并配置相同的源 bucket、S3 chain ID 和 version。该参数位于外层 CLI，不放在 Kafka + S3 JSON 配置中。策略覆盖 genesis、实时消费、追赶、重启恢复与 parent hash 回溯；Kafka 消息格式保持不变。
 
 不填写时保留历史行为：S3 chain ID `"999"` 默认使用 block hash，其他链使用 state root；显式配置可覆盖默认值，包括 chain 999。启动日志会输出最终策略。配置需与生产端一致，恢复同一批数据时保持一致；不能通过 42161 区分 Classic 和 Nitro。
 

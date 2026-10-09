@@ -1,7 +1,7 @@
 use super::abi::IArbosActs;
 use super::util::{dispatch, sol_error_revert};
 use super::{ArbPrecompileInput, ArbitrumContext};
-use revm::precompile::PrecompileResult;
+use crate::arbitrum::precompile::result::PrecompileResult;
 use revm::Database;
 
 pub(super) struct ArbosActs;

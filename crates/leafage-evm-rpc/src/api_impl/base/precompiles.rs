@@ -16,6 +16,7 @@ use leafage_evm_chains::base::{
     precompile::{has_b20_prefix, is_forwarded_registry},
 };
 use leafage_evm_types::{Address, Bytes, CfgEnv, OpSpecId};
+use revm::primitives::AddressSet;
 use op_revm::{precompiles::OpPrecompiles, L1BlockInfo, OpTransaction};
 use revm::context::TxEnv;
 use revm::context::{Block, BlockEnv, Cfg, ContextTr, LocalContextTr};
@@ -79,6 +80,7 @@ impl<DB: Database> PrecompileProvider<BaseCtx<DB>> for BasePrecompiles {
 
         let is_asset = is_asset_variant(&addr);
         let gas_limit = inputs.gas_limit;
+        let reservoir = inputs.reservoir;
         let gas_params = context.cfg().gas_params().clone();
         let chain_id = context.cfg().chain_id();
         let timestamp = context.block().timestamp();
@@ -102,10 +104,11 @@ impl<DB: Database> PrecompileProvider<BaseCtx<DB>> for BasePrecompiles {
         let spent = port.gas_spent();
         let refunded = port.gas_refunded();
 
-        let mut gas = Gas::new(gas_limit);
+        // Hand the EIP-8037 reservoir back untouched: B20 meters regular gas only.
+        let mut gas = Gas::new_with_regular_gas_and_reservoir(gas_limit, reservoir);
         let mut result = InterpreterResult {
             result: InstructionResult::Return,
-            gas: Gas::new(gas_limit),
+            gas: Gas::new_with_regular_gas_and_reservoir(gas_limit, reservoir),
             output: Bytes::new(),
         };
 
@@ -113,13 +116,13 @@ impl<DB: Database> PrecompileProvider<BaseCtx<DB>> for BasePrecompiles {
             Ok(B20Outcome::Return(output)) => {
                 // Both arms consume the metered gas: a revert keeps what it burned before
                 // reverting, exactly as an EVM call frame does.
-                let _ = gas.record_cost(spent);
+                let _ = gas.record_regular_cost(spent);
                 gas.record_refund(refunded);
                 result.gas = gas;
                 result.output = output;
             }
             Ok(B20Outcome::Revert(output)) => {
-                let _ = gas.record_cost(spent);
+                let _ = gas.record_regular_cost(spent);
                 result.gas = gas;
                 result.result = InstructionResult::Revert;
                 result.output = output;
@@ -146,7 +149,7 @@ impl<DB: Database> PrecompileProvider<BaseCtx<DB>> for BasePrecompiles {
         Ok(Some(result))
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
+    fn warm_addresses(&self) -> &AddressSet {
         PrecompileProvider::<BaseCtx<DB>>::warm_addresses(&self.inner)
     }
 

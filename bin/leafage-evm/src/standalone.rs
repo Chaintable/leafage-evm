@@ -4,11 +4,14 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
+use crate::utils::{
+    parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg, StateDiffKey,
+};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
@@ -42,6 +45,7 @@ pub struct Command {
         long,
         value_parser = [
             "mainnet",
+            "arc",
             "arbitrum",
             "op",
             "base",
@@ -54,6 +58,7 @@ pub struct Command {
             "moonbeam",
             "moonriver",
             "polygon",
+            "rsk",
             "hemi",
             "monad",
         ],
@@ -71,6 +76,8 @@ pub struct Command {
 
     /// The Ethereum Execution Specification ID for the chain.
     ///
+    /// Mainnet-derived evm-types use the legacy revm 36 `SpecId` numbering
+    /// (e.g. 17 = Cancun, 18 = Prague, 19 = Osaka, 20 = Amsterdam).
     /// if not specified, the default spec_id is u8::MAX
     #[arg(long, default_value = "255")]
     spec_id: u8,
@@ -237,6 +244,10 @@ pub struct Command {
     /// This config is used to set the kafka s3 config.
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
+
+    /// S3 StateDiff key. Omitted: block-hash for S3 chain 999, state-root otherwise.
+    #[arg(long = "statediff-key", value_enum)]
+    state_diff_key: Option<StateDiffKey>,
 
     #[command(flatten)]
     bundle_read: BundleReadArgs,
@@ -430,6 +441,9 @@ fn parse_chain_cfg(arg: &str) -> Result<u64> {
     if arg == "tempo" {
         return Ok(4217);
     }
+    if arg == "arc" {
+        return Ok(ARC_MAINNET_CHAIN_ID);
+    }
     if arg == "monad" {
         return Ok(leafage_evm_chains::monad::MONAD_MAINNET_CHAIN_ID);
     }
@@ -480,7 +494,63 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Re
         .map_err(|_| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
 }
 
+/// Map a `--spec-id` in the legacy revm 36 `SpecId` numbering to the current `SpecId`.
+///
+/// revm 39 dropped FRONTIER_THAWING / DAO_FORK / CONSTANTINOPLE / MUIR_GLACIER /
+/// ARROW_GLACIER / GRAY_GLACIER and shifted the remaining discriminants. Deployed
+/// manifests still carry the old numbers, so the CLI keeps that numbering; removed
+/// forks map to the retained fork whose execution rules revm already applied to them.
+///
+/// CONSTANTINOPLE (7) has no equivalent: revm 36 enabled SHL/SHR/SAR/EXTCODEHASH there
+/// but gated CREATE2 on PETERSBURG, so it is rejected (use 8) instead of silently
+/// changing behavior.
+fn legacy_mainnet_spec(spec_id: u8) -> Option<MainnetSpecId> {
+    use MainnetSpecId::*;
+    Some(match spec_id {
+        0 | 1 => FRONTIER,
+        2 | 3 => HOMESTEAD,
+        4 => TANGERINE,
+        5 => SPURIOUS_DRAGON,
+        6 => BYZANTIUM,
+        8 => PETERSBURG,
+        9 | 10 => ISTANBUL,
+        11 => BERLIN,
+        12..=14 => LONDON,
+        15 => MERGE,
+        16 => SHANGHAI,
+        17 => CANCUN,
+        18 => PRAGUE,
+        19 => OSAKA,
+        20 => AMSTERDAM,
+        _ => return None,
+    })
+}
+
+/// Resolve `--spec-id` (legacy mainnet numbering) for evm-types whose spec is derived from
+/// [`MainnetSpecId`]; `u8::MAX` (CLI default) → keep evm-type's built-in spec.
+fn resolve_mainnet_spec<T: From<MainnetSpecId>>(
+    spec_id: u8,
+    default: T,
+    type_label: &str,
+) -> Result<T> {
+    if spec_id == u8::MAX {
+        return Ok(default);
+    }
+    legacy_mainnet_spec(spec_id)
+        .map(T::from)
+        .ok_or_else(|| anyhow!("invalid --spec-id {} for {} evm-type", spec_id, type_label))
+}
+
 impl Command {
+    fn resolved_state_diff_key(&self) -> StateDiffKey {
+        StateDiffKey::resolve(
+            self.state_diff_key,
+            self.kafka_s3_config
+                .as_ref()
+                .map_or("", |config| config.s3_chain_id.as_str()),
+        )
+    }
+
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
         let evm_type = self.evm_type.clone();
@@ -488,7 +558,7 @@ impl Command {
         let gas_cap = self.rpc_gas_cap;
         match evm_type.as_str() {
             "mainnet" => {
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "mainnet")?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "mainnet")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -498,10 +568,32 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
             }
+            "arc" => {
+                let arc_config = ArcChainConfig::mainnet();
+                if chain_id != arc_config.chain_id() {
+                    bail!(
+                        "arc evm-type only supports --chain-cfg {}, got {}",
+                        arc_config.chain_id(),
+                        chain_id
+                    );
+                }
+                if self.spec_id != u8::MAX {
+                    bail!("arc evm-type does not accept --spec-id; its spec follows the Arc hardfork schedule");
+                }
+                let mut chain_cfg = CfgEnv::new_with_spec(arc_config.ethereum_spec());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = arc_config.chain_id();
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
+            }
             "arbitrum" => {
                 // RPC execution replaces this fallback with the target block's
                 // ArbOS-derived hardfork whenever Nitro header metadata is available.
-                let spec = resolve_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
+                let spec =
+                    resolve_mainnet_spec(self.spec_id, ArbitrumHardfork::Prague, "arbitrum")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -519,7 +611,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "op" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA);
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::KARST);
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -531,7 +623,7 @@ impl Command {
             "base" => {
                 // Base forked from the OP stack; execution is OP-equivalent
                 // (Beryl precompiles are layered on separately).
-                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::OSAKA));
+                let mut chain_cfg = CfgEnv::new_with_spec(BaseHardfork::from(OpSpecId::KARST));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -551,7 +643,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Bsc(chain_cfg))
             }
             "cosmos" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::AMSTERDAM.into());
+                let mut chain_cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -568,7 +660,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Cosmos((chain_cfg, custom_evm_cfg)))
             }
             "iotex" => {
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, "iotex")?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "iotex")?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -577,6 +669,18 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Iotex(chain_cfg))
+            }
+            "rsk" => {
+                // RSK's instruction set is Cancun minus the blob opcodes, see `RskHardfork`.
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::CANCUN, "rsk")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Rsk(chain_cfg))
             }
             "polygon" => {
                 let spec = resolve_spec(
@@ -613,7 +717,7 @@ impl Command {
             // token metadata, which leafage does not need. Both map to the same
             // MoonbeamHardfork executor.
             "moonbeam" | "moonriver" => {
-                let spec = resolve_spec(self.spec_id, MainnetSpecId::AMSTERDAM, &evm_type)?;
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, &evm_type)?;
                 let mut chain_cfg = CfgEnv::new_with_spec(spec.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
@@ -624,7 +728,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Moonbeam(chain_cfg))
             }
             "mantlev2" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::OSAKA.into());
+                let mut chain_cfg = CfgEnv::new_with_spec(OpSpecId::KARST.into());
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -647,7 +751,7 @@ impl Command {
             }
             "citrea" => {
                 let mut chain_cfg =
-                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::AMSTERDAM));
+                    CfgEnv::new_with_spec(CitreaHardfork::from(MainnetSpecId::OSAKA));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -657,7 +761,7 @@ impl Command {
                 Ok(MultiChainCfgEnv::Citrea(chain_cfg))
             }
             "hemi" => {
-                let mut chain_cfg = CfgEnv::new_with_spec(HemiHardfork::from(OpSpecId::OSAKA));
+                let mut chain_cfg = CfgEnv::new_with_spec(HemiHardfork::from(OpSpecId::KARST));
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -771,14 +875,13 @@ impl Command {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
 
+        let state_diff_key = self.resolved_state_diff_key();
         // set default offset dir if not set
         if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
             if kafka_s3_config.offset_dir.is_empty() {
                 kafka_s3_config.offset_dir =
                     format!("{}/offset", self.db_path.to_str().unwrap_or_default());
             }
-            let state_diff_key = kafka_s3_config.resolved_state_diff_key();
-            kafka_s3_config.state_diff_key = Some(state_diff_key);
             info!(target: "updater", %state_diff_key, "resolved S3 StateDiff addressing");
             info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
         } else {
@@ -838,6 +941,7 @@ impl Command {
             ),
             self.rpc_addr.clone(),
             self.kafka_s3_config.clone(),
+            state_diff_key,
             self.genesis_number,
         )
         .await?;
@@ -911,6 +1015,7 @@ impl Command {
             tree.clone(),
             self.rpc_addr.clone(),
             self.kafka_s3_config.clone(),
+            state_diff_key,
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,
@@ -956,5 +1061,181 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_command(args: &[&str]) -> Command {
+        let mut argv = vec![
+            "standalone-test",
+            "--db-path",
+            "/dev/null/leafage-arc-must-not-open",
+        ];
+        argv.extend_from_slice(args);
+        Command::try_parse_from(argv).expect("command should parse")
+    }
+
+    #[test]
+    fn arc_alias_and_numeric_chain_id_build_mainnet_config() {
+        for chain_cfg_arg in ["arc", "5042"] {
+            let command = parse_command(&["--evm-type", "arc", "--chain-cfg", chain_cfg_arg]);
+            let chain_cfg = command
+                .build_chain_cfg_env()
+                .expect("Arc mainnet config should build");
+
+            let MultiChainCfgEnv::Arc((cfg, arc_config)) = chain_cfg else {
+                panic!("expected Arc chain config");
+            };
+            assert_eq!(cfg.chain_id, ARC_MAINNET_CHAIN_ID);
+            assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+            assert!(cfg.disable_balance_check);
+            assert!(cfg.disable_eip3607);
+            assert!(cfg.disable_block_gas_limit);
+            assert!(cfg.disable_base_fee);
+            assert_eq!(arc_config, ArcChainConfig::mainnet());
+        }
+    }
+
+    #[test]
+    fn arc_rejects_non_mainnet_chain_cfg_and_spec_id() {
+        for args in [
+            &["--evm-type", "arc", "--chain-cfg", "5043"][..],
+            &["--evm-type", "arc"][..],
+            &["--evm-type", "arc", "--chain-cfg", "arc", "--spec-id", "20"][..],
+        ] {
+            let error = parse_command(args)
+                .build_chain_cfg_env()
+                .expect_err("Arc must reject parameters it cannot honor");
+            assert!(error.to_string().contains("arc"), "{args:?}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_startup_reaches_runtime_initialization() {
+        let mut command = parse_command(&[
+            "--evm-type",
+            "arc",
+            "--chain-cfg",
+            "arc",
+            "--prometheus-addr",
+            "not-a-socket-address",
+        ]);
+        let error = command
+            .run()
+            .await
+            .expect_err("invalid metrics address should stop startup");
+        assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
+    }
+
+    #[test]
+    fn legacy_spec_id_keeps_revm36_numbering() {
+        assert_eq!(legacy_mainnet_spec(1), Some(MainnetSpecId::FRONTIER));
+        assert_eq!(legacy_mainnet_spec(7), None);
+        assert_eq!(legacy_mainnet_spec(8), Some(MainnetSpecId::PETERSBURG));
+        assert_eq!(legacy_mainnet_spec(12), Some(MainnetSpecId::LONDON));
+        assert_eq!(legacy_mainnet_spec(14), Some(MainnetSpecId::LONDON));
+        assert_eq!(legacy_mainnet_spec(15), Some(MainnetSpecId::MERGE));
+        assert_eq!(legacy_mainnet_spec(17), Some(MainnetSpecId::CANCUN));
+        assert_eq!(legacy_mainnet_spec(18), Some(MainnetSpecId::PRAGUE));
+        assert_eq!(legacy_mainnet_spec(19), Some(MainnetSpecId::OSAKA));
+        assert_eq!(legacy_mainnet_spec(20), Some(MainnetSpecId::AMSTERDAM));
+        assert_eq!(legacy_mainnet_spec(21), None);
+        assert_eq!(
+            resolve_mainnet_spec(18, ArbitrumHardfork::Prague, "arbitrum").unwrap(),
+            ArbitrumHardfork::from(MainnetSpecId::PRAGUE)
+        );
+        assert_eq!(
+            resolve_mainnet_spec(u8::MAX, MainnetSpecId::OSAKA, "mainnet").unwrap(),
+            MainnetSpecId::OSAKA
+        );
+    }
+}
+
+#[cfg(test)]
+mod statediff_key_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_cli_preserves_s3_chain_defaults() {
+        for (chain_cfg, s3_chain_id, expected) in [
+            ("1", "999", StateDiffKey::BlockHash),
+            ("999", "1", StateDiffKey::StateRoot),
+            ("999", "42161", StateDiffKey::StateRoot),
+        ] {
+            let kafka_s3_config = serde_json::json!({
+                "topic": "test", "brokers": "localhost:9092", "partition": 0,
+                "bucket_name": "source", "outer_bucket_name": "outer",
+                "s3_chain_id": s3_chain_id
+            })
+            .to_string();
+            let command = Command::try_parse_from([
+                "standalone",
+                "--db-path",
+                "/tmp/test",
+                "--chain-cfg",
+                chain_cfg,
+                "--kafka-s3-config",
+                &kafka_s3_config,
+            ])
+            .unwrap();
+            assert!(command.state_diff_key.is_none());
+            assert_eq!(command.resolved_state_diff_key(), expected);
+            let config = serde_json::to_value(command.kafka_s3_config.unwrap()).unwrap();
+            assert!(config.get("state_diff_key").is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_cli_overrides_s3_chain_defaults() {
+        for s3_chain_id in ["1", "42161", "999"] {
+            let kafka_s3_config = serde_json::json!({
+                "topic": "test", "brokers": "localhost:9092", "partition": 0,
+                "bucket_name": "source", "outer_bucket_name": "outer",
+                "s3_chain_id": s3_chain_id
+            })
+            .to_string();
+            for (value, expected) in [
+                ("state-root", StateDiffKey::StateRoot),
+                ("block-hash", StateDiffKey::BlockHash),
+            ] {
+                let command = Command::try_parse_from([
+                    "standalone",
+                    "--db-path",
+                    "/tmp/test",
+                    "--kafka-s3-config",
+                    &kafka_s3_config,
+                    "--statediff-key",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(command.state_diff_key, Some(expected));
+                assert_eq!(command.resolved_state_diff_key(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_cli_accepts_only_explicit_key_strategies_without_kafka() {
+        let base = ["standalone", "--db-path", "/tmp/test"];
+        for (value, expected) in [
+            ("state-root", StateDiffKey::StateRoot),
+            ("block-hash", StateDiffKey::BlockHash),
+        ] {
+            let command =
+                Command::try_parse_from(base.into_iter().chain(["--statediff-key", value]))
+                    .unwrap();
+            assert!(command.kafka_s3_config.is_none());
+            assert_eq!(command.state_diff_key, Some(expected));
+            assert_eq!(command.resolved_state_diff_key(), expected);
+        }
+        for invalid in ["auto", "hash", "block_hash", ""] {
+            assert!(
+                Command::try_parse_from(base.into_iter().chain(["--statediff-key", invalid]))
+                    .is_err()
+            );
+        }
     }
 }

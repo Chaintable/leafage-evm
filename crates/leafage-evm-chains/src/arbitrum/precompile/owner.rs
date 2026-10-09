@@ -7,11 +7,11 @@ use super::{
     NUM_RESOURCE_KIND, RESOURCE_KIND_SINGLE_DIM,
 };
 use crate::arbitrum::arbos_state;
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use alloy::primitives::{keccak256, Address, Bytes, Log, B256, U256};
 use alloy::sol_types::{SolCall, SolValue};
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::Block;
-use revm::precompile::{PrecompileError, PrecompileResult};
 use revm::Database;
 
 const FEATURE_ENABLE_DELAY: u64 = 7 * 24 * 60 * 60;

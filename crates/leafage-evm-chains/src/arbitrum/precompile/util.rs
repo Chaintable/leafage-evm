@@ -1,28 +1,35 @@
 use super::{ADDRESS_ALIAS_OFFSET, BASE_PRECOMPILE_GAS};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileOutput, PrecompileResult};
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use alloy::sol_types::{SolCall, SolError, SolInterface};
 use revm::interpreter::{Gas, InstructionResult, InterpreterResult};
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 
 const COPY_GAS: u64 = 3;
 const LOG_GAS: u64 = 375;
 const LOG_TOPIC_GAS: u64 = 375;
 const LOG_DATA_GAS: u64 = 8;
 
+/// Converts an Arbitrum precompile result into the call frame's [`InterpreterResult`].
+///
+/// `reservoir` is the EIP-8037 state-gas reservoir the frame inherited
+/// ([`CallInputs::reservoir`](revm::interpreter::CallInputs)); precompiles do not
+/// consume it, so it is handed back unchanged to the parent frame.
 pub(super) fn to_interpreter_result(
     gas_limit: u64,
+    reservoir: u64,
     result: PrecompileResult,
 ) -> Result<InterpreterResult, String> {
     let mut interpreter_result = InterpreterResult {
         result: InstructionResult::Return,
-        gas: Gas::new(gas_limit),
+        gas: Gas::new_with_regular_gas_and_reservoir(gas_limit, reservoir),
         output: Bytes::new(),
     };
 
     match result {
         Ok(output) => {
-            if !interpreter_result.gas.record_cost(output.gas_used) {
+            if !interpreter_result.gas.record_regular_cost(output.gas_used) {
                 interpreter_result.result = InstructionResult::PrecompileOOG;
+                interpreter_result.gas.spend_all();
                 return Ok(interpreter_result);
             }
             interpreter_result.result = if output.reverted {
@@ -39,6 +46,7 @@ pub(super) fn to_interpreter_result(
             } else {
                 InstructionResult::PrecompileError
             };
+            interpreter_result.gas.spend_all();
         }
     }
 
@@ -256,7 +264,7 @@ mod tests {
 
     #[test]
     fn interpreter_result_over_gas_output_becomes_oog() {
-        let result = to_interpreter_result(10, Ok(PrecompileOutput::new(11, Bytes::new())))
+        let result = to_interpreter_result(10, 0, Ok(PrecompileOutput::new(11, Bytes::new())))
             .expect("convert precompile result");
 
         assert_eq!(result.result, InstructionResult::PrecompileOOG);

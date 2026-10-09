@@ -104,8 +104,7 @@ fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
 pub const HYPEREVM_S3_CHAIN_ID: &str = "999";
 
 /// Object addressing only; the roots inside a StateDiff remain state roots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum StateDiffKey {
     StateRoot,
     BlockHash,
@@ -134,12 +133,6 @@ impl std::fmt::Display for StateDiffKey {
             Self::StateRoot => "state-root",
             Self::BlockHash => "block-hash",
         })
-    }
-}
-
-impl KafkaS3Config {
-    pub fn resolved_state_diff_key(&self) -> StateDiffKey {
-        StateDiffKey::resolve(self.state_diff_key, &self.s3_chain_id)
     }
 }
 
@@ -809,34 +802,6 @@ mod tests {
         server.abort();
         let paths = requests.lock().unwrap().clone();
         (actual, paths)
-    }
-
-    #[test]
-    fn config_preserves_defaults_and_accepts_only_explicit_key_strategies() {
-        for chain in ["1", "42161", "999"] {
-            let mut json = serde_json::json!({
-                "topic":"test", "brokers":"localhost:9092", "partition":0,
-                "bucket_name":"source", "outer_bucket_name":"outer", "s3_chain_id":chain
-            });
-            let old: KafkaS3Config = serde_json::from_value(json.clone()).unwrap();
-            assert_eq!(
-                old.resolved_state_diff_key(),
-                StateDiffKey::resolve(None, chain)
-            );
-            for (value, expected) in [
-                ("state-root", StateDiffKey::StateRoot),
-                ("block-hash", StateDiffKey::BlockHash),
-            ] {
-                json["state_diff_key"] = value.into();
-                let cfg = parse_kafka_s3_config(&json.to_string()).unwrap();
-                assert_eq!(cfg.resolved_state_diff_key(), expected);
-                assert_eq!(serde_json::to_value(cfg).unwrap()["state_diff_key"], value);
-            }
-            for invalid in ["auto", "hash", "block_hash", ""] {
-                json["state_diff_key"] = invalid.into();
-                assert!(parse_kafka_s3_config(&json.to_string()).is_err());
-            }
-        }
     }
 
     /// Exercise the actual genesis, number catch-up, resumed hand-off and

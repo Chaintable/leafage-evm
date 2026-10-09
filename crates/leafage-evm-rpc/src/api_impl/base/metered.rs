@@ -56,7 +56,7 @@ impl<'a, J: JournalTr> MeteredB20Port<'a, J> {
 
     /// Gas consumed so far.
     pub fn gas_spent(&self) -> u64 {
-        self.gas.spent()
+        self.gas.total_gas_spent()
     }
 
     /// Accumulated EIP-3529 refund, for revm to apply under the transaction-level cap.
@@ -65,7 +65,7 @@ impl<'a, J: JournalTr> MeteredB20Port<'a, J> {
     }
 
     fn charge(&mut self, cost: u64) -> B20Result<()> {
-        if self.gas.record_cost(cost) {
+        if self.gas.record_regular_cost(cost) {
             Ok(())
         } else {
             Err(B20Error::OutOfGas)

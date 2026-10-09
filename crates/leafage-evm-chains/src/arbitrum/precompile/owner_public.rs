@@ -7,7 +7,7 @@ use crate::arbitrum::evm::ArbResourceKind;
 use alloy::primitives::{keccak256, Address, Bytes, Log};
 use alloy::sol_types::SolValue;
 use revm::context::{ContextTr, JournalTr};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use revm::Database;
 
 const ARBOS_VERSION_5: u64 = 5;

@@ -4,12 +4,12 @@ use crate::polygon::gas::pip88_costs::{
 };
 use crate::polygon::PolygonHardfork;
 use revm::bytecode::opcode::{SLOAD, SSTORE};
-use revm::context_interface::host::LoadError;
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::{InputsTr, RuntimeFlag, StackTr};
 use revm::interpreter::{
-    Host, Instruction, InstructionContext, InstructionResult, InterpreterTypes,
+    Host, Instruction, InstructionContext, InstructionExecResult, InstructionResult,
+    InterpreterTypes,
 };
 
 pub(crate) fn polygon_instructions<DB: revm::database::Database>(
@@ -27,90 +27,73 @@ fn install_pip88_storage_instructions<DB: revm::database::Database>(
 ) {
     instructions.insert_instruction(
         SLOAD,
-        Instruction::new(
-            sload_pip88::<EthInterpreter, PolygonContext<DB>>,
-            WARM_STORAGE_READ_COST,
-        ),
+        Instruction::new(sload_pip88::<EthInterpreter, PolygonContext<DB>>),
+        WARM_STORAGE_READ_COST as u16,
     );
     instructions.insert_instruction(
         SSTORE,
-        Instruction::new(sstore_pip88::<EthInterpreter, PolygonContext<DB>>, 0),
+        Instruction::new(sstore_pip88::<EthInterpreter, PolygonContext<DB>>),
+        0,
     );
 }
 
-fn sload_pip88<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+fn sload_pip88<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) -> InstructionExecResult {
     let Some([index]) = context.interpreter.stack.popn::<1>() else {
-        context.interpreter.halt_underflow();
-        return;
+        return Err(InstructionResult::StackUnderflow);
     };
     let target = context.interpreter.input.target_address();
 
     let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_ADDITIONAL_COST;
-    let res = context.host.sload_skip_cold_load(target, index, skip_cold);
-    match res {
-        Ok(storage) => {
-            if storage.is_cold && !record_cost(context.interpreter, COLD_SLOAD_ADDITIONAL_COST) {
-                return;
-            }
-
-            if !context.interpreter.stack.push(storage.data) {
-                context.interpreter.halt_overflow();
-            }
-        }
-        Err(LoadError::ColdLoadSkipped) => context.interpreter.halt_oog(),
-        Err(LoadError::DBError) => context.interpreter.halt_fatal(),
+    // `LoadError::ColdLoadSkipped` maps to OutOfGas, `LoadError::DBError` to FatalExternalError.
+    let storage = context
+        .host
+        .sload_skip_cold_load(target, index, skip_cold)?;
+    if storage.is_cold {
+        record_cost(context.interpreter, COLD_SLOAD_ADDITIONAL_COST)?;
     }
+
+    if !context.interpreter.stack.push(storage.data) {
+        return Err(InstructionResult::StackOverflow);
+    }
+    Ok(())
 }
 
 fn sstore_pip88<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
-) {
+) -> InstructionExecResult {
     if context.interpreter.runtime_flag.is_static() {
-        context
-            .interpreter
-            .halt(InstructionResult::StateChangeDuringStaticCall);
-        return;
+        return Err(InstructionResult::StateChangeDuringStaticCall);
     }
 
     let Some([index, value]) = context.interpreter.stack.popn::<2>() else {
-        context.interpreter.halt_underflow();
-        return;
+        return Err(InstructionResult::StackUnderflow);
     };
 
     if context.interpreter.gas.remaining() <= context.host.gas_params().call_stipend() {
-        context
-            .interpreter
-            .halt(InstructionResult::ReentrancySentryOOG);
-        return;
+        return Err(InstructionResult::ReentrancySentryOOG);
     }
 
-    if !record_cost(
+    record_cost(
         context.interpreter,
         context.host.gas_params().sstore_static_gas(),
-    ) {
-        return;
-    }
+    )?;
 
     let target = context.interpreter.input.target_address();
     let skip_cold = context.interpreter.gas.remaining() < COLD_SSTORE_ADDITIONAL_COST;
-    let state_load = match context
+    // `LoadError::ColdLoadSkipped` maps to OutOfGas, `LoadError::DBError` to FatalExternalError.
+    let state_load = context
         .host
-        .sstore_skip_cold_load(target, index, value, skip_cold)
-    {
-        Ok(load) => load,
-        Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
-        Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
-    };
+        .sstore_skip_cold_load(target, index, value, skip_cold)?;
 
-    if !record_cost(
+    record_cost(
         context.interpreter,
         context
             .host
             .gas_params()
             .sstore_dynamic_gas(true, &state_load.data, state_load.is_cold),
-    ) {
-        return;
-    }
+    )?;
 
     context.interpreter.gas.record_refund(
         context
@@ -118,18 +101,17 @@ fn sstore_pip88<WIRE: InterpreterTypes, H: Host + ?Sized>(
             .gas_params()
             .sstore_refund(true, &state_load.data),
     );
+    Ok(())
 }
 
 fn record_cost<WIRE: InterpreterTypes>(
     interpreter: &mut revm::interpreter::Interpreter<WIRE>,
     gas: u64,
-) -> bool {
-    if interpreter.gas.record_cost(gas) {
-        return true;
+) -> InstructionExecResult {
+    if interpreter.gas.record_regular_cost(gas) {
+        return Ok(());
     }
-
-    interpreter.halt_oog();
-    false
+    Err(InstructionResult::OutOfGas)
 }
 
 #[cfg(test)]
@@ -142,12 +124,9 @@ mod tests {
         let instructions = polygon_instructions::<EmptyDB>(PolygonHardfork::Chicago);
 
         assert_eq!(
-            instructions.instruction_table[SLOAD as usize].static_gas(),
+            instructions.gas_table()[SLOAD as usize] as u64,
             WARM_STORAGE_READ_COST
         );
-        assert_eq!(
-            instructions.instruction_table[SSTORE as usize].static_gas(),
-            0
-        );
+        assert_eq!(instructions.gas_table()[SSTORE as usize], 0);
     }
 }
