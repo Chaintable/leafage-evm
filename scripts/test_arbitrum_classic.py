@@ -2,6 +2,7 @@
 """Read-only differential checks for account-state-only Classic execution."""
 import argparse
 import json
+import itertools
 import urllib.request
 from pathlib import Path
 
@@ -23,6 +24,40 @@ def rpc(url, method, params):
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 
+
+
+def precompile_vectors():
+    """Boundary fixtures for native Classic; expected results come from RPC."""
+    wide = b'\x01' + bytes(32)
+    for i, (base, exponent, modulus) in enumerate(itertools.product(
+            [b'', b'\x00', b'\x02', wide],
+            [b'', b'\x00', b'\x01', bytes(33)],
+            [b'', b'\x00', b'\x01', b'\x0d', wide])):
+        data = b''.join(len(x).to_bytes(32, 'big') for x in (base, exponent, modulus))
+        yield 'modexp.boundary.' + str(i), 5, data + base + exponent + modulus
+    # Right-padding headers/body and ignoring excess input.
+    encoded = (1).to_bytes(32, 'big') * 3 + bytes([2, 0, 1])
+    for size in [0, 31, 32, 63, 64, 95, 96, 97, 98, 99]:
+        yield 'modexp.truncated.' + str(size), 5, encoded[:size]
+    yield 'modexp.trailing', 5, encoded + bytes([255]) * 32
+
+    field = 21888242871839275222246405745257275088696311157297823662689037894645226208583
+    q = [1, 2,
+         19659275751359636165940301690575149581329631496732780143538578556285923319774,
+         7292567877523311580221095596750716176434782432868683424513645834767876293070]
+    def pair(x, y, point=q):
+        return b''.join(v.to_bytes(32, 'big') for v in [x, y, *point])
+    vectors = [
+        ('infinity', pair(0, 0)),
+        ('generator', pair(1, 2)),
+        ('cancel', pair(1, 2) + pair(1, field - 2)),
+        ('trailing', pair(1, 2) + bytes([255]) * 191),
+        ('noncanonical', pair(0, 0, [field, *q[1:]])),
+        ('offcurve_g2', pair(0, 0, [*q[:3], q[3] ^ 1])),
+        ('offcurve_g1', pair(1, 1, [0] * 4)),
+    ]
+    for name, data in vectors:
+        yield 'pairing.non_subgroup.' + name, 8, data
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -159,6 +194,20 @@ def main():
         word = lambda v: format(v, '064x')
         for address, data in [(2, '616263'), (4, '010203'), (5, word(1)*3 + '02050d'), (6, word(1)+word(2)+word(0)*2), (7, word(1)+word(2)+word(2))]:
             compare('precompile.' + str(address), height, 'eth_call', [dict(to='0x' + format(address, '040x'), data='0x' + data, gas='0x989680'), block])
+
+        for name, address, data in precompile_vectors():
+            params = [dict(to='0x' + format(address, '040x'), data='0x' + data.hex(), gas='0x989680'), block]
+            reference = rpc(args.classic, 'eth_call', params)
+            actual = rpc(args.leafage, 'eth_call', params)
+            if 'result' in reference:
+                ok = reference.get('result') == actual.get('result')
+            else:
+                ok = all('revert' in r.get('error', {}).get('message', '').lower() for r in (reference, actual))
+            record(name, height, ok, reference=reference, actual=actual)
+            # Return the STATICCALL success flag followed by actual returndata.
+            parent = f'0x3660006000376000600036600060{address:02x}5afa6000523d600060203e3d6020016000f3'
+            compare(name + '.nested', height, 'eth_call', [
+                dict(to=PROBE, data='0x' + data.hex(), gas='0x989680'), block, {PROBE: dict(code=parent)}])
 
         for name, opcode in [('NUMBER', '43'), ('BLOCKHASH', '40'), ('GASLIMIT', '45'), ('GASPRICE', '3a'), ('BASEFEE', '48')]:
             # BLOCKHASH needs an operand even though Classic fails before lookup.

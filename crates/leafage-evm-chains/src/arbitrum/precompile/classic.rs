@@ -1,4 +1,7 @@
 //! Classic builtin dispatch, deliberately separate from Nitro ArbOS storage.
+mod modexp;
+mod pairing;
+
 use super::{ArbitrumContext, EthPrecompiles, PrecompileProvider};
 use alloy::primitives::{Address, Bytes, U256};
 use revm::context::{ContextTr, JournalTr, LocalContextTr};
@@ -175,16 +178,28 @@ fn run_eth<DB: Database + DatabaseRef>(
     if id == 8 && data.len() / 192 > 30 {
         return revert();
     }
-    let mut normalized = inputs.clone();
-    normalized.input = CallInput::Bytes(if id == 8 {
-        data.slice(..data.len() / 192 * 192)
+    let mut result = if id == 8 {
+        Some(revm::handler::precompile_output_to_interpreter_result(
+            revm::precompile::PrecompileOutput::from_eth_result(
+                pairing::run(&data, inputs.gas_limit),
+                inputs.reservoir,
+            ),
+            inputs.gas_limit,
+        ))
     } else {
-        data
-    });
-    let mut result = PrecompileProvider::<ArbitrumContext<DB>>::run(eth, ctx, &normalized)?;
+        let mut normalized = inputs.clone();
+        normalized.input = CallInput::Bytes(data.clone());
+        PrecompileProvider::<ArbitrumContext<DB>>::run(eth, ctx, &normalized)?
+    };
     if let Some(output) = &mut result {
         if id == 1 && output.result.is_ok() && output.output.is_empty() {
             output.output = Bytes::from(vec![0; 32]);
+        }
+        if id == 5 && output.result.is_ok() {
+            if modexp::adjust_output(&data, &mut output.output).is_err() {
+                output.result = InstructionResult::Revert;
+                output.output = Bytes::new();
+            }
         }
         if output.result == InstructionResult::PrecompileError {
             output.result = InstructionResult::Revert;

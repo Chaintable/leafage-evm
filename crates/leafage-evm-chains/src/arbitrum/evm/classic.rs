@@ -8,14 +8,18 @@ use crate::arbitrum::precompile::ArbitrumContext;
 use revm::bytecode::opcode;
 use revm::context::{ContextTr, JournalTr, Transaction};
 use revm::context_interface::{
+    cfg::gas::GasTracker,
     context::ContextError,
     result::{EVMError, HaltReason},
 };
-use revm::handler::{FrameResult, Handler, instructions::EthInstructions};
+use revm::handler::{FrameResult, Handler, PreExecutionOutput, instructions::EthInstructions};
 use revm::inspector::{Inspector, InspectorHandler};
 use revm::interpreter::interpreter::EthInterpreter;
-use revm::interpreter::interpreter_types::{LoopControl, ReturnData, StackTr};
-use revm::interpreter::{InitialAndFloorGas, Instruction, InstructionContext, as_usize_or_fail};
+use revm::interpreter::interpreter_types::{ReturnData, StackTr};
+use revm::interpreter::{
+    InitialAndFloorGas, Instruction, InstructionContext, InstructionExecResult, InstructionResult,
+    as_usize_or_fail,
+};
 use revm::primitives::hardfork::SpecId;
 use revm::{Database, DatabaseRef};
 use std::marker::PhantomData;
@@ -60,11 +64,26 @@ impl<DB: Database + DatabaseRef, I> Handler for ClassicHandler<DB, I> {
         Ok(InitialAndFloorGas::new(0, 0))
     }
 
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
-        // ContractTransaction has no sequence number. Do not bump the caller's
-        // nonce or read/deduct Nitro poster fees from Classic account state.
+    fn validate_against_state_and_deduct_caller(
+        &self,
+        _: &mut Self::Evm,
+        _: &mut InitialAndFloorGas,
+    ) -> Result<(), Self::Error> {
+        // ContractTransaction has no sequence number or prepaid Ethereum fees.
+        // Value transfers are still checked by the call frame.
+        Ok(())
+    }
+
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        _: &mut GasTracker,
+    ) -> Result<Option<PreExecutionOutput>, Self::Error> {
         self.load_accounts(evm)?;
-        Ok(0)
+        Ok(Some(PreExecutionOutput {
+            eip7702_refund: 0,
+            checkpoint: evm.ctx_mut().journal_mut().checkpoint(),
+        }))
     }
 
     fn reimburse_caller(&self, _: &mut Self::Evm, _: &mut FrameResult) -> Result<(), Self::Error> {
@@ -93,41 +112,48 @@ pub(super) fn instructions<DB: Database + DatabaseRef>()
     // NUMBER is L1, BLOCKHASH is the private inbox-accumulator hash history,
     // GASLIMIT is the current ArbOS pool limit, and both price opcodes read
     // private pricing state. None can be reconstructed from the L2 header.
-    table.insert_instruction(opcode::NUMBER, Instruction::new(unavailable::<DB, 0x43>, 2));
+    table.insert_instruction(opcode::NUMBER, Instruction::new(unavailable::<DB, 0x43>), 2);
     table.insert_instruction(
         opcode::BLOCKHASH,
-        Instruction::new(unavailable::<DB, 0x40>, 20),
+        Instruction::new(unavailable::<DB, 0x40>),
+        20,
     );
     table.insert_instruction(
         opcode::GASLIMIT,
-        Instruction::new(unavailable::<DB, 0x45>, 2),
+        Instruction::new(unavailable::<DB, 0x45>),
+        2,
     );
     table.insert_instruction(
         opcode::GASPRICE,
-        Instruction::new(unavailable::<DB, 0x3a>, 2),
+        Instruction::new(unavailable::<DB, 0x3a>),
+        2,
     );
     table.insert_instruction(
         opcode::BASEFEE,
-        Instruction::new(unavailable::<DB, 0x48>, 2),
+        Instruction::new(unavailable::<DB, 0x48>),
+        2,
     );
     // Creation/destruction need Classic-specific account lifecycle handling.
-    table.insert_instruction(opcode::CREATE, Instruction::new(unavailable::<DB, 0xf0>, 0));
+    table.insert_instruction(opcode::CREATE, Instruction::new(unavailable::<DB, 0xf0>), 0);
     table.insert_instruction(
         opcode::CREATE2,
-        Instruction::new(unavailable::<DB, 0xf5>, 0),
+        Instruction::new(unavailable::<DB, 0xf5>),
+        0,
     );
     table.insert_instruction(
         opcode::SELFDESTRUCT,
-        Instruction::new(unavailable::<DB, 0xff>, 0),
+        Instruction::new(unavailable::<DB, 0xff>),
+        0,
     );
-    table.insert_instruction(opcode::RETURNDATACOPY, Instruction::new(returndatacopy, 3));
-    table.insert_instruction(opcode::MSIZE, Instruction::new(msize, 2));
+    table.insert_instruction(opcode::RETURNDATACOPY, Instruction::new(returndatacopy), 3);
+    table.insert_instruction(opcode::MSIZE, Instruction::new(msize), 2);
     macro_rules! memory_write {
         ($op:ident) => {{
-            let gas = table.instruction_table[opcode::$op as usize].static_gas();
+            let gas = table.gas_table()[opcode::$op as usize];
             table.insert_instruction(
                 opcode::$op,
-                Instruction::new(write_memory::<DB, { opcode::$op }>, gas),
+                Instruction::new(write_memory::<DB, { opcode::$op }>),
+                gas,
             );
         }};
     }
@@ -150,13 +176,14 @@ pub(super) fn reserved_delegate_call(inputs: &revm::interpreter::CallInputs) -> 
 
 fn msize<DB: Database + DatabaseRef>(
     ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     let depth = ctx.host.journal().depth();
     let size = ctx.host.chain().classic_frame(depth).memory_size;
     revm::interpreter::push!(
         ctx.interpreter,
         revm::primitives::U256::from(size.saturating_add(31) & !31)
     );
+    Ok(())
 }
 
 fn valid_copy_source(source: revm::primitives::U256, len: revm::primitives::U256) -> bool {
@@ -166,7 +193,7 @@ fn valid_copy_source(source: revm::primitives::U256, len: revm::primitives::U256
 
 fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
     ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     use revm::primitives::{Address, U256};
     let peek = |n| ctx.interpreter.stack.peek(n).ok();
     let fields = match OP {
@@ -182,7 +209,7 @@ fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
             .map(|((d, s), l)| (d, s, l, 3)),
     };
     let Some((dest, source, len, pops)) = fields else {
-        return ctx.interpreter.halt_underflow();
+        return Err(InstructionResult::StackUnderflow);
     };
     if !valid_copy_source(source, len) && !matches!(OP, opcode::MSTORE | opcode::MSTORE8) {
         if OP == opcode::EXTCODECOPY {
@@ -191,7 +218,7 @@ fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
                 Ok(account) => account,
                 Err(e) => {
                     *ctx.host.error() = Err(ContextError::Db(e));
-                    return ctx.interpreter.halt_fatal();
+                    return Err(InstructionResult::FatalExternalError);
                 }
             };
             if account
@@ -203,7 +230,7 @@ fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
                 // Empty bytecode cannot distinguish an EOA from Classic's
                 // empty-code contractInfo; these have different copy rules.
                 *ctx.host.error() = Err(ContextError::Custom("Arbitrum Classic: EXTCODECOPY with an oversized source on an empty-code account requires Classic account metadata".into()));
-                return ctx.interpreter.halt_fatal();
+                return Err(InstructionResult::FatalExternalError);
             }
         }
         // Still account for bounded destination memory expansion, but do not
@@ -217,30 +244,27 @@ fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
             &ctx.host.cfg().gas_params,
             dest,
             len,
-        );
-        return;
+        )?;
+        return Ok(());
     }
     revm::interpreter::instructions::instruction_table::<EthInterpreter, ArbitrumContext<DB>>()
         [OP as usize]
         .execute(InstructionContext {
             interpreter: &mut *ctx.interpreter,
             host: &mut *ctx.host,
-        });
-    if matches!(ctx.interpreter.bytecode.action().as_ref(), Some(revm::interpreter::InterpreterAction::Return(result)) if !result.result.is_ok())
-    {
-        return;
-    }
+        })?;
     let depth = ctx.host.journal().depth();
     ctx.host.chain_mut().classic_memory_write(
         depth,
         dest.saturating_to::<usize>(),
         len.saturating_to::<usize>(),
     );
+    Ok(())
 }
 
 fn unavailable<DB: Database + DatabaseRef, const OP: u8>(
     ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     let name = match OP {
         0x43 => "NUMBER",
         0x40 => "BLOCKHASH",
@@ -255,14 +279,14 @@ fn unavailable<DB: Database + DatabaseRef, const OP: u8>(
     *ctx.host.error() = Err(ContextError::Custom(format!(
         "Arbitrum Classic: {name} is unavailable in account-state-only simulation"
     )));
-    ctx.interpreter.halt_fatal();
+    Err(InstructionResult::FatalExternalError)
 }
 
 fn returndatacopy<DB: Database + DatabaseRef>(
     ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
-) {
+) -> InstructionExecResult {
     let Some([dest, offset, len]) = StackTr::popn(&mut ctx.interpreter.stack) else {
-        return ctx.interpreter.halt_underflow();
+        return Err(InstructionResult::StackUnderflow);
     };
     let len = as_usize_or_fail!(ctx.interpreter, len);
     let Some(dest) = revm::interpreter::instructions::system::copy_cost_and_memory_resize(
@@ -270,8 +294,9 @@ fn returndatacopy<DB: Database + DatabaseRef>(
         &ctx.host.cfg().gas_params,
         dest,
         len,
-    ) else {
-        return;
+    )?
+    else {
+        return Ok(());
     };
     let depth = ctx.host.journal().depth();
     let offset = if ctx.host.chain().classic_frame(depth).has_return_data {
@@ -280,7 +305,7 @@ fn returndatacopy<DB: Database + DatabaseRef>(
         revm::primitives::U256::ZERO
     };
     if !valid_copy_source(offset, revm::primitives::U256::from(len)) {
-        return;
+        return Ok(());
     }
     // ArbOS evmOps.mini zero-fills beyond return data, including no prior call.
     ctx.interpreter.memory.set_data(
@@ -290,6 +315,7 @@ fn returndatacopy<DB: Database + DatabaseRef>(
         ctx.interpreter.return_data.buffer(),
     );
     ctx.host.chain_mut().classic_memory_write(depth, dest, len);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -768,6 +794,141 @@ mod tests {
             evm.transact(tx).unwrap().result,
             ExecutionResult::Revert { .. }
         ));
+    }
+
+    #[test]
+    fn classic_modexp_and_pairing_return_data_match_native_avm() {
+        fn modexp(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Bytes {
+            [
+                U256::from(base.len()).to_be_bytes::<32>().as_slice(),
+                U256::from(exponent.len()).to_be_bytes::<32>().as_slice(),
+                U256::from(modulus.len()).to_be_bytes::<32>().as_slice(),
+                base,
+                exponent,
+                modulus,
+            ]
+            .concat()
+            .into()
+        }
+        let wide = [vec![1], vec![0; 32]].concat();
+        let padded_one = [vec![0; 32], vec![1]].concat();
+        let cases: &[(&[u8], &[u8], &[u8], Option<&[u8]>)] = &[
+            (&[2], &[0], &[1], Some(&[1])),
+            (&[2], &[0], &[0, 1], Some(&[0, 1])),
+            (&[2], &[1], &[1], Some(&[0])),
+            (&[2], &[5], &[13], Some(&[6])),
+            (&[0], &[0], &[1], Some(&[1])),
+            (&[], &[], &[], Some(&[])),
+            (&[], &[], &[0], Some(&[0])),
+            (&[], &[1], &[13], None),
+            (&[2], &[], &[13], None),
+            (&[2], &[], &padded_one, None),
+            (&wide, &[], &[1], Some(&[1])),
+            (&[], &[], &wide, Some(&padded_one)),
+            (&[], &[1], &wide, None),
+            (&[2], &[1], &wide, Some(&[vec![0; 32], vec![2]].concat())),
+        ];
+        let mut vectors: Vec<(u8, Bytes, Option<Bytes>)> = cases
+            .iter()
+            .map(|(b, e, m, result)| (5, modexp(b, e, m), result.map(Bytes::copy_from_slice)))
+            .collect();
+        // The body is right-padded: the declared exponent/modulus are both zero.
+        let mut truncated = modexp(&[2], &[0], &[1]).to_vec();
+        truncated.truncate(97);
+        vectors.push((5, truncated.into(), Some(Bytes::from_static(&[0]))));
+        let field = U256::from_str_radix(
+            "21888242871839275222246405745257275088696311157297823662689037894645226208583",
+            10,
+        )
+        .unwrap();
+        let q = [
+            U256::ONE,
+            U256::from(2),
+            U256::from_str_radix(
+                "19659275751359636165940301690575149581329631496732780143538578556285923319774",
+                10,
+            )
+            .unwrap(),
+            U256::from_str_radix(
+                "7292567877523311580221095596750716176434782432868683424513645834767876293070",
+                10,
+            )
+            .unwrap(),
+        ];
+        let pair = |x: U256, y: U256| -> Vec<u8> {
+            [x, y, q[0], q[1], q[2], q[3]]
+                .into_iter()
+                .flat_map(|v| v.to_be_bytes::<32>())
+                .collect()
+        };
+        let one = Bytes::copy_from_slice(&U256::ONE.to_be_bytes::<32>());
+        let zero = Bytes::from(vec![0; 32]);
+        vectors.push((8, pair(U256::ZERO, U256::ZERO).into(), Some(one.clone())));
+        vectors.push((8, pair(U256::ONE, U256::from(2)).into(), Some(zero)));
+        vectors.push((
+            8,
+            [
+                pair(U256::ONE, U256::from(2)),
+                pair(U256::ONE, field - U256::from(2)),
+            ]
+            .concat()
+            .into(),
+            Some(one),
+        ));
+        let mut invalid = pair(U256::ZERO, U256::ZERO);
+        invalid[64..96].copy_from_slice(&field.to_be_bytes::<32>());
+        vectors.push((8, invalid.into(), None));
+        let mut off_curve = pair(U256::ZERO, U256::ZERO);
+        off_curve[191] ^= 1;
+        vectors.push((8, off_curve.into(), None));
+        for (address, input, expected) in vectors {
+            for inspect in [false, true] {
+                // Exercise the top-level path and a Solidity-style caller that
+                // catches failure, returning both the success bit and bytes.
+                for nested in [false, true] {
+                    let code = alloy::primitives::hex::decode(format!(
+                        "3660006000376000600036600060{address:02x}5afa6000523d600060203e3d6020016000f3"
+                    )).unwrap();
+                    let mut executor = evm(if nested { &code } else { &[] });
+                    let mut request = tx();
+                    if !nested {
+                        request.base.kind = TxKind::Call(Address::with_last_byte(address));
+                    }
+                    request.base.data = input.clone();
+                    let result = if inspect {
+                        executor.inspect_tx(request)
+                    } else {
+                        executor.transact(request)
+                    }
+                    .unwrap()
+                    .result;
+                    if nested {
+                        let mut bytes = U256::from(u8::from(expected.is_some()))
+                            .to_be_bytes::<32>()
+                            .to_vec();
+                        if let Some(expected) = &expected {
+                            bytes.extend_from_slice(expected);
+                        }
+                        assert_eq!(
+                            output(result).as_ref(),
+                            bytes,
+                            "precompile {address}, input {input}, inspect={inspect}"
+                        );
+                    } else if let Some(expected) = &expected {
+                        assert_eq!(
+                            &output(result),
+                            expected,
+                            "precompile {address}, input {input}, inspect={inspect}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(result, ExecutionResult::Revert { .. }),
+                            "precompile {address}, input {input}, inspect={inspect}: {result:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

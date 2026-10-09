@@ -9,7 +9,7 @@ leafage-evm standalone ... --archive --evm-type=arbitrum \
 
 Omitting `execution_mode` preserves Nitro behavior. The chain ID (42161) cannot distinguish Classic from Nitro. Classic mode pins the pre-Shanghai opcode baseline internally; do not try to enable it with `--spec-id` alone. It applies to execution during normal synchronization as well as to databases populated by `archive-init`.
 
-Keep the producer and reader's StateDiff addressing aligned. For the existing Classic dataset, use `"state_diff_key":"block-hash"` in the Kafka/S3 configuration, or `archive-init --statediff-key block-hash` for bulk initialization. This is independent of EVM mode. The mode requires no new blockfile or StateDiff fields.
+Keep the producer and reader's StateDiff addressing aligned. For the existing Classic dataset, use `standalone --statediff-key block-hash`, or `archive-init --statediff-key block-hash` for bulk initialization. This is independent of EVM mode. The mode requires no new blockfile or StateDiff fields.
 
 ## Supported scope
 
@@ -22,7 +22,7 @@ The supported subset includes ordinary EVM contract reads and simulated storage/
 - ArbSys `arbBlockNumber`, `arbChainID`, `isTopLevelCall`, `getTransactionCount`, and zero-caller-only `getStorageAt`.
 - Classic eth_call's unpriced ContractTransaction does not increment the caller nonce or charge Nitro poster fees.
 - RIPEMD160 (0x03) and Blake2 (0x09) retain the native Classic AVM's catchable revert: their hash instructions exist in the Rust emulator but are absent from the native interpreter.
-- Standard precompiles retain Classic ECRECOVER input/output, pairing truncation and point limits while reusing the existing crypto implementations.
+- Standard precompiles retain Classic ECRECOVER input/output, MODEXP zero-exponent and empty-operand behavior, and pairing truncation and point limits. Pairing validates canonical coordinates and curve membership without imposing Ethereum's additional G2 subgroup check, matching the native Classic AVM.
 - DELEGATECALL/CALLCODE into 0x64–0xc8 returns false and preserves prior return data, as do insufficient-balance calls to nonempty-code contracts and known builtins.
 - ArbInfo at 0x65 executes its actual historical EVM bytecode. Classic ArbOwner is 0x6b; Nitro-only 0x70+ are not intercepted.
 
