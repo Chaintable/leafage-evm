@@ -26,6 +26,8 @@ The supported subset includes ordinary EVM contract reads and simulated storage/
 - DELEGATECALL/CALLCODE into 0x64–0xc8 returns false and preserves prior return data, as do insufficient-balance calls to nonempty-code contracts and known builtins.
 - ArbInfo at 0x65 executes its actual historical EVM bytecode. Classic ArbOwner is 0x6b; Nitro-only 0x70+ are not intercepted.
 
+MODEXP follows Arbitrum One's historical upgrades: before block **2965603** it bounds the exponent by the base's effective byte length; at **2965603** (ArbOS 49) it uses the exponent's byte length; at **3696126** (ArbOS 50) the uint fast path adds the empty-operand reverts. These boundaries were checked against native archive calls on both adjacent blocks. RPC block overrides do not change the selected historical implementation. Other Classic networks must supply `classic_modexp_upgrades` in the EVM custom config with `exponent_size_block` and `uint_fast_path_block`; without a known schedule, MODEXP reports a capability error.
+
 ## Limits
 
 Execution touching unavailable semantics returns an explicit `Arbitrum Classic:` error, even from a nested low-level call that would otherwise swallow a child failure:
@@ -48,7 +50,9 @@ cargo test -p leafage-evm-chains --lib arbitrum::
 cargo test -p leafage-evm-rpc --lib arbitrum::
 python3 scripts/test_arbitrum_classic.py \
   --classic http://127.0.0.1:8545 --leafage http://127.0.0.1:8659 \
-  --heights 156000,1107013,4198902 --report /tmp/classic-comparison.json
+  --heights 156000,1107013,2965602,2965603,3696125,3696126,4198902 --report /tmp/classic-comparison.json
 ```
 
 The differential script issues only read/simulation RPCs. Both nodes must have archive state at the selected heights. It compares return bytes and historical balance/nonce/code/storage, not AVM gas usage. Synthetic opcode probes use RPC state overrides; if the Classic reference cannot apply these at an early height, the report marks those probes as skipped, while real historical calls and state comparisons still run. It also checks explicit missing-data failures, multicall output, tracing and estimate rejection. The JSON report retains failures for debugging.
+
+The legacy reference RPC uses `GetExecutionCursorAtEndOfBlock`, whose SIDELOAD index lookup can select an earlier block when a boundary is missing. At empty block 22207816 it reports arbBlockNumber 22207815 and the preceding timestamp, although the block header and exported state target 22207816. Keep these reference discrepancies visible in reports; do not change leafage's requested block context to imitate a stale reference snapshot.

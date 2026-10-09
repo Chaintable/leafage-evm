@@ -48,6 +48,7 @@ fn precompile_env(
     let retryable = tx.retryable_redeem_tx();
     ArbitrumPrecompileEnv {
         execution_mode: custom_cfg.map(|c| c.execution_mode).unwrap_or_default(),
+        classic_modexp_upgrades: custom_cfg.and_then(|c| c.classic_modexp_upgrades),
         current_tx_l1_gas_fees: U256::ZERO,
         current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,
@@ -142,7 +143,10 @@ impl<DB> ArbitrumApiImpl<DB> {
 
     fn tx_context_for_block(&self, block: &BlockInfo) -> ArbitrumTxContext {
         if self.is_classic() {
-            return ArbitrumTxContext::default();
+            return ArbitrumTxContext {
+                classic_block_number: Some(block.header.number),
+                ..Default::default()
+            };
         }
         let legacy_zero_base_fee_until =
             configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref());
@@ -621,6 +625,9 @@ mod tests {
         assert_eq!(env.difficulty, U256::from(2_500_000_000_000_000u64));
         assert_eq!(env.basefee, 0);
         assert_eq!(ctx.current_l2_block_number(), Some(block_env.number));
+        let mut block = BlockInfo::default();
+        block.header.number = 2_965_602;
+        assert_eq!(api.tx_context_for_block(&block).classic_block_number, Some(2_965_602));
         assert_eq!(
             precompile_env(&tx, api.evm_cfg.custom_cfg.as_ref()).execution_mode,
             ArbitrumExecutionMode::Classic

@@ -932,6 +932,103 @@ mod tests {
     }
 
     #[test]
+    fn classic_modexp_tracks_upgrades_at_the_original_historical_block() {
+        for (height, exponent, modulus, expected) in [
+            (2_965_602, vec![0], 1, Some(0)),
+            (2_965_603, vec![0], 1, Some(1)),
+            (2_965_602, vec![1, 0], 13, Some(1)),
+            (2_965_603, vec![1, 0], 13, Some(3)),
+            (3_696_125, vec![], 13, Some(1)),
+            (3_696_126, vec![], 13, None),
+        ] {
+            let data: Bytes = [
+                U256::ONE.to_be_bytes::<32>().as_slice(),
+                U256::from(exponent.len()).to_be_bytes::<32>().as_slice(),
+                U256::ONE.to_be_bytes::<32>().as_slice(),
+                &[2],
+                &exponent,
+                &[modulus],
+            ]
+            .concat()
+            .into();
+            for inspect in [false, true] {
+                for block_override in [false, true] {
+                    let mut executor = evm(&[]);
+                    let mut request = tx();
+                    request.base.kind = TxKind::Call(Address::with_last_byte(5));
+                    request.base.data = data.clone();
+                    executor.ctx_mut().block.number = U256::from(height);
+                    if block_override {
+                        request.context.classic_block_number = Some(height);
+                        executor.ctx_mut().block.number = U256::from(22_207_815);
+                    }
+                    let result = if inspect {
+                        executor.inspect_tx(request)
+                    } else {
+                        executor.transact(request)
+                    }
+                    .unwrap()
+                    .result;
+                    if let Some(expected) = expected {
+                        assert_eq!(
+                            output(result).as_ref(),
+                            &[expected],
+                            "height={height}, inspect={inspect}"
+                        );
+                    } else {
+                        assert!(matches!(result, ExecutionResult::Revert { .. }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classic_modexp_custom_chains_require_an_explicit_upgrade_schedule() {
+        use crate::arbitrum::config::ClassicModexpUpgrades;
+        use crate::arbitrum::precompile::ArbitrumPrecompiles;
+        let mut executor = evm(&[]);
+        executor.ctx_mut().cfg.chain_id = 123;
+        let mut request = tx();
+        request.base.chain_id = None;
+        request.base.kind = TxKind::Call(Address::with_last_byte(5));
+        request.base.data = [U256::ONE.to_be_bytes::<32>().repeat(3), vec![2, 0, 1]]
+            .concat()
+            .into();
+        assert!(
+            executor
+                .transact(request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("requires classic_modexp_upgrades")
+        );
+        for (exponent_size_block, uint_fast_path_block, valid) in [(0, 0, true), (10, 0, false)] {
+            executor.inner.precompiles = ArbitrumPrecompiles::new_with_env(
+                ArbitrumHardfork::Berlin,
+                ArbitrumPrecompileEnv {
+                    execution_mode: ArbitrumExecutionMode::Classic,
+                    classic_modexp_upgrades: Some(ClassicModexpUpgrades {
+                        exponent_size_block,
+                        uint_fast_path_block,
+                    }),
+                    ..Default::default()
+                },
+            );
+            let result = executor.transact(request.clone());
+            if valid {
+                assert_eq!(output(result.unwrap().result).as_ref(), &[1]);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid classic_modexp_upgrades order")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classic_nonzero_callcode_fails_explicitly() {
         let mut evm =
             evm(&alloy::primitives::hex::decode("6000600060006000600160cc5af200").unwrap());

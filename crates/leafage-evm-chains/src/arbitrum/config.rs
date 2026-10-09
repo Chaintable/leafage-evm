@@ -11,6 +11,13 @@ pub enum ArbitrumExecutionMode {
     Classic,
 }
 
+/// Historical Classic MODEXP upgrades, expressed in L2 block numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClassicModexpUpgrades {
+    pub exponent_size_block: u64,
+    pub uint_fast_path_block: u64,
+}
+
 /// Per-chain configuration for Arbitrum replicas, parsed from
 /// `--evm-custom-config`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -19,6 +26,11 @@ pub struct ArbitrumEvmConfig {
     /// It does not provide AVM gas accounting or missing private ArbOS state.
     #[serde(default)]
     pub execution_mode: ArbitrumExecutionMode,
+
+    /// MODEXP upgrade schedule. Arbitrum One has built-in historical defaults;
+    /// other Classic networks need an explicit schedule to enable MODEXP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_modexp_upgrades: Option<ClassicModexpUpgrades>,
 
     /// Mirrors Nitro's
     /// `ChainConfig.ArbitrumChainParams.AllowDebugPrecompiles`.

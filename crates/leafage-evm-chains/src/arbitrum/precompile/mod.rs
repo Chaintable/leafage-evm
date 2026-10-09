@@ -275,7 +275,7 @@ impl<DB: Database + DatabaseRef> PrecompileProvider<ArbitrumContext<DB>> for Arb
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
         if self.is_classic() {
-            return classic::run(&mut self.eth, context, inputs);
+            return classic::run(&mut self.eth, context, inputs, self.env.classic_modexp_upgrades);
         }
         let address = inputs.bytecode_address;
         let Some(precompile) = ArbitrumPrecompile::from_address(address)

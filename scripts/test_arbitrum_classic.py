@@ -31,7 +31,7 @@ def precompile_vectors():
     wide = b'\x01' + bytes(32)
     for i, (base, exponent, modulus) in enumerate(itertools.product(
             [b'', b'\x00', b'\x02', wide],
-            [b'', b'\x00', b'\x01', bytes(33)],
+            [b'', b'\x00', b'\x01', b'\x01\x00', bytes(33)],
             [b'', b'\x00', b'\x01', b'\x0d', wide])):
         data = b''.join(len(x).to_bytes(32, 'big') for x in (base, exponent, modulus))
         yield 'modexp.boundary.' + str(i), 5, data + base + exponent + modulus
@@ -63,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--classic', required=True)
     parser.add_argument('--leafage', required=True)
-    parser.add_argument('--heights', default='156000,1107013,4198902')
+    parser.add_argument('--heights', default='156000,1107013,2965602,2965603,3696125,3696126,4198902')
     parser.add_argument('--report', required=True)
     args = parser.parse_args()
     records = []

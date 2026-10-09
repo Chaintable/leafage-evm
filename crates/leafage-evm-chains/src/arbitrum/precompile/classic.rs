@@ -3,6 +3,7 @@ mod modexp;
 mod pairing;
 
 use super::{ArbitrumContext, EthPrecompiles, PrecompileProvider};
+use crate::arbitrum::config::ClassicModexpUpgrades;
 use alloy::primitives::{Address, Bytes, U256};
 use revm::context::{ContextTr, JournalTr, LocalContextTr};
 use revm::interpreter::{
@@ -25,10 +26,11 @@ pub(super) fn run<DB: Database + DatabaseRef>(
     eth: &mut EthPrecompiles,
     ctx: &mut ArbitrumContext<DB>,
     inputs: &CallInputs,
+    modexp_upgrades: Option<ClassicModexpUpgrades>,
 ) -> Result<Option<InterpreterResult>, String> {
     let address = inputs.bytecode_address;
     if !addresses().any(|a| a == address) {
-        return run_eth(eth, ctx, inputs);
+        return run_eth(eth, ctx, inputs, modexp_upgrades);
     }
     let unsupported = || {
         format!(
@@ -144,6 +146,7 @@ fn run_eth<DB: Database + DatabaseRef>(
     eth: &mut EthPrecompiles,
     ctx: &mut ArbitrumContext<DB>,
     inputs: &CallInputs,
+    modexp_upgrades: Option<ClassicModexpUpgrades>,
 ) -> Result<Option<InterpreterResult>, String> {
     let address = inputs.bytecode_address;
     let is_eth = address >= Address::with_last_byte(1) && address <= Address::with_last_byte(9);
@@ -166,6 +169,39 @@ fn run_eth<DB: Database + DatabaseRef>(
         }))
     };
     let id = address.as_slice()[19];
+    let modexp_rules = if id == 5 {
+        let upgrades = modexp_upgrades
+            .or_else(|| {
+                (ctx.cfg().chain_id == 42161).then_some(ClassicModexpUpgrades {
+                    // Native archive: ArbOS 48 -> 49 at 2_965_603, then
+                    // ArbOS 49 -> 50 at 3_696_126 (post-block call state).
+                    exponent_size_block: 2_965_603,
+                    uint_fast_path_block: 3_696_126,
+                })
+            })
+            .ok_or_else(|| {
+                "Arbitrum Classic: MODEXP requires classic_modexp_upgrades for this chain"
+                    .to_owned()
+            })?;
+        if upgrades.exponent_size_block > upgrades.uint_fast_path_block {
+            return Err("Arbitrum Classic: invalid classic_modexp_upgrades order".to_owned());
+        }
+        let number = ctx
+            .tx
+            .context
+            .classic_block_number
+            .map(U256::from)
+            .unwrap_or(ctx.block.number);
+        if number < U256::from(upgrades.exponent_size_block) {
+            modexp::Rules::Legacy
+        } else if number < U256::from(upgrades.uint_fast_path_block) {
+            modexp::Rules::ExponentSize
+        } else {
+            modexp::Rules::UintFastPath
+        }
+    } else {
+        modexp::Rules::UintFastPath
+    };
     // The native Classic AVM has no RIPEMD160F (0x25) or BLAKE2F (0x26),
     // although the Mini source and Rust emulator implement both. Archive
     // calls to these builtins therefore revert, even with valid input.
@@ -196,7 +232,9 @@ fn run_eth<DB: Database + DatabaseRef>(
             output.output = Bytes::from(vec![0; 32]);
         }
         if id == 5 && output.result.is_ok() {
-            if modexp::adjust_output(&data, &mut output.output).is_err() {
+            if modexp::adjust_output(&data, &mut output.output, inputs.gas_limit, modexp_rules)
+                .is_err()
+            {
                 output.result = InstructionResult::Revert;
                 output.output = Bytes::new();
             }
