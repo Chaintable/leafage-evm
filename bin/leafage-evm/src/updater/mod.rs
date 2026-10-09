@@ -4,7 +4,7 @@ pub use http_updater::Updater as HttpUpdater;
 mod kafka_updater;
 pub use kafka_updater::Updater as KafkaUpdater;
 
-use crate::utils::KafkaS3Config;
+use crate::utils::{KafkaS3Config, StateDiffKey};
 use anyhow::Result;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrite};
 use std::time::Duration;
@@ -20,6 +20,7 @@ pub async fn updater_build<
     tree: Tree,
     rpc_url: Option<String>,
     kafka_s3_cfg: Option<KafkaS3Config>,
+    state_diff_key: StateDiffKey,
     update_interval: Duration,
     max_diff_depth: usize,
     init_task_queue_size: usize,
@@ -36,6 +37,7 @@ pub async fn updater_build<
                 tree,
                 rpc_url,
                 kafka_s3_cfg,
+                state_diff_key,
                 max_diff_depth,
                 init_task_queue_size,
                 catchup_safe_depth,

@@ -4,7 +4,9 @@ use crate::pprof::PProf;
 use crate::register::register_build;
 use crate::runner::run_until_ctrl_c;
 use crate::updater::updater_build;
-use crate::utils::{parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg};
+use crate::utils::{
+    parse_kafka_s3_config, EtcdRegisterConfig, KafkaS3Config, NodeTypeArg, StateDiffKey,
+};
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -237,6 +239,10 @@ pub struct Command {
     /// This config is used to set the kafka s3 config.
     #[arg(long, value_parser = parse_kafka_s3_config,  value_name = "KAFKA_S3_CONFIG_PATH")]
     kafka_s3_config: Option<KafkaS3Config>,
+
+    /// S3 StateDiff key. Omitted: block-hash for S3 chain 999, state-root otherwise.
+    #[arg(long = "statediff-key", value_enum)]
+    state_diff_key: Option<StateDiffKey>,
 
     #[command(flatten)]
     bundle_read: BundleReadArgs,
@@ -481,6 +487,15 @@ fn resolve_spec<T: TryFrom<u8>>(spec_id: u8, default: T, type_label: &str) -> Re
 }
 
 impl Command {
+    fn resolved_state_diff_key(&self) -> StateDiffKey {
+        StateDiffKey::resolve(
+            self.state_diff_key,
+            self.kafka_s3_config
+                .as_ref()
+                .map_or("", |config| config.s3_chain_id.as_str()),
+        )
+    }
+
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
         let evm_type = self.evm_type.clone();
@@ -771,14 +786,13 @@ impl Command {
             etcd_config.as_mut().unwrap().meta = self.meta.clone();
         }
 
+        let state_diff_key = self.resolved_state_diff_key();
         // set default offset dir if not set
         if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
             if kafka_s3_config.offset_dir.is_empty() {
                 kafka_s3_config.offset_dir =
                     format!("{}/offset", self.db_path.to_str().unwrap_or_default());
             }
-            let state_diff_key = kafka_s3_config.resolved_state_diff_key();
-            kafka_s3_config.state_diff_key = Some(state_diff_key);
             info!(target: "updater", %state_diff_key, "resolved S3 StateDiff addressing");
             info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
         } else {
@@ -814,6 +828,7 @@ impl Command {
             ),
             self.rpc_addr.clone(),
             self.kafka_s3_config.clone(),
+            state_diff_key,
             self.genesis_number,
         )
         .await?;
@@ -887,6 +902,7 @@ impl Command {
             tree.clone(),
             self.rpc_addr.clone(),
             self.kafka_s3_config.clone(),
+            state_diff_key,
             self.update_interval,
             self.diff_depth_limit,
             self.init_task_queue_size,
@@ -932,5 +948,91 @@ impl Command {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod statediff_key_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_cli_preserves_s3_chain_defaults() {
+        for (chain_cfg, s3_chain_id, expected) in [
+            ("1", "999", StateDiffKey::BlockHash),
+            ("999", "1", StateDiffKey::StateRoot),
+            ("999", "42161", StateDiffKey::StateRoot),
+        ] {
+            let kafka_s3_config = serde_json::json!({
+                "topic": "test", "brokers": "localhost:9092", "partition": 0,
+                "bucket_name": "source", "outer_bucket_name": "outer",
+                "s3_chain_id": s3_chain_id
+            })
+            .to_string();
+            let command = Command::try_parse_from([
+                "standalone",
+                "--db-path",
+                "/tmp/test",
+                "--chain-cfg",
+                chain_cfg,
+                "--kafka-s3-config",
+                &kafka_s3_config,
+            ])
+            .unwrap();
+            assert!(command.state_diff_key.is_none());
+            assert_eq!(command.resolved_state_diff_key(), expected);
+            let config = serde_json::to_value(command.kafka_s3_config.unwrap()).unwrap();
+            assert!(config.get("state_diff_key").is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_cli_overrides_s3_chain_defaults() {
+        for s3_chain_id in ["1", "42161", "999"] {
+            let kafka_s3_config = serde_json::json!({
+                "topic": "test", "brokers": "localhost:9092", "partition": 0,
+                "bucket_name": "source", "outer_bucket_name": "outer",
+                "s3_chain_id": s3_chain_id
+            })
+            .to_string();
+            for (value, expected) in [
+                ("state-root", StateDiffKey::StateRoot),
+                ("block-hash", StateDiffKey::BlockHash),
+            ] {
+                let command = Command::try_parse_from([
+                    "standalone",
+                    "--db-path",
+                    "/tmp/test",
+                    "--kafka-s3-config",
+                    &kafka_s3_config,
+                    "--statediff-key",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(command.state_diff_key, Some(expected));
+                assert_eq!(command.resolved_state_diff_key(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_cli_accepts_only_explicit_key_strategies_without_kafka() {
+        let base = ["standalone", "--db-path", "/tmp/test"];
+        for (value, expected) in [
+            ("state-root", StateDiffKey::StateRoot),
+            ("block-hash", StateDiffKey::BlockHash),
+        ] {
+            let command =
+                Command::try_parse_from(base.into_iter().chain(["--statediff-key", value]))
+                    .unwrap();
+            assert!(command.kafka_s3_config.is_none());
+            assert_eq!(command.state_diff_key, Some(expected));
+            assert_eq!(command.resolved_state_diff_key(), expected);
+        }
+        for invalid in ["auto", "hash", "block_hash", ""] {
+            assert!(
+                Command::try_parse_from(base.into_iter().chain(["--statediff-key", invalid]))
+                    .is_err()
+            );
+        }
     }
 }

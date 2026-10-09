@@ -25,6 +25,7 @@ where
         db: DB,
         rpc_url: Option<impl AsRef<str>>,
         kafka_s3_cfg: KafkaS3Config,
+        state_diff_key: StateDiffKey,
         genesis_number: u64,
     ) -> Result<Self> {
         let mut rpc_client = None;
@@ -34,7 +35,6 @@ where
         }
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
-        let state_diff_key = kafka_s3_cfg.resolved_state_diff_key();
         Ok(Self {
             state_diff_key,
             rpc_client,

@@ -176,7 +176,7 @@ When using Kafka + S3 mode, provide a JSON config file:
 
 `bundle_bucket_name` is optional; omit it or leave it empty to keep the legacy per-block S3 path.
 
-`state_diff_key` is an optional Kafka + S3 JSON field accepting `"state-root"` or `"block-hash"`. For example, add `"state_diff_key": "block-hash"` when consuming Arb Classic data produced with block-hash keys. For archive initialization, use `archive-init --statediff-key block-hash` with the same source bucket, S3 chain ID and version. The choice applies to genesis, live consumption, catch-up, restart and parent-hash backfill. There is no separate standalone flag or Kafka message change.
+Both `standalone` and `archive-init` accept the optional `--statediff-key` flag with values `state-root` or `block-hash`. For example, use `standalone --statediff-key block-hash` when consuming Arb Classic data produced with block-hash keys, or `archive-init --statediff-key block-hash` for archive initialization with the same source bucket, S3 chain ID and version. This is a top-level CLI option, outside the Kafka + S3 JSON configuration. The choice applies to genesis, live consumption, catch-up, restart and parent-hash backfill. Kafka messages are unchanged.
 
 When omitted, the historical default is preserved: S3 chain ID `"999"` uses block hashes; all others use state roots. Explicit values override this default, including on chain 999. The resolved strategy is logged at startup. Match the producer's setting and keep it consistent when resuming the same dataset; chain ID 42161 does not distinguish Classic from Nitro.
 

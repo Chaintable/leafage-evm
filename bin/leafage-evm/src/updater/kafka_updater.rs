@@ -72,6 +72,7 @@ where
         tree: Tree,
         rpc_url: Option<impl AsRef<str>>,
         kafka_s3_cfg: KafkaS3Config,
+        state_diff_key: StateDiffKey,
         max_diff_depth: usize,
         init_task_queue_size: usize,
         catchup_safe_depth: usize,
@@ -97,7 +98,6 @@ where
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
         let read_from_bundle = !kafka_s3_cfg.bundle_bucket_name.is_empty();
 
-        let state_diff_key = kafka_s3_cfg.resolved_state_diff_key();
         Ok(Self {
             state_diff_key,
             rpc_client,
@@ -747,7 +747,6 @@ mod tests {
                 s3_chain_id: "42161".into(),
                 version: "v1".into(),
                 bucket_name: "source".into(),
-                state_diff_key: Some(StateDiffKey::BlockHash),
                 ..Default::default()
             },
             state_diff_key: StateDiffKey::BlockHash,

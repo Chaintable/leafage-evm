@@ -197,9 +197,10 @@ object above, and the producer writes one for *every* block — including blocks
 that change no state, which carry an empty `BlockStorageDiff`. The reader
 fetches it for every block and never infers an empty diff from the state root.
 
-Leafage selects this strategy through `KafkaS3Config.state_diff_key` for live
+Leafage selects this strategy through `standalone --statediff-key` for live
 sync or `archive-init --statediff-key`, both accepting `state-root` and
-`block-hash`. Omission preserves the existing default (S3 chain 999: block
+`block-hash`. The flag is separate from the Kafka/S3 JSON configuration.
+Omission preserves the existing default (S3 chain 999: block
 hash; all others: state root). An explicit setting overrides that default.
 For Arb Classic, use block-hash explicitly; its S3 chain ID alone does not
 identify the addressing scheme. The general path is
