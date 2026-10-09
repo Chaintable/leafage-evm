@@ -36,9 +36,6 @@ pub struct KafkaS3Config {
     /// AWS SDK operation timeout, including retries but excluding response body reads.
     #[serde(default = "default_s3_read_timeout_secs")]
     pub s3_read_timeout_secs: NonZeroU64,
-    /// S3 StateDiff addressing. Omitted preserves the historical chain default.
-    #[serde(default)]
-    pub state_diff_key: Option<StateDiffKey>,
 }
 
 fn default_s3_read_timeout_secs() -> NonZeroU64 {
@@ -58,7 +55,6 @@ impl Default for KafkaS3Config {
             s3_chain_id: String::new(),
             version: String::new(),
             s3_read_timeout_secs: default_s3_read_timeout_secs(),
-            state_diff_key: None,
         }
     }
 }
