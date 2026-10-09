@@ -112,6 +112,9 @@ metrics-exporter-prometheus = { version = "0.16.0", default-features = false }
 axum = "0.7.9"
 
 bls_on_arkworks = "0.3.0"
+ark-bn254 = { version = "0.6", default-features = false, features = ["curve"] }
+ark-ec = { version = "0.6", default-features = false }
+ark-ff = { version = "0.6", default-features = false }
 blst = "0.3"
 blake3 = "1"
 prost = "0.12.6"

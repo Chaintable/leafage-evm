@@ -1,8 +1,8 @@
+use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
 use leafage_evm_chains::arbitrum::evm::ArbitrumEvm;
 use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
-use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_types::{BlockEnv, CfgEnv};
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 
@@ -17,6 +17,17 @@ pub(crate) fn create_arbitrum_evm_from_state<StateDB, INSP>(
 where
     StateDB: DatabaseRef,
 {
+    if precompile_env.execution_mode == leafage_evm_chains::arbitrum::ArbitrumExecutionMode::Classic
+    {
+        return Ok(ArbitrumEvm::new(
+            block_env,
+            cfg,
+            WrapDatabaseRef(state),
+            inspector,
+            precompile_env,
+            execution_context,
+        ));
+    }
     let arbos_version = state.try_arbos_version()?;
     precompile_env.current_arbos_version = arbos_version;
 
@@ -39,11 +50,11 @@ where
 mod tests {
     use super::*;
     use leafage_evm_chains::arbitrum::tx::ArbitrumTxEnv;
-    use revm::context::TxEnv;
-    use revm::database::{in_memory_db::CacheDB, EmptyDB};
-    use revm::inspector::NoOpInspector;
-    use revm::primitives::{address, keccak256, Bytes, TxKind, U256};
     use revm::ExecuteEvm;
+    use revm::context::TxEnv;
+    use revm::database::{EmptyDB, in_memory_db::CacheDB};
+    use revm::inspector::NoOpInspector;
+    use revm::primitives::{Bytes, TxKind, U256, address, keccak256};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ExpectedDbError;
@@ -160,6 +171,40 @@ mod tests {
     fn eip7623_floor_follows_arbos_feature_flag() {
         assert_eq!(calldata_heavy_gas(U256::ZERO), 37_000);
         assert_eq!(calldata_heavy_gas(U256::ONE), 61_000);
+    }
+
+    #[test]
+    fn classic_factory_does_not_read_nitro_arbos_state() {
+        let mut evm = create_arbitrum_evm_from_state(
+            BlockEnv {
+                gas_limit: 30_000_000,
+                ..Default::default()
+            },
+            CfgEnv::new_with_spec(ArbitrumHardfork::Osaka),
+            FailingArbosState {
+                version: Err(ExpectedDbError),
+                fail_features: true,
+            },
+            NoOpInspector {},
+            ArbitrumPrecompileEnv {
+                execution_mode: leafage_evm_chains::arbitrum::ArbitrumExecutionMode::Classic,
+                ..Default::default()
+            },
+            ArbitrumExecutionContext::default(),
+        )
+        .expect("Classic must not read private Nitro state");
+        let result = evm
+            .transact(ArbitrumTxEnv::new(
+                TxEnv {
+                    kind: TxKind::Call(address!("0000000000000000000000000000000000000e0a")),
+                    gas_limit: 100_000,
+                    ..Default::default()
+                },
+                Default::default(),
+            ))
+            .expect("Classic call");
+        assert!(result.result.is_success());
+        assert_eq!(evm.ctx().cfg.spec, ArbitrumHardfork::Berlin);
     }
 
     #[test]

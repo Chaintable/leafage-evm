@@ -66,7 +66,7 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Custom EVM parameters for Cosmos, Arbitrum or OP.
+    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode.
     /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules)),
     /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
     /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
