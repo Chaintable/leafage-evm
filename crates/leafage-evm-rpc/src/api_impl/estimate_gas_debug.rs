@@ -2,6 +2,7 @@
 //! Timings use the RPC metric's boundary. Only requests (or cancelled workers)
 //! taking at least 500ms emit a log; no CLI flags or log-level changes are needed.
 
+use super::estimate_gas_prefetch::PrefetchStats;
 use alloy::primitives::{hex, Address, B256, U256};
 use jsonrpsee::types::Request;
 use leafage_evm_types::CallRequest;
@@ -67,6 +68,8 @@ impl BoundedText {
 
 #[derive(Default, Serialize)]
 struct Stats {
+    prefetch: Option<PrefetchStats>,
+    initial_rocksdb: BTreeMap<&'static str, u64>,
     chain_id: Option<u64>,
     chain_config_version: Option<String>,
     from: Option<String>,
@@ -112,6 +115,14 @@ fn ms(duration: Duration) -> f64 {
 }
 
 impl EstimateTrace {
+    pub(crate) fn prefetch(&self, stats: PrefetchStats) {
+        self.update(|record| record.prefetch = Some(stats));
+    }
+
+    pub(crate) fn initial_rocksdb(&self, counters: BTreeMap<&'static str, u64>) {
+        self.update(|record| record.initial_rocksdb = counters);
+    }
+
     pub(crate) fn new(started: Instant, request: &Request<'_>) -> Self {
         Self(Some(Arc::new(TraceInner {
             started,
@@ -436,8 +447,9 @@ impl Reads {
 
 #[derive(Clone, Copy, Default, Serialize)]
 struct ReadStats {
-    // Includes cache access and backing state time. Backing state is a nested
-    // subset, including key hashing, shared caches, diff layers and disk reads.
+    // Backing-state calls are a nested subset of request-cache calls. They
+    // include prefetch-cache hits or lazy key hashing/layer/disk reads. Eager
+    // reads happen earlier and are reported separately in `prefetch`.
     request_cache: Reads,
     backing_state: Reads,
     cache_hits: u64,

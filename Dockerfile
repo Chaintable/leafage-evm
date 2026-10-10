@@ -70,6 +70,7 @@ FROM builder AS rpc-debug-tests
 # identical to the normal build. Exercise cancellation/cache diagnostics and
 # real estimateGas execution over RocksDB plus in-memory state layers.
 RUN cargo test --release -p leafage-evm-rpc --lib estimate_gas_debug \
+    && cargo test --release -p leafage-evm-rpc --lib estimate_gas_prefetch \
     && cargo test --release -p leafage-evm-rpc --test e2e_smoke
 
 FROM ubuntu:24.04 AS runtime

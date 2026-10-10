@@ -4,6 +4,7 @@ use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::estimate_gas_debug::{self, EstimateTrace, ReadTracker};
+use crate::api_impl::estimate_gas_prefetch;
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
 };
@@ -1145,11 +1146,26 @@ where
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(reads.backing(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        }));
+        let prefetch_stage = trace.stage("state_prefetch");
+        let (prefetched, prefetch_stats) = estimate_gas_prefetch::prefetch(
+            EvmStorageWrapper {
+                db: state,
+                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
+                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
+            },
+            self.inner.evm_cfg().cfg.chain_id,
+            &request,
+            &cancel_token,
+        );
+        trace.prefetch(prefetch_stats);
+        drop(prefetch_stage);
+        if cancel_token.is_cancelled() {
+            trace.exit_reason("cancelled");
+            return Err(internal_rpc_err(
+                "estimate gas cancelled by caller".to_string(),
+            ));
+        }
+        let mut cache_db = CacheDB::new(reads.backing(prefetched));
         if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(
                 overrides,
@@ -1241,7 +1257,11 @@ where
         drop(prechecks);
         let res = trace
             .execute("initial", tx.gas_limit(), || {
-                self.inner.transact(&block_env, &memory_db, tx.clone())
+                let (result, counters) = leafage_evm_storage::profile_rocksdb_reads(|| {
+                    self.inner.transact(&block_env, &memory_db, tx.clone())
+                });
+                trace.initial_rocksdb(counters);
+                result
             })
             .map_err(|e| e.to_rpc_error())?;
 

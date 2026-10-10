@@ -15,5 +15,8 @@ pub use migrate::*;
 
 mod metrics;
 
+mod read_profile;
+pub use read_profile::profile_rocksdb_reads;
+
 mod offset;
 pub use offset::*;

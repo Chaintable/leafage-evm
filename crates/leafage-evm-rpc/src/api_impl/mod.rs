@@ -16,6 +16,8 @@ mod debank;
 
 pub(crate) mod estimate_gas_debug;
 
+mod estimate_gas_prefetch;
+
 mod historical_overload;
 
 #[cfg(target_os = "linux")]

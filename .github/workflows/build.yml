@@ -54,7 +54,7 @@ jobs:
         with:
           registry-type: public
 
-      - name: Test estimateGas diagnostics
+      - name: Test estimateGas diagnostics and prefetch
         uses: docker/build-push-action@v6
         with:
           context: .
