@@ -28,6 +28,7 @@ static FIXTURE: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../../../tests/fixtures/op_xen_claim.json")).unwrap()
 });
 const MATH: Address = address!("b4609b8453bb07d540ec95d491b92bdecb794531");
+const MINT_INFO: Address = address!("1ac17ffb8456525bff46870bba7ed8772ba063a5");
 
 #[derive(Debug, thiserror::Error)]
 #[error("injected batch failure")]
@@ -173,6 +174,7 @@ fn fixture(to: Address, indices: &[u64], redeemed: bool) -> (Db, CallRequest) {
         (TORRENT, "torrent"),
         (XEN, "xen"),
         (MATH, "math"),
+        (MINT_INFO, "mint_info"),
     ] {
         db.account(address, FIXTURE["codes"][name].as_str());
     }
@@ -328,7 +330,11 @@ fn real_batch_claims_preserve_gas_logs_and_state_at_multiple_gas_limits() {
             );
             assert_eq!(plain.state, warm.state, "state mismatch at {to} / {gas}");
             if gas == 16_777_216 {
-                assert!(warm.result.is_success());
+                assert!(
+                    warm.result.is_success(),
+                    "claim failed at {to}: {:?}",
+                    warm.result
+                );
                 assert!(
                     plain_reads >= 704,
                     "fixture must exercise the cold state path"
