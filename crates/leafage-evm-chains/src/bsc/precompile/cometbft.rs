@@ -14,14 +14,24 @@ use cometbft_proto::types::v1::LightBlock as TmLightBlock;
 use leafage_evm_types::Bytes;
 use prost::Message;
 use revm::precompile::{
-    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
+    eth_precompile_fn, u64_to_address, EthPrecompileOutput, EthPrecompileResult, Precompile,
+    PrecompileHalt, PrecompileId,
 };
 use std::{borrow::Cow, borrow::ToOwned, string::String, vec::Vec};
+
+eth_precompile_fn!(
+    cometbft_light_block_validation_run_precompile,
+    cometbft_light_block_validation_run
+);
+eth_precompile_fn!(
+    cometbft_light_block_validation_run_before_hertz_precompile,
+    cometbft_light_block_validation_run_before_hertz
+);
 
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("BSC_COMETBFT_LIGHT_BLOCK_VALIDATION")),
     u64_to_address(103),
-    cometbft_light_block_validation_run,
+    cometbft_light_block_validation_run_precompile,
 );
 
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile = Precompile::new(
@@ -29,7 +39,7 @@ pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile = Prec
         "BSC_COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ",
     )),
     u64_to_address(103),
-    cometbft_light_block_validation_run_before_hertz,
+    cometbft_light_block_validation_run_before_hertz_precompile,
 );
 
 const UINT64_TYPE_LENGTH: u64 = 8;
@@ -54,14 +64,14 @@ const MAX_CONSENSUS_STATE_LENGTH: u64 = CHAIN_ID_LENGTH
     + VALIDATOR_SET_HASH_LENGTH
     + 99 * SINGLE_VALIDATOR_BYTES_LENGTH;
 
-fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, true)
 }
 
 fn cometbft_light_block_validation_run_before_hertz(
     input: &[u8],
     gas_limit: u64,
-) -> PrecompileResult {
+) -> EthPrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, false)
 }
 
@@ -69,11 +79,11 @@ fn cometbft_light_block_validation_run_inner(
     input: &[u8],
     gas_limit: u64,
     is_hertz: bool,
-) -> PrecompileResult {
+) -> EthPrecompileResult {
     const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
 
     if COMETBFT_LIGHT_BLOCK_VALIDATION_BASE > gas_limit {
-        return Err(PrecompileError::OutOfGas);
+        return Err(PrecompileHalt::OutOfGas);
     }
 
     let (mut consensus_state, tm_light_block) = decode_light_block_validation_input(input)?;
@@ -87,13 +97,13 @@ fn cometbft_light_block_validation_run_inner(
 
     let consensus_state_bytes = consensus_state.encode()?;
 
-    Ok(PrecompileOutput::new(
+    Ok(EthPrecompileOutput::new(
         COMETBFT_LIGHT_BLOCK_VALIDATION_BASE,
         encode_light_block_validation_result(validator_set_changed, consensus_state_bytes),
     ))
 }
 
-type ConvertLightBlockResult = Result<LightBlock, PrecompileError>;
+type ConvertLightBlockResult = Result<LightBlock, PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     let signed_header =
         match SignedHeader::try_from(light_block_proto.signed_header.as_ref().unwrap().clone()) {
@@ -117,7 +127,7 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     ))
 }
 
-type DecodeLightBlockResult = Result<(ConsensusState, TmLightBlock), PrecompileError>;
+type DecodeLightBlockResult = Result<(ConsensusState, TmLightBlock), PrecompileHalt>;
 fn decode_light_block_validation_input(input: &[u8]) -> DecodeLightBlockResult {
     let input_length = input.len() as u64;
     if input_length < CONSENSUS_STATE_LENGTH_BYTES_LENGTH {
@@ -180,7 +190,7 @@ impl ConsensusState {
         }
     }
 
-    fn apply_light_block(&mut self, light_block: &LightBlock) -> Result<bool, PrecompileError> {
+    fn apply_light_block(&mut self, light_block: &LightBlock) -> Result<bool, PrecompileHalt> {
         if light_block.height().value() <= self.height {
             return Err(BscPrecompileError::InvalidInput.into());
         }
@@ -255,7 +265,7 @@ impl ConsensusState {
         Ok(validator_set_changed)
     }
 
-    fn encode(&self) -> Result<Bytes, PrecompileError> {
+    fn encode(&self) -> Result<Bytes, PrecompileHalt> {
         let validator_set_length = self.validators.validators().len();
         let serialize_length = (CHAIN_ID_LENGTH
             + HEIGHT_LENGTH
@@ -313,7 +323,7 @@ impl ConsensusState {
     }
 }
 
-type DecodeConsensusStateResult = Result<ConsensusState, PrecompileError>;
+type DecodeConsensusStateResult = Result<ConsensusState, PrecompileHalt>;
 /// input:
 /// | chainID   | height   | nextValidatorSetHash | [{validator pubkey, voting power, relayer address, relayer bls pubkey}] |
 /// | 32 bytes  | 8 bytes  | 32 bytes             | [{32 bytes, 8 bytes, 20 bytes, 48 bytes}]
@@ -420,18 +430,14 @@ mod tests {
             ));
 
             let result = cometbft_light_block_validation_run(&input, 100_000);
-            let PrecompileOutput {
-                gas_used,
-                bytes,
-                reverted,
-                ..
+            let EthPrecompileOutput {
+                gas_used, bytes, ..
             } = match result {
                 Ok(output) => output,
                 Err(_) => panic!("cometbft_light_block_validation_run failed"),
             };
             assert_eq!(gas_used, 3_000);
             assert_eq!(bytes, except_output);
-            assert!(!reverted);
         }
         // apply light block failed
         {
@@ -729,17 +735,13 @@ mod tests {
         ));
 
         let result = cometbft_light_block_validation_run_before_hertz(&input, 100_000);
-        let PrecompileOutput {
-            gas_used,
-            bytes,
-            reverted,
-            ..
+        let EthPrecompileOutput {
+            gas_used, bytes, ..
         } = match result {
             Ok(output) => output,
             Err(_) => panic!("cometbft_light_block_validation_run failed"),
         };
         assert_eq!(gas_used, 3_000);
         assert_eq!(bytes, except_output_after_hertz);
-        assert!(!reverted);
     }
 }

@@ -13,10 +13,15 @@ use revm::{
         transaction::TransactionType,
         Cfg, ContextError, ContextTr, LocalContextTr, Transaction,
     },
-    context_interface::{journaled_state::account::JournaledAccountTr, result::InvalidHeader, transaction::eip7702::AuthorizationTr, Block, JournalTr},
+    context_interface::{
+        journaled_state::account::JournaledAccountTr, result::InvalidHeader,
+        transaction::eip7702::AuthorizationTr, Block, JournalTr,
+    },
     handler::{EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
-    interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
+    interpreter::{
+        interpreter::EthInterpreter, GasTracker, Host, InitialAndFloorGas, SuccessOrHalt,
+    },
     primitives::hardfork::SpecId,
 };
 
@@ -71,12 +76,16 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     // https://github.com/bluealloy/revm/blob/df467931c4b1b8b620ff2cb9f62501c7abc3ea03/crates/handler/src/pre_execution.rs#L186
     // with slight modifications to support BSC specific validation.
     // https://github.com/bnb-chain/bsc/blob/develop/core/state_transition.go#L593
-    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn apply_eip7702_auth_list(
+        &self,
+        evm: &mut Self::Evm,
+        _gas: &mut GasTracker,
+    ) -> Result<Option<u64>, Self::Error> {
         let ctx = evm.ctx_ref();
         let tx = ctx.tx();
 
         if tx.tx_type() != TransactionType::Eip7702 {
-            return Ok(0);
+            return Ok(Some(0));
         }
 
         let chain_id = evm.ctx().cfg().chain_id();
@@ -128,7 +137,8 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
             // 7. Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the global refund counter
             //    if `authority` exists in the trie.
-            if !(authority_acc.data.is_empty() && authority_acc.data.is_loaded_as_not_existing_not_touched())
+            if !(authority_acc.data.is_empty()
+                && authority_acc.data.is_loaded_as_not_existing_not_touched())
             {
                 refunded_accounts += 1;
             }
@@ -149,7 +159,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let refunded_gas =
             refunded_accounts * (eip7702::PER_EMPTY_ACCOUNT_COST - eip7702::PER_AUTH_BASE_COST);
 
-        Ok(refunded_gas)
+        Ok(Some(refunded_gas))
     }
 
     fn validate_initial_tx_gas(
@@ -160,10 +170,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let tx = ctx.tx();
 
         if tx.is_system_transaction {
-            return Ok(InitialAndFloorGas {
-                initial_gas: 0,
-                floor_gas: 0,
-            });
+            return Ok(InitialAndFloorGas::new(0, 0));
         }
 
         self.mainnet.validate_initial_tx_gas(evm)
@@ -183,7 +190,9 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
         let effective_gas_price = ctx.effective_gas_price();
         let gas = exec_result.gas();
-        let mut tx_fee = U256::from(gas.spent() - gas.refunded() as u64) * effective_gas_price;
+        // Exclude reservoir gas (EIP-8037) from the used gas — reservoir is unused and reimbursed.
+        let effective_used = gas.used().saturating_sub(gas.reservoir());
+        let mut tx_fee = U256::from(effective_used) * effective_gas_price;
 
         // EIP-4844
         let is_cancun = SpecId::from(ctx.cfg().spec().clone()).is_enabled_in(SpecId::CANCUN);
@@ -213,7 +222,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
         // For system transactions, zero out refund.
         if evm.ctx().tx().is_system_transaction {
-            result_gas = ResultGas::new(result_gas.limit(), result_gas.spent(), 0, 0, 0);
+            result_gas = result_gas.with_refunded(0).with_floor_gas(0);
         }
 
         let output = result.output();

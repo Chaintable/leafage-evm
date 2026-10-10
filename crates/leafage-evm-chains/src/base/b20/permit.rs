@@ -4,6 +4,11 @@
 //! The domain is the canonical four-field shape `(name, version, chainId, verifyingContract)`
 //! with `version` pinned to `"1"`, and `name` read live from storage — so a successful
 //! `updateName` invalidates outstanding signatures.
+//!
+//! Cobalt meters the cryptography (Base #4891, Cantina #20): every keccak in the domain
+//! separator and signing digest is charged at the EVM `KECCAK256` schedule before hashing, and
+//! signer recovery is charged the `ECRECOVER` base cost up front, before `v` is even checked.
+//! Beryl's gas schedule is frozen, so there all of this stays free.
 
 use alloy::primitives::{b256, keccak256, Address, B256, FixedBytes, Signature, U256};
 use alloy::sol_types::SolValue;
@@ -13,6 +18,22 @@ use super::error::{B20Error, Result};
 use super::layout::{checked_add, B20Store};
 use super::ops::approve;
 use super::port::B20Port;
+
+/// EVM `KECCAK256` base cost.
+const KECCAK256_GAS: u64 = 30;
+/// EVM `KECCAK256` cost per 32-byte word.
+const KECCAK256_WORD_GAS: u64 = 6;
+/// Flat signer-recovery charge, priced to the `ECRECOVER` precompile (Cobalt).
+pub const RECOVER_GAS: u64 = 3000;
+
+/// `keccak256(data)`, charging the EVM schedule first when `metered`.
+fn hash<P: B20Port>(store: &mut B20Store<'_, P>, metered: bool, data: &[u8]) -> Result<B256> {
+    if metered {
+        let words = data.len().div_ceil(32) as u64;
+        store.port().deduct_gas(KECCAK256_GAS + KECCAK256_WORD_GAS * words)?;
+    }
+    Ok(keccak256(data))
+}
 
 /// `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`
 const DOMAIN_TYPEHASH: B256 =
@@ -56,22 +77,24 @@ pub struct PermitArgs {
 }
 
 impl PermitArgs {
-    /// Hashes the EIP-2612 `Permit` struct for `nonce`.
-    fn struct_hash(&self, nonce: U256) -> B256 {
-        keccak256(
+    /// `keccak256("\x19\x01" ++ domainSeparator ++ keccak256(Permit struct))`: two keccak
+    /// rounds, both metered when `metered`.
+    fn signing_hash<P: B20Port>(
+        &self,
+        store: &mut B20Store<'_, P>,
+        metered: bool,
+        domain_separator: B256,
+        nonce: U256,
+    ) -> Result<B256> {
+        let encoded =
             (PERMIT_TYPEHASH, self.owner, self.spender, self.value, nonce, self.deadline)
-                .abi_encode(),
-        )
-    }
-
-    /// `keccak256("\x19\x01" ++ domainSeparator ++ structHash)`.
-    fn signing_hash(&self, domain_separator: B256, nonce: U256) -> B256 {
-        let struct_hash = self.struct_hash(nonce);
+                .abi_encode();
+        let struct_hash = hash(store, metered, &encoded)?;
         let mut buf = [0u8; 66];
         buf[..2].copy_from_slice(&EIP712_SIGNING_PREFIX);
         buf[2..34].copy_from_slice(domain_separator.as_slice());
         buf[34..66].copy_from_slice(struct_hash.as_slice());
-        keccak256(buf)
+        hash(store, metered, &buf)
     }
 
     fn invalid_signer(&self) -> B20Error {
@@ -98,15 +121,17 @@ impl PermitArgs {
     }
 }
 
-/// Computes this token's EIP-712 domain separator.
+/// Computes this token's EIP-712 domain separator. Cobalt meters its three keccak rounds —
+/// including when it is only read through `DOMAIN_SEPARATOR()`.
 pub fn domain_separator<P: B20Port>(store: &mut B20Store<'_, P>, chain_id: u64) -> Result<B256> {
+    let metered = store.version().is_cobalt();
     let name = store.name()?;
-    let name_hash = keccak256(name.as_bytes());
-    let version_hash = keccak256(VERSION);
+    let name_hash = hash(store, metered, name.as_bytes())?;
+    let version_hash = hash(store, metered, VERSION)?;
     let address = store.address();
-    Ok(keccak256(
-        (DOMAIN_TYPEHASH, name_hash, version_hash, U256::from(chain_id), address).abi_encode(),
-    ))
+    let encoded =
+        (DOMAIN_TYPEHASH, name_hash, version_hash, U256::from(chain_id), address).abi_encode();
+    hash(store, metered, &encoded)
 }
 
 /// Returns the ERC-5267 `eip712Domain()` tuple.
@@ -139,13 +164,19 @@ pub fn permit<P: B20Port>(
         return Err(B20Error::revert(IB20::ExpiredSignature { deadline: args.deadline }));
     }
 
+    let metered = store.version().is_cobalt();
     let domain_sep = domain_separator(store, chain_id)?;
     let nonce = store.nonce(args.owner)?;
-    let signing_hash = args.signing_hash(domain_sep, nonce);
+    let signing_hash = args.signing_hash(store, metered, domain_sep, nonce)?;
+    if metered {
+        store.port().deduct_gas(RECOVER_GAS)?;
+    }
     let recovered = args.recover_signer(signing_hash)?;
     PermitArgs::validate_recovered_address(recovered, args.owner)?;
 
-    store.set_nonce(args.owner, checked_add(nonce, U256::ONE)?)?;
+    // Base's `increment_nonce` re-reads the nonce (a warm SLOAD) rather than reusing `nonce`.
+    let current = store.nonce(args.owner)?;
+    store.set_nonce(args.owner, checked_add(current, U256::ONE)?)?;
     approve(store, args.owner, args.spender, args.value)
 }
 

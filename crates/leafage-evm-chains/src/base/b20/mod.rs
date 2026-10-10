@@ -11,6 +11,10 @@
 //! reads *and* writes — and, critically, meters gas per storage access rather than charging
 //! a flat fee, so `estimateGas` over a B20 address agrees with a real Base node.
 //!
+//! Both token logic versions are ported — Beryl (V1) and Cobalt (V2) — and the version is
+//! resolved per call from the executing block's chain ID and timestamp ([`B20Version`]),
+//! exactly as Base routes by hardfork.
+//!
 //! Why a port rather than a dependency on Base's crate: `base-common-precompiles` is built
 //! against revm 40 / alloy-evm 0.36, leafage against revm 36 / alloy-evm 0.29, and there is
 //! no published `op-revm` for revm 40 (the latest, 20.0.0, requires revm ^38) — leafage's
@@ -32,13 +36,21 @@ mod ops;
 mod permit;
 mod policy;
 mod port;
+mod version;
 
-pub use abi::{IB20, IB20Asset, IB20Stablecoin};
+#[cfg(test)]
+mod golden;
+
+pub use abi::{IB20, IB20Asset, IB20AssetV1, IB20Stablecoin, IB20V1};
 pub use dispatch::{calldata_gas_cost, dispatch, B20Outcome};
 pub use error::{B20Error, Result};
 pub use layout::{B20Store, PolicySlot, ASSET_MIN_DECIMALS, STABLECOIN_DECIMALS, WAD};
 pub use policy::POLICY_REGISTRY;
 pub use port::B20Port;
+pub use version::{
+    B20Version, BASE_MAINNET_CHAIN_ID, BASE_MAINNET_COBALT_TIMESTAMP, BASE_SEPOLIA_CHAIN_ID,
+    BASE_SEPOLIA_COBALT_TIMESTAMP,
+};
 
 use alloy::primitives::Address;
 

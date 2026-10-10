@@ -95,7 +95,7 @@ where
     fn storage_by_account_id_ref(
         &self,
         address: Address,
-        account_id: usize,
+        account_id: revm::state::AccountId,
         storage_key: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
         self.0
@@ -431,7 +431,7 @@ impl<DB> ArbitrumApiImpl<DB> {
 
         Ok(ExecutionResult::Success {
             reason: SuccessReason::Return,
-            gas: ResultGas::new(tx.gas_limit(), gas_used, 0, 0, 0),
+            gas: ResultGas::default().with_total_gas_spent(gas_used),
             logs: Vec::new(),
             output: Output::Call(output),
         })
@@ -530,6 +530,9 @@ impl<DB> ArbitrumApiImpl<DB> {
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
+        if self.is_classic() {
+            return Ok(None);
+        }
         let TxKind::Call(to) = tx.kind() else {
             return Ok(None);
         };
@@ -812,7 +815,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         };
 
         highest_gas_limit = tx.gas_limit();
-        let gas_used = res.gas_used();
+        let gas_used = res.tx_gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
         let optimistic_gas_limit = ((gas_used as u128)
             .saturating_add(gas_refund as u128)

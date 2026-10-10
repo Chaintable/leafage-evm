@@ -29,6 +29,7 @@ mod core;
 pub use core::MultiChainCfgEnv;
 pub(crate) use core::{ApiCore, EvmExecutor, GasFeeHandler};
 
+mod arc;
 mod mainnet;
 
 mod arbitrum;
@@ -42,7 +43,9 @@ mod mantle;
 mod monad;
 mod moonbeam;
 mod op;
+pub use op::build_op_custom_config;
 mod polygon;
+mod rsk;
 mod tempo;
 mod warmup;
 

@@ -6,19 +6,28 @@
 //! because every storage touch is metered — it decides the gas a succeeding call costs.
 //! Reordering a guard here silently changes both. Base pins the ordering with its
 //! `*_check_order` / `*_guard_ordering` tests; the equivalents live in `tests` below.
+//!
+//! Base keeps Beryl (`logic/v1.rs`) and Cobalt (`logic/v2.rs`) as separate frozen copies.
+//! Here the two share one body and branch on [`B20Store::version`] exactly where Base's
+//! copies differ; everything not branched is identical in both versions.
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::sol_types::SolEvent;
 
-use super::abi::{IB20, IB20Asset};
+use super::abi::{IB20, IB20Asset, ERC165_INTERFACE_ID, ERC8056_INTERFACE_IDS};
 use super::error::{B20Error, Result};
 use super::ids;
-use super::layout::{checked_add, checked_sub, checked_mul, B20Store, PolicySlot, WAD};
+use super::layout::{checked_add, checked_mul, checked_sub, B20Store, PolicySlot, WAD};
 use super::policy;
 use super::port::B20Port;
+use super::version::B20Version;
 
 /// Maximum total supply for a B20 token: `2^128 - 1`.
 pub const B20_MAX_SUPPLY_CAP: U256 = U256::from_limbs([u64::MAX, u64::MAX, 0, 0]);
+
+/// Largest multiplier the Cobalt setters accept: `type(uint128).max`. With supply capped at
+/// `2^128 - 1`, a `uint128` multiplier keeps `balance * multiplier` inside `uint256`.
+pub const MAX_UI_MULTIPLIER: U256 = U256::from_limbs([u64::MAX, u64::MAX, 0, 0]);
 
 // --- Guards ---
 
@@ -61,18 +70,48 @@ pub fn ensure_policy<P: B20Port>(
     account: Address,
 ) -> Result<()> {
     let policy_id = store.policy_id(slot_kind)?;
-    if policy::is_authorized(store.port(), policy_id, account)? {
+    ensure_authorized_by_id(store, scope, policy_id, account)
+}
+
+/// [`ensure_policy`] with the ID already read — Cobalt reads the three transfer IDs from their
+/// shared slot once and checks each against it.
+fn ensure_authorized_by_id<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    scope: B256,
+    policy_id: u64,
+    account: Address,
+) -> Result<()> {
+    if is_authorized(store, policy_id, account)? {
         Ok(())
     } else {
         Err(B20Error::revert(IB20::PolicyForbids { policyScope: scope, policyId: policy_id }))
     }
 }
 
+fn is_authorized<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    policy_id: u64,
+    account: Address,
+) -> Result<bool> {
+    let version = store.version();
+    policy::is_authorized(store.port(), policy_id, account, version)
+}
+
 /// Reverts unless `account` is *denied* by the transfer-sender policy.
 pub fn ensure_blocked<P: B20Port>(store: &mut B20Store<'_, P>, account: Address) -> Result<()> {
     let policy_id = store.policy_id(PolicySlot::TransferSender)?;
-    if policy::is_authorized(store.port(), policy_id, account)? {
+    if is_authorized(store, policy_id, account)? {
         Err(B20Error::revert(IB20::AccountNotBlocked { account }))
+    } else {
+        Ok(())
+    }
+}
+
+/// Reverts unless `account` is seizable, i.e. *not* authorized by the seize-exempt policy.
+pub fn ensure_seizable<P: B20Port>(store: &mut B20Store<'_, P>, account: Address) -> Result<()> {
+    let policy_id = store.policy_id(PolicySlot::SeizeExempt)?;
+    if is_authorized(store, policy_id, account)? {
+        Err(B20Error::revert(IB20::AccountNotSeizable { account }))
     } else {
         Ok(())
     }
@@ -94,28 +133,69 @@ pub fn transfer<P: B20Port>(
     privileged: bool,
 ) -> Result<()> {
     ensure_not_paused(store, IB20::PausableFeature::TRANSFER)?;
-    transfer_inner(store, from, to, amount, privileged)
+    match store.version() {
+        B20Version::V1 => transfer_inner_v1(store, from, to, amount, privileged),
+        B20Version::V2 => {
+            ensure_parties(from, to)?;
+            if privileged {
+                return move_balance(store, from, to, amount);
+            }
+            let policies = store.transfer_policy_ids()?;
+            check_transfer_parties(store, from, to, policies.sender, policies.receiver)?;
+            move_balance(store, from, to, amount)
+        }
+    }
 }
 
-/// Transfer body, without the pause check (`transfer_from` runs its own first).
-fn transfer_inner<P: B20Port>(
-    store: &mut B20Store<'_, P>,
-    from: Address,
-    to: Address,
-    amount: U256,
-    privileged: bool,
-) -> Result<()> {
+/// Cobalt's zero-address checks, hoisted ahead of every policy SLOAD (Base #4823). Receiver
+/// first, like Beryl.
+fn ensure_parties(from: Address, to: Address) -> Result<()> {
     if to == Address::ZERO {
         return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
     }
     if from == Address::ZERO {
         return Err(B20Error::revert(IB20::InvalidSender { sender: from }));
     }
+    Ok(())
+}
+
+/// Cobalt's sender/receiver policy checks against pre-read IDs.
+fn check_transfer_parties<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    from: Address,
+    to: Address,
+    sender_policy: u64,
+    receiver_policy: u64,
+) -> Result<()> {
+    ensure_authorized_by_id(store, ids::TRANSFER_SENDER_POLICY, sender_policy, from)?;
+    ensure_authorized_by_id(store, ids::TRANSFER_RECEIVER_POLICY, receiver_policy, to)
+}
+
+/// Beryl transfer body, without the pause check (`transfer_from` runs its own first). Each
+/// policy check re-reads the packed policy slot — cold, then warm.
+fn transfer_inner_v1<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    from: Address,
+    to: Address,
+    amount: U256,
+    privileged: bool,
+) -> Result<()> {
+    ensure_parties(from, to)?;
     if !privileged {
         ensure_policy(store, PolicySlot::TransferSender, ids::TRANSFER_SENDER_POLICY, from)?;
         ensure_policy(store, PolicySlot::TransferReceiver, ids::TRANSFER_RECEIVER_POLICY, to)?;
     }
+    move_balance(store, from, to, amount)
+}
 
+/// Debits `from`, credits `to`, and emits `Transfer`. No pause, policy, allowance or
+/// zero-address checks — callers apply their own. Shared with seize.
+fn move_balance<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    from: Address,
+    to: Address,
+    amount: U256,
+) -> Result<()> {
     let from_balance = store.balance_of(from)?;
     if from_balance < amount {
         return Err(B20Error::revert(IB20::InsufficientBalance {
@@ -144,12 +224,7 @@ pub fn transfer_from<P: B20Port>(
     privileged: bool,
 ) -> Result<()> {
     ensure_not_paused(store, IB20::PausableFeature::TRANSFER)?;
-    if to == Address::ZERO {
-        return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
-    }
-    if from == Address::ZERO {
-        return Err(B20Error::revert(IB20::InvalidSender { sender: from }));
-    }
+    ensure_parties(from, to)?;
 
     let allowance = store.allowance(from, spender)?;
     let is_infinite = allowance == U256::MAX;
@@ -160,13 +235,37 @@ pub fn transfer_from<P: B20Port>(
             needed: amount,
         }));
     }
-    // Runs even for an infinite allowance: an unlimited approval does not exempt the
-    // executor from the policy.
-    if !privileged && spender != from {
-        ensure_policy(store, PolicySlot::TransferExecutor, ids::TRANSFER_EXECUTOR_POLICY, spender)?;
+    // The executor check runs even for an infinite allowance: an unlimited approval does not
+    // exempt the executor from the policy.
+    match store.version() {
+        B20Version::V1 => {
+            if !privileged && spender != from {
+                ensure_policy(
+                    store,
+                    PolicySlot::TransferExecutor,
+                    ids::TRANSFER_EXECUTOR_POLICY,
+                    spender,
+                )?;
+            }
+            transfer_inner_v1(store, from, to, amount, privileged)?;
+        }
+        B20Version::V2 => {
+            if !privileged {
+                // One SLOAD serves the executor, sender and receiver checks.
+                let policies = store.transfer_policy_ids()?;
+                if spender != from {
+                    ensure_authorized_by_id(
+                        store,
+                        ids::TRANSFER_EXECUTOR_POLICY,
+                        policies.executor,
+                        spender,
+                    )?;
+                }
+                check_transfer_parties(store, from, to, policies.sender, policies.receiver)?;
+            }
+            move_balance(store, from, to, amount)?;
+        }
     }
-
-    transfer_inner(store, from, to, amount, privileged)?;
 
     if is_infinite {
         return Ok(());
@@ -329,6 +428,35 @@ pub fn burn_blocked<P: B20Port>(
     emit(store, IB20::BurnedBlocked { caller, from, amount }.encode_log_data())
 }
 
+// --- Seize (Cobalt) ---
+
+/// Reassigns `amount` from `from` to `to` without touching supply. Requires `SEIZE_ROLE`.
+///
+/// Bypasses the transfer policies and allowances, and is never factory-privileged. The holder
+/// gate (`SEIZE_EXEMPT_POLICY`) outranks the destination gate (`SEIZE_RECEIVER_POLICY`), which
+/// outranks the balance check. Emits `Transfer`, then `Memo`, then `Seized`.
+pub fn seize_with_memo<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    caller: Address,
+    from: Address,
+    to: Address,
+    amount: U256,
+    memo: B256,
+) -> Result<()> {
+    ensure_not_paused(store, IB20::PausableFeature::SEIZE)?;
+    ensure_role(store, caller, ids::SEIZE_ROLE)?;
+    // `to != 0` rules out a disguised burn, `from != 0` a disguised mint.
+    ensure_parties(from, to)?;
+    if from == to {
+        return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
+    }
+    ensure_seizable(store, from)?;
+    ensure_policy(store, PolicySlot::SeizeReceiver, ids::SEIZE_RECEIVER_POLICY, to)?;
+    move_balance(store, from, to, amount)?;
+    emit(store, IB20::Memo { caller, memo }.encode_log_data())?;
+    emit(store, IB20::Seized { caller, from, to, amount }.encode_log_data())
+}
+
 // --- Pause ---
 
 /// Whether `feature` is currently paused.
@@ -336,7 +464,7 @@ pub fn is_paused<P: B20Port>(
     store: &mut B20Store<'_, P>,
     feature: IB20::PausableFeature,
 ) -> Result<bool> {
-    ensure_valid_feature(feature)?;
+    ensure_valid_feature(feature, store.version())?;
     Ok(!(store.paused()? & ids::pause_mask(feature)).is_zero())
 }
 
@@ -345,16 +473,21 @@ pub fn paused_features<P: B20Port>(
     store: &mut B20Store<'_, P>,
 ) -> Result<Vec<IB20::PausableFeature>> {
     let paused = store.paused()?;
-    Ok(ids::PAUSABLE_FEATURES
-        .into_iter()
+    Ok(ids::pausable_features(store.version())
+        .iter()
+        .copied()
         .filter(|f| !(paused & ids::pause_mask(*f)).is_zero())
         .collect())
 }
 
-fn ensure_valid_feature(feature: IB20::PausableFeature) -> Result<()> {
-    match feature {
-        IB20::PausableFeature::__Invalid => Err(B20Error::empty_revert()),
-        _ => Ok(()),
+/// Base's `B20PausableFeature::ensure_one_of`: a feature outside the version's set is a
+/// Solidity enum-conversion panic. The frozen ABI gate already rejects such values at decode,
+/// so this is defence in depth.
+fn ensure_valid_feature(feature: IB20::PausableFeature, version: B20Version) -> Result<()> {
+    if ids::pausable_features(version).contains(&feature) {
+        Ok(())
+    } else {
+        Err(B20Error::enum_conversion())
     }
 }
 
@@ -366,7 +499,7 @@ pub fn pause<P: B20Port>(
     privileged: bool,
 ) -> Result<()> {
     for feature in &features {
-        ensure_valid_feature(*feature)?;
+        ensure_valid_feature(*feature, store.version())?;
     }
     if !privileged {
         ensure_role(store, caller, ids::PAUSE_ROLE)?;
@@ -390,7 +523,7 @@ pub fn unpause<P: B20Port>(
     privileged: bool,
 ) -> Result<()> {
     for feature in &features {
-        ensure_valid_feature(*feature)?;
+        ensure_valid_feature(*feature, store.version())?;
     }
     if !privileged {
         ensure_role(store, caller, ids::UNPAUSE_ROLE)?;
@@ -481,7 +614,7 @@ pub fn update_contract_uri<P: B20Port>(
 
 /// Reads the policy ID for `scope`, rejecting unknown scopes.
 pub fn policy_id<P: B20Port>(store: &mut B20Store<'_, P>, scope: B256) -> Result<u64> {
-    let slot_kind = ids::require_policy_slot(scope)?;
+    let slot_kind = ids::require_policy_slot(scope, store.version())?;
     store.policy_id(slot_kind)
 }
 
@@ -496,11 +629,22 @@ pub fn update_policy<P: B20Port>(
     if !privileged {
         ensure_role(store, caller, ids::DEFAULT_ADMIN_ROLE)?;
     }
-    let slot_kind = ids::require_policy_slot(scope)?;
-    if !policy::policy_exists(store.port(), new_policy_id)? {
+    let slot_kind = ids::require_policy_slot(scope, store.version())?;
+    let version = store.version();
+    // Beryl's stablecoin reads the old ID *before* the existence check (Base #4596), so its
+    // `PolicyNotFound` revert costs one more SLOAD. Every other variant/version checks first.
+    let old_first = version == B20Version::V1 && !store.is_asset();
+    let mut old = None;
+    if old_first {
+        old = Some(store.policy_id(slot_kind)?);
+    }
+    if !policy::policy_exists(store.port(), new_policy_id, version)? {
         return Err(B20Error::revert(IB20::PolicyNotFound { policyId: new_policy_id }));
     }
-    let old = store.policy_id(slot_kind)?;
+    let old = match old {
+        Some(old) => old,
+        None => store.policy_id(slot_kind)?,
+    };
     store.set_policy_id(slot_kind, new_policy_id)?;
     emit(
         store,
@@ -682,18 +826,35 @@ pub fn set_role_admin<P: B20Port>(
 
 // --- Asset multiplier ---
 
+/// The multiplier in force now.
+///
+/// Beryl reads the stored value. Cobalt flips lazily: once a scheduled update's
+/// `effective_at` has passed, the pending target is in force even though no transaction has
+/// written it to the multiplier slot yet.
+pub fn effective_multiplier<P: B20Port>(store: &mut B20Store<'_, P>) -> Result<U256> {
+    if store.version().is_cobalt() {
+        let now = store.port().timestamp();
+        let effective_at = store.pending_effective_at()?;
+        if effective_at != 0 && now >= U256::from(effective_at) {
+            // Both setters reject zero, so a matured pending is never zero; Base returns it raw.
+            return Ok(U256::from(store.pending_multiplier()?));
+        }
+    }
+    store.multiplier()
+}
+
 /// `rawBalance * multiplier / WAD`.
 pub fn to_scaled_balance<P: B20Port>(
     store: &mut B20Store<'_, P>,
     balance: U256,
 ) -> Result<U256> {
-    let multiplier = store.multiplier()?;
+    let multiplier = effective_multiplier(store)?;
     Ok(checked_mul(balance, multiplier)? / WAD)
 }
 
 /// `scaledBalance * WAD / multiplier`.
 pub fn to_raw_balance<P: B20Port>(store: &mut B20Store<'_, P>, balance: U256) -> Result<U256> {
-    let multiplier = store.multiplier()?;
+    let multiplier = effective_multiplier(store)?;
     Ok(checked_mul(balance, WAD)? / multiplier)
 }
 
@@ -706,21 +867,172 @@ pub fn scaled_balance_of<P: B20Port>(
     to_scaled_balance(store, balance)
 }
 
-/// Sets a new multiplier. Requires `OPERATOR_ROLE`.
+/// `totalSupply() * multiplier / WAD` (Cobalt). Reads the multiplier before the supply.
+pub fn total_supply_ui<P: B20Port>(store: &mut B20Store<'_, P>) -> Result<U256> {
+    let multiplier = effective_multiplier(store)?;
+    let supply = store.total_supply()?;
+    Ok(checked_mul(supply, multiplier)? / WAD)
+}
+
+/// The scheduled target while an update is still pending, otherwise the multiplier in force
+/// (Cobalt).
+pub fn new_ui_multiplier<P: B20Port>(store: &mut B20Store<'_, P>) -> Result<U256> {
+    let now = store.port().timestamp();
+    let effective_at = store.pending_effective_at()?;
+    if U256::from(effective_at) > now {
+        return Ok(U256::from(store.pending_multiplier()?));
+    }
+    effective_multiplier(store)
+}
+
+/// The scheduled flip timestamp; stays at a past value after maturing until overwritten
+/// (Cobalt).
+pub fn effective_at<P: B20Port>(store: &mut B20Store<'_, P>) -> Result<U256> {
+    Ok(U256::from(store.pending_effective_at()?))
+}
+
+/// ERC-165 over ERC-165 itself and the four ERC-8056 interfaces (Cobalt). No storage.
+pub fn supports_interface(interface_id: alloy::primitives::FixedBytes<4>) -> bool {
+    interface_id == ERC165_INTERFACE_ID || ERC8056_INTERFACE_IDS.contains(&interface_id)
+}
+
+/// Sets a new multiplier immediately. Requires `OPERATOR_ROLE`.
+///
+/// Cobalt keeps it as a failsafe: it also bounds the value at `MAX_UI_MULTIPLIER`, clears any
+/// schedule (emitting `UIMultiplierUpdateCancelled` if one was still pending), and emits the
+/// ERC-8056 `UIMultiplierUpdated` after the legacy `MultiplierUpdated`.
 pub fn update_multiplier<P: B20Port>(
     store: &mut B20Store<'_, P>,
     caller: Address,
     new_multiplier: U256,
     privileged: bool,
 ) -> Result<()> {
+    if !store.version().is_cobalt() {
+        if !privileged {
+            ensure_role(store, caller, ids::OPERATOR_ROLE)?;
+        }
+        if new_multiplier.is_zero() {
+            return Err(B20Error::revert(IB20Asset::InvalidMultiplier {}));
+        }
+        store.set_multiplier(new_multiplier)?;
+        return emit(
+            store,
+            IB20Asset::MultiplierUpdated { multiplier: new_multiplier }.encode_log_data(),
+        );
+    }
+
+    let now = store.port().timestamp();
     if !privileged {
         ensure_role(store, caller, ids::OPERATOR_ROLE)?;
     }
-    if new_multiplier.is_zero() {
+    if new_multiplier.is_zero() || new_multiplier > MAX_UI_MULTIPLIER {
         return Err(B20Error::revert(IB20Asset::InvalidMultiplier {}));
     }
+    let pending_multiplier = U256::from(store.pending_multiplier()?);
+    let pending_effective_at = U256::from(store.pending_effective_at()?);
+    let live_pending = pending_effective_at > now;
+
+    let old = effective_multiplier(store)?;
     store.set_multiplier(new_multiplier)?;
-    emit(store, IB20Asset::MultiplierUpdated { multiplier: new_multiplier }.encode_log_data())
+    if !pending_effective_at.is_zero() {
+        store.set_pending(0, 0)?;
+    }
+    if live_pending {
+        emit(
+            store,
+            IB20Asset::UIMultiplierUpdateCancelled {
+                cancelledMultiplier: pending_multiplier,
+                cancelledEffectiveAt: pending_effective_at,
+            }
+            .encode_log_data(),
+        )?;
+    }
+    emit(store, IB20Asset::MultiplierUpdated { multiplier: new_multiplier }.encode_log_data())?;
+    emit(
+        store,
+        IB20Asset::UIMultiplierUpdated {
+            oldMultiplier: old,
+            newMultiplier: new_multiplier,
+            effectiveAtTimestamp: now,
+        }
+        .encode_log_data(),
+    )
+}
+
+/// Schedules `new_multiplier` to take effect at `effective_at` (Cobalt). Requires
+/// `OPERATOR_ROLE`. A still-pending schedule blocks a new one; a matured one is first folded
+/// into the multiplier slot.
+pub fn update_ui_multiplier<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    caller: Address,
+    new_multiplier: U256,
+    effective_at: U256,
+    privileged: bool,
+) -> Result<()> {
+    let now = store.port().timestamp();
+    if !privileged {
+        ensure_role(store, caller, ids::OPERATOR_ROLE)?;
+    }
+    if new_multiplier.is_zero() || new_multiplier > MAX_UI_MULTIPLIER {
+        return Err(B20Error::revert(IB20Asset::InvalidMultiplier {}));
+    }
+    if effective_at <= now {
+        return Err(B20Error::revert(IB20Asset::EffectiveAtInPast { effectiveAt: effective_at }));
+    }
+    if effective_at > U256::from(u64::MAX) {
+        return Err(B20Error::revert(IB20Asset::EffectiveAtTooFar { effectiveAt: effective_at }));
+    }
+
+    let pending_effective_at = store.pending_effective_at()?;
+    if U256::from(pending_effective_at) > now {
+        return Err(B20Error::revert(IB20Asset::UIMultiplierUpdateExists {
+            effectiveAt: U256::from(pending_effective_at),
+        }));
+    }
+    if pending_effective_at != 0 {
+        let matured = U256::from(store.pending_multiplier()?);
+        store.set_multiplier(matured)?;
+    }
+
+    let old = store.multiplier()?;
+    // The guards above bound both values to their storage widths.
+    store.set_pending(new_multiplier.to::<u128>(), effective_at.to::<u64>())?;
+    emit(
+        store,
+        IB20Asset::UIMultiplierUpdated {
+            oldMultiplier: old,
+            newMultiplier: new_multiplier,
+            effectiveAtTimestamp: effective_at,
+        }
+        .encode_log_data(),
+    )
+}
+
+/// Cancels a still-pending schedule (Cobalt). Requires `OPERATOR_ROLE`. A schedule maturing
+/// at exactly `now` has already taken effect and is not cancellable.
+pub fn cancel_ui_multiplier_update<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    caller: Address,
+    privileged: bool,
+) -> Result<()> {
+    let now = store.port().timestamp();
+    if !privileged {
+        ensure_role(store, caller, ids::OPERATOR_ROLE)?;
+    }
+    let pending_multiplier = U256::from(store.pending_multiplier()?);
+    let pending_effective_at = U256::from(store.pending_effective_at()?);
+    if pending_effective_at <= now {
+        return Err(B20Error::revert(IB20Asset::UIMultiplierUpdateDoesNotExist {}));
+    }
+    store.set_pending(0, 0)?;
+    emit(
+        store,
+        IB20Asset::UIMultiplierUpdateCancelled {
+            cancelledMultiplier: pending_multiplier,
+            cancelledEffectiveAt: pending_effective_at,
+        }
+        .encode_log_data(),
+    )
 }
 
 /// Sets, updates, or removes an extra-metadata entry. Requires `METADATA_ROLE`.

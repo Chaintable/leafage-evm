@@ -1085,6 +1085,7 @@ where
                 index: Some(tx_index),
                 block_hash: Some(block.header.hash),
                 block_number: Some(block.header.number),
+                block_timestamp: Some(block.header.timestamp),
                 base_fee: block.header.base_fee_per_gas,
             };
             tx_index += 1;
@@ -1098,13 +1099,14 @@ where
                 .set_record_logs(true)
                 .set_steps(true);
             trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-            let tx = self.inner.create_txn_env(
+            let mut tx = self.inner.create_txn_env(
                 &block,
                 &block_env,
                 tx,
                 &memory_db,
                 self.inner.evm_cfg().cfg.chain_id,
             )?;
+            tx.set_stateful_simulation_context(block.header.hash, tx_info.index.unwrap());
             let (exec_res, (traces, events)) = self
                 .inner
                 .inspect_tx_commit(
@@ -1188,17 +1190,13 @@ where
         // Ethereum EIP-7825 cap from Osaka when the raw field is None; Arbitrum
         // is explicitly exempt and enforces its state-derived limit in its handler.
         let chain_spec: EthSpecId = cfg.spec().clone().into();
-        let consensus_cap = self.inner.consensus_tx_gas_limit_cap(chain_spec);
+        let consensus_cap = self
+            .inner
+            .consensus_tx_gas_limit_cap(chain_spec, &block_env);
         let max_gas_limit =
             estimate_gas_limit_cap(cfg.tx_gas_limit_cap, consensus_cap, block_env_gas_limit);
         let mut highest_gas_limit = tx_request_gas_limit
-            .map(|tx_gas_limit| {
-                if tx_gas_limit > max_gas_limit {
-                    tx_gas_limit
-                } else {
-                    max_gas_limit
-                }
-            })
+            .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
             .unwrap_or(max_gas_limit);
         let mut tx = self.inner.create_txn_env(
             &block,
@@ -1227,7 +1225,11 @@ where
                         tx.set_gas_limit(MIN_TRANSACTION_GAS);
                         if let Ok(exec_res) =
                             trace.execute("transfer_probe", tx.gas_limit(), || {
-                                self.inner.transact(&block_env, &memory_db, tx.clone())
+                                self.inner.transact_for_estimation(
+                                    &block_env,
+                                    &memory_db,
+                                    tx.clone(),
+                                )
                             })
                         {
                             if exec_res.is_success() {
@@ -1258,7 +1260,8 @@ where
         let res = trace
             .execute("initial", tx.gas_limit(), || {
                 let (result, counters) = leafage_evm_storage::profile_rocksdb_reads(|| {
-                    self.inner.transact(&block_env, &memory_db, tx.clone())
+                    self.inner
+                        .transact_for_estimation(&block_env, &memory_db, tx.clone())
                 });
                 trace.initial_rocksdb(counters);
                 result
@@ -1285,7 +1288,7 @@ where
         };
 
         highest_gas_limit = tx.gas_limit();
-        let mut gas_used = res.gas_used();
+        let mut gas_used = res.tx_gas_used();
         let mut lowest_gas_limit = gas_used.saturating_sub(1);
         trace.gas_range(lowest_gas_limit, highest_gas_limit);
 
@@ -1295,10 +1298,11 @@ where
             tx.set_gas_limit(optimistic_gas_limit);
             let res = trace
                 .execute("optimistic", tx.gas_limit(), || {
-                    self.inner.transact(&block_env, &memory_db, tx.clone())
+                    self.inner
+                        .transact_for_estimation(&block_env, &memory_db, tx.clone())
                 })
                 .map_err(|e| e.to_rpc_error())?;
-            gas_used = res.gas_used();
+            gas_used = res.tx_gas_used();
             update_estimated_gas_range(
                 &res,
                 optimistic_gas_limit,
@@ -1333,7 +1337,8 @@ where
             tx.set_gas_limit(mid_gas_limit);
 
             let res = trace.execute("binary_search", tx.gas_limit(), || {
-                self.inner.transact(&block_env, &memory_db, tx.clone())
+                self.inner
+                    .transact_for_estimation(&block_env, &memory_db, tx.clone())
             });
 
             match res {

@@ -1,4 +1,4 @@
-use revm::precompile::PrecompileError;
+use revm::precompile::PrecompileHalt;
 use std::borrow::Cow;
 
 /// BSC specific precompile errors.
@@ -14,20 +14,20 @@ pub enum BscPrecompileError {
     DoubleSignInvalidEvidence,
 }
 
-impl From<BscPrecompileError> for PrecompileError {
+impl From<BscPrecompileError> for PrecompileHalt {
     fn from(error: BscPrecompileError) -> Self {
         match error {
             BscPrecompileError::InvalidInput => {
-                PrecompileError::Other(Cow::Borrowed("invalid input"))
+                PrecompileHalt::Other(Cow::Borrowed("invalid input"))
             }
             BscPrecompileError::CometBftApplyBlockFailed => {
-                PrecompileError::Other(Cow::Borrowed("apply block failed"))
+                PrecompileHalt::Other(Cow::Borrowed("apply block failed"))
             }
             BscPrecompileError::CometBftEncodeConsensusStateFailed => {
-                PrecompileError::Other(Cow::Borrowed("encode consensus state failed"))
+                PrecompileHalt::Other(Cow::Borrowed("encode consensus state failed"))
             }
             BscPrecompileError::DoubleSignInvalidEvidence => {
-                PrecompileError::Other(Cow::Borrowed("double sign invalid evidence"))
+                PrecompileHalt::Other(Cow::Borrowed("double sign invalid evidence"))
             }
         }
     }

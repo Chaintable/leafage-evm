@@ -1,4 +1,4 @@
-use revm::precompile::PrecompileError;
+use crate::arbitrum::precompile::result::PrecompileError;
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 

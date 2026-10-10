@@ -235,13 +235,13 @@ impl EstimateTrace {
         let elapsed_ms = ms(stage.started.elapsed());
         let (outcome, gas_used) = match &result {
             Ok(ExecutionResult::Success { .. }) => {
-                ("success", result.as_ref().ok().map(|r| r.gas_used()))
+                ("success", result.as_ref().ok().map(|r| r.tx_gas_used()))
             }
             Ok(ExecutionResult::Revert { .. }) => {
-                ("revert", result.as_ref().ok().map(|r| r.gas_used()))
+                ("revert", result.as_ref().ok().map(|r| r.tx_gas_used()))
             }
             Ok(ExecutionResult::Halt { .. }) => {
-                ("halt", result.as_ref().ok().map(|r| r.gas_used()))
+                ("halt", result.as_ref().ok().map(|r| r.tx_gas_used()))
             }
             Err(_) => ("error", None),
         };

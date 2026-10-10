@@ -15,7 +15,7 @@ use alloy::sol_types::{SolError, SolValue};
 use revm::Database;
 use revm::context::{ContextTr, JournalTr};
 use revm::context_interface::{Block, Cfg};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use crate::arbitrum::precompile::result::{PrecompileError, PrecompileResult};
 use revm::primitives::KECCAK_EMPTY;
 use std::io::{Cursor, Read};
 
@@ -602,7 +602,7 @@ impl ArbWasm {
             storage.burn_out();
             return Self::empty_revert(gas_limit, gas_limit);
         }
-        Ok(revm::precompile::PrecompileOutput::new_reverted(
+        Ok(crate::arbitrum::precompile::result::PrecompileOutput::new_reverted(
             storage.gas_used,
             bytes,
         ))
@@ -612,7 +612,7 @@ impl ArbWasm {
         if gas_used > gas_limit {
             return Err(PrecompileError::OutOfGas);
         }
-        Ok(revm::precompile::PrecompileOutput::new_reverted(
+        Ok(crate::arbitrum::precompile::result::PrecompileOutput::new_reverted(
             gas_used,
             Bytes::new(),
         ))

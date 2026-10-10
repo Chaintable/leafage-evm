@@ -1,0 +1,69 @@
+# Vendored from ethereum-optimism/optimism `rust/op-revm`
+# (PR #23046 "rust: update reth to v2.6.0", commit becef5596db9ce6478f0b30f7564b2103ecc55d3),
+# which ports op-revm to revm 43. crates.io op-revm (<= 20.0.0) still pins revm 38.
+# Switch back to the crates.io release once upstream publishes an op-revm built on revm 43.
+[package]
+name = "op-revm"
+description = "Optimism variant of Revm"
+version = "20.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/ethereum-optimism/optimism"
+publish = false
+
+[dependencies]
+# revm
+revm = { workspace = true }
+auto_impl.workspace = true
+
+# alloy
+alloy-eips = { workspace = true }
+
+# op-alloy
+op-alloy-consensus = { workspace = true }
+
+# Optional
+serde = { workspace = true, features = ["derive", "rc"], optional = true }
+
+[dev-dependencies]
+rstest.workspace = true
+alloy-sol-types.workspace = true
+sha2.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde = { workspace = true, features = ["derive"] }
+alloy-primitives.workspace = true
+
+[features]
+default = ["std", "c-kzg", "secp256k1", "portable", "blst"]
+std = [
+	"serde?/std",
+	"revm/std",
+	"alloy-eips/std",
+	"op-alloy-consensus/std",
+]
+serde = ["dep:serde", "revm/serde", "alloy-eips/serde", "op-alloy-consensus/serde"]
+portable = ["revm/portable"]
+
+dev = [
+	"revm/dev",
+	"memory_limit",
+	"optional_balance_check",
+	"optional_block_gas_limit",
+	"optional_eip3541",
+	"optional_eip3607",
+	"optional_no_base_fee",
+]
+memory_limit = ["revm/memory_limit"]
+optional_balance_check = ["revm/optional_balance_check"]
+optional_block_gas_limit = ["revm/optional_block_gas_limit"]
+optional_eip3541 = ["revm/optional_eip3541"]
+optional_eip3607 = ["revm/optional_eip3607"]
+optional_no_base_fee = ["revm/optional_no_base_fee"]
+optional_fee_charge = ["revm/optional_fee_charge"]
+
+# See comments in `revm-precompile`
+secp256k1 = ["revm/secp256k1"]
+c-kzg = ["revm/c-kzg"]
+blst = ["revm/blst"]
+bn = ["revm/bn"]

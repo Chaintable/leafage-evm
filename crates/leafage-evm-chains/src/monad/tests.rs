@@ -94,7 +94,7 @@ fn run_code(hardfork: MonadHardfork, code: &[u8]) -> ExecutionResult {
 
 fn success_gas(result: &ExecutionResult) -> u64 {
     assert!(result.is_success(), "expected success, got {result:?}");
-    result.gas_used()
+    result.tx_gas_used()
 }
 
 // PUSH1 5 SLOAD POP PUSH1 6 SLOAD POP STOP
@@ -256,7 +256,7 @@ fn mip3_memory_limit_halts() {
                 reason,
                 MonadHaltReason::Base(HaltReason::OutOfGas(OutOfGasError::MemoryLimit))
             );
-            assert_eq!(gas.used(), GAS_LIMIT);
+            assert_eq!(gas.tx_gas_used(), GAS_LIMIT);
         }
         other => panic!("expected halt, got {other:?}"),
     }
@@ -318,7 +318,7 @@ fn staking_fallback_reverts_with_all_gas() {
     );
     match result {
         ExecutionResult::Revert { gas, output, .. } => {
-            assert_eq!(gas.used(), GAS_LIMIT);
+            assert_eq!(gas.tx_gas_used(), GAS_LIMIT);
             assert_eq!(output.as_ref(), b"method not supported");
         }
         other => panic!("expected revert, got {other:?}"),
@@ -443,7 +443,7 @@ fn reserve_balance_violation_reverts_transaction() {
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
     );
-    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.result.tx_gas_used(), GAS_LIMIT);
     // the message was rejected: no value moved
     assert_eq!(out.state[&CONTRACT].info.balance, mon(7));
     assert!(out
@@ -491,7 +491,7 @@ fn reserve_violation_of_top_level_create_keeps_sender_nonce() {
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
     );
-    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.result.tx_gas_used(), GAS_LIMIT);
     let caller = &out.state[&CALLER].info;
     assert_eq!(caller.nonce, 1, "nonce consumed by the rejected CREATE");
     assert_eq!(caller.balance, mon(20), "value transfer reverted");
@@ -522,7 +522,7 @@ fn reserve_violation_is_detected_before_top_level_revert() {
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
     );
-    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.result.tx_gas_used(), GAS_LIMIT);
     assert_eq!(out.state[&CONTRACT].info.balance, mon(7));
 }
 
@@ -577,7 +577,7 @@ fn created_contract_is_not_subject_to_reserve_from_monad_eight() {
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
     );
-    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.result.tx_gas_used(), GAS_LIMIT);
     assert_eq!(out.state[&created].info.balance, mon(5));
 }
 
@@ -601,7 +601,7 @@ fn failed_precompile_call_still_reports_reserve_violation() {
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
     );
-    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.result.tx_gas_used(), GAS_LIMIT);
     assert_eq!(out.state[&CALLER].info.balance, mon(20));
 
     // Without the value the precompile failure is reported with its
@@ -706,7 +706,7 @@ fn reserve_violation_is_reported_under_inspection() {
         halt_reason(&out.result),
         MonadHaltReason::ReserveBalanceViolation
     );
-    assert_eq!(out.result.gas_used(), GAS_LIMIT);
+    assert_eq!(out.result.tx_gas_used(), GAS_LIMIT);
     assert!(out
         .state
         .get(&RECIPIENT)
@@ -841,7 +841,7 @@ fn delegation_to_staking_precompile_is_rejected() {
         halt_reason(&result),
         MonadHaltReason::Base(HaltReason::PrecompileError)
     );
-    assert_eq!(result.gas_used(), GAS_LIMIT);
+    assert_eq!(result.tx_gas_used(), GAS_LIMIT);
 
     // nested: CONTRACT calls DELEGATE and returns the CALL success flag
     let mut code = vec![
