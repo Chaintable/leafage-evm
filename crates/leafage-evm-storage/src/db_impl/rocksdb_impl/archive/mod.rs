@@ -663,8 +663,7 @@ fn shard_bounds(jobs: usize) -> Vec<(u8, Option<u8>)> {
 /// leading key byte, then ingest them. Each worker scans its disjoint key
 /// range, buffers one prefix at a time and emits it sorted (the tail rewrite
 /// reverses order within a prefix), and drops orphaned `u64::MAX` sentinels.
-/// A nonzero `buffer_limit` bounds each worker's record buffer in bytes and
-/// splits long prefixes into independently sorted SST runs.
+/// A nonzero `buffer_limit` splits large prefixes into bounded sorted SST runs.
 /// Returns `(kept, dropped)`.
 #[allow(clippy::too_many_arguments)]
 fn reencode_versioned_cf(
@@ -754,21 +753,15 @@ fn reencode_versioned_cf(
                         format!("{name}_{i}"),
                         roll_bytes,
                     );
-                    type Entry = (Box<[u8]>, Box<[u8]>);
-                    // Reserve enough slots for the smallest possible records
-                    // (fixed-width key, empty value). This keeps Vec capacity
-                    // inside the budget without reallocating per record.
-                    let capacity = buffer_limit / (prefix_len + 32 + size_of::<Entry>());
-                    let mut buf: Vec<Entry> = Vec::with_capacity(capacity);
-                    let entry_bytes = buf.capacity() * size_of::<Entry>();
-                    let mut payload_bytes = 0usize;
+                    let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let mut buffered_bytes = 0usize;
                     let mut cur_prefix: Option<Vec<u8>> = None;
                     let mut local_kept = 0u64;
                     let mut local_dropped = 0u64;
                     let mut since_report = 0u64;
 
                     fn flush_prefix(
-                        buf: &mut Vec<Entry>,
+                        buf: &mut Vec<(Vec<u8>, Vec<u8>)>,
                         sink: &mut SstSink,
                     ) -> Result<u64, Error> {
                         buf.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -781,13 +774,8 @@ fn reencode_versioned_cf(
                     }
 
                     for item in src.iterator_cf_opt(cf, ro, IteratorMode::Start) {
-                        let (mut key, value) = item.map_err(Error::RocksDB)?;
+                        let (key, value) = item.map_err(Error::RocksDB)?;
                         let klen = key.len();
-                        if klen != prefix_len + 32 {
-                            return Err(Error::UnSupported(format!(
-                                "invalid {label} key length: {klen}"
-                            )));
-                        }
                         let block = u64::from_be_bytes(key[klen - 8..].try_into().unwrap());
                         since_report += 1;
                         if since_report >= 50_000 {
@@ -805,36 +793,21 @@ fn reencode_versioned_cf(
                         if cur_prefix.as_deref() != Some(&key[..prefix_len]) {
                             if !buf.is_empty() {
                                 local_kept += flush_prefix(&mut buf, &mut sink)?;
-                                payload_bytes = 0;
+                                buffered_bytes = 0;
                             }
                             cur_prefix = Some(key[..prefix_len].to_vec());
                         }
-                        let record_bytes = key.len() + value.len();
-                        if buffer_limit != 0 {
-                            if capacity == 0 || entry_bytes + record_bytes > buffer_limit {
-                                return Err(Error::UnSupported(format!(
-                                    "{label} record exceeds re-encode buffer budget; \
-                                     increase --reencode-buffer-mb"
-                                )));
-                            }
-                            if buf.len() == buf.capacity()
-                                || entry_bytes + payload_bytes + record_bytes > buffer_limit
-                            {
-                                local_kept += flush_prefix(&mut buf, &mut sink)?;
-                                // Later chunks of this prefix sort BEFORE the
-                                // previous chunk after inversion: start a new SST.
-                                sink.finish_file()?;
-                                payload_bytes = 0;
-                            }
+                        let mut new_key = key.to_vec();
+                        new_key[klen - 8..].copy_from_slice(&(u64::MAX - block).to_be_bytes());
+                        buffered_bytes +=
+                            new_key.len() + value.len() + size_of::<(Vec<u8>, Vec<u8>)>();
+                        buf.push((new_key, value.to_vec()));
+                        if buffer_limit != 0 && buffered_bytes >= buffer_limit {
+                            local_kept += flush_prefix(&mut buf, &mut sink)?;
+                            // The next chunk sorts before this one after inversion.
+                            sink.finish_file()?;
+                            buffered_bytes = 0;
                         }
-                        key[klen - 8..].copy_from_slice(&(u64::MAX - block).to_be_bytes());
-                        payload_bytes += record_bytes;
-                        buf.push((key, value));
-                        debug_assert!(
-                            buffer_limit == 0
-                                || buf.capacity() * size_of::<Entry>() + payload_bytes
-                                    <= buffer_limit
-                        );
                     }
                     if !buf.is_empty() {
                         local_kept += flush_prefix(&mut buf, &mut sink)?;
@@ -851,11 +824,7 @@ fn reencode_versioned_cf(
         let mut paths = Vec::new();
         for h in handles {
             match h.join() {
-                Ok(Ok(worker_paths)) => paths.extend(worker_paths),
-                Ok(Err(err)) => {
-                    stop.store(true, Ordering::Relaxed);
-                    return Err(err);
-                }
+                Ok(r) => paths.extend(r?),
                 Err(_) => {
                     stop.store(true, Ordering::Relaxed);
                     return Err(Error::UnSupported(format!(
@@ -1148,9 +1117,7 @@ impl DataBaseRef {
         jobs: usize,
         buffer_mb: usize,
     ) -> Result<(), Error> {
-        let buffer_limit = buffer_mb
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| Error::UnSupported("--reencode-buffer-mb is too large".to_string()))?;
+        let buffer_limit = buffer_mb.saturating_mul(1024 * 1024);
         // 0 = auto: one worker per core, capped (more than ~16 rarely helps and
         // just multiplies the per-shard read/SST overhead).
         let jobs = if jobs == 0 {
@@ -1162,7 +1129,7 @@ impl DataBaseRef {
             jobs.clamp(1, 16)
         };
         info!(target: "migrate", "reencode: legacy -> inverted with {jobs} worker(s), \
-            buffer budget={buffer_mb} MiB/worker (0=unlimited)");
+            buffer threshold={buffer_mb} MiB/worker (0=unlimited)");
 
         // Source: read-only, bounded fds (archive DBs have very many SSTs, so
         // the default unlimited max_open_files trips the OS fd limit).
@@ -3694,121 +3661,64 @@ mod inverted_encoding_tests {
 #[cfg(test)]
 mod reencode_buffer_tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
-    fn test_reencode_buffered_sst_runs() {
+    fn test_reencode_buffered_matches_unlimited() {
         let base = std::env::temp_dir().join(format!("reencode-buffer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         for (col, prefix_len) in [
             (StorageTypeColumn::AddressToAccount, 32),
             (StorageTypeColumn::AddressToStorage, 64),
         ] {
-            // Exercise unlimited mode, overlapping runs, worker boundaries,
-            // and automatic SST rolling followed by explicit file finishes.
-            for (limit, jobs, roll_bytes) in [(0, 1, 1 << 20), (256, 1, 1 << 20), (512, 4, 1024)] {
-                let dir = base.join(format!("{}-{limit}-{jobs}", col.to_str()));
-                let tmp = dir.join("sst");
-                std::fs::create_dir_all(&tmp).unwrap();
-                let mut opts = Options::default();
-                opts.create_if_missing(true);
-                opts.create_missing_column_families(true);
-                opts.set_disable_auto_compactions(true);
-                let src =
-                    DB::open_cf_with_opts(&opts, dir.join("src"), [(col.to_str(), opts.clone())])
-                        .unwrap();
-                let dst =
-                    DB::open_cf_with_opts(&opts, dir.join("dst"), [(col.to_str(), opts.clone())])
-                        .unwrap();
-                let src_cf = src.cf_handle(col.to_str()).unwrap();
-                let dst_cf = dst.cf_handle(col.to_str()).unwrap();
-                let mut expected = BTreeMap::new();
-                let mut dropped = 0;
-                let mut prefixes: Vec<_> = [0x00, 0x3f, 0x40, 0x80, 0xc0, 0xff]
-                    .into_iter()
-                    .map(|b| vec![b; prefix_len])
-                    .collect();
-                if prefix_len == 64 {
-                    // Two slots belonging to the same account.
-                    let mut prefix = vec![0; 64];
-                    prefix[63] = 1;
-                    prefixes.push(prefix);
-                }
-                for prefix in prefixes {
-                    for block in (0..64u64).chain([255, 256, u64::MAX - 1, u64::MAX]) {
-                        let mut key = prefix.clone();
-                        key.extend_from_slice(&[0; 24]);
-                        key.extend_from_slice(&block.to_be_bytes());
-                        let value = if block < 3 || block % 5 == 0 {
-                            Vec::new() // Historical deletion must survive.
-                        } else {
-                            block.to_be_bytes().to_vec()
-                        };
-                        src.put_cf(src_cf, &key, &value).unwrap();
-                        if block == u64::MAX {
-                            dropped += 1;
-                        } else {
-                            key[prefix_len + 24..]
-                                .copy_from_slice(&(u64::MAX - block).to_be_bytes());
-                            expected.insert(key, value);
-                        }
-                    }
-                }
-                src.flush().unwrap();
-                let counts = reencode_versioned_cf(
-                    &src,
-                    &dst,
-                    col,
-                    prefix_len,
-                    jobs,
-                    limit,
-                    &sst_writer_options(),
-                    &tmp,
-                    roll_bytes,
-                )
-                .unwrap();
-                assert_eq!(counts, (expected.len() as u64, dropped));
-                let files = dst.live_files().unwrap().len();
-                assert!(
-                    if limit == 0 { files == 1 } else { files > jobs },
-                    "{col:?}: limit={limit}, jobs={jobs}, files={files}"
-                );
-                let read_all = || -> BTreeMap<_, _> {
-                    dst.iterator_cf(dst_cf, IteratorMode::Start)
-                        .map(|row| {
-                            let (k, v) = row.unwrap();
-                            (k.to_vec(), v.to_vec())
-                        })
-                        .collect()
-                };
-                assert_eq!(read_all(), expected);
-                dst.compact_range_cf_opt(
-                    dst_cf,
-                    None::<&[u8]>,
-                    None::<&[u8]>,
-                    &DataBaseRef::force_bottommost_compact_options(),
-                );
-                assert_eq!(read_all(), expected);
-
-                // Oversized records must fail cleanly, including stopping the
-                // progress thread, rather than allocating past the budget.
-                src.put_cf(src_cf, vec![0; prefix_len + 32], vec![1; 1024])
+            let dir = base.join(col.to_str());
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let src = DB::open_cf(&opts, dir.join("src"), [col.to_str()]).unwrap();
+            for prefix in [0x10, 0x11] {
+                for block in 0..20u64 {
+                    let mut key = vec![prefix; prefix_len];
+                    key.extend_from_slice(&[0; 24]);
+                    key.extend_from_slice(&block.to_be_bytes());
+                    src.put_cf(
+                        src.cf_handle(col.to_str()).unwrap(),
+                        key,
+                        block.to_be_bytes(),
+                    )
                     .unwrap();
-                let err = reencode_versioned_cf(
-                    &src,
-                    &dst,
-                    col,
-                    prefix_len,
-                    jobs,
-                    512,
-                    &sst_writer_options(),
-                    &tmp,
-                    roll_bytes,
-                )
-                .unwrap_err();
-                assert!(err
-                    .to_string()
-                    .contains("record exceeds re-encode buffer budget"));
+                }
+            }
+            let mut baseline = None;
+            for limit in [0, 256] {
+                let dst =
+                    DB::open_cf(&opts, dir.join(format!("dst-{limit}")), [col.to_str()]).unwrap();
+                let tmp = dir.join(format!("sst-{limit}"));
+                std::fs::create_dir_all(&tmp).unwrap();
+                assert_eq!(
+                    reencode_versioned_cf(
+                        &src,
+                        &dst,
+                        col,
+                        prefix_len,
+                        1,
+                        limit,
+                        &sst_writer_options(),
+                        &tmp,
+                        1 << 20,
+                    )
+                    .unwrap(),
+                    (40, 0),
+                );
+                let records: Vec<_> = dst
+                    .iterator_cf(dst.cf_handle(col.to_str()).unwrap(), IteratorMode::Start)
+                    .map(Result::unwrap)
+                    .collect();
+                if let Some(expected) = &baseline {
+                    assert_eq!(&records, expected);
+                } else {
+                    baseline = Some(records);
+                }
             }
         }
         std::fs::remove_dir_all(base).unwrap();

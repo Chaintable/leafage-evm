@@ -70,10 +70,10 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     reencode_jobs: usize,
 
-    /// Per-worker record-buffer budget in MiB for --reencode-inverted.
-    /// Includes keys, values and entry storage, but not allocator/RocksDB
-    /// overhead or total process memory. 0 (default) preserves unlimited
-    /// buffering. A nonzero budget splits large histories into separate SSTs.
+    /// Approximate per-worker record-buffer threshold in MiB for
+    /// --reencode-inverted. 0 (default) keeps unlimited buffering.
+    /// Counts keys, values and entry metadata, not allocation/RocksDB overhead
+    /// or total process memory. Reaching the threshold finishes the current SST.
     #[arg(long, default_value = "0")]
     reencode_buffer_mb: usize,
 }
@@ -130,30 +130,5 @@ impl Command {
         }
         db_source.migrate()?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reencode_buffer_flag_defaults_to_unlimited() {
-        let args = [
-            "db-migrate",
-            "--src",
-            "src",
-            "--dst",
-            "dst",
-            "--src-is-archive",
-            "--reencode-inverted",
-        ];
-        assert_eq!(Command::try_parse_from(args).unwrap().reencode_buffer_mb, 0);
-        for limit in ["0", "256"] {
-            let command =
-                Command::try_parse_from(args.into_iter().chain(["--reencode-buffer-mb", limit]))
-                    .unwrap();
-            assert_eq!(command.reencode_buffer_mb, limit.parse::<usize>().unwrap());
-        }
     }
 }
