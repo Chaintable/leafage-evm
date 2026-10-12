@@ -34,10 +34,10 @@ pub(crate) fn ingest_external_file_options() -> IngestExternalFileOptions {
 }
 
 /// Streams **strictly-ascending** `(key, value)` pairs into a series of rolled
-/// SST files for later `ingest_external_file`. Keys must be globally ascending
-/// across all `put` calls; the file is rolled whenever it exceeds `roll_bytes`
-/// (any split of an ascending stream yields non-overlapping files, which ingest
-/// can place across levels instead of piling into L0).
+/// SST files for later `ingest_external_file`. Keys must be ascending within
+/// each file; call `finish_file` before starting another sorted run. Files roll
+/// automatically at `roll_bytes`. A globally ascending stream produces
+/// non-overlapping files; separate runs may overlap (ingest allows global seqnos).
 pub(crate) struct SstSink<'a> {
     opts: &'a Options,
     tmp_dir: std::path::PathBuf,
@@ -86,19 +86,23 @@ impl<'a> SstSink<'a> {
         w.put(key, value)?;
         self.has_rows = true;
         if w.file_size() >= self.roll_bytes {
-            self.writer.take().unwrap().finish()?;
-            self.paths.push(std::mem::take(&mut self.cur_path));
+            self.finish_file()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_file(&mut self) -> Result<(), Error> {
+        if let Some(mut w) = self.writer.take() {
+            if self.has_rows {
+                w.finish()?;
+                self.paths.push(std::mem::take(&mut self.cur_path));
+            }
         }
         Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<Vec<std::path::PathBuf>, Error> {
-        if let Some(mut w) = self.writer.take() {
-            if self.has_rows {
-                w.finish()?;
-                self.paths.push(self.cur_path);
-            }
-        }
+        self.finish_file()?;
         Ok(self.paths)
     }
 }
