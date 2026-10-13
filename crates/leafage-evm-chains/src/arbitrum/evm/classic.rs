@@ -512,24 +512,98 @@ mod tests {
         );
     }
     #[test]
-    fn classic_unknown_arbsys_selector_reverts_but_missing_state_is_fatal() {
-        let forwarder =
-            alloy::primitives::hex::decode("3660006000376020600036600060645afa60005260206000f3")
-                .unwrap();
-        let mut evm = evm(&forwarder);
-        let mut tx = tx();
-        tx.base.data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(
-            U256::from_be_slice(&output(evm.transact(tx.clone()).unwrap().result)),
-            U256::ZERO
-        );
-        tx.base.data = Bytes::from_static(&[0x05, 0x10, 0x38, 0xf2]);
-        assert!(
-            evm.inspect_tx(tx)
-                .unwrap_err()
-                .to_string()
-                .contains("Arbitrum Classic:")
-        );
+    fn classic_unknown_builtin_selectors_revert_but_missing_state_is_fatal() {
+        for (address, unavailable) in [
+            (0x64, "051038f2".to_string()),
+            (0x67, format!("857cdbb8{:064x}", 0)),
+            (0x69, format!("bb3480f9{:064x}", 1)),
+            (0x6b, "08df6923".into()),
+            (0x6c, "41b247a8".into()),
+            (0x6d, "875883f2".into()),
+        ] {
+            let forwarder = alloy::primitives::hex::decode(format!(
+                "3660006000376020600036600060{address:02x}5afa60005260206000f3"
+            ))
+            .unwrap();
+            let mut evm = evm(&forwarder);
+            let mut tx = tx();
+            for selector in ["deadbeef", "5c60da1b", "a619486e", "bb82aa5e"] {
+                tx.base.data = alloy::primitives::hex::decode(selector).unwrap().into();
+                assert_eq!(
+                    U256::from_be_slice(&output(evm.transact(tx.clone()).unwrap().result)),
+                    U256::ZERO
+                );
+            }
+            tx.base.data = alloy::primitives::hex::decode(unavailable).unwrap().into();
+            assert!(
+                evm.inspect_tx(tx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Arbitrum Classic:")
+            );
+        }
+    }
+
+    #[test]
+    fn classic_builtin_validation_uses_historical_block() {
+        for (activation, data) in [
+            // ArbOS 39 rejects RLP integers wider than 32 bytes.
+            (
+                226_011,
+                format!(
+                    "31862ada{:064x}{:064x}{:064x}a1{}",
+                    64,
+                    0,
+                    34,
+                    "00".repeat(33)
+                ),
+            ),
+            // ArbOS 54 starts checking the dynamic ABI offset.
+            (
+                6_835_288,
+                format!(
+                    "31862ada{:064x}{:064x}{:064x}80{}",
+                    32,
+                    0,
+                    1,
+                    "00".repeat(31)
+                ),
+            ),
+        ] {
+            for height in [activation - 1, activation] {
+                let mut evm = evm(&[]);
+                evm.ctx_mut().block.number = U256::from(99_999_999); // RPC override
+                let mut tx = tx();
+                tx.context.classic_block_number = Some(height);
+                tx.base.kind = TxKind::Call(Address::with_last_byte(0x66));
+                tx.base.data = alloy::primitives::hex::decode(&data).unwrap().into();
+                let result = evm.transact(tx).unwrap().result;
+                if height < activation {
+                    assert!(result.is_success(), "{result:?}");
+                } else {
+                    assert!(matches!(result, ExecutionResult::Revert { .. }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classic_function_table_rejects_invalid_input_before_reading_missing_context() {
+        for (offset, length, payload) in [(64, 1, ""), (32, 2, "01"), (32, 2, "a0")] {
+            let mut evm = evm(&[]);
+            evm.ctx_mut().block.number = U256::from(6_835_288);
+            let mut tx = tx();
+            tx.base.kind = TxKind::Call(Address::with_last_byte(0x68));
+            tx.base.data = alloy::primitives::hex::decode(format!(
+                "ce2ae159{offset:064x}{length:064x}{payload}"
+            ))
+            .unwrap()
+            .into();
+            assert!(matches!(
+                evm.transact(tx).unwrap().result,
+                ExecutionResult::Revert { .. }
+            ));
+        }
     }
 
     #[test]

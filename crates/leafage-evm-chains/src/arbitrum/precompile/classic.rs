@@ -1,10 +1,15 @@
 //! Classic builtin dispatch, deliberately separate from Nitro ArbOS storage.
+mod abi;
+mod builtins;
 mod modexp;
 mod pairing;
 
+use self::abi::sys;
+use self::builtins::encode;
 use super::{ArbitrumContext, EthPrecompiles, PrecompileProvider};
-use crate::arbitrum::config::ClassicModexpUpgrades;
+use crate::arbitrum::config::{ClassicBuiltinUpgrades, ClassicModexpUpgrades};
 use alloy::primitives::{Address, Bytes, U256};
+use alloy::sol_types::SolCall;
 use revm::context::{ContextTr, JournalTr, LocalContextTr};
 use revm::interpreter::{
     CallInput, CallInputs, CallScheme, Gas, InstructionResult, InterpreterResult,
@@ -27,6 +32,7 @@ pub(super) fn run<DB: Database + DatabaseRef>(
     ctx: &mut ArbitrumContext<DB>,
     inputs: &CallInputs,
     modexp_upgrades: Option<ClassicModexpUpgrades>,
+    builtin_upgrades: Option<ClassicBuiltinUpgrades>,
 ) -> Result<Option<InterpreterResult>, String> {
     let address = inputs.bytecode_address;
     if !addresses().any(|a| a == address) {
@@ -37,9 +43,6 @@ pub(super) fn run<DB: Database + DatabaseRef>(
             "Arbitrum Classic: builtin {address} requires unavailable Classic ArbOS state or call context"
         )
     };
-    if address != Address::with_last_byte(0x64) {
-        return Err(unsupported());
-    }
     if inputs.target_address != address
         || matches!(
             inputs.scheme,
@@ -48,98 +51,166 @@ pub(super) fn run<DB: Database + DatabaseRef>(
     {
         return Err(unsupported());
     }
-    let data = match &inputs.input {
+    let data = calldata(ctx, inputs);
+    let builtin_upgrades = builtin_upgrades.or_else(|| {
+        (ctx.cfg().chain_id == 42161).then_some(ClassicBuiltinUpgrades {
+            // Each boundary was checked against adjacent native archive calls.
+            arbos_34_block: 156_077,
+            arbos_39_block: 226_011,
+            arbos_42_block: 662_405,
+            arbos_54_block: 6_835_288,
+        })
+    });
+    if builtin_upgrades.is_some_and(|u| {
+        [
+            u.arbos_34_block,
+            u.arbos_39_block,
+            u.arbos_42_block,
+            u.arbos_54_block,
+        ]
+        .windows(2)
+        .any(|w| w[0] > w[1])
+    }) {
+        return Err("Arbitrum Classic: invalid classic_builtin_upgrades order".into());
+    }
+    let number = historical_block_number(ctx);
+    let rules = builtin_upgrades.map(|u| builtins::Rules {
+        arbos34: number >= U256::from(u.arbos_34_block),
+        arbos39: number >= U256::from(u.arbos_39_block),
+        arbos42: number >= U256::from(u.arbos_42_block),
+        arbos54: number >= U256::from(u.arbos_54_block),
+    });
+    if address != Address::with_last_byte(0x64) {
+        let output = match builtins::run(inputs, &data, ctx.chain().current_call().depth, rules) {
+            Ok(bytes) => Some(bytes),
+            Err(builtins::Error::Revert) => None,
+            Err(builtins::Error::Unavailable) => return Err(unsupported()),
+        };
+        return Ok(finish(inputs, output));
+    }
+    let revert = || Ok(finish(inputs, None));
+    let Some(selector) = data.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return revert();
+    };
+    let fixed = |value| if data.len() == 4 { Some(value) } else { None };
+    let value = match selector {
+        sys::arbBlockNumberCall::SELECTOR => fixed(encode::<sys::arbBlockNumberCall>(
+            &ctx.chain()
+                .current_l2_block_number()
+                .ok_or_else(unsupported)?,
+        )),
+        sys::arbChainIDCall::SELECTOR => fixed(encode::<sys::arbChainIDCall>(&U256::from(
+            ctx.cfg().chain_id,
+        ))),
+        sys::isTopLevelCallCall::SELECTOR => fixed(encode::<sys::isTopLevelCallCall>(
+            &(ctx.chain().current_call().depth == 2),
+        )),
+        sys::getTransactionCountCall::SELECTOR => {
+            if data.len() != 36 {
+                return revert();
+            }
+            let Ok(call) = sys::getTransactionCountCall::abi_decode(&data) else {
+                return revert();
+            };
+            Some(encode::<sys::getTransactionCountCall>(&U256::from(
+                ctx.journal_mut()
+                    .load_account(call.account)
+                    .map_err(|e| format!("{e:?}"))?
+                    .info
+                    .nonce,
+            )))
+        }
+        sys::getStorageAtCall::SELECTOR => {
+            if !inputs.caller.is_zero() {
+                return revert();
+            }
+            // Mini zero-pads truncated words and ignores trailing calldata.
+            let mut padded = [0; 68];
+            let len = data.len().min(padded.len());
+            padded[..len].copy_from_slice(&data[..len]);
+            let Ok(call) = sys::getStorageAtCall::abi_decode(&padded) else {
+                return revert();
+            };
+            ctx.journal_mut()
+                .load_account(call.account)
+                .map_err(|e| format!("{e:?}"))?;
+            Some(encode::<sys::getStorageAtCall>(
+                &ctx.journal_mut()
+                    .sload(call.account, call.index)
+                    .map_err(|e| format!("{e:?}"))?
+                    .data,
+            ))
+        }
+        // Caller aliasing and version depend on historical private state. A
+        // fatal error cannot be swallowed by a Solidity low-level CALL.
+        sys::arbOSVersionCall::SELECTOR
+        | sys::wasMyCallersAddressAliasedCall::SELECTOR
+        | sys::myCallersAddressWithoutAliasingCall::SELECTOR
+        | sys::getStorageGasAvailableCall::SELECTOR => {
+            if data.len() != 4 {
+                return revert();
+            }
+            return Err(unsupported());
+        }
+        sys::mapL1SenderContractAddressToL2AliasCall::SELECTOR => {
+            if data.len() != 68 {
+                return revert();
+            }
+            return Err(unsupported());
+        }
+        sys::withdrawEthCall::SELECTOR => {
+            if inputs.is_static || data.len() != 36 {
+                return revert();
+            }
+            return Err(unsupported());
+        }
+        sys::sendTxToL1Call::SELECTOR => {
+            if inputs.is_static
+                || (rules.is_some_and(|r| r.arbos42)
+                    && !builtins::padded_bytes_length(&data, 100, 68))
+                || (rules.is_some_and(|r| r.arbos54) && builtins::word(&data, 36) != U256::from(64))
+            {
+                return revert();
+            }
+            return Err(unsupported());
+        }
+        // Unknown selectors revert in Classic. Capability probes may catch
+        // this revert and continue; only recognized missing-data paths fail.
+        _ => return revert(),
+    };
+    Ok(finish(inputs, value))
+}
+
+fn calldata<DB: Database>(ctx: &mut ArbitrumContext<DB>, inputs: &CallInputs) -> Bytes {
+    match &inputs.input {
         CallInput::Bytes(b) => b.clone(),
         CallInput::SharedBuffer(range) => ctx
             .local_mut()
             .shared_memory_buffer_slice(range.clone())
             .map(|s| Bytes::copy_from_slice(&s))
             .unwrap_or_default(),
-    };
-    let result = |value: Option<U256>| {
-        Some(InterpreterResult {
-            result: if value.is_some() {
-                InstructionResult::Return
-            } else {
-                InstructionResult::Revert
-            },
-            gas: Gas::new(inputs.gas_limit),
-            output: value
-                .map(|v| Bytes::copy_from_slice(&v.to_be_bytes::<32>()))
-                .unwrap_or_default(),
-        })
-    };
-    let Some(selector) = data.get(..4) else {
-        return Ok(result(None));
-    };
-    let fixed = |value| if data.len() == 4 { Some(value) } else { None };
-    let value = match selector {
-        [0xa3, 0xb1, 0xb3, 0x1d] => fixed(
-            ctx.chain()
-                .current_l2_block_number()
-                .ok_or_else(unsupported)?,
-        ),
-        [0xd1, 0x27, 0xf5, 0x4a] => fixed(U256::from(ctx.cfg().chain_id)),
-        [0x08, 0xbd, 0x62, 0x4c] => fixed(U256::from(ctx.chain().current_call().depth == 2)),
-        [0x23, 0xca, 0x0c, 0xd2] => {
-            if data.len() != 36 {
-                return Ok(result(None));
-            }
-            let account = Address::from_slice(&data[16..36]);
-            Some(U256::from(
-                ctx.journal_mut()
-                    .load_account(account)
-                    .map_err(|e| format!("{e:?}"))?
-                    .info
-                    .nonce,
-            ))
-        }
-        [0xa1, 0x69, 0x62, 0x5f] => {
-            if !inputs.caller.is_zero() {
-                return Ok(result(None));
-            }
-            // Classic bytearray_get256 zero-pads truncated calldata.
-            let word = |start: usize| {
-                let mut out = [0u8; 32];
-                for (i, b) in out.iter_mut().enumerate() {
-                    *b = data.get(start + i).copied().unwrap_or(0);
-                }
-                out
-            };
-            let account = Address::from_slice(&word(4)[12..]);
-            let slot = U256::from_be_bytes(word(36));
-            ctx.journal_mut()
-                .load_account(account)
-                .map_err(|e| format!("{e:?}"))?;
-            Some(
-                ctx.journal_mut()
-                    .sload(account, slot)
-                    .map_err(|e| format!("{e:?}"))?
-                    .data,
-            )
-        }
-        // Caller aliasing and version depend on historical private state. A
-        // fatal error cannot be swallowed by a Solidity low-level CALL.
-        [0x05, 0x10, 0x38, 0xf2] // arbOSVersion
-        | [0x17, 0x5a, 0x26, 0x0b] // wasMyCallersAddressAliased
-        | [0xd7, 0x45, 0x23, 0xb3] // myCallersAddressWithoutAliasing
-        | [0xa9, 0x45, 0x97, 0xff] => { // getStorageGasAvailable
-            if data.len() != 4 { return Ok(result(None)); }
-            return Err(unsupported());
-        }
-        [0x4d, 0xbb, 0xd5, 0x06] => { // mapL1SenderContractAddressToL2Alias
-            if data.len() != 68 { return Ok(result(None)); }
-            return Err(unsupported());
-        }
-        [0x25, 0xe1, 0x60, 0x63] | [0x92, 0x8c, 0x16, 0x9a] => { // withdrawEth / sendTxToL1
-            if inputs.is_static { return Ok(result(None)); }
-            return Err(unsupported());
-        }
-        // Unknown selectors revert in Classic. Capability probes may catch
-        // this revert and continue; only recognized missing-data paths fail.
-        _ => return Ok(result(None)),
-    };
-    Ok(result(value))
+    }
+}
+
+fn finish(inputs: &CallInputs, output: Option<Bytes>) -> Option<InterpreterResult> {
+    Some(InterpreterResult {
+        result: if output.is_some() {
+            InstructionResult::Return
+        } else {
+            InstructionResult::Revert
+        },
+        gas: Gas::new(inputs.gas_limit),
+        output: output.unwrap_or_default(),
+    })
+}
+
+fn historical_block_number<DB: Database>(ctx: &ArbitrumContext<DB>) -> U256 {
+    // RPC block overrides must not select a different historical implementation.
+    ctx.tx
+        .context
+        .classic_block_number
+        .map(U256::from)
+        .unwrap_or(ctx.block.number)
 }
 
 fn run_eth<DB: Database + DatabaseRef>(
@@ -153,21 +224,8 @@ fn run_eth<DB: Database + DatabaseRef>(
     if !is_eth {
         return Ok(None);
     }
-    let data = match &inputs.input {
-        CallInput::Bytes(b) => b.clone(),
-        CallInput::SharedBuffer(range) => ctx
-            .local_mut()
-            .shared_memory_buffer_slice(range.clone())
-            .map(|s| Bytes::copy_from_slice(&s))
-            .unwrap_or_default(),
-    };
-    let revert = || {
-        Ok(Some(InterpreterResult {
-            result: InstructionResult::Revert,
-            output: Bytes::new(),
-            gas: Gas::new(inputs.gas_limit),
-        }))
-    };
+    let data = calldata(ctx, inputs);
+    let revert = || Ok(finish(inputs, None));
     let id = address.as_slice()[19];
     let modexp_rules = if id == 5 {
         let upgrades = modexp_upgrades
@@ -186,12 +244,7 @@ fn run_eth<DB: Database + DatabaseRef>(
         if upgrades.exponent_size_block > upgrades.uint_fast_path_block {
             return Err("Arbitrum Classic: invalid classic_modexp_upgrades order".to_owned());
         }
-        let number = ctx
-            .tx
-            .context
-            .classic_block_number
-            .map(U256::from)
-            .unwrap_or(ctx.block.number);
+        let number = historical_block_number(ctx);
         if number < U256::from(upgrades.exponent_size_block) {
             modexp::Rules::Legacy
         } else if number < U256::from(upgrades.uint_fast_path_block) {

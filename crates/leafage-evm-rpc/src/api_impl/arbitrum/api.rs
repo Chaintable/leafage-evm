@@ -49,6 +49,7 @@ fn precompile_env(
     ArbitrumPrecompileEnv {
         execution_mode: custom_cfg.map(|c| c.execution_mode).unwrap_or_default(),
         classic_modexp_upgrades: custom_cfg.and_then(|c| c.classic_modexp_upgrades),
+        classic_builtin_upgrades: custom_cfg.and_then(|c| c.classic_builtin_upgrades),
         current_tx_l1_gas_fees: U256::ZERO,
         current_tx_l1_gas_units: 0,
         current_l1_block_number: tx.context.current_l1_block_number,

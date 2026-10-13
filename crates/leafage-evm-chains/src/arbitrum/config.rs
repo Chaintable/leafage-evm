@@ -18,6 +18,15 @@ pub struct ClassicModexpUpgrades {
     pub uint_fast_path_block: u64,
 }
 
+/// Classic builtin validation upgrades, expressed in L2 block numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClassicBuiltinUpgrades {
+    pub arbos_34_block: u64,
+    pub arbos_39_block: u64,
+    pub arbos_42_block: u64,
+    pub arbos_54_block: u64,
+}
+
 /// Per-chain configuration for Arbitrum replicas, parsed from
 /// `--evm-custom-config`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -31,6 +40,11 @@ pub struct ArbitrumEvmConfig {
     /// other Classic networks need an explicit schedule to enable MODEXP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classic_modexp_upgrades: Option<ClassicModexpUpgrades>,
+
+    /// Arbitrum One has historical defaults. Other Classic chains need this
+    /// schedule for builtin behavior that changed during ArbOS upgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_builtin_upgrades: Option<ClassicBuiltinUpgrades>,
 
     /// Mirrors Nitro's
     /// `ChainConfig.ArbitrumChainParams.AllowDebugPrecompiles`.

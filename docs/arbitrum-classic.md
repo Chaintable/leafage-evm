@@ -25,8 +25,21 @@ The supported subset includes ordinary EVM contract reads and simulated storage/
 - Standard precompiles retain Classic ECRECOVER input/output, MODEXP zero-exponent and empty-operand behavior, and pairing truncation and point limits. Pairing validates canonical coordinates and curve membership without imposing Ethereum's additional G2 subgroup check, matching the native Classic AVM.
 - DELEGATECALL/CALLCODE into 0x64–0xc8 returns false and preserves prior return data, as do insufficient-balance calls to nonempty-code contracts and known builtins.
 - ArbInfo at 0x65 executes its actual historical EVM bytecode. Classic ArbOwner is 0x6b; Nitro-only 0x70+ are not intercepted.
+- Classic builtin selector dispatch, input-length checks, static-call restrictions and zero-caller checks. Unknown selectors (including proxy probes such as `implementation()`) revert within the EVM, allowing callers and non-fast-fail multicalls to continue. EVM calls to the reserved bridge address 0xc8 also revert.
+- ArbAddressTable's permanent zero-address entry and decompression of literal addresses, including Mini's noncanonical RLP behavior; `ArbosTest.burnArbGas(0)` returns empty bytes.
 
 MODEXP follows Arbitrum One's historical upgrades: before block **2965603** it bounds the exponent by the base's effective byte length; at **2965603** (ArbOS 49) it uses the exponent's byte length; at **3696126** (ArbOS 50) the uint fast path adds the empty-operand reverts. These boundaries were checked against native archive calls on both adjacent blocks. RPC block overrides do not change the selected historical implementation. Other Classic networks must supply `classic_modexp_upgrades` in the EVM custom config with `exponent_size_block` and `uint_fast_path_block`; without a known schedule, MODEXP reports a capability error.
+
+Builtin rules follow four upgrades, verified on adjacent native archive blocks:
+
+| ArbOS | First block | Behavior |
+| --- | ---: | --- |
+| 34 | 156077 | Most builtin static guards enabled; ArbBLS disabled |
+| 39 | 226011 | RLP integers longer than 32 bytes rejected |
+| 42 | 662405 | ArbBLS restored; static guard exceptions changed; `sendTxToL1` payload length checked |
+| 54 | 6835288 | Dynamic ABI offsets checked |
+
+Other Classic networks can configure `classic_builtin_upgrades` with `arbos_34_block`, `arbos_39_block`, `arbos_42_block` and `arbos_54_block`; without this schedule, version-dependent paths report a capability error. Removed ArbOwner methods remain recognized, so valid historical calls are not mistaken for unknown selectors.
 
 ## Limits
 
@@ -38,8 +51,9 @@ Execution touching unavailable semantics returns an explicit `Arbitrum Classic:`
 - Insufficient-balance CALL to an ordinary empty-code account: StateDiffs cannot distinguish EOA and empty-runtime contract return-data behavior.
 - EXTCODECOPY with an oversized source (outside Classic's 64-bit ByteArray range) on an empty-code account: StateDiffs do not distinguish an EOA from Classic empty-code contract metadata. Normal offsets are supported.
 - Typed transactions, nonzero gasPrice, and `estimateGas`.
+- Builtin dynamic slices that read outside the visible calldata. Mini can access the backing AVM message buffer or adjacent parent memory there; returning padded zeroes would be incorrect. Independently provable malformed lengths/offsets still revert.
 
-Recognized unsupported builtins return a capability error rather than running Nitro code against Classic state. Unknown ArbSys selectors retain Classic's catchable revert behavior. A capability error is not evidence that the original Classic call reverts.
+Recognized unsupported builtin methods return a capability error after independently evaluable input/context checks. Unknown selectors revert for all Classic builtins. A capability error does not imply that the native call reverts.
 
 Gas in calls/traces/multicall remains **revm resource accounting, not Classic ArbGas**. GAS, gas-sensitive branches and low-gas calls can differ from AVM even if no missing-data instruction executes. Use the archive Classic node for exact gas, estimates, transaction replay or these unsupported paths. PUSH0 and later Ethereum opcodes are not enabled. Full transaction simulation/replay fidelity is not claimed.
 
