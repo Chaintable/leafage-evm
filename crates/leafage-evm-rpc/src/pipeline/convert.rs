@@ -370,13 +370,16 @@ fn error_message(status: Option<InstructionResult>, output: &Bytes) -> String {
         InstructionResult::ReentrancySentryOOG => {
             "out of gas: not enough gas for reentrancy sentry".to_string()
         }
-        InstructionResult::OpcodeNotFound | InstructionResult::InvalidFEOpcode => {
-            "invalid opcode".to_string()
-        }
+        // An opcode of a later fork (e.g. PUSH0 before Shanghai) is
+        // undefined in go-ethereum's jump table too.
+        InstructionResult::OpcodeNotFound
+        | InstructionResult::InvalidFEOpcode
+        | InstructionResult::NotActivated => "invalid opcode".to_string(),
         InstructionResult::InvalidJump => "invalid jump destination".to_string(),
         InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
         InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-        InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
+        InstructionResult::StateChangeDuringStaticCall
+        | InstructionResult::CallNotAllowedInsideStatic => "write protection".to_string(),
         InstructionResult::CreateCollision => "contract address collision".to_string(),
         InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
         InstructionResult::CreateInitCodeSizeLimit => "max initcode size exceeded".to_string(),
