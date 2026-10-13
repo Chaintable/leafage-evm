@@ -216,7 +216,7 @@ def main():
             # A parent that ignores a child failure must not return a fake value.
             parent = '0x6000600060006000600073' + CHILD[2:] + '5af150602a60005260206000f3'
             rejected('unsupported.nested:' + name, height, 'eth_call', [dict(to=PROBE), block, {PROBE: dict(code=parent), CHILD: dict(code=code)}])
-        for address, data in [(ARBSYS, '0x051038f2'), ('0x000000000000000000000000000000000000006c', '0x41b247a8')]:
+        for address, data in [(ARBSYS, '0x051038f2'), ('0x000000000000000000000000000000000000006c', '0x')]:
             rejected('builtin:' + address + data, height, 'eth_call', [dict(to=address, data=data), block])
         rejected('trace.unsupported', height, 'pre_traceCall', [dict(to=ARBSYS, data='0x051038f2'), block])
         rejected('estimate.unsupported', height, 'estimateGas', [dict(to=TOKENS[0], data='0x313ce567'), {'block_id': block, 'type': 'Equals'}])

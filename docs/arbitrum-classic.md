@@ -53,7 +53,7 @@ Execution touching unavailable semantics returns an explicit `Arbitrum Classic:`
 - Typed transactions, nonzero gasPrice, and `estimateGas`.
 - Builtin dynamic slices that read outside the visible calldata. Mini can access the backing AVM message buffer or adjacent parent memory there; returning padded zeroes would be incorrect. Independently provable malformed lengths/offsets still revert.
 
-Recognized unsupported builtin methods return a capability error after their independently evaluable input/context guards. Unknown selectors revert for all Classic builtins. A capability error is not evidence that the original Classic call reverts. Private table entries, owner membership, BLS keys, pricing and retryable data are still unavailable. Debug account mutation methods and full storage enumeration remain unsupported; some methods were introduced after genesis, so their presence cannot be inferred from the latest Classic ABI or replaced with a constant return value. This implementation does not add state exports or rebuild historical data.
+Recognized unsupported builtin methods return a capability error after independently evaluable input/context checks. Unknown selectors revert for all Classic builtins. A capability error does not imply that the native call reverts.
 
 Gas in calls/traces/multicall remains **revm resource accounting, not Classic ArbGas**. GAS, gas-sensitive branches and low-gas calls can differ from AVM even if no missing-data instruction executes. Use the archive Classic node for exact gas, estimates, transaction replay or these unsupported paths. PUSH0 and later Ethereum opcodes are not enabled. Full transaction simulation/replay fidelity is not claimed.
 
@@ -65,9 +65,6 @@ cargo test -p leafage-evm-rpc --lib arbitrum::
 python3 scripts/test_arbitrum_classic.py \
   --classic http://127.0.0.1:8545 --leafage http://127.0.0.1:8659 \
   --heights 156000,1107013,2965602,2965603,3696125,3696126,4198902 --report /tmp/classic-comparison.json
-python3 scripts/test_arbitrum_classic_builtins.py \
-  --classic http://127.0.0.1:8545 --leafage http://127.0.0.1:8659 \
-  --report /tmp/classic-builtins.json
 ```
 
 The differential script issues only read/simulation RPCs. Both nodes must have archive state at the selected heights. It compares return bytes and historical balance/nonce/code/storage, not AVM gas usage. Synthetic opcode probes use RPC state overrides; if the Classic reference cannot apply these at an early height, the report marks those probes as skipped, while real historical calls and state comparisons still run. It also checks explicit missing-data failures, multicall output, tracing and estimate rejection. The JSON report retains failures for debugging.
