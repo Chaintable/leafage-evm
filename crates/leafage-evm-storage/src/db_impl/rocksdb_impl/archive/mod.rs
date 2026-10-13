@@ -663,6 +663,7 @@ fn shard_bounds(jobs: usize) -> Vec<(u8, Option<u8>)> {
 /// leading key byte, then ingest them. Each worker scans its disjoint key
 /// range, buffers one prefix at a time and emits it sorted (the tail rewrite
 /// reverses order within a prefix), and drops orphaned `u64::MAX` sentinels.
+/// A nonzero `buffer_limit` splits large prefixes into bounded sorted SST runs.
 /// Returns `(kept, dropped)`.
 #[allow(clippy::too_many_arguments)]
 fn reencode_versioned_cf(
@@ -671,6 +672,7 @@ fn reencode_versioned_cf(
     col: StorageTypeColumn,
     prefix_len: usize,
     jobs: usize,
+    buffer_limit: usize,
     sst_opts: &Options,
     tmp_dir: &Path,
     roll_bytes: u64,
@@ -752,6 +754,7 @@ fn reencode_versioned_cf(
                         roll_bytes,
                     );
                     let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let mut buffered_bytes = 0usize;
                     let mut cur_prefix: Option<Vec<u8>> = None;
                     let mut local_kept = 0u64;
                     let mut local_dropped = 0u64;
@@ -761,7 +764,7 @@ fn reencode_versioned_cf(
                         buf: &mut Vec<(Vec<u8>, Vec<u8>)>,
                         sink: &mut SstSink,
                     ) -> Result<u64, Error> {
-                        buf.sort_by(|a, b| a.0.cmp(&b.0));
+                        buf.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                         for (k, v) in buf.iter() {
                             sink.put(k, v)?;
                         }
@@ -790,12 +793,21 @@ fn reencode_versioned_cf(
                         if cur_prefix.as_deref() != Some(&key[..prefix_len]) {
                             if !buf.is_empty() {
                                 local_kept += flush_prefix(&mut buf, &mut sink)?;
+                                buffered_bytes = 0;
                             }
                             cur_prefix = Some(key[..prefix_len].to_vec());
                         }
                         let mut new_key = key.to_vec();
                         new_key[klen - 8..].copy_from_slice(&(u64::MAX - block).to_be_bytes());
+                        buffered_bytes +=
+                            new_key.len() + value.len() + size_of::<(Vec<u8>, Vec<u8>)>();
                         buf.push((new_key, value.to_vec()));
+                        if buffer_limit != 0 && buffered_bytes >= buffer_limit {
+                            local_kept += flush_prefix(&mut buf, &mut sink)?;
+                            // The next chunk sorts before this one after inversion.
+                            sink.finish_file()?;
+                            buffered_bytes = 0;
+                        }
                     }
                     if !buf.is_empty() {
                         local_kept += flush_prefix(&mut buf, &mut sink)?;
@@ -1103,7 +1115,9 @@ impl DataBaseRef {
         dst_path: P,
         cache_size: usize,
         jobs: usize,
+        buffer_mb: usize,
     ) -> Result<(), Error> {
+        let buffer_limit = buffer_mb.saturating_mul(1024 * 1024);
         // 0 = auto: one worker per core, capped (more than ~16 rarely helps and
         // just multiplies the per-shard read/SST overhead).
         let jobs = if jobs == 0 {
@@ -1114,7 +1128,8 @@ impl DataBaseRef {
         } else {
             jobs.clamp(1, 16)
         };
-        info!(target: "migrate", "reencode: legacy -> inverted with {jobs} worker(s)");
+        info!(target: "migrate", "reencode: legacy -> inverted with {jobs} worker(s), \
+            buffer threshold={buffer_mb} MiB/worker (0=unlimited)");
 
         // Source: read-only, bounded fds (archive DBs have very many SSTs, so
         // the default unlimited max_open_files trips the OS fd limit).
@@ -1219,6 +1234,7 @@ impl DataBaseRef {
             StorageTypeColumn::AddressToAccount,
             32,
             jobs,
+            buffer_limit,
             &sst_opts,
             &tmp_dir,
             ROLL_BYTES,
@@ -1232,6 +1248,7 @@ impl DataBaseRef {
             StorageTypeColumn::AddressToStorage,
             64,
             jobs,
+            buffer_limit,
             &sst_opts,
             &tmp_dir,
             ROLL_BYTES,
@@ -3589,7 +3606,7 @@ mod inverted_encoding_tests {
 
         // 2) Re-encode legacy -> inverted (raw handles; src untouched). Use
         //    jobs=4 to exercise the parallel sharded path.
-        DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64, 4).unwrap();
+        DataBaseRef::reencode_legacy_to_inverted(&src_dir, &dst_dir, 64, 4, 0).unwrap();
 
         // 3) Open the result WITHOUT setting the inverted flag — the DB's
         //    encoding marker must auto-align it (self-describing), proving the
@@ -3638,6 +3655,73 @@ mod inverted_encoding_tests {
         }
         let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+}
+
+#[cfg(test)]
+mod reencode_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn test_reencode_buffered_matches_unlimited() {
+        let base = std::env::temp_dir().join(format!("reencode-buffer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (col, prefix_len) in [
+            (StorageTypeColumn::AddressToAccount, 32),
+            (StorageTypeColumn::AddressToStorage, 64),
+        ] {
+            let dir = base.join(col.to_str());
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let src = DB::open_cf(&opts, dir.join("src"), [col.to_str()]).unwrap();
+            for prefix in [0x10, 0x11] {
+                for block in 0..20u64 {
+                    let mut key = vec![prefix; prefix_len];
+                    key.extend_from_slice(&[0; 24]);
+                    key.extend_from_slice(&block.to_be_bytes());
+                    src.put_cf(
+                        src.cf_handle(col.to_str()).unwrap(),
+                        key,
+                        block.to_be_bytes(),
+                    )
+                    .unwrap();
+                }
+            }
+            let mut baseline = None;
+            for limit in [0, 256] {
+                let dst =
+                    DB::open_cf(&opts, dir.join(format!("dst-{limit}")), [col.to_str()]).unwrap();
+                let tmp = dir.join(format!("sst-{limit}"));
+                std::fs::create_dir_all(&tmp).unwrap();
+                assert_eq!(
+                    reencode_versioned_cf(
+                        &src,
+                        &dst,
+                        col,
+                        prefix_len,
+                        1,
+                        limit,
+                        &sst_writer_options(),
+                        &tmp,
+                        1 << 20,
+                    )
+                    .unwrap(),
+                    (40, 0),
+                );
+                let records: Vec<_> = dst
+                    .iterator_cf(dst.cf_handle(col.to_str()).unwrap(), IteratorMode::Start)
+                    .map(Result::unwrap)
+                    .collect();
+                if let Some(expected) = &baseline {
+                    assert_eq!(&records, expected);
+                } else {
+                    baseline = Some(records);
+                }
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
 

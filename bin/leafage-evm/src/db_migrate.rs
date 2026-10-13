@@ -69,6 +69,13 @@ pub struct Command {
     /// contention on slow storage.
     #[arg(long, default_value = "0")]
     reencode_jobs: usize,
+
+    /// Approximate per-worker record-buffer threshold in MiB for
+    /// --reencode-inverted. 0 (default) keeps unlimited buffering.
+    /// Counts keys, values and entry metadata, not allocation/RocksDB overhead
+    /// or total process memory. Reaching the threshold finishes the current SST.
+    #[arg(long, default_value = "0")]
+    reencode_buffer_mb: usize,
 }
 
 impl Command {
@@ -93,6 +100,7 @@ impl Command {
                 &self.dst,
                 self.cache_size,
                 self.reencode_jobs,
+                self.reencode_buffer_mb,
             )?;
             // Carry the resync offset over, same as the normal migration.
             let offset =
