@@ -239,6 +239,32 @@ impl StateDBRead for MultiStateDB {
         }
     }
 
+    fn read_storage_and_height(
+        &self,
+        address: H256,
+        key: H256,
+    ) -> Result<(U256, Option<u64>), StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_storage_and_height(address, key),
+            MultiStateDB::RocksDBArchive(db) => db.read_storage_and_height(address, key),
+            MultiStateDB::MDBXState(db) => db.read_storage_and_height(address, key),
+            MultiStateDB::MDBXArchive(db) => db.read_storage_and_height(address, key),
+        }
+    }
+
+    fn read_account_at(
+        &self,
+        address: H256,
+        block_num: u64,
+    ) -> Result<Option<Option<NewAccount>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_account_at(address, block_num),
+            MultiStateDB::RocksDBArchive(db) => db.read_account_at(address, block_num),
+            MultiStateDB::MDBXState(db) => db.read_account_at(address, block_num),
+            MultiStateDB::MDBXArchive(db) => db.read_account_at(address, block_num),
+        }
+    }
+
     fn read_latest_block_hash(&self) -> Result<H256, StorageError> {
         match self {
             MultiStateDB::RocksDBState(db) => db.read_latest_block_hash(),

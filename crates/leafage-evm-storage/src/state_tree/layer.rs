@@ -533,6 +533,29 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
         }
     }
 
+    fn storage_and_height(
+        &self,
+        address: H256,
+        index: H256,
+    ) -> Result<(U256, Option<u64>), Self::Error> {
+        for layer in self.flattened.layers.iter() {
+            let diff = layer.unwrap_diff_layer();
+            if let Some(value) = diff.storage.get(&(address, index)) {
+                return Ok((*value, Some(diff.block_info.header.number)));
+            }
+        }
+        // The disk-layer cache keeps no versions: read the backend directly.
+        Ok(self.statedb.storage_and_height(address, index)?)
+    }
+
+    fn basic_at(
+        &self,
+        address: H256,
+        block_num: u64,
+    ) -> Result<Option<Option<AccountInfo>>, Self::Error> {
+        Ok(self.statedb.basic_at(address, block_num)?)
+    }
+
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
         for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().contracts.get(&code_hash) {

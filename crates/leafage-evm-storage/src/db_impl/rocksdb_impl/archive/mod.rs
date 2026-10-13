@@ -23,8 +23,8 @@
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding, set_inverted_block_encoding,
+    decode_version_tail, encode_account_key, encode_block_num, encode_slim_account,
+    encode_storage_key, inverted_block_encoding, set_inverted_block_encoding,
 };
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{
@@ -2346,11 +2346,16 @@ impl StateDB {
     }
 }
 
-impl StateDBRead for StateDB {
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+impl StateDB {
+    /// The greatest account version `<= block_num`.
+    fn read_account_version(
+        &self,
+        address: H256,
+        block_num: u64,
+    ) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
-        let target_key = encode_account_key(address, self.block_num);
+        let target_key = encode_account_key(address, block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -2393,8 +2398,30 @@ impl StateDBRead for StateDB {
             Ok(None)
         }
     }
+}
+
+impl StateDBRead for StateDB {
+    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+        self.read_account_version(address, self.block_num)
+    }
+
+    fn read_account_at(
+        &self,
+        address: H256,
+        block_num: u64,
+    ) -> Result<Option<Option<NewAccount>>, Error> {
+        Ok(Some(self.read_account_version(address, block_num.min(self.block_num))?))
+    }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
+        Ok(self.read_storage_and_height(address, key)?.0)
+    }
+
+    fn read_storage_and_height(
+        &self,
+        address: H256,
+        key: H256,
+    ) -> Result<(U256, Option<u64>), Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
         let key_bytes: [u8; 32] = key.into();
@@ -2417,19 +2444,20 @@ impl StateDBRead for StateDB {
             .record(start.elapsed().as_secs_f64());
         if let Some(raw_key_bytes) = storage_iter.key() {
             if address_bytes != raw_key_bytes[..32] {
-                return Ok(U256::ZERO);
+                return Ok((U256::ZERO, None));
             }
             if key_bytes != raw_key_bytes[32..64] {
-                return Ok(U256::ZERO);
+                return Ok((U256::ZERO, None));
             }
+            let version = decode_version_tail(&raw_key_bytes[64..96]);
             let raw_val_bytes = storage_iter.value().unwrap();
             if raw_val_bytes.is_empty() {
-                return Ok(U256::ZERO);
+                return Ok((U256::ZERO, Some(version)));
             }
             let value = U256::from_be_slice(&raw_val_bytes);
-            Ok(value)
+            Ok((value, Some(version)))
         } else {
-            Ok(U256::ZERO)
+            Ok((U256::ZERO, None))
         }
     }
 

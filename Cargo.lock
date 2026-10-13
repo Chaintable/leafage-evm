@@ -4942,6 +4942,7 @@ name = "leafage-evm"
 version = "0.2.0"
 dependencies = [
  "alloy",
+ "alloy-primitives",
  "alloy-rlp",
  "anyhow",
  "aws-config",
@@ -5027,11 +5028,15 @@ name = "leafage-evm-rpc"
 version = "0.2.0"
 dependencies = [
  "alloy",
+ "alloy-consensus",
  "alloy-contract",
  "alloy-evm",
  "anyhow",
  "async-trait",
+ "aws-sdk-s3",
+ "bytes 1.12.1",
  "criterion",
+ "flate2",
  "futures",
  "http 1.3.1",
  "http-body 1.0.1",
@@ -5041,6 +5046,7 @@ dependencies = [
  "leafage-evm-chains",
  "leafage-evm-storage",
  "leafage-evm-types",
+ "md-5",
  "metrics",
  "metrics-util",
  "op-revm",
@@ -5049,6 +5055,7 @@ dependencies = [
  "revm-inspectors",
  "serde",
  "serde_json",
+ "sha1",
  "socket2 0.6.0",
  "thiserror 1.0.69",
  "tokio",

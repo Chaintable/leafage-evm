@@ -28,6 +28,8 @@ tikv-jemalloc-sys.workspace = true
 jemalloc_pprof = { workspace = true, features = ["symbolize"] }
 alloy-rlp.workspace = true
 alloy.workspace = true
+# Faster keccak for every hash in the binary (archive keys, EVM, tries).
+alloy-primitives = { workspace = true, features = ["asm-keccak"] }
 rocksdb = { workspace = true, features = ["jemalloc"] }
 rdkafka.workspace = true
 aws-sdk-s3.workspace = true

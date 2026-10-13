@@ -6,6 +6,8 @@ mod compact;
 mod db_migrate;
 mod force_compact;
 mod initializer;
+mod pipeline_export;
+mod put_code;
 mod register;
 mod rewind;
 mod runner;

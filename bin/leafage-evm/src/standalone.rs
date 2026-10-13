@@ -308,6 +308,17 @@ pub struct Command {
     #[arg(long)]
     historical_height: Option<u64>,
 
+    /// Upstream BSC RPC serving full block bodies. Enables
+    /// `trace_debankBlock` on BSC mainnet archive nodes, which replays a block
+    /// on the archive state to regenerate its pipeline traces and events.
+    #[arg(long, value_name = "URL")]
+    trace_block_rpc: Option<String>,
+
+    /// Skip comparing the state changes of a `trace_debankBlock` replay with
+    /// the archive; only the gas used and receipts root are checked then.
+    #[arg(long, default_value_t = false)]
+    trace_block_skip_state_check: bool,
+
     /// The wait timeout for stoping the server.
     /// Default: 5 seconds
     ///
@@ -972,6 +983,10 @@ impl Command {
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+            .with_trace_block_rpc(
+                self.trace_block_rpc.clone(),
+                !self.trace_block_skip_state_check,
+            )?
             .with_evm_exec_concurrency(self.evm_exec_concurrency)
             .with_state_read_concurrency(self.state_read_concurrency)
             .with_multicall_parallelism(self.multicall_parallelism);

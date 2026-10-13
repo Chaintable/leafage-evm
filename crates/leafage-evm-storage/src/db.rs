@@ -38,6 +38,26 @@ pub trait StateDBRead {
     /// account address | storage index -> storage value
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, StorageError>;
 
+    /// [`StateDBRead::read_storage`] plus the block that wrote the value, for
+    /// backends that keep versions (archive); `None` when unknown.
+    fn read_storage_and_height(
+        &self,
+        address: H256,
+        key: H256,
+    ) -> Result<(U256, Option<u64>), StorageError> {
+        Ok((self.read_storage(address, key)?, None))
+    }
+
+    /// The account as of an earlier block `block_num`, for backends that keep
+    /// versions (archive); the outer `None` means unsupported.
+    fn read_account_at(
+        &self,
+        _address: H256,
+        _block_num: u64,
+    ) -> Result<Option<Option<NewAccount>>, StorageError> {
+        Ok(None)
+    }
+
     /// Batched [`StateDBRead::read_account`]: one result per input, same
     /// order. The scalar default keeps archive/MDBX/mock backends correct;
     /// exact-key backends (non-archive RocksDB) override it with MultiGet.
@@ -200,6 +220,25 @@ where
     /// Get storage value of address at index.
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error> {
         self.0.read_storage(address.into(), index)
+    }
+
+    fn storage_and_height(
+        &self,
+        address: H256,
+        index: H256,
+    ) -> Result<(U256, Option<u64>), Self::Error> {
+        self.0.read_storage_and_height(address, index)
+    }
+
+    fn basic_at(
+        &self,
+        address: H256,
+        block_num: u64,
+    ) -> Result<Option<Option<AccountInfo>>, Self::Error> {
+        Ok(self
+            .0
+            .read_account_at(address, block_num)?
+            .map(|account| account.map(Into::into)))
     }
 
     // History related
