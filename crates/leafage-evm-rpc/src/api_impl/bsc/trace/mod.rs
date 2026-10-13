@@ -19,7 +19,6 @@ use crate::error::rpc_error_with_code;
 use crate::pipeline::blocks::fetch_blocks;
 use crate::pipeline::chain::ReplayOptions;
 pub(crate) use crate::pipeline::types::DebankBlockOutput;
-use alloy::primitives::U64;
 pub(crate) use chain::BscPipeline;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee::http_client::HttpClient;
@@ -43,20 +42,9 @@ pub(crate) trait BscTraceApi {
         block_id: BlockId,
         options: Option<TraceBlockOptions>,
     ) -> RpcResult<DebankBlockOutput>;
-
-    /// [`Self::debank_block`] for the blocks `from..=to` (at most
-    /// [`MAX_RANGE`]). Replaying them in one go reads each piece of state from
-    /// the archive once for the whole range.
-    #[method(name = "debankBlocks")]
-    async fn debank_blocks(
-        &self,
-        from: U64,
-        to: U64,
-        options: Option<TraceBlockOptions>,
-    ) -> RpcResult<Vec<DebankBlockOutput>>;
 }
 
-/// Optional last parameter of the `trace_debankBlock(s)` methods.
+/// Optional last parameter of `trace_debankBlock`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct TraceBlockOptions {
@@ -70,9 +58,6 @@ impl Default for TraceBlockOptions {
         Self { state_diff: true }
     }
 }
-
-/// Most blocks one `trace_debankBlocks` call replays.
-pub(crate) const MAX_RANGE: u64 = 100;
 
 pub(crate) struct BscTrace<C> {
     api: Api<C>,
@@ -130,22 +115,6 @@ where
             .trace_range(number, number, options.unwrap_or_default())
             .await?;
         Ok(outputs.pop().expect("one block traced"))
-    }
-
-    async fn debank_blocks(
-        &self,
-        from: U64,
-        to: U64,
-        options: Option<TraceBlockOptions>,
-    ) -> RpcResult<Vec<DebankBlockOutput>> {
-        let (from, to) = (from.to::<u64>(), to.to::<u64>());
-        if to < from || to - from >= MAX_RANGE {
-            return Err(invalid_params(format!(
-                "expected from <= to and at most {MAX_RANGE} blocks, got {from}..={to}"
-            )));
-        }
-        self.trace_range(from, to, options.unwrap_or_default())
-            .await
     }
 }
 
