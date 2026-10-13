@@ -1,4 +1,5 @@
 //! Classic builtin dispatch, deliberately separate from Nitro ArbOS storage.
+mod builtins;
 mod modexp;
 mod pairing;
 
@@ -37,9 +38,6 @@ pub(super) fn run<DB: Database + DatabaseRef>(
             "Arbitrum Classic: builtin {address} requires unavailable Classic ArbOS state or call context"
         )
     };
-    if address != Address::with_last_byte(0x64) {
-        return Err(unsupported());
-    }
     if inputs.target_address != address
         || matches!(
             inputs.scheme,
@@ -56,6 +54,22 @@ pub(super) fn run<DB: Database + DatabaseRef>(
             .map(|s| Bytes::copy_from_slice(&s))
             .unwrap_or_default(),
     };
+    if address != Address::with_last_byte(0x64) {
+        let output = match builtins::run(inputs, &data, ctx.chain().current_call().depth) {
+            builtins::Outcome::Revert => None,
+            builtins::Outcome::Return(bytes) => Some(bytes),
+            builtins::Outcome::Unavailable => return Err(unsupported()),
+        };
+        return Ok(Some(InterpreterResult {
+            result: if output.is_some() {
+                InstructionResult::Return
+            } else {
+                InstructionResult::Revert
+            },
+            gas: Gas::new(inputs.gas_limit),
+            output: output.unwrap_or_default(),
+        }));
+    }
     let result = |value: Option<U256>| {
         Some(InterpreterResult {
             result: if value.is_some() {
@@ -131,8 +145,17 @@ pub(super) fn run<DB: Database + DatabaseRef>(
             if data.len() != 68 { return Ok(result(None)); }
             return Err(unsupported());
         }
-        [0x25, 0xe1, 0x60, 0x63] | [0x92, 0x8c, 0x16, 0x9a] => { // withdrawEth / sendTxToL1
-            if inputs.is_static { return Ok(result(None)); }
+        [0x25, 0xe1, 0x60, 0x63] => { // withdrawEth
+            if inputs.is_static || data.len() != 36 { return Ok(result(None)); }
+            return Err(unsupported());
+        }
+        [0x92, 0x8c, 0x16, 0x9a] => { // sendTxToL1
+            if inputs.is_static
+                || builtins::word(&data, 36) != U256::from(64)
+                || !builtins::padded_bytes_length(&data, 100, 68)
+            {
+                return Ok(result(None));
+            }
             return Err(unsupported());
         }
         // Unknown selectors revert in Classic. Capability probes may catch

@@ -533,6 +533,175 @@ mod tests {
     }
 
     #[test]
+    fn classic_builtin_probes_are_catchable_in_plain_and_inspected_calls() {
+        for address in [
+            0x64, 0x66, 0x67, 0x68, 0x69, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0xc8,
+        ] {
+            for data in ["", "01", "deadbeef", "5c60da1b", "a619486e", "bb82aa5e"] {
+                for inspect in [false, true] {
+                    for nested in [false, true] {
+                        // Return the child's success flag followed by its return data.
+                        let parent = alloy::primitives::hex::decode(format!(
+                            "3660006000376000600036600060{address:02x}5afa6000523d600060203e3d6020016000f3"
+                        )).unwrap();
+                        let mut evm = evm(&parent);
+                        let mut tx = tx();
+                        tx.base.data = alloy::primitives::hex::decode(data).unwrap().into();
+                        if !nested {
+                            tx.base.kind = TxKind::Call(Address::with_last_byte(address));
+                        }
+                        let result = if inspect {
+                            evm.inspect_tx(tx)
+                        } else {
+                            evm.transact(tx)
+                        }
+                        .unwrap()
+                        .result;
+                        if nested {
+                            assert_eq!(
+                                output(result),
+                                Bytes::from(vec![0; 32]),
+                                "{address:x}: {data}"
+                            );
+                        } else {
+                            assert!(
+                                matches!(result, ExecutionResult::Revert { .. }),
+                                "{address:x}: {data}: {result:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classic_builtin_guards_run_before_missing_state_errors() {
+        let word = |n: u64| format!("{n:064x}");
+        // These inputs must revert even without any private ArbOS state.
+        let invalid = [
+            (0x66, "949d225d00".into()),
+            (0x67, "375a7c7f".into()),
+            (0x68, format!("ce2ae159{}{}", word(64), word(0))),
+            (0x69, format!("7b510fe8{}", word(0xbb))), // requires zero caller
+            (
+                0x69,
+                format!("f0c26aff{}{}{}", word(0xbb), word(0), word(1)),
+            ),
+            (0x6b, "84352b19".into()),
+            (0x6c, "41b247a800".into()),
+            (0x6d, "875883f200".into()),
+            (0x6e, "81e6e08300".into()),
+            (0x6f, "c59d484700".into()),
+            (0x64, "25e16063".into()),
+            (0x64, format!("928c169a{}{}{}", word(1), word(32), word(0))),
+        ];
+        for (address, data) in invalid {
+            let mut evm = evm(&[]);
+            let mut tx = tx();
+            tx.base.kind = TxKind::Call(Address::with_last_byte(address));
+            tx.base.data = alloy::primitives::hex::decode(data).unwrap().into();
+            assert!(matches!(
+                evm.transact(tx).unwrap().result,
+                ExecutionResult::Revert { .. }
+            ));
+        }
+        for (address, selector, words) in [
+            (0x66, "4420e486", 1),
+            (0x67, "375a7c7f", 4),
+            (0x6b, "84352b19", 1), // even this Classic getter forbids STATICCALL
+            (0x6c, "4290549e", 1),
+            (0x6d, "6e928a6e", 1),
+            (0x6e, "f0b21a41", 1),
+        ] {
+            let parent = alloy::primitives::hex::decode(format!(
+                "3660006000376000600036600060{address:02x}5afa60005260206000f3"
+            ))
+            .unwrap();
+            let mut evm = evm(&parent);
+            let mut tx = tx();
+            tx.base.data =
+                alloy::primitives::hex::decode(format!("{selector}{}", "00".repeat(words * 32)))
+                    .unwrap()
+                    .into();
+            assert_eq!(
+                output(evm.inspect_tx(tx).unwrap().result),
+                Bytes::from(vec![0; 32])
+            );
+        }
+        // setTxBaseFee intentionally has no static guard in Classic. Do not
+        // convert an unavailable method to a catchable revert via Solidity ABI rules.
+        let parent =
+            alloy::primitives::hex::decode("36600060003760006000366000606d5afa00").unwrap();
+        let mut evm = evm(&parent);
+        let mut tx = tx();
+        tx.base.data = alloy::primitives::hex::decode(format!("5be6888b{}{}", word(1), word(2)))
+            .unwrap()
+            .into();
+        assert!(
+            evm.transact(tx)
+                .unwrap_err()
+                .to_string()
+                .contains("requires unavailable Classic ArbOS")
+        );
+    }
+
+    #[test]
+    fn classic_address_table_stateless_paths_match_mini_encoding() {
+        let word = |n: u64| format!("{n:064x}");
+        let mut vectors = vec![
+            (format!("4420e486{}", word(0)), word(0)),
+            (format!("d4b6b5da{}", word(0)), word(0)),
+            (format!("a5025222{}", word(0)), word(1)),
+            (format!("8a186788{}", word(0)), word(0)),
+            (
+                format!("f6a455a2{}", word(0)),
+                format!("{}{}80{}", word(32), word(1), "00".repeat(31)),
+            ),
+        ];
+        for (encoded, consumed, address) in [
+            ("80".to_owned(), 1, 0),
+            ("00".into(), 1, 0),
+            ("8100".into(), 2, 0),
+            (format!("94{}beef", "00".repeat(18)), 21, 0xbeef),
+            // Noncanonical RLP accepted by Mini: prefix can exceed 0x94
+            // if the decoded address fits in 20 bytes.
+            (format!("a0{}beef", "00".repeat(30)), 33, 0xbeef),
+        ] {
+            let len = encoded.len() / 2;
+            vectors.push((
+                format!(
+                    "31862ada{}{}{}{encoded}{}",
+                    word(64),
+                    word(0),
+                    word(len as u64),
+                    "00".repeat((32 - len % 32) % 32)
+                ),
+                format!("{}{}", word(address), word(consumed)),
+            ));
+        }
+        for (data, expected) in vectors {
+            for inspect in [false, true] {
+                let mut evm = evm(&[]);
+                let mut tx = tx();
+                tx.base.kind = TxKind::Call(Address::with_last_byte(0x66));
+                tx.base.data = alloy::primitives::hex::decode(&data).unwrap().into();
+                let result = if inspect {
+                    evm.inspect_tx(tx)
+                } else {
+                    evm.transact(tx)
+                }
+                .unwrap();
+                assert_eq!(
+                    output(result.result).as_ref(),
+                    alloy::primitives::hex::decode(&expected).unwrap(),
+                    "{data}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classic_msize_tracks_writes_not_memory_reads() {
         for (code, expected) in [
             ("600051505960005260206000f3", 0),
