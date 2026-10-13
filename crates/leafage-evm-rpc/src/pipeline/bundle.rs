@@ -144,8 +144,9 @@ impl GzJsonArray {
 
 /// The compactor's StateDiff bundle: a fixed index of a bitmap and payload
 /// offsets, then the RLP `BlockStorageDiff`s.
-#[derive(Default)]
 struct StateDiffWriter {
+    /// The bundle, which sets the number of entries (1 for bundle 0).
+    id: u64,
     /// Whether each entry is a real diff rather than the empty one standing
     /// for an unchanged state root.
     real: Vec<bool>,
@@ -155,6 +156,15 @@ struct StateDiffWriter {
 }
 
 impl StateDiffWriter {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            real: Vec::new(),
+            ends: Vec::new(),
+            payload: Vec::new(),
+        }
+    }
+
     /// Add the diff of the block with `state_root`, empty when the state
     /// root did not change.
     fn push(&mut self, diff: &[u8], state_root: B256) {
@@ -175,9 +185,11 @@ impl StateDiffWriter {
     }
 
     fn finish(self) -> Result<Vec<u8>> {
-        if self.ends.len() as u64 != BUNDLE_SIZE {
+        let entries = if self.id == 0 { 1 } else { BUNDLE_SIZE };
+        if self.ends.len() as u64 != entries {
             bail!(
-                "a StateDiff bundle needs {BUNDLE_SIZE} entries, got {}",
+                "StateDiff bundle {} needs {entries} entries, got {}",
+                self.id,
                 self.ends.len()
             );
         }
@@ -191,8 +203,10 @@ impl StateDiffWriter {
         for end in &self.ends {
             data.extend_from_slice(&end.to_be_bytes());
         }
+        // Offsets past the last entry are zero.
+        data.resize(STATE_DIFF_INDEX_BYTES, 0);
         // A sanity check by the reader of the format.
-        BundleStorageDiffIndex::decode_for_bundle(1, &data)
+        BundleStorageDiffIndex::decode_for_bundle(self.id, &data)
             .map_err(|err| anyhow::anyhow!("invalid StateDiff index: {err:?}"))?;
         data.extend_from_slice(&self.payload);
         Ok(data)
@@ -209,7 +223,7 @@ pub(crate) struct BundleObjects {
     pub state_diff: Option<Vec<u8>>,
 }
 
-/// Builds the chosen resources of one bundle as its blocks are replayed.
+/// Builds the chosen resources of bundle `id` as its blocks are replayed.
 pub(crate) struct BundleWriter {
     gzip_level: u32,
     block_file: Option<GzJsonArray>,
@@ -219,14 +233,14 @@ pub(crate) struct BundleWriter {
 }
 
 impl BundleWriter {
-    pub fn new(resources: &BTreeSet<Resource>, gzip_level: u32) -> Self {
+    pub fn new(id: u64, resources: &BTreeSet<Resource>, gzip_level: u32) -> Self {
         let has = |resource| resources.contains(&resource);
         Self {
             gzip_level,
             block_file: has(Resource::BlockFile).then(|| GzJsonArray::new(gzip_level)),
             validation: has(Resource::Validation).then(BundleValidation::default),
             headers: has(Resource::Header).then(|| GzJsonArray::new(gzip_level)),
-            state_diff: has(Resource::StateDiff).then(StateDiffWriter::default),
+            state_diff: has(Resource::StateDiff).then(|| StateDiffWriter::new(id)),
         }
     }
 
@@ -284,7 +298,7 @@ mod tests {
 
     #[test]
     fn state_diff_bundle_decodes() {
-        let mut writer = StateDiffWriter::default();
+        let mut writer = StateDiffWriter::new(1);
         let real = BlockStorageDiff {
             hash: B256::repeat_byte(2),
             parent_hash: B256::repeat_byte(1),
@@ -303,6 +317,28 @@ mod tests {
         assert!(!index.has_source_diff(0).unwrap());
         assert!(index.has_source_diff(1).unwrap());
         assert!(!index.has_source_diff(999).unwrap());
+    }
+
+    #[test]
+    fn genesis_state_diff_bundle_has_one_entry() {
+        let genesis = BlockStorageDiff {
+            hash: B256::repeat_byte(2),
+            ..Default::default()
+        };
+        let encoded = alloy::rlp::encode(&genesis);
+        let mut writer = StateDiffWriter::new(0);
+        writer.push(&encoded, B256::repeat_byte(2));
+        let data = writer.finish().unwrap();
+        assert_eq!(data.len(), STATE_DIFF_INDEX_BYTES + encoded.len());
+        let index =
+            BundleStorageDiffIndex::decode_for_bundle(0, &data[..STATE_DIFF_INDEX_BYTES]).unwrap();
+        assert_eq!(index.payload_range(0).unwrap(), (0, encoded.len() as u64));
+        assert!(index.has_source_diff(0).unwrap());
+
+        let mut writer = StateDiffWriter::new(0);
+        writer.push(&encoded, B256::ZERO);
+        writer.push(&encoded, B256::ZERO);
+        assert!(writer.finish().is_err());
     }
 
     #[test]

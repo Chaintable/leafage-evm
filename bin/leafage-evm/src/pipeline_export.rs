@@ -56,7 +56,7 @@ pub struct Command {
     #[arg(long, value_name = "URL")]
     block_rpc: String,
 
-    /// First bundle ID to export.
+    /// First bundle ID to export; bundle 0 is the genesis block alone.
     #[arg(long, group = "start")]
     from_bundle: Option<u64>,
 
@@ -152,9 +152,13 @@ impl Command {
 
     /// The first and last bundle asked for.
     fn bundles(&self) -> Result<(u64, u64)> {
+        // Bundle 0 is the genesis block alone.
         let bundle = |height: u64| -> Result<u64> {
-            ensure!(height > 0, "the genesis block (bundle 0) is not supported");
-            Ok((height - 1) / BUNDLE_SIZE + 1)
+            Ok(if height == 0 {
+                0
+            } else {
+                (height - 1) / BUNDLE_SIZE + 1
+            })
         };
         let first = match (self.from_bundle, self.from_block_height) {
             (Some(id), _) => id,
@@ -166,7 +170,6 @@ impl Command {
             (None, Some(height)) => bundle(height)?,
             (None, None) => unreachable!("clap requires an end"),
         };
-        ensure!(first > 0, "bundle 0 (genesis) is not supported");
         ensure!(first <= last, "the start is after the end");
         Ok((first, last))
     }

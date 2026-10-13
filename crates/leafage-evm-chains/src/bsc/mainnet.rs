@@ -5,8 +5,28 @@
 
 use crate::bsc::hardforks::{bsc::BscHardfork, BscHardforks};
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
+use revm::primitives::{address, Address};
 
 pub const BSC_MAINNET_CHAIN_ID: u64 = 56;
+
+/// The accounts of the BSC mainnet genesis alloc (`bscMainnetAllocData`):
+/// the system contracts, the zero-balance coinbase stand-in and two funded
+/// accounts. None has storage.
+pub const BSC_MAINNET_GENESIS_ALLOC: [Address; 13] = [
+    address!("ffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE"),
+    address!("0000000000000000000000000000000000001000"),
+    address!("0000000000000000000000000000000000001001"),
+    address!("0000000000000000000000000000000000001002"),
+    address!("0000000000000000000000000000000000001003"),
+    address!("0000000000000000000000000000000000001004"),
+    address!("0000000000000000000000000000000000001005"),
+    address!("0000000000000000000000000000000000001006"),
+    address!("0000000000000000000000000000000000001007"),
+    address!("0000000000000000000000000000000000001008"),
+    address!("0000000000000000000000000000000000002000"),
+    address!("b005741528b86F5952469d80A8614591E3c5B632"),
+    address!("446AA6E0DC65690403dF3F127750da1322941F3e"),
+];
 
 /// Hardfork activations of BSC mainnet (chain id 56).
 #[derive(Debug, Clone, Copy, Default)]

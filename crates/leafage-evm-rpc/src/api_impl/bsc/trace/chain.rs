@@ -3,9 +3,11 @@
 use super::recreated::{FilterStats, RecreatedStorageFilter};
 use super::replay::{RangeBlock, RangeReplayer};
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
+use crate::pipeline::genesis::genesis_output;
 use alloy::primitives::B256;
 use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{anyhow, Result};
+use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_GENESIS_ALLOC;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{BlockId, BlockInfo};
 use std::sync::atomic::Ordering;
@@ -37,6 +39,17 @@ where
             parent_state_root: parent.header.state_root,
             stats,
         })
+    }
+
+    fn genesis(
+        &self,
+        db: &Arc<DB>,
+        info: &BlockInfo,
+        block: &RpcBlock,
+        options: ReplayOptions,
+    ) -> Result<ReplayOutput> {
+        let state = filtered_state(db.as_ref(), info, &Arc::default())?;
+        genesis_output(&BSC_MAINNET_GENESIS_ALLOC, &state, block, options)
     }
 }
 

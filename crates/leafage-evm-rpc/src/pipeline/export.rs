@@ -2,7 +2,9 @@
 //! for any chain with a [`PipelineChain`] replay, uploaded to the compactor's
 //! target objects.
 //!
-//! Bundle `b` holds the blocks `(b - 1) * 1000 + 1 ..= b * 1000`. Any of its
+//! Bundle `b` holds the blocks `(b - 1) * 1000 + 1 ..= b * 1000`, bundle 0
+//! only the genesis block, which is made from its alloc rather than replayed
+//! (see [`super::genesis`]). Any of its
 //! four resources (validation, block file, header, state diff, see
 //! [`super::bundle`]) are built in memory and uploaded; nothing is written to
 //! disk. The replay only produces what they need: the block file and the
@@ -19,7 +21,7 @@
 //! once are not read from the archive again.
 
 use super::blocks::fetch_raw_blocks;
-use super::bundle::{BundleWriter, Resource, BUNDLE_SIZE};
+use super::bundle::{BundleObjects, BundleWriter, Resource, BUNDLE_SIZE};
 use super::chain::{Chain, ChainReplay, PipelineChain, ReplayOptions};
 use super::s3::{MultipartUpload, S3Target};
 use crate::api_impl::bsc::trace::BscPipeline;
@@ -88,8 +90,11 @@ impl ExportConfig {
     }
 }
 
-/// Height range of bundle `id` (never 0: bundle 0 is the genesis block).
+/// Height range of bundle `id`; bundle 0 is the genesis block alone.
 pub fn bundle_range(id: u64) -> (u64, u64) {
+    if id == 0 {
+        return (0, 0);
+    }
     ((id - 1) * BUNDLE_SIZE + 1, id * BUNDLE_SIZE)
 }
 
@@ -120,10 +125,6 @@ where
     DB: Send + Sync + BlockIndex + 'static,
     C: PipelineChain<DB>,
 {
-    anyhow::ensure!(
-        config.from_bundle >= 1,
-        "bundle 0 (genesis) is not supported"
-    );
     anyhow::ensure!(config.from_bundle <= config.to_bundle, "empty bundle range");
     anyhow::ensure!(!config.resources.is_empty(), "no resource to export");
     for &resource in &config.resources {
@@ -264,6 +265,11 @@ where
     DB: Send + Sync + BlockIndex + 'static,
     C: PipelineChain<DB>,
 {
+    if id == 0 {
+        // Nothing to carry over from or to the genesis block.
+        *carry = None;
+        return export_genesis(db, chain, client, config, progress).await;
+    }
     // The block file is uploaded in parts as it is built.
     let mut upload = None;
     let result =
@@ -292,14 +298,7 @@ where
     C: PipelineChain<DB>,
 {
     let started = Instant::now();
-    // Tells this export's objects of the bundle from those of other runs.
-    let export = format!(
-        "{:x}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
+    let export = export_id();
     let (first, last) = bundle_range(id);
     let (replay, mut since_rebase) = match carry.take() {
         Some(carried) if carried.number == first - 1 => (carried.replay, carried.since_rebase),
@@ -310,7 +309,7 @@ where
     };
     let counters_before = replay.counters();
     let mut replay = Some(replay);
-    let mut writer = Some(BundleWriter::new(&config.resources, config.gzip_level));
+    let mut writer = Some(BundleWriter::new(id, &config.resources, config.gzip_level));
     let (mut txs, mut bytes) = (0u64, 0u64);
     let (mut fetch_wait, mut execute, mut write, mut upload_wait) = (
         Duration::ZERO,
@@ -401,47 +400,7 @@ where
     let writer = writer.expect("writer");
     let objects = tokio::task::spawn_blocking(move || writer.finish()).await??;
     let t = Instant::now();
-    // In the compactor's order.
-    if let Some(data) = objects.validation {
-        bytes += data.len() as u64;
-        config
-            .s3
-            .put(id, &export, Resource::Validation, data.into())
-            .await?;
-    }
-    if let Some(data) = objects.block_file {
-        bytes += data.len() as u64;
-        match upload {
-            Some(started) => {
-                // Left in `upload` to be aborted if it fails.
-                if !data.is_empty() {
-                    started.put_part(data.into()).await?;
-                }
-                // Aborts the upload itself if it fails.
-                upload.take().expect("started").complete().await?;
-            }
-            None => {
-                config
-                    .s3
-                    .put(id, &export, Resource::BlockFile, data.into())
-                    .await?
-            }
-        }
-    }
-    if let Some(data) = objects.header {
-        bytes += data.len() as u64;
-        config
-            .s3
-            .put(id, &export, Resource::Header, data.into())
-            .await?;
-    }
-    if let Some(data) = objects.state_diff {
-        bytes += data.len() as u64;
-        config
-            .s3
-            .put(id, &export, Resource::StateDiff, data.into())
-            .await?;
-    }
+    bytes += upload_objects(config, id, &export, objects, upload).await?;
     upload_wait += t.elapsed();
 
     progress.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -472,6 +431,103 @@ where
         number: last,
         since_rebase,
     });
+    Ok(())
+}
+
+/// Tells the objects of a bundle uploaded by one export from those of other
+/// runs.
+fn export_id() -> String {
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+/// Upload the finished `objects` of bundle `id` in the compactor's order,
+/// completing the block file's `upload` if it was started; the bytes sent.
+async fn upload_objects(
+    config: &ExportConfig,
+    id: u64,
+    export: &str,
+    objects: BundleObjects,
+    upload: &mut Option<MultipartUpload>,
+) -> Result<u64> {
+    let mut bytes = 0;
+    if let Some(data) = objects.validation {
+        bytes += data.len() as u64;
+        config
+            .s3
+            .put(id, export, Resource::Validation, data.into())
+            .await?;
+    }
+    if let Some(data) = objects.block_file {
+        bytes += data.len() as u64;
+        match upload {
+            Some(started) => {
+                // Left in `upload` to be aborted if it fails.
+                if !data.is_empty() {
+                    started.put_part(data.into()).await?;
+                }
+                // Aborts the upload itself if it fails.
+                upload.take().expect("started").complete().await?;
+            }
+            None => {
+                config
+                    .s3
+                    .put(id, export, Resource::BlockFile, data.into())
+                    .await?
+            }
+        }
+    }
+    if let Some(data) = objects.header {
+        bytes += data.len() as u64;
+        config
+            .s3
+            .put(id, export, Resource::Header, data.into())
+            .await?;
+    }
+    if let Some(data) = objects.state_diff {
+        bytes += data.len() as u64;
+        config
+            .s3
+            .put(id, export, Resource::StateDiff, data.into())
+            .await?;
+    }
+    Ok(bytes)
+}
+
+/// Export bundle 0, the genesis block.
+async fn export_genesis<DB, C>(
+    db: &Arc<DB>,
+    chain: &C,
+    client: &HttpClient,
+    config: &ExportConfig,
+    progress: &Progress,
+) -> Result<()>
+where
+    DB: Send + Sync + BlockIndex + 'static,
+    C: PipelineChain<DB>,
+{
+    let (infos, blocks) = fetch_chunk(db.clone(), client, 0, 0)
+        .await
+        .context("fetch the genesis block")?;
+    let (info, block) = infos
+        .first()
+        .zip(blocks.first())
+        .context("no genesis block")?;
+    let output = chain.genesis(db, info, block, config.replay_options())?;
+    let mut writer = BundleWriter::new(0, &config.resources, config.gzip_level);
+    writer.push(&output)?;
+    let txs = output.block_file.txs.len() as u64;
+    let bytes = upload_objects(config, 0, &export_id(), writer.finish()?, &mut None).await?;
+    progress.blocks.fetch_add(1, Ordering::Relaxed);
+    progress.txs.fetch_add(txs, Ordering::Relaxed);
+    progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+    progress.bundles.fetch_add(1, Ordering::Relaxed);
+    info!(target: "export", bundle = 0, txs, bytes, "bundle done");
     Ok(())
 }
 

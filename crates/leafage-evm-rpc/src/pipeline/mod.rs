@@ -13,6 +13,7 @@ pub(crate) mod bundle;
 pub(crate) mod chain;
 pub(crate) mod convert;
 pub(crate) mod export;
+pub(crate) mod genesis;
 pub(crate) mod inspector;
 pub(crate) mod s3;
 pub(crate) mod types;

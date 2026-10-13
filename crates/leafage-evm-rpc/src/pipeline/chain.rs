@@ -1,5 +1,5 @@
 //! What a chain provides to regenerate its pipeline outputs: the replay of
-//! consecutive blocks on its archive state.
+//! consecutive blocks on its archive state, and the genesis block.
 
 use super::types::{BlockFile, PipelineHeader};
 use alloy::primitives::Bytes;
@@ -53,6 +53,16 @@ pub(crate) trait PipelineChain<DB>: Send + Sync + 'static {
         parent: &BlockInfo,
         options: ReplayOptions,
     ) -> Result<Self::Replay>;
+
+    /// The outputs of the genesis block (bundle 0), `info` and `block`, made
+    /// from its alloc rather than replayed (see [`super::genesis`]).
+    fn genesis(
+        &self,
+        db: &Arc<DB>,
+        info: &BlockInfo,
+        block: &RpcBlock,
+        options: ReplayOptions,
+    ) -> Result<ReplayOutput>;
 }
 
 /// The replay of consecutive blocks. The state it builds carries over from
