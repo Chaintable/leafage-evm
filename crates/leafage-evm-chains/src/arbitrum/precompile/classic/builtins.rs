@@ -9,6 +9,14 @@ pub(super) enum Outcome {
     Unavailable,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct Rules {
+    pub arbos34: bool,
+    pub arbos39: bool,
+    pub arbos42: bool,
+    pub arbos54: bool,
+}
+
 // Mini's bytearray_get256 pads missing calldata with zeroes.
 pub(super) fn word(data: &[u8], offset: usize) -> U256 {
     let mut bytes = [0; 32];
@@ -36,7 +44,7 @@ enum Length {
     AtLeast(usize),
 }
 
-pub(super) fn run(inputs: &CallInputs, data: &[u8], depth: usize) -> Outcome {
+pub(super) fn run(inputs: &CallInputs, data: &[u8], depth: usize, rules: Option<Rules>) -> Outcome {
     use Length::{AtLeast, Exact};
     let Some(selector) = data.get(..4) else {
         return Outcome::Revert;
@@ -77,6 +85,13 @@ pub(super) fn run(inputs: &CallInputs, data: &[u8], depth: usize) -> Outcome {
         (0x6b, 0xcad462d4 | 0x2b16e6c0) => (Exact(68), false),
         (0x6b, 0x56331f75) => (AtLeast(68), true), // continueCodeUpload
         (0x6b, 0x5b0b7f1e) => (AtLeast(132), true), // deployContract
+        // Historical ArbOwner methods removed from the final Classic ABI.
+        // Their valid calls need private state and must never become unknown
+        // selector reverts merely because the current ABI omits them.
+        (0x6b, 0x08df6923) => (Exact(4), false), // getFeeRecipients
+        (0x6b, 0xe3a0a148 | 0xa901dd92 | 0x29854f47) => (Exact(36), true),
+        (0x6b, 0xc6cabb40 | 0xf4f4e136 | 0xf589445c) => (Exact(68), true),
+        (0x6b, 0x8ea93643) => (Exact(100), true), // setGasAccountingParams
         (0x6c, 0xba9c916e | 0x7a1ea732) => (Exact(36), false),
         (0x6c, 0x41b247a8 | 0x02199f34 | 0x612af178 | 0x055f362f) => (Exact(4), false),
         (0x6c, 0x4290549e) => (Exact(36), true), // setL1GasPriceEstimate
@@ -94,19 +109,35 @@ pub(super) fn run(inputs: &CallInputs, data: &[u8], depth: usize) -> Outcome {
         // interface intercept is a separate path, not an EVM precompile.
         _ => return Outcome::Revert,
     };
-    if (forbid_static && inputs.is_static)
-        || match length {
-            Exact(n) => data.len() != n,
-            AtLeast(n) => data.len() < n,
-        }
-    {
+    if match length {
+        Exact(n) => data.len() != n,
+        AtLeast(n) => data.len() < n,
+    } {
         return Outcome::Revert;
     }
     if id == 0x69 && selector != 0xbb3480f9 && !inputs.caller.is_zero() {
         return Outcome::Revert;
     }
+    if id == 0x67 && rules.is_some_and(|r| r.arbos34 && !r.arbos42) {
+        return Outcome::Revert; // ArbBLS was disabled throughout ArbOS 34–41.
+    }
+    if inputs.is_static {
+        let guard = match (id, selector) {
+            (0x66, 0xf6a455a2) | (0x6b, 0xcad462d4) => rules.map(|r| r.arbos34 && !r.arbos42),
+            (0x6b, 0x84352b19 | 0x966e2505 | 0xe1e639cf) | (0x6c, 0x4290549e) => {
+                rules.map(|r| r.arbos42)
+            }
+            _ if forbid_static => rules.map(|r| r.arbos34),
+            _ => Some(false),
+        };
+        match guard {
+            Some(true) => return Outcome::Revert,
+            None => return Outcome::Unavailable,
+            _ => {}
+        }
+    }
     match (id, selector) {
-        (0x66, 0x31862ada) => return decompress(data),
+        (0x66, 0x31862ada) => return decompress(data, rules),
         // The address table always starts with address zero at index zero;
         // these entries cannot be removed. No private lookup is necessary.
         (0x66, 0x4420e486 | 0xd4b6b5da | 0xa5025222 | 0xf6a455a2)
@@ -120,17 +151,31 @@ pub(super) fn run(inputs: &CallInputs, data: &[u8], depth: usize) -> Outcome {
         }
         (0x66, 0x8a186788) if word(data, 4).is_zero() => return words(&[U256::ZERO]),
         (0x68, 0xce2ae159) => {
-            if word(data, 4) != U256::from(32) || !valid_function_table(data) {
+            if word(data, 4) != U256::from(32) && rules.is_some_and(|r| r.arbos54) {
                 return Outcome::Revert;
+            }
+            if let Err(outcome) = validate_function_table(data, rules) {
+                return outcome;
             }
         }
         (0x69, 0xbb3480f9) if word(data, 4).is_zero() => return Outcome::Return(Bytes::new()),
         (0x69, 0x978190f1 | 0xafefabf7) => {
-            if word(data, 68) > U256::from(data.len() - 100) {
+            // Unlike ArbSys.sendTxToL1's safeAdd, these Mini methods use
+            // wrapping uint arithmetic. An overflowing size can pass this
+            // guard and reach the unsupported account mutation path.
+            if word(data, 68).wrapping_add(U256::from(100)) > U256::from(data.len()) {
                 return Outcome::Revert;
             }
         }
-        (0x6b, 0x5b0b7f1e) if !padded_bytes_length(data, 132, 100) => return Outcome::Revert,
+        (0x6b, 0x5b0b7f1e) => {
+            let padded = (word(data, 100).wrapping_add(U256::from(31)) / U256::from(32))
+                .wrapping_add(U256::from(4))
+                .wrapping_mul(U256::from(32))
+                .wrapping_add(U256::from(4));
+            if padded != U256::from(data.len()) {
+                return Outcome::Revert;
+            }
+        }
         // Both operations are restricted to the top-level AVM call frame.
         (0x6b, 0xb3def0d7) | (0x6e, 0xeda1122c) if depth != 1 => return Outcome::Revert,
         _ => {}
@@ -141,8 +186,10 @@ pub(super) fn run(inputs: &CallInputs, data: &[u8], depth: usize) -> Outcome {
     Outcome::Unavailable
 }
 
-// Model a Mini ByteArray slice without allocating its declared length. Reads
-// beyond calldata are zero-padded, but slices outside 2^64 are empty.
+// Model a Mini ByteArray slice without allocating its declared length. Mini
+// extracts share the backing AVM buffer: reading outside the visible calldata
+// may expose parent memory (or overflow a hidden slice offset). That context
+// isn't available here; do not fabricate padded zeroes for those reads.
 struct Stream<'a> {
     data: &'a [u8],
     start: u64,
@@ -165,51 +212,63 @@ impl<'a> Stream<'a> {
         })
     }
 
-    fn byte(&mut self) -> Option<u8> {
+    fn byte(&mut self) -> Result<u8, Outcome> {
         if self.position >= self.length {
-            return None;
+            return Err(Outcome::Revert);
         }
         let index = self.start + self.position;
         self.position += 1;
-        Some(
-            usize::try_from(index)
-                .ok()
-                .and_then(|i| self.data.get(i))
-                .copied()
-                .unwrap_or(0),
-        )
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.data.get(i))
+            .copied()
+            .ok_or(Outcome::Unavailable)
     }
 
-    fn uint(&mut self) -> Option<(u8, U256)> {
+    fn uint(&mut self, rules: Option<Rules>) -> Result<(u8, U256), Outcome> {
         let prefix = self.byte()?;
         if prefix < 0x80 {
-            return Some((prefix, U256::from(prefix)));
+            return Ok((prefix, U256::from(prefix)));
         }
         let length = prefix - 0x80;
-        if length > 32 {
-            return None;
+        if length > 32 && rules.is_some_and(|r| r.arbos39) {
+            return Err(Outcome::Revert);
+        }
+        if u64::from(length) > self.length - self.position {
+            return Err(Outcome::Revert);
         }
         let mut value = U256::ZERO;
         for _ in 0..length {
             value = (value << 8) | U256::from(self.byte()?);
         }
-        Some((prefix, value))
+        Ok((prefix, value))
     }
 }
 
-fn decompress(data: &[u8]) -> Outcome {
+fn decompress(data: &[u8], rules: Option<Rules>) -> Outcome {
     let offset = word(data, 36);
     let length = word(data, 68);
-    if word(data, 4) != U256::from(64) || offset >= length {
+    if offset >= length {
         return Outcome::Revert;
+    }
+    if word(data, 4) != U256::from(64) {
+        match rules {
+            Some(rules) if rules.arbos54 => return Outcome::Revert,
+            None => return Outcome::Unavailable,
+            _ => {}
+        }
     }
     let Some(mut stream) = Stream::new(data, offset.wrapping_add(U256::from(100)), length - offset)
     else {
         return Outcome::Revert;
     };
-    let Some((prefix, value)) = stream.uint() else {
-        return Outcome::Revert;
+    let (prefix, value) = match stream.uint(rules) {
+        Ok(value) => value,
+        Err(outcome) => return outcome,
     };
+    if prefix > 0xa0 && rules.is_none() {
+        return Outcome::Unavailable;
+    }
     if prefix < 0x94 && !value.is_zero() {
         return Outcome::Unavailable; // nonzero table index
     }
@@ -219,26 +278,26 @@ fn decompress(data: &[u8]) -> Outcome {
     words(&[value, offset.wrapping_add(U256::from(stream.position))])
 }
 
-fn valid_function_table(data: &[u8]) -> bool {
+fn validate_function_table(data: &[u8], rules: Option<Rules>) -> Result<(), Outcome> {
     let Some(mut stream) = Stream::new(data, U256::from(68), word(data, 36)) else {
-        return false;
+        return Err(Outcome::Revert);
     };
-    let Some((_, entries)) = stream.uint() else {
-        return false;
-    };
+    let (_, entries) = stream.uint(rules)?;
     if entries > U256::from(1024) {
-        return false;
+        return Err(Outcome::Revert);
+    }
+    // Each entry needs four selector bytes, a payable byte and at least one
+    // RLP byte. Prove truncation before trying to read unavailable backing data.
+    if entries.to::<u64>() * 6 > stream.length - stream.position {
+        return Err(Outcome::Revert);
     }
     for _ in 0..entries.to::<usize>() {
-        for _ in 0..5 {
-            // four selector bytes and one payable byte
-            if stream.byte().is_none() {
-                return false;
-            }
+        if stream.length - stream.position < 6 {
+            return Err(Outcome::Revert);
         }
-        if stream.uint().is_none() {
-            return false;
-        }
+        // Selector and payable bytes have no content restrictions.
+        stream.position += 5;
+        stream.uint(rules)?;
     }
-    true // Mini ignores trailing bytes and accepts noncanonical RLP integers.
+    Ok(()) // Mini ignores trailing bytes and accepts noncanonical RLP integers.
 }

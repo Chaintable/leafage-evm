@@ -4,7 +4,7 @@ mod modexp;
 mod pairing;
 
 use super::{ArbitrumContext, EthPrecompiles, PrecompileProvider};
-use crate::arbitrum::config::ClassicModexpUpgrades;
+use crate::arbitrum::config::{ClassicBuiltinUpgrades, ClassicModexpUpgrades};
 use alloy::primitives::{Address, Bytes, U256};
 use revm::context::{ContextTr, JournalTr, LocalContextTr};
 use revm::interpreter::{
@@ -28,6 +28,7 @@ pub(super) fn run<DB: Database + DatabaseRef>(
     ctx: &mut ArbitrumContext<DB>,
     inputs: &CallInputs,
     modexp_upgrades: Option<ClassicModexpUpgrades>,
+    builtin_upgrades: Option<ClassicBuiltinUpgrades>,
 ) -> Result<Option<InterpreterResult>, String> {
     let address = inputs.bytecode_address;
     if !addresses().any(|a| a == address) {
@@ -46,42 +47,48 @@ pub(super) fn run<DB: Database + DatabaseRef>(
     {
         return Err(unsupported());
     }
-    let data = match &inputs.input {
-        CallInput::Bytes(b) => b.clone(),
-        CallInput::SharedBuffer(range) => ctx
-            .local_mut()
-            .shared_memory_buffer_slice(range.clone())
-            .map(|s| Bytes::copy_from_slice(&s))
-            .unwrap_or_default(),
-    };
+    let data = calldata(ctx, inputs);
+    let builtin_upgrades = builtin_upgrades.or_else(|| {
+        (ctx.cfg().chain_id == 42161).then_some(ClassicBuiltinUpgrades {
+            // Each boundary was checked against adjacent native archive calls.
+            arbos_34_block: 156_077,
+            arbos_39_block: 226_011,
+            arbos_42_block: 662_405,
+            arbos_54_block: 6_835_288,
+        })
+    });
+    if builtin_upgrades.is_some_and(|u| {
+        [
+            u.arbos_34_block,
+            u.arbos_39_block,
+            u.arbos_42_block,
+            u.arbos_54_block,
+        ]
+        .windows(2)
+        .any(|w| w[0] > w[1])
+    }) {
+        return Err("Arbitrum Classic: invalid classic_builtin_upgrades order".into());
+    }
+    let number = historical_block_number(ctx);
+    let rules = builtin_upgrades.map(|u| builtins::Rules {
+        arbos34: number >= U256::from(u.arbos_34_block),
+        arbos39: number >= U256::from(u.arbos_39_block),
+        arbos42: number >= U256::from(u.arbos_42_block),
+        arbos54: number >= U256::from(u.arbos_54_block),
+    });
     if address != Address::with_last_byte(0x64) {
-        let output = match builtins::run(inputs, &data, ctx.chain().current_call().depth) {
+        let output = match builtins::run(inputs, &data, ctx.chain().current_call().depth, rules) {
             builtins::Outcome::Revert => None,
             builtins::Outcome::Return(bytes) => Some(bytes),
             builtins::Outcome::Unavailable => return Err(unsupported()),
         };
-        return Ok(Some(InterpreterResult {
-            result: if output.is_some() {
-                InstructionResult::Return
-            } else {
-                InstructionResult::Revert
-            },
-            gas: Gas::new(inputs.gas_limit),
-            output: output.unwrap_or_default(),
-        }));
+        return Ok(finish(inputs, output));
     }
     let result = |value: Option<U256>| {
-        Some(InterpreterResult {
-            result: if value.is_some() {
-                InstructionResult::Return
-            } else {
-                InstructionResult::Revert
-            },
-            gas: Gas::new(inputs.gas_limit),
-            output: value
-                .map(|v| Bytes::copy_from_slice(&v.to_be_bytes::<32>()))
-                .unwrap_or_default(),
-        })
+        finish(
+            inputs,
+            value.map(|v| Bytes::copy_from_slice(&v.to_be_bytes::<32>())),
+        )
     };
     let Some(selector) = data.get(..4) else {
         return Ok(result(None));
@@ -112,16 +119,8 @@ pub(super) fn run<DB: Database + DatabaseRef>(
             if !inputs.caller.is_zero() {
                 return Ok(result(None));
             }
-            // Classic bytearray_get256 zero-pads truncated calldata.
-            let word = |start: usize| {
-                let mut out = [0u8; 32];
-                for (i, b) in out.iter_mut().enumerate() {
-                    *b = data.get(start + i).copied().unwrap_or(0);
-                }
-                out
-            };
-            let account = Address::from_slice(&word(4)[12..]);
-            let slot = U256::from_be_bytes(word(36));
+            let account = Address::from_word(builtins::word(&data, 4).into());
+            let slot = builtins::word(&data, 36);
             ctx.journal_mut()
                 .load_account(account)
                 .map_err(|e| format!("{e:?}"))?;
@@ -151,8 +150,8 @@ pub(super) fn run<DB: Database + DatabaseRef>(
         }
         [0x92, 0x8c, 0x16, 0x9a] => { // sendTxToL1
             if inputs.is_static
-                || builtins::word(&data, 36) != U256::from(64)
-                || !builtins::padded_bytes_length(&data, 100, 68)
+                || (rules.is_some_and(|r| r.arbos42) && !builtins::padded_bytes_length(&data, 100, 68))
+                || (rules.is_some_and(|r| r.arbos54) && builtins::word(&data, 36) != U256::from(64))
             {
                 return Ok(result(None));
             }
@@ -163,6 +162,38 @@ pub(super) fn run<DB: Database + DatabaseRef>(
         _ => return Ok(result(None)),
     };
     Ok(result(value))
+}
+
+fn calldata<DB: Database>(ctx: &mut ArbitrumContext<DB>, inputs: &CallInputs) -> Bytes {
+    match &inputs.input {
+        CallInput::Bytes(b) => b.clone(),
+        CallInput::SharedBuffer(range) => ctx
+            .local_mut()
+            .shared_memory_buffer_slice(range.clone())
+            .map(|s| Bytes::copy_from_slice(&s))
+            .unwrap_or_default(),
+    }
+}
+
+fn finish(inputs: &CallInputs, output: Option<Bytes>) -> Option<InterpreterResult> {
+    Some(InterpreterResult {
+        result: if output.is_some() {
+            InstructionResult::Return
+        } else {
+            InstructionResult::Revert
+        },
+        gas: Gas::new(inputs.gas_limit),
+        output: output.unwrap_or_default(),
+    })
+}
+
+fn historical_block_number<DB: Database>(ctx: &ArbitrumContext<DB>) -> U256 {
+    // RPC block overrides must not select a different historical implementation.
+    ctx.tx
+        .context
+        .classic_block_number
+        .map(U256::from)
+        .unwrap_or(ctx.block.number)
 }
 
 fn run_eth<DB: Database + DatabaseRef>(
@@ -176,21 +207,8 @@ fn run_eth<DB: Database + DatabaseRef>(
     if !is_eth {
         return Ok(None);
     }
-    let data = match &inputs.input {
-        CallInput::Bytes(b) => b.clone(),
-        CallInput::SharedBuffer(range) => ctx
-            .local_mut()
-            .shared_memory_buffer_slice(range.clone())
-            .map(|s| Bytes::copy_from_slice(&s))
-            .unwrap_or_default(),
-    };
-    let revert = || {
-        Ok(Some(InterpreterResult {
-            result: InstructionResult::Revert,
-            output: Bytes::new(),
-            gas: Gas::new(inputs.gas_limit),
-        }))
-    };
+    let data = calldata(ctx, inputs);
+    let revert = || Ok(finish(inputs, None));
     let id = address.as_slice()[19];
     let modexp_rules = if id == 5 {
         let upgrades = modexp_upgrades
@@ -209,12 +227,7 @@ fn run_eth<DB: Database + DatabaseRef>(
         if upgrades.exponent_size_block > upgrades.uint_fast_path_block {
             return Err("Arbitrum Classic: invalid classic_modexp_upgrades order".to_owned());
         }
-        let number = ctx
-            .tx
-            .context
-            .classic_block_number
-            .map(U256::from)
-            .unwrap_or(ctx.block.number);
+        let number = historical_block_number(ctx);
         if number < U256::from(upgrades.exponent_size_block) {
             modexp::Rules::Legacy
         } else if number < U256::from(upgrades.uint_fast_path_block) {

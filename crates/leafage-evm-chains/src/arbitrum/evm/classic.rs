@@ -583,6 +583,9 @@ mod tests {
             (0x66, "949d225d00".into()),
             (0x67, "375a7c7f".into()),
             (0x68, format!("ce2ae159{}{}", word(64), word(0))),
+            (0x68, format!("ce2ae159{}{}", word(64), word(1))),
+            (0x68, format!("ce2ae159{}{}01", word(32), word(2))),
+            (0x68, format!("ce2ae159{}{}a0", word(32), word(2))),
             (0x69, format!("7b510fe8{}", word(0xbb))), // requires zero caller
             (
                 0x69,
@@ -598,6 +601,7 @@ mod tests {
         ];
         for (address, data) in invalid {
             let mut evm = evm(&[]);
+            evm.ctx_mut().block.number = U256::from(6_835_288);
             let mut tx = tx();
             tx.base.kind = TxKind::Call(Address::with_last_byte(address));
             tx.base.data = alloy::primitives::hex::decode(data).unwrap().into();
@@ -696,6 +700,258 @@ mod tests {
                     output(result.result).as_ref(),
                     alloy::primitives::hex::decode(&expected).unwrap(),
                     "{data}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classic_builtin_overflow_guards_preserve_mini_arithmetic() {
+        for (address, selector, preceding_words) in [
+            (0x69, "978190f1", 2), // setCode
+            (0x69, "afefabf7", 2), // setState
+            (0x6b, "5b0b7f1e", 3), // deployContract
+        ] {
+            let mut evm = evm(&[]);
+            let mut tx = tx();
+            tx.base.caller = Address::ZERO;
+            tx.base.kind = TxKind::Call(Address::with_last_byte(address));
+            tx.base.data = alloy::primitives::hex::decode(format!(
+                "{selector}{}{}",
+                "00".repeat(preceding_words * 32),
+                "ff".repeat(32)
+            ))
+            .unwrap()
+            .into();
+            assert!(
+                evm.transact(tx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires unavailable Classic ArbOS")
+            );
+        }
+        // ArbSys uses checked arithmetic instead, and must reject this size.
+        let mut evm = evm(&[]);
+        let mut tx = tx();
+        tx.base.kind = TxKind::Call(Address::with_last_byte(0x64));
+        tx.base.data = alloy::primitives::hex::decode(format!(
+            "928c169a{:064x}{:064x}{}",
+            0,
+            64,
+            "ff".repeat(32)
+        ))
+        .unwrap()
+        .into();
+        assert!(matches!(
+            evm.transact(tx).unwrap().result,
+            ExecutionResult::Revert { .. }
+        ));
+    }
+
+    #[test]
+    fn classic_builtin_validation_tracks_historical_upgrade_boundaries() {
+        let data = alloy::primitives::hex::decode(format!(
+            "31862ada{:064x}{:064x}{:064x}80{}",
+            32,
+            0,
+            1,
+            "00".repeat(31)
+        ))
+        .unwrap();
+        for height in [6_835_287, 6_835_288] {
+            let mut evm = evm(&[]);
+            evm.ctx_mut().block.number = U256::from(99_999_999); // simulated override
+            let mut tx = tx();
+            tx.context.classic_block_number = Some(height);
+            tx.base.kind = TxKind::Call(Address::with_last_byte(0x66));
+            tx.base.data = data.clone().into();
+            let result = evm.transact(tx).unwrap().result;
+            if height == 6_835_287 {
+                assert_eq!(U256::from_be_slice(&output(result)[32..]), U256::ONE);
+            } else {
+                assert!(matches!(result, ExecutionResult::Revert { .. }));
+            }
+        }
+        for height in [662_404, 662_405] {
+            let mut evm = evm(&[]);
+            let mut tx = tx();
+            tx.context.classic_block_number = Some(height);
+            tx.base.kind = TxKind::Call(Address::with_last_byte(0x64));
+            tx.base.data =
+                alloy::primitives::hex::decode(format!("928c169a{:064x}{:064x}{:064x}", 1, 64, 1))
+                    .unwrap()
+                    .into();
+            let result = evm.inspect_tx(tx);
+            if height == 662_404 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("requires unavailable Classic ArbOS")
+                );
+            } else {
+                assert!(matches!(
+                    result.unwrap().result,
+                    ExecutionResult::Revert { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn classic_historical_static_guards_and_bls_disable_window() {
+        for (height, selector, succeeds) in [
+            (156_076, "4420e486", true),
+            (156_077, "4420e486", false),
+            (156_076, "f6a455a2", true),
+            (156_077, "f6a455a2", false),
+            (662_404, "f6a455a2", false),
+            (662_405, "f6a455a2", true),
+        ] {
+            let mut evm = evm(&alloy::primitives::hex::decode(
+                "3660006000376000600036600060665afa60005260206000f3",
+            )
+            .unwrap());
+            let mut tx = tx();
+            tx.context.classic_block_number = Some(height);
+            tx.base.data = alloy::primitives::hex::decode(format!("{selector}{}", "00".repeat(32)))
+                .unwrap()
+                .into();
+            assert_eq!(
+                U256::from_be_slice(&output(evm.inspect_tx(tx).unwrap().result)),
+                U256::from(succeeds)
+            );
+        }
+        for height in [156_076, 156_077, 662_404, 662_405] {
+            let mut evm = evm(&[]);
+            let mut tx = tx();
+            tx.context.classic_block_number = Some(height);
+            tx.base.kind = TxKind::Call(Address::with_last_byte(0x67));
+            tx.base.data = alloy::primitives::hex::decode(format!("857cdbb8{:064x}", 1))
+                .unwrap()
+                .into();
+            let result = evm.transact(tx);
+            if (156_077..662_405).contains(&height) {
+                assert!(matches!(
+                    result.unwrap().result,
+                    ExecutionResult::Revert { .. }
+                ));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("requires unavailable Classic ArbOS")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classic_wide_rlp_and_hidden_backing_memory_are_not_padded_incorrectly() {
+        for height in [226_010, 226_011] {
+            let mut evm = evm(&[]);
+            let mut tx = tx();
+            tx.context.classic_block_number = Some(height);
+            tx.base.kind = TxKind::Call(Address::with_last_byte(0x66));
+            tx.base.data = alloy::primitives::hex::decode(format!(
+                "31862ada{:064x}{:064x}{:064x}a1{}",
+                64,
+                0,
+                34,
+                "00".repeat(63)
+            ))
+            .unwrap()
+            .into();
+            let result = evm.transact(tx).unwrap().result;
+            if height == 226_010 {
+                assert_eq!(U256::from_be_slice(&output(result)[32..]), U256::from(34));
+            } else {
+                assert!(matches!(result, ExecutionResult::Revert { .. }));
+            }
+        }
+        // Native Mini sees bytes after CALL's input region in parent memory.
+        // Only the 132-byte calldata is visible here: do not invent a zero.
+        let mut evm = evm(&[]);
+        let mut request = tx();
+        request.base.kind = TxKind::Call(Address::with_last_byte(0x66));
+        request.base.data = alloy::primitives::hex::decode(format!(
+            "31862ada{:064x}{:064x}{:064x}{}",
+            64,
+            32,
+            53,
+            "00".repeat(32)
+        ))
+        .unwrap()
+        .into();
+        assert!(
+            evm.transact(request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("requires unavailable Classic ArbOS")
+        );
+        // Removed owner methods were valid historical calls, not unknown probes.
+        request.base.kind = TxKind::Call(Address::with_last_byte(0x6b));
+        request.base.data = alloy::primitives::hex::decode("08df6923").unwrap().into();
+        request.context.classic_block_number = Some(1);
+        assert!(
+            evm.transact(request)
+                .unwrap_err()
+                .to_string()
+                .contains("requires unavailable Classic ArbOS")
+        );
+    }
+
+    #[test]
+    fn classic_custom_builtin_upgrade_schedule_controls_version_dependent_paths() {
+        use crate::arbitrum::config::ClassicBuiltinUpgrades;
+        use crate::arbitrum::precompile::ArbitrumPrecompiles;
+        let mut evm = evm(&[]);
+        evm.ctx_mut().cfg.chain_id = 123;
+        let mut tx = tx();
+        tx.base.chain_id = None;
+        tx.base.kind = TxKind::Call(Address::with_last_byte(0x66));
+        tx.base.data = alloy::primitives::hex::decode(format!(
+            "31862ada{:064x}{:064x}{:064x}80{}",
+            32,
+            0,
+            1,
+            "00".repeat(31)
+        ))
+        .unwrap()
+        .into();
+        assert!(
+            evm.transact(tx.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("requires unavailable Classic ArbOS")
+        );
+        for (arbos_34_block, valid) in [(0, true), (1, false)] {
+            evm.inner.precompiles = ArbitrumPrecompiles::new_with_env(
+                ArbitrumHardfork::Berlin,
+                ArbitrumPrecompileEnv {
+                    execution_mode: ArbitrumExecutionMode::Classic,
+                    classic_builtin_upgrades: Some(ClassicBuiltinUpgrades {
+                        arbos_34_block,
+                        arbos_39_block: 0,
+                        arbos_42_block: 0,
+                        arbos_54_block: 0,
+                    }),
+                    ..Default::default()
+                },
+            );
+            let result = evm.transact(tx.clone());
+            if valid {
+                assert!(matches!(
+                    result.unwrap().result,
+                    ExecutionResult::Revert { .. }
+                ));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid classic_builtin_upgrades order")
                 );
             }
         }
