@@ -394,6 +394,17 @@ fn evm_env(header: &alloy::rpc::types::Header, spec: BscHardfork) -> EvmEnv<BscH
     EvmEnv::new(cfg, block)
 }
 
+/// EIP-161, active since genesis: a touched account left empty is deleted.
+/// CacheDB would keep it as an existing empty account, which EIP-7702
+/// refunds as an existing authority.
+fn delete_touched_empty(state: &mut EvmState) {
+    for account in state.values_mut() {
+        if account.is_touched() && account.is_empty() {
+            account.mark_selfdestruct();
+        }
+    }
+}
+
 /// go-bsc `Parlia.IsSystemTransaction`.
 fn is_system_transaction(tx: &TxEnvelope, sender: Address, coinbase: Address) -> bool {
     sender == coinbase
@@ -469,8 +480,9 @@ where
                 .map_err(failed)?;
             (outcome, None)
         };
-        let (result, state) = (outcome.result, outcome.state);
+        let (result, mut state) = (outcome.result, outcome.state);
         self.record(&state)?;
+        delete_touched_empty(&mut state);
         self.db.commit(state);
 
         if let Some((arena, sstore)) = traces {
@@ -825,6 +837,28 @@ fn describe(info: Option<&AccountInfo>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touched_empty_accounts_are_deleted() {
+        use revm::database::EmptyDB;
+        use revm::state::Account;
+        let (empty, funded) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(empty, AccountInfo::default());
+        let mut state = EvmState::default();
+        for (address, balance) in [(empty, 0), (funded, 1)] {
+            let mut account = Account::from(AccountInfo {
+                balance: U256::from(balance),
+                ..Default::default()
+            });
+            account.mark_touch();
+            state.insert(address, account);
+        }
+        delete_touched_empty(&mut state);
+        db.commit(state);
+        assert_eq!(db.basic(empty).unwrap(), None);
+        assert_eq!(db.basic(funded).unwrap().unwrap().balance, U256::from(1));
+    }
 
     #[test]
     fn system_transaction_needs_coinbase_zero_price_and_system_target() {
