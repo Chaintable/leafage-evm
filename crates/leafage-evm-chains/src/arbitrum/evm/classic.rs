@@ -265,19 +265,16 @@ fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
 fn unavailable<DB: Database + DatabaseRef, const OP: u8>(
     ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
 ) -> InstructionExecResult {
-    let name = match OP {
-        0x43 => "NUMBER",
-        0x40 => "BLOCKHASH",
-        0x45 => "GASLIMIT",
-        0x3a => "GASPRICE",
-        0x48 => "BASEFEE",
-        0xf0 => "CREATE",
-        0xf5 => "CREATE2",
-        0xff => "SELFDESTRUCT",
-        _ => unreachable!(),
-    };
+    let instruction = opcode::OpCode::new(OP).expect("valid Classic opcode");
+    if ctx.interpreter.stack.len() < usize::from(instruction.inputs())
+        || (ctx.interpreter.runtime_flag.is_static
+            && matches!(OP, opcode::CREATE | opcode::CREATE2 | opcode::SELFDESTRUCT))
+    {
+        // Classic rejects invalid execution before accessing private state.
+        return Err(InstructionResult::Revert);
+    }
     *ctx.host.error() = Err(ContextError::Custom(format!(
-        "Arbitrum Classic: {name} is unavailable in account-state-only simulation"
+        "Arbitrum Classic: {instruction} is unavailable in account-state-only simulation"
     )));
     Err(InstructionResult::FatalExternalError)
 }
@@ -460,7 +457,10 @@ mod tests {
         for op in [0x43, 0x40, 0x45, 0x3a, 0x48, 0xf0, 0xf5, 0xff] {
             for inspect in [false, true] {
                 let mut evm = evm(&parent);
-                code(evm.ctx_mut().db_mut(), CHILD, &[op, 0]);
+                code(
+                    evm.ctx_mut().db_mut(), CHILD,
+                    &[0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, op, 0],
+                );
                 let err = if inspect {
                     evm.inspect_tx(tx())
                 } else {
@@ -468,6 +468,29 @@ mod tests {
                 }
                 .unwrap_err();
                 assert!(err.to_string().contains("Arbitrum Classic:"), "{err}");
+            }
+        }
+    }
+    #[test]
+    fn classic_invalid_execution_reverts_before_private_state() {
+        // Return the success flag of STATICCALL to CHILD.
+        let parent = [
+            0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0xcc, 0x5a, 0xfa, 0x60, 0, 0x52,
+            0x60, 32, 0x60, 0, 0xf3,
+        ];
+        for op in [opcode::BLOCKHASH, opcode::CREATE, opcode::CREATE2, opcode::SELFDESTRUCT] {
+            let result = evm(&[op]).transact(tx()).unwrap().result;
+            assert!(matches!(result, ExecutionResult::Revert { .. }));
+            if op != opcode::BLOCKHASH {
+                let mut evm = evm(&parent);
+                code(
+                    evm.ctx_mut().db_mut(), CHILD,
+                    &[0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, op],
+                );
+                assert_eq!(
+                    U256::from_be_slice(&output(evm.transact(tx()).unwrap().result)),
+                    U256::ZERO,
+                );
             }
         }
     }
