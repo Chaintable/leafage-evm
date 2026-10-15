@@ -1,4 +1,6 @@
-use crate::{archive_init, archive_scan, compact, db_migrate, force_compact, rewind, standalone};
+use crate::{
+    archive_init, archive_scan, compact, db_migrate, force_compact, rewind, rpc_merge, standalone,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::future::Future;
@@ -43,6 +45,9 @@ pub(crate) enum Commands {
     /// Read-only scan of an archive DB column family (forensics/debugging)
     #[command(name = "archive-scan")]
     ArchiveScan(archive_scan::Command),
+    /// Bridge two adjacent RPC states into one StateDiff and upload it to S3
+    #[command(name = "rpc-merge")]
+    RpcMerge(rpc_merge::Command),
 }
 
 impl Commands {
@@ -55,6 +60,7 @@ impl Commands {
             Commands::ForceCompact(mut cmd) => cmd.run().await,
             Commands::Rewind(mut cmd) => cmd.run().await,
             Commands::ArchiveScan(mut cmd) => cmd.run().await,
+            Commands::RpcMerge(mut cmd) => cmd.run().await,
         }
     }
 }
