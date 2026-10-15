@@ -2,7 +2,7 @@
 //!
 //! Classic executes translated EVM bytecode inside AVM. Revm gas is only a
 //! resource bound here; it cannot reproduce ArbGas, fee settlement or estimates.
-//! Unsupported operations fail the whole request, including from nested calls.
+//! Unsupported operations fail the current simulation, including from nested calls.
 use super::ArbitrumEvm;
 use crate::arbitrum::precompile::ArbitrumContext;
 use revm::bytecode::opcode;

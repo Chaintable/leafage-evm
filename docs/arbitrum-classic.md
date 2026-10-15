@@ -57,6 +57,8 @@ Execution touching unavailable semantics returns an explicit `Arbitrum Classic:`
 
 Recognized unsupported builtin methods return a capability error after independently evaluable input/context checks. Unknown selectors revert for all Classic builtins. A capability error does not imply that the native call reverts.
 
+In `contractMultiCall`, transaction validation and Classic capability failures retain their error code and message on the affected item. With `fast_fail=false`, other items continue; leafage-py's `raise_on_error=False` returns `None` for that failed item. Database, block, configuration and other infrastructure errors remain RPC errors. Nested EVM calls cannot swallow capability failures.
+
 Gas in calls/traces/multicall remains **revm resource accounting, not Classic ArbGas**. GAS, gas-sensitive branches and low-gas calls can differ from AVM even if no missing-data instruction executes. Use the archive Classic node for exact gas, estimates, transaction replay or these unsupported paths. PUSH0 and later Ethereum opcodes are not enabled. Full transaction simulation/replay fidelity is not claimed.
 
 ## Verification

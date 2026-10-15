@@ -557,7 +557,16 @@ where
         )?;
         let mut res: DebankSingleCallResult = match self.inner.transact(block_env, db, tx) {
             Ok(result) => result.into(),
-            Err(EVMError::Transaction(err)) => {
+            Err(err) => {
+                // Classic capability failures abort this EVM execution, including
+                // nested calls, but must not discard unrelated multicall results.
+                let call_error = matches!(&err, EVMError::Transaction(_))
+                    || matches!(&err, EVMError::Custom(message)
+                        if message.starts_with("Arbitrum Classic:")
+                            && !message.starts_with("Arbitrum Classic: invalid "));
+                if !call_error {
+                    return Err(err.to_rpc_error());
+                }
                 let err = err.to_rpc_error();
                 DebankSingleCallResult {
                     code: err.code(),
@@ -565,7 +574,6 @@ where
                     ..Default::default()
                 }
             }
-            Err(err) => return Err(err.to_rpc_error()),
         };
         res.time_cost = start.elapsed().as_secs_f64();
         Ok(res)
