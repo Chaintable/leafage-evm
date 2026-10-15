@@ -41,11 +41,13 @@ Builtin rules follow four upgrades, verified on adjacent native archive blocks:
 
 Other Classic networks can configure `classic_builtin_upgrades` with `arbos_34_block`, `arbos_39_block`, `arbos_42_block` and `arbos_54_block`; without this schedule, version-dependent paths report a capability error. Removed ArbOwner methods remain recognized, so valid historical calls are not mistaken for unknown selectors.
 
+NUMBER uses the block's `l1BlockNumber` metadata, clamped to at least the requested L2 height before ArbOS 42. Missing L1 metadata or an unknown upgrade schedule produces a capability error only when NUMBER executes. ArbSys.arbBlockNumber continues to return the L2 height.
+
 ## Limits
 
 Execution touching unavailable semantics returns an explicit `Arbitrum Classic:` error, even from a nested low-level call that would otherwise swallow a child failure:
 
-- NUMBER (L1 height), BLOCKHASH (Classic's private inbox-derived hash history), GASLIMIT (private ArbOS pool limit), GASPRICE and BASEFEE (private ArbGas price). The L2 header's fields are not substitutes.
+- BLOCKHASH (Classic's private inbox-derived hash history), GASLIMIT (private ArbOS pool limit), GASPRICE and BASEFEE (private ArbGas price). The L2 header's fields are not substitutes.
 - Other ArbOS builtins, including pricing, retryables, address/function tables, owner operations, ArbOS version and caller alias queries. Historical private ArbOS state and version are not in account StateDiffs.
 - Contract creation/destruction and nonzero-value CALLCODE, whose Classic account lifecycle/transfer handling is not implemented in this mode.
 - Insufficient-balance CALL to an ordinary empty-code account: StateDiffs cannot distinguish EOA and empty-runtime contract return-data behavior.

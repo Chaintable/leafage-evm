@@ -1,4 +1,5 @@
 use alloy::primitives::keccak256;
+use alloy::rpc::types::state::StateOverridesBuilder;
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::sol_types::{SolCall, SolValue};
 use jsonrpsee::http_client::HttpClientBuilder;
@@ -492,6 +493,50 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             response.results[failed_count + 1].result.as_ref(),
             &[0u8; 32]
         );
+    }
+
+    // A high historical L1 price must not consume the default compute cap.
+    // Explicit gas stays limited, and its failure is isolated within multicall.
+    let pricing_override = StateOverridesBuilder::default()
+        .with_state_diff(
+            ARBOS_STATE_ADDRESS,
+            [
+                (
+                    H256::from(arbos_slot_at(keccak256([0]).as_slice(), 7)),
+                    H256::from(U256::from(100_000)),
+                ),
+                (
+                    H256::from(arbos_slot_at(l2_pricing_key.as_slice(), 3)),
+                    H256::from(U256::ONE),
+                ),
+            ],
+        )
+        .build();
+    let default_call = TransactionRequest::default().from(sender).to(target);
+    for parallel in [false, true] {
+        let response = DebankApiClient::contract_multi_call(
+            &client,
+            [
+                default_call.clone().gas_limit(100_000_000),
+                default_call.clone(),
+            ]
+            .into_iter()
+            .map(|inner| CallRequest { inner, tempo: None })
+            .collect(),
+            None,
+            None,
+            Some(pricing_override.clone()),
+            Some(false),
+            Some(parallel),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert!(!response.stats.success);
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].code, -39001);
+        assert_eq!(response.results[1].code, 0);
+        assert_eq!(response.results[1].result.as_ref(), &[0u8; 32]);
     }
 
     handle.stop().unwrap();

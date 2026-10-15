@@ -22,7 +22,7 @@ use leafage_evm_types::{
 };
 use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
-use revm::context::result::{ExecutionResult, HaltReason};
+use revm::context::result::{EVMError, ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
@@ -555,11 +555,18 @@ where
             db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        let mut res: DebankSingleCallResult = self
-            .inner
-            .transact(block_env, db, tx)
-            .map_err(|e| e.to_rpc_error())?
-            .into();
+        let mut res: DebankSingleCallResult = match self.inner.transact(block_env, db, tx) {
+            Ok(result) => result.into(),
+            Err(EVMError::Transaction(err)) => {
+                let err = err.to_rpc_error();
+                DebankSingleCallResult {
+                    code: err.code(),
+                    err: err.message().to_owned(),
+                    ..Default::default()
+                }
+            }
+            Err(err) => return Err(err.to_rpc_error()),
+        };
         res.time_cost = start.elapsed().as_secs_f64();
         Ok(res)
     }

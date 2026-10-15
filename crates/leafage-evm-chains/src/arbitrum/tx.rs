@@ -34,8 +34,12 @@ pub struct ArbitrumTxEnv {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArbitrumTxContext {
+    /// Extra L1 posting allowance when the RPC caller omits gas.
+    pub rpc_posting_gas: u64,
     /// Original historical block, unaffected by RPC block overrides.
     pub classic_block_number: Option<u64>,
+    /// Classic NUMBER context, absent when the header lacks L1 metadata.
+    pub classic_l1_block_number: Option<u64>,
     pub current_l1_block_number: u64,
     /// Nitro `HeaderInfo.ArbOSFormatVersion` decoded from the target block.
     pub current_arbos_version: u64,

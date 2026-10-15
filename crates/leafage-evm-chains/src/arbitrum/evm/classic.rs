@@ -109,10 +109,10 @@ where
 pub(super) fn instructions<DB: Database + DatabaseRef>()
 -> EthInstructions<EthInterpreter, ArbitrumContext<DB>> {
     let mut table = EthInstructions::new_mainnet_with_spec(SpecId::BERLIN);
-    // NUMBER is L1, BLOCKHASH is the private inbox-accumulator hash history,
+    table.insert_instruction(opcode::NUMBER, Instruction::new(number), 2);
+    // BLOCKHASH is the private inbox-accumulator hash history,
     // GASLIMIT is the current ArbOS pool limit, and both price opcodes read
     // private pricing state. None can be reconstructed from the L2 header.
-    table.insert_instruction(opcode::NUMBER, Instruction::new(unavailable::<DB, 0x43>), 2);
     table.insert_instruction(
         opcode::BLOCKHASH,
         Instruction::new(unavailable::<DB, 0x40>),
@@ -262,6 +262,16 @@ fn write_memory<DB: Database + DatabaseRef, const OP: u8>(
     Ok(())
 }
 
+fn number<DB: Database + DatabaseRef>(
+    ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult {
+    let Some(number) = ctx.host.tx().context.classic_l1_block_number else {
+        return unavailable::<DB, { opcode::NUMBER }>(ctx);
+    };
+    revm::interpreter::push!(ctx.interpreter, revm::primitives::U256::from(number));
+    Ok(())
+}
+
 fn unavailable<DB: Database + DatabaseRef, const OP: u8>(
     ctx: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
 ) -> InstructionExecResult {
@@ -396,16 +406,19 @@ mod tests {
     fn classic_opcode_outputs_match_archive_node() {
         for (op, expected) in [
             (0x41, U256::ZERO),
+            (0x43, U256::from(12_562_043)),
             (0x44, U256::from(2_500_000_000_000_000u64)),
             (0x46, U256::from(42161)),
         ] {
             let bytes = [op, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3];
             for inspect in [false, true] {
                 let mut evm = evm(&bytes);
+                let mut tx = tx();
+                tx.context.classic_l1_block_number = Some(12_562_043);
                 let result = if inspect {
-                    evm.inspect_tx(tx())
+                    evm.inspect_tx(tx)
                 } else {
-                    evm.transact(tx())
+                    evm.transact(tx)
                 }
                 .unwrap();
                 assert_eq!(U256::from_be_slice(&output(result.result)), expected);
