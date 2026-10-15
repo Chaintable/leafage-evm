@@ -265,6 +265,15 @@ impl StateDBRead for MultiStateDB {
         }
     }
 
+    fn read_storage_slots(&self, address: H256) -> Result<Option<Vec<H256>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_storage_slots(address),
+            MultiStateDB::RocksDBArchive(db) => db.read_storage_slots(address),
+            MultiStateDB::MDBXState(db) => db.read_storage_slots(address),
+            MultiStateDB::MDBXArchive(db) => db.read_storage_slots(address),
+        }
+    }
+
     fn read_latest_block_hash(&self) -> Result<H256, StorageError> {
         match self {
             MultiStateDB::RocksDBState(db) => db.read_latest_block_hash(),

@@ -58,6 +58,13 @@ pub trait StateDBRead {
         Ok(None)
     }
 
+    /// The slots of `address` holding a non-zero value, for backends that
+    /// keep an account's storage after deleting it (archive), so that the
+    /// deletion can zero them; `None` means the backend needs no such help.
+    fn read_storage_slots(&self, _address: H256) -> Result<Option<Vec<H256>>, StorageError> {
+        Ok(None)
+    }
+
     /// Batched [`StateDBRead::read_account`]: one result per input, same
     /// order. The scalar default keeps archive/MDBX/mock backends correct;
     /// exact-key backends (non-archive RocksDB) override it with MultiGet.
@@ -313,6 +320,12 @@ where
                 "commit delete account: block {}, address {}", block_number, account);
             self.0
                 .write_account(&mut batch, account, block_number, None)?;
+            // The diff lists no storage for a deleted account; zero what it
+            // held, before this block's own writes so that those win.
+            for slot in self.0.read_storage_slots(account)?.unwrap_or_default() {
+                self.0
+                    .write_storage(&mut batch, account, slot, block_number, U256::ZERO)?;
+            }
         }
         for account in block_diff.new_accounts {
             trace!(target: "state_diff",
