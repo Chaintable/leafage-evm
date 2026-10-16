@@ -64,6 +64,13 @@ RUN cargo test --release -p leafage-evm-chains --lib \
     && cargo test --release -p leafage-evm-chains --lib -- \
         --ignored --test-threads=1
 
+FROM builder AS rpc-debug-tests
+
+# Execute diagnostics and multicall regression tests on the CI build hosts.
+RUN cargo test --release -p leafage-evm-rpc --lib multicall_debug \
+    && cargo test --release -p leafage-evm-rpc --test e2e_smoke \
+    && cargo test --release -p leafage-evm-rpc --test multicall_parallel
+
 FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

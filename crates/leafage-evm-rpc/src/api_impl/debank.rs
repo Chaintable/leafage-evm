@@ -1,3 +1,4 @@
+use super::multicall_debug::{self, MulticallTrace, ObservedDb};
 use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
@@ -434,11 +435,11 @@ where
                 let user_addr = Address::from(h160_bytes);
                 // get address's native balance
                 let res = Self::get_balance_from_state(
-                    EvmStorageWrapper {
+                    ObservedDb::backing(EvmStorageWrapper {
                         db: state,
                         ovm_address,
                         normalize_state_key,
-                    },
+                    }),
                     user_addr,
                 )
                 .unwrap_or_default();
@@ -521,47 +522,60 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &ObservedDb<
+            utils::RequestCacheDB<
+                ObservedDb<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+            >,
+        >,
         request: CallRequest,
+        trace: &MulticallTrace,
+        index: usize,
     ) -> RpcResult<DebankSingleCallResult> {
-        let start = std::time::Instant::now();
+        let mut diagnostic = trace.call(index, &request);
+        let result = (|| {
+            let start = std::time::Instant::now();
 
-        // Collect ERC20 token address if token_collector is enabled
-        if let Some(collector) = self.inner.token_collector() {
-            let to = request.to.and_then(|txkind| txkind.to().copied());
-            let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
-            collector.maybe_collect_call(to, data);
-        }
+            // Collect ERC20 token address if token_collector is enabled
+            if let Some(collector) = self.inner.token_collector() {
+                let to = request.to.and_then(|txkind| txkind.to().copied());
+                let data = request.input.input().map(|d| d.as_ref()).unwrap_or(&[]);
+                collector.maybe_collect_call(to, data);
+            }
 
-        if let Some(txkind) = request.to {
-            if let Some(address) = txkind.to() {
-                if *address == *utils::NATIVE_TOKEN_SENTINEL {
-                    let mut res = Self::debank_eth_erc20_handle(
-                        &block.header,
-                        state.clone(),
-                        request,
-                        self.inner.evm_cfg().ovm_address.clone(),
-                        self.inner.evm_cfg().normalize_state_key,
-                    );
-                    res.time_cost = start.elapsed().as_secs_f64();
-                    return Ok(res);
+            if let Some(txkind) = request.to {
+                if let Some(address) = txkind.to() {
+                    if *address == *utils::NATIVE_TOKEN_SENTINEL {
+                        let mut res = Self::debank_eth_erc20_handle(
+                            &block.header,
+                            state.clone(),
+                            request,
+                            self.inner.evm_cfg().ovm_address.clone(),
+                            self.inner.evm_cfg().normalize_state_key,
+                        );
+                        res.time_cost = start.elapsed().as_secs_f64();
+                        return Ok(res);
+                    }
                 }
             }
+            let tx = self.inner.create_txn_env(
+                block,
+                block_env,
+                request,
+                db,
+                self.inner.evm_cfg().cfg.chain_id,
+            )?;
+            let mut res: DebankSingleCallResult = self
+                .inner
+                .transact(block_env, db, tx)
+                .map_err(|e| e.to_rpc_error())?
+                .into();
+            res.time_cost = start.elapsed().as_secs_f64();
+            Ok(res)
+        })();
+        if let Some(diagnostic) = &mut diagnostic {
+            diagnostic.finish(&result);
         }
-        let tx = self.inner.create_txn_env(
-            block,
-            block_env,
-            request,
-            db,
-            self.inner.evm_cfg().cfg.chain_id,
-        )?;
-        let mut res: DebankSingleCallResult = self
-            .inner
-            .transact(block_env, db, tx)
-            .map_err(|e| e.to_rpc_error())?
-            .into();
-        res.time_cost = start.elapsed().as_secs_f64();
-        Ok(res)
+        result
     }
 
     /// Warms `cache_db` with every call's `from`/`to` account and the
@@ -577,8 +591,9 @@ where
     /// prefetch a net extra read for fresh addresses.
     fn prefetch_multi_call_accounts(
         requests: &[CallRequest],
-        cache_db: &mut CacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        cache_db: &mut CacheDB<ObservedDb<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>>,
         cancel_token: &CancellationToken,
+        trace: &MulticallTrace,
     ) {
         // leafage-py chunks multicalls at 20 calls, so real traffic
         // always fits this window; on oversized batches the tail keeps
@@ -601,7 +616,8 @@ where
         if addresses.is_empty() {
             return;
         }
-        let Ok(infos) = cache_db.db.basic_many_ref(&addresses) else {
+        trace.prefetch_keys("account", addresses.len());
+        let Ok(infos) = cache_db.db.db.basic_many_ref(&addresses) else {
             return;
         };
         if cancel_token.is_cancelled() {
@@ -619,7 +635,8 @@ where
             }
         }
         if !code_hashes.is_empty() {
-            if let Ok(codes) = cache_db.db.code_by_hash_many_ref(&code_hashes) {
+            trace.prefetch_keys("code", code_hashes.len());
+            if let Ok(codes) = cache_db.db.db.code_by_hash_many_ref(&code_hashes) {
                 for (code_hash, code) in code_hashes.into_iter().zip(codes) {
                     cache_db.cache.contracts.insert(code_hash, code);
                 }
@@ -653,11 +670,16 @@ where
         workers: usize,
         handle: tokio::runtime::Handle,
         cancel_token: CancellationToken,
+        trace: MulticallTrace,
     ) -> RpcResult<DebankMultiCallResp> {
+        let setup = trace.setup();
+        let acquisition = trace.stage("state_acquisition");
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
         let block = state.block_info_arc().map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
+        drop(acquisition);
+        trace.resolved_block(block.header.number, block.header.hash);
         let mut stats = DebankMultiCallStats {
             block_num: block.header.number,
             block_time: block.header.timestamp,
@@ -669,11 +691,11 @@ where
         // shared by every call in this multicall: overrides apply once,
         // and repeated keys across calls skip the layered-state walk.
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(EvmStorageWrapper {
+        let mut cache_db = CacheDB::new(ObservedDb::backing(EvmStorageWrapper {
             db: state.clone(),
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        }));
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
@@ -692,9 +714,11 @@ where
         // early failure would turn that into O(N) wasted reads. On
         // MultiGet backends the fast_fail waste is bounded by two
         // batched reads over the capped prefetch window.
-        if cache_db.db.supports_batched_reads() {
-            Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token);
+        if cache_db.db.db.supports_batched_reads() {
+            let _prefetch = trace.stage("prefetch");
+            Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token, &trace);
         }
+        drop(setup);
         if workers > 1 {
             let results = self.debank_multi_call_parallel(
                 &handle,
@@ -706,14 +730,15 @@ where
                 fast_fail,
                 workers,
                 &cancel_token,
+                &trace,
             )?;
             stats.success = results.iter().all(|res| res.code == 0);
             return Ok(DebankMultiCallResp { stats, results });
         }
-        let db = utils::RequestCacheDB::new(cache_db);
+        let db = ObservedDb::cached(utils::RequestCacheDB::new(cache_db));
         // run in sequence
         let mut results: Vec<DebankSingleCallResult> = vec![];
-        for request in requests {
+        for (index, request) in requests.into_iter().enumerate() {
             if cancel_token.is_cancelled() {
                 return Err(internal_rpc_err(
                     "multicall cancelled by caller".to_string(),
@@ -725,11 +750,7 @@ where
                 continue;
             }
             let res = self.debank_single_call_from_state_impl_inner(
-                &state,
-                &block,
-                &block_env,
-                &db,
-                request,
+                &state, &block, &block_env, &db, request, &trace, index,
             )?;
             if res.code != 0 {
                 stats.success = false;
@@ -751,13 +772,18 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &ObservedDb<
+            utils::RequestCacheDB<
+                ObservedDb<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+            >,
+        >,
         requests: &[CallRequest],
         slots: &[OnceLock<RpcResult<DebankSingleCallResult>>],
         next: &AtomicUsize,
         stop_after: &AtomicUsize,
         fast_fail: bool,
         cancel_token: &CancellationToken,
+        trace: &MulticallTrace,
     ) {
         loop {
             let index = next.fetch_add(1, Ordering::SeqCst);
@@ -773,6 +799,8 @@ where
                 block_env,
                 db,
                 requests[index].clone(),
+                trace,
+                index,
             );
             let stops = match &res {
                 Err(_) => true,
@@ -797,11 +825,19 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &ObservedDb<
+            utils::RequestCacheDB<
+                ObservedDb<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+            >,
+        >,
         request: CallRequest,
+        trace: &MulticallTrace,
+        index: usize,
     ) -> RpcResult<DebankSingleCallResult> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.debank_single_call_from_state_impl_inner(state, block, block_env, db, request)
+            self.debank_single_call_from_state_impl_inner(
+                state, block, block_env, db, request, trace, index,
+            )
         })) {
             Ok(res) => res,
             Err(_) => {
@@ -837,11 +873,12 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &Arc<BlockInfo>,
         block_env: &BlockEnv,
-        base_db: CacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        base_db: CacheDB<ObservedDb<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>>,
         requests: Arc<Vec<CallRequest>>,
         fast_fail: bool,
         workers: usize,
         cancel_token: &CancellationToken,
+        trace: &MulticallTrace,
     ) -> RpcResult<Vec<DebankSingleCallResult>> {
         let slots: Arc<Vec<OnceLock<RpcResult<DebankSingleCallResult>>>> =
             Arc::new((0..requests.len()).map(|_| OnceLock::new()).collect());
@@ -868,13 +905,16 @@ where
                 let state = state.clone();
                 let block = block.clone();
                 let block_env = block_env.clone();
-                let db = utils::RequestCacheDB::new(base_db.clone());
+                let db = ObservedDb::cached(utils::RequestCacheDB::new(base_db.clone()));
                 let requests = requests.clone();
                 let slots = slots.clone();
                 let next = next.clone();
                 let stop_after = stop_after.clone();
                 let cancel_token = cancel_token.clone();
+                let trace = trace.clone();
+                let queue = trace.stage("parallel_worker_queue_sum");
                 handle.spawn_blocking(move || {
+                    drop(queue);
                     if gate
                         .compare_exchange(QUEUED, STARTED, Ordering::SeqCst, Ordering::SeqCst)
                         .is_err()
@@ -892,11 +932,12 @@ where
                         &stop_after,
                         fast_fail,
                         &cancel_token,
+                        &trace,
                     )
                 })
             })
             .collect();
-        let parent_db = utils::RequestCacheDB::new(base_db.clone());
+        let parent_db = ObservedDb::cached(utils::RequestCacheDB::new(base_db.clone()));
         self.multicall_worker_loop(
             state,
             block.as_ref(),
@@ -908,6 +949,7 @@ where
             &stop_after,
             fast_fail,
             cancel_token,
+            trace,
         );
         // The parent has drained the index space (or stopped on
         // cancel / a known failure), so a worker still QUEUED has
@@ -963,8 +1005,10 @@ where
                     state,
                     block,
                     block_env,
-                    &utils::RequestCacheDB::new(base_db.clone()),
+                    &ObservedDb::cached(utils::RequestCacheDB::new(base_db.clone())),
                     requests[index].clone(),
+                    trace,
+                    index,
                 ),
             };
             let res = res?;
@@ -999,23 +1043,36 @@ where
         } else {
             1
         };
+        let trace = MulticallTrace::current();
+        trace.context(
+            evm_cfg.cfg.chain_id,
+            &evm_cfg.version,
+            requests.len(),
+            workers,
+            fast_fail.unwrap_or_default(),
+        );
+        let worker_trace = trace.clone();
         let this = self.clone();
         let handle = tokio::runtime::Handle::current();
-        utils::spawn_blocking_limited_many_with_cancel(limiter, workers as u32, move |token| {
-            this.debank_multi_call_from_state_impl_inner(
-                requests,
-                block_ctx,
-                block_overrides,
-                state_override,
-                fast_fail.unwrap_or_default(),
-                workers,
-                handle,
-                token,
-            )
-        })
-        .await
-        .inspect_err(|err| error!("Failed to spawn contract_multi_call result: {:?}", err))
-        .map_err(|_| internal_rpc_err("multi call failed"))?
+        let result =
+            multicall_debug::spawn_blocking(limiter, workers as u32, trace.clone(), move |token| {
+                this.debank_multi_call_from_state_impl_inner(
+                    requests,
+                    block_ctx,
+                    block_overrides,
+                    state_override,
+                    fast_fail.unwrap_or_default(),
+                    workers,
+                    handle,
+                    token,
+                    worker_trace,
+                )
+            })
+            .await
+            .inspect_err(|err| error!("Failed to spawn contract_multi_call result: {:?}", err))
+            .map_err(|_| internal_rpc_err("multi call failed"))?;
+        trace.local_result(&result);
+        result
     }
 
     async fn debank_simulate_transactions_impl(
@@ -1650,6 +1707,7 @@ where
             Ok(result) => Ok(result),
             Err(err) => {
                 if let Some(historical_client) = self.should_try_historical(&block_ctx) {
+                    let _fallback = MulticallTrace::current().stage("historical_fallback");
                     match historical_client
                         .contract_multi_call(
                             requests,
