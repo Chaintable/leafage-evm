@@ -1,11 +1,14 @@
 // cache-verify round 2: validating Plan C (layer-cache via cargo-chef, no cache mounts)
 mod archive_init;
+mod archive_clear_deleted;
 mod archive_scan;
 mod bundle;
 mod compact;
 mod db_migrate;
 mod force_compact;
 mod initializer;
+mod pipeline_export;
+mod put_code;
 mod register;
 mod rewind;
 mod runner;
@@ -17,6 +20,11 @@ mod warm;
 
 use clap::Parser;
 use runner::Cli;
+
+/// Held by tests that open an archive: the archive backend keeps its DB and
+/// block encoding in process globals.
+#[cfg(test)]
+static ARCHIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use tikv_jemallocator;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};

@@ -12,3 +12,8 @@ pub use api_impl::InterceptorConfig;
 pub use api_impl::{build_op_custom_config, ApiBuilder, MultiChainCfgEnv, TokenCollector};
 
 mod metrics;
+
+mod pipeline;
+pub use pipeline::{
+    bundle_range, export_bundles, Chain, ExportConfig, Resource, S3Target, BUNDLE_SIZE,
+};

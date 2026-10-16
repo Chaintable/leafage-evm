@@ -1,4 +1,7 @@
-use crate::{archive_init, archive_scan, compact, db_migrate, force_compact, rewind, standalone};
+use crate::{
+    archive_clear_deleted, archive_init, archive_scan, compact, db_migrate, force_compact, pipeline_export, put_code,
+    rewind, standalone,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::future::Future;
@@ -43,6 +46,15 @@ pub(crate) enum Commands {
     /// Read-only scan of an archive DB column family (forensics/debugging)
     #[command(name = "archive-scan")]
     ArchiveScan(archive_scan::Command),
+    /// Zero the storage an archive DB kept for deleted accounts (offline repair)
+    #[command(name = "archive-clear-deleted")]
+    ArchiveClearDeleted(archive_clear_deleted::Command),
+    /// Write contract code missing from an archive DB (offline repair)
+    #[command(name = "put-code")]
+    PutCode(put_code::Command),
+    /// Replay a chain's blocks on its archive DB into pipeline-compactor bundles
+    #[command(name = "pipeline-export")]
+    PipelineExport(pipeline_export::Command),
 }
 
 impl Commands {
@@ -55,6 +67,9 @@ impl Commands {
             Commands::ForceCompact(mut cmd) => cmd.run().await,
             Commands::Rewind(mut cmd) => cmd.run().await,
             Commands::ArchiveScan(mut cmd) => cmd.run().await,
+            Commands::ArchiveClearDeleted(mut cmd) => cmd.run().await,
+            Commands::PutCode(mut cmd) => cmd.run().await,
+            Commands::PipelineExport(mut cmd) => cmd.run().await,
         }
     }
 }

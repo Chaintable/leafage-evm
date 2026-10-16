@@ -1,4 +1,5 @@
 pub mod hardforks;
+pub mod mainnet;
 mod precompile;
 pub use hardforks::{bsc::BscHardfork, BscHardforks};
 

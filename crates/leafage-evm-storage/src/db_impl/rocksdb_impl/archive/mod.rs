@@ -23,8 +23,8 @@
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use crate::db_impl::archive_encoding::{
-    encode_account_key, encode_block_num, encode_slim_account, encode_storage_key,
-    inverted_block_encoding, set_inverted_block_encoding,
+    decode_version_tail, encode_account_key, encode_block_num, encode_slim_account,
+    encode_storage_key, inverted_block_encoding, set_inverted_block_encoding, STORAGE_KEY_LEN,
 };
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{
@@ -2363,6 +2363,92 @@ impl StateDB {
     }
 }
 
+impl StateDB {
+    /// [`StateDBRead::read_storage`] plus the block that wrote the value;
+    /// `None` if no block did.
+    pub fn read_storage_and_height(
+        &self,
+        address: H256,
+        key: H256,
+    ) -> Result<(U256, Option<u64>), Error> {
+        let start = std::time::Instant::now();
+        let address_bytes: [u8; 32] = address.into();
+        let key_bytes: [u8; 32] = key.into();
+        let target_key = encode_storage_key(address, key, self.block_num);
+
+        // Check timeout before using iterator
+        self.check_timeout()?;
+        let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
+        let storage_iter = storage_iter_guard
+            .as_mut()
+            .ok_or(Error::IteratorTimedOut(self.block_num))?;
+        // Inverted -> forward seek; legacy ascending -> seek_for_prev. See read_account.
+        if inverted_block_encoding() {
+            storage_iter.seek(target_key);
+        } else {
+            storage_iter.seek_for_prev(target_key);
+        }
+        STORAGE_METRICS
+            .read_storage_latency
+            .record(start.elapsed().as_secs_f64());
+        if let Some(raw_key_bytes) = storage_iter.key() {
+            if address_bytes != raw_key_bytes[..32] {
+                return Ok((U256::ZERO, None));
+            }
+            if key_bytes != raw_key_bytes[32..64] {
+                return Ok((U256::ZERO, None));
+            }
+            let version = decode_version_tail(&raw_key_bytes[64..96]);
+            let raw_val_bytes = storage_iter.value().unwrap();
+            if raw_val_bytes.is_empty() {
+                return Ok((U256::ZERO, Some(version)));
+            }
+            let value = U256::from_be_slice(&raw_val_bytes);
+            Ok((value, Some(version)))
+        } else {
+            Ok((U256::ZERO, None))
+        }
+    }
+
+    /// The slots of `address` holding a non-zero value.
+    fn storage_slots(&self, address: H256) -> Result<Vec<H256>, Error> {
+        let address_bytes: [u8; 32] = address.into();
+        // Seeking to slots that may not exist: past the prefix bloom.
+        let address_to_storage_cf = self
+            .db
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let mut read_options = rocksdb_read_options();
+        read_options.set_total_order_seek(true);
+        let mut slot_iter = self
+            .db
+            .db
+            .raw_iterator_cf_opt(address_to_storage_cf, read_options);
+        let mut slots = Vec::new();
+        let mut from = Some(U256::ZERO);
+        while let Some(start) = from {
+            // The newest version of the first slot at or after `start`: an
+            // all-zero version tail sorts first under both encodings.
+            let mut key = [0u8; STORAGE_KEY_LEN];
+            key[..32].copy_from_slice(&address_bytes);
+            key[32..64].copy_from_slice(&start.to_be_bytes::<32>());
+            slot_iter.seek(key);
+            let slot = match slot_iter.key() {
+                Some(raw_key_bytes) if raw_key_bytes[..32] == address_bytes => {
+                    H256::from_slice(&raw_key_bytes[32..64])
+                }
+                _ => break,
+            };
+            if !self.read_storage(address, slot)?.is_zero() {
+                slots.push(slot);
+            }
+            from = U256::from_be_bytes(slot.0).checked_add(U256::from(1));
+        }
+        Ok(slots)
+    }
+}
+
 impl StateDBRead for StateDB {
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
         let start = std::time::Instant::now();
@@ -2412,42 +2498,7 @@ impl StateDBRead for StateDB {
     }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
-        let start = std::time::Instant::now();
-        let address_bytes: [u8; 32] = address.into();
-        let key_bytes: [u8; 32] = key.into();
-        let target_key = encode_storage_key(address, key, self.block_num);
-
-        // Check timeout before using iterator
-        self.check_timeout()?;
-        let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
-        let storage_iter = storage_iter_guard
-            .as_mut()
-            .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        // Inverted -> forward seek; legacy ascending -> seek_for_prev. See read_account.
-        if inverted_block_encoding() {
-            storage_iter.seek(target_key);
-        } else {
-            storage_iter.seek_for_prev(target_key);
-        }
-        STORAGE_METRICS
-            .read_storage_latency
-            .record(start.elapsed().as_secs_f64());
-        if let Some(raw_key_bytes) = storage_iter.key() {
-            if address_bytes != raw_key_bytes[..32] {
-                return Ok(U256::ZERO);
-            }
-            if key_bytes != raw_key_bytes[32..64] {
-                return Ok(U256::ZERO);
-            }
-            let raw_val_bytes = storage_iter.value().unwrap();
-            if raw_val_bytes.is_empty() {
-                return Ok(U256::ZERO);
-            }
-            let value = U256::from_be_slice(&raw_val_bytes);
-            Ok(value)
-        } else {
-            Ok(U256::ZERO)
-        }
+        Ok(self.read_storage_and_height(address, key)?.0)
     }
 
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
@@ -2523,6 +2574,21 @@ impl StateDBWrite for StateDB {
         value: U256,
     ) -> Result<(), Error> {
         self.db.write_storage(batch, address, key, block_num, value)
+    }
+
+    /// The archive keeps every version of a slot, so the storage an account
+    /// held stays readable past its deletion unless zeroed here.
+    fn clear_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), Error> {
+        for slot in self.storage_slots(address)? {
+            self.db
+                .write_storage(batch, address, slot, block_num, U256::ZERO)?;
+        }
+        Ok(())
     }
 
     fn write_code(
@@ -3305,6 +3371,106 @@ mod inverted_encoding_tests {
     #[test]
     fn test_versioned_read_greatest_leq_height_legacy() {
         run_versioned_roundtrip(false);
+    }
+
+    /// Deleting an account zeroes the storage it held, as of the deletion,
+    /// while the deleting block's own writes and later ones still win.
+    fn run_delete_clears_storage(inverted: bool) {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(inverted);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-clear-{}-{}",
+            inverted,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let addr = H256::repeat_byte(0xab);
+            // Sorts right after `addr`; its storage must stay.
+            let next = H256::repeat_byte(0xac);
+            let (a, b, c) = (
+                H256::repeat_byte(0x01),
+                H256::repeat_byte(0x02),
+                H256::repeat_byte(0x03),
+            );
+            let slots = |address: H256, pairs: &[(H256, u64)]| AccountStorageDiff {
+                address,
+                diffs: pairs
+                    .iter()
+                    .map(|(index, value)| IndexValuePair {
+                        index: *index,
+                        value: U256::from(*value),
+                    })
+                    .collect(),
+            };
+            let blocks = [
+                // 1: a = 7, b = 9; next's b = 1.
+                BlockStorageDiff {
+                    storage_diffs: vec![slots(addr, &[(a, 7), (b, 9)]), slots(next, &[(b, 1)])],
+                    ..slot_diff(addr, c, 100, 0)
+                },
+                // 2: b = 0.
+                BlockStorageDiff {
+                    storage_diffs: vec![slots(addr, &[(b, 0)])],
+                    ..Default::default()
+                },
+                // 3: deleted.
+                BlockStorageDiff {
+                    deleted_accounts: vec![addr],
+                    ..Default::default()
+                },
+                // 4: created again, b = 5.
+                slot_diff(addr, b, 0, 5),
+                // 5: deleted, with a = 11 written in the same block.
+                BlockStorageDiff {
+                    deleted_accounts: vec![addr],
+                    storage_diffs: vec![slots(addr, &[(a, 11)])],
+                    ..Default::default()
+                },
+            ];
+            for (n, diff) in (1u64..).zip(blocks) {
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+            let values =
+                |n: u64| [a, b, c].map(|slot| at(n).read_storage(addr, slot).unwrap().to::<u64>());
+            assert_eq!(values(2), [7, 0, 0], "inverted={inverted}");
+            assert_eq!(at(2).storage_slots(addr).unwrap(), vec![a]);
+            assert_eq!(values(3), [0, 0, 0], "inverted={inverted}");
+            assert!(at(3).storage_slots(addr).unwrap().is_empty());
+            assert_eq!(values(4), [0, 5, 0], "inverted={inverted}");
+            assert_eq!(values(5), [11, 0, 0], "inverted={inverted}");
+            assert_eq!(at(5).read_storage(next, b).unwrap(), U256::from(1));
+            // The zero is a version of the deleting block.
+            assert_eq!(
+                at(4).read_storage_and_height(addr, a).unwrap(),
+                (U256::ZERO, Some(3))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    #[test]
+    fn test_delete_clears_storage_inverted() {
+        run_delete_clears_storage(true);
+    }
+
+    #[test]
+    fn test_delete_clears_storage_legacy() {
+        run_delete_clears_storage(false);
     }
 
     /// Tip state of a small archive, scanned with the latest-state iterators.

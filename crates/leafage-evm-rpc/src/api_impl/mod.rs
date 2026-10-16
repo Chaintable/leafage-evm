@@ -30,7 +30,7 @@ mod arc;
 
 mod arbitrum;
 mod base;
-mod bsc;
+pub(crate) mod bsc;
 mod citrea;
 mod op;
 pub use op::build_op_custom_config;

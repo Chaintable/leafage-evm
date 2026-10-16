@@ -145,6 +145,17 @@ pub trait StateDBWrite: Send + Sync + 'static {
         value: U256,
     ) -> Result<(), StorageError>;
 
+    /// Clear the storage of `address`, deleted at `block_num`, for backends
+    /// that keep it otherwise (archive).
+    fn clear_storage(
+        &self,
+        _batch: &mut Self::DBWriteBatch,
+        _address: H256,
+        _block_num: u64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// commit write batch
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError>;
 }
@@ -274,6 +285,9 @@ where
                 "commit delete account: block {}, address {}", block_number, account);
             self.0
                 .write_account(&mut batch, account, block_number, None)?;
+            // The diff lists no storage for a deleted account; clear what it
+            // held, before this block's own writes so that those win.
+            self.0.clear_storage(&mut batch, account, block_number)?;
         }
         for account in block_diff.new_accounts {
             trace!(target: "state_diff",

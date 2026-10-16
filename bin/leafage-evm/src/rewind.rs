@@ -311,6 +311,7 @@ mod tests {
     #[tokio::test]
     async fn archive_head_only_then_default_truncation() {
         use leafage_evm_types::{Block, BlockInfo, Header, NewAccount, RawHeader, U256};
+        let _guard = crate::ARCHIVE_TEST_LOCK.lock().await;
         for (kind, inverted, marked) in [
             (StorageKind::MDBX, false, false),
             (StorageKind::MDBX, true, false),

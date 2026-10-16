@@ -1,4 +1,5 @@
 use super::api_impl::NoneEvmCustomConfig;
+use super::bsc::trace::{BscTrace, BscTraceApiServer};
 use super::tempo::api::TempoEvmCustomConfig;
 use super::token_collector::TokenCollector;
 use super::ApiImpl;
@@ -16,10 +17,11 @@ use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
     RpcModule,
 };
+use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
-use tracing::error;
+use tracing::{error, warn};
 
 pub struct ApiBuilder<DB> {
     db: DB,
@@ -29,6 +31,8 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
+    trace_block_client: Option<HttpClient>,
+    trace_block_check_state: bool,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
     warmup_erc20_addresses: Option<(Address, Vec<Address>)>,
     token_collector: Option<TokenCollector>,
@@ -50,6 +54,8 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
+            trace_block_client: None,
+            trace_block_check_state: true,
             replay_blocks: None,
             warmup_erc20_addresses: None,
             token_collector: None,
@@ -86,6 +92,33 @@ where
         }
         self.historical_height = historical_height;
         self
+    }
+
+    /// Upstream RPC serving full block bodies for `trace_debankBlock`. The
+    /// method is only served by BSC mainnet archive nodes configured with one.
+    /// `check_state` also compares every account and slot the replay changed
+    /// with the archive state of the block, on top of the gas used and
+    /// receipts root checks.
+    pub fn with_trace_block_rpc(
+        mut self,
+        url: Option<String>,
+        check_state: bool,
+    ) -> std::io::Result<Self> {
+        self.trace_block_check_state = check_state;
+        if let Some(url) = url {
+            let client = HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(30))
+                .max_response_size(u32::MAX)
+                .build(&url)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid trace block rpc {url:?}: {e}"),
+                    )
+                })?;
+            self.trace_block_client = Some(client);
+        }
+        Ok(self)
     }
 
     pub fn with_replay_blocks(mut self, blocks: Vec<Vec<DebankTransaction>>) -> Self {
@@ -214,7 +247,10 @@ where
             .build_from_tcp(listener)?;
         let mut rpc_module = RpcModule::new(());
         macro_rules! run_chain_setup {
-            ($cfg:expr, $custom_evm_cfg: expr) => {{
+            ($cfg:expr, $custom_evm_cfg: expr) => {
+                run_chain_setup!($cfg, $custom_evm_cfg, |_api| {})
+            };
+            ($cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {{
                 let mut api_impl = ApiImpl::new(
                     self.db,
                     $cfg,
@@ -238,8 +274,22 @@ where
                     self.warmup_erc20_addresses.take(),
                 )
                 .await;
+                let $api = api.clone();
+                $extra
                 register_api(&mut rpc_module, api)?;
             }};
+        }
+
+        // trace_debankBlock replays on the archive with the BSC mainnet fork
+        // schedule.
+        let mut trace_block_client = self.trace_block_client.take();
+        let bsc_mainnet = matches!(
+            &self.cfg,
+            MultiChainCfgEnv::Bsc(env) if env.chain_id == BSC_MAINNET_CHAIN_ID
+        );
+        if trace_block_client.is_some() && !(is_archive && bsc_mainnet) {
+            warn!("trace_debankBlock needs a BSC mainnet archive database, not serving it");
+            trace_block_client = None;
         }
 
         match self.cfg.clone() {
@@ -256,7 +306,16 @@ where
             MultiChainCfgEnv::Base(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
             }
-            MultiChainCfgEnv::Bsc(env) => run_chain_setup!(env, None),
+            MultiChainCfgEnv::Bsc(env) => {
+                run_chain_setup!(env, None, |api| {
+                    merge_bsc_trace(
+                        &mut rpc_module,
+                        api,
+                        trace_block_client.take(),
+                        self.trace_block_check_state,
+                    )?;
+                })
+            }
             MultiChainCfgEnv::Cosmos((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)
             }
@@ -334,6 +393,33 @@ async fn warmup_api<A>(
             error!("Error while warmup erc20 address: {}", err);
         }
     }
+}
+
+fn merge_bsc_trace<C>(
+    rpc_module: &mut RpcModule<()>,
+    api: Api<C>,
+    block_client: Option<HttpClient>,
+    check_state: bool,
+) -> std::io::Result<()>
+where
+    C: ApiBase,
+    C::DB: BlockIndex + EvmStorageRead + Sync + Send + 'static,
+{
+    let Some(block_client) = block_client else {
+        return Ok(());
+    };
+    rpc_module
+        .merge(BscTraceApiServer::into_rpc(BscTrace::new(
+            api,
+            block_client,
+            check_state,
+        )))
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to merge rpc module: {}", e),
+            )
+        })
 }
 
 fn register_api<A>(rpc_module: &mut RpcModule<()>, api: Api<A>) -> std::io::Result<()>

@@ -34,6 +34,13 @@ http.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 anyhow.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+flate2.workspace = true
+aws-sdk-s3.workspace = true
+bytes.workspace = true
+# Recover transaction senders with libsecp256k1 instead of the much slower k256.
+alloy-consensus = { version = "2.5.0", default-features = false, features = ["secp256k1"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true
