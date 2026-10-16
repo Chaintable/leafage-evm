@@ -18,8 +18,10 @@ use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
-use alloy::primitives::{Bytes, B256, Log, U256};
+use alloy::primitives::{Bytes, Log, B256, U256, U64};
 use jsonrpsee::core::RpcResult;
+use leafage_evm_chains::arbitrum::arbos_state::ArbStateReader;
+use leafage_evm_chains::arbitrum::config::ClassicBuiltinUpgrades;
 use leafage_evm_chains::arbitrum::evm::ArbitrumExecutionContext;
 use leafage_evm_chains::arbitrum::precompile::ArbitrumPrecompileEnv;
 use leafage_evm_chains::arbitrum::tx::{ArbitrumTxContext, ArbitrumTxEnv, ArbitrumRetryTx};
@@ -107,7 +109,8 @@ impl<DB> ArbitrumApiImpl<DB> {
         cfg.tx_gas_limit_cap = Some(
             cfg.tx_gas_limit_cap
                 .filter(|&cap| cap != 0)
-                .unwrap_or(u64::MAX),
+                .unwrap_or(u64::MAX)
+                .saturating_add(tx.context.rpc_posting_gas),
         );
         if tx.is_retryable_redeem() {
             cfg.disable_balance_check = true;
@@ -144,8 +147,29 @@ impl<DB> ArbitrumApiImpl<DB> {
 
     fn tx_context_for_block(&self, block: &BlockInfo) -> ArbitrumTxContext {
         if self.is_classic() {
+            let upgrades = self
+                .evm_cfg
+                .custom_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.classic_builtin_upgrades)
+                .or_else(|| ClassicBuiltinUpgrades::for_chain_id(self.evm_cfg.cfg.chain_id));
+            let l1_number = block
+                .other
+                .get_deserialized::<U64>("l1BlockNumber")
+                .and_then(Result::ok);
+            let classic_l1_block_number = l1_number.zip(upgrades).map(|(l1, upgrades)| {
+                // Before ArbOS 42, eth_call's request context clamps its L2
+                // height to the inbox L1 height; later versions use the inbox.
+                let l1 = l1.to::<u64>();
+                if block.header.number < upgrades.arbos_42_block {
+                    l1.max(block.header.number)
+                } else {
+                    l1
+                }
+            });
             return ArbitrumTxContext {
                 classic_block_number: Some(block.header.number),
+                classic_l1_block_number,
                 ..Default::default()
             };
         }
@@ -436,9 +460,19 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        let base =
-            create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
-        Ok(ArbitrumTxEnv::new(base, self.tx_context_for_block(block)))
+        let add_posting_gas = !self.is_classic() && block_env.basefee != 0 && request.gas.is_none();
+        let mut base =
+            create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, &db, chain_id)?;
+        let mut context = self.tx_context_for_block(block);
+        if add_posting_gas {
+            if let Some(pricing) = db.try_read_pricing().map_err(|err| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, err.to_string())
+            })? {
+                context.rpc_posting_gas = pricing.rpc_posting_gas(&base, block_env.basefee);
+                base.gas_limit = base.gas_limit.saturating_add(context.rpc_posting_gas);
+            }
+        }
+        Ok(ArbitrumTxEnv::new(base, context))
     }
 
     fn transact<StateDB: DatabaseRef + Debug>(
@@ -610,6 +644,7 @@ mod tests {
     #[test]
     fn classic_ignores_nitro_header_metadata_and_version() {
         let mut api = test_api(ArbitrumHardfork::Osaka);
+        api.evm_cfg.cfg.chain_id = 42161;
         api.evm_cfg.custom_cfg = Some(ArbitrumEvmConfig {
             execution_mode: ArbitrumExecutionMode::Classic,
             ..Default::default()
@@ -628,7 +663,29 @@ mod tests {
         assert_eq!(ctx.current_l2_block_number(), Some(block_env.number));
         let mut block = BlockInfo::default();
         block.header.number = 2_965_602;
-        assert_eq!(api.tx_context_for_block(&block).classic_block_number, Some(2_965_602));
+        assert_eq!(
+            api.tx_context_for_block(&block).classic_block_number,
+            Some(2_965_602)
+        );
+        assert_eq!(
+            api.tx_context_for_block(&block).classic_l1_block_number,
+            None
+        );
+        for (l2, l1, expected) in [
+            (0, 0, 0),
+            (481, 12_562_043, 12_562_043),
+            (662_404, 1, 662_404),
+            (662_405, 1, 1),
+            (20_000_000, 15_320_447, 15_320_447),
+        ] {
+            block.header.number = l2;
+            block
+                .other
+                .insert("l1BlockNumber".into(), serde_json::json!(U64::from(l1)));
+            let context = api.tx_context_for_block(&block);
+            assert_eq!(context.classic_block_number, Some(l2));
+            assert_eq!(context.classic_l1_block_number, Some(expected));
+        }
         assert_eq!(
             precompile_env(&tx, api.evm_cfg.custom_cfg.as_ref()).execution_mode,
             ArbitrumExecutionMode::Classic

@@ -114,7 +114,7 @@ def main():
                 token_requests.append((request, expected))
 
         for name, bytecode in [
-            ('coinbase', '41'), ('difficulty', '44'), ('timestamp', '42'),
+            ('coinbase', '41'), ('difficulty', '44'), ('timestamp', '42'), ('number', '43'),
             ('chainid', '46'), ('caller', '33'), ('origin', '32'), ('selfbalance', '47'),
         ]:
             code = '0x' + bytecode + '60005260206000f3'
@@ -209,7 +209,7 @@ def main():
             compare(name + '.nested', height, 'eth_call', [
                 dict(to=PROBE, data='0x' + data.hex(), gas='0x989680'), block, {PROBE: dict(code=parent)}])
 
-        for name, opcode in [('NUMBER', '43'), ('BLOCKHASH', '40'), ('GASLIMIT', '45'), ('GASPRICE', '3a'), ('BASEFEE', '48')]:
+        for name, opcode in [('BLOCKHASH', '40'), ('GASLIMIT', '45'), ('GASPRICE', '3a'), ('BASEFEE', '48')]:
             # BLOCKHASH needs an operand even though Classic fails before lookup.
             code = '0x6000' + opcode + '60005260206000f3'
             rejected('unsupported:' + name, height, 'eth_call', [dict(to=PROBE), block, {PROBE: dict(code=code)}])

@@ -1,9 +1,12 @@
 use alloy::primitives::keccak256;
+use alloy::rpc::types::state::StateOverridesBuilder;
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolValue};
 use jsonrpsee::http_client::HttpClientBuilder;
 use leafage_evm_chains::arbitrum::arbos_state::ARBOS_STATE_ADDRESS;
-use leafage_evm_chains::arbitrum::precompile::{ARB_RETRYABLE_TX_ADDRESS, NODE_INTERFACE_ADDRESS};
+use leafage_evm_chains::arbitrum::precompile::{
+    ARB_RETRYABLE_TX_ADDRESS, NODE_INTERFACE_ADDRESS, NODE_INTERFACE_DEBUG_ADDRESS,
+};
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_rpc::{ApiBuilder, DebankApiClient, EthApiClient, MultiChainCfgEnv};
 use leafage_evm_storage::{
@@ -27,6 +30,11 @@ alloy::sol! {
         address callValueRefundAddress,
         bytes data
     ) external;
+    function decimals() external view returns (uint8);
+    function nitroGenesisBlock() external pure returns (uint256);
+    function blockL1Num(uint64 l2BlockNum) external view returns (uint64);
+    function getRetryable(bytes32 ticket) external view;
+    function gasEstimateComponents(address to, bool contractCreation, bytes data) external payable;
 }
 
 fn block_info(number: u64, hash: H256, parent_hash: H256) -> BlockInfo {
@@ -183,6 +191,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     cfg.tx_gas_limit_cap = Some(100_000_000);
 
     let handle = ApiBuilder::new(tree.clone(), MultiChainCfgEnv::Arbitrum((cfg, None)))
+        .with_multicall_parallelism(2)
         .build_and_run(
             "127.0.0.1:18550",
             100,
@@ -389,6 +398,146 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     )
     .await
     .expect("an explicit RPC cap above EIP-7825 must allow this Arbitrum call");
+
+    // Token probes and invalid virtual calls must fail individually, including
+    // when the surrounding multicall runs in parallel.
+    let node_call = |to, data: Vec<u8>| {
+        TransactionRequest::default()
+            .from(sender)
+            .to(to)
+            .input(TransactionInput::new(data.into()))
+    };
+    let estimate = |to| {
+        gasEstimateComponentsCall {
+            to,
+            contractCreation: false,
+            data: Bytes::new(),
+        }
+        .abi_encode()
+    };
+    let mut invalid_bool = estimate(target);
+    invalid_bool[67] = 2;
+    let mut invalid_uint64 = blockL1NumCall { l2BlockNum: 0 }.abi_encode();
+    invalid_uint64[4] = 1;
+    let invalid_calls = vec![
+        node_call(NODE_INTERFACE_ADDRESS, decimalsCall {}.abi_encode()),
+        node_call(NODE_INTERFACE_DEBUG_ADDRESS, decimalsCall {}.abi_encode()),
+        node_call(NODE_INTERFACE_ADDRESS, blockL1NumCall::SELECTOR.to_vec()),
+        node_call(
+            NODE_INTERFACE_DEBUG_ADDRESS,
+            getRetryableCall::SELECTOR.to_vec(),
+        ),
+        node_call(
+            NODE_INTERFACE_ADDRESS,
+            nitroGenesisBlockCall {}.abi_encode(),
+        )
+        .value(U256::ONE),
+        node_call(NODE_INTERFACE_ADDRESS, estimate(reverting_target)),
+        node_call(NODE_INTERFACE_ADDRESS, estimate(NODE_INTERFACE_ADDRESS)),
+        node_call(
+            NODE_INTERFACE_DEBUG_ADDRESS,
+            getRetryableCall { ticket: H256::ZERO }.abi_encode(),
+        ),
+        node_call(
+            NODE_INTERFACE_ADDRESS,
+            blockL1NumCall { l2BlockNum: 2 }.abi_encode(),
+        ),
+        node_call(NODE_INTERFACE_ADDRESS, invalid_bool),
+        node_call(NODE_INTERFACE_ADDRESS, invalid_uint64),
+        node_call(
+            NODE_INTERFACE_ADDRESS,
+            nitroGenesisBlockCall {}.abi_encode(),
+        )
+        .gas_limit(2),
+    ];
+    let failed_count = invalid_calls.len();
+    let requests: Vec<_> = invalid_calls
+        .into_iter()
+        .chain([
+            node_call(
+                NODE_INTERFACE_ADDRESS,
+                nitroGenesisBlockCall {}.abi_encode(),
+            ),
+            TransactionRequest::default().from(sender).to(target),
+        ])
+        .map(|inner| CallRequest { inner, tempo: None })
+        .collect();
+    for parallel in [false, true] {
+        let response = DebankApiClient::contract_multi_call(
+            &client,
+            requests.clone(),
+            None,
+            None,
+            None,
+            Some(false),
+            Some(parallel),
+            Some(true),
+        )
+        .await
+        .expect("virtual call failures must not abort the RPC");
+        assert!(!response.stats.success);
+        assert_eq!(response.results.len(), failed_count + 2);
+        for (index, result) in response.results[..failed_count].iter().enumerate() {
+            assert_eq!(
+                result.code, -39000,
+                "case {index}, parallel={parallel}: {result:?}"
+            );
+        }
+        assert_eq!(response.results[failed_count].code, 0);
+        assert_eq!(
+            response.results[failed_count].result.as_ref(),
+            U256::from(22_207_817).abi_encode()
+        );
+        assert_eq!(response.results[failed_count + 1].code, 0);
+        assert_eq!(
+            response.results[failed_count + 1].result.as_ref(),
+            &[0u8; 32]
+        );
+    }
+
+    // A high historical L1 price must not consume the default compute cap.
+    // Explicit gas stays limited, and its failure is isolated within multicall.
+    let pricing_override = StateOverridesBuilder::default()
+        .with_state_diff(
+            ARBOS_STATE_ADDRESS,
+            [
+                (
+                    H256::from(arbos_slot_at(keccak256([0]).as_slice(), 7)),
+                    H256::from(U256::from(100_000)),
+                ),
+                (
+                    H256::from(arbos_slot_at(l2_pricing_key.as_slice(), 3)),
+                    H256::from(U256::ONE),
+                ),
+            ],
+        )
+        .build();
+    let default_call = TransactionRequest::default().from(sender).to(target);
+    for parallel in [false, true] {
+        let response = DebankApiClient::contract_multi_call(
+            &client,
+            [
+                default_call.clone().gas_limit(100_000_000),
+                default_call.clone(),
+            ]
+            .into_iter()
+            .map(|inner| CallRequest { inner, tempo: None })
+            .collect(),
+            None,
+            None,
+            Some(pricing_override.clone()),
+            Some(false),
+            Some(parallel),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert!(!response.stats.success);
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].code, -39001);
+        assert_eq!(response.results[1].code, 0);
+        assert_eq!(response.results[1].result.as_ref(), &[0u8; 32]);
+    }
 
     handle.stop().unwrap();
 

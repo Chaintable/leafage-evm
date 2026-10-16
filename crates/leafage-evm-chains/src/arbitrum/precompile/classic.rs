@@ -52,15 +52,8 @@ pub(super) fn run<DB: Database + DatabaseRef>(
         return Err(unsupported());
     }
     let data = calldata(ctx, inputs);
-    let builtin_upgrades = builtin_upgrades.or_else(|| {
-        (ctx.cfg().chain_id == 42161).then_some(ClassicBuiltinUpgrades {
-            // Each boundary was checked against adjacent native archive calls.
-            arbos_34_block: 156_077,
-            arbos_39_block: 226_011,
-            arbos_42_block: 662_405,
-            arbos_54_block: 6_835_288,
-        })
-    });
+    let builtin_upgrades =
+        builtin_upgrades.or_else(|| ClassicBuiltinUpgrades::for_chain_id(ctx.cfg().chain_id));
     if builtin_upgrades.is_some_and(|u| {
         [
             u.arbos_34_block,
