@@ -17,7 +17,9 @@ use leafage_evm_types::{
 };
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
+    error::{KafkaError, KafkaResult},
     message::BorrowedMessage,
+    types::RDKafkaErrorCode,
     util::Timeout,
     ClientConfig, Message, Offset, TopicPartitionList,
 };
@@ -35,6 +37,71 @@ struct BlockContextWithOffset {
     block_diff: BlockStorageDiff,
     block_info: BlockInfo,
     offset: i64,
+}
+
+/// Builds the librdkafka configuration for the updater consumer.
+fn consumer_config(kafka_s3_cfg: &KafkaS3Config) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", &kafka_s3_cfg.brokers)
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.auto.commit", "false")
+        // Never let librdkafka silently jump to the latest offset when the
+        // fetch position has been expired by retention: that skips blocks and
+        // leaves the tree with an unfillable parent-hash gap. Surface it as
+        // `ERR__AUTO_OFFSET_RESET` instead; the loop then exits and the
+        // restart catches up from S3 via `init_offset`.
+        .set("auto.offset.reset", "error")
+        .set(
+            "group.id",
+            format!("leafage-evm-group-{}", kafka_s3_cfg.s3_chain_id),
+        );
+    config
+}
+
+/// What the caller must do after draining a chunk of the consumer stream,
+/// in addition to applying the returned messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ChunkSignal {
+    /// Nothing beyond applying the messages.
+    None,
+    /// librdkafka reported the fetch offset is out of range (expired by
+    /// retention) and has paused the partition. Continuing would skip blocks,
+    /// so the process must restart and let `init_offset` catch up from S3.
+    ResetOffset,
+    /// librdkafka raised a fatal error; the client is unusable from now on.
+    Fatal,
+}
+
+/// Splits one `ready_chunks` batch into the messages to apply and the signal
+/// derived from any error items librdkafka interleaved with them.
+///
+/// Error items are interleaved with messages in the same queue, so a broker
+/// restart typically yields `[Err(transport), Ok(..), Ok(..)]`. Transport and
+/// similar transient errors are only logged: librdkafka retries the fetch from
+/// the same position, so the messages after the error are still contiguous and
+/// must be applied, never dropped.
+fn split_chunk<M>(chunk: Vec<KafkaResult<M>>) -> (Vec<M>, ChunkSignal) {
+    let mut msgs = vec![];
+    let mut signal = ChunkSignal::None;
+    for message in chunk {
+        match message {
+            Ok(message) => msgs.push(message),
+            Err(err) => {
+                error!(target:"updater", "Failed to receive message: {:?}", err);
+                let err_signal = match err {
+                    KafkaError::MessageConsumptionFatal(_) => ChunkSignal::Fatal,
+                    KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::AutoOffsetReset | RDKafkaErrorCode::OffsetOutOfRange,
+                    ) => ChunkSignal::ResetOffset,
+                    _ => ChunkSignal::None,
+                };
+                signal = signal.max(err_signal);
+            }
+        }
+    }
+    (msgs, signal)
 }
 
 /// [`Updater`] is used to update the snapshot tree to the latest block
@@ -87,16 +154,7 @@ where
             let client = HttpClientBuilder::default().build(rpc_url.as_ref())?;
             rpc_client = Some(client);
         }
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &kafka_s3_cfg.brokers)
-            .set("enable.partition.eof", "false")
-            .set("session.timeout.ms", "6000")
-            .set("enable.auto.commit", "false")
-            .set(
-                "group.id",
-                format!("leafage-evm-group-{}", kafka_s3_cfg.s3_chain_id),
-            )
-            .create()?;
+        let consumer: StreamConsumer = consumer_config(&kafka_s3_cfg).create()?;
 
         let s3_config = aws_config::from_env()
             .timeout_config(
@@ -691,13 +749,17 @@ where
                     }
                     messages = chunk.next() => {
                         let messages = messages.expect("kafka stream next failed");
-                        let mut msgs = vec![];
-                        for message in messages {
-                           if message.is_err() {
-                                error!(target:"updater", "Failed to receive message: {:?}", message.err());
-                                break;
+                        let (msgs, signal) = split_chunk(messages);
+                        match signal {
+                            ChunkSignal::Fatal => {
+                                error!(target:"updater", "fatal kafka consumer error, exiting");
+                                std::process::exit(1);
                             }
-                            msgs.push(message.unwrap());
+                            ChunkSignal::ResetOffset => {
+                                error!(target:"updater", "kafka fetch offset is out of range (expired by retention); exiting so the restart catches up from s3");
+                                std::process::exit(1);
+                            }
+                            ChunkSignal::None => {}
                         }
                         if msgs.is_empty() {
                             continue
@@ -875,5 +937,80 @@ mod tests {
             .iter()
             .all(|(key, _)| !key.contains(&H256::ZERO.to_string())));
         server.abort();
+    }
+
+    fn owned_message(offset: i64) -> OwnedMessage {
+        OwnedMessage::new(
+            None,
+            None,
+            "test".into(),
+            Timestamp::NotAvailable,
+            0,
+            offset,
+            None,
+        )
+    }
+
+    fn offsets(msgs: &[OwnedMessage]) -> Vec<i64> {
+        msgs.iter().map(|m| m.offset()).collect()
+    }
+
+    #[test]
+    fn split_chunk_keeps_messages_after_transport_error() {
+        // A broker restart interleaves a transport error with the backlog that
+        // arrives once the connection is re-established.
+        let chunk = vec![
+            Err(KafkaError::MessageConsumption(
+                RDKafkaErrorCode::BrokerTransportFailure,
+            )),
+            Ok(owned_message(1001)),
+            Ok(owned_message(1002)),
+        ];
+        let (msgs, signal) = split_chunk(chunk);
+        assert_eq!(offsets(&msgs), vec![1001, 1002]);
+        assert_eq!(signal, ChunkSignal::None);
+
+        let chunk = vec![
+            Ok(owned_message(1001)),
+            Err(KafkaError::MessageConsumption(
+                RDKafkaErrorCode::BrokerTransportFailure,
+            )),
+            Ok(owned_message(1002)),
+        ];
+        let (msgs, signal) = split_chunk(chunk);
+        assert_eq!(offsets(&msgs), vec![1001, 1002]);
+        assert_eq!(signal, ChunkSignal::None);
+    }
+
+    #[test]
+    fn split_chunk_signals_offset_reset_and_fatal_errors() {
+        let chunk = vec![
+            Ok(owned_message(1001)),
+            Err(KafkaError::MessageConsumption(
+                RDKafkaErrorCode::AutoOffsetReset,
+            )),
+        ];
+        let (msgs, signal) = split_chunk(chunk);
+        assert_eq!(offsets(&msgs), vec![1001]);
+        assert_eq!(signal, ChunkSignal::ResetOffset);
+
+        let chunk: Vec<KafkaResult<OwnedMessage>> = vec![Err(KafkaError::MessageConsumptionFatal(
+            RDKafkaErrorCode::Fatal,
+        ))];
+        let (msgs, signal) = split_chunk(chunk);
+        assert!(msgs.is_empty());
+        assert_eq!(signal, ChunkSignal::Fatal);
+    }
+
+    #[test]
+    fn consumer_config_refuses_silent_offset_reset() {
+        let config = consumer_config(&KafkaS3Config {
+            brokers: "localhost:9092".into(),
+            s3_chain_id: "1".into(),
+            ..Default::default()
+        });
+        assert_eq!(config.get("auto.offset.reset"), Some("error"));
+        assert_eq!(config.get("enable.partition.eof"), Some("false"));
+        assert_eq!(config.get("group.id"), Some("leafage-evm-group-1"));
     }
 }
