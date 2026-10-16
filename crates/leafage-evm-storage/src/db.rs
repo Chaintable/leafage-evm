@@ -38,33 +38,6 @@ pub trait StateDBRead {
     /// account address | storage index -> storage value
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, StorageError>;
 
-    /// [`StateDBRead::read_storage`] plus the block that wrote the value, for
-    /// backends that keep versions (archive); `None` when unknown.
-    fn read_storage_and_height(
-        &self,
-        address: H256,
-        key: H256,
-    ) -> Result<(U256, Option<u64>), StorageError> {
-        Ok((self.read_storage(address, key)?, None))
-    }
-
-    /// The account as of an earlier block `block_num`, for backends that keep
-    /// versions (archive); the outer `None` means unsupported.
-    fn read_account_at(
-        &self,
-        _address: H256,
-        _block_num: u64,
-    ) -> Result<Option<Option<NewAccount>>, StorageError> {
-        Ok(None)
-    }
-
-    /// The slots of `address` holding a non-zero value, for backends that
-    /// keep an account's storage after deleting it (archive), so that the
-    /// deletion can zero them; `None` means the backend needs no such help.
-    fn read_storage_slots(&self, _address: H256) -> Result<Option<Vec<H256>>, StorageError> {
-        Ok(None)
-    }
-
     /// Batched [`StateDBRead::read_account`]: one result per input, same
     /// order. The scalar default keeps archive/MDBX/mock backends correct;
     /// exact-key backends (non-archive RocksDB) override it with MultiGet.
@@ -172,6 +145,17 @@ pub trait StateDBWrite: Send + Sync + 'static {
         value: U256,
     ) -> Result<(), StorageError>;
 
+    /// Clear the storage of `address`, deleted at `block_num`, for backends
+    /// that keep it otherwise (archive).
+    fn clear_storage(
+        &self,
+        _batch: &mut Self::DBWriteBatch,
+        _address: H256,
+        _block_num: u64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// commit write batch
     fn commit(&self, batch: Self::DBWriteBatch) -> Result<(), StorageError>;
 }
@@ -227,25 +211,6 @@ where
     /// Get storage value of address at index.
     fn storage(&self, address: H256, index: H256) -> Result<U256, Self::Error> {
         self.0.read_storage(address.into(), index)
-    }
-
-    fn storage_and_height(
-        &self,
-        address: H256,
-        index: H256,
-    ) -> Result<(U256, Option<u64>), Self::Error> {
-        self.0.read_storage_and_height(address, index)
-    }
-
-    fn basic_at(
-        &self,
-        address: H256,
-        block_num: u64,
-    ) -> Result<Option<Option<AccountInfo>>, Self::Error> {
-        Ok(self
-            .0
-            .read_account_at(address, block_num)?
-            .map(|account| account.map(Into::into)))
     }
 
     // History related
@@ -320,12 +285,9 @@ where
                 "commit delete account: block {}, address {}", block_number, account);
             self.0
                 .write_account(&mut batch, account, block_number, None)?;
-            // The diff lists no storage for a deleted account; zero what it
+            // The diff lists no storage for a deleted account; clear what it
             // held, before this block's own writes so that those win.
-            for slot in self.0.read_storage_slots(account)?.unwrap_or_default() {
-                self.0
-                    .write_storage(&mut batch, account, slot, block_number, U256::ZERO)?;
-            }
+            self.0.clear_storage(&mut batch, account, block_number)?;
         }
         for account in block_diff.new_accounts {
             trace!(target: "state_diff",

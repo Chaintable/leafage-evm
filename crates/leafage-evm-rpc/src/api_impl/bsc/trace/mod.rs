@@ -8,7 +8,6 @@
 
 mod chain;
 mod patches;
-mod recreated;
 mod replay;
 
 #[cfg(test)]
@@ -23,13 +22,10 @@ pub(crate) use chain::BscPipeline;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::proc_macros::rpc;
-use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead};
 use leafage_evm_types::{BlockId, BlockNumberOrTag, DebankErrorCode};
-use recreated::{FilterStats, RecreatedStorageFilter};
 use replay::{replay_range, RangeBlock};
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tracing::{info, warn};
 
 #[rpc(server, namespace = "trace")]
@@ -177,32 +173,20 @@ where
             ),
             None => None,
         };
-        let (parent_stats, post_stats) = (Arc::<FilterStats>::default(), Arc::default());
-        let wrap = |db, height, stats: &Arc<FilterStats>| {
-            RecreatedStorageFilter::new(
-                EvmStorageWrapper {
-                    db,
-                    ovm_address: None,
-                    normalize_state_key: false,
-                },
-                height,
-                stats.clone(),
-            )
-        };
         let mut blocks = Vec::with_capacity(infos.len());
         let (mut parent_timestamp, mut parent_state_root) =
             (parent.header.timestamp, parent.header.state_root);
         for (post_state, block) in post_states.into_iter().zip(rpc_blocks) {
             let (timestamp, state_root) = (block.header.timestamp, block.header.state_root);
             blocks.push(RangeBlock {
-                post_state: wrap(post_state, block.header.number, &post_stats),
+                post_state: chain::bsc_state(post_state),
                 parent_timestamp,
                 parent_state_root,
                 block,
             });
             (parent_timestamp, parent_state_root) = (timestamp, state_root);
         }
-        let parent_state = wrap(parent_state, from - 1, &parent_stats);
+        let parent_state = chain::bsc_state(parent_state);
         let options = ReplayOptions {
             strict: true,
             check_state: self.check_state,
@@ -218,9 +202,6 @@ where
                     rpc_error_with_code(DebankErrorCode::EvmFailed as i32, format!("{err:#}"))
                 })?;
 
-        let load = |stats: &FilterStats, counter: fn(&FilterStats) -> &AtomicU64| {
-            counter(stats).load(Ordering::Relaxed)
-        };
         let sum = |part: fn(&crate::pipeline::chain::ReplayTimings) -> std::time::Duration| {
             outputs
                 .iter()
@@ -237,11 +218,6 @@ where
             execute_ms = sum(|t| t.execute).as_millis() as u64,
             verify_ms = sum(|t| t.verify).as_millis() as u64,
             diff_ms = sum(|t| t.diff).as_millis() as u64,
-            parent_slots = load(&parent_stats, |s| &s.slots),
-            parent_accounts_checked = load(&parent_stats, |s| &s.accounts),
-            parent_zeroed = load(&parent_stats, |s| &s.zeroed),
-            post_slots = load(&post_stats, |s| &s.slots),
-            post_accounts_checked = load(&post_stats, |s| &s.accounts),
             "trace_debankBlock"
         );
         Ok(outputs

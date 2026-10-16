@@ -1184,6 +1184,8 @@ mod tests {
 
     #[tokio::test]
     async fn arc_startup_reaches_runtime_initialization() {
+        // Startup sets the archive block encoding.
+        let _guard = crate::ARCHIVE_TEST_LOCK.lock().await;
         let mut command = parse_command(&[
             "--evm-type",
             "arc",

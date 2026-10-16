@@ -9,17 +9,28 @@
 //! zero version at `d` of each slot that was non-zero then, unless block `d`
 //! wrote the slot itself.
 //!
+//! A contract destroyed and created again within one block leaves no deletion
+//! at all, only a new account version. With `--bsc-mainnet` such a block also
+//! counts as a deletion before Cancun (EIP-6780), told by the code hash
+//! changing or the nonce going down, which nothing else does to a contract
+//! then; the system contracts, upgraded in place, aside.
+//!
 //! It runs in two steps. The scan opens the archive read-only, so it can run
 //! next to a process using it, and writes the slots to zero to `--plan`, one
 //! `address slot block recreated` line each (hashed keys, as stored;
-//! `recreated` when the account exists again after the deletion). `--apply`
+//! `recreated` when the account exists at or after the deletion). `--apply`
 //! then writes the plan into the archive, which it needs to itself.
 
-use alloy::primitives::{hex, U256};
+use alloy::primitives::{hex, keccak256, U256};
+use alloy_rlp::Decodable;
 use anyhow::{anyhow, bail, Context, Result};
+use leafage_evm_chains::bsc::mainnet::{
+    BSC_MAINNET_CANCUN_BLOCK, BSC_MAINNET_UPGRADABLE_CONTRACTS,
+};
 use leafage_evm_storage::rocksdb::{DBRawIteratorWithThreadMode, Options, ReadOptions, DB};
 use leafage_evm_storage::{ArchiveRocksDBStorage, StateDBProvider, StateDBRead, StateDBWrite};
-use leafage_evm_types::{BlockId, BlockNumberOrTag, H256};
+use leafage_evm_types::{BlockId, BlockNumberOrTag, SlimAccount, H256, KECCAK256_EMPTY};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -53,6 +64,11 @@ pub struct Command {
     #[arg(long, default_value = "false")]
     apply: bool,
 
+    /// The archive is BSC mainnet's: also plan the zeros for contracts
+    /// destroyed and created again within one block before Cancun.
+    #[arg(long, default_value = "false")]
+    bsc_mainnet: bool,
+
     /// Scan threads.
     #[arg(long, default_value_t = 16)]
     threads: usize,
@@ -82,6 +98,11 @@ impl Command {
     }
 
     fn scan(&self) -> Result<()> {
+        let recreations = self.bsc_mainnet.then(Recreations::bsc_mainnet);
+        self.scan_with(recreations.as_ref())
+    }
+
+    fn scan_with(&self, recreations: Option<&Recreations>) -> Result<()> {
         let mut opts = Options::default();
         opts.set_max_open_files(self.max_open_files);
         let db =
@@ -96,6 +117,7 @@ impl Command {
         let scanner = Scanner {
             db: &db,
             inverted: self.inverted_block_encoding,
+            recreations,
             plan: &plan,
             stats: &stats,
         };
@@ -178,6 +200,8 @@ struct Stats {
     shards: AtomicU64,
     account_versions: AtomicU64,
     deletions: AtomicU64,
+    /// Contracts destroyed and created again within one block.
+    recreations: AtomicU64,
     /// Deleted accounts with any storage.
     with_storage: AtomicU64,
     /// Deleted accounts with a slot to zero.
@@ -195,6 +219,7 @@ impl Stats {
             shards = format!("{}/256", get(&self.shards)),
             account_versions = get(&self.account_versions),
             deletions = get(&self.deletions),
+            recreations = get(&self.recreations),
             deleted_with_storage = get(&self.with_storage),
             accounts_to_clear = get(&self.to_clear),
             recreated = get(&self.recreated),
@@ -205,9 +230,59 @@ impl Stats {
     }
 }
 
+/// Tells a contract destroyed and created again within one block, which
+/// leaves no deletion, from two consecutive versions of the account.
+struct Recreations {
+    /// From this block on contracts are not destroyed (EIP-6780).
+    before: u64,
+    /// Hashed addresses of the contracts whose code changes in place.
+    upgradable: HashSet<[u8; 32]>,
+}
+
+impl Recreations {
+    fn bsc_mainnet() -> Self {
+        Self {
+            before: BSC_MAINNET_CANCUN_BLOCK,
+            upgradable: BSC_MAINNET_UPGRADABLE_CONTRACTS
+                .iter()
+                .map(|address| keccak256(address).0)
+                .collect(),
+        }
+    }
+
+    /// Whether `address` went from `older` to `newer` (block, code hash and
+    /// nonce) by being destroyed and created again in `newer`'s block.
+    fn between(&self, address: &[u8; 32], older: Live, newer: (u64, Live)) -> bool {
+        let (Some((code_before, nonce_before)), (block, Some((code, nonce)))) = (older, newer)
+        else {
+            return false;
+        };
+        block < self.before
+            && !self.upgradable.contains(address)
+            && (code != code_before || nonce < nonce_before)
+    }
+}
+
+/// The code hash and nonce of an account version; `None` if deleted.
+type Live = Option<(H256, u64)>;
+
+fn decode_live(value: &[u8]) -> Result<Live> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let account = SlimAccount::decode(&mut &value[..]).map_err(|e| anyhow!("account: {e}"))?;
+    let code_hash = if account.code_hash.is_zero() {
+        KECCAK256_EMPTY.0.into()
+    } else {
+        account.code_hash
+    };
+    Ok(Some((code_hash, account.nonce)))
+}
+
 struct Scanner<'a> {
     db: &'a DB,
     inverted: bool,
+    recreations: Option<&'a Recreations>,
     plan: &'a Mutex<BufWriter<File>>,
     stats: &'a Stats,
 }
@@ -274,12 +349,28 @@ impl Scanner<'_> {
             let account = current.get_or_insert_with(|| Account {
                 address,
                 deletions: Vec::new(),
+                recreations: Vec::new(),
                 last_live: None,
+                previous: None,
             });
             if deleted {
                 account.deletions.push(block);
             } else {
                 account.last_live = account.last_live.max(Some(block));
+            }
+            if let Some(recreations) = self.recreations {
+                let live = decode_live(accounts.value().unwrap_or_default())?;
+                if let Some(seen) = account.previous.replace((block, live)) {
+                    // Versions come oldest first, or newest first if inverted.
+                    let (older, newer) = if self.inverted {
+                        (live, seen)
+                    } else {
+                        (seen.1, (block, live))
+                    };
+                    if recreations.between(&address, older, newer) {
+                        account.recreations.push(newer.0);
+                    }
+                }
             }
             versions += 1;
             if versions.is_multiple_of(1_000_000) {
@@ -305,12 +396,21 @@ impl Scanner<'_> {
         storage: &mut DBRawIteratorWithThreadMode<'_, DB>,
         account: Account,
     ) -> Result<()> {
-        if account.deletions.is_empty() {
-            return Ok(());
-        }
         self.stats
             .deletions
             .fetch_add(account.deletions.len() as u64, Ordering::Relaxed);
+        self.stats
+            .recreations
+            .fetch_add(account.recreations.len() as u64, Ordering::Relaxed);
+        let deletions: Vec<u64> = account
+            .deletions
+            .iter()
+            .chain(&account.recreations)
+            .copied()
+            .collect();
+        if deletions.is_empty() {
+            return Ok(());
+        }
         let mut lines = Vec::new();
         let mut recreated = false;
         let mut any_storage = false;
@@ -327,7 +427,7 @@ impl Scanner<'_> {
                 _ => break,
             };
             any_storage = true;
-            for &deleted in &account.deletions {
+            for &deleted in &deletions {
                 // The slot's value as of the deletion block.
                 key[32..64].copy_from_slice(&slot);
                 key[64..].copy_from_slice(&self.encode_version(deleted));
@@ -348,7 +448,7 @@ impl Scanner<'_> {
                     .value()
                     .is_some_and(|value| value.iter().any(|b| *b != 0))
                 {
-                    let again = account.last_live.is_some_and(|live| live > deleted);
+                    let again = account.last_live.is_some_and(|live| live >= deleted);
                     recreated |= again;
                     lines.push(format!(
                         "0x{} 0x{} {deleted} {again}\n",
@@ -384,8 +484,12 @@ impl Scanner<'_> {
 struct Account {
     address: [u8; 32],
     deletions: Vec<u64>,
+    /// Blocks that destroyed and created it again, see [`Recreations`].
+    recreations: Vec<u64>,
     /// The newest block the account exists at.
     last_live: Option<u64>,
+    /// The version scanned last, with [`Recreations`].
+    previous: Option<(u64, Live)>,
 }
 
 fn read_plan(path: &PathBuf) -> Result<Vec<(H256, H256, u64)>> {
@@ -451,8 +555,21 @@ mod tests {
         }
     }
 
+    /// A contract with code `code`.
+    fn contract(address: H256, code: u8, nonce: u64) -> NewAccount {
+        NewAccount {
+            address,
+            balance: U256::ZERO,
+            nonce,
+            code_hash: H256::repeat_byte(code),
+        }
+    }
+
     /// An archive written before deletions zeroed storage: the scan plans the
     /// slots, the apply zeroes them, and the deleting block's own writes stand.
+    /// `meta` is destroyed and created again within blocks 2 (other code) and
+    /// 4 (lower nonce), leaving no deletion; `system` is upgraded in place at
+    /// 2, and `meta` changes code again at 5, past the rules' Cancun.
     fn run(inverted: bool) {
         leafage_evm_storage::set_inverted_block_encoding(inverted);
         let dir = std::env::temp_dir().join(format!(
@@ -463,7 +580,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("db");
         let (addr, next) = (H256::repeat_byte(0xab), H256::repeat_byte(0xac));
+        let (meta, system) = (H256::repeat_byte(0xcd), H256::repeat_byte(0xee));
         let (a, b) = (H256::repeat_byte(0x01), H256::repeat_byte(0x02));
+        let with = |mut block: BlockStorageDiff,
+                    accounts: &[NewAccount],
+                    slots: &[(H256, &[(H256, u64)])]| {
+            block.new_accounts.extend_from_slice(accounts);
+            for (address, slots) in slots {
+                block
+                    .storage_diffs
+                    .extend(diff(*address, slots, false).storage_diffs);
+            }
+            block
+        };
         {
             let db = Arc::new(ArchiveRocksDBStorage::open(&db_path, 64, false, false));
             let commit = |n: u64, diff: BlockStorageDiff, delete: bool| {
@@ -481,14 +610,31 @@ mod tests {
                     db.commit(batch).unwrap();
                 }
             };
-            let mut first = diff(addr, &[(a, 7), (b, 9)], true);
-            first
-                .storage_diffs
-                .extend(diff(next, &[(b, 1)], false).storage_diffs);
+            let first = with(
+                diff(addr, &[(a, 7), (b, 9)], true),
+                &[contract(meta, 1, 1), contract(system, 1, 1)],
+                &[
+                    (next, &[(b, 1)]),
+                    (meta, &[(a, 3), (b, 4)]),
+                    (system, &[(a, 1)]),
+                ],
+            );
             commit(1, first, false);
-            commit(2, BlockStorageDiff::default(), true);
-            commit(3, diff(addr, &[(b, 5)], true), false);
-            commit(4, diff(addr, &[(a, 11)], false), true);
+            let second = with(
+                BlockStorageDiff::default(),
+                &[contract(meta, 2, 1), contract(system, 2, 1)],
+                &[(meta, &[(b, 8)])],
+            );
+            commit(2, second, true);
+            let third = with(diff(addr, &[(b, 5)], true), &[contract(meta, 2, 2)], &[]);
+            commit(3, third, false);
+            let fourth = with(diff(addr, &[(a, 11)], false), &[contract(meta, 2, 1)], &[]);
+            commit(4, fourth, true);
+            commit(
+                5,
+                with(Default::default(), &[contract(meta, 3, 1)], &[]),
+                false,
+            );
         }
         let mut command = Command {
             db_path: db_path.clone(),
@@ -499,20 +645,32 @@ mod tests {
             max_open_files: 64,
             cache_size: 64,
             archive_zstd_compression: false,
+            bsc_mainnet: false,
         };
-        command.scan().unwrap();
+        let recreations = Recreations {
+            before: 5,
+            upgradable: HashSet::from([system.0]),
+        };
+        command.scan_with(Some(&recreations)).unwrap();
         let mut plan = read_plan(&command.plan).unwrap();
         plan.sort();
         assert_eq!(
             plan,
-            [(addr, a, 2), (addr, b, 2), (addr, b, 4)],
+            [
+                (addr, a, 2),
+                (addr, b, 2),
+                (addr, b, 4),
+                (meta, a, 2),
+                (meta, a, 4),
+                (meta, b, 4),
+            ],
             "inverted={inverted}"
         );
         let lines = std::fs::read_to_string(&command.plan).unwrap();
         assert_eq!(
             lines.matches(" true\n").count(),
-            2,
-            "recreated after 2 only"
+            5,
+            "all but addr's deletion at 4"
         );
 
         command.apply = true;
@@ -531,13 +689,18 @@ mod tests {
         assert_eq!([read(3, addr, a), read(3, addr, b)], [0, 5]);
         assert_eq!([read(4, addr, a), read(4, addr, b)], [11, 0]);
         assert_eq!(read(4, next, b), 1);
+        assert_eq!([read(1, meta, a), read(1, meta, b)], [3, 4]);
+        assert_eq!([read(2, meta, a), read(2, meta, b)], [0, 8]);
+        assert_eq!([read(3, meta, a), read(3, meta, b)], [0, 8]);
+        assert_eq!([read(4, meta, a), read(4, meta, b)], [0, 0]);
+        assert_eq!(read(2, system, a), 1);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn clears_deleted_storage() {
-        // One test: the archive backend keeps its DB in a process global.
+        let _guard = crate::ARCHIVE_TEST_LOCK.blocking_lock();
         run(true);
         run(false);
         leafage_evm_storage::set_inverted_block_encoding(false);

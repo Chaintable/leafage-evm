@@ -40,6 +40,7 @@ use alloy_evm::{EvmEnv, FromRecoveredTx};
 use anyhow::{anyhow, bail, Context as _, Result};
 use leafage_evm_chains::bsc::mainnet::{
     bsc_mainnet_fork_transition, bsc_mainnet_spec_at, BscMainnetHardforks, BSC_MAINNET_CHAIN_ID,
+    BSC_MAINNET_UPGRADABLE_CONTRACTS,
 };
 use leafage_evm_chains::bsc::{BscEvm, BscHardfork, BscHardforks, BscTxEnv};
 use leafage_evm_types::{
@@ -74,28 +75,6 @@ const SYSTEM_TX_CONTRACTS: [Address; 14] = [
     address!("0000000000000000000000000000000000001005"),
     address!("0000000000000000000000000000000000002000"),
     address!("0000000000000000000000000000000000002002"),
-    address!("0000000000000000000000000000000000002004"),
-    address!("0000000000000000000000000000000000002005"),
-    address!("0000000000000000000000000000000000002006"),
-    address!("0000000000000000000000000000000000003000"),
-];
-
-/// Every contract a go-bsc hardfork upgrade may replace
-/// (`systemcontracts.TryUpdateBuildInSystemContract`).
-pub(crate) const UPGRADABLE_CONTRACTS: [Address; 17] = [
-    address!("0000000000000000000000000000000000001000"),
-    address!("0000000000000000000000000000000000001001"),
-    address!("0000000000000000000000000000000000001002"),
-    address!("0000000000000000000000000000000000001003"),
-    address!("0000000000000000000000000000000000001004"),
-    address!("0000000000000000000000000000000000001005"),
-    address!("0000000000000000000000000000000000001006"),
-    address!("0000000000000000000000000000000000001007"),
-    address!("0000000000000000000000000000000000001008"),
-    address!("0000000000000000000000000000000000002000"),
-    address!("0000000000000000000000000000000000002001"),
-    address!("0000000000000000000000000000000000002002"),
-    address!("0000000000000000000000000000000000002003"),
     address!("0000000000000000000000000000000000002004"),
     address!("0000000000000000000000000000000000002005"),
     address!("0000000000000000000000000000000000002006"),
@@ -420,7 +399,7 @@ where
     D::Error: Send + Sync + 'static,
 {
     let mut changed = Vec::new();
-    for address in UPGRADABLE_CONTRACTS {
+    for address in BSC_MAINNET_UPGRADABLE_CONTRACTS {
         let before = parent.basic_ref(address)?.map(|info| info.code_hash);
         let Some(after) = post.basic_ref(address)? else {
             continue;

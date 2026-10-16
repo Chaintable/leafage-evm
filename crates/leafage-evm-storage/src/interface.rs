@@ -21,26 +21,6 @@ pub trait StateDB {
     // History related
     fn block_hash(&self, number: u64) -> Result<H256, Self::Error>;
 
-    /// [`StateDB::storage`] plus the block that wrote the value, where the
-    /// backend keeps versions (archive); `None` when unknown.
-    fn storage_and_height(
-        &self,
-        address: H256,
-        index: H256,
-    ) -> Result<(U256, Option<u64>), Self::Error> {
-        Ok((self.storage(address, index)?, None))
-    }
-
-    /// The account as of an earlier block, where the backend keeps versions
-    /// (archive); the outer `None` means unsupported.
-    fn basic_at(
-        &self,
-        _address: H256,
-        _block_num: u64,
-    ) -> Result<Option<Option<AccountInfo>>, Self::Error> {
-        Ok(None)
-    }
-
     /// Batched [`StateDB::basic`]: one result per input, same order.
     /// The scalar default keeps every implementation correct; backends
     /// that can serve point reads in one storage round trip override it.
@@ -176,31 +156,6 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
 }
 
 impl<T: StateDB> EvmStorageWrapper<T> {
-    /// [`DatabaseRef::storage_ref`] plus the block that wrote the value,
-    /// when the backend keeps versions.
-    pub fn storage_and_height_ref(
-        &self,
-        address: Address,
-        index: U256,
-    ) -> Result<(U256, Option<u64>), T::Error> {
-        let address = keccak256(address.as_slice());
-        let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
-            to_normalize_state_key(index)
-        } else {
-            index.to_be_bytes()
-        });
-        self.db.storage_and_height(address, index)
-    }
-
-    /// The account as of an earlier block, when the backend keeps versions.
-    pub fn basic_at_ref(
-        &self,
-        address: Address,
-        block_num: u64,
-    ) -> Result<Option<Option<AccountInfo>>, T::Error> {
-        self.db.basic_at(keccak256(address.as_slice()), block_num)
-    }
-
     /// Batched [`DatabaseRef::basic_ref`]: one result per input, same
     /// order. On OVM-configured chains every account read needs an extra
     /// balance-slot read whose key derivation bypasses

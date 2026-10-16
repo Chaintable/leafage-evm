@@ -20,6 +20,11 @@ mod warm;
 
 use clap::Parser;
 use runner::Cli;
+
+/// Held by tests that open an archive: the archive backend keeps its DB and
+/// block encoding in process globals.
+#[cfg(test)]
+static ARCHIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use tikv_jemallocator;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};

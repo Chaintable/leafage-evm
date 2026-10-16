@@ -2347,15 +2347,96 @@ impl StateDB {
 }
 
 impl StateDB {
-    /// The greatest account version `<= block_num`.
-    fn read_account_version(
+    /// [`StateDBRead::read_storage`] plus the block that wrote the value;
+    /// `None` if no block did.
+    pub fn read_storage_and_height(
         &self,
         address: H256,
-        block_num: u64,
-    ) -> Result<Option<NewAccount>, Error> {
+        key: H256,
+    ) -> Result<(U256, Option<u64>), Error> {
         let start = std::time::Instant::now();
         let address_bytes: [u8; 32] = address.into();
-        let target_key = encode_account_key(address, block_num);
+        let key_bytes: [u8; 32] = key.into();
+        let target_key = encode_storage_key(address, key, self.block_num);
+
+        // Check timeout before using iterator
+        self.check_timeout()?;
+        let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
+        let storage_iter = storage_iter_guard
+            .as_mut()
+            .ok_or(Error::IteratorTimedOut(self.block_num))?;
+        // Inverted -> forward seek; legacy ascending -> seek_for_prev. See read_account.
+        if inverted_block_encoding() {
+            storage_iter.seek(target_key);
+        } else {
+            storage_iter.seek_for_prev(target_key);
+        }
+        STORAGE_METRICS
+            .read_storage_latency
+            .record(start.elapsed().as_secs_f64());
+        if let Some(raw_key_bytes) = storage_iter.key() {
+            if address_bytes != raw_key_bytes[..32] {
+                return Ok((U256::ZERO, None));
+            }
+            if key_bytes != raw_key_bytes[32..64] {
+                return Ok((U256::ZERO, None));
+            }
+            let version = decode_version_tail(&raw_key_bytes[64..96]);
+            let raw_val_bytes = storage_iter.value().unwrap();
+            if raw_val_bytes.is_empty() {
+                return Ok((U256::ZERO, Some(version)));
+            }
+            let value = U256::from_be_slice(&raw_val_bytes);
+            Ok((value, Some(version)))
+        } else {
+            Ok((U256::ZERO, None))
+        }
+    }
+
+    /// The slots of `address` holding a non-zero value.
+    fn storage_slots(&self, address: H256) -> Result<Vec<H256>, Error> {
+        let address_bytes: [u8; 32] = address.into();
+        // Seeking to slots that may not exist: past the prefix bloom.
+        let address_to_storage_cf = self
+            .db
+            .db
+            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+            .unwrap();
+        let mut read_options = rocksdb_read_options();
+        read_options.set_total_order_seek(true);
+        let mut slot_iter = self
+            .db
+            .db
+            .raw_iterator_cf_opt(address_to_storage_cf, read_options);
+        let mut slots = Vec::new();
+        let mut from = Some(U256::ZERO);
+        while let Some(start) = from {
+            // The newest version of the first slot at or after `start`: an
+            // all-zero version tail sorts first under both encodings.
+            let mut key = [0u8; STORAGE_KEY_LEN];
+            key[..32].copy_from_slice(&address_bytes);
+            key[32..64].copy_from_slice(&start.to_be_bytes::<32>());
+            slot_iter.seek(key);
+            let slot = match slot_iter.key() {
+                Some(raw_key_bytes) if raw_key_bytes[..32] == address_bytes => {
+                    H256::from_slice(&raw_key_bytes[32..64])
+                }
+                _ => break,
+            };
+            if !self.read_storage(address, slot)?.is_zero() {
+                slots.push(slot);
+            }
+            from = U256::from_be_bytes(slot.0).checked_add(U256::from(1));
+        }
+        Ok(slots)
+    }
+}
+
+impl StateDBRead for StateDB {
+    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
+        let start = std::time::Instant::now();
+        let address_bytes: [u8; 32] = address.into();
+        let target_key = encode_account_key(address, self.block_num);
 
         // Check timeout before using iterator
         self.check_timeout()?;
@@ -2398,104 +2479,9 @@ impl StateDB {
             Ok(None)
         }
     }
-}
-
-impl StateDBRead for StateDB {
-    fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
-        self.read_account_version(address, self.block_num)
-    }
-
-    fn read_account_at(
-        &self,
-        address: H256,
-        block_num: u64,
-    ) -> Result<Option<Option<NewAccount>>, Error> {
-        Ok(Some(self.read_account_version(address, block_num.min(self.block_num))?))
-    }
-
-    fn read_storage_slots(&self, address: H256) -> Result<Option<Vec<H256>>, Error> {
-        let address_bytes: [u8; 32] = address.into();
-        // Seeking to slots that may not exist: past the prefix bloom.
-        let address_to_storage_cf = self
-            .db
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-        let mut read_options = rocksdb_read_options();
-        read_options.set_total_order_seek(true);
-        let mut slot_iter = self
-            .db
-            .db
-            .raw_iterator_cf_opt(address_to_storage_cf, read_options);
-        let mut slots = Vec::new();
-        let mut from = Some(U256::ZERO);
-        while let Some(start) = from {
-            // The newest version of the first slot at or after `start`: an
-            // all-zero version tail sorts first under both encodings.
-            let mut key = [0u8; STORAGE_KEY_LEN];
-            key[..32].copy_from_slice(&address_bytes);
-            key[32..64].copy_from_slice(&start.to_be_bytes::<32>());
-            slot_iter.seek(key);
-            let slot = match slot_iter.key() {
-                Some(raw_key_bytes) if raw_key_bytes[..32] == address_bytes => {
-                    H256::from_slice(&raw_key_bytes[32..64])
-                }
-                _ => break,
-            };
-            if !self.read_storage(address, slot)?.is_zero() {
-                slots.push(slot);
-            }
-            from = U256::from_be_bytes(slot.0).checked_add(U256::from(1));
-        }
-        Ok(Some(slots))
-    }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
         Ok(self.read_storage_and_height(address, key)?.0)
-    }
-
-    fn read_storage_and_height(
-        &self,
-        address: H256,
-        key: H256,
-    ) -> Result<(U256, Option<u64>), Error> {
-        let start = std::time::Instant::now();
-        let address_bytes: [u8; 32] = address.into();
-        let key_bytes: [u8; 32] = key.into();
-        let target_key = encode_storage_key(address, key, self.block_num);
-
-        // Check timeout before using iterator
-        self.check_timeout()?;
-        let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
-        let storage_iter = storage_iter_guard
-            .as_mut()
-            .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        // Inverted -> forward seek; legacy ascending -> seek_for_prev. See read_account.
-        if inverted_block_encoding() {
-            storage_iter.seek(target_key);
-        } else {
-            storage_iter.seek_for_prev(target_key);
-        }
-        STORAGE_METRICS
-            .read_storage_latency
-            .record(start.elapsed().as_secs_f64());
-        if let Some(raw_key_bytes) = storage_iter.key() {
-            if address_bytes != raw_key_bytes[..32] {
-                return Ok((U256::ZERO, None));
-            }
-            if key_bytes != raw_key_bytes[32..64] {
-                return Ok((U256::ZERO, None));
-            }
-            let version = decode_version_tail(&raw_key_bytes[64..96]);
-            let raw_val_bytes = storage_iter.value().unwrap();
-            if raw_val_bytes.is_empty() {
-                return Ok((U256::ZERO, Some(version)));
-            }
-            let value = U256::from_be_slice(&raw_val_bytes);
-            Ok((value, Some(version)))
-        } else {
-            Ok((U256::ZERO, None))
-        }
     }
 
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
@@ -2571,6 +2557,21 @@ impl StateDBWrite for StateDB {
         value: U256,
     ) -> Result<(), Error> {
         self.db.write_storage(batch, address, key, block_num, value)
+    }
+
+    /// The archive keeps every version of a slot, so the storage an account
+    /// held stays readable past its deletion unless zeroed here.
+    fn clear_storage(
+        &self,
+        batch: &mut Self::DBWriteBatch,
+        address: H256,
+        block_num: u64,
+    ) -> Result<(), Error> {
+        for slot in self.storage_slots(address)? {
+            self.db
+                .write_storage(batch, address, slot, block_num, U256::ZERO)?;
+        }
+        Ok(())
     }
 
     fn write_code(
@@ -3426,13 +3427,12 @@ mod inverted_encoding_tests {
                     .unwrap()
                     .unwrap()
             };
-            let values = |n: u64| {
-                [a, b, c].map(|slot| at(n).read_storage(addr, slot).unwrap().to::<u64>())
-            };
+            let values =
+                |n: u64| [a, b, c].map(|slot| at(n).read_storage(addr, slot).unwrap().to::<u64>());
             assert_eq!(values(2), [7, 0, 0], "inverted={inverted}");
-            assert_eq!(at(2).read_storage_slots(addr).unwrap(), Some(vec![a]));
+            assert_eq!(at(2).storage_slots(addr).unwrap(), vec![a]);
             assert_eq!(values(3), [0, 0, 0], "inverted={inverted}");
-            assert_eq!(at(3).read_storage_slots(addr).unwrap(), Some(vec![]));
+            assert!(at(3).storage_slots(addr).unwrap().is_empty());
             assert_eq!(values(4), [0, 5, 0], "inverted={inverted}");
             assert_eq!(values(5), [11, 0, 0], "inverted={inverted}");
             assert_eq!(at(5).read_storage(next, b).unwrap(), U256::from(1));
@@ -3455,7 +3455,6 @@ mod inverted_encoding_tests {
     fn test_delete_clears_storage_legacy() {
         run_delete_clears_storage(false);
     }
-
 
     /// Tip state of a small archive, scanned with the latest-state iterators.
     /// Under inverted encoding those seek from an address's newest record
