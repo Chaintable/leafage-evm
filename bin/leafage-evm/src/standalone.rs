@@ -319,11 +319,12 @@ pub struct Command {
     /// caught up.
     /// Default: 10 seconds
     ///
-    /// The node registers itself to etcd (and reports ready) only after the
-    /// Kafka updater has caught up with the chain head: a batch is applied
-    /// whose newest block timestamp is at most this old, or the batch reached
-    /// the topic's high watermark. This keeps a freshly started replica out
-    /// of the consistency checker's ready ratio while it backfills.
+    /// The node registers itself to etcd only after the Kafka updater has
+    /// caught up with the chain head: a batch is applied whose newest block
+    /// timestamp is at most this old, or the batch reached the topic's high
+    /// watermark. This keeps a freshly started replica out of the consistency
+    /// checker's ready ratio while it backfills. The readiness probe is not
+    /// affected.
     #[arg(long, default_value = "10")]
     catchup_max_lag_secs: u64,
 
@@ -1046,9 +1047,11 @@ impl Command {
         )
         .await?;
 
-        // Register to etcd (and report ready) only once the updater has caught
-        // up with the chain head, so a backfilling replica is not counted by
-        // the consistency checker nor routed to by the gateway. The returned
+        // Register to etcd only once the updater has caught up with the chain
+        // head, so a backfilling replica is not counted by the consistency
+        // checker nor routed to by the gateway. The readiness probe is left
+        // alone on purpose: the rpc StatefulSets create pods in order, so
+        // gating readiness on catch-up would serialize scale-ups. The returned
         // handle unregisters on shutdown, or cancels a registration that has
         // not happened yet.
         let (registry_handle, mut registry_stop) = tokio::sync::watch::channel(());
@@ -1085,12 +1088,12 @@ impl Command {
                     }
                 }
             };
-            ready.store(true, std::sync::atomic::Ordering::SeqCst);
             info!(target:"updater", "leafage server caught up with chain head and registered");
             let _ = registry_stop.changed().await;
             let _ = unregister.send(());
         });
 
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
         info!(target:"updater", "leafage server started");
 
         Ok((updater_handle, rpc_handle, registry_handle))
