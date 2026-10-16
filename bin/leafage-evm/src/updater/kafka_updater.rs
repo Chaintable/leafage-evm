@@ -58,6 +58,9 @@ pub struct Updater<Tree> {
     /// process. Retries continue from the in-memory latest block, so they do
     /// not need to reread the already-applied bundle prefix.
     read_from_bundle: AtomicBool,
+    /// A batch whose newest block is at most this old marks the node as
+    /// caught up with the chain head (see [`Updater::start`]).
+    catchup_max_lag: Duration,
 }
 
 impl<Tree> Updater<Tree>
@@ -77,6 +80,7 @@ where
         init_task_queue_size: usize,
         catchup_safe_depth: usize,
         bundle_range_size_mib: u32,
+        catchup_max_lag: Duration,
     ) -> Result<Self> {
         let mut rpc_client = None;
         if let Some(rpc_url) = rpc_url {
@@ -119,6 +123,7 @@ where
             catchup_safe_depth,
             bundle_range_size_mib,
             read_from_bundle: AtomicBool::new(read_from_bundle),
+            catchup_max_lag,
         })
     }
 
@@ -616,8 +621,64 @@ where
         }
     }
 
-    pub fn start(mut self) -> watch::Sender<()> {
+    /// Whether the node has caught up with the chain head after applying
+    /// `messages` (the batch just handed to [`Self::update_from_kafka`]).
+    ///
+    /// The newest block timestamp carried by the last message is compared with
+    /// wall-clock time: once a batch is applied within `catchup_max_lag` of
+    /// its block time the node is trailing the head by no more than the
+    /// pipeline latency. A stalled chain (or a producer that omits the
+    /// timestamp) never satisfies that, so fall back to the consumer position:
+    /// the node is also caught up when the batch ends at the topic's high
+    /// watermark.
+    async fn is_caught_up(&self, messages: &[BorrowedMessage<'_>]) -> bool {
+        let Some(last) = messages.last() else {
+            return false;
+        };
+        let newest_block_ts = last
+            .payload()
+            .and_then(|payload| KafkaBlockChangeNotification::try_from(payload).ok())
+            .map(|notification| {
+                notification
+                    .new_blocks
+                    .iter()
+                    .chain(notification.drop_blocks.iter())
+                    .map(|block| block.timestamp)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let lag = now.saturating_sub(newest_block_ts);
+        if newest_block_ts > 0 && lag < self.catchup_max_lag.as_secs() {
+            info!(target:"updater", "caught up with chain head: newest block timestamp {} is {}s old", newest_block_ts, lag);
+            return true;
+        }
+        match self.get_offset().await {
+            Result::Ok((_, latest_offset)) if last.offset() >= latest_offset => {
+                info!(target:"updater", "caught up with chain head: offset {} reached the high watermark (newest block timestamp {} is {}s old)", last.offset(), newest_block_ts, lag);
+                true
+            }
+            Result::Ok((_, latest_offset)) => {
+                debug!(target:"updater", "not caught up: offset {} behind high watermark {}, newest block timestamp {} is {}s old", last.offset(), latest_offset, newest_block_ts, lag);
+                false
+            }
+            Err(e) => {
+                error!(target:"updater", "failed to fetch watermarks for catch-up check: {:?}", e);
+                false
+            }
+        }
+    }
+
+    /// Starts the updater. Returns the stop handle and a receiver that turns
+    /// `true` once the node has caught up with the chain head (see
+    /// [`Self::is_caught_up`]); it never turns back to `false`.
+    pub fn start(mut self) -> (watch::Sender<()>, watch::Receiver<bool>) {
         let (tx, mut rx) = watch::channel(());
+        let (caught_up_tx, caught_up_rx) = watch::channel(false);
         tokio::spawn(async move {
             self.init_offset().await;
             let stream = self.consumer.stream();
@@ -662,6 +723,9 @@ where
                                     break;
                                 }
                             }
+                            if !*caught_up_tx.borrow() && self.is_caught_up(&msgs).await {
+                                let _ = caught_up_tx.send(true);
+                            }
                         }
 
                     }
@@ -669,7 +733,7 @@ where
             }
         });
 
-        tx
+        (tx, caught_up_rx)
     }
 }
 
@@ -729,6 +793,7 @@ mod tests {
                 hash: block.header.hash,
                 parent_hash: block.header.parent_hash,
                 block_number: number,
+                timestamp: 0,
             });
             objects.insert(
                 format!("42161/v1/{}/block", block.header.hash),
@@ -770,6 +835,7 @@ mod tests {
             catchup_safe_depth: 2,
             bundle_range_size_mib: 32,
             read_from_bundle: AtomicBool::new(false),
+            catchup_max_lag: Duration::from_secs(10),
         };
         let messages = vec![OwnedMessage::new(
             Some(gzip(&notification)),

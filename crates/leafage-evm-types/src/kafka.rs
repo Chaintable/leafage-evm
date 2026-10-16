@@ -9,6 +9,9 @@ pub struct KafkaBlockContext {
     pub hash: H256,
     pub parent_hash: H256,
     pub block_number: u64,
+    /// Block timestamp in seconds. Older producers omit it, which leaves 0.
+    #[serde(default)]
+    pub timestamp: u64,
 }
 
 fn unwrap_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
