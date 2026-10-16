@@ -26,11 +26,15 @@ pub async fn updater_build<
     init_task_queue_size: usize,
     catchup_safe_depth: usize,
     bundle_range_size_mib: u32,
-) -> Result<watch::Sender<()>> {
+    catchup_max_lag: Duration,
+) -> Result<(watch::Sender<()>, watch::Receiver<bool>)> {
+    // Only the Kafka updater knows how far the node trails the chain head;
+    // the other modes report caught up right away (the previous behavior).
+    let caught_up = || watch::channel(true).1;
     match (rpc_url, kafka_s3_cfg) {
         (Some(rpc_url), None) => {
             let updater = HttpUpdater::new(tree, rpc_url, update_interval, max_diff_depth)?;
-            Ok(updater.start())
+            Ok((updater.start(), caught_up()))
         }
         (rpc_url, Some(kafka_s3_cfg)) => {
             let updater = KafkaUpdater::new(
@@ -42,10 +46,11 @@ pub async fn updater_build<
                 init_task_queue_size,
                 catchup_safe_depth,
                 bundle_range_size_mib,
+                catchup_max_lag,
             )
             .await?;
             Ok(updater.start())
         }
-        (None, None) => Ok(tokio::sync::watch::channel(()).0),
+        (None, None) => Ok((watch::channel(()).0, caught_up())),
     }
 }

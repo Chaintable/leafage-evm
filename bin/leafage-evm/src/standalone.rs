@@ -28,7 +28,7 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::time;
-use tracing::info;
+use tracing::{error, info};
 
 /// `leafage-evm standalone` command
 #[derive(Debug, Parser)]
@@ -314,6 +314,19 @@ pub struct Command {
     /// This timeout is used to wait for the etcd unregister to complete.
     #[arg(long, default_value = "5")]
     stop_wait_timeout: u64,
+
+    /// The max lag (seconds) behind the chain head for the node to count as
+    /// caught up.
+    /// Default: 10 seconds
+    ///
+    /// The node registers itself to etcd only after the Kafka updater has
+    /// caught up with the chain head: a batch is applied whose newest block
+    /// timestamp is at most this old, or the batch reached the topic's high
+    /// watermark. This keeps a freshly started replica out of the consistency
+    /// checker's ready ratio while it backfills. The readiness probe is not
+    /// affected.
+    #[arg(long, default_value = "10")]
+    catchup_max_lag_secs: u64,
 
     /// Whether to normalize the state key
     /// Default: false
@@ -1020,7 +1033,7 @@ impl Command {
             )
             .await?;
 
-        let updater_handle = updater_build(
+        let (updater_handle, mut caught_up) = updater_build(
             tree.clone(),
             self.rpc_addr.clone(),
             self.kafka_s3_config.clone(),
@@ -1030,16 +1043,55 @@ impl Command {
             self.init_task_queue_size,
             self.catchup_safe_depth,
             self.bundle_read.bundle_range_size_mib,
+            std::time::Duration::from_secs(self.catchup_max_lag_secs),
         )
         .await?;
 
-        let registry_handle = register_build(
-            chain_cfg.chain_id(),
-            self.kafka_s3_config.clone().unwrap_or_default().version,
-            etcd_config.clone(),
-            self.node_type.resolve(self.archive),
-        )
-        .await?;
+        // Register to etcd only once the updater has caught up with the chain
+        // head, so a backfilling replica is not counted by the consistency
+        // checker nor routed to by the gateway. The readiness probe is left
+        // alone on purpose: the rpc StatefulSets create pods in order, so
+        // gating readiness on catch-up would serialize scale-ups. The returned
+        // handle unregisters on shutdown, or cancels a registration that has
+        // not happened yet.
+        let (registry_handle, mut registry_stop) = tokio::sync::watch::channel(());
+        let chain_id = chain_cfg.chain_id();
+        let version = self.kafka_s3_config.clone().unwrap_or_default().version;
+        let node_type = self.node_type.resolve(self.archive);
+        tokio::spawn(async move {
+            tokio::select! {
+                res = caught_up.wait_for(|caught_up| *caught_up) => {
+                    if res.is_err() {
+                        info!(target:"register", "updater stopped before catching up, skip etcd registration");
+                        return;
+                    }
+                }
+                _ = registry_stop.changed() => {
+                    info!(target:"register", "stopped before catching up, skip etcd registration");
+                    return;
+                }
+            }
+            let unregister = loop {
+                match register_build(chain_id, version.clone(), etcd_config.clone(), node_type)
+                    .await
+                {
+                    Ok(handle) => break handle,
+                    Err(e) => {
+                        error!(target:"register", "etcd registration failed, retrying in 5s: {e}");
+                        tokio::select! {
+                            _ = time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = registry_stop.changed() => {
+                                info!(target:"register", "stopped while retrying etcd registration");
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+            info!(target:"updater", "leafage server caught up with chain head and registered");
+            let _ = registry_stop.changed().await;
+            let _ = unregister.send(());
+        });
 
         ready.store(true, std::sync::atomic::Ordering::SeqCst);
         info!(target:"updater", "leafage server started");
