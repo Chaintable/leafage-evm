@@ -22,7 +22,7 @@ use leafage_evm_types::{
 };
 use revm::bytecode::OpCode;
 use revm::context::result::InvalidTransaction;
-use revm::context::result::{ExecutionResult, HaltReason};
+use revm::context::result::{EVMError, ExecutionResult, HaltReason};
 use revm::context::{TransactTo, Transaction as TransactionTrait};
 use revm::database::{CacheDB, DatabaseRef, DbAccount};
 use revm::primitives::hardfork::SpecId as EthSpecId;
@@ -555,11 +555,26 @@ where
             db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        let mut res: DebankSingleCallResult = self
-            .inner
-            .transact(block_env, db, tx)
-            .map_err(|e| e.to_rpc_error())?
-            .into();
+        let mut res: DebankSingleCallResult = match self.inner.transact(block_env, db, tx) {
+            Ok(result) => result.into(),
+            Err(err) => {
+                // Classic capability failures abort this EVM execution, including
+                // nested calls, but must not discard unrelated multicall results.
+                let call_error = matches!(&err, EVMError::Transaction(_))
+                    || matches!(&err, EVMError::Custom(message)
+                        if message.starts_with("Arbitrum Classic:")
+                            && !message.starts_with("Arbitrum Classic: invalid "));
+                if !call_error {
+                    return Err(err.to_rpc_error());
+                }
+                let err = err.to_rpc_error();
+                DebankSingleCallResult {
+                    code: err.code(),
+                    err: err.message().to_owned(),
+                    ..Default::default()
+                }
+            }
+        };
         res.time_cost = start.elapsed().as_secs_f64();
         Ok(res)
     }

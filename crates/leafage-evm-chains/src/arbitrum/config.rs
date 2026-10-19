@@ -27,6 +27,18 @@ pub struct ClassicBuiltinUpgrades {
     pub arbos_54_block: u64,
 }
 
+impl ClassicBuiltinUpgrades {
+    pub fn for_chain_id(chain_id: u64) -> Option<Self> {
+        (chain_id == 42161).then_some(Self {
+            // Boundaries verified against adjacent native archive calls.
+            arbos_34_block: 156_077,
+            arbos_39_block: 226_011,
+            arbos_42_block: 662_405,
+            arbos_54_block: 6_835_288,
+        })
+    }
+}
+
 /// Per-chain configuration for Arbitrum replicas, parsed from
 /// `--evm-custom-config`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

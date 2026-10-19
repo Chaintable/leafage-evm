@@ -169,6 +169,19 @@ fn brotli_len(input: &[u8], level: u64) -> Option<usize> {
 }
 
 impl ArbPricing {
+    /// Nitro's RPCPostingGasHook reserves posting gas in addition to the
+    /// default compute cap, using the call's gas field and estimation padding.
+    pub fn rpc_posting_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
+        let cost = self
+            .poster_data_cost(tx, PosterDataMode::CurrentTx)
+            .unwrap_or_default();
+        self.poster_gas_from_cost(
+            self.pad_estimation_cost(cost),
+            U256::from(l2_base_fee),
+            true,
+        )
+    }
+
     /// Replicate Nitro's gas-estimation posterGas for `tx`. `l2_base_fee` is the
     /// block base fee. Returns 0 if the fake tx can't be compressed.
     pub fn poster_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {

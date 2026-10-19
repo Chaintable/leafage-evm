@@ -41,11 +41,13 @@ Builtin rules follow four upgrades, verified on adjacent native archive blocks:
 
 Other Classic networks can configure `classic_builtin_upgrades` with `arbos_34_block`, `arbos_39_block`, `arbos_42_block` and `arbos_54_block`; without this schedule, version-dependent paths report a capability error. Removed ArbOwner methods remain recognized, so valid historical calls are not mistaken for unknown selectors.
 
+NUMBER uses the block's `l1BlockNumber` metadata, clamped to at least the requested L2 height before ArbOS 42. Missing L1 metadata or an unknown upgrade schedule produces a capability error only when NUMBER executes. ArbSys.arbBlockNumber continues to return the L2 height.
+
 ## Limits
 
 Execution touching unavailable semantics returns an explicit `Arbitrum Classic:` error, even from a nested low-level call that would otherwise swallow a child failure:
 
-- NUMBER (L1 height), BLOCKHASH (Classic's private inbox-derived hash history), GASLIMIT (private ArbOS pool limit), GASPRICE and BASEFEE (private ArbGas price). The L2 header's fields are not substitutes.
+- BLOCKHASH (Classic's private inbox-derived hash history), GASLIMIT (private ArbOS pool limit), GASPRICE and BASEFEE (private ArbGas price). The L2 header's fields are not substitutes.
 - Other ArbOS builtins, including pricing, retryables, address/function tables, owner operations, ArbOS version and caller alias queries. Historical private ArbOS state and version are not in account StateDiffs.
 - Contract creation/destruction and nonzero-value CALLCODE, whose Classic account lifecycle/transfer handling is not implemented in this mode.
 - Insufficient-balance CALL to an ordinary empty-code account: StateDiffs cannot distinguish EOA and empty-runtime contract return-data behavior.
@@ -54,6 +56,8 @@ Execution touching unavailable semantics returns an explicit `Arbitrum Classic:`
 - Builtin dynamic slices that read outside the visible calldata. Mini can access the backing AVM message buffer or adjacent parent memory there; returning padded zeroes would be incorrect. Independently provable malformed lengths/offsets still revert.
 
 Recognized unsupported builtin methods return a capability error after independently evaluable input/context checks. Unknown selectors revert for all Classic builtins. A capability error does not imply that the native call reverts.
+
+In `contractMultiCall`, transaction validation and Classic capability failures retain their error code and message on the affected item. With `fast_fail=false`, other items continue; leafage-py's `raise_on_error=False` returns `None` for that failed item. Database, block, configuration and other infrastructure errors remain RPC errors. Nested EVM calls cannot swallow capability failures.
 
 Gas in calls/traces/multicall remains **revm resource accounting, not Classic ArbGas**. GAS, gas-sensitive branches and low-gas calls can differ from AVM even if no missing-data instruction executes. Use the archive Classic node for exact gas, estimates, transaction replay or these unsupported paths. PUSH0 and later Ethereum opcodes are not enabled. Full transaction simulation/replay fidelity is not claimed.
 

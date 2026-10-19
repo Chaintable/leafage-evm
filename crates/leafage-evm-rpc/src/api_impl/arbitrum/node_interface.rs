@@ -1,8 +1,6 @@
 use crate::api_impl::arbitrum::api::ArbitrumApiImpl;
-use crate::error::internal_rpc_err;
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
-use alloy::sol_types::{decode_revert_reason, SolInterface, SolValue};
-use jsonrpsee::core::RpcResult;
+use alloy::sol_types::{SolCall, SolInterface, SolValue};
 use leafage_evm_chains::arbitrum::arbos_state::{ArbStateReader, ARBOS_STATE_ADDRESS};
 use leafage_evm_chains::arbitrum::precompile::{
     NODE_INTERFACE_ADDRESS, NODE_INTERFACE_DEBUG_ADDRESS,
@@ -14,7 +12,8 @@ use leafage_evm_chains::arbitrum::ArbitrumEvmConfig;
 use leafage_evm_storage::BlockIndex;
 use leafage_evm_types::{BlockEnv, BlockId, BlockInfo, BlockNumberOrTag};
 use revm::context::result::{
-    EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output, ResultGas, SuccessReason,
+    EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError, Output, ResultGas,
+    SuccessReason,
 };
 use revm::context::Transaction as _;
 use revm::primitives::{StorageKey, StorageValue, TxKind};
@@ -169,6 +168,33 @@ alloy::sol! {
     }
 }
 
+use INodeInterfaceDebugVirtual::INodeInterfaceDebugVirtualCalls as DebugCall;
+use INodeInterfaceVirtual::INodeInterfaceVirtualCalls as NodeCall;
+
+fn decode_node_call(data: &[u8]) -> alloy::sol_types::Result<NodeCall> {
+    let call = NodeCall::abi_decode(data)?;
+    // Geth validates bool/uint64 words, but accepts nonzero address padding.
+    // Validate only those scalar types rather than tightening the whole ABI.
+    match &call {
+        NodeCall::gasEstimateComponents(_) | NodeCall::gasEstimateL1Component(_) => {
+            bool::abi_decode_validate(&data[36..68])?;
+        }
+        NodeCall::constructOutboxProof(_) => {
+            <(u64, u64)>::abi_decode_validate(&data[4..])?;
+        }
+        NodeCall::findBatchContainingBlock(_)
+        | NodeCall::blockL1Num(_)
+        | NodeCall::l2BlockRangeForL1(_) => {
+            u64::abi_decode_validate(&data[4..])?;
+        }
+        NodeCall::legacyLookupMessageBatchProof(_) => {
+            u64::abi_decode_validate(&data[36..68])?;
+        }
+        _ => {}
+    }
+    Ok(call)
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::api_impl::arbitrum) struct RetryableRedeemCall {
     pub sender: Address,
@@ -184,6 +210,38 @@ pub(in crate::api_impl::arbitrum) struct RetryableRedeemCall {
 pub(in crate::api_impl::arbitrum) enum NodeInterfaceAction {
     Return(ExecutionResult<HaltReason>),
     Replace(ArbitrumTxEnv),
+}
+
+// RPC virtual calls have no EVM frame; feed failures through the same result
+// handling as ordinary calls instead of aborting multicalls and traces.
+fn virtual_revert() -> ExecutionResult<HaltReason> {
+    ExecutionResult::Revert {
+        gas: ResultGas::default(),
+        logs: Vec::new(),
+        output: Bytes::new(),
+    }
+}
+
+fn virtual_halt(reason: HaltReason) -> ExecutionResult<HaltReason> {
+    ExecutionResult::Halt {
+        reason,
+        gas: ResultGas::default(),
+        logs: Vec::new(),
+    }
+}
+
+fn virtual_out_of_gas(arbos_version: u64) -> ExecutionResult<HaltReason> {
+    if arbos_version >= 11 {
+        virtual_revert()
+    } else {
+        virtual_halt(HaltReason::OutOfGas(OutOfGasError::Basic))
+    }
+}
+
+#[derive(Debug)]
+enum BlockLookupError {
+    InvalidInput,
+    Backend(String),
 }
 
 impl From<INodeInterfaceVirtual::estimateRetryableTicketCall> for RetryableRedeemCall {
@@ -237,22 +295,24 @@ pub(in crate::api_impl::arbitrum) fn header_l1_block_num(
     header_l1_and_arbos_version(block, legacy_zero_base_fee_until).0
 }
 
-fn block_by_l2_num<DB>(db: &DB, l2_block_num: u64) -> RpcResult<BlockInfo>
+fn block_by_l2_num<DB>(db: &DB, l2_block_num: u64) -> Result<BlockInfo, BlockLookupError>
 where
     DB: BlockIndex,
 {
     if l2_block_num > i64::MAX as u64 {
-        return Err(internal_rpc_err(format!(
-            "requested l2 block number {l2_block_num} out of range for int64"
-        )));
+        return Err(BlockLookupError::InvalidInput);
     }
 
     db.get_block_by_id(BlockId::Number(BlockNumberOrTag::Number(l2_block_num)))
-        .map_err(|err| internal_rpc_err(err.to_string()))?
-        .ok_or_else(|| internal_rpc_err(format!("nil header for l2 block: {l2_block_num}")))
+        .map_err(|err| BlockLookupError::Backend(err.to_string()))?
+        .ok_or(BlockLookupError::InvalidInput)
 }
 
-fn block_l1_num<DB>(db: &DB, l2_block_num: u64, legacy_zero_base_fee_until: u64) -> RpcResult<u64>
+fn block_l1_num<DB>(
+    db: &DB,
+    l2_block_num: u64,
+    legacy_zero_base_fee_until: u64,
+) -> Result<u64, BlockLookupError>
 where
     DB: BlockIndex,
 {
@@ -260,14 +320,14 @@ where
     Ok(header_l1_block_num(&block, legacy_zero_base_fee_until))
 }
 
-fn latest_l2_block_num<DB>(db: &DB) -> RpcResult<u64>
+fn latest_l2_block_num<DB>(db: &DB) -> Result<u64, BlockLookupError>
 where
     DB: BlockIndex,
 {
     let block = db
         .get_block_by_id(BlockId::Number(BlockNumberOrTag::Latest))
-        .map_err(|err| internal_rpc_err(err.to_string()))?
-        .ok_or_else(|| internal_rpc_err("nil latest l2 block header"))?;
+        .map_err(|err| BlockLookupError::Backend(err.to_string()))?
+        .ok_or_else(|| BlockLookupError::Backend("nil latest l2 block header".to_string()))?;
     Ok(block.header.number)
 }
 
@@ -296,7 +356,7 @@ fn first_l2_block_for_l1<DB>(
     target_l1_block_num: u64,
     legacy_zero_base_fee_until: u64,
     cached_l1_nums: &mut HashMap<u64, u64>,
-) -> RpcResult<u64>
+) -> Result<u64, BlockLookupError>
 where
     DB: BlockIndex,
 {
@@ -333,21 +393,13 @@ fn match_l2_block_num_with_l1<DB>(
     l2_block_num: u64,
     l1_block_num: u64,
     legacy_zero_base_fee_until: u64,
-) -> RpcResult<()>
+) -> Result<(), BlockLookupError>
 where
     DB: BlockIndex,
 {
-    let block_l1_block_num =
-        block_l1_num(db, l2_block_num, legacy_zero_base_fee_until).map_err(|err| {
-            internal_rpc_err(format!(
-                "failed to get the L1 block number of the L2 block: {l2_block_num}. Error: {}",
-                err.message()
-            ))
-        })?;
+    let block_l1_block_num = block_l1_num(db, l2_block_num, legacy_zero_base_fee_until)?;
     if block_l1_block_num != l1_block_num {
-        return Err(internal_rpc_err(format!(
-            "no L2 block was found with the given L1 block number. Found L2 block: {l2_block_num} with L1 block number: {block_l1_block_num}, given L1 block number: {l1_block_num}",
-        )));
+        return Err(BlockLookupError::InvalidInput);
     }
     Ok(())
 }
@@ -358,7 +410,7 @@ fn l2_block_range_for_l1<DB>(
     current_block_num: u64,
     l1_block_num: u64,
     legacy_zero_base_fee_until: u64,
-) -> RpcResult<(u64, u64)>
+) -> Result<(u64, u64), BlockLookupError>
 where
     DB: BlockIndex,
 {
@@ -370,13 +422,7 @@ where
         l1_block_num,
         legacy_zero_base_fee_until,
         &mut cached_l1_nums,
-    )
-    .map_err(|err| {
-        internal_rpc_err(format!(
-            "failed to get the first L2 block with the L1 block: {l1_block_num}. Error: {}",
-            err.message()
-        ))
-    })?;
+    )?;
     let next_l1_block_num = l1_block_num.wrapping_add(1);
     let last_block_exclusive = first_l2_block_for_l1(
         db,
@@ -385,13 +431,7 @@ where
         next_l1_block_num,
         legacy_zero_base_fee_until,
         &mut cached_l1_nums,
-    )
-    .map_err(|err| {
-        internal_rpc_err(format!(
-            "failed to get the last L2 block with the L1 block: {l1_block_num}. Error: {}",
-            err.message()
-        ))
-    })?;
+    )?;
 
     match_l2_block_num_with_l1(db, first_block, l1_block_num, legacy_zero_base_fee_until)?;
     let last_block = last_block_exclusive.wrapping_sub(1);
@@ -412,34 +452,30 @@ impl<DB> ArbitrumApiImpl<DB> {
         Address::from_slice(&bytes[12..])
     }
 
-    fn virtual_success<StateDB>(
+    fn virtual_success(
         tx: &ArbitrumTxEnv,
         output: Bytes,
         gas_used: u64,
-    ) -> Result<ExecutionResult<HaltReason>, EVMError<StateDB::Error, InvalidTransaction>>
-    where
-        StateDB: DatabaseRef,
-    {
+        arbos_version: u64,
+    ) -> ExecutionResult<HaltReason> {
         if tx.gas_limit() < gas_used {
-            return Err(EVMError::Transaction(
-                InvalidTransaction::CallGasCostMoreThanGasLimit {
-                    initial_gas: gas_used,
-                    gas_limit: tx.gas_limit(),
-                },
-            ));
+            if tx.gas_limit() < gas_used.saturating_sub(copy_gas(output.len())) {
+                return virtual_out_of_gas(arbos_version);
+            }
+            return virtual_revert();
         }
 
-        Ok(ExecutionResult::Success {
+        ExecutionResult::Success {
             reason: SuccessReason::Return,
             gas: ResultGas::default().with_total_gas_spent(gas_used),
             logs: Vec::new(),
             output: Output::Call(output),
-        })
+        }
     }
 
     fn virtual_call_gas(data: &[u8], output: &[u8], method_storage_reads: u64) -> u64 {
-        let storage_reads = NODE_INTERFACE_CONTEXT_STORAGE_READS
-            .saturating_add(method_storage_reads);
+        let storage_reads =
+            NODE_INTERFACE_CONTEXT_STORAGE_READS.saturating_add(method_storage_reads);
         copy_gas(data.len().saturating_sub(4))
             .saturating_add(copy_gas(output.len()))
             .saturating_add(STORAGE_READ_GAS.saturating_mul(storage_reads))
@@ -539,26 +575,64 @@ impl<DB> ArbitrumApiImpl<DB> {
         if to != NODE_INTERFACE_ADDRESS && to != NODE_INTERFACE_DEBUG_ADDRESS {
             return Ok(None);
         }
-        if state.try_arbos_version().map_err(EVMError::Database)? == 0 {
+        let arbos_version = state.try_arbos_version().map_err(EVMError::Database)?;
+        if arbos_version == 0 {
             return Ok(None);
         }
-        if to == NODE_INTERFACE_DEBUG_ADDRESS {
-            let data = tx.input().as_ref();
-            return match INodeInterfaceDebugVirtual::INodeInterfaceDebugVirtualCalls::abi_decode(
-                data,
-            ) {
-                Ok(INodeInterfaceDebugVirtual::INodeInterfaceDebugVirtualCalls::getRetryable(
-                    call,
-                )) => {
-                    let info = state
+        let revert = || Ok(Some(NodeInterfaceAction::Return(virtual_revert())));
+        let method_failure = || {
+            // ArbOS 11 normalized handler errors to REVERT. Earlier versions
+            // treated non-solidity errors as exceptional execution failures.
+            let result = if arbos_version >= 11 {
+                virtual_revert()
+            } else {
+                virtual_halt(HaltReason::PrecompileError)
+            };
+            Ok(Some(NodeInterfaceAction::Return(result)))
+        };
+        let data = tx.input().as_ref();
+        let Some(selector) = data.get(..4).and_then(|bytes| bytes.try_into().ok()) else {
+            return revert();
+        };
+        let is_debug = to == NODE_INTERFACE_DEBUG_ADDRESS;
+        let known = if is_debug {
+            DebugCall::valid_selector(selector)
+        } else {
+            NodeCall::valid_selector(selector)
+        };
+        let payable = !is_debug
+            && matches!(
+                selector,
+                INodeInterfaceVirtual::gasEstimateComponentsCall::SELECTOR
+                    | INodeInterfaceVirtual::gasEstimateL1ComponentCall::SELECTOR
+            );
+        if !known || (!payable && !tx.value().is_zero()) {
+            return revert();
+        }
+        let pure = !is_debug && selector == INodeInterfaceVirtual::nitroGenesisBlockCall::SELECTOR;
+        let context_gas = if pure { 0 } else { STORAGE_READ_GAS };
+        if tx.gas_limit() < context_gas {
+            return Ok(Some(NodeInterfaceAction::Return(virtual_halt(
+                HaltReason::OutOfGas(OutOfGasError::Basic),
+            ))));
+        }
+        if tx.gas_limit() < context_gas.saturating_add(copy_gas(data.len() - 4)) {
+            return revert();
+        }
+        if is_debug {
+            return match DebugCall::abi_decode(data) {
+                Ok(DebugCall::getRetryable(call)) => {
+                    if tx.gas_limit() < Self::virtual_call_gas(data, &[], 1) {
+                        return Ok(Some(NodeInterfaceAction::Return(virtual_out_of_gas(
+                            arbos_version,
+                        ))));
+                    }
+                    let Some(info) = state
                         .read_retryable_info(call.ticket)
                         .map_err(evm_custom_error::<StateDB>)?
-                        .ok_or_else(|| {
-                            evm_custom_error::<StateDB>(format!(
-                                "no retryable with id {:?} exists",
-                                call.ticket
-                            ))
-                        })?;
+                    else {
+                        return method_failure();
+                    };
                     let ret = INodeInterfaceDebugVirtual::RetryableInfo {
                         timeout: info.timeout,
                         from: info.from,
@@ -575,25 +649,21 @@ impl<DB> ArbitrumApiImpl<DB> {
                         output.as_ref(),
                         Self::retryable_info_storage_reads(retryable_data_len),
                     );
-                    let result = Self::virtual_success::<StateDB>(tx, output, gas_used)?;
+                    let result = Self::virtual_success(tx, output, gas_used, arbos_version);
                     Ok(Some(NodeInterfaceAction::Return(result)))
                 }
-                Err(err) => Err(evm_custom_error::<StateDB>(format!(
-                    "invalid NodeInterfaceDebug calldata: {err}",
-                ))),
+                Err(_) => revert(),
             };
         }
 
-        let data = tx.input().as_ref();
-
-        let (output, gas_used) = match INodeInterfaceVirtual::INodeInterfaceVirtualCalls::abi_decode(
-            data,
-        ) {
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::gasEstimateComponents(call)) => {
+        let call = match decode_node_call(data) {
+            Ok(call) => call,
+            Err(_) => return revert(),
+        };
+        let (output, gas_used) = match call {
+            NodeCall::gasEstimateComponents(call) => {
                 if call.to == NODE_INTERFACE_ADDRESS || call.to == NODE_INTERFACE_DEBUG_ADDRESS {
-                    return Err(evm_custom_error::<StateDB>(
-                        "cannot estimate virtual contract",
-                    ));
+                    return method_failure();
                 }
 
                 let mut target_tx = Self::gas_estimate_target_tx(
@@ -603,11 +673,15 @@ impl<DB> ArbitrumApiImpl<DB> {
                     call.data.clone(),
                 );
                 let l2_basefee = Self::l2_basefee_from_state(state).map_err(EVMError::Database)?;
-                let execution_gas = self.estimate_node_interface_execution_gas(
+                let execution_gas = match self.estimate_node_interface_execution_gas(
                     block_env,
                     state,
                     target_tx.clone(),
-                )?;
+                ) {
+                    Ok(Some(gas)) => gas,
+                    Ok(None) | Err(EVMError::Transaction(_)) => return method_failure(),
+                    Err(err) => return Err(err),
+                };
                 target_tx.base.gas_limit = execution_gas;
                 let pricing = state.try_read_pricing().map_err(EVMError::Database)?;
                 let l1_gas = pricing
@@ -629,7 +703,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 );
                 (output, gas_used)
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::gasEstimateL1Component(call)) => {
+            NodeCall::gasEstimateL1Component(call) => {
                 let mut target_tx = Self::gas_estimate_target_tx(
                     tx,
                     call.to,
@@ -658,27 +732,23 @@ impl<DB> ArbitrumApiImpl<DB> {
                 );
                 (output, gas_used)
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::nitroGenesisBlock(_)) => {
+            NodeCall::nitroGenesisBlock(_) => {
                 let output: Bytes = configured_nitro_genesis_block_num(
                     self.evm_cfg.cfg.chain_id,
                     self.evm_cfg.custom_cfg.as_ref(),
                 )
                 .abi_encode()
                 .into();
-                let gas_used = copy_gas(data.len().saturating_sub(4))
-                    .saturating_add(copy_gas(output.len()));
+                let gas_used =
+                    copy_gas(data.len().saturating_sub(4)).saturating_add(copy_gas(output.len()));
                 (output, gas_used)
             }
-            Ok(
-                INodeInterfaceVirtual::INodeInterfaceVirtualCalls::legacyLookupMessageBatchProof(_),
-            ) => {
+            NodeCall::legacyLookupMessageBatchProof(_) => {
                 return Err(evm_custom_error::<StateDB>(
                     "this node doesnt support classicLookupMessageBatchProof",
-                ))
+                ));
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::estimateRetryableTicket(
-                call,
-            )) => {
+            NodeCall::estimateRetryableTicket(call) => {
                 let call = RetryableRedeemCall::from(call);
                 let submit_tx = Self::retryable_submission(tx, block_env, state, &call)
                     .map_err(EVMError::Database)?;
@@ -686,61 +756,62 @@ impl<DB> ArbitrumApiImpl<DB> {
                     ArbitrumTxEnv::submit_retryable(tx.clone(), submit_tx),
                 )));
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::blockL1Num(call)) => {
-                let output: Bytes = rpc_to_evm_result::<StateDB, _>(block_l1_num(
+            NodeCall::blockL1Num(call) => {
+                let Some(l1_block_num) = block_lookup_result::<StateDB, _>(block_l1_num(
                     &self.db,
                     call.l2BlockNum,
                     configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref()),
                 ))?
-                .abi_encode()
-                .into();
+                else {
+                    return method_failure();
+                };
+                let output: Bytes = l1_block_num.abi_encode().into();
                 let gas_used = Self::virtual_call_gas(data, output.as_ref(), 0);
                 (output, gas_used)
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::l2BlockRangeForL1(call)) => {
+            NodeCall::l2BlockRangeForL1(call) => {
                 let genesis_block_num = configured_nitro_genesis_block_num(
                     self.evm_cfg.cfg.chain_id,
                     self.evm_cfg.custom_cfg.as_ref(),
                 );
                 let legacy_zero_base_fee_until =
                     configured_legacy_zero_base_fee_until(self.evm_cfg.custom_cfg.as_ref());
-                let current_block_num =
-                    rpc_to_evm_result::<StateDB, _>(latest_l2_block_num(&self.db))?;
-                let (first_block, last_block) =
-                    rpc_to_evm_result::<StateDB, _>(l2_block_range_for_l1(
-                        &self.db,
-                        genesis_block_num,
-                        current_block_num,
-                        call.blockNum,
-                        legacy_zero_base_fee_until,
-                    ))?;
-                let output: Bytes = (first_block, last_block).abi_encode().into();
+                let Some(range) = block_lookup_result::<StateDB, _>(
+                    latest_l2_block_num(&self.db).and_then(|current_block_num| {
+                        l2_block_range_for_l1(
+                            &self.db,
+                            genesis_block_num,
+                            current_block_num,
+                            call.blockNum,
+                            legacy_zero_base_fee_until,
+                        )
+                    }),
+                )?
+                else {
+                    return method_failure();
+                };
+                let output: Bytes = range.abi_encode().into();
                 let gas_used = Self::virtual_call_gas(data, output.as_ref(), 0);
                 (output, gas_used)
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::getL1Confirmations(_)) => {
+            NodeCall::getL1Confirmations(_) => {
                 return Err(evm_custom_error::<StateDB>(
                     "NodeInterface.getL1Confirmations requires node backend context",
-                ))
+                ));
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::constructOutboxProof(_)) => {
+            NodeCall::constructOutboxProof(_) => {
                 return Err(evm_custom_error::<StateDB>(
                     "NodeInterface.constructOutboxProof requires node backend context",
-                ))
+                ));
             }
-            Ok(INodeInterfaceVirtual::INodeInterfaceVirtualCalls::findBatchContainingBlock(_)) => {
+            NodeCall::findBatchContainingBlock(_) => {
                 return Err(evm_custom_error::<StateDB>(
                     "NodeInterface.findBatchContainingBlock requires node backend context",
-                ))
-            }
-            Err(err) => {
-                return Err(evm_custom_error::<StateDB>(format!(
-                    "invalid NodeInterface calldata: {err}",
-                )))
+                ));
             }
         };
 
-        let result = Self::virtual_success::<StateDB>(tx, output, gas_used)?;
+        let result = Self::virtual_success(tx, output, gas_used, arbos_version);
         Ok(Some(NodeInterfaceAction::Return(result)))
     }
 
@@ -749,7 +820,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         block_env: &BlockEnv,
         state: &StateDB,
         mut tx: ArbitrumTxEnv,
-    ) -> Result<u64, EVMError<StateDB::Error, InvalidTransaction>>
+    ) -> Result<Option<u64>, EVMError<StateDB::Error, InvalidTransaction>>
     where
         StateDB: DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
@@ -773,12 +844,12 @@ impl<DB> ArbitrumApiImpl<DB> {
                 if no_code_callee {
                     let mut min_tx = tx.clone();
                     min_tx.base.gas_limit = MIN_TRANSACTION_GAS;
-                    if let Ok((exec_res, _)) =
-                        self.transact_arbitrum(block_env, BorrowedState(state), min_tx)
-                    {
-                        if exec_res.is_success() {
-                            return Ok(MIN_TRANSACTION_GAS);
+                    match self.transact_arbitrum(block_env, BorrowedState(state), min_tx) {
+                        Ok((exec_res, _)) if exec_res.is_success() => {
+                            return Ok(Some(MIN_TRANSACTION_GAS));
                         }
+                        Ok(_) | Err(EVMError::Transaction(_)) => {}
+                        Err(err) => return Err(err),
                     }
                 }
             }
@@ -803,15 +874,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         let (res, _) = self.transact_arbitrum(block_env, BorrowedState(state), tx.clone())?;
         let gas_refund = match &res {
             ExecutionResult::Success { gas, .. } => gas.inner_refunded(),
-            ExecutionResult::Halt { reason, .. } => {
-                return Err(evm_custom_error::<StateDB>(format!("Halted: {:?}", reason)));
-            }
-            ExecutionResult::Revert { output, .. } => {
-                return Err(evm_custom_error::<StateDB>(format!(
-                    "Reverted: {:?}",
-                    decode_revert_reason(output).unwrap_or("execution revert".to_string())
-                )));
-            }
+            ExecutionResult::Halt { .. } | ExecutionResult::Revert { .. } => return Ok(None),
         };
 
         highest_gas_limit = tx.gas_limit();
@@ -827,12 +890,16 @@ impl<DB> ArbitrumApiImpl<DB> {
         if optimistic_gas_limit < highest_gas_limit {
             tx.base.gas_limit = optimistic_gas_limit;
             let (res, _) = self.transact_arbitrum(block_env, BorrowedState(state), tx.clone())?;
-            update_estimated_gas_range::<StateDB>(
+            if update_estimated_gas_range(
                 &res,
                 optimistic_gas_limit,
                 &mut highest_gas_limit,
                 &mut lowest_gas_limit,
-            )?;
+            )
+            .is_err()
+            {
+                return Ok(None);
+            }
         }
 
         loop {
@@ -850,12 +917,18 @@ impl<DB> ArbitrumApiImpl<DB> {
             }
             tx.base.gas_limit = mid_gas_limit;
             match self.transact_arbitrum(block_env, BorrowedState(state), tx.clone()) {
-                Ok((res, _)) => update_estimated_gas_range::<StateDB>(
-                    &res,
-                    mid_gas_limit,
-                    &mut highest_gas_limit,
-                    &mut lowest_gas_limit,
-                )?,
+                Ok((res, _)) => {
+                    if update_estimated_gas_range(
+                        &res,
+                        mid_gas_limit,
+                        &mut highest_gas_limit,
+                        &mut lowest_gas_limit,
+                    )
+                    .is_err()
+                    {
+                        return Ok(None);
+                    }
+                }
                 Err(err) => match err {
                     EVMError::Transaction(
                         InvalidTransaction::CallerGasLimitMoreThanBlock
@@ -877,9 +950,11 @@ impl<DB> ArbitrumApiImpl<DB> {
         let buffer = self.evm_cfg.estimate_gas_buffer;
         if buffer > 100 {
             let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
-            Ok((buffered.min(u64::MAX as u128) as u64).min(gas_limit_cap))
+            Ok(Some(
+                (buffered.min(u64::MAX as u128) as u64).min(gas_limit_cap),
+            ))
         } else {
-            Ok(highest_gas_limit)
+            Ok(Some(highest_gas_limit))
         }
     }
 }
@@ -893,24 +968,25 @@ where
     EVMError::Custom(message.into())
 }
 
-fn rpc_to_evm_result<StateDB, T>(
-    result: RpcResult<T>,
-) -> Result<T, EVMError<<StateDB as DatabaseRef>::Error, InvalidTransaction>>
+fn block_lookup_result<StateDB, T>(
+    result: Result<T, BlockLookupError>,
+) -> Result<Option<T>, EVMError<<StateDB as DatabaseRef>::Error, InvalidTransaction>>
 where
     StateDB: DatabaseRef,
 {
-    result.map_err(|err| evm_custom_error::<StateDB>(err.message().to_string()))
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(BlockLookupError::InvalidInput) => Ok(None),
+        Err(BlockLookupError::Backend(message)) => Err(evm_custom_error::<StateDB>(message)),
+    }
 }
 
-fn update_estimated_gas_range<StateDB>(
+fn update_estimated_gas_range(
     result: &ExecutionResult<HaltReason>,
     tx_gas_limit: u64,
     highest_gas_limit: &mut u64,
     lowest_gas_limit: &mut u64,
-) -> Result<(), EVMError<<StateDB as DatabaseRef>::Error, InvalidTransaction>>
-where
-    StateDB: DatabaseRef,
-{
+) -> Result<(), HaltReason> {
     match result {
         ExecutionResult::Success { .. } => {
             *highest_gas_limit = tx_gas_limit;
@@ -922,7 +998,7 @@ where
             HaltReason::OutOfGas(_) | HaltReason::InvalidFEOpcode => {
                 *lowest_gas_limit = tx_gas_limit;
             }
-            reason => return Err(evm_custom_error::<StateDB>(format!("Halted: {:?}", reason))),
+            reason => return Err(reason.clone()),
         },
     }
 
@@ -1277,7 +1353,8 @@ mod tests {
         let state = state_with_l2_basefee(0);
         let gas = api
             .estimate_node_interface_execution_gas(&block_env, &state, tx)
-            .expect("target gas estimation should not inherit source gas limit");
+            .expect("target gas estimation should not inherit source gas limit")
+            .expect("successful estimate");
 
         assert!(gas > MIN_TRANSACTION_GAS);
         assert!(gas < block_env.gas_limit);
@@ -1306,7 +1383,8 @@ mod tests {
         let state = state_with_l2_basefee(0);
         let gas = api
             .estimate_node_interface_execution_gas(&block_env, &state, tx)
-            .expect("source gas above cap should not break target gas estimation");
+            .expect("source gas above cap should not break target gas estimation")
+            .expect("successful estimate");
 
         assert!(gas > MIN_TRANSACTION_GAS);
         assert!(gas <= api.evm_cfg.cfg.tx_gas_limit_cap.unwrap());
@@ -1336,7 +1414,8 @@ mod tests {
         let state = state_with_l2_basefee(0);
         let gas = api
             .estimate_node_interface_execution_gas(&block_env, &state, tx)
-            .expect("buffered estimate should still obey the cap");
+            .expect("buffered estimate should still obey the cap")
+            .expect("successful estimate");
 
         assert!(gas <= api.evm_cfg.cfg.tx_gas_limit_cap.unwrap());
     }
@@ -1395,15 +1474,9 @@ mod tests {
             ArbitrumTxContext::default(),
         );
 
-        let err = ArbitrumApiImpl::<()>::virtual_success::<EmptyDB>(&tx, Bytes::new(), 11)
-            .expect_err("insufficient gas should fail");
-
         assert!(matches!(
-            err,
-            EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit {
-                initial_gas: 11,
-                gas_limit: 10,
-            })
+            ArbitrumApiImpl::<()>::virtual_success(&tx, Bytes::new(), 11, 11),
+            ExecutionResult::Revert { .. }
         ));
     }
 }
