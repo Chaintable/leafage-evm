@@ -21,11 +21,11 @@ mod interceptor;
 #[cfg(target_os = "linux")]
 pub use interceptor::{InterceptorConfig, InterceptorLayer};
 
-mod core;
+pub(crate) mod core;
 pub use core::MultiChainCfgEnv;
 pub(crate) use core::{ApiCore, EvmExecutor, GasFeeHandler};
 
-mod mainnet;
+pub(crate) mod mainnet;
 mod arc;
 
 mod arbitrum;

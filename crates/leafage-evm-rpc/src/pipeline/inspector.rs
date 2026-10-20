@@ -8,18 +8,25 @@
 //! addresses. geth still emits `OnEnter(SELFDESTRUCT, self, self, balance)`
 //! for it, so the missing data is recorded from the opcode step instead.
 //!
+//! Before Homestead, a contract creation without the gas to deposit its code
+//! succeeds with empty code; revm drops the code its constructor returned.
+//! geth keeps it as the frame's output and fails the transaction
+//! (`ErrCodeStoreOutOfGas`), so the code is taken from the constructor's
+//! RETURN once it has run, after its memory expansion was paid for.
+//!
 //! The tracer records no steps, so its own per-instruction hooks only check
 //! a byte budget that is unlimited here; they are skipped, leaving one opcode
-//! comparison per instruction.
+//! comparison and one flag check per instruction.
 
-use alloy::primitives::{Address, Log, U256};
+use alloy::primitives::{Address, Bytes, Log, U256};
 use revm::{
     bytecode::opcode,
     context::{ContextTr, JournalTr},
     inspector::JournalExt,
     interpreter::{
-        interpreter_types::Jumps, CallInputs, CallOutcome, CreateInputs, CreateOutcome,
-        InstructionResult, Interpreter,
+        interpreter_types::{Jumps, LoopControl},
+        CallInputs, CallOutcome, CreateInputs, CreateOutcome, InstructionResult, Interpreter,
+        InterpreterAction,
     },
     Inspector,
 };
@@ -44,6 +51,13 @@ pub(crate) struct PipelineInspector {
     /// Whether the frame with this arena index ran an SSTORE. Recording
     /// the tracer's steps for that costs a step entry per instruction.
     sstore: Vec<bool>,
+    /// For the open frame with the same position: `Some` for a creation,
+    /// holding the code its constructor returned once it returns.
+    returned: Vec<Option<Bytes>>,
+    /// The instruction being run is a RETURN.
+    returning: bool,
+    /// The transaction's own creation could not deposit its code.
+    code_deposit_failed: bool,
 }
 
 impl PipelineInspector {
@@ -57,7 +71,16 @@ impl PipelineInspector {
             frames: Vec::new(),
             pending: Vec::new(),
             sstore: Vec::new(),
+            returned: Vec::new(),
+            returning: false,
+            code_deposit_failed: false,
         }
+    }
+
+    /// Whether the transaction creates a contract that could not pay for its
+    /// code (before Homestead): geth counts it as failed.
+    pub(crate) fn code_deposit_failed(&self) -> bool {
+        self.code_deposit_failed
     }
 
     /// The call traces, and whether each of their nodes ran an SSTORE.
@@ -65,7 +88,7 @@ impl PipelineInspector {
         (self.tracer.into_traces(), self.sstore)
     }
 
-    fn open_frame<CTX: ContextTr>(&mut self, context: &CTX, nodes_before: usize) {
+    fn open_frame<CTX: ContextTr>(&mut self, context: &CTX, nodes_before: usize, create: bool) {
         // The root frame overwrites node 0; nested frames are appended.
         let idx = if context.journal_ref().depth() == 0 {
             0
@@ -74,9 +97,11 @@ impl PipelineInspector {
         };
         self.frames.push(idx);
         self.pending.push(None);
+        self.returned.push(create.then(Bytes::new));
     }
 
     fn close_frame(&mut self, result: InstructionResult) {
+        self.returned.pop();
         let (Some(idx), Some(pending)) = (self.frames.pop(), self.pending.pop()) else {
             return;
         };
@@ -100,6 +125,45 @@ impl PipelineInspector {
                 self.sstore.resize(idx + 1, false);
             }
             self.sstore[idx] = true;
+        }
+    }
+
+    /// The code a constructor returned, once its RETURN has run: before
+    /// that, the stack's length is not paid for and may be huge.
+    #[cold]
+    fn record_return(&mut self, interp: &mut Interpreter) {
+        self.returning = false;
+        let Some(Some(returned)) = self.returned.last_mut() else {
+            return;
+        };
+        if let Some(InterpreterAction::Return(result)) = interp.bytecode.action() {
+            if result.result == InstructionResult::Return {
+                *returned = result.output.clone();
+            }
+        }
+    }
+
+    /// A creation that succeeded with no code although its constructor
+    /// returned some: it could not pay for the code.
+    fn check_code_deposit(&mut self, outcome: &CreateOutcome) {
+        let Some(Some(returned)) = self.returned.last() else {
+            return;
+        };
+        if returned.is_empty()
+            || !outcome.result.result.is_ok()
+            || !outcome.result.output.is_empty()
+        {
+            return;
+        }
+        let returned = returned.clone();
+        let Some(&idx) = self.frames.last() else {
+            return;
+        };
+        if idx == 0 && self.frames.len() == 1 {
+            self.code_deposit_failed = true;
+        }
+        if let Some(node) = self.tracer.traces_mut().nodes_mut().get_mut(idx) {
+            node.trace.output = returned;
         }
     }
 
@@ -149,6 +213,15 @@ where
             self.mark_sstore();
         } else if op == opcode::SELFDESTRUCT {
             self.record_selfdestruct(interp, context);
+        } else if op == opcode::RETURN {
+            self.returning = true;
+        }
+    }
+
+    #[inline(always)]
+    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        if self.returning {
+            self.record_return(interp);
         }
     }
 
@@ -160,7 +233,7 @@ where
         let nodes_before = self.tracer.traces().nodes().len();
         let outcome = self.tracer.call(context, inputs);
         if outcome.is_none() {
-            self.open_frame(context, nodes_before);
+            self.open_frame(context, nodes_before, false);
         }
         outcome
     }
@@ -174,7 +247,7 @@ where
         let nodes_before = self.tracer.traces().nodes().len();
         let outcome = self.tracer.create(context, inputs);
         if outcome.is_none() {
-            self.open_frame(context, nodes_before);
+            self.open_frame(context, nodes_before, true);
         }
         outcome
     }
@@ -186,10 +259,80 @@ where
         outcome: &mut CreateOutcome,
     ) {
         self.tracer.create_end(context, inputs, outcome);
+        self.check_code_deposit(outcome);
         self.close_frame(outcome.result.result);
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         Inspector::<CTX>::selfdestruct(&mut self.tracer, contract, target, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context::TxEnv;
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::primitives::hardfork::SpecId;
+    use revm::primitives::TxKind;
+    use revm::{Context, InspectEvm, MainBuilder, MainContext};
+
+    /// PUSH1 100, PUSH1 0, RETURN: 100 zero bytes of code.
+    const RETURN_100: &[u8] = &[0x60, 0x64, 0x60, 0x00, 0xf3];
+
+    /// Deploy `initcode` with `gas_limit`.
+    fn deploy(spec: SpecId, initcode: &'static [u8], gas_limit: u64) -> (bool, PipelineInspector) {
+        let mut evm = Context::mainnet()
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
+            .build_mainnet_with_inspector(PipelineInspector::new());
+        let tx = TxEnv::builder()
+            .caller(Address::with_last_byte(1))
+            .kind(TxKind::Create)
+            .data(Bytes::from_static(initcode))
+            .gas_limit(gas_limit)
+            .gas_price(0)
+            .build()
+            .unwrap();
+        let result = evm.inspect_tx(tx).unwrap();
+        (result.result.is_success(), evm.inspector)
+    }
+
+    fn output(inspector: PipelineInspector) -> Bytes {
+        let (arena, _) = inspector.into_traces();
+        arena.nodes()[0].trace.output.clone()
+    }
+
+    #[test]
+    fn frontier_creation_without_gas_for_its_code_keeps_it_as_output() {
+        // Enough to run the constructor (21000 + 276 calldata + 18), not
+        // to deposit 100 bytes (20000).
+        let (success, inspector) = deploy(SpecId::FRONTIER, RETURN_100, 22_000);
+        assert!(success, "revm keeps the contract, without code");
+        assert!(inspector.code_deposit_failed());
+        assert_eq!(output(inspector), Bytes::from(vec![0u8; 100]));
+
+        let (success, inspector) = deploy(SpecId::FRONTIER, RETURN_100, 100_000);
+        assert!(success);
+        assert!(!inspector.code_deposit_failed());
+        assert_eq!(output(inspector), Bytes::from(vec![0u8; 100]));
+
+        // Homestead fails the creation instead.
+        let (success, inspector) = deploy(SpecId::HOMESTEAD, RETURN_100, 60_000);
+        assert!(!success);
+        assert!(!inspector.code_deposit_failed());
+    }
+
+    #[test]
+    fn unpaid_return_length_is_not_allocated() {
+        // PUSH4 2^31, PUSH1 0, RETURN: runs out of gas expanding memory; the
+        // inspector must not read 2 GiB before that.
+        let initcode = &[0x63, 0x80, 0x00, 0x00, 0x00, 0x60, 0x00, 0xf3];
+        for spec in [SpecId::FRONTIER, SpecId::CANCUN] {
+            let (success, inspector) = deploy(spec, initcode, 100_000);
+            assert!(!success);
+            assert!(!inspector.code_deposit_failed());
+            assert!(output(inspector).is_empty());
+        }
     }
 }

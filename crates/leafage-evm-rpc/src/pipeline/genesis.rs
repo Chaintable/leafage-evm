@@ -10,7 +10,7 @@ use super::types::{addr_hex, to_hash, BlockFile, PipelineTrace, PipelineTransact
 use alloy::primitives::{keccak256, Address, Bytes, U256};
 use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{bail, Result};
-use leafage_evm_types::{BlockStorageDiff, NewAccount, NewCode};
+use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, NewAccount, NewCode};
 use revm::primitives::KECCAK_EMPTY;
 use revm::DatabaseRef;
 use std::collections::BTreeMap;
@@ -201,11 +201,21 @@ fn genesis_state_diff(accounts: &[AllocAccount], block: &RpcBlock) -> BlockStora
             );
         }
     }
+    // `GenesisAllocToStateDiff` lists every account's storage, empty or
+    // not. The allocs of the supported chains have no storage.
+    let storage_diffs = new_accounts
+        .keys()
+        .map(|&address| AccountStorageDiff {
+            address,
+            diffs: Vec::new(),
+        })
+        .collect();
     BlockStorageDiff {
         hash: block.header.state_root,
         // The genesis block has no parent.
         parent_hash: alloy::consensus::constants::EMPTY_ROOT_HASH,
         new_accounts: new_accounts.into_values().collect(),
+        storage_diffs,
         new_codes: new_codes.into_values().collect(),
         ..Default::default()
     }

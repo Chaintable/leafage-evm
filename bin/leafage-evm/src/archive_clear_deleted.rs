@@ -6,14 +6,18 @@
 //! (or built by `archive-init`, which cannot) still return the old slots
 //! after the deletion: wrong once the address is created again, as `CREATE2`
 //! does with the same code. This writes, for every deletion at block `d`, a
-//! zero version at `d` of each slot that was non-zero then, unless block `d`
-//! wrote the slot itself.
+//! zero version at `d` of each slot that was non-zero then. Slots block `d`
+//! wrote itself are zeroed too: the account is gone at the end of `d` (a
+//! block's new accounts are written after its deletions), so they belong to
+//! a contract created and destroyed within it.
 //!
 //! A contract destroyed and created again within one block leaves no deletion
-//! at all, only a new account version. With `--bsc-mainnet` such a block also
-//! counts as a deletion before Cancun (EIP-6780), told by the code hash
-//! changing or the nonce going down, which nothing else does to a contract
-//! then; the system contracts, upgraded in place, aside.
+//! at all, only a new account version. With `--bsc-mainnet` or
+//! `--eth-mainnet` such a block also counts as a deletion before Cancun
+//! (EIP-6780), told by the code hash changing or the nonce going down, which
+//! nothing else does to a contract then; BSC's system contracts, upgraded in
+//! place, aside. Slots written by such a block stand: they are the new
+//! contract's.
 //!
 //! It runs in two steps. The scan opens the archive read-only, so it can run
 //! next to a process using it, and writes the slots to zero to `--plan`, one
@@ -27,6 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use leafage_evm_chains::bsc::mainnet::{
     BSC_MAINNET_CANCUN_BLOCK, BSC_MAINNET_UPGRADABLE_CONTRACTS,
 };
+use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CANCUN_BLOCK;
 use leafage_evm_storage::rocksdb::{DBRawIteratorWithThreadMode, Options, ReadOptions, DB};
 use leafage_evm_storage::{ArchiveRocksDBStorage, StateDBProvider, StateDBRead, StateDBWrite};
 use leafage_evm_types::{BlockId, BlockNumberOrTag, SlimAccount, H256, KECCAK256_EMPTY};
@@ -69,6 +74,11 @@ pub struct Command {
     #[arg(long, default_value = "false")]
     bsc_mainnet: bool,
 
+    /// The archive is Ethereum mainnet's: also plan the zeros for contracts
+    /// destroyed and created again within one block before Cancun.
+    #[arg(long, default_value = "false", conflicts_with = "bsc_mainnet")]
+    eth_mainnet: bool,
+
     /// Scan threads.
     #[arg(long, default_value_t = 16)]
     threads: usize,
@@ -98,7 +108,13 @@ impl Command {
     }
 
     fn scan(&self) -> Result<()> {
-        let recreations = self.bsc_mainnet.then(Recreations::bsc_mainnet);
+        let recreations = if self.bsc_mainnet {
+            Some(Recreations::bsc_mainnet())
+        } else if self.eth_mainnet {
+            Some(Recreations::eth_mainnet())
+        } else {
+            None
+        };
         self.scan_with(recreations.as_ref())
     }
 
@@ -247,6 +263,13 @@ impl Recreations {
                 .iter()
                 .map(|address| keccak256(address).0)
                 .collect(),
+        }
+    }
+
+    fn eth_mainnet() -> Self {
+        Self {
+            before: ETH_MAINNET_CANCUN_BLOCK,
+            upgradable: HashSet::new(),
         }
     }
 
@@ -402,11 +425,12 @@ impl Scanner<'_> {
         self.stats
             .recreations
             .fetch_add(account.recreations.len() as u64, Ordering::Relaxed);
-        let deletions: Vec<u64> = account
+        // Each with whether the account exists at the end of that block.
+        let deletions: Vec<(u64, bool)> = account
             .deletions
             .iter()
-            .chain(&account.recreations)
-            .copied()
+            .map(|&block| (block, false))
+            .chain(account.recreations.iter().map(|&block| (block, true)))
             .collect();
         if deletions.is_empty() {
             return Ok(());
@@ -427,7 +451,7 @@ impl Scanner<'_> {
                 _ => break,
             };
             any_storage = true;
-            for &deleted in &deletions {
+            for &(deleted, live) in &deletions {
                 // The slot's value as of the deletion block.
                 key[32..64].copy_from_slice(&slot);
                 key[64..].copy_from_slice(&self.encode_version(deleted));
@@ -440,8 +464,9 @@ impl Scanner<'_> {
                 if found[..64] != key[..64] {
                     continue;
                 }
-                // Written by the deleting block itself: that write stands.
-                if self.decode_version(&found[64..96]) == deleted {
+                // Written by a block that created the account again: the
+                // new contract's slot stands.
+                if live && self.decode_version(&found[64..96]) == deleted {
                     continue;
                 }
                 if storage
@@ -566,7 +591,8 @@ mod tests {
     }
 
     /// An archive written before deletions zeroed storage: the scan plans the
-    /// slots, the apply zeroes them, and the deleting block's own writes stand.
+    /// slots and the apply zeroes them, including those the deleting block
+    /// wrote (addr's `a` at 4), but not those a recreating block wrote.
     /// `meta` is destroyed and created again within blocks 2 (other code) and
     /// 4 (lower nonce), leaving no deletion; `system` is upgraded in place at
     /// 2, and `meta` changes code again at 5, past the rules' Cancun.
@@ -646,6 +672,7 @@ mod tests {
             cache_size: 64,
             archive_zstd_compression: false,
             bsc_mainnet: false,
+            eth_mainnet: false,
         };
         let recreations = Recreations {
             before: 5,
@@ -658,6 +685,7 @@ mod tests {
             plan,
             [
                 (addr, a, 2),
+                (addr, a, 4),
                 (addr, b, 2),
                 (addr, b, 4),
                 (meta, a, 2),
@@ -670,7 +698,7 @@ mod tests {
         assert_eq!(
             lines.matches(" true\n").count(),
             5,
-            "all but addr's deletion at 4"
+            "all but addr's deletions at 4"
         );
 
         command.apply = true;
@@ -687,7 +715,7 @@ mod tests {
         assert_eq!([read(1, addr, a), read(1, addr, b)], [7, 9]);
         assert_eq!([read(2, addr, a), read(2, addr, b)], [0, 0]);
         assert_eq!([read(3, addr, a), read(3, addr, b)], [0, 5]);
-        assert_eq!([read(4, addr, a), read(4, addr, b)], [11, 0]);
+        assert_eq!([read(4, addr, a), read(4, addr, b)], [0, 0]);
         assert_eq!(read(4, next, b), 1);
         assert_eq!([read(1, meta, a), read(1, meta, b)], [3, 4]);
         assert_eq!([read(2, meta, a), read(2, meta, b)], [0, 8]);

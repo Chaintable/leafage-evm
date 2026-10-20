@@ -25,6 +25,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 alloy.workspace = true
 alloy-evm.workspace = true
+alloy-hardforks.workspace = true
 alloy-contract.workspace = true  # sol! 宏展开需要
 metrics.workspace = true
 hyper.workspace = true

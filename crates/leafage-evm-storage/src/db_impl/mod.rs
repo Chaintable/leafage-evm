@@ -307,6 +307,15 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::MDBXArchive(db) => db.supports_batched_reads(),
         }
     }
+
+    fn read_storage_slots(&self, address: H256) -> Result<Option<Vec<(H256, U256)>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_storage_slots(address),
+            MultiStateDB::RocksDBArchive(db) => db.read_storage_slots(address),
+            MultiStateDB::MDBXState(db) => db.read_storage_slots(address),
+            MultiStateDB::MDBXArchive(db) => db.read_storage_slots(address),
+        }
+    }
 }
 
 pub enum MultiWriteBatch {

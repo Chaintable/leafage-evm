@@ -2410,8 +2410,8 @@ impl StateDB {
         }
     }
 
-    /// The slots of `address` holding a non-zero value.
-    fn storage_slots(&self, address: H256) -> Result<Vec<H256>, Error> {
+    /// The slots of `address` holding a non-zero value, with the value.
+    fn storage_slots(&self, address: H256) -> Result<Vec<(H256, U256)>, Error> {
         let address_bytes: [u8; 32] = address.into();
         // Seeking to slots that may not exist: past the prefix bloom.
         let address_to_storage_cf = self
@@ -2440,8 +2440,9 @@ impl StateDB {
                 }
                 _ => break,
             };
-            if !self.read_storage(address, slot)?.is_zero() {
-                slots.push(slot);
+            let value = self.read_storage(address, slot)?;
+            if !value.is_zero() {
+                slots.push((slot, value));
             }
             from = U256::from_be_bytes(slot.0).checked_add(U256::from(1));
         }
@@ -2528,6 +2529,10 @@ impl StateDBRead for StateDB {
             None => self.db.read_latest_block_hash(),
         }
     }
+
+    fn read_storage_slots(&self, address: H256) -> Result<Option<Vec<(H256, U256)>>, Error> {
+        self.storage_slots(address).map(Some)
+    }
 }
 /// StateDB delegates all write operations to Arc<DataBaseRef>
 impl StateDBWrite for StateDB {
@@ -2584,7 +2589,7 @@ impl StateDBWrite for StateDB {
         address: H256,
         block_num: u64,
     ) -> Result<(), Error> {
-        for slot in self.storage_slots(address)? {
+        for (slot, _) in self.storage_slots(address)? {
             self.db
                 .write_storage(batch, address, slot, block_num, U256::ZERO)?;
         }
@@ -3447,7 +3452,7 @@ mod inverted_encoding_tests {
             let values =
                 |n: u64| [a, b, c].map(|slot| at(n).read_storage(addr, slot).unwrap().to::<u64>());
             assert_eq!(values(2), [7, 0, 0], "inverted={inverted}");
-            assert_eq!(at(2).storage_slots(addr).unwrap(), vec![a]);
+            assert_eq!(at(2).storage_slots(addr).unwrap(), vec![(a, U256::from(7))]);
             assert_eq!(values(3), [0, 0, 0], "inverted={inverted}");
             assert!(at(3).storage_slots(addr).unwrap().is_empty());
             assert_eq!(values(4), [0, 5, 0], "inverted={inverted}");

@@ -24,6 +24,9 @@ use crate::pipeline::build::{
     pipeline_block, pipeline_header, pipeline_transaction, receipt_envelope,
 };
 use crate::pipeline::chain::{ReplayOptions, ReplayOutput, ReplayTimings};
+use crate::pipeline::changes::{
+    check, delete_touched_empty, normalize_code_hash, AccountChange, ChangeSet, StorageSlots,
+};
 use crate::pipeline::convert::append_tx_traces;
 use crate::pipeline::inspector::PipelineInspector;
 use crate::pipeline::types::{addr_hex, BlockFile};
@@ -34,7 +37,7 @@ use alloy::eips::{
     eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS},
     eip7840::BlobParams,
 };
-use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{address, Address, Bytes, B256, U256};
 use alloy::rpc::types::{Block as RpcBlock, BlockTransactions};
 use alloy_evm::{EvmEnv, FromRecoveredTx};
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -43,9 +46,6 @@ use leafage_evm_chains::bsc::mainnet::{
     BSC_MAINNET_UPGRADABLE_CONTRACTS,
 };
 use leafage_evm_chains::bsc::{BscEvm, BscHardfork, BscHardforks, BscTxEnv};
-use leafage_evm_types::{
-    AccountStorageDiff, BlockStorageDiff, IndexValuePair, NewAccount, NewCode,
-};
 use revm::bytecode::Bytecode;
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
@@ -54,9 +54,8 @@ use revm::inspector::NoOpInspector;
 use revm::primitives::{hardfork::SpecId, KECCAK_EMPTY};
 use revm::state::{AccountInfo, EvmState};
 use revm::{Database, DatabaseCommit, DatabaseRef, ExecuteEvm, InspectEvm};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
-use tracing::warn;
 
 /// go-bsc `consensus.SystemAddress`: collects the fees of a block until
 /// `distributeIncoming` hands them to the coinbase.
@@ -81,13 +80,12 @@ const SYSTEM_TX_CONTRACTS: [Address; 14] = [
     address!("0000000000000000000000000000000000003000"),
 ];
 
-/// Mismatches listed in a verification error before it is cut short.
-const MAX_REPORTED_MISMATCHES: usize = 20;
-
 /// One block of a [`replay_range`].
 pub(crate) struct RangeBlock<D> {
     /// State after the block, used for upgrades and checks.
     pub post_state: D,
+    /// State before the block, for the storage of the accounts it destroys.
+    pub parent_state: Option<Box<dyn StorageSlots + Send>>,
     pub parent_timestamp: u64,
     pub parent_state_root: B256,
     pub block: RpcBlock,
@@ -98,6 +96,7 @@ pub(crate) struct RangeBlock<D> {
 /// next, so a key is read from `parent_state` only the first time the range
 /// touches it: until then no block of the range changed it, so its value
 /// before the first block is still current.
+#[cfg(test)]
 pub(crate) fn replay_range<D>(
     parent_state: D,
     blocks: Vec<RangeBlock<D>>,
@@ -167,6 +166,7 @@ where
 {
     let RangeBlock {
         post_state,
+        parent_state,
         parent_timestamp,
         parent_state_root,
         block,
@@ -287,13 +287,7 @@ where
     timings.execute = started.elapsed();
     let started = std::time::Instant::now();
     // checks
-    let check = |result: Result<()>| match result {
-        Err(err) if !options.strict => {
-            warn!("ignoring failed check: {err:#}");
-            Ok(())
-        }
-        result => result,
-    };
+    let check = |result: Result<()>| check(options.strict, result);
     check(if replay.gas_used != header.gas_used {
         Err(anyhow!(
             "block {number}: replay used {} gas, header says {}",
@@ -323,10 +317,15 @@ where
     } else if header.state_root == parent_state_root {
         Some(Bytes::new())
     } else {
-        let diff =
-            replay
-                .changes
-                .to_storage_diff(&replay.db, header.state_root, parent_state_root)?;
+        let parent_state = parent_state
+            .as_deref()
+            .map(|state| state as &dyn StorageSlots);
+        let diff = replay.changes.to_storage_diff(
+            &replay.db,
+            parent_state,
+            header.state_root,
+            parent_state_root,
+        )?;
         Some(alloy::rlp::encode(diff).into())
     };
 
@@ -371,17 +370,6 @@ fn evm_env(header: &alloy::rpc::types::Header, spec: BscHardfork) -> EvmEnv<BscH
         slot_num: 0,
     };
     EvmEnv::new(cfg, block)
-}
-
-/// EIP-161, active since genesis: a touched account left empty is deleted.
-/// CacheDB would keep it as an existing empty account, which EIP-7702
-/// refunds as an existing authority.
-fn delete_touched_empty(state: &mut EvmState) {
-    for account in state.values_mut() {
-        if account.is_touched() && account.is_empty() {
-            account.mark_selfdestruct();
-        }
-    }
 }
 
 /// go-bsc `Parlia.IsSystemTransaction`.
@@ -502,61 +490,15 @@ where
         self.set_info(address, info)
     }
 
-    /// The change entry of `address`, created with the value the account
-    /// had before the block. Called before the first write to it, so the
-    /// read hits the account the execution already cached.
     fn track(&mut self, address: Address) -> Result<&mut AccountChange> {
-        if !self.changes.accounts.contains_key(&address) {
-            let original = self.db.basic(address)?.filter(|info| !is_empty(info));
-            self.changes.accounts.insert(
-                address,
-                AccountChange {
-                    info: original.clone(),
-                    original,
-                    storage: HashMap::new(),
-                },
-            );
-        }
-        Ok(self
-            .changes
-            .accounts
-            .get_mut(&address)
-            .expect("inserted above"))
+        Ok(self.changes.track(&mut self.db, address)?)
     }
 
     /// Fold a transaction's state changes into the block's, before they are
     /// committed to `db`.
     fn record(&mut self, state: &EvmState) -> Result<()> {
-        if !self.track {
-            return Ok(());
-        }
-        for (address, account) in state {
-            if !account.is_touched() {
-                continue;
-            }
-            let change = self.track(*address)?;
-            if account.is_selfdestructed() || account.is_created() {
-                for slot in change.storage.values_mut() {
-                    slot.present = U256::ZERO;
-                }
-            }
-            if account.is_selfdestructed() {
-                change.info = None;
-                continue;
-            }
-            change.info = Some(account.info.clone());
-            for (key, value) in &account.storage {
-                if value.is_changed() {
-                    change
-                        .storage
-                        .entry(*key)
-                        .or_insert(SlotChange {
-                            original: value.original_value(),
-                            present: U256::ZERO,
-                        })
-                        .present = value.present_value();
-                }
-            }
+        if self.track {
+            self.changes.record(&mut self.db, state)?;
         }
         Ok(())
     }
@@ -568,11 +510,7 @@ where
         }
         self.track(address)?;
         self.db.insert_account_info(address, info.clone());
-        self.changes
-            .accounts
-            .get_mut(&address)
-            .expect("tracked")
-            .info = Some(info);
+        self.track(address)?.info = Some(info);
         Ok(())
     }
 
@@ -591,14 +529,7 @@ where
         if change.info.is_none() {
             change.info = info;
         }
-        change
-            .storage
-            .entry(slot)
-            .or_insert(SlotChange {
-                original,
-                present: U256::ZERO,
-            })
-            .present = value;
+        ChangeSet::set_slot(change, slot, original, value);
         Ok(())
     }
 
@@ -627,217 +558,9 @@ where
     }
 }
 
-/// Accounts and slots written by the replay, with their values before and
-/// after the block.
-#[derive(Default)]
-struct ChangeSet {
-    accounts: HashMap<Address, AccountChange>,
-}
-
-struct AccountChange {
-    /// Before the block; `None` if the account did not exist (or was empty).
-    original: Option<AccountInfo>,
-    /// `None` once the account was destroyed.
-    info: Option<AccountInfo>,
-    storage: HashMap<U256, SlotChange>,
-}
-
-struct SlotChange {
-    original: U256,
-    present: U256,
-}
-
-impl ChangeSet {
-    /// Compare every changed account and slot with the archive state of the
-    /// block.
-    fn verify<D>(&self, post: &D) -> Result<()>
-    where
-        D: DatabaseRef,
-        D::Error: Send + Sync + 'static,
-    {
-        let mut mismatches = Vec::new();
-        let mut addresses: Vec<_> = self.accounts.keys().collect();
-        addresses.sort();
-        for address in addresses {
-            let change = &self.accounts[address];
-            let ours = change.info.as_ref().filter(|info| !is_empty(info));
-            let stored = post.basic_ref(*address)?;
-            let stored = stored.as_ref().filter(|info| !is_empty(info));
-            match (ours, stored) {
-                (None, None) => {}
-                (Some(ours), Some(stored))
-                    if ours.balance == stored.balance
-                        && ours.nonce == stored.nonce
-                        && normalize_code_hash(ours.code_hash)
-                            == normalize_code_hash(stored.code_hash) => {}
-                (ours, stored) => mismatches.push(format!(
-                    "account {address}: replay {}, archive {}",
-                    describe(ours),
-                    describe(stored)
-                )),
-            }
-            if ours.is_none() {
-                continue;
-            }
-            let mut slots: Vec<_> = change
-                .storage
-                .iter()
-                .map(|(slot, value)| (slot, &value.present))
-                .collect();
-            slots.sort();
-            for (slot, value) in slots {
-                let stored = post.storage_ref(*address, *slot)?;
-                if stored != *value {
-                    mismatches.push(format!(
-                        "storage {address}[{slot:#x}]: replay {value:#x}, archive {stored:#x}"
-                    ));
-                }
-            }
-        }
-        if mismatches.is_empty() {
-            return Ok(());
-        }
-        let total = mismatches.len();
-        mismatches.truncate(MAX_REPORTED_MISMATCHES);
-        bail!(
-            "replayed state differs from the archive in {total} places: {}",
-            mismatches.join("; ")
-        )
-    }
-
-    /// Best-effort `BlockStorageDiff` in the leafage / pipeline encoding.
-    fn to_storage_diff<D>(
-        &self,
-        db: &CacheDB<D>,
-        state_root: B256,
-        parent_state_root: B256,
-    ) -> Result<BlockStorageDiff>
-    where
-        D: DatabaseRef,
-        D::Error: Send + Sync + 'static,
-    {
-        let mut new_accounts = BTreeMap::new();
-        let mut deleted_accounts = BTreeSet::new();
-        let mut storage_diffs = BTreeMap::new();
-        let mut new_codes = BTreeMap::new();
-        // Net changes against the state before the block, from the values
-        // recorded during execution (no reads of the parent state).
-        for (address, change) in &self.accounts {
-            let hashed = keccak256(address);
-            let before = change.original.as_ref();
-            let Some(info) = change.info.as_ref().filter(|info| !is_empty(info)) else {
-                if before.is_some() {
-                    deleted_accounts.insert(hashed);
-                }
-                continue;
-            };
-            let unchanged = before.is_some_and(|before| {
-                before.balance == info.balance
-                    && before.nonce == info.nonce
-                    && normalize_code_hash(before.code_hash) == normalize_code_hash(info.code_hash)
-            });
-            if !unchanged {
-                new_accounts.insert(
-                    hashed,
-                    NewAccount {
-                        address: hashed,
-                        balance: info.balance,
-                        nonce: info.nonce,
-                        code_hash: info.code_hash,
-                    },
-                );
-            }
-            let code_hash = normalize_code_hash(info.code_hash);
-            let code_before = before.map(|before| normalize_code_hash(before.code_hash));
-            if code_hash != KECCAK_EMPTY && code_before != Some(code_hash) {
-                let code = db.code_by_hash_ref(info.code_hash)?;
-                new_codes.insert(
-                    code_hash,
-                    NewCode {
-                        code_hash,
-                        code: code.original_bytes(),
-                    },
-                );
-            }
-            let mut diffs: Vec<_> = change
-                .storage
-                .iter()
-                .filter(|(_, slot)| slot.present != slot.original)
-                .map(|(key, slot)| IndexValuePair {
-                    index: keccak256(key.to_be_bytes::<32>()),
-                    value: slot.present,
-                })
-                .collect();
-            if !diffs.is_empty() {
-                diffs.sort_by_key(|pair| pair.index);
-                storage_diffs.insert(
-                    hashed,
-                    AccountStorageDiff {
-                        address: hashed,
-                        diffs,
-                    },
-                );
-            }
-        }
-        Ok(BlockStorageDiff {
-            hash: state_root,
-            parent_hash: parent_state_root,
-            new_accounts: new_accounts.into_values().collect(),
-            deleted_accounts: deleted_accounts.into_iter().collect(),
-            storage_diffs: storage_diffs.into_values().collect(),
-            new_codes: new_codes.into_values().collect(),
-        })
-    }
-}
-
-/// EIP-161 empty: such accounts are removed from the trie.
-fn is_empty(info: &AccountInfo) -> bool {
-    info.balance.is_zero() && info.nonce == 0 && normalize_code_hash(info.code_hash) == KECCAK_EMPTY
-}
-
-fn normalize_code_hash(code_hash: B256) -> B256 {
-    if code_hash.is_zero() {
-        KECCAK_EMPTY
-    } else {
-        code_hash
-    }
-}
-
-fn describe(info: Option<&AccountInfo>) -> String {
-    match info {
-        None => "absent".to_string(),
-        Some(info) => format!(
-            "balance {} nonce {} code {}",
-            info.balance, info.nonce, info.code_hash
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn touched_empty_accounts_are_deleted() {
-        use revm::database::EmptyDB;
-        use revm::state::Account;
-        let (empty, funded) = (Address::with_last_byte(1), Address::with_last_byte(2));
-        let mut db = CacheDB::new(EmptyDB::default());
-        db.insert_account_info(empty, AccountInfo::default());
-        let mut state = EvmState::default();
-        for (address, balance) in [(empty, 0), (funded, 1)] {
-            let mut account = Account::from(AccountInfo {
-                balance: U256::from(balance),
-                ..Default::default()
-            });
-            account.mark_touch();
-            state.insert(address, account);
-        }
-        delete_touched_empty(&mut state);
-        db.commit(state);
-        assert_eq!(db.basic(empty).unwrap(), None);
-        assert_eq!(db.basic(funded).unwrap().unwrap().balance, U256::from(1));
-    }
 
     #[test]
     fn system_transaction_needs_coinbase_zero_price_and_system_target() {

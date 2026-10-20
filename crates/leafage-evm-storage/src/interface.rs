@@ -54,6 +54,12 @@ pub trait StateDB {
     fn supports_batched_reads(&self) -> bool {
         false
     }
+
+    /// The slots of `address` holding a non-zero value, with the value, or
+    /// `None` if the backend cannot list them.
+    fn storage_slots(&self, _address: H256) -> Result<Option<Vec<(H256, U256)>>, Self::Error> {
+        Ok(None)
+    }
 }
 
 /// [`BlockContext`] is a trait that provides access to the block information at a specific block height.
@@ -156,6 +162,19 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
 }
 
 impl<T: StateDB> EvmStorageWrapper<T> {
+    /// The slots of `address` holding a non-zero value, hashed keys with
+    /// the value, as [`StateDB::storage_slots`]; `None` also when the keys
+    /// are normalized, since they would not hash back from the slot index.
+    pub fn storage_slots_ref(
+        &self,
+        address: Address,
+    ) -> Result<Option<Vec<(H256, U256)>>, T::Error> {
+        if self.normalize_state_key {
+            return Ok(None);
+        }
+        self.db.storage_slots(keccak256(address.as_slice()))
+    }
+
     /// Batched [`DatabaseRef::basic_ref`]: one result per input, same
     /// order. On OVM-configured chains every account read needs an extra
     /// balance-slot read whose key derivation bypasses

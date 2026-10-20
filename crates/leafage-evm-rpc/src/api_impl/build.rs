@@ -1,5 +1,6 @@
 use super::api_impl::NoneEvmCustomConfig;
-use super::bsc::trace::{BscTrace, BscTraceApiServer};
+use super::bsc::trace::BscPipeline;
+use super::mainnet::trace::EthPipeline;
 use super::tempo::api::TempoEvmCustomConfig;
 use super::token_collector::TokenCollector;
 use super::ApiImpl;
@@ -12,12 +13,15 @@ use crate::api_impl::core::{
 };
 use crate::api_impl::historical_overload::{HistoricalOverloadHttpLayer, HistoricalOverloadRpc};
 use crate::metrics::{HttpMetricLayer, RpcMetric};
+use crate::pipeline::chain::PipelineChain;
+use crate::pipeline::rpc::{TraceDebank, TraceDebankApiServer};
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
     RpcModule,
 };
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
+use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
@@ -95,7 +99,8 @@ where
     }
 
     /// Upstream RPC serving full block bodies for `trace_debankBlock`. The
-    /// method is only served by BSC mainnet archive nodes configured with one.
+    /// method is only served by BSC and Ethereum mainnet archive nodes
+    /// configured with one.
     /// `check_state` also compares every account and slot the replay changed
     /// with the archive state of the block, on top of the gas used and
     /// receipts root checks.
@@ -193,7 +198,7 @@ fn bind_listener(addr: &str, backlog: u32) -> std::io::Result<std::net::TcpListe
 
 impl<DB> ApiBuilder<DB>
 where
-    DB: EvmStorageRead + BlockIndex + Sync + Send + 'static,
+    DB: EvmStorageRead + BlockIndex + Clone + Sync + Send + 'static,
 {
     pub async fn build_and_run(
         mut self,
@@ -280,21 +285,32 @@ where
             }};
         }
 
-        // trace_debankBlock replays on the archive with the BSC mainnet fork
-        // schedule.
+        // trace_debankBlock replays on the archive with the BSC or Ethereum
+        // mainnet fork schedule.
         let mut trace_block_client = self.trace_block_client.take();
-        let bsc_mainnet = matches!(
-            &self.cfg,
-            MultiChainCfgEnv::Bsc(env) if env.chain_id == BSC_MAINNET_CHAIN_ID
-        );
-        if trace_block_client.is_some() && !(is_archive && bsc_mainnet) {
-            warn!("trace_debankBlock needs a BSC mainnet archive database, not serving it");
+        let traced_chain = match &self.cfg {
+            MultiChainCfgEnv::Bsc(env) => env.chain_id == BSC_MAINNET_CHAIN_ID,
+            MultiChainCfgEnv::Mainnet(env) => env.chain_id == ETH_MAINNET_CHAIN_ID,
+            _ => false,
+        };
+        if trace_block_client.is_some() && !(is_archive && traced_chain) {
+            warn!(
+                "trace_debankBlock needs a BSC or Ethereum mainnet archive database, not serving it"
+            );
             trace_block_client = None;
         }
 
         match self.cfg.clone() {
             MultiChainCfgEnv::Mainnet(env) => {
-                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>, |api| {
+                    merge_trace(
+                        &mut rpc_module,
+                        api,
+                        EthPipeline,
+                        trace_block_client.take(),
+                        self.trace_block_check_state,
+                    )?;
+                })
             }
             MultiChainCfgEnv::Arc((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, Some(custom_evm_cfg))
@@ -308,9 +324,10 @@ where
             }
             MultiChainCfgEnv::Bsc(env) => {
                 run_chain_setup!(env, None, |api| {
-                    merge_bsc_trace(
+                    merge_trace(
                         &mut rpc_module,
                         api,
+                        BscPipeline,
                         trace_block_client.take(),
                         self.trace_block_check_state,
                     )?;
@@ -395,22 +412,27 @@ async fn warmup_api<A>(
     }
 }
 
-fn merge_bsc_trace<C>(
+/// Serve `trace_debankBlock` for `chain` when an upstream for its block
+/// bodies is configured.
+fn merge_trace<C, P>(
     rpc_module: &mut RpcModule<()>,
     api: Api<C>,
+    chain: P,
     block_client: Option<HttpClient>,
     check_state: bool,
 ) -> std::io::Result<()>
 where
     C: ApiBase,
-    C::DB: BlockIndex + EvmStorageRead + Sync + Send + 'static,
+    C::DB: BlockIndex + EvmStorageRead + Clone + Sync + Send + 'static,
+    P: PipelineChain<C::DB>,
 {
     let Some(block_client) = block_client else {
         return Ok(());
     };
     rpc_module
-        .merge(BscTraceApiServer::into_rpc(BscTrace::new(
+        .merge(TraceDebankApiServer::into_rpc(TraceDebank::new(
             api,
+            chain,
             block_client,
             check_state,
         )))

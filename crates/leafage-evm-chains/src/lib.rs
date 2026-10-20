@@ -4,6 +4,7 @@ pub mod base;
 pub mod bsc;
 pub mod citrea;
 pub mod cosmos;
+pub mod eth;
 pub mod hemi;
 pub mod iotex;
 pub mod mantle;
