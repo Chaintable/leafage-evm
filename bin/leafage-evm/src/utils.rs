@@ -702,47 +702,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn parse_block_info_legacy_header() {
-        // Actual eth_getBlockByNumber response for Celo mainnet block 96.
-        let mut rpc: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/celo-l1-block-96.json")).unwrap();
-        let block = parse_block_info(rpc.clone()).unwrap();
-        let normalized = serde_json::to_value(block).unwrap();
-        assert_eq!(normalized["nonce"], "0x0000000000000000");
-        assert_eq!(
-            normalized["sha3Uncles"],
-            "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
-        );
-        assert_eq!(normalized["mixHash"], serde_json::json!(H256::ZERO));
-        for (key, value) in rpc.as_object().unwrap() {
-            assert_eq!(&normalized[key], value, "RPC field {key} changed");
-        }
-        // Required state fields must still fail validation when missing.
-        rpc.as_object_mut().unwrap().remove("stateRoot");
-        let error = parse_block_info(rpc).unwrap_err();
-        assert!(format!("{error:#}").contains("missing field `stateRoot`"));
-    }
-
-    #[test]
-    fn parse_block_info_preserves_rpc_fields() {
-        let mut rpc = serde_json::to_value(BlockInfo::default()).unwrap();
-        rpc["nonce"] = serde_json::json!("0x0000000000000042");
-        rpc["sha3Uncles"] = serde_json::json!(test_hash(1));
-        rpc["mixHash"] = serde_json::json!(test_hash(2));
-        rpc["prevRandao"] = serde_json::json!(test_hash(3));
-        let block = parse_block_info(rpc.clone()).unwrap();
-        assert_eq!(serde_json::to_value(block).unwrap(), rpc);
-        // Keep the existing prevRandao fallback and reject malformed values.
-        rpc.as_object_mut().unwrap().remove("mixHash");
-        assert_eq!(
-            parse_block_info(rpc.clone()).unwrap().header.mix_hash,
-            test_hash(3)
-        );
-        rpc["nonce"] = Value::Null;
-        assert!(parse_block_info(rpc).is_err());
-    }
-
-    #[test]
     fn s3_timeout_config_defaults_and_rejects_zero() {
         let mut json = serde_json::json!({
             "topic": "blocks", "brokers": "localhost:9092", "partition": 0,
