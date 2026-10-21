@@ -83,8 +83,18 @@ pub fn parse_kafka_s3_config(arg: &str) -> Result<KafkaS3Config> {
 /// `mixHash` 缺失时，优先复用 RPC 返回的 `prevRandao`（避免丢失真实随机值），
 /// 否则才退回零哈希（与 alloy `Header::default()` 一致，对 difficulty 非 0 的
 /// 链无影响）。
-fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
+fn parse_block_info(mut block: Value, s3_chain_id: &str) -> Result<BlockInfo> {
     if let Some(obj) = block.as_object_mut() {
+        // Pre-Gingerbread Celo RPC omits these PoW fields. Match the zero
+        // values exposed by its trace_debankBlock header, without changing
+        // the canonical hash or relaxing required fields for other chains.
+        if s3_chain_id == "42220" {
+            obj.entry("sha3Uncles").or_insert_with(|| {
+                serde_json::to_value(H256::ZERO).expect("zero hash serializes")
+            });
+            obj.entry("nonce")
+                .or_insert_with(|| Value::String("0x0000000000000000".into()));
+        }
         if !obj.contains_key("mixHash") {
             let mix_hash = obj
                 .get("prevRandao")
@@ -93,7 +103,7 @@ fn parse_block_info(mut block: Value) -> Result<BlockInfo> {
             obj.insert("mixHash".to_string(), mix_hash);
         }
     }
-    serde_json::from_value(block).context("rpc get block by hash parse failed")
+    serde_json::from_value(block).context("rpc block response parse failed")
 }
 
 /// Historical default used only when no explicit addressing strategy is supplied.
@@ -270,13 +280,13 @@ pub async fn s3_get_block_transactions_by_number(
             let block = rpc
                 .get_block_by_number(number.into(), false)
                 .await
-                .context(format!("rpc get block by hash failed, {number}"))?;
+                .context(format!("rpc get block by number failed, {number}"))?;
             if block.is_none() {
                 return Err(anyhow::anyhow!(
-                    "rpc get block by hash returned none, {number}"
+                    "rpc get block by number returned none, {number}"
                 ));
             }
-            let block: BlockInfo = parse_block_info(block.unwrap())?;
+            let block: BlockInfo = parse_block_info(block.unwrap(), s3_chain_id)?;
             s3_get_block_transactions(
                 s3_client,
                 outer_bucket_name,
@@ -392,13 +402,13 @@ pub async fn s3_get_block_info_by_number(
             let block = rpc
                 .get_block_by_number(number.into(), false)
                 .await
-                .context(format!("rpc get block by hash failed, {number}"))?;
+                .context(format!("rpc get block by number failed, {number}"))?;
             if block.is_none() {
                 return Err(anyhow::anyhow!(
-                    "rpc get block by hash returned none, {number}"
+                    "rpc get block by number returned none, {number}"
                 ));
             }
-            parse_block_info(block.unwrap())
+            parse_block_info(block.unwrap(), s3_chain_id)
         }
         None => {
             let block_hash = s3_get_block_hash_by_number(
@@ -703,6 +713,45 @@ mod tests {
         Router,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn parse_block_info_celo_legacy_fields() {
+        // Actual eth_getBlockByNumber response for Celo mainnet block 96.
+        let rpc: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/celo-l1-block-96.json")).unwrap();
+        let block = parse_block_info(rpc.clone(), "42220").unwrap();
+        let normalized = serde_json::to_value(block).unwrap();
+        assert_eq!(normalized["nonce"], "0x0000000000000000");
+        assert_eq!(normalized["sha3Uncles"], serde_json::json!(H256::ZERO));
+        assert_eq!(normalized["mixHash"], serde_json::json!(H256::ZERO));
+        for (key, value) in rpc.as_object().unwrap() {
+            assert_eq!(&normalized[key], value, "RPC field {key} changed");
+        }
+        // Missing PoW fields on another chain must still fail validation.
+        let error = parse_block_info(rpc, "1").unwrap_err();
+        assert!(format!("{error:#}").contains("missing field `sha3Uncles`"));
+    }
+
+    #[test]
+    fn parse_block_info_preserves_rpc_fields() {
+        let mut rpc = serde_json::to_value(BlockInfo::default()).unwrap();
+        rpc["nonce"] = serde_json::json!("0x0000000000000042");
+        rpc["sha3Uncles"] = serde_json::json!(test_hash(1));
+        rpc["mixHash"] = serde_json::json!(test_hash(2));
+        rpc["prevRandao"] = serde_json::json!(test_hash(3));
+        for chain in ["42220", "1"] {
+            let block = parse_block_info(rpc.clone(), chain).unwrap();
+            assert_eq!(serde_json::to_value(block).unwrap(), rpc);
+        }
+        // Keep the existing prevRandao fallback and reject malformed values.
+        rpc.as_object_mut().unwrap().remove("mixHash");
+        assert_eq!(
+            parse_block_info(rpc.clone(), "42220").unwrap().header.mix_hash,
+            test_hash(3)
+        );
+        rpc["nonce"] = Value::Null;
+        assert!(parse_block_info(rpc, "42220").is_err());
+    }
 
     #[test]
     fn s3_timeout_config_defaults_and_rejects_zero() {
