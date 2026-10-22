@@ -5,8 +5,60 @@ use auto_impl::auto_impl;
 use leafage_evm_types::{
     AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
+use moka::sync::Cache as MokaCache;
 use std::fmt::Debug;
-use tracing::{debug, trace};
+use std::sync::LazyLock;
+use tracing::{debug, info, trace};
+
+/// Default weighted capacity (MB) of the analyzed-bytecode cache.
+const DEFAULT_ANALYZED_CODE_CACHE_MB: u64 = 128;
+
+/// Approximate fixed cost of one cache entry (key, `Arc`s, cache metadata).
+const ANALYZED_CODE_ENTRY_OVERHEAD: usize = 128;
+
+/// Process-wide cache of analyzed bytecode, keyed by code hash.
+///
+/// [`Bytecode::new_raw`] walks the whole contract to build its jump table.
+/// Without this cache every request that touches a contract repeats that
+/// walk (a request-scoped `CacheDB` only dedupes within one request); on a
+/// historical-read workload it was ~4% of node CPU. The key is the keccak
+/// of the code, so an entry never goes stale and needs no invalidation, and
+/// `Bytecode` is an `Arc`, so a hit costs a reference-count bump.
+/// `ANALYZED_CODE_CACHE_MB=0` disables it.
+static ANALYZED_CODE_CACHE: LazyLock<Option<MokaCache<H256, Bytecode>>> = LazyLock::new(|| {
+    let mb = std::env::var("ANALYZED_CODE_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ANALYZED_CODE_CACHE_MB);
+    if mb == 0 {
+        info!(target = "storage", "analyzed bytecode cache disabled");
+        return None;
+    }
+    info!(target = "storage", "analyzed bytecode cache enabled: {}MB", mb);
+    Some(
+        MokaCache::builder()
+            .max_capacity(mb.saturating_mul(1024 * 1024))
+            // Padded code bytes, the one-bit-per-byte jump table, and a rough
+            // allowance for the key and per-entry bookkeeping. moka treats the
+            // capacity as best-effort, so this is a budget, not a hard limit.
+            .weigher(|_k: &H256, v: &Bytecode| {
+                let len = v.bytes_slice().len();
+                (len + len.div_ceil(8) + ANALYZED_CODE_ENTRY_OVERHEAD)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+            })
+            .build(),
+    )
+});
+
+/// Analyze `code` and remember the result under `code_hash`.
+fn analyze_and_cache(code_hash: H256, code: Bytes) -> Bytecode {
+    let bytecode = Bytecode::new_raw(code.0.into());
+    if let Some(cache) = ANALYZED_CODE_CACHE.as_ref() {
+        cache.insert(code_hash, bytecode.clone());
+    }
+    bytecode
+}
 
 #[auto_impl(&, Box, Arc)]
 pub trait BlockIterator: Send + Sync + 'static {
@@ -211,9 +263,12 @@ where
     }
     /// Get account code by its hash
     fn code_by_hash(&self, code_hash: H256) -> Result<Bytecode, Self::Error> {
+        if let Some(bytecode) = ANALYZED_CODE_CACHE.as_ref().and_then(|c| c.get(&code_hash)) {
+            return Ok(bytecode);
+        }
         let code = self.0.read_code(code_hash.into())?;
         if let Some(code) = code {
-            Ok(Bytecode::new_raw(code.0.into()))
+            Ok(analyze_and_cache(code_hash, code))
         } else {
             Ok(Bytecode::default())
         }
@@ -238,15 +293,29 @@ where
     }
 
     fn code_by_hash_many(&self, code_hashes: &[H256]) -> Result<Vec<Bytecode>, Self::Error> {
-        Ok(self
-            .0
-            .read_code_many(code_hashes)?
-            .into_iter()
-            .map(|code| match code {
-                Some(code) => Bytecode::new_raw(code.0.into()),
-                None => Bytecode::default(),
-            })
-            .collect())
+        let cache = ANALYZED_CODE_CACHE.as_ref();
+        let mut out: Vec<Option<Bytecode>> = code_hashes
+            .iter()
+            .map(|hash| cache.and_then(|c| c.get(hash)))
+            .collect();
+        let missing: Vec<H256> = code_hashes
+            .iter()
+            .zip(&out)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(hash, _)| *hash)
+            .collect();
+        if !missing.is_empty() {
+            let mut read = self.0.read_code_many(&missing)?.into_iter();
+            for (slot, hash) in out.iter_mut().zip(code_hashes) {
+                if slot.is_none() {
+                    *slot = Some(match read.next().flatten() {
+                        Some(code) => analyze_and_cache(*hash, code),
+                        None => Bytecode::default(),
+                    });
+                }
+            }
+        }
+        Ok(out.into_iter().map(|b| b.unwrap_or_default()).collect())
     }
 
     fn storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Self::Error> {
@@ -358,5 +427,107 @@ pub trait StateDBProvider: Send + Sync + 'static {
     ) -> Result<Option<StateDBWrapper<Self::StateDBReadWrite>>, StorageError> {
         let db = self.db_at(block_arg)?;
         Ok(db.map(|db| StateDBWrapper(db)))
+    }
+}
+
+#[cfg(test)]
+mod analyzed_code_cache_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A code-only reader that counts how often the backend is consulted.
+    #[derive(Default)]
+    struct CodeOnly {
+        codes: HashMap<H256, Bytes>,
+        reads: AtomicUsize,
+    }
+
+    impl StateDBRead for CodeOnly {
+        fn read_latest_block_hash(&self) -> Result<H256, StorageError> {
+            unimplemented!()
+        }
+        fn read_block_info(&self, _: H256) -> Result<Option<BlockInfo>, StorageError> {
+            unimplemented!()
+        }
+        fn read_block_hash(&self, _: u64) -> Result<H256, StorageError> {
+            unimplemented!()
+        }
+        fn read_account(&self, _: H256) -> Result<Option<NewAccount>, StorageError> {
+            unimplemented!()
+        }
+        fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, StorageError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.codes.get(&code_hash).cloned())
+        }
+        fn read_storage(&self, _: H256, _: H256) -> Result<U256, StorageError> {
+            unimplemented!()
+        }
+    }
+
+    fn hash(tag: u8) -> H256 {
+        // Distinct from every other test's keys: the cache is process-wide.
+        H256::from_slice(&[0xA7, 0xC0, 0xDE, tag].repeat(8))
+    }
+
+    /// The cache is configured once per process from the environment.
+    fn cache_enabled() -> bool {
+        ANALYZED_CODE_CACHE.is_some()
+    }
+
+    #[test]
+    fn repeat_code_reads_reuse_the_analyzed_bytecode() {
+        // PUSH1 4, JUMP, INVALID, JUMPDEST, STOP
+        let code = Bytes::from(vec![0x60, 0x04, 0x56, 0xfe, 0x5b, 0x00]);
+        let h = hash(1);
+        let reader = CodeOnly {
+            codes: HashMap::from([(h, code.clone())]),
+            ..Default::default()
+        };
+        let db = StateDBWrapper(reader);
+        let first = db.code_by_hash(h).unwrap();
+        let second = db.code_by_hash(h).unwrap();
+        assert_eq!(first, Bytecode::new_raw(code.0.clone().into()));
+        assert_eq!(first, second);
+        assert!(first.legacy_jump_table().unwrap().is_valid(4));
+        let expected_reads = if cache_enabled() { 1 } else { 2 };
+        assert_eq!(db.0.reads.load(Ordering::Relaxed), expected_reads);
+    }
+
+    #[test]
+    fn missing_code_is_empty_and_not_remembered() {
+        let h = hash(2);
+        let db = StateDBWrapper(CodeOnly::default());
+        assert_eq!(db.code_by_hash(h).unwrap(), Bytecode::default());
+        assert_eq!(db.code_by_hash(h).unwrap(), Bytecode::default());
+        assert_eq!(db.0.reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn batched_reads_match_scalar_reads_and_fill_the_cache() {
+        let (a, b, missing) = (hash(3), hash(4), hash(5));
+        let code_a = Bytes::from(vec![0x60, 0x01, 0x00]);
+        let code_b = Bytes::from(vec![0x5b, 0x60, 0x00, 0x56]);
+        let reader = CodeOnly {
+            codes: HashMap::from([(a, code_a.clone()), (b, code_b.clone())]),
+            ..Default::default()
+        };
+        let db = StateDBWrapper(reader);
+        // Warm only `a`, then ask for a mixed batch with a duplicate.
+        db.code_by_hash(a).unwrap();
+        let batch = db.code_by_hash_many(&[b, a, missing, b]).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                Bytecode::new_raw(code_b.0.clone().into()),
+                Bytecode::new_raw(code_a.0.clone().into()),
+                Bytecode::default(),
+                Bytecode::new_raw(code_b.0.clone().into()),
+            ]
+        );
+        let reads = db.0.reads.load(Ordering::Relaxed);
+        db.code_by_hash(b).unwrap();
+        let expected_reads = if cache_enabled() { reads } else { reads + 1 };
+        assert_eq!(db.0.reads.load(Ordering::Relaxed), expected_reads);
     }
 }
