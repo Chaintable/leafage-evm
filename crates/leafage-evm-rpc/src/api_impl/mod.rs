@@ -31,6 +31,7 @@ mod arc;
 mod arbitrum;
 mod base;
 pub(crate) mod bsc;
+mod celo;
 mod citrea;
 mod op;
 pub use op::build_op_custom_config;
