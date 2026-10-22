@@ -298,9 +298,9 @@ pub struct DataBaseRef {
     /// HashToCode disk get + zstd decode even for hot contracts. `None` =
     /// disabled via `ARCHIVE_CODE_CACHE_MB=0`.
     code_cache: Option<MokaCache<H256, Bytes>>,
-    /// Block hash -> block info. A hash names one block, so commits never
-    /// invalidate entries; rewind drops the whole cache. `None` = disabled
-    /// via `ARCHIVE_BLOCK_INFO_CACHE=0`.
+    /// Block hash -> block info. A hash names one block, so entries never go
+    /// stale; rewound blocks stay cached to serve requests for fork blocks.
+    /// `None` = disabled via `ARCHIVE_BLOCK_INFO_CACHE=0`.
     block_info_cache: Option<MokaCache<H256, BlockInfo>>,
     /// Cross-request account/storage read cache, see [`StateCache`]. Only
     /// built for a serving node (not bulk load or maintenance).
@@ -3591,8 +3591,7 @@ mod inverted_encoding_tests {
     }
 
     /// Reads through the state cache must match the archive at every height,
-    /// in any order and repeated (hits, extended spans, probed spans), and a
-    /// commit that rewrites an existing height must drop what was cached.
+    /// in any order and repeated (hits, extended spans, probed spans).
     fn run_state_cache_consistency(inverted: bool) {
         let _g = super::ARCHIVE_DB_TEST_LOCK
             .lock()
@@ -3726,7 +3725,7 @@ mod inverted_encoding_tests {
             assert_eq!(read(15), (U256::from(10), Some(10)));
             assert_eq!(read(20), (U256::from(10), Some(10)));
             assert_eq!(read(25), (U256::from(10), Some(10)));
-            // Appending block 21 is not a rewrite.
+            // Append block 21 on the head: reads from 21 on see its version.
             commit(&db, 21, Some(777));
             assert_eq!(read(21), (U256::from(777), Some(21)));
             assert_eq!(read(25), (U256::from(777), Some(21)));
