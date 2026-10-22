@@ -34,6 +34,18 @@ pub struct StorageMetrics {
     pub code_cache_hits: Counter,
     /// Archive code-cache misses (cumulative).
     pub code_cache_misses: Counter,
+    /// Archive state-cache account hits (cumulative).
+    pub account_cache_hits: Counter,
+    /// Archive state-cache account misses (cumulative).
+    pub account_cache_misses: Counter,
+    /// Archive state-cache storage hits (cumulative).
+    pub storage_cache_hits: Counter,
+    /// Archive state-cache storage misses (cumulative).
+    pub storage_cache_misses: Counter,
+    /// Archive state-cache misses that probed for the key's next version.
+    pub state_cache_probes: Counter,
+    /// Archive block-info cache hits (cumulative).
+    pub block_info_cache_hits: Counter,
     /// Commit block latency.
     pub commit_block_latency: Histogram,
     /// latest commit block.

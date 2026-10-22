@@ -201,6 +201,10 @@ mod tests {
             &dir.join("offset/offset"),
         )
         .unwrap();
+        // Rewind is an offline command; the node reopens the archive after it
+        // (a live process's read caches may still serve the rewound blocks).
+        drop(db);
+        let db = MultiStorage::open(&dir, 16, kind, true, false, false).unwrap();
         assert!(db.db_at(BlockId::number(3)).unwrap().is_none());
         for hash in [3, 4, 5] {
             assert!(db
