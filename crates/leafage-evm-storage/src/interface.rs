@@ -1,10 +1,11 @@
-use alloy::primitives::keccak256;
+use alloy::primitives::{keccak256, B256};
 use auto_impl::auto_impl;
 use leafage_evm_types::{
     AccountInfo, Address, BlockId, BlockInfo, BlockStorageDiff, Bytecode, H256, U256,
 };
 use revm::database_interface::DBErrorMarker;
 use revm::DatabaseRef;
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -119,10 +120,30 @@ pub struct EvmStorageWrapper<T> {
     pub normalize_state_key: bool,
 }
 
+/// `keccak256(address)`, the state key of an account. Reads that miss the
+/// request cache tend to come in runs on one contract (its slots), so the
+/// thread remembers the last address hashed.
+#[inline]
+fn hash_address(address: &Address) -> B256 {
+    thread_local! {
+        static LAST: Cell<Option<(Address, B256)>> = const { Cell::new(None) };
+    }
+    LAST.with(|last| {
+        if let Some((cached, hash)) = last.get() {
+            if cached == *address {
+                return hash;
+            }
+        }
+        let hash = keccak256(address.as_slice());
+        last.set(Some((*address, hash)));
+        hash
+    })
+}
+
 impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
     type Error = T::Error;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let account = self.db.basic(keccak256(address.as_slice()))?;
+        let account = self.db.basic(hash_address(&address))?;
         if let Some(ovm_address) = self.ovm_address {
             let balance = self
                 .db
@@ -145,7 +166,7 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
         self.db.code_by_hash(code_hash.0.into())
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let address = keccak256(address.as_slice());
+        let address = hash_address(&address);
         let index = keccak256::<[u8; 32]>(if self.normalize_state_key {
             to_normalize_state_key(index)
         } else {

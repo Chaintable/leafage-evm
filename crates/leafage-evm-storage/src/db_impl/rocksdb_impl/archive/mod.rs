@@ -52,9 +52,11 @@ use tracing::{debug, info, warn};
 
 mod iterator_tracker;
 mod rewind;
+mod state_cache;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
+use state_cache::{CachedAccount, Lookup, Span, StateCache};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -104,6 +106,45 @@ fn rocksdb_read_options() -> ReadOptions {
     let mut read_options = ReadOptions::default();
     read_options.set_verify_checksums(false);
     read_options
+}
+
+/// Turn RocksDB's per-thread perf counters off for the calling thread, once.
+/// Nothing reads them, and RocksDB's default level counts on every block and
+/// key a read visits. The level is thread-local, and reads run on whichever
+/// blocking-pool thread picked up the request.
+#[inline]
+fn disable_perf_counters() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    DONE.with(|done| {
+        if !done.get() {
+            rocksdb::perf::set_perf_stats(rocksdb::perf::PerfStatsLevel::Disable);
+            done.set(true);
+        }
+    });
+}
+
+/// Default entry count of the block-info cache (block hash -> header).
+const DEFAULT_BLOCK_INFO_CACHE_ENTRIES: u64 = 16384;
+
+/// Build the block-info cache honoring `ARCHIVE_BLOCK_INFO_CACHE` (entries;
+/// `0` disables). Keyed by block hash, so an entry never goes stale. Every
+/// request resolves its block through it.
+fn build_block_info_cache() -> Option<MokaCache<H256, BlockInfo>> {
+    let entries = env::var("ARCHIVE_BLOCK_INFO_CACHE")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BLOCK_INFO_CACHE_ENTRIES);
+    if entries == 0 {
+        info!(target = "rocksdb", "archive block info cache disabled");
+        return None;
+    }
+    info!(
+        target = "rocksdb",
+        "archive block info cache enabled: {} entries", entries
+    );
+    Some(MokaCache::new(entries))
 }
 
 /// Default weighted capacity (MB) of the content-addressed code cache.
@@ -257,6 +298,13 @@ pub struct DataBaseRef {
     /// HashToCode disk get + zstd decode even for hot contracts. `None` =
     /// disabled via `ARCHIVE_CODE_CACHE_MB=0`.
     code_cache: Option<MokaCache<H256, Bytes>>,
+    /// Block hash -> block info. A hash names one block, so entries never go
+    /// stale; rewound blocks stay cached to serve requests for fork blocks.
+    /// `None` = disabled via `ARCHIVE_BLOCK_INFO_CACHE=0`.
+    block_info_cache: Option<MokaCache<H256, BlockInfo>>,
+    /// Cross-request account/storage read cache, see [`StateCache`]. Only
+    /// built for a serving node (not bulk load or maintenance).
+    state_cache: Option<StateCache>,
 }
 
 pub struct ArchiveRocksDBWriteBatch {
@@ -268,6 +316,9 @@ pub struct ArchiveRocksDBWriteBatch {
     /// Used by archive ingest at checkpoint boundaries to make the resume
     /// pointer durable without paying for fsync on every commit.
     sync: bool,
+    /// Highest block this batch writes a version or block hash at; the
+    /// state cache's head moves to it once the batch is committed.
+    max_block: Option<u64>,
 }
 
 impl ArchiveRocksDBWriteBatch {
@@ -277,7 +328,13 @@ impl ArchiveRocksDBWriteBatch {
             account_writes: Vec::new(),
             storage_writes: Vec::new(),
             sync: false,
+            max_block: None,
         }
+    }
+
+    #[inline]
+    fn note_block(&mut self, block_num: u64) {
+        self.max_block = Some(self.max_block.map_or(block_num, |m| m.max(block_num)));
     }
 
     /// Mark this batch as a sync commit: fsync the WAL before `commit()`
@@ -1031,15 +1088,25 @@ impl DataBaseRef {
             ),
         ];
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
+        let serving = !bulk_load && !maintenance;
         let db_ref = Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
             code_cache: build_code_cache(),
+            block_info_cache: build_block_info_cache(),
+            state_cache: if serving {
+                StateCache::from_env()
+            } else {
+                None
+            },
         };
         // Self-describing encoding: if the DB records its block-height key
         // encoding, honor it (a legacy DB has no marker and is left untouched),
         // so the node can't mistake an inverted DB for a legacy one.
         if !maintenance {
             db_ref.align_encoding_from_marker();
+        }
+        if let Some(cache) = &db_ref.state_cache {
+            cache.advance_head(db_ref.read_latest_block_num()?.unwrap_or(0));
         }
         Ok(db_ref)
     }
@@ -1320,6 +1387,22 @@ impl DataBaseRef {
     }
 
     pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+        if let Some(info) = self
+            .block_info_cache
+            .as_ref()
+            .and_then(|cache| cache.get(&block_hash))
+        {
+            STORAGE_METRICS.block_info_cache_hits.increment(1);
+            return Ok(Some(info));
+        }
+        let info = self.read_block_info_from_db(block_hash)?;
+        if let (Some(cache), Some(info)) = (&self.block_info_cache, &info) {
+            cache.insert(block_hash, info.clone());
+        }
+        Ok(info)
+    }
+
+    fn read_block_info_from_db(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
         let start = std::time::Instant::now();
         let block_hash_to_block_info_cf = self
             .db
@@ -2229,25 +2312,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
             },
         }
 
-        let address_to_account_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-            .unwrap();
-        let account_iterator = self
-            .db
-            .raw_iterator_cf_opt(address_to_account_cf, rocksdb_read_options());
-
-        let address_to_storage_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-
-        let storage_iterator = self
-            .db
-            .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
-
-        // Create shared iterators
-        let iterators = SharedIterators::new(account_iterator, storage_iterator);
+        let (iterators, cache_view) = new_state_iterators(self, block_num);
 
         // Register with iterator tracker if enabled
         let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
@@ -2263,10 +2328,124 @@ impl StateDBProvider for Arc<DataBaseRef> {
             block_num,
             block_info: cached_block_info,
             iterators,
+            cache_view,
             tracker_id,
             timed_out,
         }))
     }
+}
+
+/// Seek the greatest version `<= block_num` of `address`'s account: the
+/// account (`None` if never written or deleted) and the version found. Leaves
+/// the iterator on that version.
+fn seek_account(
+    account_iter: &mut rocksdb::DBRawIteratorWithThreadMode<'static, DB>,
+    address: H256,
+    block_num: u64,
+) -> Result<(Option<NewAccount>, Option<u64>), Error> {
+    let start = std::time::Instant::now();
+    let target_key = encode_account_key(address, block_num);
+    // Greatest version <= block_num: inverted encoding -> smallest key >=
+    // target (forward seek); legacy ascending -> largest key <= target
+    // (seek_for_prev). See archive_encoding module docs.
+    if inverted_block_encoding() {
+        account_iter.seek(target_key);
+    } else {
+        account_iter.seek_for_prev(target_key);
+    }
+    STORAGE_METRICS
+        .read_account_latency
+        .record(start.elapsed().as_secs_f64());
+    let Some(raw_key_bytes) = account_iter.key() else {
+        // No key at or after the target, unless the seek failed: never report
+        // (or cache) an error as absence.
+        account_iter.status()?;
+        return Ok((None, None));
+    };
+    if address.as_slice() != &raw_key_bytes[..32] {
+        return Ok((None, None));
+    }
+    let version = Some(decode_version_tail(&raw_key_bytes[32..64]));
+    let mut raw_val_bytes = account_iter.value().unwrap();
+    if raw_val_bytes.is_empty() {
+        return Ok((None, version));
+    }
+    let account = SlimAccount::decode(&mut raw_val_bytes).unwrap();
+    let account = NewAccount {
+        address,
+        balance: account.balance,
+        nonce: account.nonce,
+        code_hash: if account.code_hash.is_zero() {
+            KECCAK256_EMPTY.0.into()
+        } else {
+            account.code_hash
+        },
+    };
+    Ok((Some(account), version))
+}
+
+/// After a seek landed on the version of `prefix` read at `block`, step the
+/// iterator back to the key's next newer version (inverted encoding sorts
+/// versions newest-first). Returns the last block the read value is known to
+/// hold at, never above `head` (`block <= head`): the block before the next
+/// version, else `head`; and whether that next version is what ended it.
+/// Falls back to `block` if the iterator errors.
+fn newer_version_bound(
+    iter: &mut rocksdb::DBRawIteratorWithThreadMode<'static, DB>,
+    prefix: &[u8],
+    block: u64,
+    head: u64,
+) -> (u64, bool) {
+    debug_assert!(inverted_block_encoding() && block <= head);
+    iter.prev();
+    match iter.key() {
+        Some(raw) if raw.len() == prefix.len() + 32 && raw[..prefix.len()] == *prefix => {
+            let before_next = decode_version_tail(&raw[prefix.len()..]).saturating_sub(1);
+            if before_next <= head {
+                (before_next.max(block), true)
+            } else {
+                // A version committed after the reader took its head.
+                (head, false)
+            }
+        }
+        Some(_) => (head, false),
+        None if iter.status().is_ok() => (head, false),
+        None => (block, false),
+    }
+}
+
+/// Create the account and storage iterators of a state handle at
+/// `block_num`, and the state cache view they read under (`None` if the
+/// cache is off or the block is above the head).
+fn new_state_iterators(
+    db: &Arc<DataBaseRef>,
+    block_num: u64,
+) -> (Arc<SharedIterators>, Option<state_cache::ReadView>) {
+    disable_perf_counters();
+    // Take the head before creating the iterators, so they see every block
+    // up to it.
+    let cache_view = db
+        .state_cache
+        .as_ref()
+        .and_then(|cache| cache.view(block_num));
+    let address_to_account_cf = db
+        .db
+        .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
+        .unwrap();
+    let account_iterator = db
+        .db
+        .raw_iterator_cf_opt(address_to_account_cf, rocksdb_read_options());
+    let address_to_storage_cf = db
+        .db
+        .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
+        .unwrap();
+    let storage_iterator = db
+        .db
+        .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
+    (
+        SharedIterators::new(account_iterator, storage_iterator),
+        cache_view,
+    )
 }
 
 pub struct StateDB {
@@ -2277,6 +2456,9 @@ pub struct StateDB {
     block_info: Option<BlockInfo>,
     /// Shared iterators
     iterators: Arc<SharedIterators>,
+    /// The state cache view the iterators read under; `None` reads bypass
+    /// the cache.
+    cache_view: Option<state_cache::ReadView>,
     /// Tracker ID for iterator lifecycle management
     tracker_id: Option<u64>,
     /// Shared timeout flag with IteratorTracker
@@ -2285,29 +2467,7 @@ pub struct StateDB {
 
 impl Clone for StateDB {
     fn clone(&self) -> Self {
-        let address_to_account_cf = self
-            .db
-            .db
-            .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-            .unwrap();
-        let account_iterator = self
-            .db
-            .db
-            .raw_iterator_cf_opt(address_to_account_cf, rocksdb_read_options());
-
-        let address_to_storage_cf = self
-            .db
-            .db
-            .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-            .unwrap();
-
-        let storage_iterator = self
-            .db
-            .db
-            .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
-
-        // Create shared iterators
-        let iterators = SharedIterators::new(account_iterator, storage_iterator);
+        let (iterators, cache_view) = new_state_iterators(&self.db, self.block_num);
 
         // Register cloned StateDB with iterator tracker if enabled
         let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
@@ -2323,6 +2483,7 @@ impl Clone for StateDB {
             block_num: self.block_num,
             block_info: self.block_info.clone(),
             iterators,
+            cache_view,
             tracker_id,
             timed_out,
         }
@@ -2371,13 +2532,29 @@ impl StateDB {
         address: H256,
         key: H256,
     ) -> Result<(U256, Option<u64>), Error> {
-        let start = std::time::Instant::now();
-        let address_bytes: [u8; 32] = address.into();
-        let key_bytes: [u8; 32] = key.into();
-        let target_key = encode_storage_key(address, key, self.block_num);
-
+        disable_perf_counters();
         // Check timeout before using iterator
         self.check_timeout()?;
+        let mut slot_key = [0u8; 64];
+        slot_key[..32].copy_from_slice(address.as_slice());
+        slot_key[32..].copy_from_slice(key.as_slice());
+        let cache = self.cache_view.as_ref().zip(self.db.state_cache.as_ref());
+        let mut cached = None;
+        if let Some((_, cache)) = cache {
+            match cache.storage.lookup(&slot_key, self.block_num) {
+                Lookup::Hit(span) => {
+                    STORAGE_METRICS.storage_cache_hits.increment(1);
+                    return Ok((span.value, span.found.then_some(span.lo)));
+                }
+                Lookup::Miss(entry) => {
+                    STORAGE_METRICS.storage_cache_misses.increment(1);
+                    cached = entry;
+                }
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let target_key = encode_storage_key(address, key, self.block_num);
         let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
         let storage_iter = storage_iter_guard
             .as_mut()
@@ -2391,23 +2568,47 @@ impl StateDB {
         STORAGE_METRICS
             .read_storage_latency
             .record(start.elapsed().as_secs_f64());
-        if let Some(raw_key_bytes) = storage_iter.key() {
-            if address_bytes != raw_key_bytes[..32] {
-                return Ok((U256::ZERO, None));
+        let (value, version) = match storage_iter.key() {
+            Some(raw_key_bytes) if raw_key_bytes[..64] == slot_key => {
+                let version = decode_version_tail(&raw_key_bytes[64..96]);
+                let raw_val_bytes = storage_iter.value().unwrap();
+                let value = if raw_val_bytes.is_empty() {
+                    U256::ZERO
+                } else {
+                    U256::from_be_slice(raw_val_bytes)
+                };
+                (value, Some(version))
             }
-            if key_bytes != raw_key_bytes[32..64] {
-                return Ok((U256::ZERO, None));
+            Some(_) => (U256::ZERO, None),
+            // An invalid iterator means no key at or after the target, unless
+            // the seek failed: never report (or cache) an error as absence.
+            None => {
+                storage_iter.status()?;
+                (U256::ZERO, None)
             }
-            let version = decode_version_tail(&raw_key_bytes[64..96]);
-            let raw_val_bytes = storage_iter.value().unwrap();
-            if raw_val_bytes.is_empty() {
-                return Ok((U256::ZERO, Some(version)));
-            }
-            let value = U256::from_be_slice(&raw_val_bytes);
-            Ok((value, Some(version)))
-        } else {
-            Ok((U256::ZERO, None))
+        };
+
+        if let Some((view, cache)) = cache {
+            let probe =
+                version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
+            let (hi, next_version_found) = if probe {
+                STORAGE_METRICS.state_cache_probes.increment(1);
+                newer_version_bound(storage_iter, &slot_key, self.block_num, view.head())
+            } else {
+                (self.block_num, false)
+            };
+            drop(storage_iter_guard);
+            let span = Span {
+                lo: version.unwrap_or(0),
+                hi,
+                found: version.is_some(),
+                value,
+            };
+            cache
+                .storage
+                .record(slot_key, cached, span, next_version_found);
         }
+        Ok((value, version))
     }
 
     /// The slots of `address` holding a non-zero value, with the value.
@@ -2452,50 +2653,65 @@ impl StateDB {
 
 impl StateDBRead for StateDB {
     fn read_account(&self, address: H256) -> Result<Option<NewAccount>, Error> {
-        let start = std::time::Instant::now();
-        let address_bytes: [u8; 32] = address.into();
-        let target_key = encode_account_key(address, self.block_num);
-
+        disable_perf_counters();
         // Check timeout before using iterator
         self.check_timeout()?;
+        let cache = self.cache_view.as_ref().zip(self.db.state_cache.as_ref());
+        let mut cached = None;
+        if let Some((_, cache)) = cache {
+            match cache.accounts.lookup(&address.0, self.block_num) {
+                Lookup::Hit(span) => {
+                    STORAGE_METRICS.account_cache_hits.increment(1);
+                    return Ok(span.value.map(|account| NewAccount {
+                        address,
+                        balance: account.balance,
+                        nonce: account.nonce,
+                        code_hash: account.code_hash,
+                    }));
+                }
+                Lookup::Miss(entry) => {
+                    STORAGE_METRICS.account_cache_misses.increment(1);
+                    cached = entry;
+                }
+            }
+        }
         let mut account_iter_guard = self.iterators.account_iterator.lock().unwrap();
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
-        // Greatest version <= block_num: inverted encoding -> smallest key >=
-        // target (forward seek); legacy ascending -> largest key <= target
-        // (seek_for_prev). See archive_encoding module docs.
-        if inverted_block_encoding() {
-            account_iter.seek(target_key);
-        } else {
-            account_iter.seek_for_prev(target_key);
-        }
-        STORAGE_METRICS
-            .read_account_latency
-            .record(start.elapsed().as_secs_f64());
-        if let Some(raw_key_bytes) = account_iter.key() {
-            if address_bytes != raw_key_bytes[..32] {
-                return Ok(None);
-            }
-            let mut raw_val_bytes = account_iter.value().unwrap();
-            if raw_val_bytes.is_empty() {
-                return Ok(None);
-            }
-            let account = SlimAccount::decode(&mut raw_val_bytes).unwrap();
-            let account = NewAccount {
-                address,
-                balance: account.balance,
-                nonce: account.nonce,
-                code_hash: if account.code_hash.is_zero() {
-                    KECCAK256_EMPTY.0.into()
-                } else {
-                    account.code_hash
-                },
+        let (account, version) = seek_account(account_iter, address, self.block_num)?;
+        if let Some((view, cache)) = cache {
+            let probe =
+                version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
+            // Probe under the same lock: another reader of this handle may
+            // move the iterator once it is released.
+            let (hi, next_version_found) = if probe {
+                STORAGE_METRICS.state_cache_probes.increment(1);
+                newer_version_bound(
+                    account_iter,
+                    address.as_slice(),
+                    self.block_num,
+                    view.head(),
+                )
+            } else {
+                (self.block_num, false)
             };
-            Ok(Some(account))
-        } else {
-            Ok(None)
+            drop(account_iter_guard);
+            let span = Span {
+                lo: version.unwrap_or(0),
+                hi,
+                found: version.is_some(),
+                value: account.as_ref().map(|account| CachedAccount {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                }),
+            };
+            cache
+                .accounts
+                .record(address.0, cached, span, next_version_found);
         }
+        Ok(account)
     }
 
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, Error> {
@@ -2639,6 +2855,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
             .unwrap();
         let block_hash_bytes: [u8; 32] = block_hash.into();
         let block_num_bytes = encode_block_num(block_num);
+        batch.note_block(block_num);
         batch.inner.put_cf(
             block_num_to_block_hash_cf,
             block_num_bytes,
@@ -2683,6 +2900,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
     ) -> Result<(), Error> {
         let account_key = encode_account_key(address, block_num);
         let value = raw_account.map(encode_slim_account).unwrap_or_default();
+        batch.note_block(block_num);
         batch.account_writes.push((account_key, value));
         Ok(())
     }
@@ -2698,6 +2916,7 @@ impl StateDBWrite for Arc<DataBaseRef> {
         let storage_key = encode_storage_key(address, key, block_num);
         let value_bytes: [u8; 32] = value.to_be_bytes();
 
+        batch.note_block(block_num);
         batch.storage_writes.push((storage_key, value_bytes));
         Ok(())
     }
@@ -2788,6 +3007,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
         let mut wo = WriteOptions::default();
         wo.set_sync(batch.sync);
         self.db.write_opt(batch.inner, &wo)?;
+        if let (Some(cache), Some(max)) = (&self.state_cache, batch.max_block) {
+            cache.advance_head(max);
+        }
         Ok(())
     }
 }
@@ -3366,6 +3588,161 @@ mod inverted_encoding_tests {
         let _ = std::fs::remove_dir_all(&dir);
         // Restore the default so other tests aren't affected.
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    /// Reads through the state cache must match the archive at every height,
+    /// in any order and repeated (hits, extended spans, probed spans).
+    fn run_state_cache_consistency(inverted: bool) {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(inverted);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-state-cache-{}-{}",
+            inverted,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            assert!(db.state_cache.is_some(), "cache on by default");
+            let addr = H256::repeat_byte(0xcd);
+            let slot = H256::repeat_byte(0x02);
+            let never_written = H256::repeat_byte(0x03);
+            // (block, slot value, balance) at the change points.
+            let changes = [
+                (5u64, 7u64, 100u64),
+                (10, 9, 200),
+                (20, 11, 300),
+                (30, 13, 400),
+            ];
+            for n in 1..=40u64 {
+                let diff = match changes.iter().find(|c| c.0 == n) {
+                    Some(&(_, value, balance)) => slot_diff(addr, slot, balance, value),
+                    None => BlockStorageDiff::default(),
+                };
+                let state = StateDBWrapper(
+                    db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                        .unwrap()
+                        .unwrap(),
+                );
+                state.update_block(block_info(n), diff).unwrap();
+            }
+            let at = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+            };
+            let check = |changes: &[(u64, u64, u64)], h: u64| {
+                let expected = changes.iter().rev().find(|c| c.0 <= h);
+                let state = at(h);
+                assert_eq!(
+                    state.read_storage_and_height(addr, slot).unwrap(),
+                    match expected {
+                        Some(&(block, value, _)) => (U256::from(value), Some(block)),
+                        None => (U256::ZERO, None),
+                    },
+                    "storage at {h} (inverted={inverted})"
+                );
+                assert_eq!(
+                    state.read_account(addr).unwrap().map(|a| a.balance),
+                    expected.map(|c| U256::from(c.2)),
+                    "account at {h} (inverted={inverted})"
+                );
+                assert_eq!(state.read_storage(addr, never_written).unwrap(), U256::ZERO);
+            };
+            let heights = [
+                33u64, 4, 12, 40, 5, 9, 19, 20, 1, 29, 30, 10, 25, 7, 38, 15, 21,
+            ];
+            for _ in 0..3 {
+                for h in heights {
+                    check(&changes, h);
+                }
+            }
+            // The cache now serves the slot without a seek.
+            let cache = db.state_cache.as_ref().unwrap();
+            let mut slot_key = [0u8; 64];
+            slot_key[..32].copy_from_slice(addr.as_slice());
+            slot_key[32..].copy_from_slice(slot.as_slice());
+            assert!(matches!(
+                cache.storage.lookup(&slot_key, 12),
+                Lookup::Hit(_)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    /// Versions above a reader's head (in service: blocks committed after it
+    /// took the head; here: futures an old pointer-only rewind left) must not
+    /// stretch a span past the head, and a reader above the head must not use
+    /// the cache, or the next append would leave the span stale.
+    #[test]
+    fn test_state_cache_after_head_only_rewind() {
+        use crate::db::StateDBWrite;
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
+        let dir = std::env::temp_dir().join(format!(
+            "leafage-archive-state-cache-rewind-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let addr = H256::repeat_byte(0xef);
+        let slot = H256::repeat_byte(0x04);
+        let commit = |db: &Arc<DataBaseRef>, n: u64, value: Option<u64>| {
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            let diff =
+                value.map_or_else(BlockStorageDiff::default, |v| slot_diff(addr, slot, v, v));
+            state.update_block(block_info(n), diff).unwrap();
+        };
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            for n in 1..=40u64 {
+                commit(&db, n, [10u64, 30].contains(&n).then_some(n));
+            }
+            // Head-only rewind to 20: move the latest pointer, keep the rest.
+            let mut batch = db.prepare_write_batch().unwrap();
+            db.write_latest_block_hash(&mut batch, block_info(20).header.hash)
+                .unwrap();
+            db.commit(batch).unwrap();
+        }
+        {
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let read = |n: u64| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+                    .read_storage_and_height(addr, slot)
+                    .unwrap()
+            };
+            // Second read probes: the next version (30) is above the head.
+            assert_eq!(read(15), (U256::from(10), Some(10)));
+            assert_eq!(read(20), (U256::from(10), Some(10)));
+            assert_eq!(read(25), (U256::from(10), Some(10)));
+            // Append block 21 on the head: reads from 21 on see its version.
+            commit(&db, 21, Some(777));
+            assert_eq!(read(21), (U256::from(777), Some(21)));
+            assert_eq!(read(25), (U256::from(777), Some(21)));
+            assert_eq!(read(20), (U256::from(10), Some(10)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    #[test]
+    fn test_state_cache_matches_archive_inverted() {
+        run_state_cache_consistency(true);
+    }
+
+    #[test]
+    fn test_state_cache_matches_archive_legacy() {
+        run_state_cache_consistency(false);
     }
 
     #[test]
