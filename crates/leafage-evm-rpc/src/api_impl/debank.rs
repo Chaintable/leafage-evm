@@ -7,7 +7,7 @@ use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
 };
 use crate::api_impl::utils::build_debank_traces;
-use crate::error::{internal_rpc_err, rpc_error_with_code};
+use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err, rpc_error_with_code};
 
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
@@ -62,7 +62,7 @@ impl<C> Api<C> {
     {
         let account = state
             .basic_ref(address.0.into())
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let balance = account.map(|a| a.balance);
         Ok(balance.unwrap_or_default().into())
     }
@@ -123,9 +123,11 @@ where
         let state;
 
         if block_ctx.block_type == BlockType::Equals {
-            state = self.inner.db().state_at(block_ctx.block_id).map_err(|e| {
-                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-            })?;
+            state = self
+                .inner
+                .db()
+                .state_at(block_ctx.block_id)
+                .map_err(|e| block_lookup_err(block_ctx.block_id, e))?;
         } else {
             state = self
                 .inner
@@ -329,7 +331,7 @@ where
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
-                internal_rpc_err(format!(
+                database_rpc_err(format!(
                     "Failed to get storage at {:?} {:?}: {:?}",
                     address, index, e
                 ))
@@ -1468,13 +1470,13 @@ fn update_estimated_gas_range<R: GetHaltReason + Clone>(
                 }
                 Some(err) => {
                     return Err(rpc_error_with_code(
-                        DebankErrorCode::InternalError as i32,
+                        DebankErrorCode::from(err.clone()) as i32,
                         format!("Halted: {:?}", err),
                     ))
                 }
                 None => {
                     return Err(rpc_error_with_code(
-                        DebankErrorCode::InternalError as i32,
+                        DebankErrorCode::EvmFailed as i32,
                         format!("Halted: UnKnown"),
                     ))
                 }

@@ -1,7 +1,7 @@
 use crate::api::EthApiServer;
 use crate::api_impl::core::{Api, ApiCore, GetHaltReason, GetTransactionError, ToJsonRpcError};
 use crate::api_impl::utils;
-use crate::error::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
+use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err, rpc_error_with_code};
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
@@ -28,28 +28,10 @@ where
     DebankErrorCode: From<C::EvmHaltReason>,
 {
     fn base_fee_inner(&self, block_id: BlockId) -> RpcResult<u64> {
-        let state = self
-            .inner
-            .db()
-            .state_at(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
+        let state = self.resolve_state(block_id)?;
         let block = state
-            .unwrap()
             .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let base_fee = calc_next_block_base_fee(
             block.header.gas_used,
             block.header.gas_limit,
@@ -80,28 +62,10 @@ where
             collector.maybe_collect_call(to, data);
         }
 
-        let state = self
-            .inner
-            .db()
-            .state_at(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
-        let state = state.unwrap();
+        let state = self.resolve_state(block_id)?;
         let block = state
             .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let mut block_env = block_env_from_block(&block);
         let mut db = CacheDB::new(EvmStorageWrapper {
             db: state.clone(),
@@ -133,14 +97,17 @@ where
             .into();
         match res {
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
-            ExecutionResult::Revert { output, .. } => Err(internal_rpc_err(format!(
-                "Reverted: {:?}",
-                decode_revert_reason(&output).unwrap_or("execution revert".to_string())
-            ))
-            .into()),
-            ExecutionResult::Halt { reason, gas, .. } => {
-                Err(internal_rpc_err(format!("Halted: {:?} {}", reason, gas.tx_gas_used())).into())
-            }
+            ExecutionResult::Revert { output, .. } => Err(rpc_error_with_code(
+                DebankErrorCode::EvmRevert as i32,
+                format!(
+                    "Reverted: {:?}",
+                    decode_revert_reason(&output).unwrap_or("execution revert".to_string())
+                ),
+            )),
+            ExecutionResult::Halt { reason, gas, .. } => Err(rpc_error_with_code(
+                DebankErrorCode::from(reason.clone()) as i32,
+                format!("Halted: {:?} {}", reason, gas.tx_gas_used()),
+            )),
         }
     }
 
@@ -302,18 +269,10 @@ where
         fast_fail: bool,
         cancellation_token: CancellationToken,
     ) -> RpcResult<MultiCallResp> {
-        let state = self
-            .inner
-            .db()
-            .state_at(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
-        }
-        let state = state.unwrap();
+        let state = self.resolve_state(block_id)?;
         let block = state
             .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let state = EvmStorageWrapper {
             db: state.clone(),
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
@@ -391,18 +350,11 @@ where
     }
 
     fn block_number_inner(&self) -> RpcResult<U256> {
-        let state = self
-            .inner
-            .db()
-            .state_at(BlockId::Number(BlockNumberOrTag::Latest))
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            return Err(invalid_params_rpc_err("Block not found".to_string()));
-        }
-        let state = state.unwrap();
+        let block_id = BlockId::Number(BlockNumberOrTag::Latest);
+        let state = self.resolve_state(block_id)?;
         let block = state
             .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         Ok(U256::from(block.header.number))
     }
 
@@ -414,33 +366,15 @@ where
     }
 
     fn get_balance_inner(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
-        let state: Option<_> = self
-            .inner
-            .db()
-            .state_at(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
+        let state = self.resolve_state(block_id)?;
         Self::get_balance_from_state(
             EvmStorageWrapper {
-                db: state.unwrap(),
+                db: state,
                 ovm_address: self.inner.evm_cfg().ovm_address.clone(),
                 normalize_state_key: self.inner.evm_cfg().normalize_state_key,
             },
             address,
         )
-        .map_err(|e| internal_rpc_err(e.to_string()))
     }
 
     async fn get_balance_impl(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
@@ -463,21 +397,8 @@ where
             .inner
             .db()
             .get_block_by_id_arc(block_id)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if block.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
-        let block = block.unwrap();
+            .map_err(|e| block_lookup_err(block_id, e))?
+            .ok_or_else(|| self.block_unavailable_err(block_id))?;
         let value = serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?;
         Ok(Some(value))
     }
@@ -494,32 +415,15 @@ where
     }
 
     fn get_code_inner(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
-        let state = self
-            .inner
-            .db()
-            .state_at(block_number)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_number),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_number),
-                ));
-            }
-        }
+        let state = self.resolve_state(block_number)?;
         let state = EvmStorageWrapper {
-            db: state.unwrap(),
+            db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         if account.is_none() {
             return Ok(Bytes::new());
         } else {
@@ -529,7 +433,7 @@ where
             }
             let code = state
                 .code_by_hash_ref(account.code_hash)
-                .map_err(|e| internal_rpc_err(e.to_string()))?;
+                .map_err(|e| database_rpc_err(e.to_string()))?;
             Ok(code.original_bytes().0.clone().into())
         }
     }
@@ -550,34 +454,16 @@ where
         index: H256,
         block_number: BlockId,
     ) -> RpcResult<H256> {
-        let state = self
-            .inner
-            .db()
-            .state_at(block_number)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_number),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_number),
-                ));
-            }
-        }
+        let state = self.resolve_state(block_number)?;
         let state = EvmStorageWrapper {
-            db: state.unwrap(),
+            db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
-                internal_rpc_err(format!(
+                database_rpc_err(format!(
                     "Failed to get storage at {:?} {:?}: {:?}",
                     address, index, e
                 ))
@@ -606,32 +492,15 @@ where
         address: Address,
         block_number: BlockId,
     ) -> RpcResult<U256> {
-        let state = self
-            .inner
-            .db()
-            .state_at(block_number)
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_number),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_number),
-                ));
-            }
-        }
+        let state = self.resolve_state(block_number)?;
         let state = EvmStorageWrapper {
-            db: state.unwrap(),
+            db: state,
             ovm_address: self.inner.evm_cfg().ovm_address.clone(),
             normalize_state_key: self.inner.evm_cfg().normalize_state_key,
         };
         let account = state
             .basic_ref(address.0.into())
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let nonce = account.map(|a| a.nonce);
         Ok(U256::from(nonce.unwrap_or_default()))
     }

@@ -171,7 +171,7 @@ where
                         state
                             .storage_ref(address.0.into(), U256::from_be_bytes((*slot).into()))
                             .map_err(|e| ItemError {
-                                code: jsonrpsee::types::error::INTERNAL_ERROR_CODE,
+                                code: DebankErrorCode::DataBaseFailed as i32,
                                 message: format!(
                                     "Failed to get storage at {:?} {:?}: {:?}",
                                     address, slot, e

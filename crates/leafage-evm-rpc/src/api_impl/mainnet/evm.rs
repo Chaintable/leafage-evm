@@ -1,4 +1,4 @@
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::{database_rpc_err, invalid_params_rpc_err};
 use alloy::consensus::TxType;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::Either;
@@ -149,7 +149,7 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
 
     let nonce = db
         .basic_ref(caller)
-        .map_err(|_| internal_rpc_err("get nonce failed"))?
+        .map_err(|e| database_rpc_err(format!("get nonce failed: {e}")))?
         .map(|acc| acc.nonce)
         .unwrap_or_default();
 
