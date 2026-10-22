@@ -27,7 +27,7 @@ use tracing::info;
     group(clap::ArgGroup::new("end").required(true))
 )]
 pub struct Command {
-    /// The chain of the archive: bsc.
+    /// The chain of the archive: bsc, eth.
     #[arg(long)]
     chain: Chain,
 

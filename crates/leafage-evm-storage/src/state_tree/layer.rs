@@ -473,6 +473,34 @@ impl<DB: StateDB> HybridStateDB<DB> {
 impl<DB: StateDB> StateDB for HybridStateDB<DB> {
     type Error = Error<DB::Error>;
 
+    /// The disk's slots and those the diff layers wrote, each read through
+    /// the layers.
+    fn storage_slots(&self, address: H256) -> Result<Option<Vec<(H256, U256)>>, Self::Error> {
+        let Some(disk) = self.statedb.storage_slots(address)? else {
+            return Ok(None);
+        };
+        let mut candidates: std::collections::BTreeSet<H256> =
+            disk.into_iter().map(|(slot, _)| slot).collect();
+        for layer in self.flattened.layers.iter() {
+            let diff = &layer.unwrap_diff_layer().block_diff;
+            for account in diff
+                .storage_diffs
+                .iter()
+                .filter(|diff| diff.address == address)
+            {
+                candidates.extend(account.diffs.iter().map(|pair| pair.index));
+            }
+        }
+        let mut slots = Vec::with_capacity(candidates.len());
+        for slot in candidates {
+            let value = self.storage(address, slot)?;
+            if !value.is_zero() {
+                slots.push((slot, value));
+            }
+        }
+        Ok(Some(slots))
+    }
+
     fn basic(&self, address: H256) -> Result<Option<AccountInfo>, Self::Error> {
         for layer in self.flattened.layers.iter() {
             if let Some(value) = layer.unwrap_diff_layer().accounts.get(&address) {
@@ -709,6 +737,17 @@ mod tests {
         fn block_hash(&self, _number: u64) -> Result<H256, MockErr> {
             Ok(H256::ZERO)
         }
+        fn storage_slots(&self, address: H256) -> Result<Option<Vec<(H256, U256)>>, MockErr> {
+            let inner = self.inner.lock().unwrap();
+            Ok(Some(
+                inner
+                    .storage
+                    .iter()
+                    .filter(|((owner, _), value)| *owner == address && !value.is_zero())
+                    .map(|((_, slot), value)| (*slot, *value))
+                    .collect(),
+            ))
+        }
     }
 
     impl BlockContext for MockDB {
@@ -811,6 +850,41 @@ mod tests {
             prev = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(info, diff, prev)));
         }
         (prev, addr)
+    }
+
+    /// The slots listed through the layers: the disk's, less those a layer
+    /// zeroed, plus those a layer set.
+    #[test]
+    fn storage_slots_merge_disk_and_layers() {
+        let (top, addr) = build_chain(2);
+        let mock = MockDB::default();
+        {
+            let mut inner = mock.inner.lock().unwrap();
+            inner.storage.insert((addr, key(1)), U256::from(5));
+            inner.storage.insert((addr, key(1000)), U256::from(9));
+            inner.storage.insert((key(7), key(2)), U256::from(5));
+        }
+        // Layer 1 zeroes slot 1 over the disk.
+        let mut diff = BlockStorageDiff::default();
+        diff.storage_diffs.push(AccountStorageDiff {
+            address: addr,
+            diffs: vec![IndexValuePair {
+                index: key(1),
+                value: U256::ZERO,
+            }],
+        });
+        let top = Arc::new(LinkedDiffLayer::DiffLayer(DiffLayer::new(
+            BlockInfo::default(),
+            diff,
+            top,
+        )));
+        let db = HybridStateDB::new(top, mock, None);
+        let mut slots = db.storage_slots(addr).unwrap().unwrap();
+        slots.sort();
+        assert_eq!(
+            slots,
+            vec![(key(1000), U256::from(1)), (key(1001), U256::from(2))]
+        );
     }
 
     #[test]

@@ -308,9 +308,10 @@ pub struct Command {
     #[arg(long)]
     historical_height: Option<u64>,
 
-    /// Upstream BSC RPC serving full block bodies. Enables
-    /// `trace_debankBlock` on BSC mainnet archive nodes, which replays a block
-    /// on the archive state to regenerate its pipeline traces and events.
+    /// Upstream RPC of the chain serving full block bodies. Enables
+    /// `trace_debankBlock` on BSC and Ethereum mainnet archive nodes, which
+    /// replays a block on the archive state to regenerate its pipeline traces
+    /// and events.
     #[arg(long, value_name = "URL")]
     trace_block_rpc: Option<String>,
 

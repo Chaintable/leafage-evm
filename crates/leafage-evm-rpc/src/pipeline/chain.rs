@@ -1,6 +1,7 @@
 //! What a chain provides to regenerate its pipeline outputs: the replay of
 //! consecutive blocks on its archive state, and the genesis block.
 
+use super::blocks::FetchedBlock;
 use super::types::{BlockFile, PipelineHeader};
 use alloy::primitives::Bytes;
 use alloy::rpc::types::Block as RpcBlock;
@@ -70,7 +71,7 @@ pub(crate) trait PipelineChain<DB>: Send + Sync + 'static {
 /// time the replay touches it.
 pub(crate) trait ChainReplay {
     /// Replay the block after the last one; `info` is its archive entry.
-    fn replay(&mut self, info: &BlockInfo, block: RpcBlock) -> Result<ReplayOutput>;
+    fn replay(&mut self, info: &BlockInfo, block: FetchedBlock) -> Result<ReplayOutput>;
 
     /// Go on from the archive state after `info`, the last block replayed,
     /// dropping the state built so far to bound its memory.
@@ -87,14 +88,17 @@ pub(crate) trait ChainReplay {
 pub enum Chain {
     /// BSC mainnet.
     Bsc,
+    /// Ethereum mainnet.
+    Eth,
 }
 
 impl Chain {
-    pub const ALL: [Chain; 1] = [Chain::Bsc];
+    pub const ALL: [Chain; 2] = [Chain::Bsc, Chain::Eth];
 
     pub fn name(self) -> &'static str {
         match self {
             Chain::Bsc => "bsc",
+            Chain::Eth => "eth",
         }
     }
 
@@ -102,6 +106,7 @@ impl Chain {
     pub fn chain_id(self) -> u64 {
         match self {
             Chain::Bsc => 56,
+            Chain::Eth => 1,
         }
     }
 }

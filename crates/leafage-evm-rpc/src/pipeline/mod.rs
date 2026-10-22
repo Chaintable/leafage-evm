@@ -11,10 +11,12 @@ pub(crate) mod blocks;
 pub(crate) mod build;
 pub(crate) mod bundle;
 pub(crate) mod chain;
+pub(crate) mod changes;
 pub(crate) mod convert;
 pub(crate) mod export;
 pub(crate) mod genesis;
 pub(crate) mod inspector;
+pub(crate) mod rpc;
 pub(crate) mod s3;
 pub(crate) mod types;
 

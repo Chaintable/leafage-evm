@@ -20,11 +20,12 @@
 //! archive every `rebase_every` blocks to bound its memory: keys a run read
 //! once are not read from the archive again.
 
-use super::blocks::fetch_raw_blocks;
+use super::blocks::{fetch_raw_blocks, FetchedBlock};
 use super::bundle::{BundleObjects, BundleWriter, Resource, BUNDLE_SIZE};
 use super::chain::{Chain, ChainReplay, PipelineChain, ReplayOptions};
 use super::s3::{MultipartUpload, S3Target};
 use crate::api_impl::bsc::trace::BscPipeline;
+use crate::api_impl::mainnet::trace::EthPipeline;
 use anyhow::{anyhow, Context as _, Result};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
@@ -117,6 +118,7 @@ where
 {
     match chain {
         Chain::Bsc => export_chain(db, Arc::new(BscPipeline), config).await,
+        Chain::Eth => export_chain(db, Arc::new(EthPipeline), config).await,
     }
 }
 
@@ -518,7 +520,7 @@ where
         .first()
         .zip(blocks.first())
         .context("no genesis block")?;
-    let output = chain.genesis(db, info, block, config.replay_options())?;
+    let output = chain.genesis(db, info, &block.block, config.replay_options())?;
     let mut writer = BundleWriter::new(0, &config.resources, config.gzip_level);
     writer.push(&output)?;
     let txs = output.block_file.txs.len() as u64;
@@ -542,7 +544,7 @@ async fn fetch_chunk<DB: BlockIndex + Send + Sync + 'static>(
     client: &HttpClient,
     lo: u64,
     hi: u64,
-) -> Result<(Vec<Arc<BlockInfo>>, Vec<alloy::rpc::types::Block>)> {
+) -> Result<(Vec<Arc<BlockInfo>>, Vec<FetchedBlock>)> {
     // Archive reads block; keep them off the async workers.
     let infos = tokio::task::spawn_blocking(move || {
         (lo..=hi)

@@ -74,6 +74,16 @@ pub trait StateDBRead {
     fn supports_batched_reads(&self) -> bool {
         false
     }
+
+    /// The slots of `address` holding a non-zero value, with the value, or
+    /// `None` if the backend cannot list them (only the RocksDB archive
+    /// can). For writing out the storage an account lost when destroyed.
+    fn read_storage_slots(
+        &self,
+        _address: H256,
+    ) -> Result<Option<Vec<(H256, U256)>>, StorageError> {
+        Ok(None)
+    }
 }
 
 #[auto_impl(&, Box, Arc)]
@@ -245,6 +255,10 @@ where
 
     fn supports_batched_reads(&self) -> bool {
         self.0.supports_batched_reads()
+    }
+
+    fn storage_slots(&self, address: H256) -> Result<Option<Vec<(H256, U256)>>, Self::Error> {
+        self.0.read_storage_slots(address)
     }
 }
 

@@ -309,6 +309,7 @@ where
 {
     let block = RangeBlock {
         post_state,
+        parent_state: None,
         parent_timestamp,
         parent_state_root,
         block,

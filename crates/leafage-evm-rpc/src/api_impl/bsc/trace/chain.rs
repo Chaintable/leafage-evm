@@ -1,7 +1,9 @@
 //! BSC mainnet as a [`PipelineChain`] for the bundle export.
 
 use super::replay::{RangeBlock, RangeReplayer};
+use crate::pipeline::blocks::FetchedBlock;
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
+use crate::pipeline::changes::LazyState;
 use crate::pipeline::genesis::genesis_output;
 use alloy::primitives::B256;
 use alloy::rpc::types::Block as RpcBlock;
@@ -59,12 +61,18 @@ pub(crate) struct BscReplay<DB: EvmStorageRead> {
 
 impl<DB> ChainReplay for BscReplay<DB>
 where
-    DB: EvmStorageRead,
+    DB: EvmStorageRead + Send + Sync + 'static,
 {
-    fn replay(&mut self, info: &BlockInfo, block: RpcBlock) -> Result<ReplayOutput> {
+    fn replay(&mut self, info: &BlockInfo, block: FetchedBlock) -> Result<ReplayOutput> {
+        // BSC has no ommers.
+        let block = block.block;
         let (timestamp, state_root) = (block.header.timestamp, block.header.state_root);
         let output = self.replayer.replay(RangeBlock {
             post_state: archive_state(self.db.as_ref(), info)?,
+            parent_state: Some(Box::new(LazyState::new(
+                self.db.clone(),
+                info.header.parent_hash,
+            ))),
             parent_timestamp: self.parent_timestamp,
             parent_state_root: self.parent_state_root,
             block,
