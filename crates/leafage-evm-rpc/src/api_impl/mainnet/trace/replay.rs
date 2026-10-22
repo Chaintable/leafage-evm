@@ -4,7 +4,8 @@
 //! The block is executed by alloy-evm's [`EthBlockExecutor`], reth's
 //! consensus executor: the EIP-2935 and EIP-4788 system calls before the
 //! transactions; the withdrawal and consolidation request system calls,
-//! block and ommer rewards, withdrawals and the DAO fork drain after them.
+//! block and ommer rewards and withdrawals after them. The DAO fork drain is
+//! moved before the transactions, where geth applies it.
 //! Like go-ethereum, the pipeline tracer only sees the transactions: system
 //! calls have no transaction, so they leave no traces or events, while their
 //! state changes are part of the state diff.
@@ -32,16 +33,18 @@ use alloy::eips::BlobScheduleBlobParams;
 use alloy::primitives::{Bloom, Bytes, B256};
 use alloy::rpc::types::BlockTransactions;
 use alloy_evm::block::BlockExecutor;
+use alloy_evm::eth::dao_fork;
 use alloy_evm::eth::receipt_builder::AlloyReceiptBuilder;
 use alloy_evm::eth::spec::EthSpec;
 use alloy_evm::eth::{EthBlockExecutionCtx, EthBlockExecutor, EthEvmFactory};
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
-use alloy_hardforks::EthereumHardforks;
+use alloy_hardforks::{EthereumHardfork, EthereumHardforks};
 use anyhow::{anyhow, bail, Context as _, Result};
 use leafage_evm_chains::eth::mainnet::{
     eth_mainnet_blob_params_at, eth_mainnet_blob_schedule, ETH_MAINNET_CHAIN_ID,
 };
 use revm::database::CacheDB;
+use revm::database::DatabaseCommitExt;
 use revm::DatabaseRef;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -154,6 +157,20 @@ where
         executor
             .apply_pre_execution_changes()
             .map_err(|err| anyhow!("block {number} system calls: {err}"))?;
+        // geth moves the DAO funds before the block's transactions, which may
+        // see the balances; alloy-evm does it in `finish`, which then finds
+        // the accounts already drained.
+        if spec
+            .ethereum_fork_activation(EthereumHardfork::Dao)
+            .transitions_at_block(number)
+        {
+            let db = executor.evm_mut().db_mut();
+            let drained = db
+                .drain_balances(dao_fork::DAO_HARDFORK_ACCOUNTS)
+                .map_err(|err| anyhow!("block {number} DAO fork drain: {err}"))?;
+            db.increment_balances([(dao_fork::DAO_HARDFORK_BENEFICIARY, drained.iter().sum())])
+                .map_err(|err| anyhow!("block {number} DAO fork refund: {err}"))?;
+        }
 
         let mut block_file = BlockFile {
             block: pipeline_block(header),
