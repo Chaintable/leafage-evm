@@ -2,6 +2,7 @@ pub mod arbitrum;
 pub mod arc;
 pub mod base;
 pub mod bsc;
+pub mod celo;
 pub mod citrea;
 pub mod cosmos;
 pub mod eth;

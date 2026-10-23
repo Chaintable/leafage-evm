@@ -140,7 +140,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-path` | - | 数据库路径（必需） |
 | `--listen-addr` | 0.0.0.0:8545 | RPC 监听地址 |
 | `--rpc-addr` | - | Geth RPC 地址（用于 HTTP 模式状态更新） |
-| `--evm-type` | mainnet | EVM 类型：mainnet/op/bsc/cosmos |
+| `--evm-type` | mainnet | EVM 类型：mainnet/op/celo/bsc/cosmos |
 | `--chain-cfg` | 1 | 链 ID |
 | `--db-type` | rocksdb | 数据库类型：rocksdb/mdbx |
 | `--db-cache` | 2048 | 数据库缓存大小（MB） |
@@ -155,6 +155,8 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--iterator-timeout-secs` | 0 | 归档模式迭代器超时（0 = 禁用） |
 | `--historical-rpc` | - | 历史 RPC 端点，用于无法获取 block diff 的区块（如 OP pre-bedrock） |
 | `--historical-height` | - | 历史 RPC 转发的分叉高度阈值 |
+
+Celo L2 主网使用 `--evm-type=celo --chain-cfg=42220`。执行规则按请求区块选择 Granite / Isthmus / Jovian，包含 CELO 原生转账预编译 `0xfd`，合约代码上限为 64 KiB。费用处理仍复用 OP；Celo 专用费用分配、`feeCurrency` / CIP-64 及 Celo L1 历史执行暂不支持，且不接受固定分叉覆盖参数。
 
 ### Kafka + S3 配置
 
