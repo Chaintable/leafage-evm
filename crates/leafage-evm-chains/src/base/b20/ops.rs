@@ -7,9 +7,9 @@
 //! Reordering a guard here silently changes both. Base pins the ordering with its
 //! `*_check_order` / `*_guard_ordering` tests; the equivalents live in `tests` below.
 //!
-//! Base keeps Beryl (`logic/v1.rs`) and Cobalt (`logic/v2.rs`) as separate frozen copies.
-//! Here the two share one body and branch on [`B20Store::version`] exactly where Base's
-//! copies differ; everything not branched is identical in both versions.
+//! Base keeps Beryl (`logic/v1.rs`), Cobalt (`logic/v2.rs`) and Denim (`logic/v3.rs`) as
+//! separate frozen copies. Here they share one body and branch on [`B20Store::version`] exactly
+//! where Base's copies differ; everything not branched is identical across versions.
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::sol_types::SolEvent;
@@ -17,7 +17,9 @@ use alloy::sol_types::SolEvent;
 use super::abi::{IB20, IB20Asset, ERC165_INTERFACE_ID, ERC8056_INTERFACE_IDS};
 use super::error::{B20Error, Result};
 use super::ids;
-use super::layout::{checked_add, checked_mul, checked_sub, B20Store, PolicySlot, WAD};
+use super::layout::{
+    checked_add, checked_mul, checked_sub, B20Store, PolicySlot, TransferPolicyIds, WAD,
+};
 use super::policy;
 use super::port::B20Port;
 use super::version::B20Version;
@@ -136,7 +138,7 @@ pub fn transfer<P: B20Port>(
     match store.version() {
         B20Version::V1 => transfer_inner_v1(store, from, to, amount, privileged),
         B20Version::V2 => {
-            ensure_parties(from, to)?;
+            ensure_parties(store, from, to)?;
             if privileged {
                 return move_balance(store, from, to, amount);
             }
@@ -144,19 +146,54 @@ pub fn transfer<P: B20Port>(
             check_transfer_parties(store, from, to, policies.sender, policies.receiver)?;
             move_balance(store, from, to, amount)
         }
+        B20Version::V3 => {
+            ensure_parties(store, from, to)?;
+            if privileged {
+                return move_balance(store, from, to, amount);
+            }
+            let policies = store.transfer_policy_ids()?;
+            // The holder moves its own balance, so it is also the executor.
+            check_transfer_policies_v3(store, from, from, to, &policies)?;
+            move_balance(store, from, to, amount)
+        }
     }
+}
+
+/// Reverts with `InvalidReceiver` unless `to` may be credited. Every version rejects the zero
+/// address; Denim also rejects the token's own address, where a balance would be stranded
+/// (Base `B20CreditRecipientStrategy::ExcludingZeroAndSelf`).
+fn ensure_receiver<P: B20Port>(store: &B20Store<'_, P>, to: Address) -> Result<()> {
+    if to == Address::ZERO || (store.version().is_denim() && to == store.address()) {
+        return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
+    }
+    Ok(())
 }
 
 /// Cobalt's zero-address checks, hoisted ahead of every policy SLOAD (Base #4823). Receiver
 /// first, like Beryl.
-fn ensure_parties(from: Address, to: Address) -> Result<()> {
-    if to == Address::ZERO {
-        return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
-    }
+fn ensure_parties<P: B20Port>(store: &B20Store<'_, P>, from: Address, to: Address) -> Result<()> {
+    ensure_receiver(store, to)?;
     if from == Address::ZERO {
         return Err(B20Error::revert(IB20::InvalidSender { sender: from }));
     }
     Ok(())
+}
+
+/// Denim's transfer policy checks against pre-read IDs, on every unprivileged transfer path:
+/// executor, then sender, then receiver. The sender check is skipped when it would repeat the
+/// executor check — the executor is the holder and both scopes name the same policy.
+fn check_transfer_policies_v3<P: B20Port>(
+    store: &mut B20Store<'_, P>,
+    caller: Address,
+    from: Address,
+    to: Address,
+    policies: &TransferPolicyIds,
+) -> Result<()> {
+    ensure_authorized_by_id(store, ids::TRANSFER_EXECUTOR_POLICY, policies.executor, caller)?;
+    if caller != from || policies.executor != policies.sender {
+        ensure_authorized_by_id(store, ids::TRANSFER_SENDER_POLICY, policies.sender, from)?;
+    }
+    ensure_authorized_by_id(store, ids::TRANSFER_RECEIVER_POLICY, policies.receiver, to)
 }
 
 /// Cobalt's sender/receiver policy checks against pre-read IDs.
@@ -180,7 +217,7 @@ fn transfer_inner_v1<P: B20Port>(
     amount: U256,
     privileged: bool,
 ) -> Result<()> {
-    ensure_parties(from, to)?;
+    ensure_parties(store, from, to)?;
     if !privileged {
         ensure_policy(store, PolicySlot::TransferSender, ids::TRANSFER_SENDER_POLICY, from)?;
         ensure_policy(store, PolicySlot::TransferReceiver, ids::TRANSFER_RECEIVER_POLICY, to)?;
@@ -224,7 +261,7 @@ pub fn transfer_from<P: B20Port>(
     privileged: bool,
 ) -> Result<()> {
     ensure_not_paused(store, IB20::PausableFeature::TRANSFER)?;
-    ensure_parties(from, to)?;
+    ensure_parties(store, from, to)?;
 
     let allowance = store.allowance(from, spender)?;
     let is_infinite = allowance == U256::MAX;
@@ -262,6 +299,15 @@ pub fn transfer_from<P: B20Port>(
                     )?;
                 }
                 check_transfer_parties(store, from, to, policies.sender, policies.receiver)?;
+            }
+            move_balance(store, from, to, amount)?;
+        }
+        B20Version::V3 => {
+            if !privileged {
+                // One SLOAD serves the executor, sender and receiver checks. Unlike Cobalt, the
+                // executor check also runs when the spender is the holder.
+                let policies = store.transfer_policy_ids()?;
+                check_transfer_policies_v3(store, spender, from, to, &policies)?;
             }
             move_balance(store, from, to, amount)?;
         }
@@ -331,9 +377,7 @@ pub fn mint<P: B20Port>(
     if !privileged {
         ensure_role(store, caller, ids::MINT_ROLE)?;
     }
-    if to == Address::ZERO {
-        return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
-    }
+    ensure_receiver(store, to)?;
     // Unlike transfer, the mint-receiver policy is enforced even when privileged.
     ensure_policy(store, PolicySlot::MintReceiver, ids::MINT_RECEIVER_POLICY, to)?;
 
@@ -445,8 +489,9 @@ pub fn seize_with_memo<P: B20Port>(
 ) -> Result<()> {
     ensure_not_paused(store, IB20::PausableFeature::SEIZE)?;
     ensure_role(store, caller, ids::SEIZE_ROLE)?;
-    // `to != 0` rules out a disguised burn, `from != 0` a disguised mint.
-    ensure_parties(from, to)?;
+    // `to != 0` rules out a disguised burn (and from Denim, `to != token` a balance stranded on
+    // the token), `from != 0` a disguised mint.
+    ensure_parties(store, from, to)?;
     if from == to {
         return Err(B20Error::revert(IB20::InvalidReceiver { receiver: to }));
     }

@@ -1,4 +1,4 @@
-//! Storage-access goldens transcribed from Base reth v1.4.2.
+//! Storage-access goldens transcribed from Base reth v1.4.2 (Beryl, Cobalt) and v1.5.1 (Denim).
 //!
 //! Base's `tests/b20_{asset,stablecoin}_v{1,2}_golden.rs::golden_gas_footprints` pin, per
 //! operation, how many SLOADs, SSTOREs and metered KECCAK256s the token performs. Those counts
@@ -51,6 +51,8 @@ struct CountingPort {
     sloads: u64,
     sstores: u64,
     keccaks: u64,
+    /// Policy-registry reads. Not part of Base's footprints, but they are metered too.
+    registry_sloads: u64,
     /// Gas charged through `deduct_gas` (metered keccak + signer recovery), for metering pins.
     deducted: u64,
     caller: Address,
@@ -66,6 +68,7 @@ impl CountingPort {
             sloads: 0,
             sstores: 0,
             keccaks: 0,
+            registry_sloads: 0,
             deducted: 0,
             caller: ADMIN,
             timestamp: U256::ZERO,
@@ -76,6 +79,7 @@ impl CountingPort {
         self.sloads = 0;
         self.sstores = 0;
         self.keccaks = 0;
+        self.registry_sloads = 0;
         self.deducted = 0;
         self.logs.clear();
     }
@@ -89,6 +93,8 @@ impl B20Port for CountingPort {
     fn sload(&mut self, address: Address, key: U256) -> Result<U256> {
         if address == self.token {
             self.sloads += 1;
+        } else if address == POLICY_REGISTRY {
+            self.registry_sloads += 1;
         }
         Ok(self
             .storage
@@ -739,7 +745,18 @@ fn seize_call() -> Vec<u8> {
 /// `tests/b20_asset_v2_golden.rs::golden_gas_footprints`.
 #[test]
 fn asset_v2_footprints_match_base() {
-    let v = B20Version::V2;
+    asset_cobalt_surface_footprints(B20Version::V2);
+}
+
+/// `tests/b20_asset_v3_golden.rs::golden_gas_footprints`: every tuple equals V2's. These are
+/// privileged calls, which skip the transfer policies Denim changes.
+#[test]
+fn asset_v3_footprints_match_base() {
+    asset_cobalt_surface_footprints(B20Version::V3);
+}
+
+/// The asset golden footprints, identical for Cobalt (V2) and Denim (V3).
+fn asset_cobalt_surface_footprints(v: B20Version) {
     let mut actual = common_footprints(v, true);
     actual.extend([
         ("seize", gas(v, true, seize_setup, ADMIN, seize_call())),
@@ -826,7 +843,7 @@ fn asset_v2_footprints_match_base() {
         ),
     ]);
     assert_footprints(
-        "asset V2",
+        &format!("asset {v:?}"),
         &actual,
         &[
             ("transfer", (3, 2, 0)),
@@ -860,7 +877,17 @@ fn asset_v2_footprints_match_base() {
 /// `tests/b20_stablecoin_v2_golden.rs::golden_gas_footprints`.
 #[test]
 fn stablecoin_v2_footprints_match_base() {
-    let v = B20Version::V2;
+    stablecoin_cobalt_surface_footprints(B20Version::V2);
+}
+
+/// `tests/b20_stablecoin_v3_golden.rs::golden_gas_footprints`: every tuple equals V2's.
+#[test]
+fn stablecoin_v3_footprints_match_base() {
+    stablecoin_cobalt_surface_footprints(B20Version::V3);
+}
+
+/// The stablecoin golden footprints, identical for Cobalt (V2) and Denim (V3).
+fn stablecoin_cobalt_surface_footprints(v: B20Version) {
     let mut actual = common_footprints(v, false);
     actual.extend([
         ("seize", gas(v, false, seize_setup, ADMIN, seize_call())),
@@ -956,7 +983,7 @@ fn stablecoin_v2_footprints_match_base() {
         ),
     ]);
     assert_footprints(
-        "stablecoin V2",
+        &format!("stablecoin {v:?}"),
         &actual,
         &[
             ("transfer", (3, 2, 0)),
@@ -1715,4 +1742,466 @@ fn cobalt_surface_is_a_strict_superset() {
     let v2_common: Vec<[u8; 4]> = IB20::IB20Calls::selectors().collect();
     assert!(v1_common.iter().all(|s| v2_common.contains(s)));
     assert_eq!(v2_common.len() - v1_common.len(), 4);
+}
+
+// --- Denim (V3), from Base reth v1.5.1 `tests/b20_{asset,stablecoin,policy}_v3_golden.rs` ---
+
+/// ALLOWLIST, counter 9.
+const POLICY_ID_3: u64 = (1u64 << 56) | 9;
+/// Bit 63 of a policy ID: the inverted form of the base policy (Denim).
+const INVERTED: u64 = 1u64 << 63;
+/// A B20 address other than the fixtures' own tokens.
+const OTHER_B20: Address = address!("0xb2000000000000000000000000000000000000ff");
+
+fn token(is_asset: bool) -> Address {
+    if is_asset {
+        ASSET
+    } else {
+        STABLECOIN
+    }
+}
+
+fn executor_forbids(policy_id: u64) -> B20Error {
+    B20Error::revert(IB20::PolicyForbids {
+        policyScope: ids::TRANSFER_EXECUTOR_POLICY,
+        policyId: policy_id,
+    })
+}
+
+/// `golden_transfer{,_with_memo}_unprivileged_enforces_executor_policy`: from Denim a plain
+/// transfer checks the executor policy against the holder. Cobalt does not.
+#[test]
+fn v3_transfer_enforces_executor_policy() {
+    for is_asset in [true, false] {
+        let calls = [
+            IB20::transferCall {
+                to: BOB,
+                amount: u(10),
+            }
+            .abi_encode(),
+            IB20::transferWithMemoCall {
+                to: BOB,
+                amount: u(10),
+                memo: MEMO,
+            }
+            .abi_encode(),
+        ];
+        for call in calls {
+            let run = |version| {
+                let mut f = Fixture::fresh(is_asset);
+                f.fund(ALICE, 100);
+                f.set_policy(PolicySlot::TransferExecutor, POLICY_ID);
+                f.call(version, ALICE, &call, false)
+            };
+            assert!(run(B20Version::V2).is_ok());
+            assert_eq!(
+                run(B20Version::V3).unwrap_err(),
+                executor_forbids(POLICY_ID)
+            );
+        }
+    }
+}
+
+/// `golden_transfer_from{,_with_memo}_self_unprivileged_enforces_executor_policy`: Cobalt skips
+/// the executor check when the spender is the holder; Denim does not.
+#[test]
+fn v3_self_transfer_from_enforces_executor_policy() {
+    for is_asset in [true, false] {
+        let calls = [
+            IB20::transferFromCall {
+                from: ALICE,
+                to: BOB,
+                amount: u(10),
+            }
+            .abi_encode(),
+            IB20::transferFromWithMemoCall {
+                from: ALICE,
+                to: BOB,
+                amount: u(10),
+                memo: MEMO,
+            }
+            .abi_encode(),
+        ];
+        for call in calls {
+            let run = |version| {
+                let mut f = Fixture::fresh(is_asset);
+                f.fund(ALICE, 100);
+                f.set_allowance(ALICE, ALICE, 10);
+                f.set_policy(PolicySlot::TransferExecutor, POLICY_ID);
+                f.call(version, ALICE, &call, false)
+            };
+            assert!(run(B20Version::V2).is_ok());
+            assert_eq!(
+                run(B20Version::V3).unwrap_err(),
+                executor_forbids(POLICY_ID)
+            );
+        }
+    }
+}
+
+/// `transfer_policy_order_executor_then_sender_then_receiver`: each step allows the account the
+/// previous gate checked, so the next revert names the next gate.
+#[test]
+fn v3_transfer_policy_order_is_executor_sender_receiver() {
+    for is_asset in [true, false] {
+        let mut f = Fixture::fresh(is_asset);
+        f.fund(ALICE, 100);
+        f.set_policy(PolicySlot::TransferExecutor, POLICY_ID);
+        f.set_policy(PolicySlot::TransferSender, POLICY_ID_2);
+        f.set_policy(PolicySlot::TransferReceiver, POLICY_ID_3);
+        let call = IB20::transferCall {
+            to: BOB,
+            amount: u(10),
+        }
+        .abi_encode();
+        let forbids = |scope, policy_id| {
+            B20Error::revert(IB20::PolicyForbids {
+                policyScope: scope,
+                policyId: policy_id,
+            })
+        };
+
+        let err = f.call(B20Version::V3, ALICE, &call, false).unwrap_err();
+        assert_eq!(err, executor_forbids(POLICY_ID));
+        f.registry_allow(POLICY_ID, ALICE);
+        let err = f.call(B20Version::V3, ALICE, &call, false).unwrap_err();
+        assert_eq!(err, forbids(ids::TRANSFER_SENDER_POLICY, POLICY_ID_2));
+        f.registry_allow(POLICY_ID_2, ALICE);
+        let err = f.call(B20Version::V3, ALICE, &call, false).unwrap_err();
+        assert_eq!(err, forbids(ids::TRANSFER_RECEIVER_POLICY, POLICY_ID_3));
+        f.registry_allow(POLICY_ID_3, BOB);
+        f.call(B20Version::V3, ALICE, &call, false).unwrap();
+    }
+}
+
+/// The sender check is skipped only when it would repeat the executor check: the holder moves
+/// its own balance and both scopes name the same policy. That saves one registry read.
+#[test]
+fn v3_sender_check_is_skipped_only_when_it_repeats_the_executor_check() {
+    let registry_reads = |version, caller: Address, call: Vec<u8>| {
+        let mut f = Fixture::fresh(true);
+        f.fund(ALICE, 100);
+        f.set_allowance(ALICE, CAROL, 10);
+        f.set_policy(PolicySlot::TransferExecutor, POLICY_ID);
+        f.set_policy(PolicySlot::TransferSender, POLICY_ID);
+        f.registry_allow(POLICY_ID, ALICE);
+        f.registry_allow(POLICY_ID, CAROL);
+        f.call(version, caller, &call, false).unwrap();
+        f.port.registry_sloads
+    };
+    let transfer = IB20::transferCall {
+        to: BOB,
+        amount: u(10),
+    }
+    .abi_encode();
+    let transfer_from = IB20::transferFromCall {
+        from: ALICE,
+        to: BOB,
+        amount: u(10),
+    }
+    .abi_encode();
+    // Holder transfer: executor only (sender skipped); the receiver policy is the built-in 0.
+    assert_eq!(registry_reads(B20Version::V3, ALICE, transfer.clone()), 1);
+    // Cobalt checks the sender only.
+    assert_eq!(registry_reads(B20Version::V2, ALICE, transfer), 1);
+    // A third-party spender is a different account, so both checks run.
+    assert_eq!(
+        registry_reads(B20Version::V3, CAROL, transfer_from.clone()),
+        2
+    );
+    assert_eq!(registry_reads(B20Version::V2, CAROL, transfer_from), 2);
+
+    // Different policies: the holder transfer checks both.
+    let mut f = Fixture::fresh(true);
+    f.fund(ALICE, 100);
+    f.set_policy(PolicySlot::TransferExecutor, POLICY_ID);
+    f.set_policy(PolicySlot::TransferSender, POLICY_ID_2);
+    f.registry_allow(POLICY_ID, ALICE);
+    f.registry_allow(POLICY_ID_2, ALICE);
+    f.call(
+        B20Version::V3,
+        ALICE,
+        &IB20::transferCall {
+            to: BOB,
+            amount: u(10),
+        }
+        .abi_encode(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(f.port.registry_sloads, 2);
+}
+
+/// `golden_transfer_reverts_token_receiver`: from Denim the token's own address cannot be
+/// credited. Rejected after the pause read and before any policy read, like the zero address.
+#[test]
+fn v3_transfer_rejects_the_token_as_receiver() {
+    for is_asset in [true, false] {
+        let token = token(is_asset);
+        let call = IB20::transferCall {
+            to: token,
+            amount: u(1),
+        }
+        .abi_encode();
+        let run = |version| {
+            let mut f = Fixture::fresh(is_asset);
+            f.fund(ALICE, 10);
+            let result = f.call(version, ALICE, &call, false);
+            (result, f.port.footprint())
+        };
+        assert!(run(B20Version::V2).0.is_ok());
+        let (result, footprint) = run(B20Version::V3);
+        assert_eq!(
+            result.unwrap_err(),
+            B20Error::revert(IB20::InvalidReceiver { receiver: token })
+        );
+        assert_eq!(footprint, (1, 0, 0));
+    }
+}
+
+/// `transfer_allows_another_b20_receiver`: only the token itself is excluded.
+#[test]
+fn v3_transfer_allows_another_b20_as_receiver() {
+    for is_asset in [true, false] {
+        let mut f = Fixture::fresh(is_asset);
+        f.fund(ALICE, 10);
+        let call = IB20::transferCall {
+            to: OTHER_B20,
+            amount: u(1),
+        }
+        .abi_encode();
+        f.call(B20Version::V3, ALICE, &call, false).unwrap();
+    }
+}
+
+/// `golden_transfer_from_reverts_token_receiver_before_sender_validation`.
+#[test]
+fn v3_transfer_from_checks_the_token_receiver_before_the_sender() {
+    for is_asset in [true, false] {
+        let token = token(is_asset);
+        let call = IB20::transferFromCall {
+            from: Address::ZERO,
+            to: token,
+            amount: u(1),
+        }
+        .abi_encode();
+        let mut f = Fixture::fresh(is_asset);
+        assert_eq!(
+            f.call(B20Version::V2, BOB, &call, true).unwrap_err(),
+            B20Error::revert(IB20::InvalidSender {
+                sender: Address::ZERO
+            })
+        );
+        assert_eq!(
+            f.call(B20Version::V3, BOB, &call, true).unwrap_err(),
+            B20Error::revert(IB20::InvalidReceiver { receiver: token })
+        );
+    }
+}
+
+/// `golden_mint_reverts_token_receiver` and `golden_batch_mint_reverts_token_recipient`.
+#[test]
+fn v3_mint_rejects_the_token_as_receiver() {
+    for is_asset in [true, false] {
+        let token = token(is_asset);
+        let call = IB20::mintCall {
+            to: token,
+            amount: u(1),
+        }
+        .abi_encode();
+        let mut f = Fixture::fresh(is_asset);
+        f.call(B20Version::V2, ADMIN, &call, true).unwrap();
+        let mut f = Fixture::fresh(is_asset);
+        assert_eq!(
+            f.call(B20Version::V3, ADMIN, &call, true).unwrap_err(),
+            B20Error::revert(IB20::InvalidReceiver { receiver: token })
+        );
+    }
+
+    let call = IB20Asset::batchMintCall {
+        recipients: vec![BOB, ASSET],
+        amounts: vec![u(1), u(1)],
+    }
+    .abi_encode();
+    let mut f = Fixture::fresh(true);
+    assert_eq!(
+        f.call(B20Version::V3, ADMIN, &call, true).unwrap_err(),
+        B20Error::revert(IB20::InvalidReceiver { receiver: ASSET })
+    );
+}
+
+/// `golden_seize_reverts_token_receiver_before_sender_validation` and
+/// `golden_seize_recovers_a_balance_from_token_source`: the token cannot receive a seized
+/// balance, but a balance stranded on it before Denim can still be seized out.
+#[test]
+fn v3_seize_rejects_the_token_as_receiver_but_not_as_source() {
+    for is_asset in [true, false] {
+        let token = token(is_asset);
+        let mut f = Fixture::fresh(is_asset);
+        f.give_role(ids::SEIZE_ROLE, ADMIN);
+        let call = IB20::seizeWithMemoCall {
+            from: Address::ZERO,
+            to: token,
+            amount: u(1),
+            memo: MEMO,
+        }
+        .abi_encode();
+        assert_eq!(
+            f.call(B20Version::V2, ADMIN, &call, false).unwrap_err(),
+            B20Error::revert(IB20::InvalidSender {
+                sender: Address::ZERO
+            })
+        );
+        assert_eq!(
+            f.call(B20Version::V3, ADMIN, &call, false).unwrap_err(),
+            B20Error::revert(IB20::InvalidReceiver { receiver: token })
+        );
+
+        let mut f = Fixture::fresh(is_asset);
+        f.fund(token, 10);
+        f.give_role(ids::SEIZE_ROLE, ADMIN);
+        f.set_policy(PolicySlot::SeizeExempt, POLICY_ID);
+        f.set_policy(PolicySlot::SeizeReceiver, POLICY_ID_2);
+        f.registry_allow(POLICY_ID_2, BOB);
+        let call = IB20::seizeWithMemoCall {
+            from: token,
+            to: BOB,
+            amount: u(10),
+            memo: MEMO,
+        }
+        .abi_encode();
+        f.call(B20Version::V3, ADMIN, &call, false).unwrap();
+        let balance = |f: &mut Fixture, who: Address| {
+            U256::abi_decode(
+                &f.call(
+                    B20Version::V3,
+                    who,
+                    &IB20::balanceOfCall { account: who }.abi_encode(),
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(balance(&mut f, token), U256::ZERO);
+        assert_eq!(balance(&mut f, BOB), u(10));
+    }
+}
+
+/// `inverted_policies_negate_simple_composite_and_builtin_authorization`,
+/// `inverted_unknown_policy_fails_closed`, and
+/// `golden_is_authorized_denies_malformed_and_inverted_uncreated_ids`.
+#[test]
+fn v3_inverted_policy_ids_negate_their_base_policy() {
+    use super::policy::{is_authorized, policy_exists, ALWAYS_ALLOW_ID, ALWAYS_BLOCK_ID};
+    let v3 = B20Version::V3;
+    let mut f = Fixture::fresh(true);
+    f.registry_create(POLICY_ID);
+    f.registry_allow(POLICY_ID, ALICE);
+    let mut auth = |id, who, version| is_authorized(&mut f.port, id, who, version).unwrap();
+
+    assert!(auth(POLICY_ID, ALICE, v3) && !auth(POLICY_ID, BOB, v3));
+    assert!(!auth(POLICY_ID | INVERTED, ALICE, v3) && auth(POLICY_ID | INVERTED, BOB, v3));
+    // Inverted built-ins.
+    assert!(!auth(ALWAYS_ALLOW_ID | INVERTED, ALICE, v3));
+    assert!(auth(ALWAYS_BLOCK_ID | INVERTED, ALICE, v3));
+    // An uncreated BLOCKLIST allows everyone, but its inverse fails closed rather than
+    // blocking everyone.
+    let uncreated_blocklist = 0x1234;
+    assert!(auth(uncreated_blocklist, ALICE, v3));
+    assert!(!auth(uncreated_blocklist | INVERTED, ALICE, v3));
+    // Before Denim bit 63 makes the type byte malformed.
+    assert!(!auth(POLICY_ID | INVERTED, BOB, B20Version::V2));
+    // Every type byte above INTERSECT, over an uncreated base, is unauthorized.
+    for type_byte in 4u8..=u8::MAX {
+        assert!(
+            !auth((u64::from(type_byte) << 56) | 0x1234, ALICE, v3),
+            "{type_byte:#04x}"
+        );
+    }
+
+    let mut exists = |id, version| policy_exists(&mut f.port, id, version).unwrap();
+    assert!(exists(POLICY_ID | INVERTED, v3));
+    assert!(!exists(POLICY_ID | INVERTED, B20Version::V2));
+    assert!(exists(ALWAYS_ALLOW_ID | INVERTED, v3));
+    assert!(!exists(uncreated_blocklist | INVERTED, v3));
+
+    // The existence check reads the base policy word, then the membership.
+    f.port.reset_counters();
+    is_authorized(&mut f.port, POLICY_ID | INVERTED, BOB, v3).unwrap();
+    assert_eq!(f.port.registry_sloads, 2);
+}
+
+/// `inverted_simple_children_are_valid_and_remain_verbatim`: an INTERSECT of an allowlist and an
+/// inverted allowlist authorizes members of the first that are not members of the second.
+#[test]
+fn v3_inverted_policy_ids_work_as_composite_children() {
+    use super::policy::is_authorized;
+    let intersect = (3u64 << 56) | 10;
+    let mut f = Fixture::fresh(true);
+    f.registry_create(POLICY_ID);
+    f.registry_create(POLICY_ID_2);
+    f.registry_allow(POLICY_ID, ALICE);
+    f.registry_allow(POLICY_ID, BOB);
+    f.registry_allow(POLICY_ID_2, BOB);
+    f.registry_create(intersect);
+    f.registry_children(intersect, &[POLICY_ID, POLICY_ID_2 | INVERTED]);
+    let mut auth = |who| is_authorized(&mut f.port, intersect, who, B20Version::V3).unwrap();
+    assert!(auth(ALICE));
+    assert!(!auth(BOB));
+    assert!(!auth(CAROL));
+}
+
+/// A token can point a policy scope at an inverted ID from Denim: `updatePolicy` resolves its
+/// existence through the base policy, and transfers then evaluate the negation.
+#[test]
+fn v3_token_policies_accept_inverted_ids() {
+    let update = IB20::updatePolicyCall {
+        policyScope: ids::TRANSFER_RECEIVER_POLICY,
+        newPolicyId: POLICY_ID | INVERTED,
+    }
+    .abi_encode();
+    let mut f = Fixture::fresh(true);
+    f.registry_create(POLICY_ID);
+    f.registry_allow(POLICY_ID, BOB);
+    assert_eq!(
+        f.call(B20Version::V2, ADMIN, &update, true).unwrap_err(),
+        B20Error::revert(IB20::PolicyNotFound {
+            policyId: POLICY_ID | INVERTED
+        })
+    );
+    f.call(B20Version::V3, ADMIN, &update, true).unwrap();
+
+    f.fund(ALICE, 100);
+    // BOB is on the base allowlist, so the inverted receiver policy forbids him.
+    let err = f
+        .call(
+            B20Version::V3,
+            ALICE,
+            &IB20::transferCall {
+                to: BOB,
+                amount: u(1),
+            }
+            .abi_encode(),
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        B20Error::revert(IB20::PolicyForbids {
+            policyScope: ids::TRANSFER_RECEIVER_POLICY,
+            policyId: POLICY_ID | INVERTED,
+        })
+    );
+    f.call(
+        B20Version::V3,
+        ALICE,
+        &IB20::transferCall {
+            to: CAROL,
+            amount: u(1),
+        }
+        .abi_encode(),
+        false,
+    )
+    .unwrap();
 }

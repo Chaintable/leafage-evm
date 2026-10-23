@@ -67,10 +67,15 @@ impl MockPort {
 
     /// A port for `token` on Base Sepolia after Cobalt, calling as `caller`.
     fn sepolia_cobalt(gas_limit: u64, token: Address, caller: Address) -> Self {
+        Self::sepolia_at(gas_limit, token, caller, 1_790_222_750)
+    }
+
+    /// A port for `token` on Base Sepolia at block `timestamp`, calling as `caller`.
+    fn sepolia_at(gas_limit: u64, token: Address, caller: Address, timestamp: u64) -> Self {
         let mut port = Self::new(gas_limit);
         port.caller = caller;
         port.chain_id = 84532;
-        port.timestamp = U256::from(1_790_222_750u64);
+        port.timestamp = U256::from(timestamp);
         port.warm_accounts.insert(token);
         port.code_accounts.insert(token);
         port
@@ -394,47 +399,11 @@ fn policy_gated_transfer_matches_base_mainnet_gas() {
 /// - `uiMultiplier` reads the pending schedule slot before the multiplier slot.
 #[test]
 fn cobalt_gas_matches_base_sepolia() {
-    const SEPOLIA_TOKEN: Address = address!("0xb200000000000000000000c4c266da4035da4d13");
-    const ROOT_B20: U256 = U256::from_limbs([
-        0xbb5f01ed48434000,
-        0x4c938c3196430e10,
-        0x4aff64ea9b247419,
-        0xc78b71fee795ddd7,
-    ]);
-    let caller = address!("0x1111111111111111111111111111111111111111");
-    let dead = address!("0x000000000000000000000000000000000000dEaD");
+    let caller = SEPOLIA_CALLER;
+    let dead = SEPOLIA_DEAD;
     let seize_exempt =
         b256!("edb5da348cfb67af08746d3afd1be81034b50d5c8576f31aff688f39dfd540ed");
-
-    let seed = |port: &mut MockPort| {
-        // name "Summit Commerce Corp." (short form: bytes, then 2 * len in the last byte).
-        let name = U256::from_str_radix(
-            "53756d6d697420436f6d6d6572636520436f72702e000000000000000000002a",
-            16,
-        )
-        .unwrap();
-        port.storage.insert((SEPOLIA_TOKEN, ROOT_B20), name);
-        let policies = U256::from(0x4fu64) | (U256::from(0x4fu64) << 64) | (U256::from(0x45u64) << 128);
-        port.storage.insert((SEPOLIA_TOKEN, ROOT_B20 + U256::from(9u64)), policies);
-    };
-    let min_gas = |calldata: &[u8], who: Address| {
-        let completes = |limit: u64| {
-            let mut port = MockPort::sepolia_cobalt(limit, SEPOLIA_TOKEN, who);
-            seed(&mut port);
-            !matches!(dispatch(&mut port, SEPOLIA_TOKEN, true, calldata), Err(B20Error::OutOfGas))
-        };
-        let (mut lo, mut hi) = (0u64, 200_000u64);
-        assert!(completes(hi));
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if completes(mid) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        hi
-    };
+    let min_gas = |calldata: &[u8], who: Address| sepolia_min_gas(1_790_222_750, calldata, who);
 
     let cases: Vec<(&str, Vec<u8>, Address, u64)> = vec![
         ("SEIZE_ROLE", IB20::SEIZE_ROLECall {}.abi_encode(), caller, 106),
@@ -488,8 +457,132 @@ fn cobalt_gas_matches_base_sepolia() {
             caller,
             7594,
         ),
+        (
+            "transferFrom with spender == holder",
+            IB20::transferFromCall { from: caller, to: dead, amount: U256::ZERO }.abi_encode(),
+            caller,
+            19081,
+        ),
+        (
+            "transfer to the token",
+            IB20::transferCall { to: SEPOLIA_TOKEN, amount: U256::ZERO }.abi_encode(),
+            caller,
+            15119,
+        ),
     ];
     for (name, calldata, who, expected) in cases {
         assert_eq!(min_gas(&calldata, who), expected, "{name}: minimum gas must match Base Sepolia");
+    }
+}
+
+/// The Cobalt reference token on Base Sepolia, "Summit Commerce Corp.".
+const SEPOLIA_TOKEN: Address = address!("0xb200000000000000000000c4c266da4035da4d13");
+const SEPOLIA_CALLER: Address = address!("0x1111111111111111111111111111111111111111");
+const SEPOLIA_DEAD: Address = address!("0x000000000000000000000000000000000000dEaD");
+
+/// Minimum gas for `calldata` from `who` against [`SEPOLIA_TOKEN`]'s live state at `timestamp`,
+/// found with the same binary search Base's `eth_call` measurements use.
+fn sepolia_min_gas(timestamp: u64, calldata: &[u8], who: Address) -> u64 {
+    const ROOT_B20: U256 = U256::from_limbs([
+        0xbb5f01ed48434000,
+        0x4c938c3196430e10,
+        0x4aff64ea9b247419,
+        0xc78b71fee795ddd7,
+    ]);
+    let seed = |port: &mut MockPort| {
+        // name "Summit Commerce Corp." (short form: bytes, then 2 * len in the last byte).
+        let name = U256::from_str_radix(
+            "53756d6d697420436f6d6d6572636520436f72702e000000000000000000002a",
+            16,
+        )
+        .unwrap();
+        port.storage.insert((SEPOLIA_TOKEN, ROOT_B20), name);
+        let policies = U256::from(0x4fu64) | (U256::from(0x4fu64) << 64) | (U256::from(0x45u64) << 128);
+        port.storage.insert((SEPOLIA_TOKEN, ROOT_B20 + U256::from(9u64)), policies);
+    };
+    let completes = |limit: u64| {
+        let mut port = MockPort::sepolia_at(limit, SEPOLIA_TOKEN, who, timestamp);
+        seed(&mut port);
+        !matches!(dispatch(&mut port, SEPOLIA_TOKEN, true, calldata), Err(B20Error::OutOfGas))
+    };
+    let (mut lo, mut hi) = (0u64, 200_000u64);
+    assert!(completes(hi));
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if completes(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+/// Denim gas, checked against Base Sepolia, where Denim activated at 1_792_605_600.
+///
+/// Measured at block 48,998,068 against the same token as [`cobalt_gas_matches_base_sepolia`]
+/// (block 48,418,000, just before Denim, reproduces the Cobalt numbers). The token's executor
+/// policy (blocklist 0x45) differs from its sender policy (0x4f), so:
+/// - `transfer` now also checks the executor policy against the holder: one more cold registry
+///   read, 15119 → 17219.
+/// - `transferFrom` with the holder as spender no longer skips the executor check: 19081 → 21181,
+///   the same as a third-party spender.
+/// - `transfer` to the token's own address reverts `InvalidReceiver` right after the pause read.
+#[test]
+fn denim_gas_matches_base_sepolia() {
+    let caller = SEPOLIA_CALLER;
+    let dead = SEPOLIA_DEAD;
+    let cases: Vec<(&str, Vec<u8>, Address, u64)> = vec![
+        ("SEIZE_ROLE", IB20::SEIZE_ROLECall {}.abi_encode(), caller, 106),
+        ("DOMAIN_SEPARATOR", IB20::DOMAIN_SEPARATORCall {}.abi_encode(), caller, 2338),
+        (
+            "transfer",
+            IB20::transferCall { to: dead, amount: U256::ZERO }.abi_encode(),
+            caller,
+            17219,
+        ),
+        (
+            "transferFrom with spender != holder",
+            IB20::transferFromCall { from: caller, to: dead, amount: U256::ZERO }.abi_encode(),
+            dead,
+            21181,
+        ),
+        (
+            "transferFrom with spender == holder",
+            IB20::transferFromCall { from: caller, to: dead, amount: U256::ZERO }.abi_encode(),
+            caller,
+            21181,
+        ),
+        (
+            "transfer to the token",
+            IB20::transferCall { to: SEPOLIA_TOKEN, amount: U256::ZERO }.abi_encode(),
+            caller,
+            2218,
+        ),
+        (
+            "mint to the token without MINT_ROLE",
+            IB20::mintCall { to: SEPOLIA_TOKEN, amount: U256::ZERO }.abi_encode(),
+            caller,
+            4318,
+        ),
+        (
+            "permit with v = 0",
+            IB20::permitCall {
+                owner: caller,
+                spender: dead,
+                value: U256::ZERO,
+                deadline: U256::MAX,
+                v: 0,
+                r: B256::ZERO,
+                s: B256::ZERO,
+            }
+            .abi_encode(),
+            caller,
+            7594,
+        ),
+    ];
+    for (name, calldata, who, expected) in cases {
+        let got = sepolia_min_gas(1_792_721_482, &calldata, who);
+        assert_eq!(got, expected, "{name}: minimum gas must match Base Sepolia");
     }
 }
