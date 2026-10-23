@@ -3,14 +3,14 @@ use crate::api_impl::core::{
     Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::utils;
-use crate::error::{internal_rpc_err, rpc_error_with_code};
+use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err};
 use alloy::primitives::Bytes;
 use alloy::rpc::types::trace::geth::GethDefaultTracingOptions;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
-    block_env_from_block, BlockId, BlockNumberOrTag, CallRequest, DebankErrorCode, DefaultFrame,
-    PreErrorCode, PreResult, TransactionInfo, H256,
+    block_env_from_block, BlockId, BlockNumberOrTag, CallRequest, DefaultFrame, PreErrorCode,
+    PreResult, TransactionInfo, H256,
 };
 use revm::context::result::ExecutionResult;
 use revm::context::Transaction as TransactionTrait;
@@ -46,28 +46,16 @@ where
         request: CallRequest,
         block_id: Option<BlockId>,
     ) -> RpcResult<DefaultFrame> {
+        let resolved_id = block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
         let state = self
             .inner
             .db()
-            .state_at(block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
-        let state = state.unwrap();
+            .state_at(resolved_id)
+            .map_err(|e| block_lookup_err(resolved_id, e))?
+            .ok_or_else(|| self.block_unavailable_err(block_id))?;
         let block = state
             .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,
@@ -135,28 +123,16 @@ where
         block_id: Option<BlockId>,
         cancellation_token: CancellationToken,
     ) -> RpcResult<Vec<PreResult>> {
+        let resolved_id = block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest));
         let state = self
             .inner
             .db()
-            .state_at(block_id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
-        if state.is_none() {
-            if self.inner.evm_cfg().is_archive {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::InvalidBlockID as i32,
-                    format!("block block_id {:?} is invalid", block_id),
-                ));
-            } else {
-                return Err(rpc_error_with_code(
-                    DebankErrorCode::BlockNotFound as i32,
-                    format!("block block_id {:?} not found for state node", block_id),
-                ));
-            }
-        }
-        let state = state.unwrap();
+            .state_at(resolved_id)
+            .map_err(|e| block_lookup_err(resolved_id, e))?
+            .ok_or_else(|| self.block_unavailable_err(block_id))?;
         let block = state
             .block_info_arc()
-            .map_err(|e| internal_rpc_err(e.to_string()))?;
+            .map_err(|e| database_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
         let mut memory_db = CacheDB::new(EvmStorageWrapper {
             db: state,

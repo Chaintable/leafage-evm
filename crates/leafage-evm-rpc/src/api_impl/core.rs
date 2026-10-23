@@ -16,7 +16,10 @@ use leafage_evm_chains::moonbeam::MoonbeamHardfork;
 use leafage_evm_chains::polygon::PolygonHardfork;
 use leafage_evm_chains::rsk::RskHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
-use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256};
+use leafage_evm_storage::EvmStorageRead;
+use leafage_evm_types::{
+    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
+};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::Transaction as TransactionTrait;
@@ -245,6 +248,52 @@ impl<C> Clone for Api<C> {
         Self {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+impl<C: ApiBase> Api<C> {
+    /// Error for a block this node has no state for: `-39007 InvalidBlockID`
+    /// on archive, `-39006 BlockNotFound` on a state node, where nodex-proxy
+    /// retries the request against archive. leafage-py parses these
+    /// messages, so the text must not change.
+    pub(crate) fn block_unavailable_err(
+        &self,
+        block_id: impl Debug,
+    ) -> jsonrpsee::types::ErrorObjectOwned {
+        use crate::error::rpc_error_with_code;
+        use leafage_evm_types::DebankErrorCode;
+
+        if self.inner.evm_cfg().is_archive {
+            rpc_error_with_code(
+                DebankErrorCode::InvalidBlockID as i32,
+                format!("block block_id {:?} is invalid", block_id),
+            )
+        } else {
+            rpc_error_with_code(
+                DebankErrorCode::BlockNotFound as i32,
+                format!("block block_id {:?} not found for state node", block_id),
+            )
+        }
+    }
+}
+
+impl<C: ApiBase> Api<C>
+where
+    C::DB: EvmStorageRead,
+{
+    /// State at `block_id`, failing with [`block_lookup_err`] or
+    /// [`Self::block_unavailable_err`].
+    ///
+    /// [`block_lookup_err`]: crate::error::block_lookup_err
+    pub(crate) fn resolve_state(
+        &self,
+        block_id: BlockId,
+    ) -> RpcResult<<C::DB as EvmStorageRead>::StateDB> {
+        self.inner
+            .db()
+            .state_at(block_id)
+            .map_err(|e| crate::error::block_lookup_err(block_id, e))?
+            .ok_or_else(|| self.block_unavailable_err(block_id))
     }
 }
 

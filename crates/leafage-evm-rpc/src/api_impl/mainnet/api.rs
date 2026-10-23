@@ -4,7 +4,7 @@ use crate::api_impl::core::{
 };
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
-use crate::error::{internal_rpc_err, rpc_error_with_code};
+use crate::error::rpc_error_with_code;
 use alloy::consensus::BlockHeader;
 use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use jsonrpsee::core::RpcResult;
@@ -54,7 +54,14 @@ where
 
             evm.system_call(HISTORY_STORAGE_ADDRESS, parent_block_hash.0.into())
                 .map_err(|e| {
-                    internal_rpc_err(format!("EIP-2935 blockhashes contract call failed: {e}"))
+                    let code = match e {
+                        EVMError::Database(_) => DebankErrorCode::DataBaseFailed,
+                        _ => DebankErrorCode::InternalError,
+                    };
+                    rpc_error_with_code(
+                        code as i32,
+                        format!("EIP-2935 blockhashes contract call failed: {e}"),
+                    )
                 })?
         };
 
@@ -163,6 +170,9 @@ impl ToJsonRpcError for InvalidTransaction {
                 DebankErrorCode::GasExhausted as i32,
                 "Invalid gas limit".to_string(),
             ),
+            InvalidTransaction::GasFloorMoreThanGasLimit { .. } => {
+                rpc_error_with_code(DebankErrorCode::GasExhausted as i32, self.to_string())
+            }
             InvalidTransaction::NonceOverflowInTransaction
             | InvalidTransaction::NonceTooHigh { .. }
             | InvalidTransaction::NonceTooLow { .. } => rpc_error_with_code(

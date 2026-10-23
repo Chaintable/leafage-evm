@@ -1,4 +1,4 @@
-use crate::error::{internal_rpc_err, invalid_params_rpc_err};
+use crate::error::{database_rpc_err, invalid_params_rpc_err};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{
     AccountInfo, AccountOverride, BlockOverrides, Bytecode, DebankEvent, DebankID, DebankTrace,
@@ -163,7 +163,7 @@ where
 {
     let mut info = db
         .basic(account)
-        .map_err(|_| internal_rpc_err("Failed to get basic account info"))?
+        .map_err(|e| database_rpc_err(format!("Failed to get basic account info: {e}")))?
         .unwrap_or_default();
 
     if let Some(nonce) = account_override.nonce {

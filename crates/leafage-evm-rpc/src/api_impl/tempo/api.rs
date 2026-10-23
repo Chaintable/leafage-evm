@@ -1,7 +1,7 @@
 use crate::api_impl::core::{
     ApiCore, EvmExecutor, GasFeeHandler, GetTransactionError, ToJsonRpcError, TxSetter,
 };
-use crate::error::{invalid_params_rpc_err, rpc_error_with_code};
+use crate::error::{database_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use revm::context::Transaction as TransactionTrait;
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
@@ -541,14 +541,14 @@ where
                     let slot = nk.mapping_slot(slot);
                     db.storage_ref(NONCE_PRECOMPILE_ADDRESS, slot)
                         .map(|v| v.saturating_to::<u64>())
-                        .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                        .map_err(|error| database_rpc_err(error.to_string()))?
                 };
                 request.inner.nonce = Some(nonce);
             }
         } else if te.fee_payer_signature.is_some() && request.inner.nonce.is_none() {
             let nonce = db
                 .basic_ref(request.inner.from.unwrap_or_default())
-                .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                .map_err(|error| database_rpc_err(error.to_string()))?
                 .map(|account| account.nonce)
                 .unwrap_or_default();
             request.inner.nonce = Some(nonce);
@@ -713,7 +713,7 @@ where
         if TempoHardfork::from_timestamp(ts).is_t2() {
             let info = state
                 .basic_ref(VALIDATOR_CONFIG_V2_ADDRESS)
-                .map_err(|error| rpc_error_with_code(-32603, error.to_string()))?
+                .map_err(|error| database_rpc_err(error.to_string()))?
                 .unwrap_or_default();
             if info.is_empty_code_hash() {
                 use revm::bytecode::Bytecode;
