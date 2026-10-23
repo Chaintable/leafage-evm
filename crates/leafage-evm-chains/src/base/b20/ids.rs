@@ -115,7 +115,8 @@ pub fn pausable_features(version: B20Version) -> &'static [IB20::PausableFeature
     ];
     match version {
         B20Version::V1 => &V1,
-        B20Version::V2 => &V2,
+        // Denim adds no pausable feature.
+        B20Version::V2 | B20Version::V3 => &V2,
     }
 }
 

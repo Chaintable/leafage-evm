@@ -11,9 +11,9 @@
 //! reads *and* writes — and, critically, meters gas per storage access rather than charging
 //! a flat fee, so `estimateGas` over a B20 address agrees with a real Base node.
 //!
-//! Both token logic versions are ported — Beryl (V1) and Cobalt (V2) — and the version is
-//! resolved per call from the executing block's chain ID and timestamp ([`B20Version`]),
-//! exactly as Base routes by hardfork.
+//! All three token logic versions are ported — Beryl (V1), Cobalt (V2) and Denim (V3) — and
+//! the version is resolved per call from the executing block's chain ID and timestamp
+//! ([`B20Version`]), exactly as Base routes by hardfork.
 //!
 //! Why a port rather than a dependency on Base's crate: `base-common-precompiles` is built
 //! against revm 40 / alloy-evm 0.36, leafage against revm 36 / alloy-evm 0.29, and there is
@@ -48,8 +48,8 @@ pub use layout::{B20Store, PolicySlot, ASSET_MIN_DECIMALS, STABLECOIN_DECIMALS, 
 pub use policy::POLICY_REGISTRY;
 pub use port::B20Port;
 pub use version::{
-    B20Version, BASE_MAINNET_CHAIN_ID, BASE_MAINNET_COBALT_TIMESTAMP, BASE_SEPOLIA_CHAIN_ID,
-    BASE_SEPOLIA_COBALT_TIMESTAMP,
+    B20Version, BASE_MAINNET_CHAIN_ID, BASE_MAINNET_COBALT_TIMESTAMP, BASE_MAINNET_DENIM_TIMESTAMP,
+    BASE_SEPOLIA_CHAIN_ID, BASE_SEPOLIA_COBALT_TIMESTAMP, BASE_SEPOLIA_DENIM_TIMESTAMP,
 };
 
 use alloy::primitives::Address;

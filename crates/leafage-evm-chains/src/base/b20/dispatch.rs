@@ -95,7 +95,8 @@ fn decode_failed(selector: [u8; 4]) -> B20Error {
 fn asset_selector(version: B20Version, selector: [u8; 4]) -> bool {
     match version {
         B20Version::V1 => IB20AssetV1::IB20AssetV1Calls::valid_selector(selector),
-        B20Version::V2 => A::valid_selector(selector),
+        // Denim keeps the Cobalt wire surface.
+        B20Version::V2 | B20Version::V3 => A::valid_selector(selector),
     }
 }
 
@@ -103,7 +104,7 @@ fn asset_selector(version: B20Version, selector: [u8; 4]) -> bool {
 fn common_selector(version: B20Version, selector: [u8; 4]) -> bool {
     match version {
         B20Version::V1 => IB20V1::IB20V1Calls::valid_selector(selector),
-        B20Version::V2 => C::valid_selector(selector),
+        B20Version::V2 | B20Version::V3 => C::valid_selector(selector),
     }
 }
 

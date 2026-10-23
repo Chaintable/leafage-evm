@@ -178,9 +178,35 @@ after the selector; leafage returns the selector alone (what Base returns from C
 
 - `src/base/b20/golden.rs` reproduces Base's `golden_gas_footprints` tables for asset and
   stablecoin, V1 and V2 — per-op SLOAD / SSTORE / metered-keccak counts, copied verbatim.
-- `tests/b20_gas.rs::cobalt_gas_matches_base_sepolia` pins 11 calls to the exact minimum gas
+- `tests/b20_gas.rs::cobalt_gas_matches_base_sepolia` pins 13 calls to the exact minimum gas
   Base Sepolia accepted (block 47,227,231, token `0xb200…c4c266da4035da4d13`), including a
   transfer through real blocklist registry reads and the metered permit and domain separator.
+
+## Denim (V3)
+
+Denim (Base reth v1.5.0 / v1.5.1; mainnet `1_793_901_600` = 2026-11-05 18:00 UTC, Sepolia
+`1_792_605_600` = 2026-10-21 18:00 UTC) replaces the token and policy-registry logic in place
+again. The wire surface does not change: asset and stablecoin V3 keep the Cobalt selectors, and
+the registry's only new selector, `invertedPolicyId`, is on the forwarded administrative
+dispatch. Storage features stay at Cobalt.
+
+| Area | Change |
+| --- | --- |
+| Transfer executor policy | Checked on every unprivileged transfer path (`transfer`, `transferWithMemo`, `transferFrom`, `transferFromWithMemo`), in the order executor → sender → receiver. Cobalt checked it only on `transferFrom` with a third-party spender. The sender check is skipped when it would repeat the executor check: the holder is the caller and both scopes name the same policy |
+| Credit recipient | `transfer`, `transferFrom`, `mint` (and so `batchMint`) and `seizeWithMemo` also reject the token's own address as `to` (`InvalidReceiver`), checked with the zero address and so before the sender. Seizing *from* the token is still allowed, so a balance stranded there before Denim can be recovered |
+| Inverted policy IDs | Bit 63 of a policy ID means "the base policy, negated". `isAuthorized` checks the base exists (fail closed otherwise), then negates it; `policyExists` resolves the base. Inverted simple policies work as composite children. Before Denim such an ID is malformed |
+
+### Denim validation
+
+- `src/base/b20/golden.rs` runs the V2 footprint tables for V3 too (Base's V3 tables are
+  identical) and adds the V3-only cases from Base's `b20_{asset,stablecoin,policy}_v3_golden.rs`
+  and logic tests: executor enforcement and order, the sender-check skip (counted in registry
+  reads), the token as receiver, and inverted IDs.
+- `tests/b20_gas.rs::denim_gas_matches_base_sepolia` pins 8 calls to the exact minimum gas Base
+  Sepolia accepted after Denim (block 48,998,068, same token as Cobalt): `transfer` 17219
+  (+2100 for the executor policy read), `transferFrom` with the holder as spender 21181 (was
+  19081), and `transfer` to the token 2218 (revert). The Cobalt test pins the pre-Denim values of
+  the last two (block 48,418,000).
 
 ## References
 

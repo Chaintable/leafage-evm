@@ -11,7 +11,9 @@
 //!
 //! The registry is versioned like the tokens (`policy/versions.rs`): Beryl knows only the
 //! simple BLOCKLIST / ALLOWLIST types, while Cobalt adds the UNION / INTERSECT composites
-//! (`policy/logic/v2.rs`), whose authorization evaluates their child policies live.
+//! (`policy/logic/v2.rs`), whose authorization evaluates their child policies live. Denim
+//! (`policy/logic/v3.rs`) adds inverted IDs: bit 63 set means "the base policy, negated", with
+//! no second policy record stored.
 
 use alloy::primitives::{address, keccak256, Address, U256};
 
@@ -55,6 +57,10 @@ const ALLOWLIST_TYPE: u8 = 1;
 const UNION_TYPE: u8 = 2;
 const INTERSECT_TYPE: u8 = 3;
 
+/// Bit 63 of a policy ID marks it inverted (Denim). Before Denim such an ID has a type byte
+/// above INTERSECT, so it is malformed.
+const INVERTED_POLICY_BIT: u64 = 1u64 << 63;
+
 /// Bit 255 of a packed policy word marks the policy as created.
 const EXISTS_BIT: U256 = U256::from_limbs([0, 0, 0, 1u64 << 63]);
 
@@ -81,6 +87,10 @@ fn max_policy_type(version: B20Version) -> u8 {
 /// From Cobalt a composite is evaluated over its live child set, short-circuiting: UNION
 /// stops at the first child that authorizes, INTERSECT at the first that does not. So an
 /// empty (never-created) UNION authorizes nobody and an empty INTERSECT everybody.
+///
+/// From Denim an inverted ID authorizes exactly the accounts its base policy does not, and
+/// nobody when the base policy does not exist. The existence check reads the base policy word
+/// first (built-in bases excepted), so it costs one more SLOAD than evaluating the base alone.
 pub fn is_authorized<P: B20Port>(
     port: &mut P,
     policy_id: u64,
@@ -92,6 +102,14 @@ pub fn is_authorized<P: B20Port>(
     }
     if policy_id == ALWAYS_BLOCK_ID {
         return Ok(false);
+    }
+    // Inverted built-ins have a different ID, so they fall through to here too.
+    if version.is_denim() && policy_id & INVERTED_POLICY_BIT != 0 {
+        let base = policy_id & !INVERTED_POLICY_BIT;
+        if !policy_exists(port, base, version)? {
+            return Ok(false);
+        }
+        return Ok(!is_authorized(port, base, account, version)?);
     }
     if policy_id_type(policy_id) > max_policy_type(version) {
         return Ok(false);
@@ -123,12 +141,14 @@ pub fn is_authorized<P: B20Port>(
     }
 }
 
-/// Returns whether `policy_id` names a built-in or previously created policy.
+/// Returns whether `policy_id` names a built-in or previously created policy. From Denim an
+/// inverted ID exists exactly when its base policy does.
 pub fn policy_exists<P: B20Port>(
     port: &mut P,
     policy_id: u64,
     version: B20Version,
 ) -> Result<bool> {
+    let policy_id = if version.is_denim() { policy_id & !INVERTED_POLICY_BIT } else { policy_id };
     if policy_id == ALWAYS_ALLOW_ID || policy_id == ALWAYS_BLOCK_ID {
         return Ok(true);
     }
