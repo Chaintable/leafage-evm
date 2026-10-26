@@ -4,7 +4,7 @@ use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::bsc::{BscEvm, BscHardfork, BscTxEnv};
+use leafage_evm_chains::bsc::{header_milli_timestamp, BscEvm, BscHardfork, BscTxEnv};
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest};
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::WrapDatabaseRef;
@@ -15,7 +15,12 @@ use std::fmt::Debug;
 
 type BscApiImpl<DB> = ApiImpl<DB, BscHardfork, NoneEvmCustomConfig>;
 
-impl<DB> GasFeeHandler for BscApiImpl<DB> where DB: Sync + Send + 'static { type Tx = BscTxEnv; }
+impl<DB> GasFeeHandler for BscApiImpl<DB>
+where
+    DB: Sync + Send + 'static,
+{
+    type Tx = BscTxEnv;
+}
 
 impl<DB> EvmExecutor for BscApiImpl<DB>
 where
@@ -27,7 +32,7 @@ where
 
     fn create_txn_env<StateDB: DatabaseRef>(
         &self,
-        _block: &BlockInfo,
+        block: &BlockInfo,
         block_env: &BlockEnv,
         request: CallRequest,
         db: StateDB,
@@ -35,7 +40,12 @@ where
     ) -> RpcResult<Self::Tx> {
         let txn_env =
             create_mainnet_txn_env(block_env, self.evm_cfg.cfg.clone(), request, db, chain_id)?;
-        Ok(BscTxEnv::new(txn_env))
+        let mut tx = BscTxEnv::new(txn_env);
+        tx.milli_timestamp = Some(header_milli_timestamp(
+            block.header.timestamp,
+            block.header.mix_hash,
+        ));
+        Ok(tx)
     }
 
     fn transact<StateDB: DatabaseRef + Debug>(

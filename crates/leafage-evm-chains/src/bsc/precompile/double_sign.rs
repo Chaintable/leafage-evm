@@ -18,6 +18,18 @@ pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile = Precompile::new(
     double_sign_evidence_validation_run,
 );
 
+/// Double sign evidence validation precompile for BSC after Jenner hardfork, priced per input
+/// byte so oversized headers cannot impose unbounded SealHash work for a flat fee
+/// (go-bsc `verifyDoubleSignEvidenceJenner`).
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BSC_DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER")),
+    u64_to_address(104),
+    double_sign_evidence_validation_run_jenner,
+);
+
+const DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE: u64 = 10_000;
+const DOUBLE_SIGN_EVIDENCE_VALIDATION_PER_BYTE: u64 = 16;
+
 const EXTRA_SEAL_LENGTH: usize = 65;
 
 /// Double sign evidence with two different headers.
@@ -83,19 +95,36 @@ fn double_sign_evidence_validation_run(
     gas_limit: u64,
     reservoir: u64,
 ) -> PrecompileResult {
-    const DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE: u64 = 10_000;
+    double_sign_evidence_validation_run_inner(
+        input,
+        gas_limit,
+        reservoir,
+        DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
+    )
+}
 
-    if DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE > gas_limit {
+fn double_sign_evidence_validation_run_jenner(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
+    let gas = (input.len() as u64)
+        .saturating_mul(DOUBLE_SIGN_EVIDENCE_VALIDATION_PER_BYTE)
+        .saturating_add(DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE);
+    double_sign_evidence_validation_run_inner(input, gas_limit, reservoir, gas)
+}
+
+fn double_sign_evidence_validation_run_inner(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+    gas: u64,
+) -> PrecompileResult {
+    if gas > gas_limit {
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
-    let revert = || {
-        Ok(PrecompileOutput::revert(
-            DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
-            Default::default(),
-            reservoir,
-        ))
-    };
+    let revert = || Ok(PrecompileOutput::revert(gas, Default::default(), reservoir));
     let invalid_evidence = || {
         Ok(PrecompileOutput::halt(
             BscPrecompileError::DoubleSignInvalidEvidence.into(),
@@ -166,7 +195,7 @@ fn double_sign_evidence_validation_run(
     res[52 - header1.number.to_be_bytes().len()..].clone_from_slice(&header1.number.to_be_bytes());
 
     Ok(PrecompileOutput::new(
-        DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
+        gas,
         Bytes::copy_from_slice(&res),
         reservoir,
     ))

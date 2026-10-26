@@ -14,6 +14,7 @@ mod cometbft;
 mod double_sign;
 mod error;
 mod iavl;
+pub(crate) mod milli_timestamp;
 mod tendermint;
 mod tm_secp256k1;
 // BSC precompile provider
@@ -27,7 +28,9 @@ impl BscPrecompiles {
     /// Create a new precompile provider with the given bsc spec.
     #[inline]
     pub fn new(spec: BscHardfork) -> Self {
-        let precompiles = if spec >= BscHardfork::Pasteur {
+        let precompiles = if spec >= BscHardfork::Jenner {
+            jenner()
+        } else if spec >= BscHardfork::Pasteur {
             pasteur()
         } else if spec >= BscHardfork::Mendel {
             mendel()
@@ -233,6 +236,22 @@ pub fn pasteur() -> &'static Precompiles {
     })
 }
 
+/// Returns precompiles for Jenner spec.
+/// Reprices the double-sign evidence precompile (0x68) per input byte and adds the BEP-706
+/// millisecond timestamp precompile (0x70). The CAS20 family is dispatched by address prefix,
+/// outside this static set (see `BscEvm`).
+pub fn jenner() -> &'static Precompiles {
+    static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| {
+        let mut precompiles = pasteur().clone();
+        precompiles.extend([
+            double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER,
+            milli_timestamp::MILLI_TIMESTAMP,
+        ]);
+        Box::new(precompiles)
+    })
+}
+
 impl Default for BscPrecompiles {
     fn default() -> Self {
         Self::new(BscHardfork::default())
@@ -268,6 +287,22 @@ mod tests {
             mendel().len(),
             "Pasteur replaces, it adds nothing"
         );
+    }
+
+    #[test]
+    fn jenner_reprices_double_sign_and_adds_milli_timestamp() {
+        let double_sign = jenner().get(&u64_to_address(104)).unwrap();
+        assert_eq!(
+            double_sign.id().name(),
+            "BSC_DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER"
+        );
+        assert!(pasteur().get(&u64_to_address(0x70)).is_none());
+        assert!(jenner().get(&u64_to_address(0x70)).is_some());
+        assert_eq!(jenner().len(), pasteur().len() + 1);
+        assert!(std::ptr::eq(
+            BscPrecompiles::new(BscHardfork::Jenner).precompiles(),
+            jenner()
+        ));
     }
 
     #[test]

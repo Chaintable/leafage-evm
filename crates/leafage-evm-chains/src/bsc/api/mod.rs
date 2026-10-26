@@ -1,22 +1,25 @@
 use alloy_evm::precompiles::PrecompilesMap;
 use std::ops::{Deref, DerefMut};
 
+use crate::bsc::cas20;
 use crate::bsc::hardforks::bsc::BscHardfork;
-use crate::bsc::precompile::BscPrecompiles;
+use crate::bsc::precompile::{milli_timestamp, BscPrecompiles};
 use crate::bsc::transaction::BscTxEnv;
 use alloy_evm::{Database, EvmEnv};
+use revm::primitives::hardfork::SpecId;
 use revm::{
-    context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
+    context::{BlockEnv, CfgEnv, ContextError, Evm as EvmCtx, FrameStack, JournalTr},
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
         EthFrame, EvmTr, FrameInitOrResult, FrameResult,
     },
     inspector::InspectorEvmTr,
-    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
+    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit, FrameInput},
+    precompile::u64_to_address,
+    primitives::Address,
     Context, Inspector, Journal,
 };
-use revm::primitives::hardfork::SpecId;
 
 mod exec;
 
@@ -42,8 +45,11 @@ pub struct BscEvm<DB: revm::database::Database, I> {
 impl<DB: Database, I> BscEvm<DB, I> {
     /// Creates a new [`BscEvm`].
     pub fn new(env: EvmEnv<BscHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
-        let precompiles =
+        let mut precompiles =
             PrecompilesMap::from_static(BscPrecompiles::new(env.cfg_env.spec).precompiles());
+        if env.cfg_env.spec >= BscHardfork::Jenner {
+            install_jenner_precompiles(&mut precompiles);
+        }
 
         // Match the instruction table to the configured spec; `new_mainnet()` defaults to
         // the latest spec (Prague), which undercharges pre-Berlin SLOAD in early blocks.
@@ -68,6 +74,40 @@ impl<DB: Database, I> BscEvm<DB, I> {
             inspect,
         }
     }
+}
+
+/// Jenner's context-aware precompiles: `0x70` reads the block's millisecond timestamp, and
+/// CAS20 tokens are a whole address range, resolved by prefix rather than listed (go-bsc
+/// `EVM.precompile`). Lookup-resolved addresses stay out of the warm set, as in go-bsc.
+fn install_jenner_precompiles(precompiles: &mut PrecompilesMap) {
+    precompiles.apply_precompile(
+        &u64_to_address(milli_timestamp::MILLI_TIMESTAMP_ADDRESS),
+        |_| Some(milli_timestamp::milli_timestamp()),
+    );
+    precompiles.set_precompile_lookup(|address: &Address| {
+        cas20::is_cas20_token(address).then(cas20::token_precompile)
+    });
+}
+
+/// Short-circuits a frame whose `bytecode_address` is a CAS20 singleton leafage forwards
+/// (factory, activation registry, policy registry; see [`cas20::is_forwarded`]). The message
+/// format is parsed by `leafage-evm-rpc` `ToJsonRpcError for EVMError` into `-39008`.
+fn check_forwarded_precompiles<D>(
+    spec: BscHardfork,
+    frame_input: &FrameInput,
+) -> Result<(), ContextError<D>> {
+    if spec < BscHardfork::Jenner {
+        return Ok(());
+    }
+    if let FrameInput::Call(call) = frame_input {
+        if cas20::is_forwarded(&call.bytecode_address) {
+            return Err(ContextError::Custom(format!(
+                "unsupported precompile address: {}",
+                call.bytecode_address
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl<DB: Database, I> BscEvm<DB, I> {
@@ -133,6 +173,7 @@ where
         &mut self,
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        check_forwarded_precompiles(self.inner.ctx.cfg.spec, &frame_input.frame_input)?;
         self.inner.frame_init(frame_input)
     }
 
@@ -179,5 +220,13 @@ where
         &mut Self::Inspector,
     ) {
         self.inner.all_mut_inspector()
+    }
+
+    fn inspect_frame_init(
+        &mut self,
+        frame_init: FrameInit,
+    ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        check_forwarded_precompiles(self.inner.ctx.cfg.spec, &frame_init.frame_input)?;
+        self.inner.inspect_frame_init(frame_init)
     }
 }
