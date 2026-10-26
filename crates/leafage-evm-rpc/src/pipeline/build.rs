@@ -109,5 +109,6 @@ pub(crate) fn pipeline_header(block: &RpcBlock) -> PipelineHeader {
         excess_blob_gas: header.excess_blob_gas.map(U64::from),
         parent_beacon_block_root: header.parent_beacon_block_root,
         requests_root: header.requests_hash,
+        requests_hash: None,
     }
 }

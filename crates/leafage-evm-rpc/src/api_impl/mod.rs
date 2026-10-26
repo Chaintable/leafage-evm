@@ -26,7 +26,7 @@ pub use core::MultiChainCfgEnv;
 pub(crate) use core::{ApiCore, EvmExecutor, GasFeeHandler};
 
 pub(crate) mod mainnet;
-mod arc;
+pub(crate) mod arc;
 
 mod arbitrum;
 mod base;

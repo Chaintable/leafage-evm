@@ -143,6 +143,9 @@ pub struct PipelineHeader {
     pub parent_beacon_block_root: Option<B256>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requests_root: Option<B256>,
+    /// Arc follows its Writer header field name; other chains keep requestsRoot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_hash: Option<B256>,
 }
 
 /// Go `common.Address.Hex()` lowercased.
