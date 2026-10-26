@@ -141,7 +141,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-path` | - | Database path (required) |
 | `--listen-addr` | 0.0.0.0:8545 | RPC listen address |
 | `--rpc-addr` | - | Geth RPC address (for HTTP mode state updates) |
-| `--evm-type` | mainnet | EVM type: mainnet/op/bsc/cosmos |
+| `--evm-type` | mainnet | EVM type: mainnet/op/celo/bsc/cosmos |
 | `--chain-cfg` | 1 | Chain ID |
 | `--db-type` | rocksdb | Database type: rocksdb/mdbx |
 | `--db-cache` | 2048 | Database cache size (MB) |
@@ -156,6 +156,8 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--iterator-timeout-secs` | 0 | Iterator timeout for archive mode (0 = disabled) |
 | `--historical-rpc` | - | Historical RPC endpoint for pre-fork queries (e.g., OP pre-bedrock) |
 | `--historical-height` | - | Fork height threshold for historical RPC forwarding |
+
+For Celo L2 mainnet, use `--evm-type=celo --chain-cfg=42220`. Execution selects Granite / Isthmus / Jovian at the requested block and includes the CELO native transfer precompile (`0xfd`) and the 64 KiB code limit. This mode reuses OP fee handling; Celo-specific fee distribution, `feeCurrency` / CIP-64 and Celo L1 execution are not yet supported. Fixed-fork overrides are not accepted.
 
 ### Kafka + S3 Configuration
 

@@ -13,6 +13,7 @@ use clap::Parser;
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
+use leafage_evm_chains::celo::{CELO_CHAIN_ID, MAX_CODE_SIZE};
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
 #[cfg(target_os = "linux")]
@@ -54,6 +55,7 @@ pub struct Command {
             "mantlev2",
             "tempo",
             "citrea",
+            "celo",
             "iotex",
             "moonbeam",
             "moonriver",
@@ -639,6 +641,23 @@ impl Command {
                     .transpose()?;
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
+            "celo" => {
+                if chain_id != CELO_CHAIN_ID {
+                    bail!("celo evm-type only supports --chain-cfg {CELO_CHAIN_ID}");
+                }
+                if self.spec_id != u8::MAX || custom_evm_cfg.is_some() {
+                    bail!("celo evm-type follows its mainnet L2 fork schedule; --spec-id and --evm-custom-config are not supported");
+                }
+                let mut cfg = CfgEnv::new_with_spec(OpSpecId::JOVIAN);
+                cfg.chain_id = chain_id;
+                cfg.disable_balance_check = true;
+                cfg.disable_eip3607 = true;
+                cfg.disable_block_gas_limit = true;
+                cfg.disable_base_fee = true;
+                cfg.tx_gas_limit_cap = Some(gas_cap);
+                cfg.limit_contract_code_size = Some(MAX_CODE_SIZE);
+                Ok(MultiChainCfgEnv::Celo(cfg))
+            }
             "op" => {
                 if self.spec_id != u8::MAX {
                     bail!(
@@ -1142,7 +1161,7 @@ impl Command {
 }
 
 #[cfg(test)]
-mod op_config_tests {
+mod chain_config_tests {
     use super::*;
 
     fn command(args: &[&str]) -> Command {
@@ -1159,6 +1178,26 @@ mod op_config_tests {
             panic!("expected OP configuration")
         };
         cfg
+    }
+
+    #[test]
+    fn celo_selects_mainnet_l2_without_fixed_fork_overrides() {
+        let parse = |args: &[&str]| {
+            Command::try_parse_from(
+                ["standalone", "--db-path=/unused", "--evm-type=celo"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .unwrap()
+            .build_chain_cfg_env()
+        };
+        let MultiChainCfgEnv::Celo(cfg) = parse(&["--chain-cfg=42220"]).unwrap() else {
+            panic!("expected Celo configuration");
+        };
+        assert_eq!(cfg.limit_contract_code_size, Some(MAX_CODE_SIZE));
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--chain-cfg=42220", "--spec-id=18"]).is_err());
+        assert!(parse(&["--chain-cfg=42220", "--evm-custom-config={}"]).is_err());
     }
 
     #[test]
