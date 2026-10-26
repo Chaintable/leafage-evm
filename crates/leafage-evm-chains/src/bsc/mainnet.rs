@@ -63,6 +63,7 @@ const SHANGHAI_TIME: u64 = 1_705_996_800;
 const CANCUN_TIME: u64 = 1_718_863_500;
 const PRAGUE_TIME: u64 = 1_742_436_600;
 const OSAKA_TIME: u64 = 1_777_343_400;
+const PASTEUR_TIME: u64 = 1_787_625_000;
 
 impl EthereumHardforks for BscMainnetHardforks {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
@@ -119,6 +120,9 @@ impl BscHardforks for BscMainnetHardforks {
             BscHardfork::Maxwell => ForkCondition::Timestamp(1_751_250_600),
             BscHardfork::Fermi => ForkCondition::Timestamp(1_768_357_800),
             BscHardfork::Osaka | BscHardfork::Mendel => ForkCondition::Timestamp(OSAKA_TIME),
+            BscHardfork::Pasteur => ForkCondition::Timestamp(PASTEUR_TIME),
+            // go-bsc v1.8.1 schedules Jenner on Chapel only.
+            BscHardfork::Jenner => ForkCondition::Never,
         }
     }
 }
@@ -130,6 +134,8 @@ pub fn bsc_mainnet_spec_at(block_number: u64, timestamp: u64) -> BscHardfork {
     // Tycho shares Haber's activation and adds nothing the EVM sees, so
     // it is left out like in reth-bsc.
     const ORDER: &[BscHardfork] = &[
+        BscHardfork::Jenner,
+        BscHardfork::Pasteur,
         BscHardfork::Mendel,
         BscHardfork::Osaka,
         BscHardfork::Fermi,
@@ -251,5 +257,31 @@ mod tests {
             bsc_mainnet_spec_at(80_000_000, OSAKA_TIME),
             BscHardfork::Mendel
         );
+        assert_eq!(
+            bsc_mainnet_spec_at(90_000_000, PASTEUR_TIME - 1),
+            BscHardfork::Mendel
+        );
+        assert_eq!(
+            bsc_mainnet_spec_at(90_000_000, PASTEUR_TIME),
+            BscHardfork::Pasteur
+        );
+        assert_eq!(
+            bsc_mainnet_spec_at(90_000_000, u64::MAX),
+            BscHardfork::Pasteur
+        );
+    }
+
+    #[test]
+    fn pasteur_is_a_system_contract_transition() {
+        assert!(bsc_mainnet_fork_transition(
+            90_000_000,
+            PASTEUR_TIME - 1,
+            PASTEUR_TIME
+        ));
+        assert!(!bsc_mainnet_fork_transition(
+            90_000_000,
+            PASTEUR_TIME,
+            PASTEUR_TIME + 1
+        ));
     }
 }

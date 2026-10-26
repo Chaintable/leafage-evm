@@ -27,7 +27,9 @@ impl BscPrecompiles {
     /// Create a new precompile provider with the given bsc spec.
     #[inline]
     pub fn new(spec: BscHardfork) -> Self {
-        let precompiles = if spec >= BscHardfork::Mendel {
+        let precompiles = if spec >= BscHardfork::Pasteur {
+            pasteur()
+        } else if spec >= BscHardfork::Mendel {
             mendel()
         } else if spec >= BscHardfork::Pascal {
             pascal()
@@ -215,8 +217,68 @@ pub fn mendel() -> &'static Precompiles {
     })
 }
 
+/// Returns precompiles for Pasteur spec.
+/// Deprecates the v1 Tendermint precompiles (0x64, 0x65) and reprices the v2 light block
+/// precompile (0x67) per input byte, rejecting duplicate validators.
+pub fn pasteur() -> &'static Precompiles {
+    static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| {
+        let mut precompiles = mendel().clone();
+        precompiles.extend([
+            tendermint::TENDERMINT_HEADER_VALIDATION_PASTEUR,
+            iavl::IAVL_PROOF_VALIDATION_PASTEUR,
+            cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR,
+        ]);
+        Box::new(precompiles)
+    })
+}
+
 impl Default for BscPrecompiles {
     fn default() -> Self {
         Self::new(BscHardfork::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::precompile::{u64_to_address, PrecompileStatus};
+
+    #[test]
+    fn pasteur_deprecates_the_v1_tendermint_precompiles() {
+        for address in [100, 101] {
+            let precompile = pasteur().get(&u64_to_address(address)).unwrap();
+            assert!(
+                precompile.id().name().ends_with("_PASTEUR"),
+                "0x{address:x}"
+            );
+            let output = precompile.execute(&[], 3_000, 0).expect("not fatal");
+            assert!(
+                matches!(output.status, PrecompileStatus::Halt(_)),
+                "0x{address:x} must fail after Pasteur"
+            );
+        }
+        let comet = pasteur().get(&u64_to_address(103)).unwrap();
+        assert_eq!(
+            comet.id().name(),
+            "BSC_COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR"
+        );
+        assert_eq!(
+            pasteur().len(),
+            mendel().len(),
+            "Pasteur replaces, it adds nothing"
+        );
+    }
+
+    #[test]
+    fn pasteur_selected_from_the_pasteur_spec() {
+        assert!(std::ptr::eq(
+            BscPrecompiles::new(BscHardfork::Pasteur).precompiles(),
+            pasteur()
+        ));
+        assert!(std::ptr::eq(
+            BscPrecompiles::new(BscHardfork::Mendel).precompiles(),
+            mendel()
+        ));
     }
 }
