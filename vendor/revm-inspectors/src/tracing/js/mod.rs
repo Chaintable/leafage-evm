@@ -341,7 +341,7 @@ impl JsInspector {
             gas: tx.gas_limit(),
             gas_used,
             gas_price: tx
-                .effective_gas_price(block.basefee() as u128)
+                .effective_gas_price(block.basefee())
                 .try_into()
                 .unwrap_or(u64::MAX),
             value: tx.value(),

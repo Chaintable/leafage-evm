@@ -129,7 +129,7 @@ pub fn validate_tx_env<CTX: ContextTr>(
     let base_fee = if context.cfg().is_base_fee_check_disabled() {
         None
     } else {
-        Some(context.block().basefee() as u128)
+        Some(context.block().basefee())
     };
 
     let tx_type = TransactionType::from(tx_type);

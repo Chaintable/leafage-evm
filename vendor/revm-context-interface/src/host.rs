@@ -51,7 +51,7 @@ pub trait Host {
 
     /* Transaction */
 
-    /// Transaction effective gas price, calls `ContextTr::tx().effective_gas_price(basefee as u128)`
+    /// Transaction effective gas price, calls `ContextTr::tx().effective_gas_price(basefee)`
     fn effective_gas_price(&self) -> U256;
     /// Transaction caller, calls `ContextTr::tx().caller()`
     fn caller(&self) -> Address;

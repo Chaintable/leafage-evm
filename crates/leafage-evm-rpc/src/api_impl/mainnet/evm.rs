@@ -210,3 +210,83 @@ where
         .build_mainnet_with_inspector(inspector)
         .with_precompiles(EthPrecompiles::new(spec))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leafage_evm_types::{block_env_from_block, Block, Header, RawHeader};
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::inspector::NoOpInspector;
+    use revm::primitives::{address, bytes};
+    use revm::state::{AccountInfo, Bytecode};
+    use revm::ExecuteEvm;
+
+    #[test]
+    fn stable_basefee_and_gasprice_use_full_width_fees() {
+        let caller = address!("0000000000000000000000000000000000000100");
+        let contract = address!("0000000000000000000000000000000000000200");
+        let beneficiary = address!("0000000000000000000000000000000000000300");
+        let balance = U256::from(1) << 240;
+        for fee in [1_000_000_000_000_000_000_001u128, u128::MAX] {
+            let tip = u128::from(fee != u128::MAX);
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance,
+                    ..Default::default()
+                },
+            );
+            // Return BASEFEE and GASPRICE as two 32-byte words.
+            db.insert_account_info(
+                contract,
+                AccountInfo::from_bytecode(Bytecode::new_raw(bytes!("486000523a60205260406000f3"))),
+            );
+            let block = Block::<H256>::empty(Header {
+                inner: RawHeader {
+                    base_fee_per_gas: Some(fee),
+                    gas_limit: 100_000,
+                    beneficiary,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let env = block_env_from_block(&block);
+            let cfg = CfgEnv::new_with_spec(MainnetSpecId::CANCUN);
+            let tx = TxEnv {
+                tx_type: 2,
+                caller,
+                kind: TxKind::Call(contract),
+                gas_limit: 100_000,
+                gas_price: fee + tip,
+                gas_priority_fee: Some(tip),
+                chain_id: Some(cfg.chain_id),
+                ..Default::default()
+            };
+            let mut evm = create_main_evm_from_state(env, cfg, db, NoOpInspector {});
+            let result = evm.transact(tx.clone()).unwrap();
+            assert!(result.result.is_success());
+            let output = result.result.output().unwrap();
+            assert_eq!(U256::from_be_slice(&output[..32]), U256::from(fee));
+            assert_eq!(U256::from_be_slice(&output[32..]), U256::from(fee + tip));
+            let used = U256::from(result.result.tx_gas_used());
+            assert_eq!(
+                result.state[&caller].info.balance,
+                balance - used * U256::from(fee + tip)
+            );
+            assert_eq!(
+                result.state[&beneficiary].info.balance,
+                used * U256::from(tip)
+            );
+            assert!(matches!(
+                evm.transact(TxEnv {
+                    gas_price: fee - 1,
+                    ..tx
+                }),
+                Err(revm::context::result::EVMError::Transaction(
+                    revm::context::result::InvalidTransaction::GasPriceLessThanBasefee
+                ))
+            ));
+        }
+    }
+}

@@ -300,9 +300,9 @@ pub trait ArbStateReader: DatabaseRef {
             .map(address_from_word)
     }
 
-    fn paid_l1_gas_price(&self, tx: &TxEnv, block_base_fee: u64) -> U256 {
+    fn paid_l1_gas_price(&self, tx: &TxEnv, block_base_fee: u128) -> U256 {
         if self.collect_tips() {
-            let price = nitro_message_gas_price(tx, block_base_fee as u128);
+            let price = nitro_message_gas_price(tx, block_base_fee);
             if price != 0 {
                 return U256::from(price);
             }
@@ -310,7 +310,7 @@ pub trait ArbStateReader: DatabaseRef {
         U256::from(block_base_fee)
     }
 
-    fn current_tx_l1_gas_fee(&self, tx: &TxEnv, block_base_fee: u64) -> U256 {
+    fn current_tx_l1_gas_fee(&self, tx: &TxEnv, block_base_fee: u128) -> U256 {
         if block_base_fee == 0 {
             return U256::ZERO;
         }
@@ -324,7 +324,7 @@ pub trait ArbStateReader: DatabaseRef {
         pricing.current_tx_l1_fee(tx, paid_gas_price)
     }
 
-    fn current_tx_l1_gas_units(&self, tx: &TxEnv, block_base_fee: u64) -> u64 {
+    fn current_tx_l1_gas_units(&self, tx: &TxEnv, block_base_fee: u128) -> u64 {
         if block_base_fee == 0 {
             return 0;
         }

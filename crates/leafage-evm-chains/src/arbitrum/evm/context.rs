@@ -91,7 +91,7 @@ pub struct ArbitrumExecutionContext {
     current_call: ArbitrumCallContext,
     classic_frames: Vec<ClassicFrameContext>,
     current_l2_block_number: Option<U256>,
-    current_l2_basefee: Option<u64>,
+    current_l2_basefee: Option<u128>,
     tx_fee_context: Option<ArbitrumTxFeeContext>,
     current_poster_charge: Option<ArbPosterCharge>,
     current_arbos_version: u64,
@@ -136,7 +136,7 @@ impl ArbitrumExecutionContext {
         }
     }
 
-    pub fn set_current_l2_context(&mut self, block_number: U256, basefee: u64) {
+    pub fn set_current_l2_context(&mut self, block_number: U256, basefee: u128) {
         self.current_l2_block_number = Some(block_number);
         self.current_l2_basefee = Some(basefee);
     }
@@ -145,7 +145,7 @@ impl ArbitrumExecutionContext {
         self.current_l2_block_number
     }
 
-    pub fn current_l2_basefee(&self) -> Option<u64> {
+    pub fn current_l2_basefee(&self) -> Option<u128> {
         self.current_l2_basefee
     }
 

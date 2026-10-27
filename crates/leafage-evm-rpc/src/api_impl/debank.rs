@@ -697,7 +697,7 @@ where
                 &mut cache_db,
                 &mut block_env,
                 block.header.clone(),
-            );
+            )?;
         }
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
@@ -1085,10 +1085,13 @@ where
                 &mut memory_db,
                 &mut block_env,
                 block.header.clone(),
-            );
+            )?;
             if let Some(header) = header {
-                self.inner
-                    .apply_pre_execution_changes(header, &block_env, &mut memory_db)?;
+                self.inner.apply_pre_execution_changes(
+                    header.parent_hash,
+                    &block_env,
+                    &mut memory_db,
+                )?;
             }
         }
         let mut tx_index: u64 = 0;
@@ -1105,7 +1108,11 @@ where
                 block_hash: Some(block.header.hash),
                 block_number: Some(block.header.number),
                 block_timestamp: Some(block.header.timestamp),
-                base_fee: block.header.base_fee_per_gas,
+                // Trace metadata only; execution uses the full-width BlockEnv fee.
+                base_fee: block
+                    .header
+                    .base_fee_per_gas
+                    .and_then(|fee| fee.try_into().ok()),
             };
             tx_index += 1;
             if let Some(last_res) = results.last() {
@@ -1172,7 +1179,7 @@ where
                 &mut cache_db,
                 &mut block_env,
                 block.header.clone(),
-            );
+            )?;
         }
         // The binary search below re-executes the same tx many times;
         // the request-scoped cache lets every retry after the first read

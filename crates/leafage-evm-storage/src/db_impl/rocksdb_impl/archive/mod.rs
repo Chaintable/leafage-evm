@@ -909,13 +909,13 @@ pub(crate) fn decode_archive_header(buf: &mut &[u8]) -> Result<RawHeader, Error>
     let original = *buf;
     Ok(match RawHeader::decode(buf) {
         Ok(header) => header,
-        Err(_) => {
+        Err(alloy_rlp::Error::UnexpectedList) => {
             *buf = original;
             let rlp_head = alloy_rlp::Header::decode(buf)?;
             if !rlp_head.list {
                 Err(alloy_rlp::Error::NonCanonicalSingleByte)?;
             }
-            RawHeader {
+            let header = RawHeader {
                 parent_hash: Decodable::decode(buf)?,
                 ommers_hash: Decodable::decode(buf)?,
                 beneficiary: Decodable::decode(buf)?,
@@ -932,8 +932,21 @@ pub(crate) fn decode_archive_header(buf: &mut &[u8]) -> Result<RawHeader, Error>
                 mix_hash: Decodable::decode(buf)?,
                 nonce: B64::decode(buf)?,
                 ..Default::default()
+            };
+            // Only legacy pre-London list extensions may use this fallback.
+            // A malformed or overflowing fee scalar must never become None.
+            if !alloy_rlp::Header::decode(&mut *buf)?.list {
+                return Err(alloy_rlp::Error::UnexpectedList.into());
             }
+            let mut payload = original;
+            let _ = alloy_rlp::Header::decode(&mut payload)?;
+            if payload.len() < rlp_head.payload_length {
+                return Err(alloy_rlp::Error::InputTooShort.into());
+            }
+            *buf = &payload[rlp_head.payload_length..];
+            header
         }
+        Err(err) => return Err(err.into()),
     })
 }
 
@@ -3028,6 +3041,20 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn oversized_base_fee_does_not_fall_back_to_legacy_header() {
+        let bytes = alloy_rlp::encode(RawHeader::default());
+        let mut payload = bytes.as_slice();
+        let mut list = alloy_rlp::Header::decode(&mut payload).unwrap();
+        let fee = alloy_rlp::encode(U256::from(1) << 128);
+        list.payload_length += fee.len();
+        let mut bytes = Vec::new();
+        list.encode(&mut bytes);
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&fee);
+        assert!(decode_archive_header(&mut bytes.as_slice()).is_err());
+    }
+
     fn make_block_info_with_other() -> BlockInfo {
         let block_json = json!({
             "hash":"0x321040cad932841b60186b937dd7b05a9a19a7b5a4d9f34e6f824f3b98346c5c",
@@ -3046,7 +3073,7 @@ mod tests {
             "extraData":"0x",
             "mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000",
             "nonce":"0x0000000000000000",
-            "baseFeePerGas":"0x342770c0",
+            "baseFeePerGas":"0x3635c9adc5dea00001",
             "withdrawalsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
             "blobGasUsed":"0x0",
             "excessBlobGas":"0x0",

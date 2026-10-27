@@ -5,7 +5,6 @@ use crate::api_impl::core::{
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
-use alloy::consensus::BlockHeader;
 use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{BlockInfo, CallRequest, DebankErrorCode, MainnetSpecId, H256};
@@ -113,7 +112,7 @@ where
 
     fn apply_pre_execution_changes<StateDB>(
         &self,
-        header: impl BlockHeader,
+        parent_hash: leafage_evm_types::H256,
         block_env: &BlockEnv,
         state: &mut StateDB,
     ) -> RpcResult<()>
@@ -121,7 +120,7 @@ where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
-        self.apply_blockhashes_contract_call(header.parent_hash(), block_env, state)
+        self.apply_blockhashes_contract_call(parent_hash, block_env, state)
     }
 
     fn inspect_tx_commit<

@@ -27,7 +27,7 @@ where
     C::EvmHaltReason: std::fmt::Debug + Clone + GetHaltReason,
     DebankErrorCode: From<C::EvmHaltReason>,
 {
-    fn base_fee_inner(&self, block_id: BlockId) -> RpcResult<u64> {
+    fn base_fee_inner(&self, block_id: BlockId) -> RpcResult<u128> {
         let state = self.resolve_state(block_id)?;
         let block = state
             .block_info_arc()
@@ -38,10 +38,10 @@ where
             block.header.base_fee_per_gas.unwrap_or_default(),
             BaseFeeParams::ethereum(),
         );
-        Ok(base_fee)
+        base_fee.ok_or_else(|| internal_rpc_err("next base fee exceeds u128"))
     }
 
-    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u64> {
+    async fn base_fee_impl(&self, block_id: BlockId) -> RpcResult<u128> {
         let this = self.clone();
         utils::spawn_blocking_with_cancel(move |_token| this.base_fee_inner(block_id))
             .await
@@ -78,7 +78,7 @@ where
                 &mut db,
                 &mut block_env,
                 block.header.clone(),
-            );
+            )?;
         }
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut db)?;
@@ -604,7 +604,7 @@ where
         self.chain_id_impl()
     }
 
-    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u64> {
+    async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .await
     }

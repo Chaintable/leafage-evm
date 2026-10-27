@@ -28,7 +28,7 @@ pub trait Block {
     /// The base fee per gas, added in the London upgrade with [EIP-1559].
     ///
     /// [EIP-1559]: https://eips.ethereum.org/EIPS/eip-1559
-    fn basefee(&self) -> u64;
+    fn basefee(&self) -> u128;
 
     /// The difficulty of the block.
     ///
