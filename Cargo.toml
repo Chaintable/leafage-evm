@@ -151,3 +151,11 @@ rstest = "0.26.1"
 [profile.release]
 opt-level = 3
 debug = true
+
+# Pinned execution dependencies for the Stable development branch.
+[patch.crates-io]
+revm-context = { path = "vendor/revm-context" }
+revm-context-interface = { path = "vendor/revm-context-interface" }
+alloy-evm = { path = "vendor/alloy-evm" }
+revm-handler = { path = "vendor/revm-handler" }
+revm-inspectors = { path = "vendor/revm-inspectors" }

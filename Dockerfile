@@ -24,6 +24,7 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY bin ./bin
 COPY crates ./crates
+COPY vendor ./vendor
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -38,6 +39,7 @@ ENV RUSTFLAGS="-C force-frame-pointers=yes -C link-arg=-fuse-ld=lld --cfg tokio_
 WORKDIR /app
 
 COPY --from=planner /app/recipe.json recipe.json
+COPY --from=planner /app/vendor ./vendor
 
 # 关键：不用 --mount=type=cache。
 # cargo-chef 的 layer cache 模式依赖 target/ 存在 layer 文件系统里，
