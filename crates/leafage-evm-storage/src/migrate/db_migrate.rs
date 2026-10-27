@@ -136,7 +136,7 @@ impl DBSource {
             .state_at(BlockId::Number(BlockNumberOrTag::Latest))?
             .ok_or(anyhow::anyhow!("failed to get source latest state db"))?;
         let latest_block_info = src_statedb.block_info()?;
-        dst_db.write_latest_block_hash(&mut batch, latest_block_info.hash())?;
+        dst_db.write_latest_block_hash(&mut batch, latest_block_info.header.hash)?;
         dst_db.write_block_info(&mut batch, latest_block_info)?;
         dst_db.commit(batch)?;
         Ok(())
@@ -451,9 +451,9 @@ mod tests {
             "slot zeroed at the tip must not be migrated"
         );
         assert_eq!(state.read_code(code_hash).unwrap().unwrap(), code);
-        assert_eq!(state.read_block_hash(2).unwrap(), block_info(2).hash());
+        assert_eq!(state.read_block_hash(2).unwrap(), block_info(2).header.hash);
         let head = state.read_latest_block_hash().unwrap();
-        assert_eq!(head, block_info(2).hash());
+        assert_eq!(head, block_info(2).header.hash);
         assert_eq!(
             state.read_block_info(head).unwrap().unwrap().header.number,
             2

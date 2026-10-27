@@ -138,7 +138,7 @@ pub fn calculate_caller_fee(
         return Ok(balance);
     }
 
-    let basefee = block.basefee() as u128;
+    let basefee = block.basefee();
     let blob_price = block.blob_gasprice().unwrap_or_default();
     let is_balance_check_disabled = cfg.is_balance_check_disabled();
 
@@ -147,8 +147,7 @@ pub fn calculate_caller_fee(
     }
 
     let effective_balance_spending = tx
-        .effective_balance_spending(basefee, blob_price)
-        .expect("effective balance is always smaller than max balance so it can't overflow");
+        .effective_balance_spending(basefee, blob_price)?;
 
     let gas_balance_spending = effective_balance_spending - tx.value();
 

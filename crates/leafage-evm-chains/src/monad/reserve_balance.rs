@@ -52,7 +52,7 @@ pub(crate) fn dipped_into_reserve<DB: Database>(
     ctx: &mut MonadContext<DB>,
 ) -> Result<bool, DB::Error> {
     let hardfork = ctx.cfg().spec();
-    let basefee = ctx.block().basefee() as u128;
+    let basefee = ctx.block().basefee();
     let tx = ctx.tx();
     let sender = tx.caller();
     let gas_fees = U256::from(tx.gas_limit()) * U256::from(tx.effective_gas_price(basefee));

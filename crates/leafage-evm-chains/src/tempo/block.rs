@@ -63,7 +63,7 @@ impl Block for TempoBlockEnv {
         self.inner.gas_limit()
     }
     #[inline]
-    fn basefee(&self) -> u64 {
+    fn basefee(&self) -> u128 {
         self.inner.basefee()
     }
     #[inline]
