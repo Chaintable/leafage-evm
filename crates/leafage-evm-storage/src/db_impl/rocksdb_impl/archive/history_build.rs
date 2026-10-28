@@ -214,7 +214,15 @@ pub fn build_history_v3(
     let src = open_v2_read_only(src_path)?;
     let head = read_head(&src)?;
     let dir = format!("epoch-0-{head}");
-    std::fs::create_dir_all(out_dir.join(&dir)).map_err(io_err)?;
+    // Never write into a directory a manifest may already point at: a
+    // serving node maps those files.
+    std::fs::create_dir_all(out_dir).map_err(io_err)?;
+    std::fs::create_dir(out_dir.join(&dir)).map_err(|e| {
+        Error::UnSupported(format!(
+            "{}: {e} (refusing to overwrite segments)",
+            out_dir.join(&dir).display()
+        ))
+    })?;
     let shards = 1usize << shard_bits;
     // Storage first: it is the bulk of the work.
     let tasks: Vec<(SegKind, usize)> = [SegKind::Storage, SegKind::Account]
@@ -321,6 +329,11 @@ pub fn build_history_v3(
             storage: files(SegKind::Storage),
         }],
     };
+    // The segments' directory entries must be durable before the manifest
+    // that names them.
+    std::fs::File::open(out_dir.join(&manifest.epochs[0].dir))
+        .and_then(|d| d.sync_all())
+        .map_err(io_err)?;
     manifest.write(out_dir).map_err(io_err)?;
     let skipped = progress.skipped.load(Ordering::Relaxed);
     if skipped > 0 {

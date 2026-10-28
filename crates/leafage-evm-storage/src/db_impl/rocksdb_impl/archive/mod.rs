@@ -1131,7 +1131,7 @@ impl DataBaseRef {
         ];
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
         let serving = !bulk_load && !maintenance;
-        let db_ref = Self {
+        let mut db_ref = Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
             code_cache: build_code_cache(),
             block_info_cache: build_block_info_cache(),
@@ -1140,17 +1140,28 @@ impl DataBaseRef {
             } else {
                 None
             },
-            history: if serving {
-                open_history_from_env()?
-            } else {
-                None
-            },
+            history: None,
         };
         // Self-describing encoding: if the DB records its block-height key
         // encoding, honor it (a legacy DB has no marker and is left untouched),
         // so the node can't mistake an inverted DB for a legacy one.
         if !maintenance {
             db_ref.align_encoding_from_marker();
+        }
+        // After the encoding is settled: the tail must be inverted.
+        if serving {
+            db_ref.history = open_history_from_env()?;
+        }
+        if let Some(history) = &db_ref.history {
+            let head = db_ref.read_latest_block_num()?.unwrap_or(0);
+            if head < history.sealed_upto {
+                // Rewound below the boundary: blocks re-appended there would
+                // be shadowed by the sealed versions.
+                return Err(Error::UnSupported(format!(
+                    "archive head {head} is below the v3 sealed boundary {}",
+                    history.sealed_upto
+                )));
+            }
         }
         if let Some(cache) = &db_ref.state_cache {
             cache.advance_head(db_ref.read_latest_block_num()?.unwrap_or(0));
@@ -2362,13 +2373,14 @@ impl StateDBProvider for Arc<DataBaseRef> {
         let (iterators, cache_view) = new_state_iterators(self, block_num);
 
         // Register with iterator tracker if enabled
-        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
-            let id = next_statedb_id();
-            let flag = ITERATOR_TRACKER.register(id, block_num, iterators.clone());
-            (Some(id), Some(flag))
-        } else {
-            (None, None)
-        };
+        let (tracker_id, timed_out) =
+            if ITERATOR_TRACKER.is_enabled() && !reads_sealed(self, block_num) {
+                let id = next_statedb_id();
+                let flag = ITERATOR_TRACKER.register(id, block_num, iterators.clone());
+                (Some(id), Some(flag))
+            } else {
+                (None, None)
+            };
 
         Ok(Some(StateDB {
             db: self.clone(),
@@ -2475,6 +2487,15 @@ fn sealed_span_end(next: Option<u64>, epoch_end: u64, at: u64, block: u64) -> (u
     }
 }
 
+/// Whether a state handle at `block_num` reads accounts and storage from
+/// sealed history only: it holds no RocksDB iterators (nothing for the
+/// iterator tracker to time out).
+fn reads_sealed(db: &DataBaseRef, block_num: u64) -> bool {
+    db.history
+        .as_ref()
+        .is_some_and(|h| block_num <= h.sealed_upto)
+}
+
 /// Create the account and storage iterators of a state handle at
 /// `block_num`, and the state cache view they read under (`None` if the
 /// cache is off or the block is above the head).
@@ -2489,11 +2510,7 @@ fn new_state_iterators(
         .state_cache
         .as_ref()
         .and_then(|cache| cache.view(block_num));
-    if db
-        .history
-        .as_ref()
-        .is_some_and(|h| block_num <= h.sealed_upto)
-    {
+    if reads_sealed(db, block_num) {
         // Every account/storage read at this height is a sealed-history lookup.
         return (SharedIterators::empty(), cache_view);
     }
@@ -2539,13 +2556,14 @@ impl Clone for StateDB {
         let (iterators, cache_view) = new_state_iterators(&self.db, self.block_num);
 
         // Register cloned StateDB with iterator tracker if enabled
-        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
-            let id = next_statedb_id();
-            let flag = ITERATOR_TRACKER.register(id, self.block_num, iterators.clone());
-            (Some(id), Some(flag))
-        } else {
-            (None, None)
-        };
+        let (tracker_id, timed_out) =
+            if ITERATOR_TRACKER.is_enabled() && !reads_sealed(&self.db, self.block_num) {
+                let id = next_statedb_id();
+                let flag = ITERATOR_TRACKER.register(id, self.block_num, iterators.clone());
+                (Some(id), Some(flag))
+            } else {
+                (None, None)
+            };
 
         Self {
             db: self.db.clone(),

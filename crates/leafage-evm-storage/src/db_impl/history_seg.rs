@@ -193,7 +193,7 @@ impl SegmentWriter {
         epoch_end: u64,
     ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::create(&path)?;
+        let file = File::create_new(&path)?;
         let mut out = BufWriter::with_capacity(8 << 20, file);
         out.write_all(&[0u8; PAGE])?; // header, rewritten by finish()
         Ok(Self {
