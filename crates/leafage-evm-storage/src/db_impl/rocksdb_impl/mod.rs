@@ -9,7 +9,10 @@ pub(crate) use sst::SstSink;
 
 mod archive;
 pub(crate) use archive::decode_archive_header;
-pub use archive::{DataBaseRef as ArchiveRocksDBStorage, StateDB as ArchiveStateDB};
+pub use archive::{
+    build_history_v3, verify_history_v3, DataBaseRef as ArchiveRocksDBStorage,
+    StateDB as ArchiveStateDB, VerifyReport as HistoryVerifyReport,
+};
 
 #[cfg(test)]
 pub(crate) use archive::ARCHIVE_DB_TEST_LOCK;

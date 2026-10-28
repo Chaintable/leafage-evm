@@ -32,6 +32,14 @@ impl SharedIterators {
         })
     }
 
+    /// No iterators: a handle whose reads never touch the RocksDB state CFs.
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            account_iterator: Mutex::new(None),
+            storage_iterator: Mutex::new(None),
+        })
+    }
+
     /// Release both iterators
     pub fn release(&self) {
         let _ = self.account_iterator.lock().unwrap().take();

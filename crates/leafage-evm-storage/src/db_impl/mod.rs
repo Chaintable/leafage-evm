@@ -1,6 +1,7 @@
 //! Database implementation for EVM storage.
 
 mod archive_encoding;
+pub mod history_seg;
 mod rewind;
 mod rocksdb_impl;
 
@@ -20,10 +21,13 @@ pub use mdbx_impl::{
 pub use rocksdb;
 #[cfg(test)]
 pub(crate) use rocksdb_impl::ARCHIVE_DB_TEST_LOCK;
+pub use rocksdb_impl::{
+    build_history_v3, verify_history_v3, ArchiveRocksDBStorage, ArchiveStateDB, BulkColumn,
+    HistoryVerifyReport, RocksDBStorage,
+};
 pub(crate) use rocksdb_impl::{
     state_account_value, state_block_num_key, state_sst_writer_options, state_storage_key, SstSink,
 };
-pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, BulkColumn, RocksDBStorage};
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use leafage_evm_types::{BlockId, BlockInfo, Bytes, NewAccount, H256, U256};

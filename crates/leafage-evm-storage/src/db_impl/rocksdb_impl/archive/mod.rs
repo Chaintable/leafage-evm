@@ -50,9 +50,12 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+mod history_build;
 mod iterator_tracker;
 mod rewind;
 mod state_cache;
+use crate::db_impl::history_seg::{HistoryStore, SegKind};
+pub use history_build::{build_history_v3, verify_history_v3, VerifyReport};
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
@@ -280,6 +283,41 @@ impl Display for StorageTypeColumn {
     }
 }
 
+/// Open the v3 sealed history named by `ARCHIVE_HISTORY_DIR`, if set.
+fn open_history_from_env() -> Result<Option<Arc<HistoryStore>>, Error> {
+    let Some(dir) = env::var_os("ARCHIVE_HISTORY_DIR").filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    let store = HistoryStore::open(&dir)
+        .map_err(|e| Error::UnSupported(format!("open v3 history {dir:?}: {e}")))?;
+    if !inverted_block_encoding() {
+        return Err(Error::UnSupported(
+            "v3 history needs the v2 (inverted) tail encoding".into(),
+        ));
+    }
+    info!(target: "rocksdb", "archive v3 history at {:?}: sealed up to block {}",
+        dir, store.sealed_upto);
+    Ok(Some(Arc::new(store)))
+}
+
+/// Decode a v3 account value (`RLP(SlimAccount)`, empty when deleted).
+fn decode_v3_account(address: H256, mut raw: &[u8]) -> Option<NewAccount> {
+    if raw.is_empty() {
+        return None;
+    }
+    let account = SlimAccount::decode(&mut raw).unwrap();
+    Some(NewAccount {
+        address,
+        balance: account.balance,
+        nonce: account.nonce,
+        code_hash: if account.code_hash.is_zero() {
+            KECCAK256_EMPTY.0.into()
+        } else {
+            account.code_hash
+        },
+    })
+}
+
 #[derive(Debug)]
 struct DataBaseInner {
     _cols: Vec<(StorageTypeColumn, NonNull<ColumnFamily>)>,
@@ -305,6 +343,10 @@ pub struct DataBaseRef {
     /// Cross-request account/storage read cache, see [`StateCache`]. Only
     /// built for a serving node (not bulk load or maintenance).
     state_cache: Option<StateCache>,
+    /// Schema v3 sealed history (`docs/ArchiveSchemaV3.md`), loaded from
+    /// `ARCHIVE_HISTORY_DIR` on a serving node. Reads at or below its
+    /// sealed boundary are answered from it instead of RocksDB.
+    history: Option<Arc<HistoryStore>>,
 }
 
 pub struct ArchiveRocksDBWriteBatch {
@@ -1095,6 +1137,11 @@ impl DataBaseRef {
             block_info_cache: build_block_info_cache(),
             state_cache: if serving {
                 StateCache::from_env()
+            } else {
+                None
+            },
+            history: if serving {
+                open_history_from_env()?
             } else {
                 None
             },
@@ -2414,6 +2461,20 @@ fn newer_version_bound(
     }
 }
 
+/// The end of the span a sealed-history read at `at` (by a reader at
+/// `block`) is known to hold over, and whether the key's next version ended
+/// it. Within the sealed range the next record or the epoch end bounds it;
+/// a reader above the boundary only knows up to its own block.
+fn sealed_span_end(next: Option<u64>, epoch_end: u64, at: u64, block: u64) -> (u64, bool) {
+    if block > at {
+        return (block, false);
+    }
+    match next {
+        Some(n) => (n - 1, true),
+        None => (epoch_end, false),
+    }
+}
+
 /// Create the account and storage iterators of a state handle at
 /// `block_num`, and the state cache view they read under (`None` if the
 /// cache is off or the block is above the head).
@@ -2428,6 +2489,14 @@ fn new_state_iterators(
         .state_cache
         .as_ref()
         .and_then(|cache| cache.view(block_num));
+    if db
+        .history
+        .as_ref()
+        .is_some_and(|h| block_num <= h.sealed_upto)
+    {
+        // Every account/storage read at this height is a sealed-history lookup.
+        return (SharedIterators::empty(), cache_view);
+    }
     let address_to_account_cf = db
         .db
         .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -2553,6 +2622,11 @@ impl StateDB {
             }
         }
 
+        let history = self.db.history.as_deref();
+        if let Some(history) = history.filter(|h| self.block_num <= h.sealed_upto) {
+            return Ok(self.read_storage_sealed(history, slot_key, self.block_num, cache, cached));
+        }
+
         let start = std::time::Instant::now();
         let target_key = encode_storage_key(address, key, self.block_num);
         let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
@@ -2588,6 +2662,21 @@ impl StateDB {
             }
         };
 
+        if let Some(history) = history {
+            if version.is_none_or(|v| v <= history.sealed_upto) {
+                // Nothing in the tail above the sealed boundary: the value at
+                // the boundary still holds.
+                drop(storage_iter_guard);
+                return Ok(self.read_storage_sealed(
+                    history,
+                    slot_key,
+                    history.sealed_upto,
+                    cache,
+                    cached,
+                ));
+            }
+        }
+
         if let Some((view, cache)) = cache {
             let probe =
                 version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
@@ -2611,6 +2700,80 @@ impl StateDB {
         Ok((value, version))
     }
 
+    /// Read a slot from sealed history at `at` (`self.block_num`, or the
+    /// sealed boundary for a reader above it) and cache the span it holds.
+    fn read_storage_sealed(
+        &self,
+        history: &HistoryStore,
+        slot_key: [u8; 64],
+        at: u64,
+        cache: Option<(&state_cache::ReadView, &StateCache)>,
+        cached: Option<Arc<state_cache::Entry<U256>>>,
+    ) -> (U256, Option<u64>) {
+        let start = std::time::Instant::now();
+        let epoch = history.epoch(at).expect("at <= sealed_upto");
+        let read = epoch.lookup(SegKind::Storage, &slot_key, at);
+        STORAGE_METRICS
+            .read_storage_latency
+            .record(start.elapsed().as_secs_f64());
+        let value = read
+            .version
+            .map_or(U256::ZERO, |v| U256::from_be_slice(v.value));
+        let version = read.version.map(|v| v.block);
+        if let Some((_, cache)) = cache {
+            let (hi, next_version_found) =
+                sealed_span_end(read.next, epoch.end, at, self.block_num);
+            let span = Span {
+                lo: version.unwrap_or(epoch.start),
+                hi,
+                found: version.is_some(),
+                value,
+            };
+            cache
+                .storage
+                .record(slot_key, cached, span, next_version_found);
+        }
+        (value, version)
+    }
+
+    /// Read an account from sealed history; see [`Self::read_storage_sealed`].
+    fn read_account_sealed(
+        &self,
+        history: &HistoryStore,
+        address: H256,
+        at: u64,
+        cache: Option<(&state_cache::ReadView, &StateCache)>,
+        cached: Option<Arc<state_cache::Entry<Option<CachedAccount>>>>,
+    ) -> Option<NewAccount> {
+        let start = std::time::Instant::now();
+        let epoch = history.epoch(at).expect("at <= sealed_upto");
+        let read = epoch.lookup(SegKind::Account, address.as_slice(), at);
+        STORAGE_METRICS
+            .read_account_latency
+            .record(start.elapsed().as_secs_f64());
+        let account = read
+            .version
+            .and_then(|v| decode_v3_account(address, v.value));
+        if let Some((_, cache)) = cache {
+            let (hi, next_version_found) =
+                sealed_span_end(read.next, epoch.end, at, self.block_num);
+            let span = Span {
+                lo: read.version.map_or(epoch.start, |v| v.block),
+                hi,
+                found: read.version.is_some(),
+                value: account.as_ref().map(|account| CachedAccount {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                }),
+            };
+            cache
+                .accounts
+                .record(address.0, cached, span, next_version_found);
+        }
+        account
+    }
+
     /// The slots of `address` holding a non-zero value, with the value.
     fn storage_slots(&self, address: H256) -> Result<Vec<(H256, U256)>, Error> {
         let address_bytes: [u8; 32] = address.into();
@@ -2626,8 +2789,27 @@ impl StateDB {
             .db
             .db
             .raw_iterator_cf_opt(address_to_storage_cf, read_options);
-        let mut slots = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
         let mut from = Some(U256::ZERO);
+        if let Some(history) = self.db.history.as_deref() {
+            let at = self.block_num.min(history.sealed_upto);
+            let mut start = [0u8; 64];
+            start[..32].copy_from_slice(&address_bytes);
+            history
+                .epoch(at)
+                .expect("at <= sealed_upto")
+                .segment(SegKind::Storage, &start)
+                .for_each_key_from(&start, |k| {
+                    if k[..32] != address_bytes {
+                        return false;
+                    }
+                    ids.insert(H256::from_slice(&k[32..]));
+                    true
+                });
+            if self.block_num <= history.sealed_upto {
+                from = None; // the tail holds nothing this reader can see
+            }
+        }
         while let Some(start) = from {
             // The newest version of the first slot at or after `start`: an
             // all-zero version tail sorts first under both encodings.
@@ -2641,11 +2823,15 @@ impl StateDB {
                 }
                 _ => break,
             };
+            ids.insert(slot);
+            from = U256::from_be_bytes(slot.0).checked_add(U256::from(1));
+        }
+        let mut slots = Vec::new();
+        for slot in ids {
             let value = self.read_storage(address, slot)?;
             if !value.is_zero() {
                 slots.push((slot, value));
             }
-            from = U256::from_be_bytes(slot.0).checked_add(U256::from(1));
         }
         Ok(slots)
     }
@@ -2675,11 +2861,27 @@ impl StateDBRead for StateDB {
                 }
             }
         }
+        let history = self.db.history.as_deref();
+        if let Some(history) = history.filter(|h| self.block_num <= h.sealed_upto) {
+            return Ok(self.read_account_sealed(history, address, self.block_num, cache, cached));
+        }
         let mut account_iter_guard = self.iterators.account_iterator.lock().unwrap();
         let account_iter = account_iter_guard
             .as_mut()
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
         let (account, version) = seek_account(account_iter, address, self.block_num)?;
+        if let Some(history) = history {
+            if version.is_none_or(|v| v <= history.sealed_upto) {
+                drop(account_iter_guard);
+                return Ok(self.read_account_sealed(
+                    history,
+                    address,
+                    history.sealed_upto,
+                    cache,
+                    cached,
+                ));
+            }
+        }
         if let Some((view, cache)) = cache {
             let probe =
                 version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
@@ -4349,6 +4551,206 @@ mod scan_completeness_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+}
+
+/// Schema v3: reads served from sealed history (and the tail above it) must
+/// match the v2 archive they were built from, with the state cache on.
+#[cfg(test)]
+mod history_v3_tests {
+    use super::*;
+    use crate::db::{StateDBRead, StateDBWrapper};
+    use crate::interface::EvmStorageWrite;
+    use leafage_evm_types::{AccountStorageDiff, BlockStorageDiff, IndexValuePair};
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    fn block_info(number: u64) -> BlockInfo {
+        let mut raw = RawHeader::default();
+        raw.number = number;
+        let mut hash = H256::ZERO;
+        hash.0[24..].copy_from_slice(&number.to_be_bytes());
+        hash.0[0] = 0xb1;
+        BlockInfo::new(Block {
+            header: Header {
+                hash,
+                inner: raw,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn addrs() -> Vec<H256> {
+        // Spread over shards (first byte) with some sharing one.
+        (0..12u8)
+            .map(|i| {
+                let mut a = H256::repeat_byte(i.wrapping_mul(37));
+                a.0[0] = [0x05, 0x45, 0x85, 0xc5, 0x05, 0x46][i as usize % 6];
+                a.0[31] = i;
+                a
+            })
+            .collect()
+    }
+
+    fn slots() -> Vec<H256> {
+        (0..6u8).map(|i| H256::repeat_byte(0x10 + i)).collect()
+    }
+
+    fn random_diff(rng: &mut Rng, n: u64) -> BlockStorageDiff {
+        let mut diff = BlockStorageDiff::default();
+        for a in addrs() {
+            match rng.below(10) {
+                0 if n > 3 => diff.deleted_accounts.push(a),
+                1..=4 => {
+                    diff.new_accounts.push(NewAccount {
+                        address: a,
+                        balance: U256::from(rng.below(1_000_000)),
+                        nonce: n,
+                        code_hash: KECCAK256_EMPTY.0.into(),
+                    });
+                    let mut diffs = Vec::new();
+                    for s in slots() {
+                        if rng.below(3) != 0 {
+                            continue;
+                        }
+                        // Zeros too, and values of every length.
+                        let value = match rng.below(4) {
+                            0 => U256::ZERO,
+                            1 => U256::from(rng.below(256)),
+                            2 => U256::MAX - U256::from(rng.below(1000)),
+                            _ => U256::from(rng.below(u64::MAX)) << 64,
+                        };
+                        diffs.push(IndexValuePair { index: s, value });
+                    }
+                    diff.storage_diffs
+                        .push(AccountStorageDiff { address: a, diffs });
+                }
+                _ => {}
+            }
+        }
+        diff
+    }
+
+    type Answers = Vec<(
+        Option<NewAccount>,
+        Vec<(U256, Option<u64>)>,
+        Vec<(H256, U256)>,
+    )>;
+
+    /// Every account, slot and slot listing at every height, read in a
+    /// scrambled order (the cache sees reads at mixed heights).
+    fn read_all(db: &Arc<DataBaseRef>, head: u64, rng: &mut Rng) -> Vec<Answers> {
+        let mut out: Vec<Answers> = vec![Vec::new(); head as usize + 1];
+        let mut heights: Vec<u64> = (1..=head).collect();
+        for i in (1..heights.len()).rev() {
+            heights.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        for h in heights {
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Number(h)))
+                .unwrap()
+                .unwrap();
+            out[h as usize] = addrs()
+                .into_iter()
+                .map(|a| {
+                    let account = state.read_account(a).unwrap();
+                    let slots = slots()
+                        .into_iter()
+                        .map(|s| state.read_storage_and_height(a, s).unwrap())
+                        .collect();
+                    let listed = state.read_storage_slots(a).unwrap().unwrap();
+                    (account, slots, listed)
+                })
+                .collect();
+        }
+        out
+    }
+
+    fn compare(want: &[Answers], got: &[Answers], what: &str) {
+        for (h, (w, g)) in want.iter().zip(got).enumerate() {
+            for (i, (w, g)) in w.iter().zip(g).enumerate() {
+                assert_eq!(w.0, g.0, "{what}: account {i} at {h}");
+                for (j, (w, g)) in w.1.iter().zip(&g.1).enumerate() {
+                    // Epoch 0 has no base versions, so heights match exactly.
+                    assert_eq!(w, g, "{what}: slot {j} of account {i} at {h}");
+                }
+                assert_eq!(w.2, g.2, "{what}: slots of account {i} at {h}");
+            }
+        }
+    }
+
+    fn append(db: &Arc<DataBaseRef>, rng: &mut Rng, from: u64, to: u64) {
+        for n in from..=to {
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            state
+                .update_block(block_info(n), random_diff(rng, n))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sealed_history_matches_v2() {
+        let _g = super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
+        let base = std::env::temp_dir().join(format!("leafage-history-v3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (db_dir, history_dir) = (base.join("db"), base.join("history"));
+        let mut rng = Rng(0x5eed);
+        let sealed = 40u64;
+        let head = 55u64;
+
+        // v2 archive up to `sealed`, marked inverted like a production DB.
+        {
+            let db = Arc::new(DataBaseRef::open(&db_dir, 64, false, false));
+            db.write_encoding_marker(true).unwrap();
+            append(&db, &mut rng, 1, sealed);
+        }
+        build_history_v3(&db_dir, &history_dir, 3, 2, 1 << 20).unwrap();
+        let report = verify_history_v3(&db_dir, &history_dir, 200, 7).unwrap();
+        assert_eq!(report.mismatches, 0, "{report:?}");
+        assert!(report.keys > 0 && report.absent_keys > 0, "{report:?}");
+
+        // Serve from sealed history, then append a tail above it.
+        let v3 = {
+            std::env::set_var("ARCHIVE_HISTORY_DIR", &history_dir);
+            let db = Arc::new(DataBaseRef::open(&db_dir, 64, false, false));
+            std::env::remove_var("ARCHIVE_HISTORY_DIR");
+            assert_eq!(db.history.as_ref().unwrap().sealed_upto, sealed);
+            let sealed_reads = read_all(&db, sealed, &mut rng);
+            append(&db, &mut rng, sealed + 1, head);
+            (
+                sealed_reads,
+                read_all(&db, head, &mut rng),
+                read_all(&db, head, &mut rng),
+            )
+        };
+        // The same database without the sealed history is plain v2 (the PoC
+        // build leaves every version in the tail).
+        let v2 = {
+            let db = Arc::new(DataBaseRef::open(&db_dir, 64, false, false));
+            assert!(db.history.is_none());
+            read_all(&db, head, &mut rng)
+        };
+        compare(&v2[..=sealed as usize], &v3.0, "sealed");
+        compare(&v2, &v3.1, "sealed + tail");
+        compare(&v2, &v3.2, "sealed + tail, cached");
+        let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 }

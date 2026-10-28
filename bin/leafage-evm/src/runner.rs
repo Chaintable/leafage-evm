@@ -1,6 +1,6 @@
 use crate::{
-    archive_clear_deleted, archive_init, archive_scan, compact, db_migrate, force_compact, pipeline_export, put_code,
-    rewind, standalone,
+    archive_clear_deleted, archive_init, archive_scan, archive_v3, compact, db_migrate,
+    force_compact, pipeline_export, put_code, rewind, standalone,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -46,6 +46,9 @@ pub(crate) enum Commands {
     /// Read-only scan of an archive DB column family (forensics/debugging)
     #[command(name = "archive-scan")]
     ArchiveScan(archive_scan::Command),
+    /// Build or verify archive schema v3 sealed history (offline)
+    #[command(name = "archive-v3")]
+    ArchiveV3(archive_v3::Command),
     /// Zero the storage an archive DB kept for deleted accounts (offline repair)
     #[command(name = "archive-clear-deleted")]
     ArchiveClearDeleted(archive_clear_deleted::Command),
@@ -67,6 +70,7 @@ impl Commands {
             Commands::ForceCompact(mut cmd) => cmd.run().await,
             Commands::Rewind(mut cmd) => cmd.run().await,
             Commands::ArchiveScan(mut cmd) => cmd.run().await,
+            Commands::ArchiveV3(mut cmd) => cmd.run().await,
             Commands::ArchiveClearDeleted(mut cmd) => cmd.run().await,
             Commands::PutCode(mut cmd) => cmd.run().await,
             Commands::PipelineExport(mut cmd) => cmd.run().await,
