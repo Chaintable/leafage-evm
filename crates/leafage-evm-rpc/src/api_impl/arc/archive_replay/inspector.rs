@@ -546,13 +546,8 @@ mod tests {
             valid: true,
         };
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert_eq!(traces.len(), 2);
         assert!(trace_for_address(&traces, Address::repeat_byte(1))
@@ -654,13 +649,8 @@ mod tests {
             valid: true,
         };
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].to_addr, Address::repeat_byte(1));
@@ -814,13 +804,8 @@ mod tests {
             valid: true,
         };
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert_eq!(traces.len(), 1);
         assert_eq!(error_traces.len(), 1);
@@ -905,13 +890,8 @@ mod tests {
             valid: true,
         };
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert!(error_traces.is_empty());
         assert_eq!(traces.len(), 2);
@@ -1011,13 +991,8 @@ mod tests {
             valid: true,
         };
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert!(traces.is_empty());
         assert!(events.is_empty());
@@ -1076,13 +1051,8 @@ mod tests {
             valid: true,
         };
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert!(traces.is_empty());
         assert!(events.is_empty());
@@ -1171,13 +1141,8 @@ mod tests {
             child,
         ]);
 
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert_eq!(traces.len(), 1);
         assert!(!traces[0].storage_change);
@@ -1241,13 +1206,8 @@ mod tests {
                 vec![],
             ),
         ]);
-        let (traces, error_traces, events, error_events) = build_debank_traces(
-            B256::repeat_byte(0xaa),
-            arena,
-            captured,
-            &std::cell::RefCell::new(0),
-        )
-        .unwrap();
+        let (traces, error_traces, events, error_events) =
+            build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert_eq!(traces.len(), 1);
         assert_eq!(error_traces.len(), 1);
@@ -1375,13 +1335,8 @@ mod tests {
                 assert_eq!(trace.output.as_ref(), b"raw child output");
                 assert_eq!((trace.gas_used, trace.gas_limit), (7, 11));
 
-                let (traces, error_traces, events, error_events) = build_debank_traces(
-                    B256::repeat_byte(0xaa),
-                    arena,
-                    captured,
-                    &std::cell::RefCell::new(0),
-                )
-                .unwrap();
+                let (traces, error_traces, events, error_events) =
+                    build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
                 assert!(traces.is_empty());
                 assert!(events.is_empty());
                 assert!(error_events.is_empty());
@@ -1440,13 +1395,8 @@ mod tests {
             assert_eq!(trace.output.as_ref(), b"raw child output");
             assert_eq!((trace.gas_used, trace.gas_limit), (7, 11));
 
-            let (traces, error_traces, events, error_events) = build_debank_traces(
-                B256::repeat_byte(0xaa),
-                arena,
-                captured,
-                &std::cell::RefCell::new(0),
-            )
-            .unwrap();
+            let (traces, error_traces, events, error_events) =
+                build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
             assert_eq!(traces.len(), 1);
             assert_eq!(traces[0].output.as_ref(), b"raw child output");
             assert_eq!(traces[0].gas_used, 7);

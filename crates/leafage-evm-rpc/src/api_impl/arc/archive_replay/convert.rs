@@ -188,8 +188,8 @@ struct DebankTraceNode {
 
 #[allow(clippy::too_many_arguments)]
 fn build_trace_node(
-    tx_id: String,
-    parent_trace_id: String,
+    tx_id: &str,
+    parent_trace_id: &str,
     pos_in_parent_trace: usize,
     node_id: usize,
     nodes: &[CallTraceNode],
@@ -236,9 +236,9 @@ fn build_trace_node(
         success: effective_frame_success && parent_success,
     };
     debank_node.trace.trace_address = trace_address.clone();
-    debank_node.trace.parent_trace_id = parent_trace_id;
+    debank_node.trace.parent_trace_id = parent_trace_id.to_owned();
     debank_node.trace.pos_in_parent_trace = pos_in_parent_trace;
-    debank_node.trace.tx_id = tx_id.clone();
+    debank_node.trace.tx_id = tx_id.to_owned();
     debank_node.trace.id = debank_node.trace.debank_id();
 
     let id = debank_node.trace.id.clone();
@@ -246,7 +246,7 @@ fn build_trace_node(
     append_captured_members(
         &mut debank_node,
         node_id,
-        &tx_id,
+        tx_id,
         &id,
         nodes,
         captured,
@@ -277,7 +277,7 @@ fn build_trace_node(
             trace_address: selfdestruct_ta,
             parent_trace_id: id,
             pos_in_parent_trace: debank_node.children.len(),
-            tx_id,
+            tx_id: tx_id.to_owned(),
             call_create_type: "suicide".to_string(),
             ..Default::default()
         };
@@ -326,8 +326,8 @@ fn append_captured_members(
                     child_trace_address.push(*next_trace_index);
                     *next_trace_index += 1;
                     let child_trace = build_trace_node(
-                        tx_id.to_string(),
-                        parent_trace_id.to_string(),
+                        tx_id,
+                        parent_trace_id,
                         debank_node.children.len(),
                         *child_id,
                         nodes,
@@ -393,28 +393,27 @@ fn append_captured_members(
 }
 
 fn finish_build_traces(
-    node: &mut DebankTraceNode,
+    node: DebankTraceNode,
     traces: &mut Vec<DebankTrace>,
     error_traces: &mut Vec<DebankTrace>,
     events: &mut Vec<DebankEvent>,
     error_events: &mut Vec<DebankEvent>,
 ) {
     if node.success {
-        traces.push(node.trace.clone());
+        traces.push(node.trace);
     } else {
-        error_traces.push(node.trace.clone());
+        error_traces.push(node.trace);
     }
-    for child in &mut node.children {
+    for child in node.children {
         match child {
             DebankTraceOrLog::Trace(trace) => {
-                trace.trace.parent_trace_id = node.trace.id.clone();
                 finish_build_traces(trace, traces, error_traces, events, error_events);
             }
             DebankTraceOrLog::Log { event, success } => {
-                if *success {
-                    events.push(event.clone());
+                if success {
+                    events.push(event);
                 } else {
-                    error_events.push(event.clone());
+                    error_events.push(event);
                 }
             }
         }
@@ -435,7 +434,7 @@ pub(crate) fn build_debank_traces(
     tx_id: H256,
     traces: CallTraceArena,
     captured: CapturedEvents,
-    log_index: &std::cell::RefCell<usize>,
+    log_index: &mut usize,
 ) -> Result<DebankTraceResult, String> {
     let nodes = traces.into_nodes();
     captured.validate(nodes.len())?;
@@ -451,9 +450,10 @@ pub(crate) fn build_debank_traces(
             }
         }
     }
-    let mut top = build_trace_node(
-        tx_id.to_string(),
-        String::new(),
+    let tx_id = tx_id.to_string();
+    let top = build_trace_node(
+        &tx_id,
+        "",
         0,
         0,
         &nodes,
@@ -461,14 +461,14 @@ pub(crate) fn build_debank_traces(
         &visible,
         true,
         vec![],
-        &mut log_index.borrow_mut(),
+        log_index,
     )?;
     let mut traces = vec![];
     let mut error_traces = vec![];
     let mut events = vec![];
     let mut error_events = vec![];
     finish_build_traces(
-        &mut top,
+        top,
         &mut traces,
         &mut error_traces,
         &mut events,

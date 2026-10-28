@@ -23,7 +23,14 @@ static ALLOC: LazyLock<BTreeMap<Address, Vec<B256>>> = LazyLock::new(|| {
         .expect("valid pinned Arc genesis keys")
 });
 
-fn synthetic(file: &mut BlockFile, kind: u8, address: Address, value: U256, code: Bytes) {
+fn synthetic(
+    file: &mut BlockFile,
+    kind: u8,
+    address: Address,
+    value: U256,
+    code: Bytes,
+    traces: bool,
+) {
     let id = format!(
         "0x{kind:02}{:022}{}",
         0,
@@ -44,6 +51,9 @@ fn synthetic(file: &mut BlockFile, kind: u8, address: Address, value: U256, code
         idx: file.txs.len() as i64,
         value,
     });
+    if !traces {
+        return;
+    }
     let trace = DebankTrace {
         id: to_hash(&[&id, "", "0"]),
         from_addr: Address::ZERO,
@@ -94,10 +104,24 @@ pub(crate) fn genesis_output<D: DatabaseRef>(
             "genesis code hash mismatch for {address}"
         );
         if !info.balance.is_zero() {
-            synthetic(&mut file, 1, address, info.balance, Bytes::new());
+            synthetic(
+                &mut file,
+                1,
+                address,
+                info.balance,
+                Bytes::new(),
+                options.traces,
+            );
         }
         if !code.is_empty() {
-            synthetic(&mut file, 2, address, U256::ZERO, code.clone());
+            synthetic(
+                &mut file,
+                2,
+                address,
+                U256::ZERO,
+                code.clone(),
+                options.traces,
+            );
         }
         let hashed = keccak256(address);
         diff.new_accounts.push(NewAccount {
@@ -114,7 +138,9 @@ pub(crate) fn genesis_output<D: DatabaseRef>(
         }
         let keys = &ALLOC[&address];
         if !keys.is_empty() {
-            file.storage_contracts.push(addr_hex(&address));
+            if options.traces {
+                file.storage_contracts.push(addr_hex(&address));
+            }
             let mut diffs = Vec::with_capacity(keys.len());
             for slot in keys {
                 let value = state
@@ -138,6 +164,7 @@ pub(crate) fn genesis_output<D: DatabaseRef>(
         Address::repeat_byte(0xee),
         U256::ZERO,
         Bytes::new(),
+        options.traces,
     );
     file.storage_contracts.sort();
     diff.new_accounts.sort_by_key(|a| a.address);
@@ -149,4 +176,44 @@ pub(crate) fn genesis_output<D: DatabaseRef>(
         state_diff: options.state_diff.then(|| alloy::rlp::encode(diff).into()),
         timings: ReplayTimings::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::{database::InMemoryDB, state::AccountInfo};
+
+    #[test]
+    fn no_traces_preserves_genesis_transactions_and_storage_diff() {
+        let mut db = InMemoryDB::default();
+        for address in ALLOC.keys() {
+            db.insert_account_info(
+                *address,
+                AccountInfo {
+                    balance: U256::from(1),
+                    ..Default::default()
+                },
+            );
+        }
+        let block = Block::default();
+        let mut options = ReplayOptions {
+            strict: true,
+            check_state: false,
+            state_diff: true,
+            traces: true,
+        };
+        let traced = genesis_output(&db, &block, options).unwrap();
+        options.traces = false;
+        let plain = genesis_output(&db, &block, options).unwrap();
+        assert!(!traced.block_file.traces.is_empty());
+        assert!(!traced.block_file.storage_contracts.is_empty());
+        assert!(plain.block_file.traces.is_empty());
+        assert!(plain.block_file.storage_contracts.is_empty());
+        assert_eq!(plain.block_file.txs.len(), ALLOC.len() + 1);
+        assert_eq!(
+            serde_json::to_value(plain.block_file.txs).unwrap(),
+            serde_json::to_value(traced.block_file.txs).unwrap()
+        );
+        assert_eq!(plain.state_diff, traced.state_diff);
+    }
 }

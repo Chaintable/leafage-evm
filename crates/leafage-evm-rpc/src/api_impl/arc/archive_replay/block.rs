@@ -6,13 +6,14 @@ use alloy::primitives::{address, Address, Bytes, U256};
 use alloy::sol_types::{sol, SolCall, SolValue};
 use alloy_evm::Database;
 use anyhow::{anyhow, ensure, Result};
-use leafage_evm_chains::arc::ArcEvm;
+use leafage_evm_chains::arc::{
+    blocklist_storage_slot, is_blocklisted_status, ArcEvm, NATIVE_COIN_CONTROL_ADDRESS,
+};
 use revm::{context::ContextTr, DatabaseCommit, SystemCallEvm};
 
 const SYSTEM_CALLER: Address = revm::handler::SYSTEM_ADDRESS;
 const PROTOCOL_CONFIG: Address = address!("3600000000000000000000000000000000000001");
 const ACCOUNTING: Address = address!("1800000000000000000000000000000000000002");
-const CONTROL: Address = address!("1800000000000000000000000000000000000001");
 
 sol! {
     #![sol(alloy_sol_types = alloy::sol_types)]
@@ -43,9 +44,30 @@ fn call<DB: Database, I>(evm: &mut ArcEvm<DB, I>, to: Address, data: Bytes) -> R
         .ok_or_else(|| anyhow!("system call to {to} has no output"))
 }
 
-fn fee_params<DB: Database, I>(evm: &mut ArcEvm<DB, I>) -> Result<FeeParams> {
-    let output = call(evm, PROTOCOL_CONFIG, feeParamsCall {}.abi_encode().into())?;
-    Ok(feeParamsCall::abi_decode_returns(&output)?)
+fn fee_params<DB: Database, I>(evm: &mut ArcEvm<DB, I>) -> Result<Option<FeeParams>> {
+    // Contract failures retain the Writer's fallback; database/EVM errors abort replay.
+    let outcome = evm
+        .system_call_with_caller(
+            SYSTEM_CALLER,
+            PROTOCOL_CONFIG,
+            feeParamsCall {}.abi_encode().into(),
+        )
+        .map_err(|e| anyhow!("ProtocolConfig feeParams: {e}"))?;
+    if !outcome.result.is_success() {
+        tracing::warn!(result = ?outcome.result, "feeParams failed; using defaults");
+        return Ok(None);
+    }
+    let Some(output) = outcome.result.output() else {
+        tracing::warn!("feeParams has no output; using defaults");
+        return Ok(None);
+    };
+    match feeParamsCall::abi_decode_returns(output) {
+        Ok(params) => Ok(Some(params)),
+        Err(err) => {
+            tracing::warn!(%err, "invalid feeParams output; using defaults");
+            Ok(None)
+        }
+    }
 }
 
 pub(crate) fn before<DB: Database + DatabaseCommit, I>(
@@ -64,27 +86,20 @@ pub(crate) fn before<DB: Database + DatabaseCommit, I>(
     let state = outcome.state;
     evm.ctx_mut().db_mut().commit(state);
 
-    let slot = U256::from_be_bytes(
-        alloy::primitives::keccak256(
-            (
-                U256::from_be_slice(header.beneficiary.as_slice()),
-                U256::from(2),
-            )
-                .abi_encode(),
-        )
-        .0,
-    );
     let blocked = evm
         .ctx_mut()
         .db_mut()
-        .storage(CONTROL, slot)
+        .storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            blocklist_storage_slot(header.beneficiary),
+        )
         .map_err(|e| anyhow!("beneficiary blocklist: {e:?}"))?;
     ensure!(
-        blocked.is_zero(),
+        !is_blocklisted_status(blocked),
         "beneficiary {} is blocklisted",
         header.beneficiary
     );
-    let params = fee_params(evm).ok();
+    let params = fee_params(evm)?;
     let gas_limit = params
         .and_then(|p| u64::try_from(p.blockGasLimit).ok())
         .filter(|v| (10_000_000..=200_000_000).contains(v))
@@ -129,7 +144,7 @@ pub(crate) fn after<DB: Database + DatabaseCommit, I>(
     header: &alloy::rpc::types::Header,
     gas_used: u64,
 ) -> Result<()> {
-    let params = fee_params(evm).ok();
+    let params = fee_params(evm)?;
     let (alpha, rate, inverse) = params
         .as_ref()
         .map(|p| {
@@ -205,4 +220,141 @@ pub(crate) fn after<DB: Database + DatabaseCommit, I>(
     );
     evm.ctx_mut().db_mut().commit(outcome.state);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::B256;
+    use alloy_evm::EvmEnv;
+    use leafage_evm_chains::arc::{ArcChainConfig, ArcEvmFactory};
+    use leafage_evm_types::{BlockEnv, CfgEnv};
+    use revm::{
+        database::InMemoryDB,
+        state::{AccountInfo, Bytecode, EvmState},
+    };
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("forced ProtocolConfig database read failure")]
+    struct ReadError;
+    impl revm::database_interface::DBErrorMarker for ReadError {}
+
+    #[derive(Debug, Default)]
+    struct FailingDb(InMemoryDB);
+
+    impl revm::Database for FailingDb {
+        type Error = ReadError;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, ReadError> {
+            if address == PROTOCOL_CONFIG {
+                return Err(ReadError);
+            }
+            Ok(self.0.basic(address).unwrap())
+        }
+
+        fn code_by_hash(&mut self, hash: B256) -> Result<Bytecode, ReadError> {
+            Ok(self.0.code_by_hash(hash).unwrap())
+        }
+
+        fn storage(&mut self, address: Address, slot: U256) -> Result<U256, ReadError> {
+            Ok(self.0.storage(address, slot).unwrap())
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<B256, ReadError> {
+            Ok(self.0.block_hash(number).unwrap())
+        }
+    }
+
+    impl DatabaseCommit for FailingDb {
+        fn commit(&mut self, changes: EvmState) {
+            self.0.commit(changes);
+        }
+    }
+
+    fn env() -> EvmEnv {
+        let config = ArcChainConfig::mainnet();
+        let mut cfg = CfgEnv::new_with_spec(config.ethereum_spec());
+        cfg.chain_id = config.chain_id();
+        EvmEnv::new(
+            cfg,
+            BlockEnv {
+                gas_limit: 30_000_000,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn database_errors_abort_both_block_hooks() {
+        let header = alloy::rpc::types::Header::default();
+        for pre_block in [true, false] {
+            let mut db = FailingDb::default();
+            let factory = ArcEvmFactory::new(ArcChainConfig::mainnet());
+            let mut evm = factory
+                .create(env(), &mut db, revm::inspector::NoOpInspector {})
+                .unwrap();
+            let err = if pre_block {
+                before(&mut evm, &header)
+            } else {
+                after(&mut evm, &header, 0)
+            }
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("ProtocolConfig feeParams"), "{message}");
+            assert!(
+                message.contains("forced ProtocolConfig database read failure"),
+                "{message}"
+            );
+        }
+    }
+
+    fn config_db(code: Bytes) -> InMemoryDB {
+        let mut db = InMemoryDB::default();
+        let code = Bytecode::new_raw(code);
+        db.insert_account_info(
+            PROTOCOL_CONFIG,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        db
+    }
+
+    #[test]
+    fn contract_and_abi_failures_keep_writer_defaults() {
+        // REVERT, exceptional halt, empty return, and a one-byte malformed return.
+        for code in ["60006000fd", "fe", "00", "600160005360016000f3"] {
+            let mut db = config_db(alloy::hex::decode(code).unwrap().into());
+            let factory = ArcEvmFactory::new(ArcChainConfig::mainnet());
+            let mut evm = factory
+                .create(env(), &mut db, revm::inspector::NoOpInspector {})
+                .unwrap();
+            assert!(fee_params(&mut evm).unwrap().is_none(), "{code}");
+        }
+    }
+
+    #[test]
+    fn valid_contract_fee_params_are_preserved() {
+        let params = FeeParams {
+            alpha: 37,
+            kRate: 123,
+            inverseElasticityMultiplier: 6789,
+            minBaseFee: U256::from(10),
+            maxBaseFee: U256::from(1000),
+            blockGasLimit: U256::from(42_000_000),
+        };
+        let output = params.abi_encode();
+        let mut code = alloy::hex::decode("6100c061000f6000396100c06000f3").unwrap();
+        assert_eq!(code.len(), 15);
+        assert_eq!(output.len(), 192);
+        code.extend_from_slice(&output);
+        let mut db = config_db(code.into());
+        let factory = ArcEvmFactory::new(ArcChainConfig::mainnet());
+        let mut evm = factory
+            .create(env(), &mut db, revm::inspector::NoOpInspector {})
+            .unwrap();
+        assert_eq!(fee_params(&mut evm).unwrap().unwrap().abi_encode(), output);
+    }
 }

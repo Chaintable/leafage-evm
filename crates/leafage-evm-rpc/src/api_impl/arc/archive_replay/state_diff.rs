@@ -32,7 +32,7 @@ pub fn get_storage_contracts_from_bundle(bundle: &BundleState) -> Vec<Address> {
     storage_contracts
 }
 
-pub fn get_storage_diffs_from_bundle(bundle: BundleState) -> anyhow::Result<BlockStorageDiff> {
+pub fn get_storage_diffs_from_bundle(bundle: BundleState) -> BlockStorageDiff {
     let mut new_accounts = Vec::new();
     let mut deleted_accounts = Vec::new();
     let mut storage_diffs = Vec::new();
@@ -93,7 +93,7 @@ pub fn get_storage_diffs_from_bundle(bundle: BundleState) -> anyhow::Result<Bloc
         new_codes,
     };
     sort_block_storage_diff(&mut state_diff);
-    Ok(state_diff)
+    state_diff
 }
 
 fn sort_block_storage_diff(state_diff: &mut BlockStorageDiff) {

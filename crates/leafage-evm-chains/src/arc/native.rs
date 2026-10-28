@@ -21,15 +21,16 @@ sol! {
 }
 
 #[inline]
-pub(crate) fn blocklist_storage_slot(address: Address) -> U256 {
+pub fn blocklist_storage_slot(address: Address) -> U256 {
     let mut input = [0u8; 64];
     input[12..32].copy_from_slice(address.as_slice());
     input[32..].copy_from_slice(BLOCKLIST_MAPPING_SLOT.as_slice());
     U256::from_be_bytes(keccak256(input).0)
 }
 
+/// Any non-zero mapping value denotes a blocklisted address.
 #[inline]
-pub(crate) fn is_blocklisted_status(status: U256) -> bool {
+pub fn is_blocklisted_status(status: U256) -> bool {
     !status.is_zero()
 }
 
