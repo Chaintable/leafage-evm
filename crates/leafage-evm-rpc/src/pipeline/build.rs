@@ -108,7 +108,34 @@ pub(crate) fn pipeline_header(block: &RpcBlock) -> PipelineHeader {
         blob_gas_used: header.blob_gas_used.map(U64::from),
         excess_blob_gas: header.excess_blob_gas.map(U64::from),
         parent_beacon_block_root: header.parent_beacon_block_root,
-        requests_root: header.requests_hash,
-        requests_hash: None,
+        requests_hash: header.requests_hash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::B256;
+
+    #[test]
+    fn pipeline_header_uses_standard_requests_hash() {
+        let mut block: RpcBlock = Default::default();
+        let hash = B256::repeat_byte(0x42);
+        block.header.requests_hash = Some(hash);
+
+        let json = serde_json::to_value(pipeline_header(&block)).unwrap();
+        assert_eq!(json["requestsHash"], serde_json::json!(hash));
+        assert!(!json.as_object().unwrap().contains_key("requestsRoot"));
+
+        let decoded: alloy::rpc::types::Header = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.requests_hash, Some(hash));
+    }
+
+    #[test]
+    fn pipeline_header_omits_requests_hash_before_activation() {
+        let block = RpcBlock::default();
+        let json = serde_json::to_value(pipeline_header(&block)).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("requestsHash"));
+        assert!(!json.as_object().unwrap().contains_key("requestsRoot"));
     }
 }

@@ -2,9 +2,8 @@
 //! Account values and code are read from archive block zero.
 
 use super::convert::{append, DebankTrace};
-use super::pipeline_header;
 use crate::pipeline::{
-    build::pipeline_block,
+    build::{pipeline_block, pipeline_header},
     chain::{ReplayOptions, ReplayOutput, ReplayTimings},
     types::{addr_hex, to_hash, BlockFile, PipelineTransaction},
 };

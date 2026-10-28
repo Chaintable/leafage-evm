@@ -1,10 +1,12 @@
 //! `trace_debankBlock` response types.
 //!
-//! Field names, order and JSON encodings follow the Go types of
+//! Field names, order and JSON encodings generally follow the Go types of
 //! `github.com/Chaintable/pipeline/types` (v0.0.69) that the pipeline nodes
 //! (e.g. bsc-x) return:
 //! `*big.Int` fields are JSON numbers, `hexutil.*` fields are hex strings
 //! and addresses are lowercase hex.
+//! Headers use the standard `requestsHash` name instead of the legacy
+//! pipeline `requestsRoot` name.
 
 use alloy::primitives::{Address, Bloom, Bytes, B256, B64, U256, U64};
 use md5::{Digest as _, Md5};
@@ -141,9 +143,6 @@ pub struct PipelineHeader {
     pub excess_blob_gas: Option<U64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_beacon_block_root: Option<B256>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests_root: Option<B256>,
-    /// Arc follows its Writer header field name; other chains keep requestsRoot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requests_hash: Option<B256>,
 }

@@ -1,7 +1,5 @@
 //! Re-execute canonical Arc blocks on archive parent state.
 
-use super::pipeline_header;
-
 use super::{
     block, convert,
     inspector::{record_subcall_trace_completion, ArcEventInspector},
@@ -9,7 +7,7 @@ use super::{
 };
 use crate::pipeline::{
     blocks::FetchedBlock,
-    build::{pipeline_block, pipeline_transaction, receipt_envelope},
+    build::{pipeline_block, pipeline_header, pipeline_transaction, receipt_envelope},
     chain::{ReplayOptions, ReplayOutput, ReplayTimings},
     changes::check,
     types::{addr_hex, BlockFile},
