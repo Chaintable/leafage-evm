@@ -67,6 +67,10 @@ hardfork!(
         Osaka,
         /// BSC `Mendel` hardfork
         Mendel,
+        /// BSC `Pasteur` hardfork
+        Pasteur,
+        /// BSC `Jenner` hardfork - CAS20 (BEP-702) and the millisecond timestamp precompile (BEP-706)
+        Jenner,
     }
 );
 
@@ -113,7 +117,10 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::Lorentz
             | BscHardfork::Maxwell
             | BscHardfork::Fermi => SpecId::PRAGUE,
-            BscHardfork::Osaka | BscHardfork::Mendel => SpecId::OSAKA,
+            BscHardfork::Osaka
+            | BscHardfork::Mendel
+            | BscHardfork::Pasteur
+            | BscHardfork::Jenner => SpecId::OSAKA,
         }
     }
 }

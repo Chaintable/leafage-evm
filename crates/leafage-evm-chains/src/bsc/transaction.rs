@@ -13,6 +13,10 @@ pub type TransactionSigned = EthereumTxEnvelope<TxEip4844>;
 pub struct BscTxEnv {
     pub base: TxEnv,
     pub is_system_transaction: bool,
+    /// The executing block's millisecond timestamp (BEP-520 `Header.MilliTimestamp()`), read
+    /// by the Jenner `0x70` precompile. It is block context revm's `BlockEnv` has no room for;
+    /// `None` falls back to `timestamp * 1000`, as go-bsc does.
+    pub milli_timestamp: Option<u64>,
 }
 
 impl BscTxEnv {
@@ -20,6 +24,7 @@ impl BscTxEnv {
         Self {
             base,
             is_system_transaction: false,
+            milli_timestamp: None,
         }
     }
 }
@@ -119,10 +124,7 @@ impl FromTxWithEncoded<TransactionSigned> for BscTxEnv {
             EthereumTypedTransaction::Eip7702(tx) => TxEnv::from_recovered_tx(&tx, sender),
         };
 
-        Self {
-            base,
-            is_system_transaction: false,
-        }
+        Self::new(base)
     }
 }
 impl SystemCallTx for BscTxEnv {
@@ -142,6 +144,7 @@ impl SystemCallTx for BscTxEnv {
         Self {
             base,
             is_system_transaction: true,
+            milli_timestamp: None,
         }
     }
 }
@@ -162,6 +165,7 @@ mod tests {
                 ..Default::default()
             },
             is_system_transaction: false,
+            milli_timestamp: None,
         };
 
         assert_eq!(bsc_tx.tx_type(), 0);

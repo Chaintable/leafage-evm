@@ -45,7 +45,9 @@ use leafage_evm_chains::bsc::mainnet::{
     bsc_mainnet_fork_transition, bsc_mainnet_spec_at, BscMainnetHardforks, BSC_MAINNET_CHAIN_ID,
     BSC_MAINNET_UPGRADABLE_CONTRACTS,
 };
-use leafage_evm_chains::bsc::{BscEvm, BscHardfork, BscHardforks, BscTxEnv};
+use leafage_evm_chains::bsc::{
+    header_milli_timestamp, BscEvm, BscHardfork, BscHardforks, BscTxEnv,
+};
 use revm::bytecode::Bytecode;
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
@@ -233,6 +235,7 @@ where
 
     // 2. ordinary transactions
     let coinbase = header.beneficiary;
+    let milli_timestamp = Some(header_milli_timestamp(header.timestamp, header.mix_hash));
     let mut system_txs = Vec::new();
     for (index, tx) in transactions.iter().enumerate() {
         let sender = tx.inner.signer();
@@ -245,7 +248,8 @@ where
         if let Some(patch) = patches::find(patches::PATCHES_BEFORE_TX, &tx_hash) {
             replay.apply_patch(patch)?;
         }
-        let tx_env = BscTxEnv::new(TxEnv::from_recovered_tx(envelope, sender));
+        let mut tx_env = BscTxEnv::new(TxEnv::from_recovered_tx(envelope, sender));
+        tx_env.milli_timestamp = milli_timestamp;
         let gas_price = revm::context::Transaction::effective_gas_price(
             &tx_env,
             header.base_fee_per_gas.unwrap_or_default() as u128,
@@ -279,6 +283,7 @@ where
                 ..Default::default()
             },
             is_system_transaction: true,
+            milli_timestamp,
         };
         let index = replay.receipts.len();
         replay.execute(envelope, sender, tx_env, 0, index)?;
