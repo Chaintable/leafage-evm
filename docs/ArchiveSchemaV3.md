@@ -215,3 +215,34 @@ u32      CRC32 of the preceding header bytes
   within the tail.
 - Full latest-state scans over segments (`db-migrate` from v3, `archive-scan`)
   are not implemented in the prototype.
+
+## Prototype results (bsc, 2026-10-28)
+
+Built from the bsc v2 bench archive (head 128538186, 2.4 TiB RocksDB) on an
+i3en.3xlarge, reading the archive at up to 1000 MB/s and writing to local
+NVMe: 103.4 G records (71.3 G storage, 32.1 G account) in 2 h 51 min.
+
+- **Correctness.** `archive-v3 verify` (10 000 keys, 360 000 reads including
+  next-version bounds, 10 000 absent keys): 0 mismatches. 8 580 captured
+  production bsc responses replayed against v3: 0 mismatches.
+- **CPU.** One pod's share of the bsc bundle backfill, open loop at
+  1 100 req/s on 4 cores (warm page cache, second pass):
+
+  | | CPU / request | p50 | p99 |
+  |---|---|---|---|
+  | v2 (same binary, no history) | 1.15–1.19 ms | 0.85–0.89 ms | 6.8–9.5 ms |
+  | v3 + state cache | 0.57–0.58 ms | 0.52 ms | 2.4–2.8 ms |
+  | v3, state cache off | 0.56–0.58 ms | 0.51 ms | 2.2 ms |
+
+  A sealed lookup costs about 2 µs of CPU against about 24 µs for a v2
+  storage seek; RocksDB falls from 47% of the CPU profile to 5% (block info
+  and code). The state cache no longer pays for itself on this path.
+- **Size.** 3.6 TiB (storage 2 135 GiB at ~32 B/record, account
+  1 585 GiB at ~53 B/record) against 2.4 TiB for the whole v2 archive.
+  Caveat for the CPU numbers: the segments sat on local NVMe and the v2
+  archive on gp3.
+
+Open items before production: a compact account value (the slim RLP and
+its 32-byte code hash dominate account records), 4-byte block deltas per
+page, sealing epochs on a live node and tail garbage collection, the
+segments on the production volume type, and rewind/scans over segments.
