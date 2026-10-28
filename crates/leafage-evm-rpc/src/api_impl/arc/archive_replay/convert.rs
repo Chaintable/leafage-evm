@@ -17,53 +17,21 @@
 //! Arc blockfile conversion, ported from arc-node 830ad37 debank_trace.rs.
 use super::inspector::{CapturedEvents, CapturedMember};
 use crate::pipeline::types::{addr_hex, to_hash, BlockFile, PipelineEvent, PipelineTrace};
-use alloy::primitives::{Address, Bytes, Log, B256 as H256, U256};
+use alloy::primitives::{Log, B256 as H256};
 use revm_inspectors::tracing::{
     types::{CallKind, CallTraceNode},
     CallTraceArena,
 };
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DebankEvent {
-    pub id: String,
-    pub contract_id: Address,
-    pub selector: String,
-    pub topics: Vec<String>,
-    pub data: Bytes,
-    pub parent_trace_id: String,
-    pub pos_in_parent_trace: usize,
-    pub idx: usize,
-}
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DebankTrace {
-    pub id: String,
-    pub from_addr: Address,
-    pub gas_limit: u64,
-    pub input: Bytes,
-    pub to_addr: Address,
-    pub value: U256,
-    pub gas_used: u64,
-    pub output: Bytes,
-    pub call_create_type: String,
-    pub call_type: String,
-    pub tx_id: String,
-    pub parent_trace_id: String,
-    pub pos_in_parent_trace: usize,
-    pub self_storage_change: bool,
-    pub storage_change: bool,
-    pub subtraces: usize,
-    pub trace_address: Vec<usize>,
-    pub error: String,
-}
 trait DebankID {
     fn debank_id(&self) -> String;
 }
-impl DebankID for DebankEvent {
+impl DebankID for PipelineEvent {
     fn debank_id(&self) -> String {
         to_hash(&[&self.parent_trace_id, &self.pos_in_parent_trace.to_string()])
     }
 }
-impl DebankID for DebankTrace {
+impl DebankID for PipelineTrace {
     fn debank_id(&self) -> String {
         to_hash(&[
             &self.tx_id,
@@ -98,36 +66,36 @@ pub(crate) fn fmt_error_msg(res: revm::interpreter::InstructionResult) -> Option
 }
 
 // ---------------------------------------------------------------------------
-// Trace node conversion: CallTraceNode → DebankTrace
+// Trace node conversion: CallTraceNode → PipelineTrace
 // ---------------------------------------------------------------------------
 
-impl From<&CallTraceNode> for DebankTrace {
+impl From<&CallTraceNode> for PipelineTrace {
     fn from(call_trace: &CallTraceNode) -> Self {
         let trace = &call_trace.trace;
         let (call_create_type, call_type) = debank_call_types(trace.kind);
         let error = trace.status.and_then(fmt_error_msg);
-        let mut debank_trace = Self {
-            from_addr: trace.caller,
-            gas_limit: trace.gas_limit,
+        let mut converted = Self {
+            from_addr: addr_hex(&trace.caller),
+            gas_limit: trace.gas_limit as i64,
             input: trace.data.clone(),
-            to_addr: trace.address,
+            to_addr: addr_hex(&trace.address),
             value: trace.value,
-            gas_used: trace.gas_used,
+            gas_used: trace.gas_used as i64,
             output: trace.output.clone(),
             call_create_type: call_create_type.to_string(),
             call_type: call_type.to_string(),
-            subtraces: call_trace.children.len(),
+            subtraces: call_trace.children.len() as i64,
             error: error.unwrap_or_default(),
             ..Default::default()
         };
         for op in &trace.steps {
             if op.op == revm::bytecode::opcode::OpCode::SSTORE {
-                debank_trace.self_storage_change = true;
-                debank_trace.storage_change = true;
+                converted.self_storage_change = true;
+                converted.storage_change = true;
                 break;
             }
         }
-        debank_trace
+        converted
     }
 }
 
@@ -142,7 +110,7 @@ fn debank_call_types(kind: CallKind) -> (&'static str, &'static str) {
     }
 }
 
-impl From<&Log> for DebankEvent {
+impl From<&Log> for PipelineEvent {
     fn from(log: &Log) -> Self {
         let selector = log
             .topics()
@@ -155,9 +123,9 @@ impl From<&Log> for DebankEvent {
             vec![]
         };
         Self {
-            contract_id: log.address,
+            contract_id: addr_hex(&log.address),
             selector,
-            topics,
+            topics: Some(topics),
             data: log.data.data.clone(),
             ..Default::default()
         }
@@ -168,19 +136,19 @@ impl From<&Log> for DebankEvent {
 // Trace tree building
 // ---------------------------------------------------------------------------
 
-// Trace 节点比 Event 大 ~376 vs ~168 bytes; 整树只在一笔 tx 内构建后即消费，
+// 整树只在一笔 tx 内构建后即消费，
 // 不进入持久存储，不 Box 以避免热路径上的一次 heap 分配。
 #[allow(clippy::large_enum_variant)]
-enum DebankTraceOrLog {
-    Trace(DebankTraceNode),
-    Log { event: DebankEvent, success: bool },
+enum PipelineTraceOrLog {
+    Trace(PipelineTraceNode),
+    Log { event: PipelineEvent, success: bool },
 }
 
 const PARENT_CALL_FAILED_ERROR: &str = "parent call failed";
 
-struct DebankTraceNode {
-    trace: DebankTrace,
-    children: Vec<DebankTraceOrLog>,
+struct PipelineTraceNode {
+    trace: PipelineTrace,
+    children: Vec<PipelineTraceOrLog>,
     frame_success: bool,
     effective_frame_success: bool,
     success: bool,
@@ -198,7 +166,7 @@ fn build_trace_node(
     parent_success: bool,
     trace_address: Vec<usize>,
     log_index: &mut usize,
-) -> Result<DebankTraceNode, String> {
+) -> Result<PipelineTraceNode, String> {
     let node = nodes
         .get(node_id)
         .ok_or_else(|| format!("missing trace node {node_id}"))?;
@@ -214,11 +182,11 @@ fn build_trace_node(
 
     let raw_frame_success = frame.raw_success();
     let effective_frame_success = frame.effective_success();
-    let mut trace: DebankTrace = node.into();
+    let mut trace: PipelineTrace = node.into();
     if let Some(completion) = frame.subcall_completion() {
         trace.output = completion.child_output.clone();
-        trace.gas_used = completion.child_gas_used;
-        trace.gas_limit = completion.child_gas_limit;
+        trace.gas_used = completion.child_gas_used as i64;
+        trace.gas_limit = completion.child_gas_limit as i64;
     }
     if let Some(status) = frame.raw_failure_status() {
         trace.error = fmt_error_msg(status).unwrap_or_default();
@@ -228,23 +196,23 @@ fn build_trace_node(
     if (!parent_success || !effective_frame_success) && trace.error.is_empty() {
         trace.error = PARENT_CALL_FAILED_ERROR.to_string();
     }
-    let mut debank_node = DebankTraceNode {
+    let mut trace_node = PipelineTraceNode {
         trace,
         children: Vec::new(),
         frame_success: raw_frame_success,
         effective_frame_success,
         success: effective_frame_success && parent_success,
     };
-    debank_node.trace.trace_address = trace_address.clone();
-    debank_node.trace.parent_trace_id = parent_trace_id.to_owned();
-    debank_node.trace.pos_in_parent_trace = pos_in_parent_trace;
-    debank_node.trace.tx_id = tx_id.to_owned();
-    debank_node.trace.id = debank_node.trace.debank_id();
+    trace_node.trace.trace_address = trace_address.iter().map(|index| *index as i64).collect();
+    trace_node.trace.parent_trace_id = parent_trace_id.to_owned();
+    trace_node.trace.pos_in_parent_trace = pos_in_parent_trace as i64;
+    trace_node.trace.tx_id = tx_id.to_owned();
+    trace_node.trace.id = trace_node.trace.debank_id();
 
-    let id = debank_node.trace.id.clone();
+    let id = trace_node.trace.id.clone();
     let mut next_trace_index = 0;
     append_captured_members(
-        &mut debank_node,
+        &mut trace_node,
         node_id,
         tx_id,
         &id,
@@ -256,51 +224,54 @@ fn build_trace_node(
         &mut next_trace_index,
         log_index,
     )?;
-    debank_node.trace.subtraces = debank_node
+    trace_node.trace.subtraces = trace_node
         .children
         .iter()
-        .filter(|child| matches!(child, DebankTraceOrLog::Trace(_)))
-        .count();
+        .filter(|child| matches!(child, PipelineTraceOrLog::Trace(_)))
+        .count() as i64;
 
     // selfdestruct handling
     if node.is_selfdestruct() {
         let mut selfdestruct_ta = trace_address;
         selfdestruct_ta.push(next_trace_index);
-        debank_node.trace.subtraces += 1;
-        let mut selfdestruct_trace = DebankTrace {
-            from_addr: node.trace.selfdestruct_address.unwrap_or_default(),
-            to_addr: node.trace.selfdestruct_refund_target.unwrap_or_default(),
+        trace_node.trace.subtraces += 1;
+        let mut selfdestruct_trace = PipelineTrace {
+            from_addr: addr_hex(&node.trace.selfdestruct_address.unwrap_or_default()),
+            to_addr: addr_hex(&node.trace.selfdestruct_refund_target.unwrap_or_default()),
             value: node
                 .trace
                 .selfdestruct_transferred_value
                 .unwrap_or_default(),
-            trace_address: selfdestruct_ta,
+            trace_address: selfdestruct_ta
+                .into_iter()
+                .map(|index| index as i64)
+                .collect(),
             parent_trace_id: id,
-            pos_in_parent_trace: debank_node.children.len(),
+            pos_in_parent_trace: trace_node.children.len() as i64,
             tx_id: tx_id.to_owned(),
             call_create_type: "suicide".to_string(),
             ..Default::default()
         };
-        if debank_node.frame_success && !debank_node.success {
+        if trace_node.frame_success && !trace_node.success {
             selfdestruct_trace.error = PARENT_CALL_FAILED_ERROR.to_string();
         }
         selfdestruct_trace.id = selfdestruct_trace.debank_id();
-        debank_node
+        trace_node
             .children
-            .push(DebankTraceOrLog::Trace(DebankTraceNode {
+            .push(PipelineTraceOrLog::Trace(PipelineTraceNode {
                 trace: selfdestruct_trace,
                 children: vec![],
-                frame_success: debank_node.frame_success,
-                effective_frame_success: debank_node.effective_frame_success,
-                success: debank_node.success,
+                frame_success: trace_node.frame_success,
+                effective_frame_success: trace_node.effective_frame_success,
+                success: trace_node.success,
             }));
     }
-    Ok(debank_node)
+    Ok(trace_node)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn append_captured_members(
-    debank_node: &mut DebankTraceNode,
+    trace_node: &mut PipelineTraceNode,
     frame_id: usize,
     tx_id: &str,
     parent_trace_id: &str,
@@ -328,7 +299,7 @@ fn append_captured_members(
                     let child_trace = build_trace_node(
                         tx_id,
                         parent_trace_id,
-                        debank_node.children.len(),
+                        trace_node.children.len(),
                         *child_id,
                         nodes,
                         captured,
@@ -341,14 +312,14 @@ fn append_captured_members(
                     // propagating a successful child's SSTORE even if an ancestor
                     // later reverts the transaction.
                     if child_trace.trace.storage_change && child_trace.effective_frame_success {
-                        debank_node.trace.storage_change = true;
+                        trace_node.trace.storage_change = true;
                     }
-                    debank_node
+                    trace_node
                         .children
-                        .push(DebankTraceOrLog::Trace(child_trace));
+                        .push(PipelineTraceOrLog::Trace(child_trace));
                 } else {
                     append_captured_members(
-                        debank_node,
+                        trace_node,
                         *child_id,
                         tx_id,
                         parent_trace_id,
@@ -373,15 +344,15 @@ fn append_captured_members(
                         captured_event.frame
                     ));
                 }
-                let mut event: DebankEvent = (&captured_event.log).into();
+                let mut event: PipelineEvent = (&captured_event.log).into();
                 event.parent_trace_id = parent_trace_id.to_string();
-                event.pos_in_parent_trace = debank_node.children.len();
+                event.pos_in_parent_trace = trace_node.children.len() as i64;
                 event.id = event.debank_id();
                 if frame_success {
-                    event.idx = *log_index;
+                    event.idx = *log_index as i64;
                     *log_index += 1;
                 }
-                debank_node.children.push(DebankTraceOrLog::Log {
+                trace_node.children.push(PipelineTraceOrLog::Log {
                     event,
                     success: frame_success,
                 });
@@ -393,11 +364,11 @@ fn append_captured_members(
 }
 
 fn finish_build_traces(
-    node: DebankTraceNode,
-    traces: &mut Vec<DebankTrace>,
-    error_traces: &mut Vec<DebankTrace>,
-    events: &mut Vec<DebankEvent>,
-    error_events: &mut Vec<DebankEvent>,
+    node: PipelineTraceNode,
+    traces: &mut Vec<PipelineTrace>,
+    error_traces: &mut Vec<PipelineTrace>,
+    events: &mut Vec<PipelineEvent>,
+    error_events: &mut Vec<PipelineEvent>,
 ) {
     if node.success {
         traces.push(node.trace);
@@ -406,10 +377,10 @@ fn finish_build_traces(
     }
     for child in node.children {
         match child {
-            DebankTraceOrLog::Trace(trace) => {
+            PipelineTraceOrLog::Trace(trace) => {
                 finish_build_traces(trace, traces, error_traces, events, error_events);
             }
-            DebankTraceOrLog::Log { event, success } => {
+            PipelineTraceOrLog::Log { event, success } => {
                 if success {
                     events.push(event);
                 } else {
@@ -423,11 +394,11 @@ fn finish_build_traces(
 /// Build DeBank traces and events from a revm `CallTraceArena`.
 ///
 /// Returns `(traces, error_traces, events, error_events)`.
-pub(crate) type DebankTraceResult = (
-    Vec<DebankTrace>,
-    Vec<DebankTrace>,
-    Vec<DebankEvent>,
-    Vec<DebankEvent>,
+pub(crate) type PipelineTraceResult = (
+    Vec<PipelineTrace>,
+    Vec<PipelineTrace>,
+    Vec<PipelineEvent>,
+    Vec<PipelineEvent>,
 );
 
 pub(crate) fn build_debank_traces(
@@ -435,7 +406,7 @@ pub(crate) fn build_debank_traces(
     traces: CallTraceArena,
     captured: CapturedEvents,
     log_index: &mut usize,
-) -> Result<DebankTraceResult, String> {
+) -> Result<PipelineTraceResult, String> {
     let nodes = traces.into_nodes();
     captured.validate(nodes.len())?;
     if nodes.is_empty() {
@@ -477,59 +448,20 @@ pub(crate) fn build_debank_traces(
     Ok((traces, error_traces, events, error_events))
 }
 
-impl From<DebankTrace> for PipelineTrace {
-    fn from(t: DebankTrace) -> Self {
-        Self {
-            id: t.id,
-            from_addr: addr_hex(&t.from_addr),
-            gas_limit: t.gas_limit as i64,
-            input: t.input,
-            to_addr: addr_hex(&t.to_addr),
-            value: t.value,
-            gas_used: t.gas_used as i64,
-            output: t.output,
-            call_create_type: t.call_create_type,
-            call_type: t.call_type,
-            tx_id: t.tx_id,
-            parent_trace_id: t.parent_trace_id,
-            pos_in_parent_trace: t.pos_in_parent_trace as i64,
-            self_storage_change: t.self_storage_change,
-            storage_change: t.storage_change,
-            subtraces: t.subtraces as i64,
-            trace_address: t.trace_address.into_iter().map(|v| v as i64).collect(),
-            error: t.error,
-        }
-    }
-}
-impl From<DebankEvent> for PipelineEvent {
-    fn from(e: DebankEvent) -> Self {
-        Self {
-            id: e.id,
-            contract_id: addr_hex(&e.contract_id),
-            selector: e.selector,
-            topics: Some(e.topics),
-            data: e.data,
-            parent_trace_id: e.parent_trace_id,
-            pos_in_parent_trace: e.pos_in_parent_trace as i64,
-            idx: e.idx as i64,
-        }
-    }
-}
-pub(crate) fn append(file: &mut BlockFile, result: DebankTraceResult) {
+pub(crate) fn append(file: &mut BlockFile, result: PipelineTraceResult) {
     let (traces, errors, events, error_events) = result;
-    file.traces.extend(traces.into_iter().map(Into::into));
-    file.error_traces.extend(errors.into_iter().map(Into::into));
-    file.events.extend(events.into_iter().map(Into::into));
-    file.error_events
-        .extend(error_events.into_iter().map(Into::into));
+    file.traces.extend(traces);
+    file.error_traces.extend(errors);
+    file.events.extend(events);
+    file.error_events.extend(error_events);
 }
 
 pub(super) fn validate_transaction_classification(
     tx_success: bool,
-    traces: &[DebankTrace],
-    error_traces: &[DebankTrace],
-    events: &[DebankEvent],
-    error_events: &[DebankEvent],
+    traces: &[PipelineTrace],
+    error_traces: &[PipelineTrace],
+    events: &[PipelineEvent],
+    error_events: &[PipelineEvent],
 ) -> Result<(), &'static str> {
     if traces.iter().any(|trace| !trace.error.is_empty()) {
         return Err("successful trace has an error");
@@ -558,4 +490,38 @@ pub(super) fn validate_transaction_classification(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Address, LogData};
+
+    #[test]
+    fn event_without_topics_keeps_arc_array_encoding() {
+        let log = Log {
+            address: Address::repeat_byte(0xab),
+            data: LogData::empty(),
+        };
+        let event: PipelineEvent = (&log).into();
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["contract_id"], addr_hex(&log.address));
+        assert_eq!(json["selector"], "");
+        assert_eq!(json["topics"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn trace_numbers_keep_go_signed_integer_encoding() {
+        let mut node = CallTraceNode::default();
+        node.trace.caller = Address::repeat_byte(0xab);
+        node.trace.address = Address::repeat_byte(0xcd);
+        node.trace.gas_limit = u64::MAX;
+        node.trace.gas_used = u64::MAX;
+        let trace: PipelineTrace = (&node).into();
+        let json = serde_json::to_value(trace).unwrap();
+        assert_eq!(json["from_addr"], addr_hex(&node.trace.caller));
+        assert_eq!(json["to_addr"], addr_hex(&node.trace.address));
+        assert_eq!(json["gas_limit"], -1);
+        assert_eq!(json["gas_used"], -1);
+    }
 }

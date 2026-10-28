@@ -4,7 +4,7 @@ use super::replay::{RangeBlock, RangeReplayer};
 use crate::pipeline::blocks::FetchedBlock;
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
 use crate::pipeline::changes::LazyState;
-use crate::pipeline::genesis::genesis_output;
+use crate::pipeline::genesis::{genesis_output, GenesisOptions};
 use alloy::primitives::B256;
 use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{anyhow, Result};
@@ -47,7 +47,13 @@ where
         options: ReplayOptions,
     ) -> Result<ReplayOutput> {
         let state = archive_state(db.as_ref(), info)?;
-        genesis_output(&BSC_MAINNET_GENESIS_ALLOC, &state, block, options)
+        genesis_output(
+            &BSC_MAINNET_GENESIS_ALLOC,
+            &state,
+            block,
+            options,
+            GenesisOptions::default(),
+        )
     }
 }
 

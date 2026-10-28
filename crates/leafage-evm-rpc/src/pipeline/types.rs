@@ -76,7 +76,7 @@ pub struct PipelineTransaction {
     pub value: U256,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PipelineEvent {
     pub id: String,
     pub contract_id: String,
@@ -89,7 +89,7 @@ pub struct PipelineEvent {
     pub idx: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PipelineTrace {
     pub id: String,
     pub from_addr: String,

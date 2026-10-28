@@ -407,7 +407,8 @@ mod tests {
         CallTraceArena,
     };
 
-    use super::super::convert::{build_debank_traces, DebankTrace};
+    use super::super::convert::build_debank_traces;
+    use crate::pipeline::types::{addr_hex, PipelineTrace};
 
     fn log(byte: u8) -> Log {
         Log {
@@ -445,10 +446,10 @@ mod tests {
         arena
     }
 
-    fn trace_for_address(traces: &[DebankTrace], address: Address) -> &DebankTrace {
+    fn trace_for_address(traces: &[PipelineTrace], address: Address) -> &PipelineTrace {
         traces
             .iter()
-            .find(|trace| trace.to_addr == address)
+            .find(|trace| trace.to_addr == addr_hex(&address))
             .unwrap()
     }
 
@@ -570,19 +571,19 @@ mod tests {
             "Out of gas"
         );
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].contract_id, logs[2].address);
+        assert_eq!(events[0].contract_id, addr_hex(&logs[2].address));
         assert_eq!(
             events[0].parent_trace_id,
             trace_for_address(&traces, Address::repeat_byte(5)).id
         );
         assert_eq!(events[0].idx, 0);
         assert_eq!(error_events.len(), 2);
-        assert_eq!(error_events[0].contract_id, logs[0].address);
+        assert_eq!(error_events[0].contract_id, addr_hex(&logs[0].address));
         assert_eq!(
             error_events[0].parent_trace_id,
             trace_for_address(&error_traces, Address::repeat_byte(2)).id
         );
-        assert_eq!(error_events[1].contract_id, logs[1].address);
+        assert_eq!(error_events[1].contract_id, addr_hex(&logs[1].address));
         assert_eq!(
             error_events[1].parent_trace_id,
             trace_for_address(&error_traces, Address::repeat_byte(3)).id
@@ -653,15 +654,18 @@ mod tests {
             build_debank_traces(B256::repeat_byte(0xaa), arena, captured, &mut 0).unwrap();
 
         assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].to_addr, Address::repeat_byte(1));
+        assert_eq!(traces[0].to_addr, addr_hex(&Address::repeat_byte(1)));
         assert_eq!(error_traces.len(), 1);
-        assert_eq!(error_traces[0].to_addr, Address::repeat_byte(3));
+        assert_eq!(error_traces[0].to_addr, addr_hex(&Address::repeat_byte(3)));
         assert_eq!(error_traces[0].error, "parent call failed");
         assert_eq!(error_traces[0].trace_address, vec![0]);
         assert_eq!(error_traces[0].parent_trace_id, traces[0].id);
         assert!(events.is_empty());
         assert_eq!(error_events.len(), 1);
-        assert_eq!(error_events[0].contract_id, descendant_log.address);
+        assert_eq!(
+            error_events[0].contract_id,
+            addr_hex(&descendant_log.address)
+        );
         assert_eq!(error_events[0].parent_trace_id, error_traces[0].id);
         assert_eq!(error_events[0].idx, 0);
     }
@@ -812,18 +816,18 @@ mod tests {
         assert_eq!(error_traces[0].trace_address, vec![0]);
         assert_eq!(error_traces[0].pos_in_parent_trace, 2);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].contract_id, logs[0].address);
+        assert_eq!(events[0].contract_id, addr_hex(&logs[0].address));
         assert_eq!(events[0].pos_in_parent_trace, 0);
-        assert_eq!(events[1].contract_id, logs[1].address);
+        assert_eq!(events[1].contract_id, addr_hex(&logs[1].address));
         assert_eq!(events[1].pos_in_parent_trace, 1);
-        assert_eq!(events[2].contract_id, logs[3].address);
+        assert_eq!(events[2].contract_id, addr_hex(&logs[3].address));
         assert_eq!(events[2].pos_in_parent_trace, 3);
         assert_eq!(
             events.iter().map(|event| event.idx).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
         assert_eq!(error_events.len(), 1);
-        assert_eq!(error_events[0].contract_id, logs[2].address);
+        assert_eq!(error_events[0].contract_id, addr_hex(&logs[2].address));
         assert_eq!(error_events[0].idx, 0);
     }
 
@@ -904,8 +908,8 @@ mod tests {
 
         let suicide = &traces[1];
         assert_eq!(suicide.call_create_type, "suicide");
-        assert_eq!(suicide.from_addr, selfdestruct_address);
-        assert_eq!(suicide.to_addr, refund_target);
+        assert_eq!(suicide.from_addr, addr_hex(&selfdestruct_address));
+        assert_eq!(suicide.to_addr, addr_hex(&refund_target));
         assert_eq!(suicide.value, transferred_value);
         assert_eq!(suicide.pos_in_parent_trace, 2);
         assert_eq!(suicide.trace_address, vec![0]);
@@ -1062,7 +1066,7 @@ mod tests {
             .iter()
             .find(|trace| trace.call_create_type == "suicide")
             .unwrap();
-        assert_eq!(suicide.to_addr, refund_target);
+        assert_eq!(suicide.to_addr, addr_hex(&refund_target));
         assert_eq!(suicide.error, "parent call failed");
     }
 
@@ -1152,8 +1156,8 @@ mod tests {
         assert!(error_traces[0].storage_change);
         assert_eq!(events.len(), 1);
         assert_eq!(error_events.len(), 1);
-        assert_eq!(events[0].contract_id, reused_log.address);
-        assert_eq!(error_events[0].contract_id, reused_log.address);
+        assert_eq!(events[0].contract_id, addr_hex(&reused_log.address));
+        assert_eq!(error_events[0].contract_id, addr_hex(&reused_log.address));
         assert_eq!(events[0].parent_trace_id, traces[0].id);
         assert_eq!(error_events[0].parent_trace_id, error_traces[0].id);
     }
@@ -1214,8 +1218,8 @@ mod tests {
         assert_eq!(error_traces[0].error, "Reverted");
         assert_eq!(events.len(), 1);
         assert_eq!(error_events.len(), 1);
-        assert_eq!(events[0].contract_id, reused_log.address);
-        assert_eq!(error_events[0].contract_id, reused_log.address);
+        assert_eq!(events[0].contract_id, addr_hex(&reused_log.address));
+        assert_eq!(error_events[0].contract_id, addr_hex(&reused_log.address));
         assert_eq!(events[0].parent_trace_id, traces[0].id);
         assert_eq!(error_events[0].parent_trace_id, error_traces[0].id);
     }
