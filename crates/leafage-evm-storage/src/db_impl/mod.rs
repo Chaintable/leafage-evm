@@ -23,7 +23,10 @@ pub(crate) use rocksdb_impl::ARCHIVE_DB_TEST_LOCK;
 pub(crate) use rocksdb_impl::{
     state_account_value, state_block_num_key, state_sst_writer_options, state_storage_key, SstSink,
 };
-pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, BulkColumn, RocksDBStorage};
+pub use rocksdb_impl::{
+    verify_udt_against_v2, ArchiveRocksDBStorage, ArchiveStateDB, BulkColumn, RocksDBStorage,
+    UdtConvertReport, UdtVerifyReport,
+};
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use leafage_evm_types::{BlockId, BlockInfo, Bytes, NewAccount, H256, U256};

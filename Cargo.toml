@@ -21,6 +21,8 @@ bytes = "1.5.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rocksdb = { git = "https://github.com/rust-rocksdb/rust-rocksdb", rev = "a4f178d0ca668c4b48d993ab8aef6f4004780f23", features = ["jemalloc"] }
+# The C API of the same RocksDB build, for calls rust-rocksdb does not wrap.
+librocksdb-sys = { git = "https://github.com/rust-rocksdb/rust-rocksdb", rev = "a4f178d0ca668c4b48d993ab8aef6f4004780f23", default-features = false }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
