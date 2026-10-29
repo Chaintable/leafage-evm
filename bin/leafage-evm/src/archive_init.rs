@@ -11,8 +11,8 @@ use futures::{stream, StreamExt, TryStreamExt};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
     encode_account_key, encode_slim_account, encode_storage_key, ArchiveRocksDBStorage,
-    MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXSyncMode, StateDBWrite,
-    StorageKind,
+    ArchiveSchema, MDBXArchiveOptions, MDBXArchiveStorage, MDBXArchiveWriteBatch, MDBXSyncMode,
+    StateDBWrite, StorageKind,
 };
 use leafage_evm_types::{BlockInfo, BlockStorageDiff, NewCode, H256};
 use std::collections::BTreeMap;
@@ -151,6 +151,12 @@ pub struct Command {
     /// unreadable.
     #[arg(long, default_value = "false")]
     inverted_block_encoding: bool,
+
+    /// Schema of a new RocksDB archive (empty `--db-path`): v1 (ascending
+    /// block tail), v2 (inverted tail) or v3 (RocksDB user-defined
+    /// timestamps). A resumed archive keeps its own schema.
+    #[arg(long, default_value = "v3")]
+    archive_schema: ArchiveSchema,
 }
 
 /// Data fetched and pre-encoded for a single block, to be written by the
@@ -610,6 +616,25 @@ fn ingest_worker_process(
         .map(|(k, v)| (k.len() + v.len()) as u64)
         .sum();
 
+    // Schema v3 cannot ingest version SSTs (see `is_schema_v3`): its versions
+    // go with the small writes, which the advancer commits in block order.
+    if db.is_schema_v3() {
+        let accounts = std::mem::take(&mut payload.account_writes);
+        payload
+            .small_writes
+            .extend_account_writes(accounts.into_iter().map(|(k, v)| (k, Some(v))));
+        let storage = std::mem::take(&mut payload.storage_writes);
+        payload.small_writes.extend_storage_writes(storage);
+        return Ok(BatchCompletion {
+            batch_seq: payload.batch_seq,
+            last_block_num: payload.last_block_num,
+            last_block_hash: payload.last_block_hash,
+            blocks_in_batch: payload.blocks_in_batch,
+            small_writes: payload.small_writes,
+            timings,
+        });
+    }
+
     // STABLE sort: when the same key appears more than once within a batch,
     // the last write must win (matches the legacy WriteBatch path's semantics
     // at archive/mod.rs:1573 and 1598). An unstable sort would leave equal
@@ -885,6 +910,14 @@ impl Command {
 
         // Initialize RPC client
         let rpc_client = HttpClientBuilder::default().build(&self.rpc_addr)?;
+
+        if matches!(self.db_type, StorageKind::Rocksdb) {
+            crate::archive_udt::prepare_archive_schema(
+                &self.db_path,
+                self.archive_schema,
+                self.inverted_block_encoding,
+            )?;
+        }
 
         // Open archive database based on db type
         let db = Arc::new(match self.db_type {

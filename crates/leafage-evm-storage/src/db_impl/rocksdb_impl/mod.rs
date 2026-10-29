@@ -13,7 +13,9 @@ pub(crate) use archive::udt::{
     check_rewind_target as check_udt_rewind_target, is_udt_archive,
     trim_history as trim_udt_history,
 };
-pub use archive::udt::{verify_udt_against_v2, UdtConvertReport, UdtVerifyReport};
+pub use archive::udt::{
+    init_archive_schema, verify_udt_against_v2, ArchiveSchema, UdtConvertReport, UdtVerifyReport,
+};
 pub use archive::{DataBaseRef as ArchiveRocksDBStorage, StateDB as ArchiveStateDB};
 
 #[cfg(test)]

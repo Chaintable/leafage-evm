@@ -1556,6 +1556,15 @@ impl DataBaseRef {
         Ok(())
     }
 
+    /// Whether this is a schema v3 archive. Its versions cannot be
+    /// bulk-loaded as SST files ([`Self::write_account_sst`]): RocksDB only
+    /// ingests a file into a timestamped CF if its keys do not overlap the
+    /// CF's, and a key's versions must be written in block order (a read
+    /// stops at the first level holding a version at or below its height).
+    pub fn is_schema_v3(&self) -> bool {
+        self.udt
+    }
+
     /// Ingest a list of pre-built SST files into the `AddressToAccount` CF.
     /// Files in `paths` must have non-overlapping key ranges among themselves
     /// (otherwise they all land in L0 anyway). Across calls the key ranges may

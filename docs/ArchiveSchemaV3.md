@@ -1,7 +1,7 @@
 # Archive schema v3: versions as RocksDB user-defined timestamps
 
-Status: **prototype**. Reads, writes, an offline v2 → v3 conversion and
-offline rewind are implemented.
+Status: **prototype**. Reads, writes, new v3 archives, an offline v2 → v3
+conversion and offline rewind are implemented.
 
 ## Schema versions
 
@@ -55,6 +55,28 @@ A CF's comparator is fixed when it is created, so the database declares its
 schema in `LEAFAGE_ARCHIVE_SCHEMA` and is opened with the matching options.
 Opening with the wrong options fails in RocksDB (comparator name mismatch);
 an older binary cannot open a v3 archive.
+
+### Choosing the schema of a new archive
+
+`standalone --archive` and `archive-init` take `--archive-schema v1|v2|v3`
+(default `v3`), used only when `--db-path` holds no RocksDB database yet
+(no `CURRENT` file): v3 writes the schema file before the open creates the
+column families, and every new archive records its encoding marker (v1: 0;
+v2 and v3: 1, as v3 keys are encoded as v2's before the block is split
+off). `--archive-schema v1` with `--inverted-block-encoding` is refused.
+
+An existing archive is opened as before, whatever the flag says: the schema
+file selects v3, otherwise the encoding marker (or, for an unmarked one,
+`--inverted-block-encoding`) selects v1 or v2. MDBX archives ignore the flag.
+
+`archive-init` bulk-loads v1 / v2 versions as SST files that parallel
+workers ingest batch by batch. A v3 archive cannot take them: RocksDB only
+ingests a file into a timestamped CF if its keys do not overlap the CF's,
+and a key's versions must reach the database in block order, since a read
+stops at the first level holding a version at or below its height. On v3,
+`archive-init` puts each batch's versions into the batch's write batch,
+which is committed in block order with its block info. This is slower than
+ingestion; a large chain is better initialized as v2 and converted.
 
 ## Reads
 

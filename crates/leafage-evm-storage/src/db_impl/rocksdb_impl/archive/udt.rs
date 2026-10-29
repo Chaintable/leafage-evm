@@ -55,6 +55,72 @@ pub(crate) fn is_udt_archive(path: &Path) -> Result<bool, Error> {
     }
 }
 
+/// The on-disk layout of a new RocksDB archive's account and storage
+/// history (see `docs/ArchiveSchemaV3.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveSchema {
+    /// Ascending 32-byte block tail.
+    V1,
+    /// Descending block tail (inverted encoding).
+    V2,
+    /// Block as a RocksDB user-defined timestamp.
+    V3,
+}
+
+impl ArchiveSchema {
+    /// Whether the versioned keys use the inverted block encoding. A v3
+    /// archive records the inverted marker too: its write path encodes keys
+    /// as v2 does before splitting off the block.
+    pub fn inverted(self) -> bool {
+        self != Self::V1
+    }
+}
+
+impl std::str::FromStr for ArchiveSchema {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            "v3" => Ok(Self::V3),
+            _ => Err(format!("unknown archive schema {s:?} (v1, v2 or v3)")),
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::V3 => "v3",
+        })
+    }
+}
+
+/// Lay out `path` for a new RocksDB archive of `schema`, if no database is
+/// there yet: create the directory and, for v3, the schema file, so the open
+/// that follows creates v3 column families. Returns whether the database is
+/// new; an existing one keeps its own schema and is left untouched.
+pub fn init_archive_schema(path: &Path, schema: ArchiveSchema) -> Result<bool, Error> {
+    if path.join("CURRENT").exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(path)?;
+    if schema == ArchiveSchema::V3 {
+        write_schema_file(path)?;
+    } else {
+        // Left by an earlier start that asked for v3 and stopped before
+        // RocksDB created the database.
+        match std::fs::remove_file(path.join(SCHEMA_FILE)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
 fn write_schema_file(path: &Path) -> Result<(), Error> {
     let tmp = path.join(format!("{SCHEMA_FILE}.tmp"));
     {
@@ -978,6 +1044,133 @@ mod tests {
         assert_eq!(&v2[..=split], &v3.0[..], "converted");
         assert_eq!(v2, v3.1, "converted + appended");
         assert_eq!(v2, v3.2, "converted + appended, read again");
+        let _ = std::fs::remove_dir_all(&base);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    /// A new archive created as v3 answers as one created as v2; an existing
+    /// archive keeps its schema.
+    #[test]
+    fn test_new_udt_archive_matches_v2() {
+        let _g = ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("leafage-udt-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut rng = Rng(0xab1e);
+        let head = 40u64;
+        let diffs: Vec<(u64, BlockStorageDiff)> =
+            (1..=head).map(|n| (n, random_diff(&mut rng, n))).collect();
+        let mut answers = Vec::new();
+        for schema in [ArchiveSchema::V2, ArchiveSchema::V3] {
+            let dir = base.join(schema.to_string());
+            assert!(init_archive_schema(&dir, schema).unwrap());
+            crate::db_impl::archive_encoding::set_inverted_block_encoding(schema.inverted());
+            {
+                let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+                assert_eq!(db.udt, schema == ArchiveSchema::V3);
+                db.write_encoding_marker(schema.inverted()).unwrap();
+                append(&db, &diffs);
+            }
+            // Reopened, whatever schema is asked for.
+            assert!(!init_archive_schema(&dir, ArchiveSchema::V1).unwrap());
+            assert_eq!(is_udt_archive(&dir).unwrap(), schema == ArchiveSchema::V3);
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            answers.push(read_all(&db, head, &mut rng));
+        }
+        assert_eq!(answers[0], answers[1]);
+
+        // A schema file left before RocksDB created the database is dropped
+        // when a new v1 / v2 archive is asked for.
+        let dir = base.join("stale");
+        assert!(init_archive_schema(&dir, ArchiveSchema::V3).unwrap());
+        assert!(is_udt_archive(&dir).unwrap());
+        assert!(init_archive_schema(&dir, ArchiveSchema::V1).unwrap());
+        assert!(!is_udt_archive(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    /// `archive-init`'s bulk load of pre-encoded versions: into a new v2
+    /// archive as SST files ingested batch by batch, into a new v3 archive as
+    /// write batches committed in block order. Both answer alike.
+    #[test]
+    fn test_udt_bulk_load_matches_v2() {
+        use crate::db_impl::archive_encoding::{
+            encode_account_key, encode_slim_account, encode_storage_key,
+        };
+        let _g = ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
+        let base = std::env::temp_dir().join(format!("leafage-udt-sst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut rng = Rng(0x55d7);
+        let head = 40u64;
+        let diffs: Vec<(u64, BlockStorageDiff)> =
+            (1..=head).map(|n| (n, random_diff(&mut rng, n))).collect();
+        let mut answers = Vec::new();
+        for schema in [ArchiveSchema::V2, ArchiveSchema::V3] {
+            let dir = base.join(schema.to_string());
+            assert!(init_archive_schema(&dir, schema).unwrap());
+            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            db.write_encoding_marker(true).unwrap();
+            for (i, batch) in diffs.chunks(10).enumerate() {
+                let (mut accounts, mut storage) = (Vec::new(), Vec::new());
+                for (n, diff) in batch {
+                    // Block metadata through the regular path, state as SSTs.
+                    append(&db, &[(*n, BlockStorageDiff::default())]);
+                    for a in &diff.deleted_accounts {
+                        accounts.push((encode_account_key(*a, *n), Vec::new()));
+                    }
+                    for a in &diff.new_accounts {
+                        accounts.push((
+                            encode_account_key(a.address, *n),
+                            encode_slim_account(a.clone()),
+                        ));
+                    }
+                    for d in &diff.storage_diffs {
+                        for p in &d.diffs {
+                            storage.push((
+                                encode_storage_key(d.address, p.index, *n),
+                                p.value.to_be_bytes::<32>(),
+                            ));
+                        }
+                    }
+                }
+                accounts.sort_by_key(|a| a.0);
+                accounts.dedup_by(|later, earlier| {
+                    let same = later.0 == earlier.0;
+                    if same {
+                        std::mem::swap(later, earlier);
+                    }
+                    same
+                });
+                storage.sort_by_key(|a| a.0);
+                storage.dedup_by(|later, earlier| {
+                    let same = later.0 == earlier.0;
+                    if same {
+                        std::mem::swap(later, earlier);
+                    }
+                    same
+                });
+                if db.is_schema_v3() {
+                    let mut batch = db.prepare_write_batch().unwrap();
+                    batch.extend_account_writes(accounts.into_iter().map(|(k, v)| (k, Some(v))));
+                    batch.extend_storage_writes(storage);
+                    db.commit(batch).unwrap();
+                } else {
+                    let acc = dir.join(format!("acc_{i}.sst"));
+                    let sto = dir.join(format!("sto_{i}.sst"));
+                    db.write_account_sst(&acc, &accounts).unwrap();
+                    db.write_storage_sst(&sto, &storage).unwrap();
+                    db.ingest_account_ssts(vec![acc]).unwrap();
+                    db.ingest_storage_ssts(vec![sto]).unwrap();
+                }
+            }
+            answers.push(read_all(&db, head, &mut rng));
+        }
+        assert_eq!(answers[0], answers[1]);
         let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }

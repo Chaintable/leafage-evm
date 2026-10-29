@@ -2,10 +2,35 @@
 //! and storage versions keyed by RocksDB user-defined timestamps
 //! (`docs/ArchiveSchemaV3.md`).
 
-use anyhow::Result;
-use leafage_evm_storage::{verify_udt_against_v2, ArchiveRocksDBStorage};
-use std::path::PathBuf;
+use anyhow::{bail, Result};
+use leafage_evm_storage::{
+    init_archive_schema, set_inverted_block_encoding, verify_udt_against_v2, ArchiveRocksDBStorage,
+    ArchiveSchema,
+};
+use std::path::{Path, PathBuf};
 use tracing::info;
+
+/// Before a RocksDB archive is opened: lay out a new one at `path` for
+/// `schema` and fix the process-wide block encoding to it. An existing
+/// archive keeps its own schema, which the open detects. Returns whether the
+/// archive is new.
+pub(crate) fn prepare_archive_schema(
+    path: &Path,
+    schema: ArchiveSchema,
+    inverted_flag: bool,
+) -> Result<bool> {
+    let new = init_archive_schema(path, schema)?;
+    if new {
+        if schema == ArchiveSchema::V1 && inverted_flag {
+            bail!("--archive-schema v1 conflicts with --inverted-block-encoding");
+        }
+        set_inverted_block_encoding(schema.inverted());
+        info!("creating a new archive at {path:?} with schema {schema}");
+    } else {
+        info!("opening the existing archive at {path:?} with its own schema (--archive-schema {schema} only applies to new archives)");
+    }
+    Ok(new)
+}
 
 #[derive(Debug, clap::Parser)]
 pub struct Command {
@@ -72,5 +97,23 @@ impl Command {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_v1_archive_conflicts_with_inverted_flag() {
+        let dir = std::env::temp_dir().join(format!("leafage-schema-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = prepare_archive_schema(&dir, ArchiveSchema::V1, true).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!("v3".parse::<ArchiveSchema>().unwrap(), ArchiveSchema::V3);
+        assert_eq!("v1".parse::<ArchiveSchema>().unwrap(), ArchiveSchema::V1);
+        assert!("3".parse::<ArchiveSchema>().is_err());
     }
 }
