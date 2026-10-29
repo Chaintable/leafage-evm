@@ -1009,7 +1009,8 @@ async fn arc_pre_traces_expose_post_zero7_callfrom_as_the_logical_child() {
     let child_result = child.result.as_ref().expect("logical child result");
     assert_eq!(output_words(child_result.output()), vec![U256::ONE]);
     assert_eq!(child_result.gas_used(), 22_126, "{child:#?}");
-    assert_eq!(child_call.gas, 457_879, "{child:#?}");
+    // Writer exposes the budget before account access costs; gas_used stays actual.
+    assert_eq!(child_call.gas, 460_438, "{child:#?}");
 
     let geth = fixture.api.trace_call(request, anchor).await.unwrap();
     assert!(!geth.failed, "{geth:#?}");
