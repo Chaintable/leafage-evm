@@ -13,7 +13,9 @@ use clap::Parser;
 use leafage_evm_chains::arbitrum::ArbitrumHardfork;
 use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
-use leafage_evm_chains::celo::{CELO_CHAIN_ID, MAX_CODE_SIZE};
+use leafage_evm_chains::celo::{
+    CeloCfgEnv, CeloEvmConfig, CeloExecutionMode, CELO_CHAIN_ID, MAX_CODE_SIZE,
+};
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
 #[cfg(target_os = "linux")]
@@ -69,7 +71,8 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode.
+    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode
+    /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
     /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules)),
     /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
     /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
@@ -652,9 +655,11 @@ impl Command {
                 if chain_id != CELO_CHAIN_ID {
                     bail!("celo evm-type only supports --chain-cfg {CELO_CHAIN_ID}");
                 }
-                if self.spec_id != u8::MAX || custom_evm_cfg.is_some() {
-                    bail!("celo evm-type follows its mainnet L2 fork schedule; --spec-id and --evm-custom-config are not supported");
+                if self.spec_id != u8::MAX {
+                    bail!("celo evm-type follows its mainnet fork schedule; --spec-id is not supported");
                 }
+                let custom: CeloEvmConfig =
+                    serde_json::from_str(custom_evm_cfg.as_deref().unwrap_or("{}"))?;
                 let mut cfg = CfgEnv::new_with_spec(OpSpecId::JOVIAN);
                 cfg.chain_id = chain_id;
                 cfg.disable_balance_check = true;
@@ -663,7 +668,12 @@ impl Command {
                 cfg.disable_base_fee = true;
                 cfg.tx_gas_limit_cap = Some(gas_cap);
                 cfg.limit_contract_code_size = Some(MAX_CODE_SIZE);
-                Ok(MultiChainCfgEnv::Celo(cfg))
+                Ok(MultiChainCfgEnv::Celo(match custom.execution_mode {
+                    CeloExecutionMode::L1 => {
+                        CeloCfgEnv::L1(cfg.with_spec_and_mainnet_gas_params(MainnetSpecId::LONDON))
+                    }
+                    CeloExecutionMode::L2 => CeloCfgEnv::L2(cfg),
+                }))
             }
             "op" => {
                 if self.spec_id != u8::MAX {
@@ -1207,13 +1217,32 @@ mod chain_config_tests {
             .unwrap()
             .build_chain_cfg_env()
         };
-        let MultiChainCfgEnv::Celo(cfg) = parse(&["--chain-cfg=42220"]).unwrap() else {
+        let MultiChainCfgEnv::Celo(CeloCfgEnv::L2(cfg)) = parse(&["--chain-cfg=42220"]).unwrap()
+        else {
             panic!("expected Celo configuration");
         };
         assert_eq!(cfg.limit_contract_code_size, Some(MAX_CODE_SIZE));
         assert!(parse(&[]).is_err());
         assert!(parse(&["--chain-cfg=42220", "--spec-id=18"]).is_err());
-        assert!(parse(&["--chain-cfg=42220", "--evm-custom-config={}"]).is_err());
+        assert!(parse(&["--chain-cfg=42220", "--evm-custom-config={}"]).is_ok());
+        assert!(matches!(
+            parse(&[
+                "--chain-cfg=42220",
+                r#"--evm-custom-config={"execution_mode":"l1"}"#
+            ])
+            .unwrap(),
+            MultiChainCfgEnv::Celo(CeloCfgEnv::L1(_))
+        ));
+        assert!(parse(&[
+            "--chain-cfg=42220",
+            r#"--evm-custom-config={"execution_mode":"classic"}"#
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--chain-cfg=42220",
+            r#"--evm-custom-config={"execution_mod":"l1"}"#
+        ])
+        .is_err());
     }
 
     #[test]

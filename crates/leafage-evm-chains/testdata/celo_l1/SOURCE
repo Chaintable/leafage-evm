@@ -1,0 +1,26 @@
+Protocol oracle: Chaintable/celo-blockchain at f59d067ab.
+
+precompiles.json contains 608 selected upstream core/vm/testdata/precompiles
+vectors, six native BLS proof-of-possession cases, and 400 native GLV/Ed25519
+boundary cases. All 1014 inputs, outputs, failure statuses and gas costs were
+rechecked with scripts/gen_celo_l1_vectors.go against the native implementation.
+Upstream Gas fields sometimes contain placeholders, so RequiredGas is always
+recorded from execution. Public BLS test scalars are deliberately 1, 5 and 17.
+public_keys.json records the corresponding native uncompressed public keys.
+
+consensus.json.gz contains 1810 canonical Celo mainnet headers and 77 eth_call
+results from native Celo. It covers every epoch boundary through the final L1
+block, 31056499, and samples both sides of Donut, Espresso and Gingerbread.
+Generate it with scripts/gen_celo_l1_consensus.go; gzip uses mtime=0.
+
+opcode_gas.json records 32 native eth_call results for SLOAD, BALANCE,
+EXTCODEHASH and SSTORE at fork boundaries. Regenerate with
+scripts/check_celo_l1_rpc.py and select those four opcode cases. SSTORE uses
+the real empty account storage: native Celo's debug-only full-storage override
+aliases committed and mutable storage, so it is not a protocol-gas oracle.
+
+The BLS corpora originate from EIP-2537/2539 and Celo test suites. See Celo's
+LGPL-3.0 COPYING.LESSER. CIP-20 inputs include their selector; Blake2s uses the
+sequential default parameter block. BLS encoding/hash-to-curve follows
+celo-org/celo-bls-snark-rs@eca15ffed3984601cb441600ba3002d12f339e5f
+(MIT/Apache-2.0), the exact dependency of celo-bls-go v0.3.4.

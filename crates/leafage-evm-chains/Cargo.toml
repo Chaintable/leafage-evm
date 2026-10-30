@@ -10,6 +10,7 @@ exclude.workspace = true
 [dependencies]
 alloy = { workspace = true, features = ["rpc-types-trace", "getrandom"] }
 alloy-rlp.workspace = true
+alloy-rlp-derive.workspace = true
 alloy-chains.workspace = true
 alloy-hardforks.workspace = true
 alloy-evm.workspace = true
@@ -60,5 +61,18 @@ bytes = "1.10.1"
 scoped-tls = "1.0"
 ed25519-consensus = { workspace = true }
 
+# Celo L1's deployed BLS serialization uses arkworks 0.3. Keep this
+# protocol dependency separate from the newer curves used by other chains.
+ark-bls12-377 = "0.3"
+ark-ec-03 = { package = "ark-ec", version = "0.3" }
+ark-ff-03 = { package = "ark-ff", version = "0.3" }
+ark-serialize-03 = { package = "ark-serialize", version = "0.3" }
+ark-bls12-381 = "0.3"
+num-bigint = "0.4"
+num-traits = "0.2"
+sha3 = "0.10"
+blake2s_simd = "1"
+
 [dev-dependencies]
 elliptic-curve.workspace = true
+flate2.workspace = true

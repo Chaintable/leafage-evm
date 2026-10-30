@@ -1000,6 +1000,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ark-bls12-377"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc41c02c0d18a226947ee9ee023b1d957bdb6a68fc22ac296722935a9fef423c"
+dependencies = [
+ "ark-ec 0.3.0",
+ "ark-ff 0.3.0",
+ "ark-std 0.3.0",
+]
+
+[[package]]
+name = "ark-bls12-381"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65be532f9dd1e98ad0150b037276cde464c6f371059e6dd02c0222395761f6aa"
+dependencies = [
+ "ark-ec 0.3.0",
+ "ark-ff 0.3.0",
+ "ark-std 0.3.0",
+]
+
+[[package]]
 name = "ark-bls12-381"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,6 +1055,20 @@ dependencies = [
  "ark-ff 0.6.0",
  "ark-r1cs-std",
  "ark-std 0.6.0",
+]
+
+[[package]]
+name = "ark-ec"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dea978406c4b1ca13c2db2373b05cc55429c3575b8b21f1b9ee859aa5b03dd42"
+dependencies = [
+ "ark-ff 0.3.0",
+ "ark-serialize 0.3.0",
+ "ark-std 0.3.0",
+ "derivative",
+ "num-traits",
+ "zeroize",
 ]
 
 [[package]]
@@ -2129,6 +2165,16 @@ dependencies = [
  "serde",
  "tap",
  "wyz",
+]
+
+[[package]]
+name = "blake2s_simd"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2380c0236432f7b22a70229df30f218f5293870c056beb76f5ca068e3273a366"
+dependencies = [
+ "arrayvec",
+ "constant_time_eq",
 ]
 
 [[package]]
@@ -4983,12 +5029,19 @@ dependencies = [
  "alloy-evm",
  "alloy-hardforks",
  "alloy-rlp",
+ "alloy-rlp-derive",
  "alloy-sol-types",
+ "ark-bls12-377",
+ "ark-bls12-381 0.3.0",
  "ark-bn254",
+ "ark-ec 0.3.0",
  "ark-ec 0.6.0",
+ "ark-ff 0.3.0",
  "ark-ff 0.6.0",
+ "ark-serialize 0.3.0",
  "base64 0.22.1",
  "bech32",
+ "blake2s_simd",
  "blake3",
  "bls_on_arkworks",
  "blst",
@@ -5001,10 +5054,13 @@ dependencies = [
  "cometbft-proto",
  "ed25519-consensus",
  "elliptic-curve 0.13.8",
+ "flate2",
  "k256",
  "leafage-evm-types",
  "libloading",
  "moka",
+ "num-bigint",
+ "num-traits",
  "once_cell",
  "op-revm",
  "p256 0.13.2",
@@ -5016,6 +5072,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha3 0.10.9",
  "slh-dsa",
  "tempo-contracts",
  "tempo-hardfork",
@@ -8043,6 +8100,16 @@ dependencies = [
  "digest 0.8.1",
  "keccak 0.1.5",
  "opaque-debug 0.2.3",
+]
+
+[[package]]
+name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest 0.10.7",
+ "keccak 0.1.5",
 ]
 
 [[package]]

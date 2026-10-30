@@ -319,8 +319,11 @@ where
                 run_chain_setup!(env, custom_evm_cfg)
             }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
-            MultiChainCfgEnv::Celo(env) => {
+            MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L2(env)) => {
                 run_chain_setup!(env, Some(leafage_evm_chains::celo::CeloConfig))
+            }
+            MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L1(env)) => {
+                run_chain_setup!(env, Some(leafage_evm_chains::celo::l1::CeloL1Config))
             }
             MultiChainCfgEnv::Base(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
