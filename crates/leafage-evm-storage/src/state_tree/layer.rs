@@ -1,17 +1,53 @@
 use crate::interface::{BlockContext, EvmStorageWrite, StateDB};
 use crate::state_tree::error::Error;
 use leafage_evm_types::{AccountInfo, BlockInfo, BlockStorageDiff, Bytecode, H256, U256};
-use moka::ops::compute::Op;
-use moka::sync::Cache;
+use quick_cache::sync::{Cache, DefaultLifecycle, EntryAction, EntryResult};
+use quick_cache::UnitWeighter;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
+use std::time::Duration;
 use tracing::info;
 
 /// Keys are already uniformly distributed (keccak-derived), and these
 /// maps sit on the per-read hot path — use ahash instead of SipHash.
 type FastMap<K, V> = HashMap<K, V, ahash::RandomState>;
-type FastCache<K, V> = Cache<K, V, ahash::RandomState>;
+type FastCache<K, V> = Cache<K, V, UnitWeighter, ahash::RandomState, DefaultLifecycle<K, V>>;
+
+fn new_fast_cache<K: Eq + Hash, V: Clone>(capacity: u64) -> FastCache<K, V> {
+    FastCache::with(
+        capacity.try_into().unwrap_or(usize::MAX),
+        capacity,
+        UnitWeighter,
+        ahash::RandomState::default(),
+        DefaultLifecycle::default(),
+    )
+}
+
+/// Cache `value` read at height `tag` under `key`, unless the key already
+/// holds a value tagged `tag` or higher. Atomic per key: an occupied entry is
+/// compared and replaced under the shard lock, and a plain `insert` (the
+/// commit write-through) that lands while this refill holds the key's
+/// placeholder wins, the refill being dropped. Skipped if another refill of
+/// the key is in flight.
+fn refill<K: Eq + Hash + Clone, V: Clone>(
+    cache: &FastCache<K, (u64, V)>,
+    key: K,
+    tag: u64,
+    value: V,
+) {
+    let mut value = Some(value);
+    let result = cache.entry(&key, Some(Duration::ZERO), |_, current| {
+        if current.0 < tag {
+            *current = (tag, value.take().expect("the callback runs once"));
+        }
+        EntryAction::Retain(())
+    });
+    if let EntryResult::Vacant(guard) = result {
+        let _ = guard.insert((tag, value.take().expect("the callback did not run")));
+    }
+}
 
 /// [`LinkedDiffLayer`] is a single linked list that stores the state of the EVM.
 ///
@@ -124,10 +160,9 @@ impl LinkedDiffLayer {
 /// on-disk DB and caches recently committed state.
 ///
 /// Each entry is tagged with a block height (commit block_num for
-/// write-through, handle snapshot for refill). Both paths go through
-/// `entry().and_compute_with` so the "only overwrite if new tag is
-/// strictly higher" rule holds atomically — no TOCTOU window between
-/// the tag check and the write.
+/// write-through, handle snapshot for refill). Refills go through
+/// [`refill`], so the "only overwrite if new tag is strictly higher" rule
+/// holds atomically — no TOCTOU window between the tag check and the write.
 #[derive(Debug)]
 pub struct CacheDiskLayer {
     accounts: FastCache<H256, (u64, Option<AccountInfo>)>,
@@ -138,7 +173,7 @@ pub struct CacheDiskLayer {
     /// Latest committed block height. Published after write-through so
     /// handles snapshotting it find the diff's keys already tagged.
     committed_height: AtomicU64,
-    /// When false the moka caches are never read or written. Backends
+    /// When false the caches are never read or written. Backends
     /// with per-handle snapshot isolation (MDBX) set this to skip the
     /// shared cache entirely.
     enabled: bool,
@@ -165,18 +200,10 @@ impl CacheDiskLayer {
             (0, 0, 0, 0)
         };
         Self {
-            accounts: Cache::builder()
-                .max_capacity(a)
-                .build_with_hasher(ahash::RandomState::default()),
-            storages: Cache::builder()
-                .max_capacity(s)
-                .build_with_hasher(ahash::RandomState::default()),
-            contracts: Cache::builder()
-                .max_capacity(c)
-                .build_with_hasher(ahash::RandomState::default()),
-            block_hashes: Cache::builder()
-                .max_capacity(b)
-                .build_with_hasher(ahash::RandomState::default()),
+            accounts: new_fast_cache(a),
+            storages: new_fast_cache(s),
+            contracts: new_fast_cache(c),
+            block_hashes: new_fast_cache(b),
             old_diff_layer: Mutex::new(None),
             committed_height: AtomicU64::new(initial_committed_height),
             enabled,
@@ -211,7 +238,7 @@ impl CacheDiskLayer {
         info!(target: "storage",
             "commit diff layer to db, block number: {}, block hash: {}, account cache size: {}, storage cache size: {}, contract cache size: {}",
             block_info.header.number, block_info.header.hash,
-            self.accounts.entry_count(), self.storages.entry_count(), self.contracts.entry_count()
+            self.accounts.len(), self.storages.len(), self.contracts.len()
         );
 
         let old_head = self.old_diff_layer_lock().clone();
@@ -514,14 +541,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     None => {
                         let res = self.statedb.basic(address)?;
                         if let Some(h) = self.cache_view_height {
-                            let new_val = (h, res.clone());
-                            cache
-                                .accounts
-                                .entry(address)
-                                .and_compute_with(|maybe| match maybe {
-                                    Some(e) if e.value().0 >= h => Op::Nop,
-                                    _ => Op::Put(new_val),
-                                });
+                            refill(&cache.accounts, address, h, res.clone());
                         }
                         Ok(res)
                     }
@@ -544,14 +564,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     None => {
                         let res = self.statedb.storage(address, index)?;
                         if let Some(h) = self.cache_view_height {
-                            let new_val = (h, res);
-                            cache
-                                .storages
-                                .entry((address, index))
-                                .and_compute_with(|maybe| match maybe {
-                                    Some(e) if e.value().0 >= h => Op::Nop,
-                                    _ => Op::Put(new_val),
-                                });
+                            refill(&cache.storages, (address, index), h, res);
                         }
                         Ok(res)
                     }
@@ -574,13 +587,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     None => {
                         let res = self.statedb.code_by_hash(code_hash)?;
                         if let Some(h) = self.cache_view_height {
-                            let new_val = (h, res.clone());
-                            cache.contracts.entry(code_hash).and_compute_with(
-                                |maybe| match maybe {
-                                    Some(e) if e.value().0 >= h => Op::Nop,
-                                    _ => Op::Put(new_val),
-                                },
-                            );
+                            refill(&cache.contracts, code_hash, h, res.clone());
                         }
                         Ok(res)
                     }
@@ -595,16 +602,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
             addresses,
             |diff, key| diff.accounts.get(key).cloned(),
             |cache, key| cache.accounts.get(key).map(|(_, value)| value),
-            |cache, key, h, value| {
-                let new_val = (h, value.clone());
-                cache
-                    .accounts
-                    .entry(*key)
-                    .and_compute_with(|maybe| match maybe {
-                        Some(e) if e.value().0 >= h => Op::Nop,
-                        _ => Op::Put(new_val),
-                    });
-            },
+            |cache, key, h, value| refill(&cache.accounts, *key, h, value.clone()),
             |keys| self.statedb.basic_many(keys),
         )
     }
@@ -614,16 +612,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
             keys,
             |diff, key| diff.storage.get(key).copied(),
             |cache, key| cache.storages.get(key).map(|(_, value)| value),
-            |cache, key, h, value| {
-                let new_val = (h, *value);
-                cache
-                    .storages
-                    .entry(*key)
-                    .and_compute_with(|maybe| match maybe {
-                        Some(e) if e.value().0 >= h => Op::Nop,
-                        _ => Op::Put(new_val),
-                    });
-            },
+            |cache, key, h, value| refill(&cache.storages, *key, h, *value),
             |keys| self.statedb.storage_many(keys),
         )
     }
@@ -633,16 +622,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
             code_hashes,
             |diff, key| diff.contracts.get(key).cloned(),
             |cache, key| cache.contracts.get(key).map(|(_, value)| value),
-            |cache, key, h, value| {
-                let new_val = (h, value.clone());
-                cache
-                    .contracts
-                    .entry(*key)
-                    .and_compute_with(|maybe| match maybe {
-                        Some(e) if e.value().0 >= h => Op::Nop,
-                        _ => Op::Put(new_val),
-                    });
-            },
+            |cache, key, h, value| refill(&cache.contracts, *key, h, value.clone()),
             |keys| self.statedb.code_by_hash_many(keys),
         )
     }
@@ -665,13 +645,7 @@ impl<DB: StateDB> StateDB for HybridStateDB<DB> {
                     None => {
                         let res = self.statedb.block_hash(number)?;
                         if let Some(h) = self.cache_view_height {
-                            let new_val = (h, res);
-                            cache.block_hashes.entry(number).and_compute_with(
-                                |maybe| match maybe {
-                                    Some(e) if e.value().0 >= h => Op::Nop,
-                                    _ => Op::Put(new_val),
-                                },
-                            );
+                            refill(&cache.block_hashes, number, h, res);
                         }
                         Ok(res)
                     }
@@ -956,7 +930,7 @@ mod tests {
     }
 
     /// With the shared cache disabled the batch goes straight to the
-    /// bottom DB for unresolved keys and never touches moka.
+    /// bottom DB for unresolved keys and never touches the cache.
     #[test]
     fn batched_reads_bypass_disabled_cache() {
         let addr = key(0xabcd);
@@ -1040,6 +1014,41 @@ mod tests {
             );
             assert_eq!(after.basic(key(2000 + n)).unwrap().unwrap().nonce, n + 1);
         }
+    }
+
+    #[test]
+    fn refill_keeps_the_highest_tag() {
+        let cache: FastCache<u64, (u64, u64)> = new_fast_cache(16);
+        // Vacant: inserted.
+        refill(&cache, 1, 5, 50);
+        assert_eq!(cache.get(&1), Some((5, 50)));
+        // Same or lower tag: kept.
+        refill(&cache, 1, 5, 51);
+        refill(&cache, 1, 4, 40);
+        assert_eq!(cache.get(&1), Some((5, 50)));
+        // Higher tag: replaced.
+        refill(&cache, 1, 6, 60);
+        assert_eq!(cache.get(&1), Some((6, 60)));
+
+        // A write-through landing while a refill holds the key's placeholder
+        // wins; the refill is dropped.
+        let EntryResult::Vacant(guard) =
+            cache.entry(&2, Some(Duration::ZERO), |_, _| EntryAction::Retain(()))
+        else {
+            panic!("key 2 is vacant");
+        };
+        cache.insert(2, (9, 90));
+        assert!(guard.insert((3, 30)).is_err());
+        assert_eq!(cache.get(&2), Some((9, 90)));
+        // Another refill of a key in flight is skipped, not blocked.
+        let EntryResult::Vacant(guard) =
+            cache.entry(&3, Some(Duration::ZERO), |_, _| EntryAction::Retain(()))
+        else {
+            panic!("key 3 is vacant");
+        };
+        refill(&cache, 3, 7, 70);
+        drop(guard);
+        assert_eq!(cache.get(&3), None);
     }
 }
 

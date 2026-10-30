@@ -4,7 +4,7 @@
 //! a real RocksDB-backed StateTree behind a jsonrpsee HTTP server.
 //!
 //! Two servers isolate the two regimes:
-//! - `cold_block_cache_miss`: the CacheDiskLayer moka caches are off,
+//! - `cold_block_cache_miss`: the CacheDiskLayer caches are off,
 //!   the DB is flushed to SST, the RocksDB block cache is squeezed to
 //!   1MB, and every iteration calls the next of 1000 disjoint 20-
 //!   contract sets (~15MB of state), so by the time a set comes around
@@ -12,7 +12,7 @@
 //!   read is a real block-cache miss. This is the first-touch path the
 //!   prefetch batches: 2 MultiGets instead of 40 scalar point reads
 //!   (storage stays on demand).
-//! - `warm_cache_enabled`: one fixed set, moka caches on and warmed
+//! - `warm_cache_enabled`: one fixed set, CacheDiskLayer caches on and warmed
 //!   after the first iteration, so the prefetch resolves from cache —
 //!   this variant guards against a regression on the hot path.
 //!

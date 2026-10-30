@@ -26,10 +26,12 @@
 //! that head, and a reader above it does not use the cache.
 
 use leafage_evm_types::{H256, U256};
-use moka::sync::Cache as MokaCache;
+use quick_cache::sync::{Cache as QuickCache, DefaultLifecycle, EntryAction, EntryResult};
+use quick_cache::Weighter;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 /// Default weighted capacity (MB) of the cache.
@@ -44,11 +46,11 @@ const MAX_SPANS: usize = 4;
 /// than the hits it buys.
 const VOLATILE_SPAN: u64 = 64;
 
-/// Per-entry memory beyond the key and the spans: the `Arc<Entry>` and moka's
-/// bookkeeping (hash table node, access-order node, key `Arc`, entry info).
-/// Measured: 1M single-span storage entries take ~410 B each in RSS
-/// (64 B key + 56 B span + ~290 B), accounts ~422 B (32 + 104 + ~286).
-const ENTRY_OVERHEAD: usize = 288;
+/// Per-entry memory beyond the key and the spans: the `Arc<Entry>`, the span
+/// vector's allocation and the cache's slot and hash table index. Measured:
+/// 1M single-span storage entries take ~225 B each in RSS (64 B key + 56 B
+/// span + ~105 B); moka took ~410 B.
+const ENTRY_OVERHEAD: usize = 105;
 
 /// The account fields the archive stores, without the address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,9 +138,31 @@ impl Hasher for KeyHasher {
     }
 }
 
+/// Weighs an entry by the memory it takes.
+#[derive(Clone, Copy)]
+struct EntryWeighter;
+
+impl<const N: usize, V> Weighter<Key<N>, Arc<Entry<V>>> for EntryWeighter {
+    fn weight(&self, _: &Key<N>, entry: &Arc<Entry<V>>) -> u64 {
+        entry_weight::<N, V>(entry.spans.capacity())
+    }
+}
+
+fn entry_weight<const N: usize, V>(spans: usize) -> u64 {
+    (N + ENTRY_OVERHEAD + spans * std::mem::size_of::<Span<V>>()) as u64
+}
+
+type SpanCache<const N: usize, V> = QuickCache<
+    Key<N>,
+    Arc<Entry<V>>,
+    EntryWeighter,
+    BuildHasherDefault<KeyHasher>,
+    DefaultLifecycle<Key<N>, Arc<Entry<V>>>,
+>;
+
 /// The spans of `N`-byte keys holding `V` values.
 pub(super) struct Table<const N: usize, V> {
-    cache: MokaCache<Key<N>, Arc<Entry<V>>, BuildHasherDefault<KeyHasher>>,
+    cache: SpanCache<N, V>,
 }
 
 impl<const N: usize, V> Table<N, V>
@@ -146,14 +170,16 @@ where
     V: Copy + PartialEq + std::fmt::Debug + Send + Sync + 'static,
 {
     fn new(capacity_bytes: u64) -> Self {
+        // Sized for single-span entries, the common case.
+        let entries = capacity_bytes / entry_weight::<N, V>(1);
         Self {
-            cache: MokaCache::builder()
-                .max_capacity(capacity_bytes)
-                .weigher(|_: &Key<N>, entry: &Arc<Entry<V>>| {
-                    let spans = entry.spans.capacity() * std::mem::size_of::<Span<V>>();
-                    (N + ENTRY_OVERHEAD + spans).try_into().unwrap_or(u32::MAX)
-                })
-                .build_with_hasher(BuildHasherDefault::default()),
+            cache: SpanCache::with(
+                entries.try_into().unwrap_or(usize::MAX),
+                capacity_bytes,
+                EntryWeighter,
+                BuildHasherDefault::default(),
+                DefaultLifecycle::default(),
+            ),
         }
     }
 
@@ -168,35 +194,50 @@ where
         Lookup::Miss(entry)
     }
 
-    /// Fold a span just read into `prev`, the key's entry from the miss.
-    /// `next_version_found`: the span ends right before the key's next
-    /// version (rather than at the read block or the head).
-    pub(super) fn record(
-        &self,
-        key: [u8; N],
-        prev: Option<Arc<Entry<V>>>,
-        span: Span<V>,
-        next_version_found: bool,
-    ) {
+    /// Fold a span just read into the key's entry. `next_version_found`:
+    /// the span ends right before the key's next version (rather than at the
+    /// read block or the head).
+    pub(super) fn record(&self, key: [u8; N], span: Span<V>, next_version_found: bool) {
         // When the next version ended the span, it sits at `hi + 1`.
         let short = next_version_found && span.hi + 1 - span.lo < VOLATILE_SPAN;
-        self.cache
-            .insert(Key(key), Arc::new(merge(prev.as_deref(), span, short)));
+        self.fold(key, span, short);
     }
 
     /// Schema v3 [`Self::record`]: `newer` is a version above the span,
     /// found by probing at the head. It bounds the key's next version from
     /// above.
-    pub(super) fn record_udt(
-        &self,
-        key: [u8; N],
-        prev: Option<Arc<Entry<V>>>,
-        span: Span<V>,
-        newer: Option<u64>,
-    ) {
+    pub(super) fn record_udt(&self, key: [u8; N], span: Span<V>, newer: Option<u64>) {
         let short = newer.is_some_and(|n| n - span.lo < VOLATILE_SPAN);
-        self.cache
-            .insert(Key(key), Arc::new(merge(prev.as_deref(), span, short)));
+        self.fold(key, span, short);
+    }
+
+    /// Merge `span` into the key's current entry under the shard lock, so
+    /// concurrent misses on one key do not drop each other's spans. If
+    /// another reader is inserting the key right now, skip.
+    fn fold(&self, key: [u8; N], span: Span<V>, short: bool) {
+        let key = Key(key);
+        let mut grown = None;
+        let result = self.cache.entry(&key, Some(Duration::ZERO), |_, entry| {
+            let merged = Arc::new(merge(Some(&**entry), span, short));
+            if merged.spans.capacity() > entry.spans.capacity() {
+                // A heavier entry goes back in through an insert: changing it
+                // in place would not evict to make room for it.
+                grown = Some(merged);
+                EntryAction::ReplaceWithGuard
+            } else {
+                *entry = merged;
+                EntryAction::Retain(())
+            }
+        });
+        match result {
+            EntryResult::Vacant(guard) => {
+                let _ = guard.insert(Arc::new(merge(None, span, short)));
+            }
+            EntryResult::Replaced(guard, _) => {
+                let _ = guard.insert(grown.expect("set with ReplaceWithGuard"));
+            }
+            EntryResult::Retained(()) | EntryResult::Removed(..) | EntryResult::Timeout => {}
+        }
     }
 }
 
@@ -337,8 +378,8 @@ mod tests {
     }
 
     fn record(cache: &StateCache, k: u8, block: u64, span: Span<U256>, probed: bool) {
-        let prev = miss(cache, k, block);
-        cache.storage.record(key(k), prev, span, probed);
+        miss(cache, k, block);
+        cache.storage.record(key(k), span, probed);
     }
 
     #[test]
@@ -396,7 +437,7 @@ mod tests {
             assert!(StateCache::should_probe(&prev));
             cache
                 .storage
-                .record(key(k), prev, found(lo, hi, 2), next_version_found);
+                .record(key(k), found(lo, hi, 2), next_version_found);
             StateCache::should_probe(&miss(&cache, k, 20_000))
         };
         // The next version 3 blocks later.
@@ -444,5 +485,171 @@ mod tests {
         other_address[0] ^= 1;
         assert_ne!(hash(base), hash(other_slot));
         assert_ne!(hash(base), hash(other_address));
+    }
+
+    #[test]
+    fn concurrent_misses_keep_both_spans() {
+        let cache = StateCache::new(1 << 20);
+        // Two readers miss the same key, then record different versions.
+        miss(&cache, 9, 15);
+        miss(&cache, 9, 105);
+        cache.storage.record(key(9), found(10, 15, 1), false);
+        cache.storage.record(key(9), found(100, 105, 2), false);
+        assert_eq!(get(&cache, 9, 12).map(|s| s.value), Some(U256::from(1)));
+        assert_eq!(get(&cache, 9, 102).map(|s| s.value), Some(U256::from(2)));
+    }
+
+    #[test]
+    fn growing_entries_stay_within_the_budget() {
+        let cache = StateCache::new(1 << 20);
+        let capacity = cache.storage.cache.capacity();
+        // Fill the storage table with single-span entries, then give each
+        // resident one more spans, without inserting any new key.
+        let fit = capacity / entry_weight::<64, U256>(1);
+        let keys: Vec<[u8; 64]> = (0..fit).map(bench_key).collect();
+        for k in &keys {
+            put(&cache, *k, found(10, 20, 7));
+        }
+        let keys: Vec<[u8; 64]> = keys
+            .into_iter()
+            .filter(|k| matches!(cache.storage.lookup(k, 15), Lookup::Hit(_)))
+            .collect();
+        assert!(keys.len() as u64 > fit / 2, "{} resident", keys.len());
+        for i in 1..MAX_SPANS as u64 {
+            for k in &keys {
+                put(&cache, *k, found(i * 100, i * 100 + 5, 7));
+            }
+        }
+        assert!(
+            cache.storage.cache.weight() <= capacity,
+            "{} > {capacity}",
+            cache.storage.cache.weight()
+        );
+    }
+
+    /// Uniform 64-byte keys, as keccak hashes are.
+    fn bench_key(i: u64) -> [u8; 64] {
+        let mut x = i.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut k = [0u8; 64];
+        for word in k.chunks_mut(8) {
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+            x ^= x >> 31;
+            word.copy_from_slice(&x.to_le_bytes());
+        }
+        k
+    }
+
+    fn rss_bytes() -> u64 {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+        pages * 4096
+    }
+
+    fn put(cache: &StateCache, k: [u8; 64], span: Span<U256>) {
+        if let Lookup::Miss(_) = cache.storage.lookup(&k, span.hi) {
+            cache.storage.record(k, span, false);
+        }
+    }
+
+    /// Memory per entry, hit cost, and hit rate under a skewed workload.
+    /// `cargo test --release -p leafage-evm-storage --lib bench_state_cache
+    /// -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn bench_state_cache() {
+        const ENTRIES: u64 = 1_000_000;
+        let keys: Vec<[u8; 64]> = (0..ENTRIES).map(bench_key).collect();
+
+        // Memory: a budget just above the entries, as in production.
+        let budget = ENTRIES * entry_weight::<64, U256>(1) * 4 / 3 * 11 / 10;
+        let before = rss_bytes();
+        let cache = StateCache::new(budget);
+        for k in &keys {
+            put(&cache, *k, found(10, 20, 7));
+        }
+        let after = rss_bytes();
+        println!(
+            "memory: {:.0} B/entry RSS, {} entries kept, weight {} B/entry",
+            (after - before) as f64 / ENTRIES as f64,
+            cache.storage.cache.len(),
+            entry_weight::<64, U256>(1)
+        );
+
+        // Hit cost, one thread, random keys over the whole cache.
+        let start = std::time::Instant::now();
+        let mut hits = 0u64;
+        for i in 0..ENTRIES {
+            let k = &keys[(i.wrapping_mul(0x9e37_79b9) % ENTRIES) as usize];
+            if matches!(cache.storage.lookup(k, 15), Lookup::Hit(_)) {
+                hits += 1;
+            }
+        }
+        assert!(hits > ENTRIES * 99 / 100, "{hits}");
+        println!(
+            "hit, 1 thread, random over 1M: {:.0} ns",
+            start.elapsed().as_nanos() as f64 / ENTRIES as f64
+        );
+
+        // Hit cost, 8 threads on 1024 hot keys.
+        let threads = 8u64;
+        let per_thread = 1_000_000u64;
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let (cache, keys) = (&cache, &keys);
+                scope.spawn(move || {
+                    for i in 0..per_thread {
+                        let k = &keys[((i * 7 + t * 131) % 1024) as usize];
+                        assert!(matches!(cache.storage.lookup(k, 15), Lookup::Hit(_)));
+                    }
+                });
+            }
+        });
+        println!(
+            "hit, 8 threads on 1024 keys: {:.0} ns",
+            start.elapsed().as_nanos() as f64 * threads as f64 / (threads * per_thread) as f64
+        );
+        drop(cache);
+
+        // Hit rate: Zipf(0.9) over 1M keys, in the byte budget that holds
+        // 100k storage entries under moka's weights (64 + 288 + 56 B each;
+        // storage gets three quarters of the budget).
+        let weights: Vec<f64> = (1..=ENTRIES).map(|r| 1.0 / (r as f64).powf(0.9)).collect();
+        let total: f64 = weights.iter().sum();
+        let mut cdf = Vec::with_capacity(weights.len());
+        let mut acc = 0.0;
+        for w in &weights {
+            acc += w / total;
+            cdf.push(acc);
+        }
+        let cache = StateCache::new(100_000 * 408 * 4 / 3);
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let (mut lookups, mut hits) = (0u64, 0u64);
+        for round in 0..5_000_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+            let rank = cdf.partition_point(|&c| c < u).min(ENTRIES as usize - 1);
+            let k = keys[rank];
+            if round >= 1_000_000 {
+                lookups += 1;
+            }
+            match cache.storage.lookup(&k, 15) {
+                Lookup::Hit(_) => {
+                    if round >= 1_000_000 {
+                        hits += 1;
+                    }
+                }
+                Lookup::Miss(_) => cache.storage.record(k, found(10, 20, 7), false),
+            }
+        }
+        println!(
+            "hit rate, Zipf(0.9) over 1M keys, moka's 100k-entry budget: {:.1} %",
+            100.0 * hits as f64 / lookups as f64
+        );
     }
 }
