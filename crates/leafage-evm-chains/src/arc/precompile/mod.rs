@@ -21,7 +21,7 @@ pub(crate) use helpers::{
     ERR_ZERO_ADDRESS,
 };
 use native_coin_authority::NATIVE_COIN_AUTHORITY_ADDRESS;
-pub(crate) use native_coin_control::NATIVE_COIN_CONTROL_ADDRESS;
+pub use native_coin_control::NATIVE_COIN_CONTROL_ADDRESS;
 use pq::PQ_ADDRESS;
 use system_accounting::SYSTEM_ACCOUNTING_ADDRESS;
 
