@@ -58,7 +58,7 @@ pub(crate) mod udt;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
-use state_cache::{CachedAccount, Lookup, Span, StateCache};
+use state_cache::{CachedAccount, Entry, Lookup, Probe, Span, StateCache, Table};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -2582,25 +2582,60 @@ impl StateDB {
         Ok(())
     }
 
-    /// Schema v3 state cache probe of `key`, whose version at `block_num` is
-    /// `version`: the span's end and, if the key has a version above
-    /// `version` at or below the head, that version.
-    fn udt_probe(
+    /// Schema v3: cache `span`, which a miss on `key` just read (it ends at
+    /// the read block), after probing at the head if that can extend it.
+    fn udt_record<const N: usize, V>(
         &self,
         view: &state_cache::ReadView,
+        table: &Table<N, V>,
+        cached: &Option<Arc<Entry<V>>>,
         col: StorageTypeColumn,
-        key: &[u8],
-        version: u64,
-    ) -> Result<(u64, Option<u64>), Error> {
-        STORAGE_METRICS.state_cache_probes.increment(1);
-        let reader = self
-            .udt_head
-            .get_or_init(|| udt::UdtReader::new(view.head()));
-        let newest = reader.get(self.db.db, col, key)?.map(|f| f.block);
-        Ok(match newest {
-            Some(newest) if newest > version => (self.block_num, Some(newest)),
-            _ => (view.head(), None),
-        })
+        key: [u8; N],
+        mut span: Span<V>,
+    ) -> Result<(), Error>
+    where
+        V: Copy + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let mut newer = None;
+        if counted_probe(StateCache::probe(cached, view, self.block_num, &span)) {
+            let reader = self
+                .udt_head
+                .get_or_init(|| udt::UdtReader::new(view.head()));
+            match reader.get(self.db.db, col, &key)?.map(|f| f.block) {
+                // The newest version at the head is above the read one, or
+                // the key was written after the read block.
+                Some(newest) if !span.found || newest > span.lo => {
+                    STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                    newer = Some(newest);
+                }
+                _ => span.hi = view.head(),
+            }
+        }
+        table.record_udt(key, span, newer);
+        Ok(())
+    }
+}
+
+/// Count a miss's probe decision; whether it probes.
+fn counted_probe(probe: Probe) -> bool {
+    match probe {
+        Probe::Yes => {
+            STORAGE_METRICS.state_cache_probes.increment(1);
+            true
+        }
+        Probe::AtHead => {
+            STORAGE_METRICS
+                .state_cache_probes_skipped_at_head
+                .increment(1);
+            false
+        }
+        Probe::Capped => {
+            STORAGE_METRICS
+                .state_cache_probes_skipped_capped
+                .increment(1);
+            false
+        }
+        Probe::No => false,
     }
 }
 
@@ -2628,6 +2663,9 @@ impl StateDB {
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.storage_cache_misses.increment(1);
+                    if entry.is_none() {
+                        STORAGE_METRICS.state_cache_cold_misses.increment(1);
+                    }
                     cached = entry;
                 }
             }
@@ -2643,19 +2681,20 @@ impl StateDB {
                 (decode_storage(f.value()), Some(f.block))
             });
             if let Some((view, cache)) = cache {
-                let (hi, newer) = match version {
-                    Some(v) if StateCache::should_probe(&cached) => {
-                        self.udt_probe(view, StorageTypeColumn::AddressToStorage, &slot_key, v)?
-                    }
-                    _ => (self.block_num, None),
-                };
                 let span = Span {
                     lo: version.unwrap_or(0),
-                    hi,
+                    hi: self.block_num,
                     found: version.is_some(),
                     value,
                 };
-                cache.storage.record_udt(slot_key, span, newer);
+                self.udt_record(
+                    view,
+                    &cache.storage,
+                    &cached,
+                    StorageTypeColumn::AddressToStorage,
+                    slot_key,
+                    span,
+                )?;
             }
             return Ok((value, version));
         }
@@ -2690,21 +2729,24 @@ impl StateDB {
         };
 
         if let Some((view, cache)) = cache {
-            let probe =
-                version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
-            let (hi, next_version_found) = if probe {
-                STORAGE_METRICS.state_cache_probes.increment(1);
-                newer_version_bound(storage_iter, &slot_key, self.block_num, view.head())
-            } else {
-                (self.block_num, false)
-            };
-            drop(storage_iter_guard);
-            let span = Span {
+            let mut span = Span {
                 lo: version.unwrap_or(0),
-                hi,
+                hi: self.block_num,
                 found: version.is_some(),
                 value,
             };
+            let mut next_version_found = false;
+            if version.is_some()
+                && inverted_block_encoding()
+                && counted_probe(StateCache::probe(&cached, view, self.block_num, &span))
+            {
+                (span.hi, next_version_found) =
+                    newer_version_bound(storage_iter, &slot_key, self.block_num, view.head());
+                if next_version_found {
+                    STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                }
+            }
+            drop(storage_iter_guard);
             cache.storage.record(slot_key, span, next_version_found);
         }
         Ok((value, version))
@@ -2773,6 +2815,9 @@ impl StateDBRead for StateDB {
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.account_cache_misses.increment(1);
+                    if entry.is_none() {
+                        STORAGE_METRICS.state_cache_cold_misses.increment(1);
+                    }
                     cached = entry;
                 }
             }
@@ -2790,18 +2835,9 @@ impl StateDBRead for StateDB {
             let version = found.as_ref().map(|f| f.block);
             let account = found.and_then(|f| decode_account(address, f.value()));
             if let Some((view, cache)) = cache {
-                let (hi, newer) = match version {
-                    Some(v) if StateCache::should_probe(&cached) => self.udt_probe(
-                        view,
-                        StorageTypeColumn::AddressToAccount,
-                        address.as_slice(),
-                        v,
-                    )?,
-                    _ => (self.block_num, None),
-                };
                 let span = Span {
                     lo: version.unwrap_or(0),
-                    hi,
+                    hi: self.block_num,
                     found: version.is_some(),
                     value: account.as_ref().map(|account| CachedAccount {
                         balance: account.balance,
@@ -2809,7 +2845,14 @@ impl StateDBRead for StateDB {
                         code_hash: account.code_hash,
                     }),
                 };
-                cache.accounts.record_udt(address.0, span, newer);
+                self.udt_record(
+                    view,
+                    &cache.accounts,
+                    &cached,
+                    StorageTypeColumn::AddressToAccount,
+                    address.0,
+                    span,
+                )?;
             }
             return Ok(account);
         }
@@ -2819,25 +2862,9 @@ impl StateDBRead for StateDB {
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
         let (account, version) = seek_account(account_iter, address, self.block_num)?;
         if let Some((view, cache)) = cache {
-            let probe =
-                version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
-            // Probe under the same lock: another reader of this handle may
-            // move the iterator once it is released.
-            let (hi, next_version_found) = if probe {
-                STORAGE_METRICS.state_cache_probes.increment(1);
-                newer_version_bound(
-                    account_iter,
-                    address.as_slice(),
-                    self.block_num,
-                    view.head(),
-                )
-            } else {
-                (self.block_num, false)
-            };
-            drop(account_iter_guard);
-            let span = Span {
+            let mut span = Span {
                 lo: version.unwrap_or(0),
-                hi,
+                hi: self.block_num,
                 found: version.is_some(),
                 value: account.as_ref().map(|account| CachedAccount {
                     balance: account.balance,
@@ -2845,6 +2872,24 @@ impl StateDBRead for StateDB {
                     code_hash: account.code_hash,
                 }),
             };
+            let mut next_version_found = false;
+            // Probe under the same lock: another reader of this handle may
+            // move the iterator once it is released.
+            if version.is_some()
+                && inverted_block_encoding()
+                && counted_probe(StateCache::probe(&cached, view, self.block_num, &span))
+            {
+                (span.hi, next_version_found) = newer_version_bound(
+                    account_iter,
+                    address.as_slice(),
+                    self.block_num,
+                    view.head(),
+                );
+                if next_version_found {
+                    STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                }
+            }
+            drop(account_iter_guard);
             cache.accounts.record(address.0, span, next_version_found);
         }
         Ok(account)
@@ -3913,8 +3958,22 @@ mod inverted_encoding_tests {
                     .read_storage_and_height(addr, slot)
                     .unwrap()
             };
-            // Second read probes: the next version (30) is above the head.
+            // Second read probes (below the head, which would not): the next
+            // version (30) is above the head, so the span stops at the head.
             assert_eq!(read(15), (U256::from(10), Some(10)));
+            assert_eq!(read(19), (U256::from(10), Some(10)));
+            let mut slot_key = [0u8; 64];
+            slot_key[..32].copy_from_slice(addr.as_slice());
+            slot_key[32..].copy_from_slice(slot.as_slice());
+            let cache = db.state_cache.as_ref().unwrap();
+            assert!(matches!(
+                cache.storage.lookup(&slot_key, 20),
+                Lookup::Hit(Span { lo: 10, hi: 20, .. })
+            ));
+            assert!(matches!(
+                cache.storage.lookup(&slot_key, 21),
+                Lookup::Miss(_)
+            ));
             assert_eq!(read(20), (U256::from(10), Some(10)));
             assert_eq!(read(25), (U256::from(10), Some(10)));
             // Append block 21 on the head: reads from 21 on see its version.
