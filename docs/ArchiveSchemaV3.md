@@ -310,3 +310,22 @@ about 2.7–2.8 times per request and stall at the volume's 8000 IOPS
 8 GiB block cache holds anyway. Whether it saves disk reads in steady
 state, where the keys read again outnumber what the block cache holds, is
 left to a production canary.
+
+v2 reads the disk more than v3 for the same requests. Same setup (12 GiB,
+host page cache dropped before each run, 2 passes × 3 segments), the v2
+bench volume raised to the same 8000 IOPS / 1000 MB/s:
+
+| | v2, cache on | v2, cache off | v3, cache on | v3, cache off |
+|---|---|---|---|---|
+| Disk reads / request | 4.83 | 4.94 | 2.79 | 2.71 |
+| Throughput at the 8000 IOPS limit, rps | 1670 | 1630 | 2910 | 3000 |
+| p50 / p99 ms | 63 / 1670 | 63 / 1740 | 43 / 910 | 42 / 890 |
+| CPU ms / request | 0.85 | 0.98 | 0.57 | 0.60 |
+| RSS | 9.1 GiB | 8.9 GiB | 8.0 GiB | 7.8 GiB |
+
+Both use the same table format (4 KiB blocks, partitioned index and
+filters). A v2 seek positions every level that holds the key, down to the
+deepest, to merge them; a v3 `Get` stops at the first level holding a
+version at or below the read height, and its data is 14 % smaller. The v3
+canary pod reading more per request than v2 pods (above) is therefore not
+the schema: its volume was new from a snapshot and its page cache cold.
