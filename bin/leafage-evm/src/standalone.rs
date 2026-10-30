@@ -20,7 +20,8 @@ use leafage_evm_chains::hemi::HemiHardfork;
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{build_op_custom_config, ApiBuilder, MultiChainCfgEnv, TokenCollector};
 use leafage_evm_storage::{
-    MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
+    ArchiveSchema, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
+    StorageKind,
 };
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use metrics::gauge;
@@ -446,6 +447,12 @@ pub struct Command {
     /// returns wrong values. Has no effect in state-node (non-archive) mode.
     #[arg(long, default_value_t = false)]
     inverted_block_encoding: bool,
+
+    /// Schema of a new RocksDB archive (`--archive` on an empty `--db-path`):
+    /// v1 (ascending block tail), v2 (inverted tail) or v3 (RocksDB
+    /// user-defined timestamps). An existing archive keeps its own schema.
+    #[arg(long, default_value = "v3")]
+    archive_schema: ArchiveSchema,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -953,6 +960,13 @@ impl Command {
             );
         }
 
+        let new_archive = self.archive
+            && matches!(self.db_type, StorageKind::Rocksdb)
+            && crate::archive_udt::prepare_archive_schema(
+                &self.db_path,
+                self.archive_schema,
+                self.inverted_block_encoding,
+            )?;
         let db = MultiStorage::open(
             self.db_path.as_path(),
             self.db_cache,
@@ -970,17 +984,19 @@ impl Command {
         //
         // The marker records what --inverted-block-encoding asserts, so passing
         // the flag against an unmarked *legacy* DB makes that mistake sticky.
-        if self.inverted_block_encoding {
+        // A new archive records its --archive-schema.
+        if self.inverted_block_encoding || new_archive {
             if let MultiStorage::RocksDBArchive(rdb) = &db {
                 let marker = rdb
                     .read_encoding_marker()
                     .map_err(|e| anyhow!("failed to read block encoding marker: {e}"))?;
                 if marker.is_none() {
-                    rdb.write_encoding_marker(true)
+                    let inverted = leafage_evm_storage::inverted_block_encoding();
+                    rdb.write_encoding_marker(inverted)
                         .map_err(|e| anyhow!("failed to write block encoding marker: {e}"))?;
                     info!(
-                        "archive db carried no block encoding marker; recorded inverted \
-                         encoding from --inverted-block-encoding"
+                        inverted,
+                        "archive db carried no block encoding marker; recorded it"
                     );
                 }
             }

@@ -23,7 +23,8 @@ use tracing::info;
 /// archive before serving it.
 ///
 /// Archive mode resolves the target locally and deletes future versions by
-/// default. Use --head-only to keep those versions and only move the head.
+/// default (a schema v3 archive by a full compaction of its versioned CFs).
+/// Use --head-only to keep those versions and only move the head.
 /// Stop all database users first; truncation has no checkpoint or automatic
 /// interruption recovery.
 #[derive(Debug, Parser)]
@@ -95,9 +96,10 @@ impl Command {
                 bail!("archive truncation forbids --keep-offset; use --head-only to only move the head");
             }
             let offset_file = self.offset_file();
-            let db =
-                MultiStorage::open_for_archive_rewind(&self.db_path, self.db_cache, self.db_type)?;
-            let target = db.rewind_archive(
+            let target = MultiStorage::rewind_archive_offline(
+                &self.db_path,
+                self.db_cache,
+                self.db_type,
                 self.to_block,
                 self.inverted_block_encoding.then_some(true),
                 std::path::Path::new(&offset_file),

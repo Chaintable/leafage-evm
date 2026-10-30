@@ -5079,6 +5079,7 @@ dependencies = [
  "dashmap",
  "leafage-evm-types",
  "libmdbx",
+ "librocksdb-sys",
  "metrics",
  "metrics-derive",
  "moka",

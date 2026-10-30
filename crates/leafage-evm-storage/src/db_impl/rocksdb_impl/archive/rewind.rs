@@ -8,6 +8,11 @@ impl DataBaseRef {
         let marker = self
             .db
             .get_cf(self.db.cf_handle("1").unwrap(), ENCODING_MARKER_KEY)?;
+        // A v3 archive is converted from a marked one, and its versions were
+        // trimmed before this open (`MultiStorage::rewind_archive_offline`).
+        if self.udt {
+            return Ok((marker, false));
+        }
         let mut populated = false;
         for (cf, table) in [("4", RewindTable::Accounts), ("5", RewindTable::Storage)] {
             let mut opts = ReadOptions::default();
@@ -35,6 +40,9 @@ impl DataBaseRef {
         options.set_sync(true);
 
         for table in REWIND_TABLES {
+            if self.udt && matches!(table, RewindTable::Accounts | RewindTable::Storage) {
+                continue;
+            }
             let name = match table {
                 RewindTable::Accounts => StorageTypeColumn::AddressToAccount,
                 RewindTable::Storage => StorageTypeColumn::AddressToStorage,

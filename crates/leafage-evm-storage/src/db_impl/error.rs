@@ -9,6 +9,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("rocksdb error, {0}")]
     RocksDB(#[from] rocksdb::Error),
+    /// An error from a RocksDB C API call made outside rust-rocksdb.
+    #[error("rocksdb error, {0}")]
+    RocksDBMessage(String),
     #[error("rlp error, {0}")]
     Rlp(#[from] alloy_rlp::Error),
     #[error("unsupported operation, {0}")]

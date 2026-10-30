@@ -17,7 +17,8 @@ tracing.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
-rocksdb = { workspace = true, features = ["jemalloc"] }
+rocksdb = { workspace = true, features = ["jemalloc", "raw-ptr"] }
+librocksdb-sys.workspace = true
 moka.workspace = true
 alloy-rlp.workspace = true
 alloy.workspace = true

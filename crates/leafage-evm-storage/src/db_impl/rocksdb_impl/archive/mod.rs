@@ -53,6 +53,7 @@ use tracing::{debug, info, warn};
 mod iterator_tracker;
 mod rewind;
 mod state_cache;
+pub(crate) mod udt;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
@@ -305,6 +306,9 @@ pub struct DataBaseRef {
     /// Cross-request account/storage read cache, see [`StateCache`]. Only
     /// built for a serving node (not bulk load or maintenance).
     state_cache: Option<StateCache>,
+    /// Schema v3: account/storage versions keyed by a user-defined timestamp
+    /// (see [`udt`]), read with timestamped point lookups.
+    udt: bool,
 }
 
 pub struct ArchiveRocksDBWriteBatch {
@@ -399,13 +403,25 @@ fn rocksdb_column_options(
     compression: CfCompression,
     bulk_load: bool,
     archive_zstd_compression: bool,
+    udt: bool,
 ) -> Options {
-    let mut cf_opts = Options::default();
+    // A schema v3 versioned CF keys versions by a u64 user-defined timestamp
+    // (the block); the comparator is fixed when the CF is created.
+    let mut cf_opts = if udt {
+        udt::base_cf_options()
+    } else {
+        Options::default()
+    };
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
     cf_opts.set_keep_log_file_num(2);
     cf_opts.set_level_compaction_dynamic_level_bytes(true);
     if fixed_prefix_size != 0 {
         cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(fixed_prefix_size));
+        cf_opts.set_memtable_prefix_bloom_ratio(0.1);
+    }
+    if udt {
+        // Point Get on the key without its timestamp: whole-key filters.
+        cf_opts.set_memtable_whole_key_filtering(true);
         cf_opts.set_memtable_prefix_bloom_ratio(0.1);
     }
     let mut block_opts = BlockBasedOptions::default();
@@ -603,15 +619,28 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts
 }
 
-/// Build the six archive column-family descriptors with the standard archive
-/// options. Shared by [`DataBaseRef::open_inner`] and the offline re-encode
-/// path so a re-encoded DB is option-compatible with a normally-opened one.
-fn archive_cf_descriptors(
+/// Every archive column family, in creation order.
+const ARCHIVE_COLUMNS: [StorageTypeColumn; 6] = [
+    StorageTypeColumn::LatestBlockHash,
+    StorageTypeColumn::BlockHashToBlockInfo,
+    StorageTypeColumn::BlockNumToBlockHash,
+    StorageTypeColumn::AddressToAccount,
+    StorageTypeColumn::AddressToStorage,
+    StorageTypeColumn::HashToCode,
+];
+
+/// The standard options of one archive column family. `udt` selects schema
+/// v3 for the versioned CFs (`AddressToAccount`, `AddressToStorage`): keys
+/// without the version tail, the block as a u64 user-defined timestamp, and
+/// whole-key filters instead of the prefix bloom.
+fn archive_cf_options(
+    col: StorageTypeColumn,
     shared_cache: &Cache,
     disable_auto_compactions: bool,
     bulk_load: bool,
     archive_zstd_compression: bool,
-) -> Vec<ColumnFamilyDescriptor> {
+    udt: bool,
+) -> Options {
     // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
     // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at deep
     // levels via `archive_zstd_compression` for ~15-20% extra ratio at the cost
@@ -622,77 +651,54 @@ fn archive_cf_descriptors(
     } else {
         CfCompression::Lz4
     };
-    vec![
-        // LatestBlockHash: single record, no compression needed
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        // BlockNumToBlockHash: 32 bytes value, no compression needed
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                32,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                64,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::Zstd,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-    ]
+    let (prefix, compression, udt) = match col {
+        // Single record / 32-byte values: no compression needed.
+        StorageTypeColumn::LatestBlockHash | StorageTypeColumn::BlockNumToBlockHash => {
+            (0, CfCompression::None, false)
+        }
+        StorageTypeColumn::BlockHashToBlockInfo => (0, big_cf_compression, false),
+        StorageTypeColumn::AddressToAccount => (if udt { 0 } else { 32 }, big_cf_compression, udt),
+        StorageTypeColumn::AddressToStorage => (if udt { 0 } else { 64 }, big_cf_compression, udt),
+        // Large code blobs (KB~tens of KB): ZSTD for high compression.
+        StorageTypeColumn::HashToCode => (0, CfCompression::Zstd, false),
+    };
+    rocksdb_column_options(
+        shared_cache,
+        prefix,
+        disable_auto_compactions,
+        compression,
+        bulk_load,
+        archive_zstd_compression,
+        udt,
+    )
+}
+
+/// Build the six archive column-family descriptors with the standard archive
+/// options. Shared by [`DataBaseRef::open_inner`] and the offline re-encode
+/// path so a re-encoded DB is option-compatible with a normally-opened one.
+fn archive_cf_descriptors(
+    shared_cache: &Cache,
+    disable_auto_compactions: bool,
+    bulk_load: bool,
+    archive_zstd_compression: bool,
+    udt: bool,
+) -> Vec<ColumnFamilyDescriptor> {
+    ARCHIVE_COLUMNS
+        .iter()
+        .map(|&col| {
+            ColumnFamilyDescriptor::new(
+                col.to_str(),
+                archive_cf_options(
+                    col,
+                    shared_cache,
+                    disable_auto_compactions,
+                    bulk_load,
+                    archive_zstd_compression,
+                    udt,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Split the leading-byte keyspace `0..=255` into `jobs` contiguous shards,
@@ -1025,11 +1031,13 @@ impl DataBaseRef {
             archive_zstd_compression,
         );
 
+        let udt = udt::is_udt_archive(path.as_ref())?;
         let cfs = archive_cf_descriptors(
             &shared_cache,
             disable_auto_compactions,
             bulk_load,
             archive_zstd_compression,
+            udt,
         );
         let mut db_opt = rocksdb_options(disable_auto_compactions);
         if maintenance {
@@ -1098,6 +1106,7 @@ impl DataBaseRef {
             } else {
                 None
             },
+            udt,
         };
         // Self-describing encoding: if the DB records its block-height key
         // encoding, honor it (a legacy DB has no marker and is left untouched),
@@ -1238,7 +1247,7 @@ impl DataBaseRef {
 
         // Destination: fresh DB with the standard archive CF options.
         let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * cache_size, 8192);
-        let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false);
+        let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false, false);
         let dst = DB::open_cf_descriptors(&rocksdb_options(false), &dst_path, dst_cfs)
             .map_err(Error::RocksDB)?;
 
@@ -1544,6 +1553,15 @@ impl DataBaseRef {
         }
         writer.finish()?;
         Ok(())
+    }
+
+    /// Whether this is a schema v3 archive. Its versions cannot be
+    /// bulk-loaded as SST files ([`Self::write_account_sst`]): RocksDB only
+    /// ingests a file into a timestamped CF if its keys do not overlap the
+    /// CF's, and a key's versions must be written in block order (a read
+    /// stops at the first level holding a version at or below its height).
+    pub fn is_schema_v3(&self) -> bool {
+        self.udt
     }
 
     /// Ingest a list of pre-built SST files into the `AddressToAccount` CF.
@@ -2315,7 +2333,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
         let (iterators, cache_view) = new_state_iterators(self, block_num);
 
         // Register with iterator tracker if enabled
-        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
+        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() && !self.udt {
             let id = next_statedb_id();
             let flag = ITERATOR_TRACKER.register(id, block_num, iterators.clone());
             (Some(id), Some(flag))
@@ -2331,6 +2349,8 @@ impl StateDBProvider for Arc<DataBaseRef> {
             cache_view,
             tracker_id,
             timed_out,
+            udt: self.udt.then(|| udt::UdtReader::new(block_num)),
+            udt_head: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -2366,12 +2386,19 @@ fn seek_account(
         return Ok((None, None));
     }
     let version = Some(decode_version_tail(&raw_key_bytes[32..64]));
-    let mut raw_val_bytes = account_iter.value().unwrap();
-    if raw_val_bytes.is_empty() {
-        return Ok((None, version));
+    Ok((
+        decode_account(address, account_iter.value().unwrap()),
+        version,
+    ))
+}
+
+/// Decode an `AddressToAccount` value: slim RLP, empty when deleted.
+fn decode_account(address: H256, mut raw: &[u8]) -> Option<NewAccount> {
+    if raw.is_empty() {
+        return None;
     }
-    let account = SlimAccount::decode(&mut raw_val_bytes).unwrap();
-    let account = NewAccount {
+    let account = SlimAccount::decode(&mut raw).unwrap();
+    Some(NewAccount {
         address,
         balance: account.balance,
         nonce: account.nonce,
@@ -2380,8 +2407,18 @@ fn seek_account(
         } else {
             account.code_hash
         },
-    };
-    Ok((Some(account), version))
+    })
+}
+
+/// Decode an `AddressToStorage` value: big-endian, possibly without leading
+/// zeros; empty is zero.
+#[inline]
+fn decode_storage(raw: &[u8]) -> U256 {
+    if raw.is_empty() {
+        U256::ZERO
+    } else {
+        U256::from_be_slice(raw)
+    }
 }
 
 /// After a seek landed on the version of `prefix` read at `block`, step the
@@ -2428,6 +2465,10 @@ fn new_state_iterators(
         .state_cache
         .as_ref()
         .and_then(|cache| cache.view(block_num));
+    if db.udt {
+        // Reads are timestamped point lookups; no iterator to hold or time out.
+        return (SharedIterators::empty(), cache_view);
+    }
     let address_to_account_cf = db
         .db
         .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
@@ -2463,6 +2504,11 @@ pub struct StateDB {
     tracker_id: Option<u64>,
     /// Shared timeout flag with IteratorTracker
     timed_out: Option<TimeoutFlag>,
+    /// Schema v3: read options at `block_num` for timestamped lookups.
+    udt: Option<udt::UdtReader>,
+    /// Schema v3: read options at the cache view's head, for state cache
+    /// probes; created on the first probe.
+    udt_head: std::sync::OnceLock<udt::UdtReader>,
 }
 
 impl Clone for StateDB {
@@ -2470,7 +2516,7 @@ impl Clone for StateDB {
         let (iterators, cache_view) = new_state_iterators(&self.db, self.block_num);
 
         // Register cloned StateDB with iterator tracker if enabled
-        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
+        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() && !self.db.udt {
             let id = next_statedb_id();
             let flag = ITERATOR_TRACKER.register(id, self.block_num, iterators.clone());
             (Some(id), Some(flag))
@@ -2486,6 +2532,8 @@ impl Clone for StateDB {
             cache_view,
             tracker_id,
             timed_out,
+            udt: self.db.udt.then(|| udt::UdtReader::new(self.block_num)),
+            udt_head: std::sync::OnceLock::new(),
         }
     }
 }
@@ -2522,6 +2570,27 @@ impl StateDB {
         }
         Ok(())
     }
+
+    /// Schema v3 state cache probe of `key`, whose version at `block_num` is
+    /// `version`: the span's end and, if the key has a version above
+    /// `version` at or below the head, that version.
+    fn udt_probe(
+        &self,
+        view: &state_cache::ReadView,
+        col: StorageTypeColumn,
+        key: &[u8],
+        version: u64,
+    ) -> Result<(u64, Option<u64>), Error> {
+        STORAGE_METRICS.state_cache_probes.increment(1);
+        let reader = self
+            .udt_head
+            .get_or_init(|| udt::UdtReader::new(view.head()));
+        let newest = reader.get(self.db.db, col, key)?.map(|f| f.block);
+        Ok(match newest {
+            Some(newest) if newest > version => (self.block_num, Some(newest)),
+            _ => (view.head(), None),
+        })
+    }
 }
 
 impl StateDB {
@@ -2553,6 +2622,33 @@ impl StateDB {
             }
         }
 
+        if let Some(reader) = &self.udt {
+            let start = std::time::Instant::now();
+            let found = reader.get(self.db.db, StorageTypeColumn::AddressToStorage, &slot_key)?;
+            STORAGE_METRICS
+                .read_storage_latency
+                .record(start.elapsed().as_secs_f64());
+            let (value, version) = found.map_or((U256::ZERO, None), |f| {
+                (decode_storage(f.value()), Some(f.block))
+            });
+            if let Some((view, cache)) = cache {
+                let (hi, newer) = match version {
+                    Some(v) if StateCache::should_probe(&cached) => {
+                        self.udt_probe(view, StorageTypeColumn::AddressToStorage, &slot_key, v)?
+                    }
+                    _ => (self.block_num, None),
+                };
+                let span = Span {
+                    lo: version.unwrap_or(0),
+                    hi,
+                    found: version.is_some(),
+                    value,
+                };
+                cache.storage.record_udt(slot_key, cached, span, newer);
+            }
+            return Ok((value, version));
+        }
+
         let start = std::time::Instant::now();
         let target_key = encode_storage_key(address, key, self.block_num);
         let mut storage_iter_guard = self.iterators.storage_iterator.lock().unwrap();
@@ -2571,13 +2667,7 @@ impl StateDB {
         let (value, version) = match storage_iter.key() {
             Some(raw_key_bytes) if raw_key_bytes[..64] == slot_key => {
                 let version = decode_version_tail(&raw_key_bytes[64..96]);
-                let raw_val_bytes = storage_iter.value().unwrap();
-                let value = if raw_val_bytes.is_empty() {
-                    U256::ZERO
-                } else {
-                    U256::from_be_slice(raw_val_bytes)
-                };
-                (value, Some(version))
+                (decode_storage(storage_iter.value().unwrap()), Some(version))
             }
             Some(_) => (U256::ZERO, None),
             // An invalid iterator means no key at or after the target, unless
@@ -2614,6 +2704,9 @@ impl StateDB {
     /// The slots of `address` holding a non-zero value, with the value.
     fn storage_slots(&self, address: H256) -> Result<Vec<(H256, U256)>, Error> {
         let address_bytes: [u8; 32] = address.into();
+        if self.udt.is_some() {
+            return udt::storage_slots(self.db.db, address_bytes, self.block_num);
+        }
         // Seeking to slots that may not exist: past the prefix bloom.
         let address_to_storage_cf = self
             .db
@@ -2674,6 +2767,42 @@ impl StateDBRead for StateDB {
                     cached = entry;
                 }
             }
+        }
+        if let Some(reader) = &self.udt {
+            let start = std::time::Instant::now();
+            let found = reader.get(
+                self.db.db,
+                StorageTypeColumn::AddressToAccount,
+                address.as_slice(),
+            )?;
+            STORAGE_METRICS
+                .read_account_latency
+                .record(start.elapsed().as_secs_f64());
+            let version = found.as_ref().map(|f| f.block);
+            let account = found.and_then(|f| decode_account(address, f.value()));
+            if let Some((view, cache)) = cache {
+                let (hi, newer) = match version {
+                    Some(v) if StateCache::should_probe(&cached) => self.udt_probe(
+                        view,
+                        StorageTypeColumn::AddressToAccount,
+                        address.as_slice(),
+                        v,
+                    )?,
+                    _ => (self.block_num, None),
+                };
+                let span = Span {
+                    lo: version.unwrap_or(0),
+                    hi,
+                    found: version.is_some(),
+                    value: account.as_ref().map(|account| CachedAccount {
+                        balance: account.balance,
+                        nonce: account.nonce,
+                        code_hash: account.code_hash,
+                    }),
+                };
+                cache.accounts.record_udt(address.0, cached, span, newer);
+            }
+            return Ok(account);
         }
         let mut account_iter_guard = self.iterators.account_iterator.lock().unwrap();
         let account_iter = account_iter_guard
@@ -2967,15 +3096,25 @@ impl StateDBWrite for Arc<DataBaseRef> {
             for (key, value) in batch.account_writes {
                 if let Some((prev_key, prev_value)) = last_write.take() {
                     if prev_key != key {
-                        batch
-                            .inner
-                            .put_cf(address_to_account_cf, prev_key, prev_value);
+                        put_account_version(
+                            &mut batch.inner,
+                            address_to_account_cf,
+                            &prev_key,
+                            &prev_value,
+                            self.udt,
+                        );
                     }
                 }
                 last_write = Some((key, value));
             }
             if let Some((key, value)) = last_write {
-                batch.inner.put_cf(address_to_account_cf, key, value);
+                put_account_version(
+                    &mut batch.inner,
+                    address_to_account_cf,
+                    &key,
+                    &value,
+                    self.udt,
+                );
             }
         }
 
@@ -2992,15 +3131,25 @@ impl StateDBWrite for Arc<DataBaseRef> {
             for (key, value) in batch.storage_writes {
                 if let Some((prev_key, prev_value)) = last_write.take() {
                     if prev_key != key {
-                        batch
-                            .inner
-                            .put_cf(address_to_storage_cf, prev_key, prev_value);
+                        put_storage_version(
+                            &mut batch.inner,
+                            address_to_storage_cf,
+                            &prev_key,
+                            &prev_value,
+                            self.udt,
+                        );
                     }
                 }
                 last_write = Some((key, value));
             }
             if let Some((key, value)) = last_write {
-                batch.inner.put_cf(address_to_storage_cf, key, value);
+                put_storage_version(
+                    &mut batch.inner,
+                    address_to_storage_cf,
+                    &key,
+                    &value,
+                    self.udt,
+                );
             }
         }
 
@@ -3011,6 +3160,42 @@ impl StateDBWrite for Arc<DataBaseRef> {
             cache.advance_head(max);
         }
         Ok(())
+    }
+}
+
+/// Write one account version. Schema v3 stores the address alone with the
+/// block as its timestamp; v1/v2 store the encoded key as is.
+#[inline]
+fn put_account_version(
+    batch: &mut WriteBatch,
+    cf: &ColumnFamily,
+    key: &[u8; 64],
+    value: &[u8],
+    udt: bool,
+) {
+    if udt {
+        let ts = udt::encode_ts(decode_version_tail(&key[32..]));
+        batch.put_cf_with_ts(cf, &key[..32], ts, value);
+    } else {
+        batch.put_cf(cf, key, value);
+    }
+}
+
+/// Write one storage version; see [`put_account_version`]. Schema v3 also
+/// strips the value's leading zeros.
+#[inline]
+fn put_storage_version(
+    batch: &mut WriteBatch,
+    cf: &ColumnFamily,
+    key: &[u8; 96],
+    value: &[u8; 32],
+    udt: bool,
+) {
+    if udt {
+        let ts = udt::encode_ts(decode_version_tail(&key[64..]));
+        batch.put_cf_with_ts(cf, &key[..64], ts, udt::strip_leading_zeros(value));
+    } else {
+        batch.put_cf(cf, key, value);
     }
 }
 
