@@ -37,7 +37,8 @@ use leafage_evm_types::{
     Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
     H256, KECCAK256_EMPTY, U256,
 };
-use moka::sync::Cache as MokaCache;
+use quick_cache::sync::Cache as QuickCache;
+use quick_cache::Weighter;
 use rocksdb::{
     BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
     CompactOptions, Direction, IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter,
@@ -132,7 +133,7 @@ const DEFAULT_BLOCK_INFO_CACHE_ENTRIES: u64 = 16384;
 /// Build the block-info cache honoring `ARCHIVE_BLOCK_INFO_CACHE` (entries;
 /// `0` disables). Keyed by block hash, so an entry never goes stale. Every
 /// request resolves its block through it.
-fn build_block_info_cache() -> Option<MokaCache<H256, BlockInfo>> {
+fn build_block_info_cache() -> Option<QuickCache<H256, BlockInfo>> {
     let entries = env::var("ARCHIVE_BLOCK_INFO_CACHE")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -145,17 +146,32 @@ fn build_block_info_cache() -> Option<MokaCache<H256, BlockInfo>> {
         target = "rocksdb",
         "archive block info cache enabled: {} entries", entries
     );
-    Some(MokaCache::new(entries))
+    Some(QuickCache::new(entries.try_into().unwrap_or(usize::MAX)))
 }
 
 /// Default weighted capacity (MB) of the content-addressed code cache.
 const DEFAULT_CODE_CACHE_MB: u64 = 256;
 
+/// Weighs a cached code by its payload: key and code bytes.
+#[derive(Clone, Copy)]
+struct CodeWeighter;
+
+impl Weighter<H256, Bytes> for CodeWeighter {
+    fn weight(&self, _: &H256, code: &Bytes) -> u64 {
+        (code.len() + std::mem::size_of::<H256>()) as u64
+    }
+}
+
+type CodeCache = QuickCache<H256, Bytes, CodeWeighter>;
+
+/// Typical size of a cached contract, to size the code cache's table.
+const TYPICAL_CODE_BYTES: u64 = 8 * 1024;
+
 /// Build the code cache honoring `ARCHIVE_CODE_CACHE_MB` (`0` disables;
 /// unset/unparsable falls back to [`DEFAULT_CODE_CACHE_MB`]). Weighted by
 /// payload size (key + code bytes), so the capacity is a payload budget —
-/// per-entry allocator and moka bookkeeping overhead sits on top of it.
-fn build_code_cache() -> Option<MokaCache<H256, Bytes>> {
+/// per-entry allocator and cache bookkeeping overhead sits on top of it.
+fn build_code_cache() -> Option<CodeCache> {
     let mb = env::var("ARCHIVE_CODE_CACHE_MB")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -168,16 +184,11 @@ fn build_code_cache() -> Option<MokaCache<H256, Bytes>> {
         return None;
     }
     info!(target = "rocksdb", "archive code cache enabled: {}MB", mb);
-    Some(
-        MokaCache::builder()
-            .max_capacity(mb.saturating_mul(1024 * 1024))
-            .weigher(|_k: &H256, v: &Bytes| {
-                (v.len() + std::mem::size_of::<H256>())
-                    .try_into()
-                    .unwrap_or(u32::MAX)
-            })
-            .build(),
-    )
+    Some(crate::db::byte_weighted_cache(
+        mb.saturating_mul(1024 * 1024),
+        TYPICAL_CODE_BYTES,
+        CodeWeighter,
+    ))
 }
 
 /// Reserved key (stored in the `LatestBlockHash` CF) recording whether this
@@ -294,15 +305,15 @@ pub struct DataBaseRef {
     /// handle regardless of block height. `code_hash` is keccak256(code), so
     /// an entry can never go stale and needs no invalidation — unlike
     /// accounts/storage, whose height-versioned reads cannot be cached this
-    /// way. Historical reads bypass the `StateTree` moka caches entirely, so
+    /// way. Historical reads bypass the `StateTree` caches entirely, so
     /// without this every `getAddressCode`/multicall at an old height pays a
     /// HashToCode disk get + zstd decode even for hot contracts. `None` =
     /// disabled via `ARCHIVE_CODE_CACHE_MB=0`.
-    code_cache: Option<MokaCache<H256, Bytes>>,
+    code_cache: Option<CodeCache>,
     /// Block hash -> block info. A hash names one block, so entries never go
     /// stale; rewound blocks stay cached to serve requests for fork blocks.
     /// `None` = disabled via `ARCHIVE_BLOCK_INFO_CACHE=0`.
-    block_info_cache: Option<MokaCache<H256, BlockInfo>>,
+    block_info_cache: Option<QuickCache<H256, BlockInfo>>,
     /// Cross-request account/storage read cache, see [`StateCache`]. Only
     /// built for a serving node (not bulk load or maintenance).
     state_cache: Option<StateCache>,
@@ -2644,7 +2655,7 @@ impl StateDB {
                     found: version.is_some(),
                     value,
                 };
-                cache.storage.record_udt(slot_key, cached, span, newer);
+                cache.storage.record_udt(slot_key, span, newer);
             }
             return Ok((value, version));
         }
@@ -2694,9 +2705,7 @@ impl StateDB {
                 found: version.is_some(),
                 value,
             };
-            cache
-                .storage
-                .record(slot_key, cached, span, next_version_found);
+            cache.storage.record(slot_key, span, next_version_found);
         }
         Ok((value, version))
     }
@@ -2800,7 +2809,7 @@ impl StateDBRead for StateDB {
                         code_hash: account.code_hash,
                     }),
                 };
-                cache.accounts.record_udt(address.0, cached, span, newer);
+                cache.accounts.record_udt(address.0, span, newer);
             }
             return Ok(account);
         }
@@ -2836,9 +2845,7 @@ impl StateDBRead for StateDB {
                     code_hash: account.code_hash,
                 }),
             };
-            cache
-                .accounts
-                .record(address.0, cached, span, next_version_found);
+            cache.accounts.record(address.0, span, next_version_found);
         }
         Ok(account)
     }

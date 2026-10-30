@@ -5,10 +5,56 @@ use auto_impl::auto_impl;
 use leafage_evm_types::{
     AccountInfo, BlockId, BlockInfo, BlockStorageDiff, Bytecode, Bytes, NewAccount, H256, U256,
 };
-use moka::sync::Cache as MokaCache;
+use quick_cache::sync::{Cache as QuickCache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::sync::LazyLock;
 use tracing::{debug, info, trace};
+
+/// The smallest share of a byte-weighted cache one shard holds. A shard
+/// admits no entry larger than about 97 % of its share, so this bounds the
+/// shard count: the largest supported contract (Metis, 2 457 600 bytes) with
+/// its jump table weighs about 2.8 MB.
+const MIN_SHARD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A cache of `capacity_bytes` weighed by `weighter`, with no more shards
+/// than keep each at [`MIN_SHARD_BYTES`]: large contracts still fit when the
+/// budget is small. `typical_entry_bytes` sizes the table.
+pub(crate) fn byte_weighted_cache<K, V, W>(
+    capacity_bytes: u64,
+    typical_entry_bytes: u64,
+    weighter: W,
+) -> QuickCache<K, V, W>
+where
+    K: Eq + Hash,
+    V: Clone,
+    W: Weighter<K, V> + Clone,
+{
+    let default_shards = std::thread::available_parallelism().map_or(4, |n| n.get() * 4);
+    let shards = usize::try_from(capacity_bytes / MIN_SHARD_BYTES)
+        .unwrap_or(usize::MAX)
+        .clamp(1, default_shards);
+    // quick_cache rounds the shard count up to a power of two; round down
+    // so no shard falls below its minimum.
+    let shards = 1 << shards.ilog2();
+    let options = OptionsBuilder::new()
+        .estimated_items_capacity(
+            (capacity_bytes / typical_entry_bytes.max(1))
+                .try_into()
+                .unwrap_or(usize::MAX),
+        )
+        .weight_capacity(capacity_bytes)
+        .shards(shards)
+        .build()
+        .expect("valid cache options");
+    QuickCache::with_options(
+        options,
+        weighter,
+        DefaultHashBuilder::default(),
+        DefaultLifecycle::default(),
+    )
+}
 
 /// Default weighted capacity (MB) of the analyzed-bytecode cache.
 const DEFAULT_ANALYZED_CODE_CACHE_MB: u64 = 128;
@@ -25,7 +71,24 @@ const ANALYZED_CODE_ENTRY_OVERHEAD: usize = 128;
 /// of the code, so an entry never goes stale and needs no invalidation, and
 /// `Bytecode` is an `Arc`, so a hit costs a reference-count bump.
 /// `ANALYZED_CODE_CACHE_MB=0` disables it.
-static ANALYZED_CODE_CACHE: LazyLock<Option<MokaCache<H256, Bytecode>>> = LazyLock::new(|| {
+/// Weighs an analyzed contract: padded code bytes, the one-bit-per-byte jump
+/// table, and an allowance for the key and per-entry bookkeeping.
+#[derive(Clone, Copy)]
+struct AnalyzedCodeWeighter;
+
+impl Weighter<H256, Bytecode> for AnalyzedCodeWeighter {
+    fn weight(&self, _: &H256, code: &Bytecode) -> u64 {
+        let len = code.bytes_slice().len();
+        (len + len.div_ceil(8) + ANALYZED_CODE_ENTRY_OVERHEAD) as u64
+    }
+}
+
+type AnalyzedCodeCache = QuickCache<H256, Bytecode, AnalyzedCodeWeighter>;
+
+/// Typical weight of an analyzed contract, to size the cache's table.
+const TYPICAL_ANALYZED_CODE_BYTES: u64 = 8 * 1024;
+
+static ANALYZED_CODE_CACHE: LazyLock<Option<AnalyzedCodeCache>> = LazyLock::new(|| {
     let mb = std::env::var("ANALYZED_CODE_CACHE_MB")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -35,20 +98,11 @@ static ANALYZED_CODE_CACHE: LazyLock<Option<MokaCache<H256, Bytecode>>> = LazyLo
         return None;
     }
     info!(target = "storage", "analyzed bytecode cache enabled: {}MB", mb);
-    Some(
-        MokaCache::builder()
-            .max_capacity(mb.saturating_mul(1024 * 1024))
-            // Padded code bytes, the one-bit-per-byte jump table, and a rough
-            // allowance for the key and per-entry bookkeeping. moka treats the
-            // capacity as best-effort, so this is a budget, not a hard limit.
-            .weigher(|_k: &H256, v: &Bytecode| {
-                let len = v.bytes_slice().len();
-                (len + len.div_ceil(8) + ANALYZED_CODE_ENTRY_OVERHEAD)
-                    .try_into()
-                    .unwrap_or(u32::MAX)
-            })
-            .build(),
-    )
+    Some(byte_weighted_cache(
+        mb.saturating_mul(1024 * 1024),
+        TYPICAL_ANALYZED_CODE_BYTES,
+        AnalyzedCodeWeighter,
+    ))
 });
 
 /// Analyze `code` and remember the result under `code_hash`.
@@ -529,5 +583,30 @@ mod analyzed_code_cache_tests {
         db.code_by_hash(b).unwrap();
         let expected_reads = if cache_enabled() { reads } else { reads + 1 };
         assert_eq!(db.0.reads.load(Ordering::Relaxed), expected_reads);
+    }
+
+    #[test]
+    fn byte_caches_admit_the_largest_contracts() {
+        // The largest supported contract, analyzed, in the default budget.
+        let metis = vec![0u8; 2_457_600];
+        let cache = byte_weighted_cache(
+            DEFAULT_ANALYZED_CODE_CACHE_MB << 20,
+            TYPICAL_ANALYZED_CODE_BYTES,
+            AnalyzedCodeWeighter,
+        );
+        cache.insert(H256::ZERO, Bytecode::new_raw(metis.into()));
+        assert!(cache.get(&H256::ZERO).is_some());
+
+        // A budget of three minimum shards gets two, not four.
+        #[derive(Clone, Copy)]
+        struct Len;
+        impl Weighter<u64, Bytes> for Len {
+            fn weight(&self, _: &u64, v: &Bytes) -> u64 {
+                v.len() as u64
+            }
+        }
+        let cache = byte_weighted_cache(3 * MIN_SHARD_BYTES, 8 << 10, Len);
+        cache.insert(1, Bytes::from(vec![0u8; 5 << 20]));
+        assert!(cache.get(&1).is_some());
     }
 }

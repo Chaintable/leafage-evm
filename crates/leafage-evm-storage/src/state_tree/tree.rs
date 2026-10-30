@@ -20,7 +20,7 @@ pub struct StateTreeConfig {
     pub account_cache_size: usize,
     pub storage_cache_size: usize,
     pub code_cache_size: usize,
-    /// Whether the bottom CacheDiskLayer's moka caches are active. Set
+    /// Whether the bottom CacheDiskLayer's caches are active. Set
     /// false for backends with per-handle snapshot semantics (MDBX) so
     /// each handle reads directly from its own ro_txn — the shared
     /// cache would otherwise blur snapshot boundaries.
