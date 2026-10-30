@@ -328,4 +328,5 @@ filters). A v2 seek positions every level that holds the key, down to the
 deepest, to merge them; a v3 `Get` stops at the first level holding a
 version at or below the read height, and its data is 14 % smaller. The v3
 canary pod reading more per request than v2 pods (above) is therefore not
-the schema: its volume was new from a snapshot and its page cache cold.
+explained by the schema; likely causes, not yet checked: its volume was new
+from a snapshot, its page cache cold, and compaction reads count too.
