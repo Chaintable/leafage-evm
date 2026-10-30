@@ -79,6 +79,7 @@ impl<DB: Database + DatabaseRef, I> ArbitrumEvm<DB, I> {
         let hardfork = cfg.spec;
         let spec = hardfork.into();
         execution_context.set_current_arbos_version(precompile_env.current_arbos_version);
+        execution_context.set_ape_yield(precompile_env.ape_yield && !classic);
         Self {
             inner: Evm {
                 ctx: Context {
@@ -287,23 +288,38 @@ where
                 }
             }
         }
-        Ok(result.map_item(|token| {
-            if is_first_init {
-                // SAFETY: `token` was produced by `start_init` on this stack.
-                unsafe { self.inner.frame_stack.end_init(token) };
-            } else {
-                // SAFETY: `token` was produced by `get_next` on this initialized stack.
-                unsafe { self.inner.frame_stack.push(token) };
-            }
-            let counted_address = {
-                let frame = self.inner.frame_stack.get();
-                Self::counted_frame_address(frame)
+        let ItemOrResult::Item(token) = result else {
+            let ItemOrResult::Result(result) = result else {
+                unreachable!()
             };
-            if let Some(address) = counted_address {
-                self.inner.ctx.chain.enter_contract_frame(address);
+            return Ok(ItemOrResult::Result(result));
+        };
+        if is_first_init {
+            // SAFETY: `token` was produced by `start_init` on this stack.
+            unsafe { self.inner.frame_stack.end_init(token) };
+        } else {
+            // SAFETY: `token` was produced by `get_next` on this initialized stack.
+            unsafe { self.inner.frame_stack.push(token) };
+        }
+        let counted_address = {
+            let frame = self.inner.frame_stack.get();
+            Self::counted_frame_address(frame)
+        };
+        if let Some(address) = counted_address {
+            self.inner.ctx.chain.enter_contract_frame(address);
+        }
+        // ApeChain: nitro `evm.create` disables yield right after the value
+        // transfer, inside the frame's checkpoint.
+        if self.inner.ctx.chain.ape_yield() {
+            let frame = self.inner.frame_stack.get();
+            if let (FrameInput::Create(_), Some(created)) =
+                (&frame.input, frame.data.created_address())
+            {
+                crate::arbitrum::precompile::ape_on_create(&mut self.inner.ctx, created)
+                    .map_err(revm::context_interface::context::ContextError::Db)?;
             }
-            self.inner.frame_stack.get()
-        }))
+        }
+        Ok(ItemOrResult::Item(self.inner.frame_stack.get()))
     }
 
     fn frame_run(
@@ -620,6 +636,101 @@ mod tests {
             },
             Default::default(),
         )
+    }
+
+    fn ape_evm(ape_yield: bool) -> ArbitrumEvm<TestDb, ()> {
+        let mut db = test_db(59);
+        db.insert_account_storage(
+            arbos_state::ARBOS_STATE_ADDRESS,
+            arbos_state::slot_at(&[], leafage_evm_types::ape_yield::APE_SHARE_PRICE_OFFSET),
+            U256::from(1_000_000_007u64),
+        )
+        .expect("seed share price");
+        ArbitrumEvm::new(
+            BlockEnv {
+                gas_limit: 1_000_000,
+                ..Default::default()
+            },
+            CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+            db,
+            (),
+            ArbitrumPrecompileEnv {
+                current_arbos_version: 59,
+                ape_yield,
+                ..Default::default()
+            },
+            ArbitrumExecutionContext::default(),
+        )
+    }
+
+    fn ape_create_tx(value: u64, initcode: Bytes) -> ArbitrumTxEnv {
+        ArbitrumTxEnv::new(
+            TxEnv {
+                caller: Address::with_last_byte(1),
+                gas_limit: 1_000_000,
+                kind: TxKind::Create,
+                value: U256::from(value),
+                data: initcode,
+                ..Default::default()
+            },
+            Default::default(),
+        )
+    }
+
+    fn ape_slots(state: &EvmState, account: Address) -> Option<[U256; 4]> {
+        use leafage_evm_types::ape_yield::{APE_YIELD_ADDRESS, ape_yield_slot};
+        let hash = revm::primitives::keccak256(account);
+        let yield_account = state.get(&APE_YIELD_ADDRESS)?;
+        Some(std::array::from_fn(|i| {
+            yield_account
+                .storage
+                .get(&ape_yield_slot(hash, i))
+                .map(|slot| slot.present_value())
+                .unwrap_or_default()
+        }))
+    }
+
+    #[test]
+    fn ape_create_with_value_disables_yield() {
+        use revm::ExecuteEvm;
+        let mut evm = ape_evm(true);
+        let ResultAndState { result, state } = evm
+            .transact(ape_create_tx(1_000, initcode_returning(&[0x00])))
+            .expect("execute CREATE");
+        assert!(result.is_success(), "{result:?}");
+        let created = Address::with_last_byte(1).create(0);
+        assert_eq!(
+            ape_slots(&state, created),
+            Some([U256::from(1u8) << 248, U256::from(1_000), U256::ZERO, U256::ZERO])
+        );
+    }
+
+    #[test]
+    fn ape_create_then_selfdestruct_leaves_no_yield_fields() {
+        use revm::ExecuteEvm;
+        let beneficiary = Address::with_last_byte(0xbe);
+        let mut initcode = vec![0x73]; // PUSH20 beneficiary
+        initcode.extend_from_slice(beneficiary.as_slice());
+        initcode.push(0xff); // SELFDESTRUCT
+        let mut evm = ape_evm(true);
+        let ResultAndState { result, state } = evm
+            .transact(ape_create_tx(1_000, Bytes::from(initcode)))
+            .expect("execute CREATE");
+        assert!(result.is_success(), "{result:?}");
+        let created = Address::with_last_byte(1).create(0);
+        assert_eq!(ape_slots(&state, created), Some([U256::ZERO; 4]));
+        assert_eq!(state[&beneficiary].info.balance, U256::from(1_000));
+    }
+
+    #[test]
+    fn create_without_ape_yield_writes_no_yield_fields() {
+        use revm::ExecuteEvm;
+        let mut evm = ape_evm(false);
+        let ResultAndState { result, state } = evm
+            .transact(ape_create_tx(1_000, initcode_returning(&[0x00])))
+            .expect("execute CREATE");
+        assert!(result.is_success(), "{result:?}");
+        assert_eq!(ape_slots(&state, Address::with_last_byte(1).create(0)), None);
     }
 
     #[test]

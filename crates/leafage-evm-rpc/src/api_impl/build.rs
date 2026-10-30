@@ -22,7 +22,7 @@ use jsonrpsee::{
 };
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
-use leafage_evm_storage::{BlockIndex, EvmStorageRead};
+use leafage_evm_storage::{ApeYieldStorage, BlockIndex, EvmStorageRead};
 use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
 use tracing::{error, warn};
@@ -255,9 +255,12 @@ where
             ($cfg:expr, $custom_evm_cfg: expr) => {
                 run_chain_setup!($cfg, $custom_evm_cfg, |_api| {})
             };
-            ($cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {{
+            ($cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {
+                run_chain_setup!(self.db, $cfg, $custom_evm_cfg, |$api| $extra)
+            };
+            ($db:expr, $cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {{
                 let mut api_impl = ApiImpl::new(
-                    self.db,
+                    $db,
                     $cfg,
                     $custom_evm_cfg,
                     self.ovm_address.clone(),
@@ -316,7 +319,17 @@ where
                 run_chain_setup!(env, Some(custom_evm_cfg))
             }
             MultiChainCfgEnv::Arbitrum((env, custom_evm_cfg)) => {
-                run_chain_setup!(env, custom_evm_cfg)
+                if custom_evm_cfg.as_ref().is_some_and(|cfg| cfg.ape_yield) {
+                    // ApeChain: resolve balances from the writer's yield slots.
+                    run_chain_setup!(
+                        ApeYieldStorage(self.db),
+                        env,
+                        custom_evm_cfg,
+                        |_api| {}
+                    )
+                } else {
+                    run_chain_setup!(env, custom_evm_cfg)
+                }
             }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
             MultiChainCfgEnv::Celo(env) => {
