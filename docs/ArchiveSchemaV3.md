@@ -105,9 +105,15 @@ with read timestamp `h`: it yields each slot once, at its version `≤ h`.
 The cross-request state cache (`ARCHIVE_STATE_CACHE_MB`) works on v3 as on
 v2. A read only proves its span up to the read height, so a second miss on
 a key probes with a `Get` at the cache view's head: if the newest version
-there is the one just read, the value holds up to the head; otherwise that
-newer version bounds the key's next version from above, and a key whose
-bound is fewer than 64 blocks away is not probed again. A `Get` costs about
+there is the one just read (or, for a key never written, there is none),
+the value holds up to the head; otherwise that newer version bounds the
+key's next version from above, and a key whose bound is fewer than 64
+blocks away is not probed again. A probe that cannot extend the span is
+skipped: a read at the head already reaches it, and a key whose cache entry
+already knows a version above the one read (from an earlier probe or read)
+would only find that version again, since the archive only appends. A
+backfill reads a changing key at ever higher blocks, each time a version
+older than the head's, so only its first miss probes. A `Get` costs about
 what a cache lookup and insert do, so the cache saves little CPU on v3, but
 it halves the RocksDB reads per request (measured below). In production
 the version without it ran out of disk IOPS, see "Production, one pod".
@@ -276,3 +282,31 @@ and second). But it read the disk more per request than v2 (up to 1.55
 against 1.0 reads), and on a read-heavy stretch it hit the volume's 8000
 IOPS for 10 minutes: mean latency rose to 50–100 ms while v2 stayed near
 2 ms. That brought the state cache back on v3.
+
+### State cache probes that cannot pay
+
+On that traffic the head probe was mostly wasted: the backfills read keys
+far below the head, where a changing key's newest version is above the one
+read, so the probe finds it and cannot extend the span. With quick_cache
+(#280) that was 4.9 probes per request, 90 % of them finding a newer
+version. Skipping a probe when the cache entry already knows a version
+above the one read (or the read is at the head) leaves 0.6, with the same
+hit rate.
+
+Same capture and setup as above (8 cores, 9300 rps, 30 GiB, warm page
+cache), on a fresh v3 volume from the 10-29 snapshot, mean of passes 2–3:
+
+| | no state cache | #280 | probe skipping |
+|---|---|---|---|
+| CPU ms / request | 0.443 | 0.447 | 0.400 (−10 %) |
+| RocksDB `Get`s / request, probes included | 15.0 | 12.2 | 7.6 |
+| Storage hits | – | 60.6 % | 63.1 % |
+| p99 ms | 4.3–5.5 | 3.3–5.3 | 2.9–3.3 |
+
+The cache does not lower disk reads in a short run, though. With 12 GiB
+and the host page cache dropped before each run, all three read the disk
+about 2.7–2.8 times per request and stall at the volume's 8000 IOPS
+(~2950 rps, p50 ~42 ms); the cache's hits are hot keys whose blocks the
+8 GiB block cache holds anyway. Whether it saves disk reads in steady
+state, where the keys read again outnumber what the block cache holds, is
+left to a production canary.

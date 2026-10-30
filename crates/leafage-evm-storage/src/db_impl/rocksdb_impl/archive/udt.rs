@@ -1048,8 +1048,9 @@ mod tests {
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 
-    /// State cache probes on v3: a slot unchanged up to the head is cached up
-    /// to the head; a slot with a newer version keeps the span it read.
+    /// State cache probes on v3: a slot unchanged up to the head, written or
+    /// not, is cached up to the head; a slot with a newer version keeps the
+    /// span it read.
     #[test]
     fn test_udt_state_cache_probe() {
         let _g = ARCHIVE_DB_TEST_LOCK
@@ -1101,11 +1102,13 @@ mod tests {
                 k[32..].copy_from_slice(slot.as_slice());
                 k
             };
+            let never = H256::repeat_byte(0x23);
             // The first read caches [10, 15]; the second, a miss at 16 on a
             // key read before, probes.
             for n in [15, 16] {
                 assert_eq!(read(n, stable), (U256::from(1), Some(10)));
                 assert_eq!(read(n, changing), (U256::from(2), Some(10)));
+                assert_eq!(read(n, never), (U256::ZERO, None));
             }
             let cache = db.state_cache.as_ref().unwrap();
             assert!(matches!(
@@ -1113,12 +1116,23 @@ mod tests {
                 Lookup::Hit(_)
             ));
             assert!(matches!(
+                cache.storage.lookup(&key(never), 120),
+                Lookup::Hit(Span { found: false, .. })
+            ));
+            assert!(matches!(
                 cache.storage.lookup(&key(changing), 16),
-                Lookup::Hit(_)
+                Lookup::Hit(Span { lo: 10, hi: 16, .. })
             ));
             assert!(matches!(
                 cache.storage.lookup(&key(changing), 17),
                 Lookup::Miss(_)
+            ));
+            // A later miss on that version extends the span by the read
+            // alone: the probe found version 100.
+            assert_eq!(read(50, changing), (U256::from(2), Some(10)));
+            assert!(matches!(
+                cache.storage.lookup(&key(changing), 50),
+                Lookup::Hit(Span { lo: 10, hi: 50, .. })
             ));
             assert_eq!(read(99, changing), (U256::from(2), Some(10)));
             assert_eq!(read(100, changing), (U256::from(3), Some(100)));

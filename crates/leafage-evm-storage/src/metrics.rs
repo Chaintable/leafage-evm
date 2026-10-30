@@ -44,6 +44,15 @@ pub struct StorageMetrics {
     pub storage_cache_misses: Counter,
     /// Archive state-cache misses that probed for the key's next version.
     pub state_cache_probes: Counter,
+    /// Probes that found a version above the one read, so could not extend
+    /// its span (schema v3) or ended it there (v2).
+    pub state_cache_probes_newer: Counter,
+    /// Misses that skipped the probe: the read was at the head.
+    pub state_cache_probes_skipped_at_head: Counter,
+    /// Misses that skipped the probe: a newer version is known.
+    pub state_cache_probes_skipped_capped: Counter,
+    /// Archive state-cache misses on a key not in the cache.
+    pub state_cache_cold_misses: Counter,
     /// Archive block-info cache hits (cumulative).
     pub block_info_cache_hits: Counter,
     /// Commit block latency.
