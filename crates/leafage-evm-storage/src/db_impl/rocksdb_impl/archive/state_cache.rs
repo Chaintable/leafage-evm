@@ -14,6 +14,9 @@
 //! (versions sort newest-first) and caches the span up to it. That probe costs
 //! about one more seek, so a key whose next version turns out fewer than
 //! [`VOLATILE_SPAN`] blocks later is marked volatile and never probed again.
+//! On schema v3 the probe is a `Get` at the head instead: the newest version
+//! is the read one if the value holds up to the head, otherwise it bounds the
+//! next version from above.
 //!
 //! **Staying correct.** The archive only appends final blocks above its
 //! head: reorgs are resolved in the in-memory diff layers, and rewind is an
@@ -175,10 +178,25 @@ where
         span: Span<V>,
         next_version_found: bool,
     ) {
-        self.cache.insert(
-            Key(key),
-            Arc::new(merge(prev.as_deref(), span, next_version_found)),
-        );
+        // When the next version ended the span, it sits at `hi + 1`.
+        let short = next_version_found && span.hi + 1 - span.lo < VOLATILE_SPAN;
+        self.cache
+            .insert(Key(key), Arc::new(merge(prev.as_deref(), span, short)));
+    }
+
+    /// Schema v3 [`Self::record`]: `newer` is a version above the span,
+    /// found by probing at the head. It bounds the key's next version from
+    /// above.
+    pub(super) fn record_udt(
+        &self,
+        key: [u8; N],
+        prev: Option<Arc<Entry<V>>>,
+        span: Span<V>,
+        newer: Option<u64>,
+    ) {
+        let short = newer.is_some_and(|n| n - span.lo < VOLATILE_SPAN);
+        self.cache
+            .insert(Key(key), Arc::new(merge(prev.as_deref(), span, short)));
     }
 }
 
@@ -246,7 +264,7 @@ impl StateCache {
 fn merge<V: Copy + PartialEq + std::fmt::Debug>(
     prev: Option<&Entry<V>>,
     span: Span<V>,
-    next_version_found: bool,
+    short: bool,
 ) -> Entry<V> {
     let kept: &[Span<V>] = prev.map_or(&[], |e| &e.spans);
     // Spans of different versions never overlap, and two reads that found
@@ -282,9 +300,7 @@ fn merge<V: Copy + PartialEq + std::fmt::Debug>(
         }
         spans.push(span);
     }
-    // When the next version ended the span, it sits at `hi + 1`.
-    let volatile = prev.is_some_and(|e| e.volatile)
-        || (next_version_found && span.hi + 1 - span.lo < VOLATILE_SPAN);
+    let volatile = prev.is_some_and(|e| e.volatile) || short;
     Entry { volatile, spans }
 }
 

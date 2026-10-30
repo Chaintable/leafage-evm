@@ -102,10 +102,15 @@ pointer).
 `read_storage_slots(address)` at `h` is an iterator over the address prefix
 with read timestamp `h`: it yields each slot once, at its version `≤ h`.
 
-A v3 archive has no cross-request state cache (`ARCHIVE_STATE_CACHE_MB` is
-ignored). A `Get` costs about what a cache lookup and insert do, and
-without the cache v3 uses less CPU and has lower latency (measured below,
-also with the cache probing at the head to learn whole spans).
+The cross-request state cache (`ARCHIVE_STATE_CACHE_MB`) works on v3 as on
+v2. A read only proves its span up to the read height, so a second miss on
+a key probes with a `Get` at the cache view's head: if the newest version
+there is the one just read, the value holds up to the head; otherwise that
+newer version bounds the key's next version from above, and a key whose
+bound is fewer than 64 blocks away is not probed again. A `Get` costs about
+what a cache lookup and insert do, so the cache saves little CPU on v3, but
+it halves the RocksDB reads per request (measured below). In production
+the version without it ran out of disk IOPS, see "Production, one pod".
 
 ## Writes
 
@@ -258,5 +263,16 @@ ranking:
 | Slowest 1 % | 8.4 ms | 2.6 (−69 %) | 2.4 (−72 %) |
 | Slowest 0.1 % | 26.9 ms | 4.3 (−84 %) | 3.5 (−87 %) |
 
-The heaviest requests gain the most. Without the state cache v3 is again a
-little cheaper than with it, which settled running v3 without it.
+The heaviest requests gain the most. Without the state cache v3 is a
+little cheaper in CPU, but it reads RocksDB more than twice as often.
+
+### Production, one pod
+
+v3 without the state cache served as one of 22 bsc archive pods
+(2026-10-29/30, gp3 8000 IOPS / 125 MB/s like the others), against v2
+pods on the same traffic. CPU per request was about 40 % lower and p99
+stayed near 5 ms while v2 queued (up to 450 ms at 9–15 k requests per pod
+and second). But it read the disk more per request than v2 (up to 1.55
+against 1.0 reads), and on a read-heavy stretch it hit the volume's 8000
+IOPS for 10 minutes: mean latency rose to 50–100 ms while v2 stayed near
+2 ms. That brought the state cache back on v3.

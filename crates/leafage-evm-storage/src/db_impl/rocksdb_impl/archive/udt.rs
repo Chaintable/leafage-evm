@@ -1026,7 +1026,7 @@ mod tests {
         let v3 = {
             let db = Arc::new(DataBaseRef::open(&v3_dir, 64, false, false));
             assert!(db.udt);
-            assert!(db.state_cache.is_none());
+            assert!(db.state_cache.is_some());
             let converted_reads = read_all(&db, converted, &mut rng);
             append(&db, &diffs[split..]);
             (
@@ -1044,6 +1044,86 @@ mod tests {
         assert_eq!(&v2[..=split], &v3.0[..], "converted");
         assert_eq!(v2, v3.1, "converted + appended");
         assert_eq!(v2, v3.2, "converted + appended, read again");
+        let _ = std::fs::remove_dir_all(&base);
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
+    }
+
+    /// State cache probes on v3: a slot unchanged up to the head is cached up
+    /// to the head; a slot with a newer version keeps the span it read.
+    #[test]
+    fn test_udt_state_cache_probe() {
+        let _g = ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
+        let base = std::env::temp_dir().join(format!("leafage-udt-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (v2_dir, v3_dir) = (base.join("v2"), base.join("v3"));
+        let (stable, changing) = (H256::repeat_byte(0x21), H256::repeat_byte(0x22));
+        let slot = H256::repeat_byte(0x10);
+        let write = |address: H256, value: u64| AccountStorageDiff {
+            address,
+            diffs: vec![IndexValuePair {
+                index: slot,
+                value: U256::from(value),
+            }],
+        };
+        let diffs: Vec<(u64, BlockStorageDiff)> = (1..=120u64)
+            .map(|n| {
+                let mut diff = BlockStorageDiff::default();
+                match n {
+                    10 => diff.storage_diffs = vec![write(stable, 1), write(changing, 2)],
+                    100 => diff.storage_diffs = vec![write(changing, 3)],
+                    _ => {}
+                }
+                (n, diff)
+            })
+            .collect();
+        {
+            let db = Arc::new(DataBaseRef::open(&v2_dir, 64, false, false));
+            db.write_encoding_marker(true).unwrap();
+            append(&db, &diffs);
+        }
+        DataBaseRef::convert_inverted_to_udt(&v2_dir, &v3_dir, 64, 3).unwrap();
+        {
+            let db = Arc::new(DataBaseRef::open(&v3_dir, 64, false, false));
+            assert!(db.udt);
+            let read = |n: u64, address: H256| {
+                db.db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap()
+                    .read_storage_and_height(address, slot)
+                    .unwrap()
+            };
+            let key = |address: H256| {
+                let mut k = [0u8; 64];
+                k[..32].copy_from_slice(address.as_slice());
+                k[32..].copy_from_slice(slot.as_slice());
+                k
+            };
+            // The first read caches [10, 15]; the second, a miss at 16 on a
+            // key read before, probes.
+            for n in [15, 16] {
+                assert_eq!(read(n, stable), (U256::from(1), Some(10)));
+                assert_eq!(read(n, changing), (U256::from(2), Some(10)));
+            }
+            let cache = db.state_cache.as_ref().unwrap();
+            assert!(matches!(
+                cache.storage.lookup(&key(stable), 120),
+                Lookup::Hit(_)
+            ));
+            assert!(matches!(
+                cache.storage.lookup(&key(changing), 16),
+                Lookup::Hit(_)
+            ));
+            assert!(matches!(
+                cache.storage.lookup(&key(changing), 17),
+                Lookup::Miss(_)
+            ));
+            assert_eq!(read(99, changing), (U256::from(2), Some(10)));
+            assert_eq!(read(100, changing), (U256::from(3), Some(100)));
+            assert_eq!(read(120, stable), (U256::from(1), Some(10)));
+        }
         let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }

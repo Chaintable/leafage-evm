@@ -304,8 +304,7 @@ pub struct DataBaseRef {
     /// `None` = disabled via `ARCHIVE_BLOCK_INFO_CACHE=0`.
     block_info_cache: Option<MokaCache<H256, BlockInfo>>,
     /// Cross-request account/storage read cache, see [`StateCache`]. Only
-    /// built for a serving node (not bulk load or maintenance) on schema v1 /
-    /// v2: a v3 point lookup costs about what a cache lookup does.
+    /// built for a serving node (not bulk load or maintenance).
     state_cache: Option<StateCache>,
     /// Schema v3: account/storage versions keyed by a user-defined timestamp
     /// (see [`udt`]), read with timestamped point lookups.
@@ -1102,7 +1101,7 @@ impl DataBaseRef {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
             code_cache: build_code_cache(),
             block_info_cache: build_block_info_cache(),
-            state_cache: if serving && !udt {
+            state_cache: if serving {
                 StateCache::from_env()
             } else {
                 None
@@ -2351,6 +2350,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
             tracker_id,
             timed_out,
             udt: self.udt.then(|| udt::UdtReader::new(block_num)),
+            udt_head: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -2506,6 +2506,9 @@ pub struct StateDB {
     timed_out: Option<TimeoutFlag>,
     /// Schema v3: read options at `block_num` for timestamped lookups.
     udt: Option<udt::UdtReader>,
+    /// Schema v3: read options at the cache view's head, for state cache
+    /// probes; created on the first probe.
+    udt_head: std::sync::OnceLock<udt::UdtReader>,
 }
 
 impl Clone for StateDB {
@@ -2530,6 +2533,7 @@ impl Clone for StateDB {
             tracker_id,
             timed_out,
             udt: self.db.udt.then(|| udt::UdtReader::new(self.block_num)),
+            udt_head: std::sync::OnceLock::new(),
         }
     }
 }
@@ -2565,6 +2569,27 @@ impl StateDB {
             }
         }
         Ok(())
+    }
+
+    /// Schema v3 state cache probe of `key`, whose version at `block_num` is
+    /// `version`: the span's end and, if the key has a version above
+    /// `version` at or below the head, that version.
+    fn udt_probe(
+        &self,
+        view: &state_cache::ReadView,
+        col: StorageTypeColumn,
+        key: &[u8],
+        version: u64,
+    ) -> Result<(u64, Option<u64>), Error> {
+        STORAGE_METRICS.state_cache_probes.increment(1);
+        let reader = self
+            .udt_head
+            .get_or_init(|| udt::UdtReader::new(view.head()));
+        let newest = reader.get(self.db.db, col, key)?.map(|f| f.block);
+        Ok(match newest {
+            Some(newest) if newest > version => (self.block_num, Some(newest)),
+            _ => (view.head(), None),
+        })
     }
 }
 
@@ -2606,6 +2631,21 @@ impl StateDB {
             let (value, version) = found.map_or((U256::ZERO, None), |f| {
                 (decode_storage(f.value()), Some(f.block))
             });
+            if let Some((view, cache)) = cache {
+                let (hi, newer) = match version {
+                    Some(v) if StateCache::should_probe(&cached) => {
+                        self.udt_probe(view, StorageTypeColumn::AddressToStorage, &slot_key, v)?
+                    }
+                    _ => (self.block_num, None),
+                };
+                let span = Span {
+                    lo: version.unwrap_or(0),
+                    hi,
+                    found: version.is_some(),
+                    value,
+                };
+                cache.storage.record_udt(slot_key, cached, span, newer);
+            }
             return Ok((value, version));
         }
 
@@ -2738,7 +2778,31 @@ impl StateDBRead for StateDB {
             STORAGE_METRICS
                 .read_account_latency
                 .record(start.elapsed().as_secs_f64());
-            return Ok(found.and_then(|f| decode_account(address, f.value())));
+            let version = found.as_ref().map(|f| f.block);
+            let account = found.and_then(|f| decode_account(address, f.value()));
+            if let Some((view, cache)) = cache {
+                let (hi, newer) = match version {
+                    Some(v) if StateCache::should_probe(&cached) => self.udt_probe(
+                        view,
+                        StorageTypeColumn::AddressToAccount,
+                        address.as_slice(),
+                        v,
+                    )?,
+                    _ => (self.block_num, None),
+                };
+                let span = Span {
+                    lo: version.unwrap_or(0),
+                    hi,
+                    found: version.is_some(),
+                    value: account.as_ref().map(|account| CachedAccount {
+                        balance: account.balance,
+                        nonce: account.nonce,
+                        code_hash: account.code_hash,
+                    }),
+                };
+                cache.accounts.record_udt(address.0, cached, span, newer);
+            }
+            return Ok(account);
         }
         let mut account_iter_guard = self.iterators.account_iterator.lock().unwrap();
         let account_iter = account_iter_guard
