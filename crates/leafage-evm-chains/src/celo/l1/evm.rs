@@ -1,6 +1,6 @@
 use super::{
     consensus::CeloChainData,
-    precompile::{Failure, L1Precompiles},
+    precompile::{Failure, InspectingPrecompiles, L1Precompiles},
     CeloL1Config, L1Fork,
 };
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};
@@ -8,7 +8,7 @@ use revm::context::{ContextSetters, ContextTr, Evm, FrameStack, TxEnv};
 use revm::context_interface::{
     cfg::gas_params::{GasId, GasParams},
     result::{EVMError, ExecutionResult, HaltReason, ResultAndState},
-    JournalTr,
+    JournalTr, LocalContextTr,
 };
 use revm::handler::{
     evm::{ContextDbError, FrameInitResult},
@@ -37,7 +37,9 @@ pub struct CeloL1Evm<'a, CTX, I> {
 
 macro_rules! evm_impl {
     ($context:ty) => {
-        impl<'a, 'b, DB: Database, I> EvmTr for CeloL1Evm<'a, $context, I> {
+        impl<'a, 'b, DB: Database, I: Inspector<CeloL1Context<DB>>> EvmTr
+            for CeloL1Evm<'a, $context, I>
+        {
             type Context = $context;
             type Instructions = EthInstructions<EthInterpreter, Self::Context>;
             type Precompiles = L1Precompiles<'a>;
@@ -75,7 +77,10 @@ macro_rules! evm_impl {
                 let result = EthFrame::init_with_context(
                     slot,
                     &mut self.inner.ctx,
-                    &mut self.inner.precompiles,
+                    &mut InspectingPrecompiles {
+                        precompiles: &mut self.inner.precompiles,
+                        inspector: &mut self.inner.inspector,
+                    },
                     init,
                 )?;
                 match result {
@@ -124,7 +129,9 @@ macro_rules! evm_impl {
 evm_impl!(CeloL1Context<DB>);
 evm_impl!(&'b mut CeloL1Context<DB>);
 
-impl<DB: Database, I> ExecuteEvm for CeloL1Evm<'_, CeloL1Context<DB>, I> {
+impl<DB: Database, I: Inspector<CeloL1Context<DB>>> ExecuteEvm
+    for CeloL1Evm<'_, CeloL1Context<DB>, I>
+{
     type ExecutionResult = ExecutionResult<HaltReason>;
     type State = EvmState;
     type Error = EVMError<DB::Error>;
@@ -145,7 +152,9 @@ impl<DB: Database, I> ExecuteEvm for CeloL1Evm<'_, CeloL1Context<DB>, I> {
         Ok(ResultAndState::new(result, self.finalize()))
     }
 }
-impl<DB: Database + DatabaseCommit, I> ExecuteCommitEvm for CeloL1Evm<'_, CeloL1Context<DB>, I> {
+impl<DB: Database + DatabaseCommit, I: Inspector<CeloL1Context<DB>>> ExecuteCommitEvm
+    for CeloL1Evm<'_, CeloL1Context<DB>, I>
+{
     fn commit(&mut self, state: EvmState) {
         self.inner.ctx.db_mut().commit(state);
     }
@@ -166,33 +175,51 @@ impl<DB: Database + DatabaseCommit, I: Inspector<CeloL1Context<DB>>> InspectComm
     for CeloL1Evm<'_, CeloL1Context<DB>, I>
 {
 }
-impl<DB: Database, I: Inspector<CeloL1Context<DB>>> InspectorEvmTr
-    for CeloL1Evm<'_, CeloL1Context<DB>, I>
-{
-    type Inspector = I;
-    fn all_inspector(
-        &self,
-    ) -> (
-        &Self::Context,
-        &Self::Instructions,
-        &Self::Precompiles,
-        &FrameStack<EthFrame>,
-        &I,
-    ) {
-        self.inner.all_inspector()
-    }
-    fn all_mut_inspector(
-        &mut self,
-    ) -> (
-        &mut Self::Context,
-        &mut Self::Instructions,
-        &mut Self::Precompiles,
-        &mut FrameStack<EthFrame>,
-        &mut I,
-    ) {
-        self.inner.all_mut_inspector()
-    }
+macro_rules! inspector_evm_impl {
+    ($context:ty) => {
+        impl<'b, DB: Database, I: Inspector<CeloL1Context<DB>> + Inspector<$context>> InspectorEvmTr
+            for CeloL1Evm<'_, $context, I>
+        {
+            type Inspector = I;
+            fn all_inspector(
+                &self,
+            ) -> (
+                &Self::Context,
+                &Self::Instructions,
+                &Self::Precompiles,
+                &FrameStack<EthFrame>,
+                &I,
+            ) {
+                (
+                    &self.inner.ctx,
+                    &self.inner.instruction,
+                    &self.inner.precompiles,
+                    &self.inner.frame_stack,
+                    &self.inner.inspector,
+                )
+            }
+            fn all_mut_inspector(
+                &mut self,
+            ) -> (
+                &mut Self::Context,
+                &mut Self::Instructions,
+                &mut Self::Precompiles,
+                &mut FrameStack<EthFrame>,
+                &mut I,
+            ) {
+                (
+                    &mut self.inner.ctx,
+                    &mut self.inner.instruction,
+                    &mut self.inner.precompiles,
+                    &mut self.inner.frame_stack,
+                    &mut self.inner.inspector,
+                )
+            }
+        }
+    };
 }
+inspector_evm_impl!(CeloL1Context<DB>);
+inspector_evm_impl!(&'b mut CeloL1Context<DB>);
 
 fn invalid<H: revm::interpreter::Host>(
     _: InstructionContext<'_, H, EthInterpreter>,
@@ -287,6 +314,32 @@ pub(super) fn system_call<DB: Database>(
     is_static: bool,
     unmetered: bool,
 ) -> Result<Bytes, Failure> {
+    let result = system_call_inspected(
+        context, fork, chain, caller, to, input, gas, is_static, unmetered, None,
+    )
+    .map_err(Failure::Node)?;
+    if result.result.is_ok() {
+        Ok(result.output)
+    } else {
+        Err(Failure::Invalid)
+    }
+}
+
+/// Native internal EVM call. Unlike a transaction, it neither increments the
+/// nonce nor settles fees. The result and journal logs are available to the
+/// block replayer, including EVM failures (database errors remain fatal).
+pub fn system_call_inspected<DB: Database>(
+    context: &mut CeloL1Context<DB>,
+    fork: L1Fork,
+    chain: &dyn CeloChainData,
+    caller: Address,
+    to: Address,
+    input: Bytes,
+    gas: u64,
+    is_static: bool,
+    unmetered: bool,
+    inspector: Option<&mut dyn Inspector<CeloL1Context<DB>>>,
+) -> Result<revm::interpreter::InterpreterResult, String> {
     let depth = context.journaled_state.depth();
     let previous_warmth = unmetered.then(|| {
         let tx_id = context.journaled_state.transaction_id;
@@ -309,12 +362,12 @@ pub(super) fn system_call<DB: Database>(
     let caller_cold = context
         .journaled_state
         .load_account(caller)
-        .map_err(|e| Failure::Node(e.to_string()))?
+        .map_err(|e| e.to_string())?
         .is_cold;
     let account = context
         .journaled_state
         .load_account_with_code(to)
-        .map_err(|e| Failure::Node(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     let to_cold = account.is_cold;
     let known_bytecode = (
         account.info.code_hash(),
@@ -383,23 +436,28 @@ pub(super) fn system_call<DB: Database>(
         is_static,
         charged_new_account_state_gas: false,
     };
+    let inspected = inspector.is_some();
+    let mut noop = revm::inspector::NoOpInspector;
     let mut evm = CeloL1Evm {
         inner: Evm {
             ctx: &mut *context,
-            inspector: (),
+            inspector: super::inspect::BorrowedInspector(inspector.unwrap_or(&mut noop)),
             instruction,
             precompiles: L1Precompiles::new(fork, chain),
             frame_stack: FrameStack::new_prealloc(8),
         },
     };
-    let result = MainnetHandler::<_, EVMError<DB::Error>, EthFrame>::default().run_exec_loop(
-        &mut evm,
-        FrameInit {
-            depth,
-            memory: SharedMemory::new(),
-            frame_input: FrameInput::Call(Box::new(inputs)),
-        },
-    );
+    let init = FrameInit {
+        depth,
+        memory: SharedMemory::new_with_buffer(evm.inner.ctx.local.shared_memory_buffer().clone()),
+        frame_input: FrameInput::Call(Box::new(inputs)),
+    };
+    let mut handler = MainnetHandler::<_, EVMError<DB::Error>, EthFrame>::default();
+    let result = if inspected {
+        handler.inspect_run_exec_loop(&mut evm, init)
+    } else {
+        handler.run_exec_loop(&mut evm, init)
+    };
     context.cfg = previous_cfg;
     context.local = previous_local;
     if let Some((accounts, slots)) = previous_warmth {
@@ -414,12 +472,7 @@ pub(super) fn system_call<DB: Database>(
             }
         }
     }
-    let result = result
-        .map_err(|e| Failure::Node(e.to_string()))?
-        .into_interpreter_result();
-    if result.result.is_ok() {
-        Ok(result.output)
-    } else {
-        Err(Failure::Invalid)
-    }
+    result
+        .map(|r| r.into_interpreter_result())
+        .map_err(|e| e.to_string())
 }

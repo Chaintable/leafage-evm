@@ -37,6 +37,7 @@ pub struct ApiBuilder<DB> {
     historical_height: Option<u64>,
     trace_block_client: Option<HttpClient>,
     trace_block_check_state: bool,
+    celo_trace_source: Option<crate::ReplayDataSource>,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
     warmup_erc20_addresses: Option<(Address, Vec<Address>)>,
     token_collector: Option<TokenCollector>,
@@ -60,6 +61,7 @@ where
             historical_height: None,
             trace_block_client: None,
             trace_block_check_state: true,
+            celo_trace_source: None,
             replay_blocks: None,
             warmup_erc20_addresses: None,
             token_collector: None,
@@ -71,6 +73,11 @@ where
 
     pub fn with_ovm_address(mut self, ovm_address: Option<Address>) -> Self {
         self.ovm_address = ovm_address;
+        self
+    }
+
+    pub fn with_celo_trace_source(mut self, source: Option<crate::ReplayDataSource>) -> Self {
+        self.celo_trace_source = source;
         self
     }
 
@@ -211,12 +218,10 @@ where
         estimate_gas_buffer: u64,
         listen_backlog: u32,
     ) -> std::io::Result<ServerHandle> {
-        let exec_limiter = (self.evm_exec_concurrency > 0).then(|| {
-            std::sync::Arc::new(tokio::sync::Semaphore::new(self.evm_exec_concurrency))
-        });
-        let state_read_limiter = (self.state_read_concurrency > 0).then(|| {
-            std::sync::Arc::new(tokio::sync::Semaphore::new(self.state_read_concurrency))
-        });
+        let exec_limiter = (self.evm_exec_concurrency > 0)
+            .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(self.evm_exec_concurrency)));
+        let state_read_limiter = (self.state_read_concurrency > 0)
+            .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(self.state_read_concurrency)));
         // A parallel multicall holds one exec permit per worker, so more
         // workers than permits would deadlock on acquire_many.
         let multicall_parallelism = if self.evm_exec_concurrency > 0 {
@@ -323,7 +328,19 @@ where
                 run_chain_setup!(env, Some(leafage_evm_chains::celo::CeloConfig))
             }
             MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L1(env)) => {
-                run_chain_setup!(env, Some(leafage_evm_chains::celo::l1::CeloL1Config))
+                run_chain_setup!(
+                    env,
+                    Some(leafage_evm_chains::celo::l1::CeloL1Config),
+                    |api| {
+                        if is_archive {
+                            if let Some(source) = self.celo_trace_source.take() {
+                                rpc_module
+                                    .merge(super::celo::trace::CeloTrace { api, source }.into_rpc())
+                                    .map_err(std::io::Error::other)?;
+                            }
+                        }
+                    }
+                )
             }
             MultiChainCfgEnv::Base(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)

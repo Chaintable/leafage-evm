@@ -233,7 +233,7 @@ fn celo_block_opcodes_follow_the_native_activation_schedule() {
                 },
                 config(),
                 db,
-                (),
+                revm::inspector::NoOpInspector,
                 &NoChain,
             )
             .unwrap();
@@ -317,7 +317,7 @@ fn token_transfer_uses_live_registry_returns_input_and_rolls_back() {
             },
             config(),
             token_db(revert),
-            (),
+            revm::inspector::NoOpInspector,
             &NoChain,
         )
         .unwrap();
@@ -358,7 +358,7 @@ fn missing_consensus_header_is_not_an_evm_success() {
         },
         config(),
         token_db(false),
-        (),
+        revm::inspector::NoOpInspector,
         &NoChain,
     )
     .unwrap();
@@ -427,7 +427,7 @@ fn tobin_tax_applies_before_call_and_create_and_reverts_with_them() {
                     },
                     config(),
                     db,
-                    (),
+                    revm::inspector::NoOpInspector,
                     &NoChain,
                 )
                 .unwrap();
@@ -595,7 +595,7 @@ fn native_opcode_gas_at_fork_boundaries() {
             },
             config(),
             db,
-            (),
+            revm::inspector::NoOpInspector,
             &NoChain,
         )
         .unwrap();

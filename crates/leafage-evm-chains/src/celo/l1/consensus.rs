@@ -246,6 +246,24 @@ impl CeloHeader {
         }
         keccak256(header.encode())
     }
+
+    /// Istanbul proposer, which can differ from the fee-recipient coinbase.
+    pub fn proposer(&self) -> Result<Address, String> {
+        let mut extra = self.extra().map_err(|_| "invalid Istanbul extra data")?;
+        let signature =
+            alloy::primitives::Signature::from_raw(&extra.proposer).map_err(|e| e.to_string())?;
+        extra.proposer = Bytes::new();
+        extra.seal = Seal::default();
+        let i = self.extra_index();
+        let mut bytes = self.fields[i][..32].to_vec();
+        extra.encode(&mut bytes);
+        let mut header = self.clone();
+        header.fields[i] = bytes.into();
+        // Native GetSignatureAddress hashes the sigHash once more.
+        signature
+            .recover_address_from_prehash(&keccak256(keccak256(header.encode())))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Clone, Debug)]
