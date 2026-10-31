@@ -53,7 +53,7 @@ One malformed-input behavior is deliberately hardened: a zero denominator in
 `fractionMulExp` fails the EVM call. The old Go implementation can panic while
 dividing by zero because its zero check compares pointers.
 
-## Transaction blockfiles
+## Complete pipeline output
 
 An L1 archive with `--rpc-addr=http://127.0.0.1:8665` exposes
 `trace_debankBlock`. Leafage reads complete transactions and receipts from
@@ -64,19 +64,29 @@ Celo's final system receipt when present. `--trace-block-rpc` is also accepted
 as a fallback when `--rpc-addr` is absent.
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"trace_debankBlock","params":["0x1d9e273",{"stateDiff":false}]}
+{"jsonrpc":"2.0","id":1,"method":"trace_debankBlock","params":["0x1d9e273"]}
 ```
 
-The response contains `block_file`, `header` and `validation_hash`. Omitting
-options also requests only this transaction output. `stateDiff:true` is
-rejected: the canonical `state_diff`, which includes consensus finalization
-and epoch rewards, must still come from native Celo. Genesis exposes the
-Registry's initial storage allocation with empty transaction/trace lists.
+The response contains `block_file`, `header`, `state_diff` and
+`validation_hash`, with the same default options as BSC. `stateDiff:false`
+omits only the StateDiff field. One local replay collects both transaction
+traces and state changes, using the shared BSC `RecordingDb` / `ChangeSet`
+and RLP encoding. It also executes Celo's initial supply, gas-price minimum
+update and epoch reward settlement. Historical epoch uptime comes from
+canonical archived parent-seal bitmaps and the exchange rate from the parent
+state. No upstream trace or StateDiff RPC is called.
+
+Genesis exposes its full allocation in StateDiff and the Registry's initial
+storage allocation in `storage_contracts`, with empty transaction/trace lists.
+Legacy consensus header encoding is selected by fork height even when old
+archives contain Ethereum compatibility fields such as `sha3Uncles`.
 
 Replay verifies the archived Celo header hash, signed transaction encodings,
 recovered senders, transaction root, receipt root and log identities. It then
-checks every transaction's gas, status and complete receipt logs. A mismatch
-fails the RPC instead of returning a partial blockfile. Before transactions,
+checks every transaction's gas, status and complete receipt logs, plus the
+finalization receipt logs. As in BSC, the default also checks all recorded
+account and slot changes against the block's archive state. A mismatch
+fails the RPC instead of returning partial pipeline data. Before transactions,
 it applies the block randomness call; fees retain native debit, balance
 query, refund and credit ordering. Celo fee-currency and gateway fields are
 kept for execution even though the analytical `txs` output omits them.
@@ -119,15 +129,25 @@ configuration test passed separately.
 
 `scripts/export_celo_replay_inputs.py` saves immutable, hash-named block and
 receipt fixtures from RPC. `scripts/check_celo_l1_trace.py` caches native
-reference output, then compares every field of `block_file`, `header` and
-`validation_hash`, including array ordering. For example:
+reference output in native `archive` mode, then compares every field of
+`block_file`, `header` and `validation_hash`, including array ordering.
+`--state-diff` also compares all decoded StateDiff entries, sorting only the
+unordered Go map lists. Use a separate cache from old native `replay` output:
+replay can include unchanged account writes and deletion of already-absent
+empty accounts, while archive mode describes net changes. For example:
 
 ```sh
 python3 scripts/check_celo_l1_trace.py \
   --oracle http://127.0.0.1:8665 --candidate http://127.0.0.1:8567 \
-  --blocks 6773999,6774000,11838439,11838440,21615999,21616000,31056499 \
+  --state-diff --blocks 6773999,6774000,11838439,11838440,21615999,21616000,31056499 \
   --cache /data/celo-reference --output /data/celo-comparison
 ```
+
+`scripts/benchmark_celo_l1_trace.py` measures the complete response on both
+endpoints, including StateDiff and upstream transaction fetching. It checks
+the outputs match, warms both endpoints, and alternates their measurement
+order. Results describe the chosen historical blocks and cache conditions,
+not a cold-cache throughput guarantee.
 
 The system-call regression also checks that metered SLOAD/SSTORE accesses
 warm the storage owner, including the pre-Espresso, Espresso and Gingerbread

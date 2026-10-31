@@ -1,6 +1,5 @@
-//! Replay only L1 transactions, like native traceDebankTransactions. Epoch
-//! finalization is deliberately outside the blockfile; it belongs to the
-//! canonical state-diff producer.
+//! Replay Celo L1 transactions and finalization, sharing BSC's state-change
+//! collection and encoding. Consensus calls affect StateDiff, not tx traces.
 use super::super::l1::ArchiveChain;
 use super::{
     fees::{abi, word, CeloTransactionHandler, System},
@@ -8,25 +7,27 @@ use super::{
 };
 use crate::pipeline::{
     build::{pipeline_block, pipeline_header},
+    chain::ReplayOptions,
+    changes::RecordingDb,
     convert::append_celo_tx_traces,
     inspector::PipelineInspector,
     types::{addr_hex, hash_hex, BlockFile, DebankBlockOutput, PipelineTransaction},
 };
 use alloy::{
-    primitives::{Address, U256},
+    primitives::{keccak256, Address, U256},
     rpc::types::Block,
 };
 use anyhow::{ensure, Context as _, Result};
 use leafage_evm_chains::celo::l1::{consensus::CeloHeader, evm::create_celo_l1_evm, L1Fork};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrapper};
-use leafage_evm_types::{BlockId, BlockInfo, MainnetSpecId};
+use leafage_evm_types::{BlockId, BlockInfo, MainnetSpecId, NewAccount};
 use revm::{
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::JournalTr,
     database::CacheDB,
     inspector::{InspectorHandler, NoOpInspector},
     primitives::TxKind,
-    DatabaseCommit, ExecuteEvm,
+    DatabaseCommit, DatabaseRef, ExecuteEvm,
 };
 use std::{
     cell::Cell,
@@ -34,7 +35,7 @@ use std::{
     marker::PhantomData,
 };
 
-fn environment(h: &alloy::rpc::types::Header) -> BlockEnv {
+pub(super) fn environment(h: &alloy::rpc::types::Header) -> BlockEnv {
     BlockEnv {
         number: U256::from(h.number),
         beneficiary: h.beneficiary,
@@ -47,7 +48,7 @@ fn environment(h: &alloy::rpc::types::Header) -> BlockEnv {
         ..Default::default()
     }
 }
-fn config() -> CfgEnv<MainnetSpecId> {
+pub(super) fn config() -> CfgEnv<MainnetSpecId> {
     let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::LONDON);
     cfg.chain_id = 42220;
     cfg.disable_eip3607 = true;
@@ -62,6 +63,7 @@ pub(super) fn replay<DB>(
     info: &BlockInfo,
     parent: Option<&BlockInfo>,
     input: BlockInput,
+    options: ReplayOptions,
 ) -> Result<DebankBlockOutput>
 where
     DB: BlockIndex + EvmStorageRead,
@@ -86,11 +88,16 @@ where
     let state = db
         .state_at(BlockId::Hash(parent.header.hash.into()))?
         .context("parent state is not in the archive")?;
-    let mut cache = CacheDB::new(EvmStorageWrapper {
+    let parent_state = EvmStorageWrapper {
         db: state,
         ovm_address: None,
         normalize_state_key: false,
-    });
+    };
+    let mut cache = RecordingDb::new(
+        CacheDB::new(parent_state.clone()),
+        options.state_diff || options.check_state,
+        true,
+    );
     let chain = ArchiveChain(db);
     let system = System {
         fork,
@@ -145,7 +152,7 @@ where
             _ => 32_000_000,
         };
     }
-    if input.transactions.is_empty() {
+    if number == 0 {
         // Celo mainnet's genesis allocation has storage only at Registry.
         // Native blockfiles expose that allocation without synthetic txs.
         if number == 0 {
@@ -156,7 +163,11 @@ where
         return Ok(DebankBlockOutput {
             block_file,
             header,
-            state_diff: None,
+            state_diff: options
+                .state_diff
+                .then(|| super::genesis::state_diff(&parent_state, &input.header))
+                .transpose()?
+                .map(|diff| alloy::rlp::encode(diff).into()),
             validation_hash,
         });
     }
@@ -338,12 +349,85 @@ where
         });
     }
     ensure!(cumulative == input.header.gas_used, "block gas mismatch");
+    if options.state_diff || options.check_state {
+        super::finalize::finalize(
+            &mut cache,
+            &chain,
+            &input,
+            &parent_state,
+            &parent.header,
+            block,
+        )?;
+    }
+    if let Some(error) = cache.error.take() {
+        return Err(error.into());
+    }
+    let state_diff = if let Some(changes) = &cache.changes {
+        let post = EvmStorageWrapper {
+            db: db
+                .state_at(BlockId::Hash(info.header.hash.into()))?
+                .context("post state is not in the archive")?,
+            ovm_address: None,
+            normalize_state_key: false,
+        };
+        if options.check_state {
+            changes.verify(&post)?;
+        }
+        if options.state_diff {
+            let mut diff = changes.to_storage_diff(
+                &cache.db,
+                Some(&parent_state),
+                info.header.state_root,
+                parent.header.state_root,
+            )?;
+            // Native Celo's archive diff also lists account leaves whose only
+            // change was the storage root. Keep the shared BSC net-change
+            // collector and adapt only this serialization convention.
+            let addresses: HashMap<_, _> = cache
+                .db
+                .cache
+                .accounts
+                .keys()
+                .map(|address| (keccak256(address), *address))
+                .collect();
+            diff.storage_diffs
+                .retain(|s| !diff.deleted_accounts.contains(&s.address));
+            for storage in &diff.storage_diffs {
+                if diff
+                    .new_accounts
+                    .iter()
+                    .any(|a| a.address == storage.address)
+                {
+                    continue;
+                }
+                let address = addresses
+                    .get(&storage.address)
+                    .context("changed account preimage missing")?;
+                let account = cache
+                    .db
+                    .basic_ref(*address)?
+                    .context("changed account missing")?;
+                diff.new_accounts.push(NewAccount {
+                    address: storage.address,
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                });
+            }
+            diff.new_accounts.sort_by_key(|a| a.address);
+            Some(alloy::rlp::encode(diff).into())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     block_file.storage_contracts = storage.iter().map(addr_hex).collect();
     let validation_hash = block_file.validation_hash();
     Ok(DebankBlockOutput {
         block_file,
         header,
-        state_diff: None,
+        state_diff,
         validation_hash,
     })
 }

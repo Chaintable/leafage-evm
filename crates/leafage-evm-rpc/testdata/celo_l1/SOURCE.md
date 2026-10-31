@@ -18,3 +18,10 @@ roots against Celo's header hash. They also reject modified transaction gas,
 receipt status and receipt identity. These inputs cover legacy Celo,
 Ethereum-compatible legacy, Ethereum dynamic-fee, and both Celo-specific
 dynamic-fee encodings (0x7b and 0x7c).
+
+The 32 genesis account addresses and total CELO supply used by the replay
+come from `core/genesis_alloc.go` (`mainnetAllocJSON`) at the same native
+commit. Account values, code and storage are read from Leafage's local
+genesis archive. Finalization follows native `consensus/istanbul/backend/pos.go`,
+`engine.go` and `consensus/istanbul/uptime/monitor.go`; the change collector,
+archive state checks and StateDiff RLP format are shared with BSC replay.

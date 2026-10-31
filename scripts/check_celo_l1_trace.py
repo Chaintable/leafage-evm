@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare transaction blockfiles with a cached native Celo trace oracle.
 
-Only block_file, header and validation_hash are compared. Leafage does not
-produce the consensus state_diff, which includes epoch finalization.
+Use --state-diff to also compare the decoded StateDiff, including epoch
+finalization. Native Go map iteration can change its RLP list order.
 """
 import argparse
 import json
@@ -40,10 +40,47 @@ def differences(expected, actual, path=""):
         yield {"path": path, "expected": expected, "actual": actual}
 
 
+def decode_diff(encoded):
+    data = bytes.fromhex(encoded[2:] if encoded.startswith("0x") else encoded)
+    def item(pos):
+        prefix = data[pos]
+        if prefix < 128:
+            return data[pos:pos+1].hex(), pos+1
+        is_list = prefix >= 192
+        short = 192 if is_list else 128
+        if prefix < short+56:
+            length, start = prefix-short, pos+1
+        else:
+            size = prefix-(short+55)
+            length = int.from_bytes(data[pos+1:pos+1+size], "big")
+            start = pos+1+size
+        end = start+length
+        if end > len(data):
+            raise ValueError("truncated StateDiff RLP")
+        if not is_list:
+            return data[start:end].hex(), end
+        out = []
+        while start < end:
+            value, start = item(start)
+            out.append(value)
+        if start != end:
+            raise ValueError("invalid StateDiff RLP list")
+        return out, end
+    result, end = item(0)
+    if end != len(data) or len(result) != 6:
+        raise ValueError("invalid BlockStorageDiff RLP")
+    for index in range(2, 6):
+        result[index].sort()
+    for account in result[4]:
+        account[1].sort()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oracle", default="http://127.0.0.1:8665")
     parser.add_argument("--candidate")
+    parser.add_argument("--state-diff", action="store_true")
     parser.add_argument("--blocks", required=True, help="comma-separated decimal heights")
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -65,12 +102,15 @@ def main():
         start = time.monotonic()
         row = {"block": number}
         try:
-            actual = rpc(args.candidate, number, {"stateDiff": False})
+            actual = rpc(args.candidate, number, {"stateDiff": args.state_diff})
             row["seconds"] = round(time.monotonic() - start, 3)
             (args.output / f"leafage-{number}.json").write_text(json.dumps(actual) + "\n")
             diffs = []
             for key in ("block_file", "header", "validation_hash"):
                 diffs.extend(differences(expected[key], actual[key], key))
+            if args.state_diff:
+                diffs.extend(differences(decode_diff(expected["state_diff"]),
+                    decode_diff(actual["state_diff"]), "state_diff"))
             row.update(ok=not diffs, differences=diffs,
                 txs=len(actual["block_file"]["txs"]),
                 traces=len(actual["block_file"]["traces"]),

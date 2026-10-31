@@ -30,11 +30,58 @@ pub(super) fn word(a: Address) -> U256 {
     U256::from_be_slice(a.as_slice())
 }
 
+/// Protocol-level system call failure. Node/database failures must escape
+/// finalization rather than be mistaken for a canonical contract revert.
+#[derive(Debug)]
+pub(super) struct ContractFailure(pub String);
+impl std::fmt::Display for ContractFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for ContractFailure {}
+
 pub(super) struct System<'a> {
     pub fork: L1Fork,
     pub chain: &'a dyn CeloChainData,
 }
 impl System<'_> {
+    pub fn address<DB: Database>(
+        &self,
+        ctx: &mut CeloL1Context<DB>,
+        name: &str,
+    ) -> Result<Address> {
+        self.registered(ctx, name)?
+            .ok_or_else(|| ContractFailure(format!("{name} is not registered")).into())
+    }
+    pub fn execute<DB: Database>(
+        &self,
+        ctx: &mut CeloL1Context<DB>,
+        name: &str,
+        method: &str,
+        args: &[U256],
+        gas: u64,
+    ) -> Result<Bytes> {
+        let to = self.address(ctx, name)?;
+        let result = self.call(ctx, to, abi(method, args), gas, false, false)?;
+        if !result.result.is_ok() {
+            return Err(
+                ContractFailure(format!("{name}.{method} failed: {:?}", result.result)).into(),
+            );
+        }
+        Ok(result.output)
+    }
+    pub fn required<DB: Database>(
+        &self,
+        ctx: &mut CeloL1Context<DB>,
+        name: &str,
+        method: &str,
+        args: &[U256],
+        gas: u64,
+    ) -> Result<Bytes> {
+        self.query(ctx, name, method, args, gas)?
+            .ok_or_else(|| ContractFailure(format!("{name}.{method} failed")).into())
+    }
     pub fn call<DB: Database>(
         &self,
         ctx: &mut CeloL1Context<DB>,

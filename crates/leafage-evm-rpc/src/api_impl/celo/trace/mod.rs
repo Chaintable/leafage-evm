@@ -1,6 +1,7 @@
-//! Celo L1 transaction blockfiles on archive state. The native state-diff
-//! producer remains authoritative for consensus finalization and epoch rewards.
+//! Celo L1 pipeline outputs from one local replay on archive state.
 mod fees;
+mod finalize;
+mod genesis;
 mod input;
 mod replay;
 
@@ -8,6 +9,7 @@ use crate::{
     api_impl::core::{Api, ApiBase},
     error::{invalid_params_rpc_err, rpc_error_with_code},
     pipeline::{
+        chain::ReplayOptions,
         rpc::{TraceBlockOptions, TraceDebankApiServer},
         source::ReplayDataSource,
         types::DebankBlockOutput,
@@ -20,6 +22,7 @@ use leafage_evm_types::{BlockId, DebankErrorCode};
 pub(crate) struct CeloTrace<C> {
     pub api: Api<C>,
     pub source: ReplayDataSource,
+    pub check_state: bool,
 }
 
 fn error(err: impl std::fmt::Display) -> jsonrpsee::types::ErrorObjectOwned {
@@ -37,9 +40,12 @@ where
         id: BlockId,
         options: Option<TraceBlockOptions>,
     ) -> RpcResult<DebankBlockOutput> {
-        if options.is_some_and(|o| o.state_diff) {
-            return Err(invalid_params_rpc_err("Celo L1 returns transaction blockfiles only; request stateDiff:false and use native Celo for the canonical state_diff"));
-        }
+        let options = ReplayOptions {
+            strict: true,
+            check_state: self.check_state,
+            state_diff: options.unwrap_or_default().state_diff,
+            traces: true,
+        };
         let started = std::time::Instant::now();
         let db = self.api.inner.db().clone();
         let info = db.get_block_by_id_arc(id).map_err(error)?.ok_or_else(|| {
@@ -72,7 +78,7 @@ where
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let input = input::BlockInput::verified(data, &info.header)?;
-            replay::replay(&db, &info, parent.as_deref(), input)
+            replay::replay(&db, &info, parent.as_deref(), input, options)
         })
         .await
         .map_err(error)?

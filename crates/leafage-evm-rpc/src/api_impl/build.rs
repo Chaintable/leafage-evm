@@ -335,7 +335,14 @@ where
                         if is_archive {
                             if let Some(source) = self.celo_trace_source.take() {
                                 rpc_module
-                                    .merge(super::celo::trace::CeloTrace { api, source }.into_rpc())
+                                    .merge(
+                                        super::celo::trace::CeloTrace {
+                                            api,
+                                            source,
+                                            check_state: self.trace_block_check_state,
+                                        }
+                                        .into_rpc(),
+                                    )
                                     .map_err(std::io::Error::other)?;
                             }
                         }
