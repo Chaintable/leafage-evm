@@ -88,7 +88,10 @@ fn integer(value: U256) -> Bytes {
 
 impl CeloHeader {
     pub fn from_header(header: &impl BlockHeader) -> Self {
-        let fields = if header.ommers_hash() == B256::ZERO {
+        // Legacy archive headers can contain Ethereum RPC compatibility
+        // defaults (notably EMPTY_OMMER_ROOT_HASH). The consensus encoding is
+        // selected by Celo's fork height, never by those synthetic fields.
+        let fields = if header.number() < super::GINGERBREAD_BLOCK {
             vec![
                 header.parent_hash().as_slice().to_vec().into(),
                 header.beneficiary().as_slice().to_vec().into(),

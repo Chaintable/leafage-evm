@@ -134,6 +134,40 @@ fn native_mainnet_headers_validators_and_seals() {
         let header = CeloHeader::decode(&raw).unwrap();
         assert_eq!(header.encode().as_ref(), raw, "RLP {}", h.number);
         assert_eq!(header.hash().to_string(), h.hash, "hash {}", h.number);
+        if h.number < GINGERBREAD_BLOCK {
+            let fields: Vec<Bytes> = alloy_rlp::decode_exact(&raw).unwrap();
+            let archive = alloy::consensus::Header {
+                parent_hash: revm::primitives::B256::from_slice(&fields[0]),
+                beneficiary: Address::from_slice(&fields[1]),
+                state_root: revm::primitives::B256::from_slice(&fields[2]),
+                transactions_root: revm::primitives::B256::from_slice(&fields[3]),
+                receipts_root: revm::primitives::B256::from_slice(&fields[4]),
+                logs_bloom: alloy::primitives::Bloom::from_slice(&fields[5]),
+                number: h.number,
+                gas_used: U256::from_be_slice(&fields[7]).to(),
+                timestamp: U256::from_be_slice(&fields[8]).to(),
+                extra_data: fields[9].clone(),
+                // None of these compatibility fields belongs to the legacy
+                // Celo consensus header, even when the archive fills them.
+                ommers_hash: alloy::consensus::constants::EMPTY_OMMER_ROOT_HASH,
+                gas_limit: 32_000_000,
+                base_fee_per_gas: Some(777),
+                ..Default::default()
+            };
+            let normalized = CeloHeader::from_header(&archive);
+            assert_eq!(
+                normalized.encode(),
+                header.encode(),
+                "archive RLP {}",
+                h.number
+            );
+            assert_eq!(
+                normalized.hash(),
+                header.hash(),
+                "archive hash {}",
+                h.number
+            );
+        }
         chain.0.insert(h.number, header);
     }
     for c in fixture.calls {
