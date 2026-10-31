@@ -1,5 +1,6 @@
 mod abi;
 mod address_table;
+mod ape;
 mod aggregator;
 mod arb_bls;
 mod arb_info;
@@ -28,6 +29,9 @@ mod wasm;
 mod wasm_cache;
 
 use self::env::ArbPrecompileInput;
+pub(crate) use self::ape::{
+    on_create as ape_on_create, on_selfdestruct as ape_on_selfdestruct, on_tx_end as ape_on_tx_end,
+};
 pub use self::env::ArbitrumPrecompileEnv;
 use self::filtered_transactions::ArbFilteredTransactionsManager;
 use self::registry::ArbitrumPrecompile;
@@ -184,7 +188,7 @@ impl ArbitrumPrecompiles {
         let purity = if matches!(precompile, ArbitrumPrecompile::ArbOwner) {
             None
         } else {
-            let Some(purity) = precompile.purity(data) else {
+            let Some(purity) = precompile.purity(data, context.chain().ape_yield()) else {
                 return decode_revert(inputs.gas_limit, "unknown Arbitrum precompile selector");
             };
 

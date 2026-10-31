@@ -10,7 +10,7 @@ use crate::utils::{
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
 use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
 use leafage_evm_chains::celo::{CELO_CHAIN_ID, MAX_CODE_SIZE};
@@ -49,6 +49,7 @@ pub struct Command {
             "mainnet",
             "arc",
             "arbitrum",
+            "ape",
             "op",
             "base",
             "bsc",
@@ -627,7 +628,7 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
             }
-            "arbitrum" => {
+            "arbitrum" | "ape" => {
                 // RPC execution replaces this fallback with the target block's
                 // ArbOS-derived hardfork whenever Nitro header metadata is available.
                 let spec =
@@ -639,13 +640,24 @@ impl Command {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
-                let custom_evm_cfg = custom_evm_cfg
+                let mut custom_evm_cfg: Option<ArbitrumEvmConfig> = custom_evm_cfg
                     .map(|str| {
                         serde_json::from_str(&str).map_err(|err| {
                             anyhow!("cannot parse arbitrum custom evm config: {}", err)
                         })
                     })
                     .transpose()?;
+                if evm_type == "ape" {
+                    // ApeChain is an Arbitrum Orbit chain with native yield.
+                    if self.normalize_state_key || self.ovm_address.is_some() {
+                        bail!(
+                            "ape evm-type supports neither --normalize-state-key nor --ovm-address"
+                        );
+                    }
+                    custom_evm_cfg
+                        .get_or_insert_with(Default::default)
+                        .ape_yield = true;
+                }
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "celo" => {

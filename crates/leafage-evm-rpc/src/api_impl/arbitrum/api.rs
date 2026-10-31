@@ -60,6 +60,7 @@ fn precompile_env(
             .filter(|ticket_id| *ticket_id != B256::ZERO),
         current_refund_to: retryable.map(|retryable| retryable.refund_to),
         allow_debug_precompiles: custom_cfg.is_some_and(|cfg| cfg.allow_debug_precompiles),
+        ape_yield: custom_cfg.is_some_and(|cfg| cfg.ape_yield),
         current_chain_config: custom_cfg
             .and_then(|cfg| cfg.chain_config.as_ref())
             .map(|chain_config| Bytes::copy_from_slice(chain_config.get().as_bytes())),
