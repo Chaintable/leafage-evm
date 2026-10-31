@@ -4,6 +4,7 @@
 pub mod consensus;
 mod crypto;
 pub mod evm;
+mod inspect;
 mod precompile;
 mod pure;
 #[cfg(test)]

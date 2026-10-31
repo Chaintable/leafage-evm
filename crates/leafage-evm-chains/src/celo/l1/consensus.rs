@@ -246,6 +246,24 @@ impl CeloHeader {
         }
         keccak256(header.encode())
     }
+
+    /// Istanbul proposer, which can differ from the fee-recipient coinbase.
+    pub fn proposer(&self) -> Result<Address, String> {
+        let mut extra = self.extra().map_err(|_| "invalid Istanbul extra data")?;
+        let signature =
+            alloy::primitives::Signature::from_raw(&extra.proposer).map_err(|e| e.to_string())?;
+        extra.proposer = Bytes::new();
+        extra.seal = Seal::default();
+        let i = self.extra_index();
+        let mut bytes = self.fields[i][..32].to_vec();
+        extra.encode(&mut bytes);
+        let mut header = self.clone();
+        header.fields[i] = bytes.into();
+        // Native GetSignatureAddress hashes the sigHash once more.
+        signature
+            .recover_address_from_prehash(&keccak256(keccak256(header.encode())))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +272,124 @@ struct Validator {
     key: Bytes,
 }
 static VALIDATORS: OnceLock<moka::sync::Cache<B256, Arc<Vec<Validator>>>> = OnceLock::new();
+
+/// CIP-21 uptime for the validators signing the ending epoch. Historical
+/// replay uses that epoch's canonical parent-seal bitmaps, never a live
+/// consensus monitor (which may already belong to another epoch).
+pub fn epoch_uptimes(
+    chain: &dyn CeloChainData,
+    number: u64,
+    lookback: u64,
+) -> Result<Vec<(Address, U256)>, String> {
+    if number == 0 || number % EPOCH_SIZE != 0 || !(3..=720).contains(&lookback) {
+        return Err("invalid Celo uptime window".into());
+    }
+    let validators = validators(chain, number).map_err(|e| format!("{e:?}"))?;
+    let first = number - EPOCH_SIZE + 1;
+    let start = first + lookback - 1;
+    let end = number - 2;
+    let mut last = vec![0; validators.len()];
+    let mut up = vec![0u64; validators.len()];
+    let mut previous = chain.header(first)?.hash();
+    for height in first + 1..number {
+        let header = chain.header(height)?;
+        if header.fields[0].as_ref() != previous.as_slice() {
+            return Err(format!("non-contiguous Celo uptime headers at {height}"));
+        }
+        let extra = header
+            .extra()
+            .map_err(|_| format!("invalid uptime header at {height}"))?;
+        let signed = height - 1;
+        for (i, last) in last.iter_mut().enumerate() {
+            if extra.parent_seal.bitmap.bit(i) {
+                *last = signed;
+            }
+            if signed >= start && signed <= end && *last >= signed + 1 - lookback {
+                up[i] += 1;
+            }
+        }
+        previous = header.hash();
+    }
+    let scale = U256::from(10).pow(U256::from(24));
+    Ok(validators
+        .iter()
+        .zip(up)
+        .map(|(v, n)| {
+            (
+                v.address,
+                U256::from(n) * scale / U256::from(end - start + 1),
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod uptime_tests {
+    use super::*;
+
+    struct Headers(Vec<CeloHeader>);
+    impl CeloChainData for Headers {
+        fn header(&self, number: u64) -> Result<CeloHeader, String> {
+            self.0
+                .get(number as usize)
+                .cloned()
+                .ok_or_else(|| "missing header".into())
+        }
+    }
+
+    #[test]
+    fn epoch_uptime_uses_parent_seals_and_excludes_the_last_two_blocks() {
+        let addresses: Vec<_> = (1..=4).map(Address::with_last_byte).collect();
+        let mut chain = Headers(Vec::new());
+        let mut previous = B256::ZERO;
+        for number in 0..=EPOCH_SIZE {
+            // Validator 0 signs throughout; validator 1 never signs;
+            // validator 2 signs only block 1; validator 3 signs only
+            // the blocks whose votes arrive in the final two headers. The header carries its parent's votes.
+            let bitmap =
+                1 | if number == 2 { 4 } else { 0 } | if number >= EPOCH_SIZE - 1 { 8 } else { 0 };
+            let extra = Extra {
+                added: if number == 0 {
+                    addresses.clone()
+                } else {
+                    Vec::new()
+                },
+                keys: if number == 0 {
+                    vec![vec![0; 96].into(); 4]
+                } else {
+                    Vec::new()
+                },
+                removed: Integer::default(),
+                proposer: Bytes::new(),
+                seal: Seal::default(),
+                parent_seal: Seal {
+                    bitmap: Integer(vec![bitmap].into()),
+                    ..Default::default()
+                },
+            };
+            let mut bytes = vec![0; 32];
+            extra.encode(&mut bytes);
+            let mut fields = vec![Bytes::new(); 10];
+            fields[0] = previous.as_slice().to_vec().into();
+            fields[6] = integer(U256::from(number));
+            fields[9] = bytes.into();
+            let header = CeloHeader { fields };
+            previous = header.hash();
+            chain.0.push(header);
+        }
+        let scores = epoch_uptimes(&chain, EPOCH_SIZE, 3).unwrap();
+        let scale = U256::from(10).pow(U256::from(24));
+        assert_eq!(scores[0], (addresses[0], scale));
+        assert_eq!(scores[1].1, U256::ZERO);
+        assert_eq!(scores[2].1, scale / U256::from(EPOCH_SIZE - 4));
+        // Parent seal in header n-1 covers n-2, the last monitored block.
+        assert_eq!(scores[3].1, scale / U256::from(EPOCH_SIZE - 4));
+        chain.0[10].fields[0] = vec![0; 32].into();
+        assert!(epoch_uptimes(&chain, EPOCH_SIZE, 3)
+            .unwrap_err()
+            .contains("non-contiguous"));
+    }
+}
 
 fn validators(chain: &dyn CeloChainData, requested: u64) -> Result<Arc<Vec<Validator>>, Failure> {
     if requested == 0 {

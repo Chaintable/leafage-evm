@@ -1039,11 +1039,26 @@ impl Command {
             ),
         )?);
 
+        let celo_l1 = matches!(&chain_cfg, MultiChainCfgEnv::Celo(CeloCfgEnv::L1(_)));
+        let celo_trace_source = if celo_l1 {
+            if let Some(url) = self.rpc_addr.as_ref().or(self.trace_block_rpc.as_ref()) {
+                Some(leafage_evm_rpc::ReplayDataSource::rpc(url)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
+            .with_celo_trace_source(celo_trace_source)
             .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_trace_block_rpc(
-                self.trace_block_rpc.clone(),
+                if celo_l1 {
+                    None
+                } else {
+                    self.trace_block_rpc.clone()
+                },
                 !self.trace_block_skip_state_check,
             )?
             .with_evm_exec_concurrency(self.evm_exec_concurrency)

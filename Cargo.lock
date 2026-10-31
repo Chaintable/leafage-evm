@@ -5089,6 +5089,7 @@ dependencies = [
  "alloy-contract",
  "alloy-evm",
  "alloy-hardforks",
+ "alloy-rlp",
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
