@@ -561,6 +561,9 @@ where
 }
 
 #[cfg(test)]
+mod ape_model_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::arbitrum::arbos_state;

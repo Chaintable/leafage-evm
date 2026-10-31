@@ -4,11 +4,13 @@
 //! and revm moves them like any balance. The raw yield fields live in the
 //! storage of [`APE_YIELD_ADDRESS`] and are only needed by the ApeChain
 //! precompile methods and the CREATE / SELFDESTRUCT hooks. Nitro updates those
-//! fields on every balance change; here they are brought up to date when read:
-//! an account whose current balance differs from the balance its stored fields
-//! give has a pending `SetBalance`, which [`YieldState::apply_pending`] replays.
-//! `SetBalance`, `adjustDebt` and `SetFlags` commute with a pending
-//! `SetBalance`, so the stored fields can stay behind.
+//! fields on every balance change; here an account whose current balance
+//! differs from the balance its stored fields give has a pending `SetBalance`,
+//! replayed by [`YieldState::sync`]. Nitro's split depends only on the final
+//! balance and debt, and `adjustDebt` leaves the balance unchanged, so one
+//! replay gives the fields nitro reaches step by step. Replays happen before
+//! the fields are read or the yield mode changes, and at the end of every
+//! transaction for all the accounts it touched.
 //!
 //! The share price is the one the block started with: an `ArbOwner.setSharePrice`
 //! in the same simulation is visible to `getSharePrice` but does not re-price
@@ -189,8 +191,14 @@ impl YieldState {
             Delta::Sub(value) => Delta::Sub(value.min(fields.debt)),
             add => add,
         };
+        // Nitro adds the delta as a uint256. Under automatic yield `fixed` is
+        // only the remainder below one share and may wrap; re-splitting
+        // `shares * price + fixed` takes the delta out of the shares.
         fields.fixed = match delta {
             Delta::Add(value) => fields.fixed.wrapping_add(value),
+            Delta::Sub(value) if fields.flags == APE_YIELD_AUTOMATIC => {
+                fields.fixed.wrapping_sub(value)
+            }
             Delta::Sub(value) => fields.fixed.saturating_sub(value),
         };
         if fields.flags == APE_YIELD_AUTOMATIC {
@@ -393,16 +401,25 @@ pub(crate) fn on_selfdestruct<DB: Database>(
     state.set_balance(ctx, address, U256::ZERO)?;
     state.write(ctx)
 }
-/// End of a transaction: an account destroyed in it leaves no yield fields,
-/// as the writer's state diff zeroes them.
+/// End of a transaction: the yield fields of every account it touched are
+/// brought up to date and written, so the next transaction of a simulation
+/// starts from fields that agree with the balances. An account destroyed in
+/// it leaves no yield fields, as the writer's state diff zeroes them.
 pub(crate) fn on_tx_end<DB: Database>(ctx: &mut ArbitrumContext<DB>) -> Result<(), DB::Error> {
-    let destroyed: Vec<Address> = ctx
+    let (live, destroyed): (Vec<_>, Vec<_>) = ctx
         .journal()
         .state
         .iter()
-        .filter(|(address, account)| **address != APE_YIELD_ADDRESS && account.is_selfdestructed())
-        .map(|(address, _)| *address)
-        .collect();
+        .filter(|(address, _)| **address != APE_YIELD_ADDRESS)
+        .map(|(address, account)| (*address, account.is_selfdestructed()))
+        .partition(|(_, destroyed)| !destroyed);
+    let mut state = YieldState::new(ctx)?;
+    for (address, _) in live {
+        state.sync(ctx, address)?;
+    }
+    state.write(ctx)?;
+
+    let destroyed: Vec<Address> = destroyed.into_iter().map(|(address, _)| address).collect();
     let mut touched = false;
     for address in destroyed {
         let hash = alloy::primitives::keccak256(address);
@@ -527,6 +544,9 @@ pub(super) fn run_arb_info<DB: Database>(
             IApeArbInfo::IApeArbInfoCalls::getBalanceValues(call) => {
                 burn(ctx, &mut gas_used, gas_limit, BALANCE_VALUES_GAS)?;
                 state.apply_pending(ctx).map_err(fatal)?;
+                // An account outside the journal can still carry a balance the
+                // fields do not reflect, e.g. from a state override.
+                state.sync(ctx, call.account).map_err(fatal)?;
                 let fields = state.fields(ctx, call.account).map_err(fatal)?;
                 finish_call::<IApeArbInfo::getBalanceValuesCall>(
                     gas_limit,
@@ -570,6 +590,7 @@ pub(super) fn run_arb_info<DB: Database>(
             }
             IApeArbInfo::IApeArbInfoCalls::configureDelegateYield(call) => {
                 state.apply_pending(ctx).map_err(fatal)?;
+                state.sync(ctx, call.account).map_err(fatal)?;
                 let mut gas = CONFIGURE_DELEGATE_YIELD_GAS;
                 if state.is_empty(ctx, call.account).map_err(fatal)? {
                     gas += CALL_NEW_ACCOUNT_GAS;
@@ -882,6 +903,63 @@ mod tests {
         );
         let (fixed, _, debt, _) = balance_values(&mut ctx, X);
         assert_eq!((fixed, debt), (U256::from(350), U256::ZERO));
+    }
+
+    #[test]
+    fn spending_delegator_takes_shares_from_an_automatic_delegate() {
+        use revm::context_interface::journaled_state::account::JournaledAccountTr;
+        let mut ctx = context(true);
+        // D: 2 shares + 7 of its own, plus 3 shares' worth delegated by X.
+        seed(
+            &mut ctx,
+            D,
+            ApeYieldFields {
+                fixed: U256::from(7),
+                shares: U256::from(5),
+                debt: p(3),
+                ..Default::default()
+            },
+        );
+        seed(
+            &mut ctx,
+            X,
+            ApeYieldFields {
+                flags: APE_YIELD_DELEGATED,
+                fixed: p(3),
+                delegate: D,
+                ..Default::default()
+            },
+        );
+        // X spends two shares' worth: more than D's `fixed`, so nitro's
+        // uint256 delta wraps `fixed` and the re-split removes two shares.
+        assert!(ctx
+            .journal_mut()
+            .load_account_mut(X)
+            .unwrap()
+            .data
+            .decr_balance(p(2)));
+
+        let (fixed, shares, debt, _) = balance_values(&mut ctx, D);
+        assert_eq!((fixed, shares, debt), (U256::from(7), U256::from(3), p(1)));
+        let mut state = YieldState::new(&mut ctx).unwrap();
+        state.apply_pending(&mut ctx).unwrap();
+        assert_eq!(state.share_delta(), U256::ZERO.wrapping_sub(U256::from(2)));
+    }
+
+    #[test]
+    fn read_replays_a_balance_set_outside_the_journal() {
+        let mut ctx = context(true);
+        seed(&mut ctx, A, automatic(5 * PRICE + 123));
+        // A state override: the database balance changes, the yield slots do not.
+        let mut info = ctx.db_mut().basic(A).unwrap().unwrap();
+        info.balance = U256::from(12_345);
+        ctx.db_mut().insert_account_info(A, info);
+
+        let (fixed, shares, debt, _) = balance_values(&mut ctx, A);
+        assert_eq!(
+            (fixed, shares, debt),
+            (U256::from(12_345), U256::ZERO, U256::ZERO)
+        );
     }
 
     #[test]
