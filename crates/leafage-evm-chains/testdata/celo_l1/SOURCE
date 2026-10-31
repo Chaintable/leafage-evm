@@ -24,3 +24,10 @@ LGPL-3.0 COPYING.LESSER. CIP-20 inputs include their selector; Blake2s uses the
 sequential default parameter block. BLS encoding/hash-to-curve follows
 celo-org/celo-bls-snark-rs@eca15ffed3984601cb441600ba3002d12f339e5f
 (MIT/Apache-2.0), the exact dependency of celo-bls-go v0.3.4.
+
+system_storage_gas.json records 12 native eth_call results captured on
+2026-10-31. Temporary Registry/Reserve/recipient bytecode exercises metered
+SLOAD, SLOAD followed by SSTORE, no storage, and reverted storage accesses
+inside TobinTransfer. The recipient measures the subsequent EXTCODESIZE
+access to Reserve. Celo warms a slot owner as well as the slot; unmetered
+Registry queries and reverted helper calls must not retain new warmth.

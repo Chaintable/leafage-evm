@@ -90,6 +90,7 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--vectors", type=Path)
     parser.add_argument("--consensus", type=Path)
+    parser.add_argument("--system-storage", type=Path, help="native system storage gas vectors")
     args = parser.parse_args()
     if args.cache.exists():
         baseline = json.loads(args.cache.read_text())
@@ -104,6 +105,8 @@ def main():
     if not args.candidate:
         print(f"native baseline saved: {len(baseline)} calls", flush=True)
         return
+    if args.system_storage:
+        baseline.extend(json.loads(args.system_storage.read_text()))
     if args.vectors:
         for vector in json.loads(args.vectors.read_text()):
             baseline.append({"name": "pure/" + vector["name"], "params": [{

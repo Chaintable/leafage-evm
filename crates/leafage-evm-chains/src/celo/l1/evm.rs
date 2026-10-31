@@ -224,6 +224,26 @@ fn instructions<H: revm::interpreter::Host>(fork: L1Fork) -> EthInstructions<Eth
     table
 }
 
+fn system_sload<H: revm::interpreter::Host>(
+    context: InstructionContext<'_, H, EthInterpreter>,
+) -> InstructionExecResult {
+    context
+        .host
+        .load_account_delegated(context.interpreter.input.target_address)
+        .ok_or(InstructionResult::FatalExternalError)?;
+    revm::interpreter::instructions::host::sload(context)
+}
+
+fn system_sstore<H: revm::interpreter::Host>(
+    context: InstructionContext<'_, H, EthInterpreter>,
+) -> InstructionExecResult {
+    context
+        .host
+        .load_account_delegated(context.interpreter.input.target_address)
+        .ok_or(InstructionResult::FatalExternalError)?;
+    revm::interpreter::instructions::host::sstore(context)
+}
+
 pub fn create_celo_l1_evm<'a, DB: Database, I>(
     block: BlockEnv,
     cfg: CfgEnv<MainnetSpecId>,
@@ -320,6 +340,21 @@ pub(super) fn system_call<DB: Database>(
     let previous_cfg = context.cfg.clone();
     let previous_local = std::mem::take(&mut context.local);
     let mut instruction = instructions::<&mut CeloL1Context<DB>>(fork);
+    if !unmetered && fork >= L1Fork::Espresso {
+        // Native AddSlotToAccessList also adds the owning account. Direct
+        // system calls can enter an otherwise cold account, unlike ordinary
+        // CALL opcodes. revm's storage host assumes its owner is already warm.
+        instruction.insert_instruction(
+            revm::bytecode::opcode::SLOAD,
+            Instruction::new(system_sload::<&mut CeloL1Context<DB>>),
+            100,
+        );
+        instruction.insert_instruction(
+            revm::bytecode::opcode::SSTORE,
+            Instruction::new(system_sstore::<&mut CeloL1Context<DB>>),
+            0,
+        );
+    }
     if unmetered {
         instruction.gas_table_mut().fill(0);
         let mut gas_params = GasParams::new(Arc::new([0; 256]));

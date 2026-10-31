@@ -450,9 +450,75 @@ fn tobin_tax_applies_before_call_and_create_and_reverts_with_them() {
 }
 
 #[test]
+fn metered_system_storage_warms_its_owner_and_reverts_with_the_frame() {
+    use revm::context_interface::JournalTr;
+    let target = Address::repeat_byte(0x77);
+    for height in [10_000_000, 20_000_000, 30_000_000] {
+        for unmetered in [false, true] {
+            for revert in [false, true] {
+                let mut db = InMemoryDB::default();
+                let mut code = vec![0x60, 0, 0x54, 0x50]; // SLOAD; POP
+                code.extend(if revert {
+                    vec![0x60, 0, 0x60, 0, 0xfd]
+                } else {
+                    vec![0]
+                });
+                db.insert_account_info(
+                    target,
+                    AccountInfo::default().with_code(Bytecode::new_raw(code.into())),
+                );
+                let mut evm = evm::create_celo_l1_evm(
+                    BlockEnv {
+                        number: U256::from(height),
+                        ..Default::default()
+                    },
+                    config(),
+                    db,
+                    revm::inspector::NoOpInspector,
+                    &NoChain,
+                )
+                .unwrap();
+                let fork = L1Fork::at(height).unwrap();
+                evm.inner.ctx.journaled_state.set_spec_id(fork.spec());
+                let result = evm::system_call(
+                    &mut evm.inner.ctx,
+                    fork,
+                    &NoChain,
+                    Address::ZERO,
+                    target,
+                    Bytes::new(),
+                    100_000,
+                    true,
+                    unmetered,
+                );
+                assert_eq!(result.is_ok(), !revert);
+                let cold = evm
+                    .inner
+                    .ctx
+                    .journaled_state
+                    .load_account(target)
+                    .unwrap()
+                    .is_cold;
+                assert_eq!(
+                    cold,
+                    unmetered || revert || fork < L1Fork::Espresso,
+                    "height={height}, unmetered={unmetered}, revert={revert}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn native_opcode_gas_at_fork_boundaries() {
-    let cases: Vec<serde_json::Value> =
+    let mut cases: Vec<serde_json::Value> =
         serde_json::from_str(include_str!("../../../testdata/celo_l1/opcode_gas.json")).unwrap();
+    cases.extend(
+        serde_json::from_str::<Vec<serde_json::Value>>(include_str!(
+            "../../../testdata/celo_l1/system_storage_gas.json"
+        ))
+        .unwrap(),
+    );
     for case in cases {
         let params = case["params"].as_array().unwrap();
         let request = &params[0];
