@@ -18,9 +18,9 @@ use revm::handler::{
 };
 use revm::inspector::{InspectorEvmTr, InspectorHandler};
 use revm::interpreter::{
-    interpreter::EthInterpreter, interpreter_action::FrameInit, CallInput, CallInputs, CallScheme,
-    CallValue, FrameInput, Instruction, InstructionContext, InstructionExecResult,
-    InstructionResult, SharedMemory,
+    interpreter::EthInterpreter, interpreter_action::FrameInit, interpreter_types::ReturnData,
+    CallInput, CallInputs, CallScheme, CallValue, FrameInput, Instruction, InstructionContext,
+    InstructionExecResult, InstructionResult, SharedMemory,
 };
 use revm::primitives::{Address, AddressSet, Bytes, HashSet, U256};
 use revm::state::EvmState;
@@ -28,11 +28,14 @@ use revm::{
     Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, InspectCommitEvm, InspectEvm,
     Inspector, Journal,
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 pub type CeloL1Context<DB> = Context<BlockEnv, TxEnv, CfgEnv<MainnetSpecId>, DB, Journal<DB>>;
 pub struct CeloL1Evm<'a, CTX, I> {
     pub inner: Evm<CTX, I, EthInstructions<EthInterpreter, CTX>, L1Precompiles<'a>, EthFrame>,
+    /// Donut/Churrito snapshots an input-aliasing precompile's return data
+    /// after copying it into caller memory. Espresso snapshots before copying.
+    aliased_return: Option<Range<usize>>,
 }
 
 macro_rules! evm_impl {
@@ -68,6 +71,20 @@ macro_rules! evm_impl {
                 &mut self,
                 mut init: FrameInit,
             ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<Self::Context>> {
+                let aliased_return = match &init.frame_input {
+                    FrameInput::Call(inputs)
+                        if self
+                            .inner
+                            .precompiles
+                            .copies_return_after_memory(inputs.bytecode_address) =>
+                    {
+                        match &inputs.input {
+                            CallInput::SharedBuffer(range) => Some(range.clone()),
+                            CallInput::Bytes(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
                 if let FrameInput::Call(inputs) = &mut init.frame_input {
                     if inputs.scheme == CallScheme::Call
                         && inputs.value == CallValue::Transfer(U256::ZERO)
@@ -105,7 +122,18 @@ macro_rules! evm_impl {
                     init,
                 )?;
                 match result {
-                    ItemOrResult::Result(result) => Ok(ItemOrResult::Result(result)),
+                    ItemOrResult::Result(result) => {
+                        self.aliased_return = match &result {
+                            FrameResult::Call(outcome)
+                                if outcome.was_precompile_called
+                                    && outcome.result.result.is_ok() =>
+                            {
+                                aliased_return
+                            }
+                            _ => None,
+                        };
+                        Ok(ItemOrResult::Result(result))
+                    }
                     ItemOrResult::Item(token) => {
                         if first {
                             unsafe { self.inner.frame_stack.end_init(token) };
@@ -142,7 +170,29 @@ macro_rules! evm_impl {
                 &mut self,
                 result: FrameResult,
             ) -> Result<Option<FrameResult>, ContextDbError<Self::Context>> {
-                self.inner.frame_return_result(result)
+                let aliased_return = self.aliased_return.take();
+                let result = self.inner.frame_return_result(result)?;
+                if result.is_none() {
+                    if let Some(range) = aliased_return {
+                        // The call trace has already observed the original return
+                        // bytes. Only the caller's RETURNDATA sees the aliased input
+                        // after return-memory copying, matching native interpreter.go.
+                        let bytes = self
+                            .inner
+                            .ctx
+                            .local
+                            .shared_memory_buffer_slice(range)
+                            .expect("precompile input belongs to the caller")
+                            .to_vec();
+                        self.inner
+                            .frame_stack
+                            .get()
+                            .interpreter
+                            .return_data
+                            .set_buffer(bytes.into());
+                    }
+                }
+                Ok(result)
             }
         }
     };
@@ -318,7 +368,10 @@ pub fn create_celo_l1_evm<'a, DB: Database, I>(
         .build_mainnet_with_inspector(inspector)
         .with_precompiles(L1Precompiles::new(fork, chain));
     evm.instruction = instructions(fork);
-    Ok(CeloL1Evm { inner: evm })
+    Ok(CeloL1Evm {
+        inner: evm,
+        aliased_return: None,
+    })
 }
 
 /// Execute an internal Celo system call against the same journal, without a
@@ -460,6 +513,7 @@ pub fn system_call_inspected<DB: Database>(
     let inspected = inspector.is_some();
     let mut noop = revm::inspector::NoOpInspector;
     let mut evm = CeloL1Evm {
+        aliased_return: None,
         inner: Evm {
             ctx: &mut *context,
             inspector: super::inspect::BorrowedInspector(inspector.unwrap_or(&mut noop)),

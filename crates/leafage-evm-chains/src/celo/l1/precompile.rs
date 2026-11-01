@@ -30,6 +30,10 @@ impl<'a> L1Precompiles<'a> {
     pub(super) fn contains(&self, address: Address) -> bool {
         self.warm.contains(&address)
     }
+    pub(super) fn copies_return_after_memory(&self, address: Address) -> bool {
+        self.fork == L1Fork::Donut
+            && (address == Address::with_last_byte(4) || address == Address::with_last_byte(0xfd))
+    }
     pub fn new(fork: L1Fork, chain: &'a dyn CeloChainData) -> Self {
         let inner = EthPrecompiles::new(fork.spec());
         let mut warm = inner.warm_addresses().clone();

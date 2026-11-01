@@ -180,3 +180,16 @@ and both direct and enclosing reverts. The native StateDB sequence
 SubBalance(a,0); Commit(true)` persists an empty account exactly when the
 bracketed touch occurs. This was independently run against native Celo;
 it is not an archive exception or an address/height special case.
+
+During Donut/Churrito (6,774,000 through 11,838,439), native Celo snapshots
+input-aliasing precompile return data after copying the output to caller
+memory. Espresso snapshots before that copy. Preserve the Donut ordering for
+identity and native transfer, including overlapping buffers, while retaining
+the original bytes in the child call trace. This fixes the deployed code of
+the creation transaction in block 8,498,434. Tests execute its actual initcode
+both with and without an inspector and check the resulting code hash and gas.
+Another 125 native oracle vectors cover CALL, CALLCODE, DELEGATECALL,
+STATICCALL, overlap directions, partial/empty output, later memory writes,
+native transfer and fork boundaries. Regenerate them with
+`scripts/gen_celo_l1_return_copy.py --output return_copy.json`, and pass the
+file to `scripts/check_celo_l1_rpc.py --return-copy return_copy.json`.
