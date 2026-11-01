@@ -18,9 +18,11 @@ pub(crate) mod genesis;
 pub(crate) mod inspector;
 pub(crate) mod rpc;
 pub(crate) mod s3;
+pub(crate) mod source;
 pub(crate) mod types;
 
 pub use bundle::{Resource, BUNDLE_SIZE};
 pub use chain::Chain;
 pub use export::{bundle_range, export_bundles, ExportConfig};
 pub use s3::S3Target;
+pub use source::ReplayDataSource;

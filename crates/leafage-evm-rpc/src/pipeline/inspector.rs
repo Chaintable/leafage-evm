@@ -58,6 +58,11 @@ pub(crate) struct PipelineInspector {
     returning: bool,
     /// The transaction's own creation could not deposit its code.
     code_deposit_failed: bool,
+    /// Receipt-log occurrence indices, including untraced fee logs before the
+    /// primary call. Celo uses these instead of matching duplicate payloads.
+    log_positions: Vec<Vec<usize>>,
+    celo: bool,
+    pending_sstore: bool,
 }
 
 impl PipelineInspector {
@@ -74,6 +79,16 @@ impl PipelineInspector {
             returned: Vec::new(),
             returning: false,
             code_deposit_failed: false,
+            log_positions: Vec::new(),
+            celo: false,
+            pending_sstore: false,
+        }
+    }
+
+    pub(crate) fn celo() -> Self {
+        Self {
+            celo: true,
+            ..Self::new()
         }
     }
 
@@ -86,6 +101,25 @@ impl PipelineInspector {
     /// The call traces, and whether each of their nodes ran an SSTORE.
     pub(crate) fn into_traces(self) -> (CallTraceArena, Vec<bool>) {
         (self.tracer.into_traces(), self.sstore)
+    }
+
+    pub(crate) fn into_celo_traces(self) -> (CallTraceArena, Vec<bool>, Vec<Vec<usize>>) {
+        (self.tracer.into_traces(), self.sstore, self.log_positions)
+    }
+
+    pub(crate) fn call_gas(&self) -> Vec<(Address, u64, u64)> {
+        self.tracer
+            .traces()
+            .nodes()
+            .iter()
+            .map(|node| {
+                (
+                    node.trace.address,
+                    node.trace.gas_limit,
+                    node.trace.gas_used,
+                )
+            })
+            .collect()
     }
 
     fn open_frame<CTX: ContextTr>(&mut self, context: &CTX, nodes_before: usize, create: bool) {
@@ -209,8 +243,11 @@ where
     #[inline(always)]
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         let op = interp.bytecode.opcode();
+        self.pending_sstore = self.celo && op == opcode::SSTORE;
         if op == opcode::SSTORE {
-            self.mark_sstore();
+            if !self.celo {
+                self.mark_sstore();
+            }
         } else if op == opcode::SELFDESTRUCT {
             self.record_selfdestruct(interp, context);
         } else if op == opcode::RETURN {
@@ -220,12 +257,25 @@ where
 
     #[inline(always)]
     fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        if self.pending_sstore {
+            self.pending_sstore = false;
+            // Native CaptureState runs after stack/static/gas validation.
+            // A faulting SSTORE never reaches its storage-change hook.
+            if interp.bytecode.action().is_none() {
+                self.mark_sstore();
+            }
+        }
         if self.returning {
             self.record_return(interp);
         }
     }
 
     fn log(&mut self, context: &mut CTX, log: Log) {
+        if let Some(&idx) = self.frames.last().filter(|_| self.celo) {
+            self.log_positions
+                .resize_with(self.log_positions.len().max(idx + 1), Vec::new);
+            self.log_positions[idx].push(context.journal_ref().logs().len().saturating_sub(1));
+        }
         self.tracer.log(context, log);
     }
 
@@ -321,6 +371,49 @@ mod tests {
         let (success, inspector) = deploy(SpecId::HOMESTEAD, RETURN_100, 60_000);
         assert!(!success);
         assert!(!inspector.code_deposit_failed());
+    }
+
+    #[test]
+    fn celo_sstore_fault_does_not_mark_storage_but_a_later_revert_does() {
+        use revm::state::{AccountInfo, Bytecode};
+        let contract = Address::repeat_byte(0x77);
+        for (gas, reverted, stored) in [
+            (21_006, false, false),
+            (100_000, false, true),
+            (100_000, true, true),
+        ] {
+            let mut db = CacheDB::new(EmptyDB::default());
+            let mut code = vec![0x60, 1, 0x60, 0, 0x55];
+            code.extend(if reverted {
+                vec![0x60, 0, 0x60, 0, 0xfd]
+            } else {
+                vec![0]
+            });
+            db.insert_account_info(
+                contract,
+                AccountInfo::default().with_code(Bytecode::new_raw(code.into())),
+            );
+            let mut evm = Context::mainnet()
+                .with_db(db)
+                .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::LONDON))
+                .build_mainnet_with_inspector(PipelineInspector::celo());
+            evm.inspect_tx(
+                TxEnv::builder()
+                    .caller(Address::repeat_byte(0xaa))
+                    .kind(TxKind::Call(contract))
+                    .gas_limit(gas)
+                    .gas_price(0)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+            let (_, sstore, _) = evm.inspector.into_celo_traces();
+            assert_eq!(
+                sstore.first().copied().unwrap_or(false),
+                stored,
+                "gas={gas}, reverted={reverted}"
+            );
+        }
     }
 
     #[test]

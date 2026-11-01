@@ -91,6 +91,7 @@ def main():
     parser.add_argument("--vectors", type=Path)
     parser.add_argument("--consensus", type=Path)
     parser.add_argument("--system-storage", type=Path, help="native system storage gas vectors")
+    parser.add_argument("--return-copy", type=Path, help="native precompile return-memory vectors")
     args = parser.parse_args()
     if args.cache.exists():
         baseline = json.loads(args.cache.read_text())
@@ -107,6 +108,8 @@ def main():
         return
     if args.system_storage:
         baseline.extend(json.loads(args.system_storage.read_text()))
+    if args.return_copy:
+        baseline.extend(json.loads(args.return_copy.read_text()))
     if args.vectors:
         for vector in json.loads(args.vectors.read_text()):
             baseline.append({"name": "pure/" + vector["name"], "params": [{

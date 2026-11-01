@@ -29,6 +29,217 @@ enum Member {
     Log(usize),
 }
 
+/// Native Celo uses preorder traces and canonical receipt-order events. Fee
+/// debit/credit logs have their own explicit empty container, and storage
+/// owners include only successful frames. The BSC/Ethereum ordering remains
+/// in `append_tx_traces` below.
+pub(crate) fn append_celo_tx_traces(
+    tx_hash: &B256,
+    arena: &CallTraceArena,
+    sstore: &[bool],
+    positions: &[Vec<usize>],
+    logs: &[alloy::rpc::types::Log],
+    storage: &mut BTreeSet<Address>,
+    out: &mut BlockFile,
+) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context as _};
+    let nodes = arena.nodes();
+    ensure!(!nodes.is_empty(), "missing primary transaction frame");
+    let tx = hash_hex(tx_hash);
+    let mut root = build_frame(nodes, sstore, 0);
+    celo_registry_trace_gas(&mut root);
+    set_parent_failed(&mut root, false);
+    celo_frame_fields(&mut root);
+    let mut captured = std::collections::BTreeMap::new();
+    fn walk(
+        frame: &mut Frame,
+        node_idx: Option<usize>,
+        nodes: &[CallTraceNode],
+        positions: &[Vec<usize>],
+        tx: &str,
+        parent: &str,
+        path: Vec<i64>,
+        captured: &mut std::collections::BTreeMap<usize, PipelineEvent>,
+        storage: &mut BTreeSet<Address>,
+        out: &mut BlockFile,
+    ) -> anyhow::Result<()> {
+        frame.id = to_hash(&[tx, parent, &frame.pos_in_parent.to_string()]);
+        let failed = frame.failed || frame.parent_failed;
+        let mut trace = to_trace(frame, tx, parent, path.clone());
+        // Native Celo uses big.Int.SetUint64; BSC's converter uses int64.
+        trace.gas_used = i128::from(frame.gas_used);
+        if failed {
+            out.error_traces.push(trace);
+        } else {
+            out.traces.push(trace);
+        }
+        if !failed && frame.self_storage_change {
+            if let Some(i) = node_idx {
+                storage.insert(nodes[i].execution_address());
+            }
+        }
+        for (i, child) in frame.calls.iter_mut().enumerate() {
+            let child_idx = node_idx.and_then(|n| nodes[n].children.get(i).copied());
+            walk(
+                child,
+                child_idx,
+                nodes,
+                positions,
+                tx,
+                &frame.id,
+                child_address(&path, i),
+                captured,
+                storage,
+                out,
+            )?;
+        }
+        for (i, log) in frame.logs.iter_mut().enumerate() {
+            log.parent_trace_id = frame.id.clone();
+            log.id = to_hash(&[&frame.id, &log.pos_in_parent_trace.to_string()]);
+            if failed {
+                log.idx = 0;
+                out.error_events.push(log.clone());
+            } else {
+                let pos = node_idx
+                    .and_then(|n| positions.get(n))
+                    .and_then(|p| p.get(i))
+                    .context("missing traced log occurrence")?;
+                ensure!(
+                    captured.insert(*pos, log.clone()).is_none(),
+                    "duplicate traced log occurrence"
+                );
+            }
+        }
+        Ok(())
+    }
+    walk(
+        &mut root,
+        Some(0),
+        nodes,
+        positions,
+        &tx,
+        "",
+        vec![],
+        &mut captured,
+        storage,
+        out,
+    )?;
+    let system_id = to_hash(&[&tx, "", "1"]);
+    let mut system_logs = 0;
+    for (i, log) in logs.iter().enumerate() {
+        let topics = log.topics();
+        let mut event = if let Some(event) = captured.remove(&i) {
+            ensure!(
+                event.contract_id == addr_hex(&log.address())
+                    && event.data == log.data().data
+                    && event.selector == topics.first().map(hash_hex).unwrap_or_default()
+                    && event.topics
+                        == (!topics.is_empty()).then(|| topics[1..].iter().map(hash_hex).collect()),
+                "traced log differs from receipt at occurrence {i}"
+            );
+            event
+        } else {
+            let pos = system_logs;
+            system_logs += 1;
+            PipelineEvent {
+                id: to_hash(&[&system_id, &pos.to_string()]),
+                contract_id: addr_hex(&log.address()),
+                selector: topics.first().map(hash_hex).unwrap_or_default(),
+                topics: (!topics.is_empty()).then(|| topics[1..].iter().map(hash_hex).collect()),
+                data: log.data().data.clone(),
+                parent_trace_id: system_id.clone(),
+                pos_in_parent_trace: pos,
+                idx: 0,
+            }
+        };
+        event.idx = log.log_index.context("receipt log has no index")? as i64;
+        out.events.push(event);
+    }
+    ensure!(
+        captured.is_empty(),
+        "traced log occurrence is absent from receipt"
+    );
+    if system_logs > 0 {
+        out.traces.push(PipelineTrace {
+            id: system_id,
+            from_addr: addr_hex(&Address::ZERO),
+            to_addr: addr_hex(&Address::ZERO),
+            gas_limit: 0,
+            gas_used: 0,
+            input: Bytes::new(),
+            output: Bytes::new(),
+            value: U256::ZERO,
+            call_create_type: "empty".into(),
+            call_type: String::new(),
+            tx_id: tx,
+            parent_trace_id: String::new(),
+            pos_in_parent_trace: 1,
+            self_storage_change: false,
+            storage_change: false,
+            subtraces: 0,
+            trace_address: vec![],
+            error: String::new(),
+        });
+    }
+    Ok(())
+}
+
+fn celo_frame_fields(frame: &mut Frame) {
+    // Historical Celo CaptureEnter supplies nil value for DELEGATECALL and
+    // STATICCALL, even when the interpreter inherits a nonzero CALLVALUE.
+    if matches!(
+        frame.kind,
+        FrameKind::Call(CallKind::DelegateCall | CallKind::StaticCall)
+    ) {
+        frame.value = U256::ZERO;
+    }
+    frame.storage_change = frame.self_storage_change;
+    for child in &mut frame.calls {
+        celo_frame_fields(child);
+        frame.storage_change |= child.storage_change && !child.failed && !child.parent_failed;
+    }
+}
+
+/// Celo's StopGasMetering skips CALL's dynamic gas calculation but its opcode
+/// still forwards the preceding metered callGasTemp and adds the child's
+/// leftover gas. Native callTracer therefore reports wrapping u64 subtraction
+/// for Registry proxy calls. Preserve those historical trace fields; this is
+/// not gas charged to the transaction (checked independently against receipts).
+fn celo_registry_trace_gas(frame: &mut Frame) {
+    use alloy::primitives::address;
+    fn unmetered(frame: &mut Frame, call_gas: u64) {
+        let mut returned = 0u64;
+        for child in &mut frame.calls {
+            child.gas = call_gas;
+            unmetered(child, call_gas);
+            returned = returned.wrapping_add(child.gas.wrapping_sub(child.gas_used));
+        }
+        frame.gas_used = frame.gas_used.wrapping_sub(returned);
+    }
+    if frame.to == Some(address!("00000000000000000000000000000000000000fd")) {
+        let stipend = if !frame.value.is_zero()
+            && matches!(
+                frame.kind,
+                FrameKind::Call(CallKind::Call | CallKind::CallCode)
+            ) {
+            2300
+        } else {
+            0
+        };
+        for child in &mut frame.calls {
+            if child.to == Some(address!("000000000000000000000000000000000000ce10"))
+                && child.from == Address::ZERO
+                && child.kind == FrameKind::Call(CallKind::StaticCall)
+            {
+                unmetered(child, frame.gas.saturating_sub(stipend));
+            }
+        }
+    }
+    for child in &mut frame.calls {
+        celo_registry_trace_gas(child);
+    }
+}
+
 struct Frame {
     kind: FrameKind,
     from: Address,
@@ -327,7 +538,7 @@ fn to_trace(frame: &Frame, tx_id: &str, parent_id: &str, trace_address: Vec<i64>
         input: frame.input.clone(),
         to_addr: addr_hex(&frame.to.unwrap_or_default()),
         value: frame.value,
-        gas_used: frame.gas_used as i64,
+        gas_used: i128::from(frame.gas_used as i64),
         output: frame.output.clone(),
         call_create_type: call_create_type.to_string(),
         call_type: call_type.to_string(),
@@ -622,5 +833,88 @@ mod tests {
         );
         assert!(file.traces[0].storage_change);
         assert!(!file.traces[0].self_storage_change);
+    }
+
+    #[test]
+    fn celo_registry_gas_keeps_native_unsigned_trace_values() {
+        // Native block 31,056,496, tx 0x551e45...47747: transfer ->
+        // unmetered Registry -> proxy. StopGasMetering leaves callGasTemp
+        // at 437449 and reports uint64(0 - 437449) for the Registry frame.
+        let mut nodes = vec![
+            node(0, None, CallKind::Call, true),
+            node(1, Some(0), CallKind::StaticCall, true),
+            node(2, Some(1), CallKind::DelegateCall, true),
+        ];
+        nodes[0].trace.address = Address::with_last_byte(0xfd);
+        nodes[0].trace.gas_limit = 437_449;
+        nodes[1].trace.address = address!("000000000000000000000000000000000000ce10");
+        nodes[1].trace.caller = Address::ZERO;
+        nodes[1].trace.gas_limit = 100_000;
+        nodes[1].trace.gas_used = 0;
+        nodes[2].trace.gas_limit = 98_438;
+        nodes[2].trace.gas_used = 0;
+        attach(&mut nodes, 0, 1);
+        attach(&mut nodes, 1, 2);
+        let mut file = BlockFile::default();
+        append_celo_tx_traces(
+            &TX,
+            &arena(nodes),
+            &[],
+            &[],
+            &[],
+            &mut BTreeSet::new(),
+            &mut file,
+        )
+        .unwrap();
+        assert_eq!(file.traces[2].gas_limit, 437_449);
+        assert_eq!(file.traces[1].gas_used, 18_446_744_073_709_114_167);
+        assert_eq!(
+            serde_json::to_value(&file.traces[1]).unwrap()["gas_used"].as_u64(),
+            Some(18_446_744_073_709_114_167)
+        );
+    }
+
+    #[test]
+    fn celo_duplicate_fee_logs_use_occurrence_identity_and_failed_storage_is_excluded() {
+        let mut nodes = vec![
+            node(0, None, CallKind::Call, true),
+            node(1, Some(0), CallKind::Call, false),
+        ];
+        log(&mut nodes, 0, 1);
+        attach(&mut nodes, 0, 1);
+        log(&mut nodes, 1, 1);
+        // The fee hook emits the exact same payload before the primary LOG.
+        // Payload matching would attach the wrong occurrence to the root.
+        let receipt_log = |index| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: nodes[0].trace.address,
+                data: nodes[0].logs[0].raw_log.clone(),
+            },
+            log_index: Some(index),
+            ..Default::default()
+        };
+        let logs = vec![receipt_log(10), receipt_log(11)];
+        let mut file = BlockFile::default();
+        let mut owners = BTreeSet::new();
+        append_celo_tx_traces(
+            &TX,
+            &arena(nodes),
+            &[false, true],
+            &[vec![1], vec![2]],
+            &logs,
+            &mut owners,
+            &mut file,
+        )
+        .unwrap();
+        assert!(owners.is_empty());
+        assert!(!file.traces[0].storage_change);
+        assert!(file.error_traces[0].self_storage_change);
+        assert_eq!(file.error_events.len(), 1);
+        assert_eq!(file.error_events[0].idx, 0);
+        assert_eq!(file.events[0].idx, 10);
+        assert_eq!(file.events[1].idx, 11);
+        assert_eq!(file.events[0].parent_trace_id, file.traces[1].id);
+        assert_eq!(file.events[1].parent_trace_id, file.traces[0].id);
+        assert_eq!(file.traces[1].call_create_type, "empty");
     }
 }

@@ -11,7 +11,7 @@ use revm::primitives::{address, hardfork::SpecId, keccak256, Address, AddressSet
 use revm::{
     context_interface::{journaled_state::account::JournaledAccountTr, JournalTr},
     handler::{EthPrecompiles, PrecompileProvider},
-    Database,
+    Database, Inspector, JournalEntry,
 };
 
 #[derive(Debug)]
@@ -27,6 +27,13 @@ pub struct L1Precompiles<'a> {
     warm: AddressSet,
 }
 impl<'a> L1Precompiles<'a> {
+    pub(super) fn contains(&self, address: Address) -> bool {
+        self.warm.contains(&address)
+    }
+    pub(super) fn copies_return_after_memory(&self, address: Address) -> bool {
+        self.fork == L1Fork::Donut
+            && (address == Address::with_last_byte(4) || address == Address::with_last_byte(0xfd))
+    }
     pub fn new(fork: L1Fork, chain: &'a dyn CeloChainData) -> Self {
         let inner = EthPrecompiles::new(fork.spec());
         let mut warm = inner.warm_addresses().clone();
@@ -47,11 +54,34 @@ impl<'a> L1Precompiles<'a> {
         &mut self,
         context: &mut CeloL1Context<DB>,
         inputs: &CallInputs,
+        inspector: Option<&mut dyn Inspector<CeloL1Context<DB>>>,
     ) -> Result<Option<InterpreterResult>, String> {
         // EthFrame has already journaled the plain value transfer. Replace it
         // inside that same checkpoint before running bytecode or a precompile.
         if inputs.scheme == CallScheme::Call {
             if let CallValue::Transfer(value) = inputs.value {
+                if value.is_zero() {
+                    let account = context
+                        .journaled_state
+                        .state
+                        .get_mut(&inputs.caller)
+                        .expect("CALL caller loaded");
+                    if account.is_loaded_as_not_existing_not_touched() && !account.is_created() {
+                        // Celo's Transfer calls StateDB.SubBalance even for zero.
+                        // GetOrNewStateObject creates a missing caller. Journal the
+                        // creation inside EthFrame's checkpoint so all enclosing
+                        // reverts undo it. The block DB distinguishes first creation
+                        // (dirty) from reset of an earlier deletion (not dirty).
+                        let is_created_globally = account.mark_created_locally();
+                        context
+                            .journaled_state
+                            .journal
+                            .push(JournalEntry::AccountCreated {
+                                address: inputs.caller,
+                                is_created_globally,
+                            });
+                    }
+                }
                 self.retax_transfer(
                     context,
                     inputs.caller,
@@ -60,6 +90,15 @@ impl<'a> L1Precompiles<'a> {
                     inputs.is_static,
                 )?;
             }
+        }
+        if (inputs.scheme == CallScheme::StaticCall
+            || (inputs.scheme == CallScheme::Call
+                && inputs.value == CallValue::Transfer(U256::ZERO)))
+            && inputs.caller == inputs.target_address
+            && inputs.value.get().is_zero()
+            && context.journaled_state.state[&inputs.target_address].is_empty()
+        {
+            context.journaled_state.touch_account(inputs.target_address);
         }
         let bytes = inputs.bytecode_address.as_slice();
         if bytes[..19].iter().any(|b| *b != 0) || !self.fork.precompile_active(bytes[19]) {
@@ -78,7 +117,7 @@ impl<'a> L1Precompiles<'a> {
             }));
         }
         let result = match address {
-            0xfd => self.transfer(context, inputs, &input),
+            0xfd => self.transfer(context, inputs, &input, inspector),
             0xfa | 0xf9 | 0xf5 | 0xf4 | 0xe1 => consensus::run(
                 address,
                 &input,
@@ -111,9 +150,18 @@ impl<'a> L1Precompiles<'a> {
         context: &mut CeloL1Context<DB>,
         name: &str,
     ) -> Result<Address, Failure> {
+        self.registered_inspected(context, name, None)
+    }
+
+    fn registered_inspected<DB: Database>(
+        &self,
+        context: &mut CeloL1Context<DB>,
+        name: &str,
+        inspector: Option<&mut dyn Inspector<CeloL1Context<DB>>>,
+    ) -> Result<Address, Failure> {
         let mut input = keccak256(b"getAddressFor(bytes32)")[..4].to_vec();
         input.extend_from_slice(keccak256(name.as_bytes()).as_slice());
-        let output = evm::system_call(
+        let result = evm::system_call_inspected(
             context,
             self.fork,
             self.chain,
@@ -123,7 +171,13 @@ impl<'a> L1Precompiles<'a> {
             100_000,
             true,
             true,
-        )?;
+            inspector,
+        )
+        .map_err(Failure::Node)?;
+        if !result.result.is_ok() {
+            return Err(Failure::Invalid);
+        }
+        let output = result.output;
         if output.len() < 32 {
             return Err(Failure::Invalid);
         }
@@ -139,8 +193,9 @@ impl<'a> L1Precompiles<'a> {
         context: &mut CeloL1Context<DB>,
         inputs: &CallInputs,
         input: &[u8],
+        inspector: Option<&mut dyn Inspector<CeloL1Context<DB>>>,
     ) -> Result<Bytes, Failure> {
-        if self.registered(context, "GoldToken")? != inputs.caller {
+        if self.registered_inspected(context, "GoldToken", inspector)? != inputs.caller {
             return Err(Failure::Invalid);
         }
         if input.len() < 96 || (self.fork >= L1Fork::Gingerbread && input.len() != 96) {
@@ -322,10 +377,40 @@ macro_rules! provider {
                 context: &mut $context,
                 inputs: &CallInputs,
             ) -> Result<Option<Self::Output>, String> {
-                self.run_inner(context, inputs)
+                self.run_inner(context, inputs, None)
             }
         }
     };
 }
 provider!(CeloL1Context<DB>);
 provider!(&mut CeloL1Context<DB>);
+
+/// Only the GoldToken authorization query is visible to the native tracer.
+/// Tobin-tax helper calls remain uninspected, as in Celo's TobinTransfer.
+pub(super) struct InspectingPrecompiles<'p, 'a, DB: Database> {
+    pub precompiles: &'p mut L1Precompiles<'a>,
+    pub inspector: &'p mut dyn Inspector<CeloL1Context<DB>>,
+}
+macro_rules! inspecting_provider {
+    ($context:ty) => {
+        impl<DB: Database> PrecompileProvider<$context> for InspectingPrecompiles<'_, '_, DB> {
+            type Output = InterpreterResult;
+            fn set_spec(&mut self, _: SpecId) -> bool {
+                false
+            }
+            fn warm_addresses(&self) -> &AddressSet {
+                &self.precompiles.warm
+            }
+            fn run(
+                &mut self,
+                context: &mut $context,
+                inputs: &CallInputs,
+            ) -> Result<Option<Self::Output>, String> {
+                self.precompiles
+                    .run_inner(context, inputs, Some(self.inspector))
+            }
+        }
+    };
+}
+inspecting_provider!(CeloL1Context<DB>);
+inspecting_provider!(&mut CeloL1Context<DB>);

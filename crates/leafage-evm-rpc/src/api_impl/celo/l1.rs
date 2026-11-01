@@ -25,7 +25,7 @@ use revm::{
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type CeloL1ApiImpl<DB> = ApiImpl<DB, MainnetSpecId, CeloL1Config>;
-struct ArchiveChain<'a, DB>(&'a DB);
+pub(super) struct ArchiveChain<'a, DB>(pub &'a DB);
 impl<DB: BlockIndex> CeloChainData for ArchiveChain<'_, DB> {
     fn header(&self, number: u64) -> Result<CeloHeader, String> {
         self.0

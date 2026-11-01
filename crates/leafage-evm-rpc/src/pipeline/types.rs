@@ -95,7 +95,9 @@ pub struct PipelineTrace {
     pub input: Bytes,
     pub to_addr: String,
     pub value: U256,
-    pub gas_used: i64,
+    /// Celo's unmetered Registry trace can wrap u64. Keep its positive JSON
+    /// integer while also preserving the existing signed Go pipeline format.
+    pub gas_used: i128,
     pub output: Bytes,
     #[serde(rename = "type")]
     pub call_create_type: String,

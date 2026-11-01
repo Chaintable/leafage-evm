@@ -5,7 +5,7 @@ use revm::{
     database::InMemoryDB,
     primitives::{Address, Bytes, TxKind, U256},
     state::{AccountInfo, Bytecode},
-    ExecuteEvm,
+    ExecuteEvm, InspectEvm,
 };
 use serde::Deserialize;
 
@@ -233,7 +233,7 @@ fn celo_block_opcodes_follow_the_native_activation_schedule() {
                 },
                 config(),
                 db,
-                (),
+                revm::inspector::NoOpInspector,
                 &NoChain,
             )
             .unwrap();
@@ -302,6 +302,77 @@ fn config() -> CfgEnv<MainnetSpecId> {
 }
 
 #[test]
+fn donut_creation_with_overlapping_identity_output_matches_native_code() {
+    // Mainnet tx bda01d03e8202f6ba721ebefc222b079e77c3d014f92e35ceec54e56abd9964d,
+    // block 8498434. Identity reads memory[0..32] and writes memory[7..39];
+    // RETURNDATACOPY then overwrites memory[0..32] before returning 64 code bytes.
+    let sender: Address = "9c690b5dd8ad58927b5714d3f2184bd18f8c2c4f".parse().unwrap();
+    let address: Address = "dd6643e105b723f94b71a9a5b3ae414f1424cbbf".parse().unwrap();
+    let init =
+        revm::primitives::hex::decode("3034526020600760203460045afa602034343e604034f3").unwrap();
+    let legacy_code = revm::primitives::hex::decode("00000000000000000000000000000000000000dd6643e105b723f94b71a9a5b3ae414f1424cbbf00000000000000000000000000000000000000000000000000").unwrap();
+    for (number, inspected) in [
+        DONUT_BLOCK,
+        8_498_434,
+        ESPRESSO_BLOCK - 1,
+        ESPRESSO_BLOCK,
+        GINGERBREAD_BLOCK,
+    ]
+    .into_iter()
+    .flat_map(|n| [(n, false), (n, true)])
+    {
+        let mut evm = evm::create_celo_l1_evm(
+            BlockEnv {
+                number: U256::from(number),
+                ..Default::default()
+            },
+            config(),
+            InMemoryDB::default(),
+            revm::inspector::NoOpInspector,
+            &NoChain,
+        )
+        .unwrap();
+        let tx = TxEnv {
+            caller: sender,
+            chain_id: Some(super::super::CELO_CHAIN_ID),
+            kind: TxKind::Create,
+            gas_limit: 150_000,
+            data: init.clone().into(),
+            ..Default::default()
+        };
+        let result = if inspected {
+            evm.inspect_tx(tx)
+        } else {
+            evm.transact(tx)
+        }
+        .unwrap();
+        assert!(result.result.is_success(), "{number}: {:?}", result.result);
+        // Espresso warms precompiles: STATICCALL's access cost drops by 600.
+        let gas_used = if number < ESPRESSO_BLOCK {
+            66_933
+        } else {
+            66_333
+        };
+        assert_eq!(result.result.tx_gas_used(), gas_used, "{number}");
+        let expected_hash = if number < ESPRESSO_BLOCK {
+            assert_eq!(
+                result.result.output().unwrap().as_ref(),
+                legacy_code,
+                "{number}"
+            );
+            "b7f3609bc945dad13aecef95699a2870fc16276c6cd580bde9e5b234bfacbba0"
+        } else {
+            "982d55b634f401eb83bbd39c8bc0b24f86f2051d8c6d902caad624031bdbb905"
+        };
+        assert_eq!(
+            result.state[&address].info.code_hash,
+            expected_hash.parse::<revm::primitives::B256>().unwrap(),
+            "{number}"
+        );
+    }
+}
+
+#[test]
 fn token_transfer_uses_live_registry_returns_input_and_rolls_back() {
     let sender = Address::repeat_byte(0x11);
     let to = Address::repeat_byte(0x22);
@@ -317,7 +388,7 @@ fn token_transfer_uses_live_registry_returns_input_and_rolls_back() {
             },
             config(),
             token_db(revert),
-            (),
+            revm::inspector::NoOpInspector,
             &NoChain,
         )
         .unwrap();
@@ -358,7 +429,7 @@ fn missing_consensus_header_is_not_an_evm_success() {
         },
         config(),
         token_db(false),
-        (),
+        revm::inspector::NoOpInspector,
         &NoChain,
     )
     .unwrap();
@@ -427,7 +498,7 @@ fn tobin_tax_applies_before_call_and_create_and_reverts_with_them() {
                     },
                     config(),
                     db,
-                    (),
+                    revm::inspector::NoOpInspector,
                     &NoChain,
                 )
                 .unwrap();
@@ -553,6 +624,12 @@ fn native_opcode_gas_at_fork_boundaries() {
         ))
         .unwrap(),
     );
+    cases.extend(
+        serde_json::from_str::<Vec<serde_json::Value>>(include_str!(
+            "../../../testdata/celo_l1/return_copy.json"
+        ))
+        .unwrap(),
+    );
     for case in cases {
         let params = case["params"].as_array().unwrap();
         let request = &params[0];
@@ -595,7 +672,7 @@ fn native_opcode_gas_at_fork_boundaries() {
             },
             config(),
             db,
-            (),
+            revm::inspector::NoOpInspector,
             &NoChain,
         )
         .unwrap();
