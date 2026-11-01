@@ -66,8 +66,29 @@ macro_rules! evm_impl {
             }
             fn frame_init(
                 &mut self,
-                init: FrameInit,
+                mut init: FrameInit,
             ) -> Result<FrameInitResult<'_, EthFrame>, ContextDbError<Self::Context>> {
+                if let FrameInput::Call(inputs) = &mut init.frame_input {
+                    if inputs.scheme == CallScheme::Call
+                        && inputs.value == CallValue::Transfer(U256::ZERO)
+                        && !self.inner.precompiles.contains(inputs.bytecode_address)
+                    {
+                        let account = self
+                            .inner
+                            .ctx
+                            .journaled_state
+                            .state
+                            .get(&inputs.target_address)
+                            .expect("CALL target loaded");
+                        if account.is_loaded_as_not_existing_not_touched() && !account.is_created()
+                        {
+                            // Native EIP-158 returns before Transfer for a zero-value
+                            // CALL to a missing non-precompile. Do not invent a dirty
+                            // object: Celo's later resetObjectChange can observe it.
+                            inputs.value = CallValue::Apparent(U256::ZERO);
+                        }
+                    }
+                }
                 let first = self.inner.frame_stack.index().is_none();
                 let slot = if first {
                     self.inner.frame_stack.start_init()

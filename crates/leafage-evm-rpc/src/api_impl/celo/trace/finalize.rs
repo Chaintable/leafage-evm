@@ -4,8 +4,8 @@ use super::{
     fees::{word, ContractFailure, System},
     input::BlockInput,
     replay::{config, environment},
+    state::CeloBlockDb,
 };
-use crate::pipeline::changes::RecordingDb;
 use alloy::primitives::{Address, U256};
 use anyhow::{ensure, Context as _, Result};
 use leafage_evm_chains::celo::l1::{
@@ -86,7 +86,7 @@ fn attempt<DB: Database>(
 }
 
 pub(super) fn finalize<D>(
-    db: &mut RecordingDb<D>,
+    db: &mut CeloBlockDb<D>,
     chain: &dyn CeloChainData,
     input: &BlockInput,
     parent: &D,

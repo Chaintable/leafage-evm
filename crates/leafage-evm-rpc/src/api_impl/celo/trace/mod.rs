@@ -4,6 +4,7 @@ mod finalize;
 mod genesis;
 mod input;
 mod replay;
+mod state;
 
 use crate::{
     api_impl::core::{Api, ApiBase},
@@ -82,7 +83,7 @@ where
         })
         .await
         .map_err(error)?
-        .map_err(|e| error(format!("{e:#}")))?;
+        .map_err(|e| error(format!("Celo block {number}: {e:#}")))?;
         tracing::info!(target: "trace", number, txs = result.block_file.txs.len(),
             fetch_ms = fetched.as_millis() as u64, total_ms = started.elapsed().as_millis() as u64,
             "Celo L1 trace_debankBlock");

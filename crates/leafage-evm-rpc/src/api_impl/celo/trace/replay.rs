@@ -4,11 +4,11 @@ use super::super::l1::ArchiveChain;
 use super::{
     fees::{abi, word, CeloTransactionHandler, System},
     input::BlockInput,
+    state::CeloBlockDb,
 };
 use crate::pipeline::{
     build::{pipeline_block, pipeline_header},
     chain::ReplayOptions,
-    changes::RecordingDb,
     convert::append_celo_tx_traces,
     inspector::PipelineInspector,
     types::{addr_hex, hash_hex, BlockFile, DebankBlockOutput, PipelineTransaction},
@@ -93,10 +93,9 @@ where
         ovm_address: None,
         normalize_state_key: false,
     };
-    let mut cache = RecordingDb::new(
+    let mut cache = CeloBlockDb::new(
         CacheDB::new(parent_state.clone()),
         options.state_diff || options.check_state,
-        true,
     );
     let chain = ArchiveChain(db);
     let system = System {
@@ -203,6 +202,7 @@ where
             );
             let state = evm.finalize();
             evm.inner.ctx.journaled_state.database.commit(state);
+            cache.intermediate_root();
         }
     }
     // Espresso freezes fee minima and intrinsic surcharge at block start.

@@ -91,6 +91,15 @@ it applies the block randomness call; fees retain native debit, balance
 query, refund and credit ordering. Celo fee-currency and gateway fields are
 kept for execution even though the analytical `txs` output omits them.
 
+Celo also preserves the original StateDB's empty-account lifecycle. A zero-value
+system CALL creates its missing caller. First creation is dirty and EIP-161
+deletes it; resetting an object deleted earlier in the block does not itself
+dirty it. Such an empty reset is written only if that address still has a
+pending trie update. Randomness flushes pending updates, while transaction
+finalization retains them. `CeloBlockDb` applies those rules before the shared
+change collector; empty accounts remain distinct from absent accounts in
+verification. This is observable at mainnet blocks 473580 and 473581.
+
 The trace format follows native Celo's preorder, reverted-event handling,
 storage ownership and explicit empty trace for untraced fee logs. In
 particular, legacy Celo reports zero value for DELEGATECALL and wraps an
@@ -156,9 +165,18 @@ RPC comparison with `--system-storage crates/leafage-evm-chains/testdata/celo_l1
 
 Transaction replay was compared field by field with native Celo at 37 heights:
 814 transactions, 18,632 successful traces, 1,629 error traces, 3,082 events
-and 91 reverted events. All fields and ordering matched. A separate deterministic
-sample of 160 historical blocks replayed 4,498 transactions with all signature,
-root, gas, status and receipt-log checks passing. These are transaction-output
-checks; consensus finalization and canonical state diffs remain native Celo's
-responsibility. The complete RPC crate regression suite passed 156 tests
-(two external-service tests were ignored).
+and 91 reverted events. All fields and ordering matched. Complete pipeline
+output, including local consensus finalization and decoded StateDiff, was
+subsequently compared at 44 heights covering 858 transactions and eight epoch
+boundaries. A separate deterministic sample of 160 historical blocks replayed
+4,498 transactions with all signature, root, gas, status, receipt-log and
+archive-state checks passing. These samples do not establish correctness for
+every historical block; strict state checks remain enabled during backfill.
+
+The empty-account regression tests exercise the native first-create/reset
+distinction, the randomness flush, later touches, absent-destination CALLs,
+and both direct and enclosing reverts. The native StateDB sequence
+`SubBalance(a,0); IntermediateRoot(true); [AddBalance(a,0); Finalise(true);]
+SubBalance(a,0); Commit(true)` persists an empty account exactly when the
+bracketed touch occurs. This was independently run against native Celo;
+it is not an archive exception or an address/height special case.

@@ -11,7 +11,7 @@ use revm::primitives::{address, hardfork::SpecId, keccak256, Address, AddressSet
 use revm::{
     context_interface::{journaled_state::account::JournaledAccountTr, JournalTr},
     handler::{EthPrecompiles, PrecompileProvider},
-    Database, Inspector,
+    Database, Inspector, JournalEntry,
 };
 
 #[derive(Debug)]
@@ -27,6 +27,9 @@ pub struct L1Precompiles<'a> {
     warm: AddressSet,
 }
 impl<'a> L1Precompiles<'a> {
+    pub(super) fn contains(&self, address: Address) -> bool {
+        self.warm.contains(&address)
+    }
     pub fn new(fork: L1Fork, chain: &'a dyn CeloChainData) -> Self {
         let inner = EthPrecompiles::new(fork.spec());
         let mut warm = inner.warm_addresses().clone();
@@ -53,6 +56,28 @@ impl<'a> L1Precompiles<'a> {
         // inside that same checkpoint before running bytecode or a precompile.
         if inputs.scheme == CallScheme::Call {
             if let CallValue::Transfer(value) = inputs.value {
+                if value.is_zero() {
+                    let account = context
+                        .journaled_state
+                        .state
+                        .get_mut(&inputs.caller)
+                        .expect("CALL caller loaded");
+                    if account.is_loaded_as_not_existing_not_touched() && !account.is_created() {
+                        // Celo's Transfer calls StateDB.SubBalance even for zero.
+                        // GetOrNewStateObject creates a missing caller. Journal the
+                        // creation inside EthFrame's checkpoint so all enclosing
+                        // reverts undo it. The block DB distinguishes first creation
+                        // (dirty) from reset of an earlier deletion (not dirty).
+                        let is_created_globally = account.mark_created_locally();
+                        context
+                            .journaled_state
+                            .journal
+                            .push(JournalEntry::AccountCreated {
+                                address: inputs.caller,
+                                is_created_globally,
+                            });
+                    }
+                }
                 self.retax_transfer(
                     context,
                     inputs.caller,
@@ -61,6 +86,15 @@ impl<'a> L1Precompiles<'a> {
                     inputs.is_static,
                 )?;
             }
+        }
+        if (inputs.scheme == CallScheme::StaticCall
+            || (inputs.scheme == CallScheme::Call
+                && inputs.value == CallValue::Transfer(U256::ZERO)))
+            && inputs.caller == inputs.target_address
+            && inputs.value.get().is_zero()
+            && context.journaled_state.state[&inputs.target_address].is_empty()
+        {
+            context.journaled_state.touch_account(inputs.target_address);
         }
         let bytes = inputs.bytecode_address.as_slice();
         if bytes[..19].iter().any(|b| *b != 0) || !self.fork.precompile_active(bytes[19]) {
