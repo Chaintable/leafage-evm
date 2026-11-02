@@ -1516,6 +1516,56 @@ impl DataBaseRef {
         Ok(Some(code))
     }
 
+    fn read_code_many(&self, hashes: &[H256]) -> Result<Vec<Option<Bytes>>, Error> {
+        let mut out: Vec<_> = hashes
+            .iter()
+            .map(|hash| {
+                let hit = self.code_cache.as_ref().and_then(|cache| cache.get(hash));
+                if hit.is_some() {
+                    STORAGE_METRICS.code_cache_hits.increment(1);
+                }
+                hit
+            })
+            .collect();
+        let pending: Vec<_> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(i, hit)| hit.is_none().then_some(i))
+            .collect();
+        if pending.len() < udt::MIN_MULTIGET_KEYS {
+            for i in pending {
+                out[i] = self.read_code(hashes[i])?;
+            }
+            return Ok(out);
+        }
+        if self.code_cache.is_some() {
+            STORAGE_METRICS
+                .code_cache_misses
+                .increment(pending.len() as u64);
+        }
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::HashToCode.to_str())
+            .unwrap();
+        let start = std::time::Instant::now();
+        let found = self.db.batched_multi_get_cf_opt(
+            cf,
+            pending.iter().map(|i| hashes[*i].as_slice()),
+            false,
+            &rocksdb_read_options(),
+        );
+        STORAGE_METRICS
+            .read_code_many_latency
+            .record(start.elapsed().as_secs_f64());
+        for (i, code) in pending.into_iter().zip(found) {
+            out[i] = code?.map(|code| Bytes::copy_from_slice(&code));
+            if let (Some(cache), Some(code)) = (&self.code_cache, &out[i]) {
+                cache.insert(hashes[i], code.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub fn read_latest_block_num(&self) -> Result<Option<u64>, Error> {
         let latest_hash = self.read_latest_block_hash()?;
         if latest_hash == H256::ZERO {
@@ -2404,13 +2454,16 @@ fn seek_account(
 }
 
 /// Decode an `AddressToAccount` value: slim RLP, empty when deleted.
-fn decode_account(address: H256, mut raw: &[u8]) -> Option<NewAccount> {
+fn decode_account(address: H256, raw: &[u8]) -> Option<NewAccount> {
+    decode_cached_account(raw).map(|account| account.with_address(address))
+}
+
+fn decode_cached_account(mut raw: &[u8]) -> Option<CachedAccount> {
     if raw.is_empty() {
         return None;
     }
     let account = SlimAccount::decode(&mut raw).unwrap();
-    Some(NewAccount {
-        address,
+    Some(CachedAccount {
         balance: account.balance,
         nonce: account.nonce,
         code_hash: if account.code_hash.is_zero() {
@@ -2614,6 +2667,78 @@ impl StateDB {
         table.record_udt(key, span, newer);
         Ok(())
     }
+
+    /// Read only cache misses in a batch, retaining the scalar path's span
+    /// learning and head-probe policy. Account and storage reads share this.
+    fn read_udt_many<const N: usize, V>(
+        &self,
+        reader: &udt::UdtReader,
+        col: StorageTypeColumn,
+        keys: &[[u8; N]],
+        table: Option<&Table<N, V>>,
+        decode: impl Fn(&[u8]) -> V,
+    ) -> Result<Vec<V>, Error>
+    where
+        V: Copy + PartialEq + Debug + Send + Sync + 'static,
+    {
+        disable_perf_counters();
+        self.check_timeout()?;
+        let (hits, misses, latency) = match col {
+            StorageTypeColumn::AddressToAccount => (
+                &STORAGE_METRICS.account_cache_hits,
+                &STORAGE_METRICS.account_cache_misses,
+                &STORAGE_METRICS.read_account_many_latency,
+            ),
+            StorageTypeColumn::AddressToStorage => (
+                &STORAGE_METRICS.storage_cache_hits,
+                &STORAGE_METRICS.storage_cache_misses,
+                &STORAGE_METRICS.read_storage_many_latency,
+            ),
+            _ => unreachable!("only account and storage CFs are timestamped"),
+        };
+        let cache = self.cache_view.as_ref().zip(table);
+        let mut out = vec![decode(&[]); keys.len()];
+        let mut pending = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            let mut cached = None;
+            if let Some((_, table)) = cache {
+                match table.lookup(key, self.block_num) {
+                    Lookup::Hit(span) => {
+                        hits.increment(1);
+                        out[i] = span.value;
+                        continue;
+                    }
+                    Lookup::Miss(entry) => {
+                        misses.increment(1);
+                        if entry.is_none() {
+                            STORAGE_METRICS.state_cache_cold_misses.increment(1);
+                        }
+                        cached = entry;
+                    }
+                }
+            }
+            pending.push((i, cached));
+        }
+        if !pending.is_empty() {
+            let raw_keys: Vec<&[u8]> = pending.iter().map(|(i, _)| keys[*i].as_slice()).collect();
+            let start = std::time::Instant::now();
+            let found = reader.get_many(self.db.db, col, &raw_keys)?;
+            latency.record(start.elapsed().as_secs_f64());
+            for ((i, cached), found) in pending.into_iter().zip(found) {
+                out[i] = decode(found.as_ref().map_or(&[], |f| f.value()));
+                if let Some((view, table)) = cache {
+                    let span = Span {
+                        lo: found.as_ref().map_or(0, |f| f.block),
+                        hi: self.block_num,
+                        found: found.is_some(),
+                        value: out[i],
+                    };
+                    self.udt_record(view, table, &cached, col, keys[i], span)?;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Count a miss's probe decision; whether it probes.
@@ -2806,12 +2931,7 @@ impl StateDBRead for StateDB {
             match cache.accounts.lookup(&address.0, self.block_num) {
                 Lookup::Hit(span) => {
                     STORAGE_METRICS.account_cache_hits.increment(1);
-                    return Ok(span.value.map(|account| NewAccount {
-                        address,
-                        balance: account.balance,
-                        nonce: account.nonce,
-                        code_hash: account.code_hash,
-                    }));
+                    return Ok(span.value.map(|account| account.with_address(address)));
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.account_cache_misses.increment(1);
@@ -2839,11 +2959,7 @@ impl StateDBRead for StateDB {
                     lo: version.unwrap_or(0),
                     hi: self.block_num,
                     found: version.is_some(),
-                    value: account.as_ref().map(|account| CachedAccount {
-                        balance: account.balance,
-                        nonce: account.nonce,
-                        code_hash: account.code_hash,
-                    }),
+                    value: account.as_ref().map(CachedAccount::from),
                 };
                 self.udt_record(
                     view,
@@ -2866,11 +2982,7 @@ impl StateDBRead for StateDB {
                 lo: version.unwrap_or(0),
                 hi: self.block_num,
                 found: version.is_some(),
-                value: account.as_ref().map(|account| CachedAccount {
-                    balance: account.balance,
-                    nonce: account.nonce,
-                    code_hash: account.code_hash,
-                }),
+                value: account.as_ref().map(CachedAccount::from),
             };
             let mut next_version_found = false;
             // Probe under the same lock: another reader of this handle may
@@ -2902,6 +3014,60 @@ impl StateDBRead for StateDB {
     fn read_code(&self, code_hash: H256) -> Result<Option<Bytes>, Error> {
         self.db.read_code(code_hash)
     }
+
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, Error> {
+        self.db.read_code_many(code_hashes)
+    }
+
+    fn read_account_many(&self, addresses: &[H256]) -> Result<Vec<Option<NewAccount>>, Error> {
+        let Some(reader) = &self.udt else {
+            return addresses
+                .iter()
+                .map(|address| self.read_account(*address))
+                .collect();
+        };
+        let keys: Vec<_> = addresses.iter().map(|address| address.0).collect();
+        let accounts = self.read_udt_many(
+            reader,
+            StorageTypeColumn::AddressToAccount,
+            &keys,
+            self.db.state_cache.as_ref().map(|cache| &cache.accounts),
+            decode_cached_account,
+        )?;
+        Ok(addresses
+            .iter()
+            .zip(accounts)
+            .map(|(address, account)| account.map(|account| account.with_address(*address)))
+            .collect())
+    }
+
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Error> {
+        let Some(reader) = &self.udt else {
+            return keys
+                .iter()
+                .map(|(address, key)| self.read_storage(*address, *key))
+                .collect();
+        };
+        let keys: Vec<[u8; 64]> = keys
+            .iter()
+            .map(|(address, slot)| {
+                let mut key = [0; 64];
+                key[..32].copy_from_slice(address.as_slice());
+                key[32..].copy_from_slice(slot.as_slice());
+                key
+            })
+            .collect();
+        self.read_udt_many(
+            reader,
+            StorageTypeColumn::AddressToStorage,
+            &keys,
+            self.db.state_cache.as_ref().map(|cache| &cache.storage),
+            decode_storage,
+        )
+    }
+
+    // Leave supports_batched_reads at its conservative default: explicit
+    // batches benefit, without enabling speculative multicall prefetch.
 
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         if let Some(info) = &self.block_info {

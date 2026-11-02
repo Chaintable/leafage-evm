@@ -3,9 +3,9 @@
 //! One batch resolves N `getAddressCode` / `getStorageAt` /
 //! `getAddressBalance` / `getAddressNonce` reads against a single state
 //! view of a fixed block: one `state_at`, deduplicated keys, and
-//! batched storage reads (RocksDB MultiGet on the non-archive backend,
-//! scalar fallback elsewhere). Code, balance and nonce reads share one
-//! account pool — the same address requested by several kinds costs one
+//! batched storage reads (RocksDB MultiGet, including schema v3 archive
+//! cache misses; scalar fallback elsewhere). Code, balance and nonce share
+//! one account pool — the same address requested by several kinds costs one
 //! account read. The wire payload is BSRB/1 binary in a JSON-RPC hex
 //! shell; item order is the correlation. Per-item results keep the
 //! exact value shapes and error code/message text of the single methods

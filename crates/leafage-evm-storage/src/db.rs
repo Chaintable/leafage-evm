@@ -145,8 +145,7 @@ pub trait StateDBRead {
     fn read_storage(&self, address: H256, key: H256) -> Result<U256, StorageError>;
 
     /// Batched [`StateDBRead::read_account`]: one result per input, same
-    /// order. The scalar default keeps archive/MDBX/mock backends correct;
-    /// exact-key backends (non-archive RocksDB) override it with MultiGet.
+    /// order. Backends with batched reads override the scalar default.
     fn read_account_many(
         &self,
         addresses: &[H256],
@@ -173,10 +172,9 @@ pub trait StateDBRead {
             .collect()
     }
 
-    /// Whether the `*_many` reads above are served by a real batched
-    /// storage primitive (RocksDB MultiGet) instead of the scalar
-    /// defaults. A performance hint for callers deciding whether eager
-    /// batched reads are worth issuing; correctness never depends on it.
+    /// Whether eager batched prefetch is recommended for this backend.
+    /// Explicit `*_many` calls may still batch when this is false (e.g.
+    /// archive); correctness never depends on this performance hint.
     fn supports_batched_reads(&self) -> bool {
         false
     }

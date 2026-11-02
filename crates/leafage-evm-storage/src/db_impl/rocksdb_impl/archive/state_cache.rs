@@ -32,7 +32,7 @@
 //! creating its iterators, so they see every block up to it; spans are cut at
 //! that head, and a reader above it does not use the cache.
 
-use leafage_evm_types::{H256, U256};
+use leafage_evm_types::{NewAccount, H256, U256};
 use quick_cache::sync::{Cache as QuickCache, DefaultLifecycle, EntryAction, EntryResult};
 use quick_cache::Weighter;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -65,6 +65,27 @@ pub(super) struct CachedAccount {
     pub balance: U256,
     pub nonce: u64,
     pub code_hash: H256,
+}
+
+impl CachedAccount {
+    pub(super) fn with_address(self, address: H256) -> NewAccount {
+        NewAccount {
+            address,
+            balance: self.balance,
+            nonce: self.nonce,
+            code_hash: self.code_hash,
+        }
+    }
+}
+
+impl From<&NewAccount> for CachedAccount {
+    fn from(account: &NewAccount) -> Self {
+        Self {
+            balance: account.balance,
+            nonce: account.nonce,
+            code_hash: account.code_hash,
+        }
+    }
 }
 
 /// One block span over which a key holds a single value.
