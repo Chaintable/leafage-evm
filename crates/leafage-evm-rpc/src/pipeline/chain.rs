@@ -90,15 +90,18 @@ pub enum Chain {
     Bsc,
     /// Ethereum mainnet.
     Eth,
+    /// Arc mainnet.
+    Arc,
 }
 
 impl Chain {
-    pub const ALL: [Chain; 2] = [Chain::Bsc, Chain::Eth];
+    pub const ALL: [Chain; 3] = [Chain::Bsc, Chain::Eth, Chain::Arc];
 
     pub fn name(self) -> &'static str {
         match self {
             Chain::Bsc => "bsc",
             Chain::Eth => "eth",
+            Chain::Arc => "arc",
         }
     }
 
@@ -107,6 +110,7 @@ impl Chain {
         match self {
             Chain::Bsc => 56,
             Chain::Eth => 1,
+            Chain::Arc => 5042,
         }
     }
 }

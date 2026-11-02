@@ -17,3 +17,5 @@ pub use evm::{
     ArcSubcallTraceCompletionPhase,
 };
 pub use hardforks::{ArcForkActivation, ArcHardfork, ArcHardforkFlags, ArcHardforkSchedule};
+pub use native::{blocklist_storage_slot, is_blocklisted_status};
+pub use precompile::NATIVE_COIN_CONTROL_ADDRESS;
