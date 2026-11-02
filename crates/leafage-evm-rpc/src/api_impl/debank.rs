@@ -702,13 +702,10 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
         }
-        // Prefetch only where the batched reads are real: archive and
-        // MDBX backends fall back to scalar loops, and OVM chains force
-        // scalar account reads, so prefetching there just front-loads
-        // the same point reads — under fast_fail (the SDK default) an
-        // early failure would turn that into O(N) wasted reads. On
-        // MultiGet backends the fast_fail waste is bounded by two
-        // batched reads over the capped prefetch window.
+        // Prefetch only on backends that opt in: archive supports explicit
+        // batches but keeps eager prefetch off pending workload measurements;
+        // MDBX and OVM account reads are scalar. Under fast_fail an early
+        // failure can waste eager reads, so the prefetch window is capped.
         if cache_db.db.supports_batched_reads() {
             Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token);
         }

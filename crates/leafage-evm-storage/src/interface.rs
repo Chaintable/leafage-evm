@@ -48,10 +48,9 @@ pub trait StateDB {
             .collect()
     }
 
-    /// Whether the `*_many` reads above are served by a real batched
-    /// storage primitive instead of the scalar defaults. A performance
-    /// hint for callers deciding whether eager batched reads are worth
-    /// issuing; correctness never depends on it.
+    /// Whether eager batched prefetch is recommended for this backend.
+    /// Explicit `*_many` calls may still batch when this is false;
+    /// correctness never depends on this performance hint.
     fn supports_batched_reads(&self) -> bool {
         false
     }
@@ -243,10 +242,8 @@ impl<T: StateDB> EvmStorageWrapper<T> {
         self.db.code_by_hash_many(code_hashes)
     }
 
-    /// Whether the `*_many_ref` reads above actually batch at the
-    /// storage layer: needs a backend with real batched point reads,
-    /// and no OVM balance override (which forces `basic_many_ref` onto
-    /// the scalar path).
+    /// Whether eager batched prefetch is recommended: the backend must
+    /// opt in, and OVM balance overrides must not force scalar account reads.
     pub fn supports_batched_reads(&self) -> bool {
         self.ovm_address.is_none() && self.db.supports_batched_reads()
     }

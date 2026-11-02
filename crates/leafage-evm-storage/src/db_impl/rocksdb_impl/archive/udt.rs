@@ -42,6 +42,8 @@ const COMPARATOR: &str = "leveldb.BytewiseComparator.u64ts";
 const ROLL_BYTES: u64 = 128 << 20;
 /// Threads of the rewind trim's compactions (the serving archive uses 4).
 const TRIM_SUBCOMPACTIONS: u32 = 8;
+/// Batch only enough cache misses to amortize MultiGet's setup allocations.
+pub(super) const MIN_MULTIGET_KEYS: usize = 8;
 
 /// Whether the archive at `path` is schema v3.
 pub(crate) fn is_udt_archive(path: &Path) -> Result<bool, Error> {
@@ -217,39 +219,87 @@ impl UdtReader {
                 &mut err,
             )
         };
-        if !err.is_null() {
-            return Err(take_error(err));
-        }
-        let m = &*STORAGE_METRICS;
-        let (found, missing) = match col {
-            StorageTypeColumn::AddressToAccount => (
-                &m.archive_account_gets_found,
-                &m.archive_account_gets_missing,
-            ),
-            _ => (
-                &m.archive_storage_gets_found,
-                &m.archive_storage_gets_missing,
-            ),
-        };
-        // Found iff a timestamp came back: an empty value may come back as a
-        // null `malloc(0)`.
-        if ts_len == 0 {
-            missing.increment(1);
-            return Ok(None);
-        }
-        found.increment(1);
-        // SAFETY: `ts` holds `ts_len` (8) bytes.
-        let block = unsafe {
-            let b = u64::from_le_bytes(
-                std::slice::from_raw_parts(ts as *const u8, 8)
-                    .try_into()
-                    .unwrap(),
-            );
-            ffi::rocksdb_free(ts as *mut c_void);
-            b
-        };
-        Ok(Some(Found { value, len, block }))
+        // SAFETY: these are the owned outputs of the C call above.
+        let found = unsafe { Found::take(value, len, ts, ts_len, err) };
+        count_gets(col, std::slice::from_ref(&found));
+        found
     }
+
+    /// Same versions and input order as `get`, including empty values.
+    pub(super) fn get_many(
+        &self,
+        db: &DB,
+        col: StorageTypeColumn,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Found>>, Error> {
+        if keys.len() < MIN_MULTIGET_KEYS {
+            return keys.iter().map(|key| self.get(db, col, key)).collect();
+        }
+        let cf = db.cf_handle(col.to_str()).unwrap();
+        let n = keys.len();
+        let cfs = vec![cf.inner() as *const ffi::rocksdb_column_family_handle_t; n];
+        let pointers: Vec<_> = keys
+            .iter()
+            .map(|key| key.as_ptr().cast::<c_char>())
+            .collect();
+        let lengths: Vec<_> = keys.iter().map(|key| key.len()).collect();
+        let mut values = vec![std::ptr::null_mut(); n];
+        let mut sizes = vec![0; n];
+        let mut timestamps = vec![std::ptr::null_mut(); n];
+        let mut timestamp_sizes = vec![0; n];
+        let mut errors = vec![std::ptr::null_mut(); n];
+        // SAFETY: all arrays have n entries; options and keys outlive the call.
+        unsafe {
+            ffi::rocksdb_multi_get_cf_with_ts(
+                db.as_raw_ptr(),
+                self.ro,
+                cfs.as_ptr(),
+                n,
+                pointers.as_ptr(),
+                lengths.as_ptr(),
+                values.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                timestamps.as_mut_ptr(),
+                timestamp_sizes.as_mut_ptr(),
+                errors.as_mut_ptr(),
+            );
+        }
+        // Own/free EVERY C result before propagating an error: collecting
+        // directly into Result would leak the outputs after the first error.
+        let owned: Vec<_> = (0..n)
+            .map(|i| unsafe {
+                Found::take(
+                    values[i],
+                    sizes[i],
+                    timestamps[i],
+                    timestamp_sizes[i],
+                    errors[i],
+                )
+            })
+            .collect();
+        count_gets(col, &owned);
+        owned.into_iter().collect()
+    }
+}
+
+/// Count the versioned reads that found a version at or below the read
+/// height, and those that found none.
+fn count_gets(col: StorageTypeColumn, results: &[Result<Option<Found>, Error>]) {
+    let m = &*STORAGE_METRICS;
+    let (found, missing) = match col {
+        StorageTypeColumn::AddressToAccount => (
+            &m.archive_account_gets_found,
+            &m.archive_account_gets_missing,
+        ),
+        _ => (
+            &m.archive_storage_gets_found,
+            &m.archive_storage_gets_missing,
+        ),
+    };
+    let hits = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    let misses = results.iter().filter(|r| matches!(r, Ok(None))).count();
+    found.increment(hits as u64);
+    missing.increment(misses as u64);
 }
 
 impl Drop for UdtReader {
@@ -268,6 +318,35 @@ pub(super) struct Found {
 }
 
 impl Found {
+    /// Take ownership of the malloc'ed outputs of a timestamped C read.
+    unsafe fn take(
+        value: *mut c_char,
+        len: usize,
+        ts: *mut c_char,
+        ts_len: usize,
+        err: *mut c_char,
+    ) -> Result<Option<Self>, Error> {
+        let mut found = Self {
+            value,
+            len,
+            block: 0,
+        };
+        if !err.is_null() {
+            ffi::rocksdb_free(ts.cast());
+            return Err(take_error(err));
+        }
+        // Found iff a timestamp came back: empty values can be null malloc(0).
+        if ts_len == 0 {
+            ffi::rocksdb_free(ts.cast());
+            return Ok(None);
+        }
+        // The versioned CF comparator always returns an eight-byte timestamp.
+        found.block =
+            u64::from_le_bytes(std::slice::from_raw_parts(ts.cast(), 8).try_into().unwrap());
+        ffi::rocksdb_free(ts.cast());
+        Ok(Some(found))
+    }
+
     pub(super) fn value(&self) -> &[u8] {
         if self.len == 0 {
             return &[];
@@ -981,14 +1060,36 @@ mod tests {
                 .db_at(BlockId::Number(BlockNumberOrTag::Number(h)))
                 .unwrap()
                 .unwrap();
-            out[h as usize] = addrs()
+            // Batch first so cold misses exercise MultiGet. The existing v2
+            // oracle also checks the spans learned by these reads on v3.
+            let mut addresses = addrs();
+            addresses.extend([addresses[0], H256::repeat_byte(0xff)]);
+            let keys: Vec<_> = addresses
+                .iter()
+                .flat_map(|a| slots().into_iter().map(|s| (*a, s)))
+                .collect();
+            let accounts = state.read_account_many(&addresses).unwrap();
+            let storage = state.read_storage_many(&keys).unwrap();
+            assert!(state.read_account_many(&[]).unwrap().is_empty());
+            assert!(state.read_storage_many(&[]).unwrap().is_empty());
+            assert!(
+                !state.supports_batched_reads(),
+                "archive must not enable eager prefetch"
+            );
+            out[h as usize] = addresses
                 .into_iter()
-                .map(|a| {
+                .enumerate()
+                .map(|(i, a)| {
                     let account = state.read_account(a).unwrap();
-                    let slots = slots()
+                    assert_eq!(accounts[i], account);
+                    let slots: Vec<_> = slots()
                         .into_iter()
                         .map(|s| state.read_storage_and_height(a, s).unwrap())
                         .collect();
+                    assert_eq!(
+                        storage[i * slots.len()..(i + 1) * slots.len()],
+                        slots.iter().map(|(value, _)| *value).collect::<Vec<_>>()
+                    );
                     let listed = state.read_storage_slots(a).unwrap().unwrap();
                     (account, slots, listed)
                 })
@@ -1167,8 +1268,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let mut rng = Rng(0xab1e);
         let head = 40u64;
-        let diffs: Vec<(u64, BlockStorageDiff)> =
+        let mut diffs: Vec<(u64, BlockStorageDiff)> =
             (1..=head).map(|n| (n, random_diff(&mut rng, n))).collect();
+        let codes: Vec<_> = (0..12u8)
+            .map(|i| leafage_evm_types::NewCode {
+                code_hash: H256::repeat_byte(0x80 + i),
+                code: Bytes::from(vec![i; 40]),
+            })
+            .collect();
+        diffs[0].1.new_codes = codes.clone();
         let mut answers = Vec::new();
         for schema in [ArchiveSchema::V2, ArchiveSchema::V3] {
             let dir = base.join(schema.to_string());
@@ -1183,8 +1291,29 @@ mod tests {
             // Reopened, whatever schema is asked for.
             assert!(!init_archive_schema(&dir, ArchiveSchema::V1).unwrap());
             assert_eq!(is_udt_archive(&dir).unwrap(), schema == ArchiveSchema::V3);
-            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let mut db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let mut hashes: Vec<_> = codes.iter().rev().map(|code| code.code_hash).collect();
+            hashes.extend([hashes[0], H256::repeat_byte(0xff)]);
+            let expected: Vec<_> = hashes
+                .iter()
+                .map(|hash| {
+                    codes
+                        .iter()
+                        .find(|code| code.code_hash == *hash)
+                        .map(|code| code.code.clone())
+                })
+                .collect();
+            db.read_code(hashes[0]).unwrap(); // Mixed cache hits and batch misses.
+            for _ in 0..2 {
+                assert_eq!(db.read_code_many(&hashes).unwrap(), expected);
+            }
+            assert!(db.read_code_many(&[]).unwrap().is_empty());
             answers.push(read_all(&db, head, &mut rng));
+            let uncached = Arc::get_mut(&mut db).unwrap();
+            uncached.state_cache = None;
+            uncached.code_cache = None;
+            assert_eq!(db.read_code_many(&hashes).unwrap(), expected);
+            assert_eq!(answers.last().unwrap(), &read_all(&db, head, &mut rng));
         }
         assert_eq!(answers[0], answers[1]);
 
