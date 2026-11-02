@@ -1,11 +1,13 @@
 //! Exports the archive database's RocksDB statistics as metrics.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use rocksdb::statistics::{StatsLevel, Ticker};
+use metrics::Counter;
+use rocksdb::statistics::StatsLevel;
 use rocksdb::{Cache, Options};
 
-use crate::metrics::ROCKSDB_METRICS;
+use crate::metrics::{RocksdbMetrics, ROCKSDB_METRICS};
 
 const EXPORT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -14,6 +16,57 @@ const EXPORT_INTERVAL: Duration = Duration::from_secs(10);
 pub(super) fn enable(opts: &mut Options) {
     opts.enable_statistics();
     opts.set_statistics_level(StatsLevel::ExceptHistogramOrTimers);
+}
+
+/// The exported tickers, by RocksDB name. They are read by name from the
+/// statistics dump: rust-rocksdb's `Ticker` numbering has drifted from
+/// RocksDB 10.7.5's (`rocksdb.last.level.read.count` is off by 4).
+fn tickers(m: &RocksdbMetrics) -> [(&'static str, &Counter); 17] {
+    [
+        ("rocksdb.number.keys.read", &m.keys_read),
+        ("rocksdb.block.cache.index.hit", &m.block_cache_index_hit),
+        ("rocksdb.block.cache.index.miss", &m.block_cache_index_miss),
+        ("rocksdb.block.cache.filter.hit", &m.block_cache_filter_hit),
+        (
+            "rocksdb.block.cache.filter.miss",
+            &m.block_cache_filter_miss,
+        ),
+        ("rocksdb.block.cache.data.hit", &m.block_cache_data_hit),
+        ("rocksdb.block.cache.data.miss", &m.block_cache_data_miss),
+        ("rocksdb.bloom.filter.useful", &m.bloom_filter_useful),
+        (
+            "rocksdb.bloom.filter.full.positive",
+            &m.bloom_filter_full_positive,
+        ),
+        (
+            "rocksdb.bloom.filter.full.true.positive",
+            &m.bloom_filter_full_true_positive,
+        ),
+        ("rocksdb.l0.hit", &m.get_hit_l0),
+        ("rocksdb.l1.hit", &m.get_hit_l1),
+        ("rocksdb.l2andup.hit", &m.get_hit_l2_and_up),
+        ("rocksdb.last.level.read.count", &m.last_level_read_count),
+        ("rocksdb.last.level.read.bytes", &m.last_level_read_bytes),
+        (
+            "rocksdb.non.last.level.read.count",
+            &m.non_last_level_read_count,
+        ),
+        (
+            "rocksdb.non.last.level.read.bytes",
+            &m.non_last_level_read_bytes,
+        ),
+    ]
+}
+
+/// Ticker values from a statistics dump, whose ticker lines read
+/// `<name> COUNT : <value>`.
+fn parse_tickers(dump: &str) -> HashMap<&str, u64> {
+    dump.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(" COUNT : ")?;
+            Some((name, value.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 /// Copy the tickers and the block cache usage into the metrics every
@@ -26,34 +79,15 @@ pub(super) fn spawn_exporter(opts: Options, cache: Cache, capacity: usize) {
         .spawn(move || {
             let m = &*ROCKSDB_METRICS;
             m.block_cache_capacity_bytes.set(capacity as f64);
-            let tickers = [
-                (Ticker::NumberKeysRead, &m.keys_read),
-                (Ticker::BlockCacheIndexHit, &m.block_cache_index_hit),
-                (Ticker::BlockCacheIndexMiss, &m.block_cache_index_miss),
-                (Ticker::BlockCacheFilterHit, &m.block_cache_filter_hit),
-                (Ticker::BlockCacheFilterMiss, &m.block_cache_filter_miss),
-                (Ticker::BlockCacheDataHit, &m.block_cache_data_hit),
-                (Ticker::BlockCacheDataMiss, &m.block_cache_data_miss),
-                (Ticker::BloomFilterUseful, &m.bloom_filter_useful),
-                (
-                    Ticker::BloomFilterFullPositive,
-                    &m.bloom_filter_full_positive,
-                ),
-                (
-                    Ticker::BloomFilterFullTruePositive,
-                    &m.bloom_filter_full_true_positive,
-                ),
-                (Ticker::GetHitL0, &m.get_hit_l0),
-                (Ticker::GetHitL1, &m.get_hit_l1),
-                (Ticker::GetHitL2AndUp, &m.get_hit_l2_and_up),
-                (Ticker::LastLevelReadCount, &m.last_level_read_count),
-                (Ticker::LastLevelReadBytes, &m.last_level_read_bytes),
-                (Ticker::NonLastLevelReadCount, &m.non_last_level_read_count),
-                (Ticker::NonLastLevelReadBytes, &m.non_last_level_read_bytes),
-            ];
+            let tickers = tickers(m);
             loop {
-                for (ticker, counter) in &tickers {
-                    counter.absolute(opts.get_ticker_count(*ticker));
+                if let Some(dump) = opts.get_statistics() {
+                    let values = parse_tickers(&dump);
+                    for (name, counter) in &tickers {
+                        if let Some(&v) = values.get(name) {
+                            counter.absolute(v);
+                        }
+                    }
                 }
                 m.block_cache_usage_bytes.set(cache.get_usage() as f64);
                 m.block_cache_pinned_usage_bytes
@@ -70,7 +104,8 @@ mod tests {
     use rocksdb::{BlockBasedOptions, DB};
 
     /// The options keep reading the open database's tickers, which
-    /// [`spawn_exporter`] relies on.
+    /// [`spawn_exporter`] relies on, and every exported ticker is found by
+    /// name.
     #[test]
     fn options_read_the_open_databases_tickers() {
         let dir =
@@ -91,10 +126,22 @@ mod tests {
         }
         assert_eq!(db.get(b"absent").unwrap(), None);
 
-        assert_eq!(opts.get_ticker_count(Ticker::NumberKeysRead), 4);
-        let data = opts.get_ticker_count(Ticker::BlockCacheDataHit)
-            + opts.get_ticker_count(Ticker::BlockCacheDataMiss);
-        assert!(data > 0);
+        let dump = opts.get_statistics().unwrap();
+        let values = parse_tickers(&dump);
+        // Every exported ticker is in the dump under its name.
+        for (name, _) in tickers(&RocksdbMetrics::default()) {
+            assert!(values.contains_key(name), "{name}");
+        }
+        assert_eq!(values["rocksdb.number.keys.read"], 4);
+        assert!(
+            values["rocksdb.block.cache.data.hit"] + values["rocksdb.block.cache.data.miss"] > 0
+        );
+        // The file reads behind the misses, which rust-rocksdb's Ticker
+        // numbering reads as another ticker.
+        assert!(
+            values["rocksdb.last.level.read.count"] + values["rocksdb.non.last.level.read.count"]
+                > 0
+        );
         assert!(cache.get_usage() > 0);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
