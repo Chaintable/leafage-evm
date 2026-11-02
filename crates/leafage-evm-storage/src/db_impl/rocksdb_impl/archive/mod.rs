@@ -1737,6 +1737,9 @@ impl DataBaseRef {
         // partitioned index the read path is tuned for (and resizing the files
         // to `target_file_size_base`). This makes the final compact O(DB size)
         // once, which is the intended one-time cost of a bulk-load finalize.
+        // Not `kForceOptimized`: in RocksDB 10.7 it can leave old bottommost
+        // files that follow one this compaction has just written unrewritten
+        // while reporting the range done.
         let compact_opts = Self::force_bottommost_compact_options();
 
         for cf_type in column_families {
@@ -1752,11 +1755,11 @@ impl DataBaseRef {
                     // per-range `end` bound (`nibble || 0xFF..`) covers every
                     // reachable key in the range and leaves no gap between
                     // consecutive ranges.
-                    self.compact_cf_by_prefix::<64>(cf, &compact_opts);
+                    self.compact_cf_by_prefix::<64>(cf_type);
                 }
                 StorageTypeColumn::AddressToStorage => {
                     // Key structure: address (32) || slot (32) || block_num (32) = 96 bytes.
-                    self.compact_cf_by_prefix::<96>(cf, &compact_opts);
+                    self.compact_cf_by_prefix::<96>(cf_type);
                 }
                 _ => {
                     // Small column families can be compacted in one go
@@ -1781,21 +1784,35 @@ impl DataBaseRef {
     fn force_bottommost_compact_options() -> CompactOptions {
         let mut opts = CompactOptions::default();
         opts.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+        // Lets the per-range compactions of `compact_cf_by_prefix` run at once.
+        opts.set_exclusive_manual_compaction(false);
         opts
     }
 
-    /// Compact a column family in 16 ranges based on first byte's high nibble.
-    /// This reduces memory usage by processing smaller chunks at a time.
-    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily, opts: &CompactOptions) {
-        for i in 0u8..16 {
-            let start = [i << 4];
-            let mut end = [0xFFu8; KEY_LEN];
-            end[0] = (i << 4) | 0x0F;
-            info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
-                i + 1, i << 4, (i << 4) | 0x0F);
-            self.db
-                .compact_range_cf_opt(cf, Some(&start), Some(&end), opts);
-        }
+    /// Compact a column family in 16 ranges based on first byte's high nibble,
+    /// all at once. Each range is a smaller compaction than the whole column
+    /// family, and RocksDB runs only as many of them as it has background
+    /// compaction threads, which bounds memory.
+    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf_type: StorageTypeColumn) {
+        std::thread::scope(|scope| {
+            for i in 0u8..16 {
+                scope.spawn(move || {
+                    let start = [i << 4];
+                    let mut end = [0xFFu8; KEY_LEN];
+                    end[0] = (i << 4) | 0x0F;
+                    info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
+                        i + 1, i << 4, (i << 4) | 0x0F);
+                    let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+                    self.db.compact_range_cf_opt(
+                        cf,
+                        Some(&start),
+                        Some(&end),
+                        &Self::force_bottommost_compact_options(),
+                    );
+                    info!(target: "archive_compact", "  Range {}/16 done", i + 1);
+                });
+            }
+        });
     }
 
     /// Post-compaction sanity check for the versioned archive CFs.
