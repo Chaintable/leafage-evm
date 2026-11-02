@@ -121,9 +121,12 @@ impl Command {
     fn scan_with(&self, recreations: Option<&Recreations>) -> Result<()> {
         let mut opts = Options::default();
         opts.set_max_open_files(self.max_open_files);
-        let db =
-            DB::open_cf_for_read_only(&opts, &self.db_path, ["1", "2", "3", "4", "5", "6"], false)
-                .map_err(|e| anyhow!("open read-only: {e}"))?;
+        let cfs = DB::list_cf(&opts, &self.db_path)
+            .map_err(|e| anyhow!("list column families: {e}"))?
+            .into_iter()
+            .filter(|name| name != "default");
+        let db = DB::open_cf_for_read_only(&opts, &self.db_path, cfs, false)
+            .map_err(|e| anyhow!("open read-only: {e}"))?;
         let plan = Mutex::new(BufWriter::new(
             File::create(&self.plan).with_context(|| format!("creating {:?}", self.plan))?,
         ));

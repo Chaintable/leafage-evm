@@ -13,8 +13,8 @@
 
 use super::{
     archive_cf_descriptors, archive_cf_options, decode_archive_header, decode_storage,
-    encode_block_num, fmt_hms, key_after_prefix, rocksdb_options, shard_bounds, DataBaseRef,
-    StorageTypeColumn, ARCHIVE_COLUMNS, ENCODING_MARKER_KEY,
+    encode_block_num, existing_columns, fmt_hms, key_after_prefix, rocksdb_options, shard_bounds,
+    DataBaseRef, StorageTypeColumn, ENCODING_MARKER_KEY,
 };
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{ingest_external_file_options, SstSink};
@@ -408,17 +408,49 @@ pub(crate) fn check_rewind_target(path: &Path, number: u64) -> Result<(), Error>
     let get = |col: StorageTypeColumn, key: &[u8]| -> Result<Option<Vec<u8>>, Error> {
         Ok(db.get_cf(db.cf_handle(col.to_str()).unwrap(), key)?)
     };
-    let header_number = |hash: Option<Vec<u8>>| -> Result<Option<u64>, Error> {
-        let Some(hash) = hash else { return Ok(None) };
-        get(StorageTypeColumn::BlockHashToBlockInfo, &hash)?
-            .map(|raw| Ok(decode_archive_header(&mut &raw[..])?.number))
-            .transpose()
-    };
-    let head = header_number(get(StorageTypeColumn::LatestBlockHash, &[1u8])?)?;
-    let target = header_number(get(
+    let latest = get(StorageTypeColumn::LatestBlockHash, &[1u8])?;
+    let target_hash = get(
         StorageTypeColumn::BlockNumToBlockHash,
         &encode_block_num(number),
-    )?)?;
+    )?;
+    let (head, target) = if db
+        .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+        .is_some()
+    {
+        let header_number = |hash: Option<Vec<u8>>| -> Result<Option<u64>, Error> {
+            let Some(hash) = hash else { return Ok(None) };
+            get(StorageTypeColumn::BlockHashToBlockInfo, &hash)?
+                .map(|raw| Ok(decode_archive_header(&mut &raw[..])?.number))
+                .transpose()
+        };
+        (header_number(latest)?, header_number(target_hash)?)
+    } else {
+        // Block infos by number, each starting with its hash. The head is
+        // the latest one with the head's hash: a bulk load may have written
+        // blocks past it.
+        let cf = db
+            .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
+            .unwrap();
+        let mut head = None;
+        if let Some(latest) = &latest {
+            for item in db.iterator_cf(cf, IteratorMode::End) {
+                let (key, record) = item?;
+                if record.starts_with(latest) {
+                    head = Some(u64::from_be_bytes(key[..].try_into().unwrap()));
+                    break;
+                }
+            }
+        }
+        let record = get(
+            StorageTypeColumn::BlockNumToBlockInfo,
+            &number.to_be_bytes(),
+        )?;
+        let target = match (target_hash, record) {
+            (Some(hash), Some(record)) if record.starts_with(&hash) => Some(number),
+            _ => None,
+        };
+        (head, target)
+    };
     match (head, target) {
         (Some(head), Some(target)) if target == number && number <= head => Ok(()),
         _ => Err(Error::UnSupported(format!(
@@ -442,7 +474,7 @@ pub(crate) fn trim_history(path: &Path, number: u64) -> Result<(), Error> {
     // RocksDB opens every CF of the database, `default` included.
     let mut names = vec![CString::new("default").unwrap()];
     let mut cf_opts = vec![Options::default()];
-    for col in ARCHIVE_COLUMNS {
+    for col in existing_columns(path).unwrap_or_default() {
         names.push(CString::new(col.to_str()).unwrap());
         let mut opts = archive_cf_options(col, &cache, false, false, false, true);
         // The trim's bottommost pass skips files numbered after it started
@@ -523,7 +555,8 @@ fn open_read_only(path: &Path, udt: bool) -> Result<DB, Error> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512),
     );
-    let descriptors = ARCHIVE_COLUMNS.iter().map(|&col| {
+    let cols = existing_columns(path).unwrap_or_default();
+    let descriptors = cols.into_iter().map(|col| {
         let versioned = matches!(
             col,
             StorageTypeColumn::AddressToAccount | StorageTypeColumn::AddressToStorage
@@ -596,19 +629,22 @@ impl DataBaseRef {
             ));
         }
 
+        // The destination keeps the source's block infos, by hash or by
+        // number.
+        let cols = existing_columns(src_path).unwrap_or_default();
         let cache = Cache::new_hyper_clock_cache(cache_size << 20, 8192);
         let mut db_opts = rocksdb_options(false);
         db_opts.set_error_if_exists(true);
         let dst = DB::open_cf_descriptors(
             &db_opts,
             dst_path,
-            archive_cf_descriptors(&cache, false, false, false, true),
+            archive_cf_descriptors(&cache, false, false, false, true, &cols),
         )?;
         let tmp_dir = dst_path.join(".udt_tmp");
         std::fs::create_dir_all(&tmp_dir)?;
         // SST writers use the destination CFs' options: same comparator,
         // filters, index and bottom-level compression.
-        let sst_opts: Vec<(StorageTypeColumn, Options)> = ARCHIVE_COLUMNS
+        let sst_opts: Vec<(StorageTypeColumn, Options)> = cols
             .iter()
             .map(|&col| {
                 (
@@ -629,13 +665,13 @@ impl DataBaseRef {
                 tasks.push(Task::Versioned { col, shard, lo, hi });
             }
         }
-        for col in [
-            StorageTypeColumn::BlockHashToBlockInfo,
-            StorageTypeColumn::HashToCode,
-            StorageTypeColumn::BlockNumToBlockHash,
-            StorageTypeColumn::LatestBlockHash,
-        ] {
-            tasks.push(Task::Copy(col));
+        for &col in &cols {
+            if !matches!(
+                col,
+                StorageTypeColumn::AddressToStorage | StorageTypeColumn::AddressToAccount
+            ) {
+                tasks.push(Task::Copy(col));
+            }
         }
         let n_tasks = tasks.len();
         let queue = Mutex::new(tasks.into_iter());
@@ -780,7 +816,7 @@ impl DataBaseRef {
             other: records[2].load(Ordering::Relaxed),
             files: 0,
         };
-        for col in ARCHIVE_COLUMNS {
+        for &col in &cols {
             let paths: Vec<PathBuf> = outputs
                 .iter()
                 .filter(|(c, _, _)| *c == col)

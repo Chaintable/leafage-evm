@@ -118,6 +118,43 @@ what a cache lookup and insert do, so the cache saves little CPU on v3, but
 it halves the RocksDB reads per request (measured below). In production
 the version without it ran out of disk IOPS, see "Production, one pod".
 
+## Block infos by number (optional, any schema)
+
+Requests name historical blocks by hash, and `BlockHashToBlockInfo` (CF `2`)
+is keyed by hash, so a replay over consecutive blocks reads one CF `2` data
+block per block; on bsc that was a third to a half of the disk reads. An
+archive can instead keep its block infos in `BlockNumToBlockInfo` (CF `7`):
+block number (8 bytes BE) -> block hash ‖ the CF `2` value, in 16KB ZSTD
+blocks, so consecutive blocks share data blocks. It has one of the two CFs.
+
+A hash is resolved through an in-memory index built at open from CF `3`: the
+hash's first 4 bytes and the number of every canonical block, sorted (8
+bytes per block, ~1GB for bsc; block numbers must fit in a `u32`). The record
+carries its hash, so a shared prefix only costs a second candidate. Blocks
+committed later are indexed before their write, and merged into the sorted
+entries every 2^20 blocks.
+
+With `ARCHIVE_BLOCK_INDEX=1`, a new database is created with CF `7`, and
+opening a database with CF `2` moves it before the open returns:
+
+1. Build the index from CF `3`.
+2. Scan CF `2`, keep the canonical blocks (archives only hold finalized
+   blocks; reorgs are resolved in the in-memory diff layers), sort them by
+   number in 1GB chunks written as SST files under `.block_index_tmp`.
+3. Fail unless every block of CF `3` was copied; ingest the files into CF `7`
+   and merge them with one compaction.
+4. Drop CF `2`.
+
+A move that is interrupted leaves both CFs; the next open drops the partial CF
+`7`, and moves again if the variable is set. Once moved, the variable is no
+longer needed. Nothing restores CF `2`, and a release without CF `7` support
+cannot open the database (RocksDB requires every CF to be opened).
+
+Cost on bsc: CF `7` ~78GB against CF `2` ~90GB. The move reads CF `2` (~90GB),
+writes and merges ~85GB of chunks, so it needs ~165GB free at its peak and
+takes about an hour at 125MB/s. `leafage_storage_read_block_by_number_latency`
+counts CF `7` reads.
+
 ## Writes
 
 A block's account and storage writes are put with their block as the
