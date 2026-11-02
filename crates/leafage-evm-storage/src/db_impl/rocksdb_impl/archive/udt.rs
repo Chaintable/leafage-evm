@@ -18,6 +18,7 @@ use super::{
 };
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{ingest_external_file_options, SstSink};
+use crate::metrics::STORAGE_METRICS;
 use leafage_evm_types::{H256, U256};
 use librocksdb_sys as ffi;
 use rocksdb::{
@@ -219,7 +220,9 @@ impl UdtReader {
             )
         };
         // SAFETY: these are the owned outputs of the C call above.
-        unsafe { Found::take(value, len, ts, ts_len, err) }
+        let found = unsafe { Found::take(value, len, ts, ts_len, err) };
+        count_gets(col, std::slice::from_ref(&found));
+        found
     }
 
     /// Same versions and input order as `get`, including empty values.
@@ -274,8 +277,29 @@ impl UdtReader {
                 )
             })
             .collect();
+        count_gets(col, &owned);
         owned.into_iter().collect()
     }
+}
+
+/// Count the versioned reads that found a version at or below the read
+/// height, and those that found none.
+fn count_gets(col: StorageTypeColumn, results: &[Result<Option<Found>, Error>]) {
+    let m = &*STORAGE_METRICS;
+    let (found, missing) = match col {
+        StorageTypeColumn::AddressToAccount => (
+            &m.archive_account_gets_found,
+            &m.archive_account_gets_missing,
+        ),
+        _ => (
+            &m.archive_storage_gets_found,
+            &m.archive_storage_gets_missing,
+        ),
+    };
+    let hits = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    let misses = results.iter().filter(|r| matches!(r, Ok(None))).count();
+    found.increment(hits as u64);
+    missing.increment(misses as u64);
 }
 
 impl Drop for UdtReader {

@@ -54,6 +54,7 @@ use tracing::{debug, info, warn};
 mod iterator_tracker;
 mod rewind;
 mod state_cache;
+mod stats;
 pub(crate) mod udt;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
@@ -406,6 +407,26 @@ enum CfCompression {
     Zstd,
 }
 
+/// `ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS=1|true`: point lookups skip the filter
+/// of the last level, which holds most keys and most filter bytes. Lookups of
+/// keys present there save a filter block read; lookups of absent keys read
+/// an index and a data block instead. It applies to existing files at once,
+/// but files compacted into the last level while it is on get no filter, and
+/// keep none if it is turned off until they are rewritten.
+static OPTIMIZE_FILTERS_FOR_HITS: LazyLock<bool> = LazyLock::new(|| {
+    let on = matches!(
+        env::var("ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS").as_deref(),
+        Ok("1" | "true" | "TRUE")
+    );
+    if on {
+        info!(
+            target = "rocksdb",
+            "archive optimize_filters_for_hits enabled"
+        );
+    }
+    on
+});
+
 #[inline]
 fn rocksdb_column_options(
     shared_cache: &Cache,
@@ -475,6 +496,9 @@ fn rocksdb_column_options(
     // Default is 64MB; bump to 128MB.
     cf_opts.set_target_file_size_base(128 << 20);
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
+    if *OPTIMIZE_FILTERS_FOR_HITS {
+        cf_opts.set_optimize_filters_for_hits(true);
+    }
     // Disable TTL-based compaction. Archive data is immutable — recompacting
     // old SST files just because they exceed 30 days (the default set by
     // optimize_level_style_compaction) provides no benefit and causes massive
@@ -1030,10 +1054,10 @@ impl DataBaseRef {
         maintenance: bool,
     ) -> Result<Self, Error> {
         let total_cache_size = cache_size;
-        let shared_cache = Cache::new_hyper_clock_cache(
-            1024 * 1024 * total_cache_size,
-            8192, // 8KB typical block size
-        );
+        // Estimated entry charge 0: the table grows with the entries. A fixed
+        // estimate sizes the table for that many entries; the cache holds ~4KB
+        // blocks, so an 8KB estimate ran out of slots before using its bytes.
+        let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * total_cache_size, 0);
         info!(
             target = "rocksdb",
             "Created shared Clock Cache with size: {}MB for archive (bulk_load={}, archive_zstd_compression={})",
@@ -1055,7 +1079,14 @@ impl DataBaseRef {
             db_opt.create_if_missing(false);
             db_opt.create_missing_column_families(false);
         }
+        let serving = !bulk_load && !maintenance;
+        if serving {
+            stats::enable(&mut db_opt);
+        }
         let db = DB::open_cf_descriptors(&db_opt, path, cfs)?;
+        if serving {
+            stats::spawn_exporter(db_opt, shared_cache.clone(), 1024 * 1024 * total_cache_size);
+        }
         let cols = vec![
             (
                 StorageTypeColumn::LatestBlockHash,
@@ -1107,7 +1138,6 @@ impl DataBaseRef {
             ),
         ];
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
-        let serving = !bulk_load && !maintenance;
         let db_ref = Self {
             db: unsafe { &DATA_BASE.as_ref().unwrap().db },
             code_cache: build_code_cache(),
