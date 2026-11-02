@@ -92,9 +92,12 @@ pub(super) struct BlockIndex {
 
 impl Debug for BlockIndex {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // One lock at a time: `note` takes `recent`, then `sorted`.
+        let sorted = self.sorted.read().unwrap().len();
+        let recent = self.recent.read().unwrap().len();
         f.debug_struct("BlockIndex")
-            .field("sorted", &self.sorted.read().unwrap().len())
-            .field("recent", &self.recent.read().unwrap().len())
+            .field("sorted", &sorted)
+            .field("recent", &recent)
             .finish()
     }
 }
