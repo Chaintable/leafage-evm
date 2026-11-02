@@ -18,6 +18,7 @@ use super::{
 };
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{ingest_external_file_options, SstSink};
+use crate::metrics::STORAGE_METRICS;
 use leafage_evm_types::{H256, U256};
 use librocksdb_sys as ffi;
 use rocksdb::{
@@ -219,11 +220,24 @@ impl UdtReader {
         if !err.is_null() {
             return Err(take_error(err));
         }
+        let m = &*STORAGE_METRICS;
+        let (found, missing) = match col {
+            StorageTypeColumn::AddressToAccount => (
+                &m.archive_account_gets_found,
+                &m.archive_account_gets_missing,
+            ),
+            _ => (
+                &m.archive_storage_gets_found,
+                &m.archive_storage_gets_missing,
+            ),
+        };
         // Found iff a timestamp came back: an empty value may come back as a
         // null `malloc(0)`.
         if ts_len == 0 {
+            missing.increment(1);
             return Ok(None);
         }
+        found.increment(1);
         // SAFETY: `ts` holds `ts_len` (8) bytes.
         let block = unsafe {
             let b = u64::from_le_bytes(
