@@ -4,7 +4,7 @@
 //! transaction-only decision logic here so execution and RPC estimation cannot
 //! drift into separate partial implementations.
 
-use alloy::primitives::{Address, TxKind};
+use alloy::primitives::{Address, TxKind, U256};
 use alloy::sol_types::SolCall;
 
 use super::precompile::Result;
@@ -15,10 +15,27 @@ use super::{
         stablecoin_dex::IStablecoinDEX,
         storage_types::Handler,
         tip20::{is_tip20_prefix, TIP20Token, ITIP20},
-        DEFAULT_FEE_TOKEN, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+        DEFAULT_FEE_TOKEN, STABLECOIN_DEX_ADDRESS, TEMPO_GAS_PRICE_SCALING_FACTOR,
+        TIP_FEE_MANAGER_ADDRESS,
     },
     tx::TempoTxEnv,
 };
+
+/// No TIP-1115 fallback token covers the maximum fee on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InsufficientFallbackBalance {
+    /// Largest fallback-token balance of the fee payer.
+    pub(crate) available: U256,
+    /// Maximum fee in TIP-20 base units.
+    pub(crate) required: U256,
+}
+
+/// Maximum fee in TIP-20 base units, as `calc_gas_balance_spending` in the writer.
+pub(crate) fn max_fee_in_token_units(gas_limit: u64, max_fee_per_gas: u128) -> U256 {
+    U256::from(gas_limit)
+        .saturating_mul(U256::from(max_fee_per_gas))
+        .div_ceil(TEMPO_GAS_PRICE_SCALING_FACTOR)
+}
 
 /// State-independent candidates, in the precedence order used by the writer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,46 +99,72 @@ impl FeeTokenCandidates {
 }
 
 /// Resolves candidates using the currently installed precompile storage context.
+///
+/// `max_fee` is in TIP-20 base units; zero skips the T13 fallback balance reads.
 pub(crate) fn resolve_from_storage(
     candidates: FeeTokenCandidates,
     fee_payer: Address,
-) -> Result<Address> {
+    spec: TempoHardfork,
+    max_fee: U256,
+) -> Result<core::result::Result<Address, InsufficientFallbackBalance>> {
     resolve(
         candidates,
+        spec,
+        max_fee,
         || TipFeeManager::new().user_tokens[fee_payer].read(),
         is_valid_fee_token,
+        |token| TIP20Token::from_address_unchecked(token).balances[fee_payer].read(),
     )
 }
 
 fn resolve<E>(
     candidates: FeeTokenCandidates,
+    spec: TempoHardfork,
+    max_fee: U256,
     mut stored_user_token: impl FnMut() -> core::result::Result<Address, E>,
     mut valid_fee_token: impl FnMut(Address) -> core::result::Result<bool, E>,
-) -> core::result::Result<Address, E> {
+    mut balance_of: impl FnMut(Address) -> core::result::Result<U256, E>,
+) -> core::result::Result<core::result::Result<Address, InsufficientFallbackBalance>, E> {
     if let Some(token) = candidates.explicit {
-        return Ok(token);
+        return Ok(Ok(token));
     }
     if let Some(token) = candidates.preference_update {
-        return Ok(token);
+        return Ok(Ok(token));
     }
 
     let stored = stored_user_token()?;
     if !stored.is_zero() {
-        return Ok(stored);
+        return Ok(Ok(stored));
     }
 
     if let Some(token) = candidates.tip20_call {
         if valid_fee_token(token)? {
-            return Ok(token);
+            return Ok(Ok(token));
         }
     }
     if let Some(token) = candidates.dex_input {
         if valid_fee_token(token)? {
-            return Ok(token);
+            return Ok(Ok(token));
         }
     }
 
-    Ok(DEFAULT_FEE_TOKEN)
+    if !spec.is_t13() || max_fee.is_zero() {
+        return Ok(Ok(DEFAULT_FEE_TOKEN));
+    }
+
+    // TIP-1115: the first fallback token that covers the whole maximum fee pays it.
+    let mut available = U256::ZERO;
+    for &token in spec.fallback_fee_tokens() {
+        let balance = balance_of(token)?;
+        if balance >= max_fee {
+            return Ok(Ok(token));
+        }
+        available = available.max(balance);
+    }
+    Ok(Err(InsufficientFallbackBalance {
+        available,
+        required: max_fee,
+    }))
 }
 
 fn is_valid_fee_token(token: Address) -> Result<bool> {
@@ -194,8 +237,46 @@ mod tests {
         valid: impl Fn(Address) -> bool,
     ) -> Address {
         let candidates = FeeTokenCandidates::from_tx(tx, payer, spec);
-        resolve::<core::convert::Infallible>(candidates, || Ok(stored), |token| Ok(valid(token)))
-            .unwrap()
+        resolve::<core::convert::Infallible>(
+            candidates,
+            spec,
+            U256::ZERO,
+            || Ok(stored),
+            |token| Ok(valid(token)),
+            |_| unreachable!("free transactions do not read fallback balances"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Resolves a transaction that reaches the fallback step, recording balance reads.
+    fn resolve_fallback(
+        spec: TempoHardfork,
+        max_fee: u64,
+        balances: &[(Address, u64)],
+    ) -> (
+        core::result::Result<Address, InsufficientFallbackBalance>,
+        Vec<Address>,
+    ) {
+        let caller = Address::random();
+        let candidates = FeeTokenCandidates::from_tx(&aa_tx(caller, Vec::new()), caller, spec);
+        let mut reads = Vec::new();
+        let result = resolve::<core::convert::Infallible>(
+            candidates,
+            spec,
+            U256::from(max_fee),
+            || Ok(Address::ZERO),
+            |_| Ok(false),
+            |token| {
+                reads.push(token);
+                Ok(balances
+                    .iter()
+                    .find(|(holder, _)| *holder == token)
+                    .map_or(U256::ZERO, |(_, balance)| U256::from(*balance)))
+            },
+        )
+        .unwrap();
+        (result, reads)
     }
 
     #[test]
@@ -353,6 +434,74 @@ mod tests {
         assert_eq!(
             resolve_for_test(&multi, caller, TempoHardfork::T11, Address::ZERO, |_| true),
             DEFAULT_FEE_TOKEN
+        );
+    }
+
+    #[test]
+    fn t13_fallback_uses_first_token_covering_max_fee() {
+        let [path_usd, ousd] = TempoHardfork::T13.fallback_fee_tokens() else {
+            panic!("T13 has two fallback fee tokens");
+        };
+        let (path_usd, ousd) = (*path_usd, *ousd);
+
+        assert_eq!(
+            resolve_fallback(TempoHardfork::T13, 100, &[(path_usd, 100), (ousd, 500)]),
+            (Ok(path_usd), vec![path_usd])
+        );
+        assert_eq!(
+            resolve_fallback(TempoHardfork::T13, 100, &[(path_usd, 99), (ousd, 100)]),
+            (Ok(ousd), vec![path_usd, ousd])
+        );
+        // One token must pay the whole fee, even if the balances add up to it.
+        assert_eq!(
+            resolve_fallback(TempoHardfork::T13, 100, &[(path_usd, 60), (ousd, 70)]),
+            (
+                Err(InsufficientFallbackBalance {
+                    available: U256::from(70),
+                    required: U256::from(100),
+                }),
+                vec![path_usd, ousd]
+            )
+        );
+    }
+
+    #[test]
+    fn fallback_reads_no_balance_before_t13_or_without_max_fee() {
+        assert_eq!(
+            resolve_fallback(TempoHardfork::T12, 100, &[]),
+            (Ok(DEFAULT_FEE_TOKEN), vec![])
+        );
+        assert_eq!(
+            resolve_fallback(TempoHardfork::T13, 0, &[]),
+            (Ok(DEFAULT_FEE_TOKEN), vec![])
+        );
+    }
+
+    #[test]
+    fn earlier_rules_take_precedence_over_t13_fallback() {
+        let caller = Address::random();
+        let stored = Address::random();
+        let candidates =
+            FeeTokenCandidates::from_tx(&aa_tx(caller, Vec::new()), caller, TempoHardfork::T13);
+        let result = resolve::<core::convert::Infallible>(
+            candidates,
+            TempoHardfork::T13,
+            U256::from(100),
+            || Ok(stored),
+            |_| Ok(false),
+            |_| unreachable!("a stored preference skips the fallback"),
+        );
+        assert_eq!(result, Ok(Ok(stored)));
+    }
+
+    #[test]
+    fn max_fee_rounds_up_to_token_units() {
+        assert_eq!(max_fee_in_token_units(0, 1_000_000_000_000), U256::ZERO);
+        assert_eq!(max_fee_in_token_units(1, 1_000_000_000_000), U256::from(1));
+        assert_eq!(max_fee_in_token_units(1, 1_000_000_000_001), U256::from(2));
+        assert_eq!(
+            max_fee_in_token_units(u64::MAX, u128::MAX),
+            (U256::from(u64::MAX) * U256::from(u128::MAX)).div_ceil(TEMPO_GAS_PRICE_SCALING_FACTOR)
         );
     }
 }

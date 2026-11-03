@@ -720,7 +720,8 @@ fn validate_time_window<E: core::fmt::Debug>(
 /// Mirrors writer's `get_fee_token` followed by the balance read in
 /// `validate_against_state_and_deduct_caller`. Resolution includes the explicit
 /// override, same-transaction `setUserToken`, stored preference, TIP-20 call
-/// inference, single-call DEX inference, and the default token fallback.
+/// inference, single-call DEX inference, and the fallback (pathUSD, then OUSD
+/// from T13 when pathUSD cannot cover the maximum fee).
 ///
 /// The selected token is cached on [`TempoTxEnv`] before calls execute. This is
 /// required for AA batches: a prior call may update FeeManager storage, but the
@@ -732,7 +733,7 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
 ) -> Result<(), TempoEvmError<DB::Error>> {
     use crate::tempo::{
-        fee_token::{resolve_from_storage, FeeTokenCandidates},
+        fee_token::{max_fee_in_token_units, resolve_from_storage, FeeTokenCandidates},
         precompile::{
             tip20::{is_tip20_prefix, TIP20Token},
             Handler, LeafageStorageProvider, StorageCtx, TempoPrecompileError,
@@ -758,6 +759,11 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     let max_spending = U256::from(tx.gas_limit)
         .checked_mul(U256::from(tx.gas_price))
         .and_then(|fee| fee.checked_add(tx.value));
+    let max_fee = if evm.ctx().cfg.disable_balance_check {
+        U256::ZERO
+    } else {
+        max_fee_in_token_units(tx.gas_limit, tx.gas_price)
+    };
 
     let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
     let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
@@ -765,8 +771,18 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
         error => EVMError::Custom(error.to_string()),
     };
-    let fee_token = StorageCtx::enter(&mut storage, || resolve_from_storage(candidates, fee_payer))
-        .map_err(map_error)?;
+    let fee_token = StorageCtx::enter(&mut storage, || {
+        resolve_from_storage(candidates, fee_payer, hardfork, max_fee)
+    })
+    .map_err(map_error)?
+    .map_err(|insufficient| {
+        EVMError::Transaction(TempoInvalidTransaction::from(
+            revm::context::result::InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::new(insufficient.required),
+                balance: Box::new(insufficient.available),
+            },
+        ))
+    })?;
     // Writer validates the prefix even for free simulation, before reading
     // the balance. Do not require currency or deployed state for a free call.
     if !is_tip20_prefix(fee_token) {
@@ -2398,6 +2414,69 @@ mod tests {
                 .is_cold
         };
         assert!(default_balance_is_cold);
+    }
+
+    /// TIP-1115 (T13): pathUSD pays if it covers the maximum fee, else OUSD; one
+    /// token must cover all of it. RPC calls with the balance check disabled
+    /// resolve pathUSD without reading fallback balances.
+    #[test]
+    fn warm_fee_token_balance_uses_t13_fallback_fee_tokens() {
+        use crate::tempo::{precompile::storage_types::StorageKey, tx::TempoTxEnv};
+        use revm::{context_interface::JournalTr, primitives::TxKind};
+
+        let payer = Address::repeat_byte(0x11);
+        let balance_slot = payer.mapping_slot(U256::from(9));
+        let [path_usd, ousd] = *TempoHardfork::T13.fallback_fee_tokens() else {
+            panic!("T13 has two fallback fee tokens");
+        };
+        let mut usd = [0u8; 32];
+        usd[..3].copy_from_slice(b"USD");
+        usd[31] = 6;
+
+        // gas_limit * gas_price / 1e12 = 1_000_000 token units.
+        let run = |path_usd_balance: u64, ousd_balance: u64, balance_check: bool| {
+            let mut evm = make_cached_evm_with_spec(TempoHardfork::T13);
+            evm.inner.ctx.cfg.disable_balance_check = !balance_check;
+            for (token, balance) in [(path_usd, path_usd_balance), (ousd, ousd_balance)] {
+                let db = evm.inner.ctx.db_mut();
+                db.insert_account_storage(token, U256::from(4), U256::from_be_bytes(usd))
+                    .unwrap();
+                db.insert_account_storage(token, balance_slot, U256::from(balance))
+                    .unwrap();
+            }
+            evm.inner.ctx.tx = TempoTxEnv {
+                base: revm::context::TxEnv {
+                    caller: payer,
+                    kind: TxKind::Call(Address::repeat_byte(0x33)),
+                    gas_limit: 1_000_000,
+                    gas_price: 1_000_000_000_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let result = warm_fee_token_balance(&mut evm);
+            let journal = evm.inner.ctx.journal_mut();
+            let cold = [path_usd, ousd].map(|token| {
+                journal.load_account(token).unwrap();
+                journal.sload(token, balance_slot).unwrap().is_cold
+            });
+            (result.map(|()| evm.inner.ctx.tx.resolved_fee_token), cold)
+        };
+
+        assert_eq!(run(1_000_000, 0, true), (Ok(Some(path_usd)), [false, true]));
+        assert_eq!(
+            run(999_999, 1_000_000, true),
+            (Ok(Some(ousd)), [false, false])
+        );
+        let (result, cold) = run(999_999, 999_998, true);
+        assert!(matches!(
+            result,
+            Err(EVMError::Transaction(TempoInvalidTransaction::EthInvalidTransaction(
+                revm::context::result::InvalidTransaction::LackOfFundForMaxFee { fee, balance }
+            ))) if *fee == U256::from(1_000_000) && *balance == U256::from(999_999)
+        ));
+        assert_eq!(cold, [false, false]);
+        assert_eq!(run(0, 0, false), (Ok(Some(path_usd)), [false, true]));
     }
 
     /// A 2D-nonce transaction skips the protocol nonce check without leaving
