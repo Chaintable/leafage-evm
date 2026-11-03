@@ -394,7 +394,8 @@ pub struct Command {
     /// ~3× cold-read decompression latency on deep-level reads. RocksDB
     /// records compression type per SST, so existing data remains readable
     /// regardless of this flag — toggling only affects newly written SSTs.
-    /// Archive-only (RocksDB archive mode).
+    /// Archive-only (RocksDB archive mode). Schema v3 archives always use
+    /// ZSTD, whatever this flag says.
     #[arg(long, default_value = "false")]
     archive_zstd_compression: bool,
 

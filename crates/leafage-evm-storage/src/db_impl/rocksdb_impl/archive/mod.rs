@@ -681,6 +681,9 @@ fn archive_cf_options(
     // levels via `archive_zstd_compression` for ~15-20% extra ratio at the cost
     // of ~2× compaction CPU and ~3× cold-read decode latency. HashToCode is
     // always Zstd: code blobs benefit from dict compression regardless.
+    // v3 archives always use Zstd: on bsc it cut the database by 17% and disk
+    // reads per request by 6%, for 2% more CPU with digested dictionaries.
+    let archive_zstd_compression = archive_zstd_compression || udt;
     let big_cf_compression = if archive_zstd_compression {
         CfCompression::Zstd
     } else {
