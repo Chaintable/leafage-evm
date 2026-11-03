@@ -1144,9 +1144,12 @@ mod tests {
             assert!(db.state_cache.is_some());
             let converted_reads = read_all(&db, converted, &mut rng);
             append(&db, &diffs[split..]);
+            let appended_reads = read_all(&db, head, &mut rng);
+            db.flush().unwrap();
+            db.compact().unwrap();
             (
                 converted_reads,
-                read_all(&db, head, &mut rng),
+                appended_reads,
                 read_all(&db, head, &mut rng),
             )
         };
@@ -1158,7 +1161,7 @@ mod tests {
         };
         assert_eq!(&v2[..=split], &v3.0[..], "converted");
         assert_eq!(v2, v3.1, "converted + appended");
-        assert_eq!(v2, v3.2, "converted + appended, read again");
+        assert_eq!(v2, v3.2, "converted + appended, compacted");
         let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }

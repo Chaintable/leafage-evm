@@ -1746,20 +1746,9 @@ impl DataBaseRef {
             let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
             info!(target: "archive_compact", "Compacting column family: {}", cf_type);
 
-            // For large column families, compact by key range (first byte prefix)
-            // to further reduce memory usage
             match cf_type {
-                StorageTypeColumn::AddressToAccount => {
-                    // Key structure: address (32) || block_num (32) = 64 bytes.
-                    // KEY_LEN must equal the full encoded key width so the
-                    // per-range `end` bound (`nibble || 0xFF..`) covers every
-                    // reachable key in the range and leaves no gap between
-                    // consecutive ranges.
-                    self.compact_cf_by_prefix::<64>(cf_type);
-                }
-                StorageTypeColumn::AddressToStorage => {
-                    // Key structure: address (32) || slot (32) || block_num (32) = 96 bytes.
-                    self.compact_cf_by_prefix::<96>(cf_type);
+                StorageTypeColumn::AddressToAccount | StorageTypeColumn::AddressToStorage => {
+                    self.compact_cf_in_ranges(cf_type)?;
                 }
                 _ => {
                     // Small column families can be compacted in one go
@@ -1784,35 +1773,69 @@ impl DataBaseRef {
     fn force_bottommost_compact_options() -> CompactOptions {
         let mut opts = CompactOptions::default();
         opts.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
-        // Lets the per-range compactions of `compact_cf_by_prefix` run at once.
+        // Lets the range compactions of `compact_cf_in_ranges` run at once.
         opts.set_exclusive_manual_compaction(false);
         opts
     }
 
-    /// Compact a column family in 16 ranges based on first byte's high nibble,
-    /// all at once. Each range is a smaller compaction than the whole column
-    /// family, and RocksDB runs only as many of them as it has background
-    /// compaction threads, which bounds memory.
-    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf_type: StorageTypeColumn) {
+    /// Compacts a column family in `COMPACT_RANGES` ranges of about equal size,
+    /// `COMPACT_WORKERS` at a time. Each range is a smaller compaction than the
+    /// whole column family, which bounds memory.
+    ///
+    /// The split keys come from the bottommost files, which hold nearly all the
+    /// data. Splitting on a fixed key prefix instead leaves one range far
+    /// bigger than the rest, since a storage key starts with its contract's
+    /// address hash and one big contract sits in one range; on BSC that range
+    /// ran alone for over an hour after the others had finished.
+    fn compact_cf_in_ranges(&self, cf_type: StorageTypeColumn) -> Result<(), Error> {
+        const COMPACT_RANGES: usize = 64;
+        const COMPACT_WORKERS: usize = 16;
+
+        let name = cf_type.to_str();
+        let files: Vec<_> = self
+            .db
+            .live_files()?
+            .into_iter()
+            .filter(|f| f.column_family_name == name)
+            .collect();
+        let bottom = files.iter().map(|f| f.level).max();
+        // A v3 file's start key carries the 8-byte timestamp; compaction bounds don't.
+        let ts_len = if self.udt { 8 } else { 0 };
+        let bottom_files = files
+            .into_iter()
+            .filter(|f| Some(f.level) == bottom)
+            .filter_map(|f| {
+                let key = f.start_key?;
+                Some((key[..key.len() - ts_len].to_vec(), f.size))
+            })
+            .collect();
+        let splits = balanced_split_keys(bottom_files, COMPACT_RANGES);
+
+        let bounds: Vec<Option<&[u8]>> = std::iter::once(None)
+            .chain(splits.iter().map(|k| Some(k.as_slice())))
+            .chain(std::iter::once(None))
+            .collect();
+        let ranges = bounds.len() - 1;
+        let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
-            for i in 0u8..16 {
-                scope.spawn(move || {
-                    let start = [i << 4];
-                    let mut end = [0xFFu8; KEY_LEN];
-                    end[0] = (i << 4) | 0x0F;
-                    info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
-                        i + 1, i << 4, (i << 4) | 0x0F);
-                    let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+            for _ in 0..COMPACT_WORKERS.min(ranges) {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= ranges {
+                        break;
+                    }
+                    let cf = self.db.cf_handle(name).unwrap();
                     self.db.compact_range_cf_opt(
                         cf,
-                        Some(&start),
-                        Some(&end),
+                        bounds[i],
+                        bounds[i + 1],
                         &Self::force_bottommost_compact_options(),
                     );
-                    info!(target: "archive_compact", "  Range {}/16 done", i + 1);
+                    info!(target: "archive_compact", "  Range {}/{} done", i + 1, ranges);
                 });
             }
         });
+        Ok(())
     }
 
     /// Post-compaction sanity check for the versioned archive CFs.
@@ -1880,6 +1903,25 @@ impl DataBaseRef {
         }
         Ok(())
     }
+}
+
+/// Picks keys from `(start key, size)` file entries that cut the files into
+/// about `ranges` runs of at most `total / ranges` each, or one file where a
+/// file alone is bigger.
+fn balanced_split_keys(mut files: Vec<(Vec<u8>, usize)>, ranges: usize) -> Vec<Vec<u8>> {
+    files.sort();
+    let total: usize = files.iter().map(|(_, size)| size).sum();
+    let step = total.div_ceil(ranges).max(1);
+    let mut splits: Vec<Vec<u8>> = Vec::new();
+    let mut run = 0;
+    for (key, size) in files {
+        if run > 0 && run + size > step && splits.last() != Some(&key) {
+            splits.push(key);
+            run = 0;
+        }
+        run += size;
+    }
+    splits
 }
 
 /// Read options for the latest-state scans in [`LatestStateDBIterator`].
@@ -3477,6 +3519,31 @@ mod tests {
     use alloy::serde::OtherFields;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_balanced_split_keys() {
+        let file = |k: u8, size| (vec![k], size);
+        // One big file between small ones gets a range of its own.
+        let files = vec![
+            file(5, 10),
+            file(1, 10),
+            file(3, 100),
+            file(7, 10),
+            file(9, 10),
+        ];
+        assert_eq!(balanced_split_keys(files, 4), vec![vec![3], vec![5]]);
+        // Even sizes split evenly; one range means no split.
+        let even: Vec<_> = (0..8).map(|k| file(k, 10)).collect();
+        assert_eq!(
+            balanced_split_keys(even.clone(), 4),
+            vec![vec![2], vec![4], vec![6]]
+        );
+        assert!(balanced_split_keys(even, 1).is_empty());
+        // Files that start on the same key (a v3 key's versions) give one split.
+        let same = vec![file(1, 10), file(2, 10), file(2, 10), file(3, 10)];
+        assert_eq!(balanced_split_keys(same, 4), vec![vec![2], vec![3]]);
+        assert!(balanced_split_keys(Vec::new(), 4).is_empty());
+    }
 
     fn make_block_info_with_other() -> BlockInfo {
         let block_json = json!({
