@@ -173,7 +173,9 @@ marker.
 
 - v2 and v3 sort versions identically, so each worker streams a key range
   straight into SST files: the key without its tail, `u64::MAX - tail` as the
-  timestamp, storage values without leading zeros. Other CFs are copied.
+  timestamp, storage values without leading zeros. Other CFs are copied,
+  except that block infos move from CF `2` to CF `7` as at open (steps 1-3
+  above, run by one worker alongside the others); the result has no CF `2`.
 - Files roll only between keys, so no two files share a key; all of them
   ingest into the bottom level.
 - Files are written with the destination CFs' own options (filters,

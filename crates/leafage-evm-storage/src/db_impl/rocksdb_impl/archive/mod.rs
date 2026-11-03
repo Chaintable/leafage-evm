@@ -1196,7 +1196,7 @@ impl DataBaseRef {
                 }
                 warn!(target: "rocksdb", "moving block infos to BlockNumToBlockInfo");
                 let index = BlockIndex::build(&db)?;
-                block_index::copy_block_infos(&db, path, &index)?;
+                block_index::copy_block_infos(&db, &db, &path.join(".block_index_tmp"), &index)?;
                 warn!(target: "rocksdb", "moving block infos: dropping BlockHashToBlockInfo");
                 db.drop_cf(StorageTypeColumn::BlockHashToBlockInfo.to_str())?;
                 headers_cf = false;

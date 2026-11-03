@@ -168,25 +168,30 @@ impl BlockIndex {
 }
 
 /// Copy the records of the canonical blocks, those `index` holds, from CF `2`
-/// into the empty CF `7`. CF `2` is in hash order, so the records are sorted
-/// by number in memory chunks, written to SST files, ingested together and
-/// merged by one compaction instead of a compaction per chunk. Fails unless
-/// every canonical block was copied.
-pub(super) fn copy_block_infos(db: &DB, path: &Path, index: &BlockIndex) -> Result<(), Error> {
+/// of `src` into the empty CF `7` of `dst`, using `tmp` for SST files; returns
+/// the records copied. CF `2` is in hash order, so the records are sorted by
+/// number in memory chunks, written to SST files, ingested together and merged
+/// by one compaction instead of a compaction per chunk. Fails unless every
+/// canonical block was copied.
+pub(super) fn copy_block_infos(
+    src: &DB,
+    dst: &DB,
+    tmp: &Path,
+    index: &BlockIndex,
+) -> Result<usize, Error> {
     let start = Instant::now();
     let canonical = index.sorted.read().unwrap().clone();
-    let tmp = path.join(".block_index_tmp");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp)?;
+    let _ = std::fs::remove_dir_all(tmp);
+    std::fs::create_dir_all(tmp)?;
     let opts = sst_writer_options();
-    let headers = db
+    let headers = src
         .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
         .unwrap();
     let mut chunk = Vec::new();
     let mut chunk_bytes = 0;
     let mut files = Vec::new();
     let mut records = 0;
-    for item in db.iterator_cf_opt(headers, scan_options(), IteratorMode::Start) {
+    for item in src.iterator_cf_opt(headers, scan_options(), IteratorMode::Start) {
         let (hash, info) = item?;
         let hash = H256::from_slice(&hash);
         let number = decode_archive_header(&mut &info[..])?.number;
@@ -198,7 +203,7 @@ pub(super) fn copy_block_infos(db: &DB, path: &Path, index: &BlockIndex) -> Resu
         chunk_bytes += record.len();
         chunk.push((number, record));
         if chunk_bytes >= CHUNK_BYTES {
-            records += write_chunk(&opts, &tmp, files.len(), &mut chunk, &mut files)?;
+            records += write_chunk(&opts, tmp, files.len(), &mut chunk, &mut files)?;
             chunk_bytes = 0;
             if files.len() % 16 == 0 {
                 info!(target: "rocksdb", records, secs = start.elapsed().as_secs(),
@@ -207,7 +212,7 @@ pub(super) fn copy_block_infos(db: &DB, path: &Path, index: &BlockIndex) -> Resu
         }
     }
     if !chunk.is_empty() {
-        records += write_chunk(&opts, &tmp, files.len(), &mut chunk, &mut files)?;
+        records += write_chunk(&opts, tmp, files.len(), &mut chunk, &mut files)?;
     }
     if records != canonical.len() {
         return Err(Error::UnSupported(format!(
@@ -218,20 +223,20 @@ pub(super) fn copy_block_infos(db: &DB, path: &Path, index: &BlockIndex) -> Resu
     info!(target: "rocksdb", records, files = files.len(), secs = start.elapsed().as_secs(),
         "moving block infos: merging");
     if !files.is_empty() {
-        let cf = db
+        let cf = dst
             .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
             .unwrap();
-        db.ingest_external_file_cf_opts(cf, &ingest_external_file_options(), files)?;
+        dst.ingest_external_file_cf_opts(cf, &ingest_external_file_options(), files)?;
         let mut compact = CompactOptions::default();
         // The ingested files have the SST writer's layout, not the CF's
         // filters and index, and may land in the last level. Files this
         // compaction writes there are not rewritten again.
         compact.set_bottommost_level_compaction(BottommostLevelCompaction::ForceOptimized);
-        db.compact_range_cf_opt(cf, None::<&[u8]>, None::<&[u8]>, &compact);
+        dst.compact_range_cf_opt(cf, None::<&[u8]>, None::<&[u8]>, &compact);
     }
-    std::fs::remove_dir_all(&tmp)?;
+    std::fs::remove_dir_all(tmp)?;
     info!(target: "rocksdb", records, secs = start.elapsed().as_secs(), "moving block infos: copied");
-    Ok(())
+    Ok(records)
 }
 
 fn block_number(key: &[u8]) -> u64 {
