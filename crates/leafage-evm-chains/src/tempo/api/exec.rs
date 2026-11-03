@@ -721,7 +721,8 @@ fn validate_time_window<E: core::fmt::Debug>(
 /// `validate_against_state_and_deduct_caller`. Resolution includes the explicit
 /// override, same-transaction `setUserToken`, stored preference, TIP-20 call
 /// inference, single-call DEX inference, and the fallback (pathUSD, then OUSD
-/// from T13 when pathUSD cannot cover the maximum fee).
+/// from T13 when pathUSD cannot cover the maximum fee; with the balance check
+/// disabled, the richest fallback token when none covers it).
 ///
 /// The selected token is cached on [`TempoTxEnv`] before calls execute. This is
 /// required for AA batches: a prior call may update FeeManager storage, but the
@@ -759,11 +760,10 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     let max_spending = U256::from(tx.gas_limit)
         .checked_mul(U256::from(tx.gas_price))
         .and_then(|fee| fee.checked_add(tx.value));
-    let max_fee = if evm.ctx().cfg.disable_balance_check {
-        U256::ZERO
-    } else {
-        max_fee_in_token_units(tx.gas_limit, tx.gas_price)
-    };
+    // The fallback token is chosen as the writer RPC chooses it, which runs with the balance
+    // check enabled, even when this simulation has the balance check disabled.
+    let max_fee = max_fee_in_token_units(tx.gas_limit, tx.gas_price);
+    let balance_check = !evm.ctx().cfg.disable_balance_check;
 
     let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
     let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
@@ -771,18 +771,24 @@ fn warm_fee_token_balance<DB: Database, INSP>(
         TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
         error => EVMError::Custom(error.to_string()),
     };
-    let fee_token = StorageCtx::enter(&mut storage, || {
+    let fee_token = match StorageCtx::enter(&mut storage, || {
         resolve_from_storage(candidates, fee_payer, hardfork, max_fee)
     })
     .map_err(map_error)?
-    .map_err(|insufficient| {
-        EVMError::Transaction(TempoInvalidTransaction::from(
-            revm::context::result::InvalidTransaction::LackOfFundForMaxFee {
-                fee: Box::new(insufficient.required),
-                balance: Box::new(insufficient.available),
-            },
-        ))
-    })?;
+    {
+        Ok(token) => token,
+        Err(insufficient) if balance_check => {
+            return Err(EVMError::Transaction(TempoInvalidTransaction::from(
+                revm::context::result::InvalidTransaction::LackOfFundForMaxFee {
+                    fee: Box::new(insufficient.required),
+                    balance: Box::new(insufficient.available),
+                },
+            )));
+        }
+        // Without the balance check the simulation goes on. The writer RPC caps a request
+        // without gas at the payer's allowance, which then selects the richest token.
+        Err(insufficient) => insufficient.token,
+    };
     // Writer validates the prefix even for free simulation, before reading
     // the balance. Do not require currency or deployed state for a free call.
     if !is_tip20_prefix(fee_token) {
@@ -2417,8 +2423,8 @@ mod tests {
     }
 
     /// TIP-1115 (T13): pathUSD pays if it covers the maximum fee, else OUSD; one
-    /// token must cover all of it. RPC calls with the balance check disabled
-    /// resolve pathUSD without reading fallback balances.
+    /// token must cover all of it. With the balance check disabled the same token
+    /// is chosen, and the richest one when none covers the fee.
     #[test]
     fn warm_fee_token_balance_uses_t13_fallback_fee_tokens() {
         use crate::tempo::{precompile::storage_types::StorageKey, tx::TempoTxEnv};
@@ -2476,7 +2482,16 @@ mod tests {
             ))) if *fee == U256::from(1_000_000) && *balance == U256::from(999_999)
         ));
         assert_eq!(cold, [false, false]);
-        assert_eq!(run(0, 0, false), (Ok(Some(path_usd)), [false, true]));
+
+        assert_eq!(
+            run(999_999, 1_000_000, false),
+            (Ok(Some(ousd)), [false, false])
+        );
+        assert_eq!(
+            run(999_998, 999_999, false),
+            (Ok(Some(ousd)), [false, false])
+        );
+        assert_eq!(run(0, 0, false), (Ok(Some(path_usd)), [false, false]));
     }
 
     /// A 2D-nonce transaction skips the protocol nonce check without leaving
