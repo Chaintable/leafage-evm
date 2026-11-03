@@ -24,8 +24,6 @@ use super::{
 /// No TIP-1115 fallback token covers the maximum fee on its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InsufficientFallbackBalance {
-    /// Fallback token with the largest fee-payer balance; ties keep the earlier token.
-    pub(crate) token: Address,
     /// Largest fallback-token balance of the fee payer.
     pub(crate) available: U256,
     /// Maximum fee in TIP-20 base units.
@@ -155,22 +153,18 @@ fn resolve<E>(
     }
 
     // TIP-1115: the first fallback token that covers the whole maximum fee pays it.
-    let mut richest = InsufficientFallbackBalance {
-        token: DEFAULT_FEE_TOKEN,
-        available: U256::ZERO,
-        required: max_fee,
-    };
+    let mut available = U256::ZERO;
     for &token in spec.fallback_fee_tokens() {
         let balance = balance_of(token)?;
         if balance >= max_fee {
             return Ok(Ok(token));
         }
-        if balance > richest.available {
-            richest.token = token;
-            richest.available = balance;
-        }
+        available = available.max(balance);
     }
-    Ok(Err(richest))
+    Ok(Err(InsufficientFallbackBalance {
+        available,
+        required: max_fee,
+    }))
 }
 
 fn is_valid_fee_token(token: Address) -> Result<bool> {
@@ -463,20 +457,7 @@ mod tests {
             resolve_fallback(TempoHardfork::T13, 100, &[(path_usd, 60), (ousd, 70)]),
             (
                 Err(InsufficientFallbackBalance {
-                    token: ousd,
                     available: U256::from(70),
-                    required: U256::from(100),
-                }),
-                vec![path_usd, ousd]
-            )
-        );
-        // Equal balances keep the earlier token, as the writer does.
-        assert_eq!(
-            resolve_fallback(TempoHardfork::T13, 100, &[(path_usd, 60), (ousd, 60)]),
-            (
-                Err(InsufficientFallbackBalance {
-                    token: path_usd,
-                    available: U256::from(60),
                     required: U256::from(100),
                 }),
                 vec![path_usd, ousd]
