@@ -145,6 +145,7 @@ criterion = "0.5"
 
 ahash = "0.8"
 arc-swap = "1.7"
+crc32fast = "1.4"
 
 # for test
 metrics-util = "0.19"

@@ -29,6 +29,7 @@ page_size.workspace = true
 dashmap.workspace = true
 ahash.workspace = true
 arc-swap.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
