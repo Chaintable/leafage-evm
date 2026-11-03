@@ -346,8 +346,8 @@ pub struct ArchiveRocksDBWriteBatch {
     /// Highest block this batch writes a version or block hash at; the
     /// state cache's head moves to it once the batch is committed.
     max_block: Option<u64>,
-    /// Index entries of the block infos written to `BlockNumToBlockInfo`.
-    block_infos: Vec<u64>,
+    /// The blocks whose infos are written to `BlockNumToBlockInfo`.
+    block_infos: Vec<(H256, u32)>,
 }
 
 impl ArchiveRocksDBWriteBatch {
@@ -398,6 +398,10 @@ impl ArchiveRocksDBWriteBatch {
 
 impl Drop for DataBaseRef {
     fn drop(&mut self) {
+        // The database lock also covers the block index file.
+        if let Some(index) = &self.block_index {
+            index.wait_saved();
+        }
         // Flush every named CF. See `DataBaseRef::flush` for why `db.flush()`
         // alone is insufficient.
         self.flush().unwrap();
@@ -1198,7 +1202,7 @@ impl DataBaseRef {
                     )?;
                 }
                 warn!(target: "rocksdb", "moving block infos to BlockNumToBlockInfo");
-                let index = BlockIndex::build(&db)?;
+                let index = BlockIndex::rebuild(&db, path)?;
                 block_index::copy_block_infos(&db, &db, &path.join(".block_index_tmp"), &index)?;
                 warn!(target: "rocksdb", "moving block infos: dropping BlockHashToBlockInfo");
                 db.drop_cf(StorageTypeColumn::BlockHashToBlockInfo.to_str())?;
@@ -1208,7 +1212,7 @@ impl DataBaseRef {
                 index_cf = false;
             }
         } else if index_cf {
-            block_index = Some(Arc::new(BlockIndex::build(&db)?));
+            block_index = Some(Arc::new(BlockIndex::open(&db, path)?));
         }
         cols.retain(|&col| match col {
             StorageTypeColumn::BlockHashToBlockInfo => headers_cf,
@@ -3537,13 +3541,14 @@ impl StateDBWrite for Arc<DataBaseRef> {
 
         // Indexed before the write: a reader that sees the block must find it.
         if let Some(index) = &self.block_index {
-            for e in batch.block_infos {
-                index.note(e);
-            }
+            index.note(&batch.block_infos)?;
         }
         let mut wo = WriteOptions::default();
         wo.set_sync(batch.sync);
         self.db.write_opt(batch.inner, &wo)?;
+        if let Some(index) = &self.block_index {
+            index.committed();
+        }
         if let (Some(cache), Some(max)) = (&self.state_cache, batch.max_block) {
             cache.advance_head(max);
         }

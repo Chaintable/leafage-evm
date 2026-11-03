@@ -5075,6 +5075,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "auto_impl",
+ "crc32fast",
  "criterion",
  "dashmap",
  "leafage-evm-types",

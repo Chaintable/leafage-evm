@@ -127,17 +127,32 @@ archive can instead keep its block infos in `BlockNumToBlockInfo` (CF `7`):
 block number (8 bytes BE) -> block hash ‖ the CF `2` value, in 16KB ZSTD
 blocks, so consecutive blocks share data blocks. It has one of the two CFs.
 
-A hash is resolved through an in-memory index built at open from CF `3`: the
-hash's first 4 bytes and the number of every canonical block, sorted (8
-bytes per block, ~1GB for bsc; block numbers must fit in a `u32`). The record
-carries its hash, so a shared prefix only costs a second candidate. Blocks
-committed later are indexed before their write, and merged into the sorted
-entries every 2^20 blocks.
+A hash is resolved through an in-memory index of the canonical blocks, split
+into 256 shards by the hash's first byte. Within a shard the next bits of the
+hash pick a bucket of about 8 blocks on average, and the 8 bits after them are kept as a
+fingerprint next to the block number: 5 bytes per block and 4 per bucket
+(~0.7GB for bsc, ~2.7GB for arb; block numbers must fit in a `u32`). The
+record carries its hash, so a shared fingerprint only costs another candidate
+(~3% of lookups). Blocks committed later are indexed before their write, and
+merged into the shards, one shard at a time, every 2^20 blocks.
+
+The index is saved to `LEAFAGE_BLOCK_INDEX` in the database directory after
+each merge, in the background: a temporary file renamed over the old one,
+covered by a CRC32. An open loads it, checks that CF `3` still has its last
+block, and indexes the blocks of CF `3` after it. A missing, damaged or stale
+file (after a rewind, or with more than 16 blocks per bucket on average) is
+rebuilt from CF `3` by 8 threads and saved. A block written at or below the
+last one merged (after a head-only rewind, which keeps the higher blocks in
+CF `3`) deletes the file before its write. Merges keep the buckets of the
+open, at least 2^16 per shard, so a process that syncs past 2^28 blocks
+without restarting gets more candidates per lookup until its next open. Loading reads 5 bytes per block
+instead of scanning CF `3`'s ~48: about 6s against 70s for bsc at 125MB/s.
 
 With `ARCHIVE_BLOCK_INDEX=1`, a new database is created with CF `7`, and
 opening a database with CF `2` moves it before the open returns:
 
-1. Build the index from CF `3`.
+1. Build the index from CF `3` and save it (a file left by a failed move is
+   not reused: the archive does not keep it up to date while on CF `2`).
 2. Scan CF `2`, keep the canonical blocks (archives only hold finalized
    blocks; reorgs are resolved in the in-memory diff layers), sort them by
    number in 1GB chunks written as SST files under `.block_index_tmp`.
@@ -173,9 +188,10 @@ marker.
 
 - v2 and v3 sort versions identically, so each worker streams a key range
   straight into SST files: the key without its tail, `u64::MAX - tail` as the
-  timestamp, storage values without leading zeros. Other CFs are copied,
-  except that block infos move from CF `2` to CF `7` as at open (steps 1-3
-  above, run by one worker alongside the others); the result has no CF `2`.
+  timestamp, storage values without leading zeros. Other CFs are copied.
+  With `ARCHIVE_BLOCK_INDEX=1`, block infos instead move from CF `2` to CF `7`
+  as at open (steps 1-3 above, run by one worker alongside the others) and the
+  index is saved; the result has no CF `2`.
 - Files roll only between keys, so no two files share a key; all of them
   ingest into the bottom level.
 - Files are written with the destination CFs' own options (filters,

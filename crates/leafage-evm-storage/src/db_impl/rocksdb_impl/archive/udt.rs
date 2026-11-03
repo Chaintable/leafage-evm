@@ -11,7 +11,7 @@
 //! schema in `<db>/LEAFAGE_ARCHIVE_SCHEMA` and is opened with the matching
 //! options; RocksDB itself refuses a comparator that does not match.
 
-use super::block_index::{copy_block_infos, BlockIndex};
+use super::block_index::{self, copy_block_infos, BlockIndex};
 use super::{
     archive_cf_descriptors, archive_cf_options, decode_archive_header, decode_storage,
     encode_block_num, existing_columns, fmt_hms, key_after_prefix, rocksdb_options, shard_bounds,
@@ -604,7 +604,8 @@ impl DataBaseRef {
     /// without leading zeros. Files roll only between keys, so no two files
     /// share a key and all of them ingest into the bottom level. They are
     /// written with the CFs' own table options (filters, partitioned index),
-    /// so no compaction follows. Block infos go to `BlockNumToBlockInfo`.
+    /// so no compaction follows. Block infos are copied as they are, or with
+    /// `ARCHIVE_BLOCK_INDEX=1` go to `BlockNumToBlockInfo`.
     pub fn convert_inverted_to_udt(
         src_path: &Path,
         dst_path: &Path,
@@ -632,17 +633,23 @@ impl DataBaseRef {
             ));
         }
 
-        // The destination keeps its block infos by number.
         let src_cols = existing_columns(src_path).unwrap_or_default();
-        let cols: Vec<StorageTypeColumn> = src_cols
-            .iter()
-            .copied()
-            .filter(|&col| col != StorageTypeColumn::BlockHashToBlockInfo)
-            .chain(
-                (!src_cols.contains(&StorageTypeColumn::BlockNumToBlockInfo))
-                    .then_some(StorageTypeColumn::BlockNumToBlockInfo),
-            )
-            .collect();
+        // Block infos move from CF 2 to CF 7 only when asked for.
+        let move_infos =
+            block_index::enabled() && src_cols.contains(&StorageTypeColumn::BlockHashToBlockInfo);
+        let cols: Vec<StorageTypeColumn> = if move_infos {
+            src_cols
+                .iter()
+                .copied()
+                .filter(|&col| col != StorageTypeColumn::BlockHashToBlockInfo)
+                .chain(
+                    (!src_cols.contains(&StorageTypeColumn::BlockNumToBlockInfo))
+                        .then_some(StorageTypeColumn::BlockNumToBlockInfo),
+                )
+                .collect()
+        } else {
+            src_cols.clone()
+        };
         let cache = Cache::new_hyper_clock_cache(cache_size << 20, 8192);
         let mut db_opts = rocksdb_options(false);
         db_opts.set_error_if_exists(true);
@@ -669,7 +676,7 @@ impl DataBaseRef {
         // The block info move first, as it runs on one thread, then the
         // storage shards: they are the bulk of the work.
         let mut tasks = Vec::new();
-        if src_cols.contains(&StorageTypeColumn::BlockHashToBlockInfo) {
+        if move_infos {
             tasks.push(Task::BlockInfos);
         }
         for col in [
@@ -681,12 +688,13 @@ impl DataBaseRef {
             }
         }
         for &col in &src_cols {
-            if !matches!(
-                col,
-                StorageTypeColumn::AddressToStorage
-                    | StorageTypeColumn::AddressToAccount
-                    | StorageTypeColumn::BlockHashToBlockInfo
-            ) {
+            let moved = move_infos && col == StorageTypeColumn::BlockHashToBlockInfo;
+            if !moved
+                && !matches!(
+                    col,
+                    StorageTypeColumn::AddressToStorage | StorageTypeColumn::AddressToAccount
+                )
+            {
                 tasks.push(Task::Copy(col));
             }
         }
@@ -738,6 +746,8 @@ impl DataBaseRef {
                                         &dst_path.join(".block_index_tmp"),
                                         &index,
                                     )?;
+                                    // Same blocks as the destination's CF 3.
+                                    index.save_to(&dst_path.join(block_index::FILE))?;
                                     records[2].fetch_add(n as u64, Ordering::Relaxed);
                                     done_tasks.fetch_add(1, Ordering::Relaxed);
                                     continue;
@@ -1181,11 +1191,23 @@ mod tests {
 
     #[test]
     fn test_udt_archive_matches_v2() {
+        udt_archive_matches_v2(false);
+    }
+
+    #[test]
+    fn test_udt_archive_matches_v2_block_index() {
+        udt_archive_matches_v2(true);
+    }
+
+    /// Convert a v2 archive, with or without `ARCHIVE_BLOCK_INDEX=1`, and
+    /// check the result reads as the source, before and after appending.
+    fn udt_archive_matches_v2(by_number: bool) {
         let _g = ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
-        let base = std::env::temp_dir().join(format!("leafage-udt-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("leafage-udt-{by_number}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (v2_dir, v3_dir) = (base.join("v2"), base.join("v3"));
         let mut rng = Rng(0x5eed);
@@ -1200,15 +1222,28 @@ mod tests {
             db.write_encoding_marker(true).unwrap();
             append(&db, &diffs[..split]);
         }
-        let report = DataBaseRef::convert_inverted_to_udt(&v2_dir, &v3_dir, 64, 3).unwrap();
+        if by_number {
+            std::env::set_var("ARCHIVE_BLOCK_INDEX", "1");
+        }
+        let report = DataBaseRef::convert_inverted_to_udt(&v2_dir, &v3_dir, 64, 3);
+        std::env::remove_var("ARCHIVE_BLOCK_INDEX");
+        let report = report.unwrap();
         assert!(report.accounts > 0 && report.storage > 0, "{report:?}");
         let verify = verify_udt_against_v2(&v2_dir, &v3_dir, 300, 7).unwrap();
         assert_eq!(verify.mismatches, 0, "{verify:?}");
         assert!(verify.keys > 0 && verify.absent_keys > 0, "{verify:?}");
-        // Block infos move to `BlockNumToBlockInfo`.
+        // Block infos move to `BlockNumToBlockInfo` only when asked for,
+        // with the index saved.
         let cols = existing_columns(&v3_dir).unwrap();
-        assert!(cols.contains(&StorageTypeColumn::BlockNumToBlockInfo));
-        assert!(!cols.contains(&StorageTypeColumn::BlockHashToBlockInfo));
+        assert_eq!(
+            cols.contains(&StorageTypeColumn::BlockNumToBlockInfo),
+            by_number
+        );
+        assert_eq!(
+            cols.contains(&StorageTypeColumn::BlockHashToBlockInfo),
+            !by_number
+        );
+        assert_eq!(v3_dir.join(block_index::FILE).exists(), by_number);
         let infos = |db: &DataBaseRef| -> Vec<Option<BlockInfo>> {
             (1..=head + 1)
                 .map(|n| db.read_block_info(block_hash(n)).unwrap())
@@ -1221,6 +1256,7 @@ mod tests {
             let db = Arc::new(DataBaseRef::open(&v3_dir, 64, false, false));
             assert!(db.udt);
             assert!(db.state_cache.is_some());
+            assert_eq!(db.block_index.is_some(), by_number);
             let converted_infos = infos(&db);
             let converted_reads = read_all(&db, converted, &mut rng);
             append(&db, &diffs[split..]);
