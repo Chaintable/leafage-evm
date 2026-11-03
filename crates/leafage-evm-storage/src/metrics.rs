@@ -18,8 +18,11 @@ pub(crate) static BLOCK_METRICS: LazyLock<BlockMetrics> = LazyLock::new(|| Block
 pub struct StorageMetrics {
     /// Read block hash latency.
     pub read_block_hash_latency: Histogram,
-    /// Read block latency.
+    /// Read block latency (`BlockHashToBlockInfo`, by hash).
     pub read_block_latency: Histogram,
+    /// Read block latency from `BlockNumToBlockInfo` (by number, found
+    /// through the archive block index).
+    pub read_block_by_number_latency: Histogram,
     /// Read latest block hash latency.
     pub read_latest_block_hash_latency: Histogram,
     /// Read account latency.
