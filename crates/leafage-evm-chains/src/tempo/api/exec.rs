@@ -733,11 +733,14 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     evm: &mut TempoEvm<DB, INSP>,
 ) -> Result<(), TempoEvmError<DB::Error>> {
     use crate::tempo::{
-        fee_token::{max_fee_in_token_units, resolve_from_storage, FeeTokenCandidates},
+        fee_token::{
+            FeeTokenCandidates, max_fee_in_token_units, resolve_fallback_from_storage,
+            resolve_selected_from_storage,
+        },
         precompile::{
-            tip20::{is_tip20_prefix, TIP20Token},
-            Handler, LeafageStorageProvider, StorageCtx, TempoPrecompileError,
-            TEMPO_GAS_PRICE_SCALING_FACTOR,
+            Handler, LeafageStorageProvider, StorageCtx, TEMPO_GAS_PRICE_SCALING_FACTOR,
+            TempoPrecompileError,
+            tip20::{TIP20Token, is_tip20_prefix},
         },
     };
 
@@ -763,11 +766,23 @@ fn warm_fee_token_balance<DB: Database, INSP>(
     let (gas_limit, gas_price) = (tx.gas_limit, tx.gas_price);
     let mut max_fee = max_fee_in_token_units(gas_limit, gas_price);
     let balance_check = !evm.ctx().cfg.disable_balance_check;
-    // The writer RPC runs with the balance check enabled and caps a request without gas at the
-    // payer's allowance. Without the balance check, when no fallback token covers the fee, pick
-    // the token as that capped request does. Balances are read from the database, so this does
-    // not warm their slots.
-    if !balance_check && hardfork.is_t13() && !max_fee.is_zero() {
+    let map_error = |error: TempoPrecompileError| match error {
+        TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
+        error => EVMError::Custom(error.to_string()),
+    };
+    let selected = {
+        let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
+        let mut storage =
+            LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
+        StorageCtx::enter(&mut storage, || {
+            resolve_selected_from_storage(candidates, fee_payer)
+        })
+        .map_err(map_error)?
+    };
+    // Only fallback selection depends on these balances. Peek without warming slots,
+    // stopping at the first token that covers the requested fee. If none covers it,
+    // cap the fee as the writer RPC does before the regular, warming reads below.
+    if selected.is_none() && !balance_check && hardfork.is_t13() && !max_fee.is_zero() {
         let mut richest = U256::ZERO;
         for &token in hardfork.fallback_fee_tokens() {
             let slot = TIP20Token::from_address_unchecked(token).balances[fee_payer].slot();
@@ -778,6 +793,9 @@ fn warm_fee_token_balance<DB: Database, INSP>(
                 .storage(token, slot)
                 .map_err(EVMError::Database)?;
             richest = richest.max(balance);
+            if balance >= max_fee {
+                break;
+            }
         }
         if richest < max_fee {
             let allowance =
@@ -789,23 +807,21 @@ fn warm_fee_token_balance<DB: Database, INSP>(
 
     let internals = alloy_evm::EvmInternals::from_context(evm.ctx_mut());
     let mut storage = LeafageStorageProvider::new_max_gas_with_spec(internals, chain_id, hardfork);
-    let map_error = |error: TempoPrecompileError| match error {
-        TempoPrecompileError::Fatal(reason) => EVMError::Custom(reason),
-        error => EVMError::Custom(error.to_string()),
+    let fee_token = match selected {
+        Some(token) => token,
+        None => StorageCtx::enter(&mut storage, || {
+            resolve_fallback_from_storage(fee_payer, hardfork, max_fee)
+        })
+        .map_err(map_error)?
+        .map_err(|insufficient| {
+            EVMError::Transaction(TempoInvalidTransaction::from(
+                revm::context::result::InvalidTransaction::LackOfFundForMaxFee {
+                    fee: Box::new(insufficient.required),
+                    balance: Box::new(insufficient.available),
+                },
+            ))
+        })?,
     };
-    // With the balance check disabled the capped fee is covered by the richest token.
-    let fee_token = StorageCtx::enter(&mut storage, || {
-        resolve_from_storage(candidates, fee_payer, hardfork, max_fee)
-    })
-    .map_err(map_error)?
-    .map_err(|insufficient| {
-        EVMError::Transaction(TempoInvalidTransaction::from(
-            revm::context::result::InvalidTransaction::LackOfFundForMaxFee {
-                fee: Box::new(insufficient.required),
-                balance: Box::new(insufficient.available),
-            },
-        ))
-    })?;
     // Writer validates the prefix even for free simulation, before reading
     // the balance. Do not require currency or deployed state for a free call.
     if !is_tip20_prefix(fee_token) {
@@ -5588,3 +5604,7 @@ mod tests {
         assert_eq!(admin - regular, KEY_AUTH_EXTRA_EVENT_BUFFER);
     }
 }
+
+#[cfg(test)]
+#[path = "fee_token_tests.rs"]
+mod fee_token_tests;

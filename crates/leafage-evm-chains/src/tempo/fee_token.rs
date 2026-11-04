@@ -121,33 +121,74 @@ fn resolve<E>(
     candidates: FeeTokenCandidates,
     spec: TempoHardfork,
     max_fee: U256,
-    mut stored_user_token: impl FnMut() -> core::result::Result<Address, E>,
-    mut valid_fee_token: impl FnMut(Address) -> core::result::Result<bool, E>,
-    mut balance_of: impl FnMut(Address) -> core::result::Result<U256, E>,
+    stored_user_token: impl FnMut() -> core::result::Result<Address, E>,
+    valid_fee_token: impl FnMut(Address) -> core::result::Result<bool, E>,
+    balance_of: impl FnMut(Address) -> core::result::Result<U256, E>,
 ) -> core::result::Result<core::result::Result<Address, InsufficientFallbackBalance>, E> {
-    if let Some(token) = candidates.explicit {
+    if let Some(token) = resolve_selected(candidates, stored_user_token, valid_fee_token)? {
         return Ok(Ok(token));
     }
+    resolve_fallback(spec, max_fee, balance_of)
+}
+
+/// Resolves explicit, preference and inference rules before any fallback balance probe.
+pub(crate) fn resolve_selected_from_storage(
+    candidates: FeeTokenCandidates,
+    fee_payer: Address,
+) -> Result<Option<Address>> {
+    resolve_selected(
+        candidates,
+        || TipFeeManager::new().user_tokens[fee_payer].read(),
+        is_valid_fee_token,
+    )
+}
+
+fn resolve_selected<E>(
+    candidates: FeeTokenCandidates,
+    mut stored_user_token: impl FnMut() -> core::result::Result<Address, E>,
+    mut valid_fee_token: impl FnMut(Address) -> core::result::Result<bool, E>,
+) -> core::result::Result<Option<Address>, E> {
+    if let Some(token) = candidates.explicit {
+        return Ok(Some(token));
+    }
     if let Some(token) = candidates.preference_update {
-        return Ok(Ok(token));
+        return Ok(Some(token));
     }
 
     let stored = stored_user_token()?;
     if !stored.is_zero() {
-        return Ok(Ok(stored));
+        return Ok(Some(stored));
     }
 
     if let Some(token) = candidates.tip20_call {
         if valid_fee_token(token)? {
-            return Ok(Ok(token));
+            return Ok(Some(token));
         }
     }
     if let Some(token) = candidates.dex_input {
         if valid_fee_token(token)? {
-            return Ok(Ok(token));
+            return Ok(Some(token));
         }
     }
 
+    Ok(None)
+}
+
+pub(crate) fn resolve_fallback_from_storage(
+    fee_payer: Address,
+    spec: TempoHardfork,
+    max_fee: U256,
+) -> Result<core::result::Result<Address, InsufficientFallbackBalance>> {
+    resolve_fallback(spec, max_fee, |token| {
+        TIP20Token::from_address_unchecked(token).balances[fee_payer].read()
+    })
+}
+
+fn resolve_fallback<E>(
+    spec: TempoHardfork,
+    max_fee: U256,
+    mut balance_of: impl FnMut(Address) -> core::result::Result<U256, E>,
+) -> core::result::Result<core::result::Result<Address, InsufficientFallbackBalance>, E> {
     if !spec.is_t13() || max_fee.is_zero() {
         return Ok(Ok(DEFAULT_FEE_TOKEN));
     }
