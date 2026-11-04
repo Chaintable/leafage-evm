@@ -5,7 +5,7 @@ use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err, rpc_err
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
     block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
     BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, DebankErrorCode, Header, JsonStorageKey,
@@ -67,11 +67,7 @@ where
             .block_info_arc()
             .map_err(|e| database_rpc_err(e.to_string()))?;
         let mut block_env = block_env_from_block(&block);
-        let mut db = CacheDB::new(EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut db = CacheDB::new(self.inner.wrap_storage(state.clone()));
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
@@ -273,11 +269,7 @@ where
         let block = state
             .block_info_arc()
             .map_err(|e| database_rpc_err(e.to_string()))?;
-        let state = EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state.clone());
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
             block_num: block.header.number,
@@ -368,11 +360,7 @@ where
     fn get_balance_inner(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
         let state = self.resolve_state(block_id)?;
         Self::get_balance_from_state(
-            EvmStorageWrapper {
-                db: state,
-                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-            },
+            self.inner.wrap_storage(state),
             address,
         )
     }
@@ -416,11 +404,7 @@ where
 
     fn get_code_inner(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
         let state = self.resolve_state(block_number)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| database_rpc_err(e.to_string()))?;
@@ -455,11 +439,7 @@ where
         block_number: BlockId,
     ) -> RpcResult<H256> {
         let state = self.resolve_state(block_number)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
@@ -493,11 +473,7 @@ where
         block_number: BlockId,
     ) -> RpcResult<U256> {
         let state = self.resolve_state(block_number)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| database_rpc_err(e.to_string()))?;
