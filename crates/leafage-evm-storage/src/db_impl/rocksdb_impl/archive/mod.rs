@@ -42,9 +42,9 @@ use leafage_evm_types::{
 use quick_cache::sync::Cache as QuickCache;
 use quick_cache::Weighter;
 use rocksdb::{
-    BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
-    CompactOptions, Direction, IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter,
-    WriteBatch, WriteOptions, DB,
+    AsRawPtr, BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily,
+    ColumnFamilyDescriptor, CompactOptions, Direction, IteratorMode, Options, ReadOptions,
+    SliceTransform, SstFileWriter, WriteBatch, WriteOptions, DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
@@ -515,7 +515,7 @@ fn rocksdb_column_options(
     // Larger SST files = fewer files at every level = less metadata,
     // smaller index/bloom overhead, fewer files for compaction to track.
     // Default is 64MB; bump to 128MB.
-    cf_opts.set_target_file_size_base(128 << 20);
+    cf_opts.set_target_file_size_base(TARGET_FILE_SIZE_BASE);
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
     if *OPTIMIZE_FILTERS_FOR_HITS {
         cf_opts.set_optimize_filters_for_hits(true);
@@ -621,11 +621,30 @@ fn rocksdb_column_options(
             ]);
             cf_opts.set_zstd_max_train_bytes(1024 * 1024);
             cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
+            // A table built with a dictionary buffers its data blocks to
+            // sample them, up to the smaller of its target file size and
+            // `max_dict_buffer_bytes` (0: no limit). An SstFileWriter has no
+            // target file size, so without this limit it holds the whole
+            // file in memory and reports a size of 0 until it finishes, and
+            // `SstSink` never rolls it: on `archive-udt convert` each worker
+            // held its whole shard (36 GB within two minutes on OP). The
+            // target file size keeps compactions as they were.
+            // SAFETY: `cf_opts` owns the options pointer for the call.
+            unsafe {
+                librocksdb_sys::rocksdb_options_set_compression_options_max_dict_buffer_bytes(
+                    cf_opts.as_raw_ptr(),
+                    TARGET_FILE_SIZE_BASE,
+                );
+            }
         }
     }
 
     cf_opts
 }
+
+/// Target SST size of the archive CFs, and the cap on the data a table built
+/// with a ZSTD dictionary buffers before training it.
+const TARGET_FILE_SIZE_BASE: u64 = 128 << 20;
 
 #[inline]
 fn rocksdb_options(disable_auto_compactions: bool) -> Options {
