@@ -156,6 +156,10 @@ mod tests {
         // The default spec is Maxwell; the block decides.
         assert_eq!(cfg.spec, BscHardfork::Maxwell);
         assert_eq!(
+            block_cfg(&cfg, &block(100_000_000, 1_796_697_000)).spec,
+            BscHardfork::Jenner
+        );
+        assert_eq!(
             block_cfg(&cfg, &block(70_000_000, 1_787_625_000)).spec,
             BscHardfork::Pasteur
         );

@@ -30,7 +30,7 @@ pub const BSC_MAINNET_GENESIS_ALLOC: [Address; 13] = [
 
 /// Every contract a go-bsc hardfork upgrade may replace
 /// (`systemcontracts.TryUpdateBuildInSystemContract`).
-pub const BSC_MAINNET_UPGRADABLE_CONTRACTS: [Address; 17] = [
+pub const BSC_MAINNET_UPGRADABLE_CONTRACTS: [Address; 18] = [
     address!("0000000000000000000000000000000000001000"),
     address!("0000000000000000000000000000000000001001"),
     address!("0000000000000000000000000000000000001002"),
@@ -47,6 +47,7 @@ pub const BSC_MAINNET_UPGRADABLE_CONTRACTS: [Address; 17] = [
     address!("0000000000000000000000000000000000002004"),
     address!("0000000000000000000000000000000000002005"),
     address!("0000000000000000000000000000000000002006"),
+    address!("0000000000000000000000000000000000002007"),
     address!("0000000000000000000000000000000000003000"),
 ];
 
@@ -64,6 +65,7 @@ const CANCUN_TIME: u64 = 1_718_863_500;
 const PRAGUE_TIME: u64 = 1_742_436_600;
 const OSAKA_TIME: u64 = 1_777_343_400;
 const PASTEUR_TIME: u64 = 1_787_625_000;
+const JENNER_TIME: u64 = 1_796_697_000;
 
 impl EthereumHardforks for BscMainnetHardforks {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
@@ -121,8 +123,7 @@ impl BscHardforks for BscMainnetHardforks {
             BscHardfork::Fermi => ForkCondition::Timestamp(1_768_357_800),
             BscHardfork::Osaka | BscHardfork::Mendel => ForkCondition::Timestamp(OSAKA_TIME),
             BscHardfork::Pasteur => ForkCondition::Timestamp(PASTEUR_TIME),
-            // go-bsc v1.8.1 schedules Jenner on Chapel only.
-            BscHardfork::Jenner => ForkCondition::Never,
+            BscHardfork::Jenner => ForkCondition::Timestamp(JENNER_TIME),
         }
     }
 }
@@ -266,8 +267,16 @@ mod tests {
             BscHardfork::Pasteur
         );
         assert_eq!(
-            bsc_mainnet_spec_at(90_000_000, u64::MAX),
+            bsc_mainnet_spec_at(100_000_000, JENNER_TIME - 1),
             BscHardfork::Pasteur
+        );
+        assert_eq!(
+            bsc_mainnet_spec_at(100_000_000, JENNER_TIME),
+            BscHardfork::Jenner
+        );
+        assert_eq!(
+            bsc_mainnet_spec_at(100_000_000, u64::MAX),
+            BscHardfork::Jenner
         );
     }
 
@@ -282,6 +291,20 @@ mod tests {
             90_000_000,
             PASTEUR_TIME,
             PASTEUR_TIME + 1
+        ));
+    }
+
+    #[test]
+    fn jenner_is_a_system_contract_transition() {
+        assert!(bsc_mainnet_fork_transition(
+            100_000_000,
+            JENNER_TIME - 1,
+            JENNER_TIME
+        ));
+        assert!(!bsc_mainnet_fork_transition(
+            100_000_000,
+            JENNER_TIME,
+            JENNER_TIME + 1
         ));
     }
 }

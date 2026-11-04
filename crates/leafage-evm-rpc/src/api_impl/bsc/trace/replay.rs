@@ -41,6 +41,7 @@ use alloy::primitives::{address, Address, Bytes, B256, U256};
 use alloy::rpc::types::{Block as RpcBlock, BlockTransactions};
 use alloy_evm::{EvmEnv, FromRecoveredTx};
 use anyhow::{anyhow, bail, Context as _, Result};
+use leafage_evm_chains::bsc::cas20::{ACTIVATION_REGISTRY, MARKER_CODE, POLICY_REGISTRY};
 use leafage_evm_chains::bsc::mainnet::{
     bsc_mainnet_fork_transition, bsc_mainnet_spec_at, BscMainnetHardforks, BSC_MAINNET_CHAIN_ID,
     BSC_MAINNET_UPGRADABLE_CONTRACTS,
@@ -186,6 +187,9 @@ where
     let prague = forks.is_pascal_active_at_timestamp(number, timestamp);
     let prague_transition =
         prague && !forks.is_pascal_active_at_timestamp(number, parent_timestamp);
+    let jenner = forks.is_jenner_active_at_timestamp(number, timestamp);
+    let jenner_transition =
+        jenner && !forks.is_jenner_active_at_timestamp(number, parent_timestamp);
 
     let post = post_state;
     let started = std::time::Instant::now();
@@ -221,6 +225,11 @@ where
             .context("history storage contract missing after the Prague transition")?;
         let code = post.code_by_hash_ref(history.code_hash)?;
         replay.set_code(HISTORY_STORAGE_ADDRESS, code, Some(history.nonce))?;
+    }
+    if jenner_transition {
+        let code = Bytecode::new_raw(Bytes::from_static(&MARKER_CODE));
+        replay.set_code(ACTIVATION_REGISTRY, code.clone(), None)?;
+        replay.set_code(POLICY_REGISTRY, code, None)?;
     }
     if prague {
         // EIP-2935 system call: the contract stores the parent hash at
@@ -455,6 +464,13 @@ where
         let (result, mut state) = (outcome.result, outcome.state);
         self.record(&state)?;
         delete_touched_empty(&mut state);
+        if traces.is_some() {
+            for (addr, account) in &state {
+                if !account.storage.is_empty() {
+                    self.storage_contracts.insert(*addr);
+                }
+            }
+        }
         self.db.commit(state);
 
         if let Some((arena, sstore)) = traces {
