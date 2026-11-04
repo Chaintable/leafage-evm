@@ -121,11 +121,7 @@ where
                 .block_info_arc()
                 .map_err(|error| database_rpc_err(error.to_string()))?;
             let mut block_env = block_env_from_block(&block);
-            let mut db = CacheDB::new(EvmStorageWrapper {
-                db: state,
-                ovm_address: api.inner.evm_cfg.ovm_address,
-                normalize_state_key: api.inner.evm_cfg.normalize_state_key,
-            });
+            let mut db = CacheDB::new(api.inner.evm_cfg.wrap_storage(state));
             if let Some(overrides) = block_overrides {
                 utils::apply_block_overrides(
                     overrides,
@@ -184,11 +180,7 @@ where
                 .block_info_arc()
                 .map_err(|error| database_rpc_err(error.to_string()))?;
             let mut block_env = block_env_from_block(&block);
-            let mut db = CacheDB::new(EvmStorageWrapper {
-                db: state,
-                ovm_address: api.inner.evm_cfg.ovm_address,
-                normalize_state_key: api.inner.evm_cfg.normalize_state_key,
-            });
+            let mut db = CacheDB::new(api.inner.evm_cfg.wrap_storage(state));
             if let Some(overrides) = block_overrides {
                 utils::apply_block_overrides(
                     overrides,
