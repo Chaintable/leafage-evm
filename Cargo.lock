@@ -336,9 +336,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-hardforks"
-version = "0.4.9"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09d5ff0394d9547798fa4b666c46e356d09a113f33d45fb3d75175681c1e2652"
+checksum = "7f03efb8382bf3b19f0bd0b3cdfaa59cb13e57a3a6650f75fae47645873723d5"
 dependencies = [
  "alloy-chains",
  "alloy-eip2124",
@@ -2078,7 +2078,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -6371,8 +6371,8 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.12.1",
  "log",
  "multimap 0.10.0",
  "once_cell",
@@ -6431,7 +6431,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -8448,8 +8448,8 @@ dependencies = [
 
 [[package]]
 name = "tempo-contracts"
-version = "1.11.0"
-source = "git+https://github.com/tempoxyz/tempo?rev=74b69155ebaf6178bf7e3d59d18a2440164302d9#74b69155ebaf6178bf7e3d59d18a2440164302d9"
+version = "1.16.0"
+source = "git+https://github.com/tempoxyz/tempo?rev=55a96bad10cb3e171f1b28dfd6e21bea957df0e4#55a96bad10cb3e171f1b28dfd6e21bea957df0e4"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -8459,12 +8459,13 @@ dependencies = [
 
 [[package]]
 name = "tempo-hardfork"
-version = "1.11.0"
-source = "git+https://github.com/tempoxyz/tempo?rev=74b69155ebaf6178bf7e3d59d18a2440164302d9#74b69155ebaf6178bf7e3d59d18a2440164302d9"
+version = "1.16.0"
+source = "git+https://github.com/tempoxyz/tempo?rev=55a96bad10cb3e171f1b28dfd6e21bea957df0e4#55a96bad10cb3e171f1b28dfd6e21bea957df0e4"
 dependencies = [
  "alloy-eips",
  "alloy-evm",
  "alloy-hardforks",
+ "alloy-primitives",
  "paste",
  "serde",
 ]
