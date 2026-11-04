@@ -643,10 +643,15 @@ where
 
     async fn init_offset(&mut self) {
         let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
-        let (lowest_offset, latest_offset) = self
-            .get_offset()
-            .await
-            .expect("Failed to get latest offset");
+        let (lowest_offset, latest_offset) = loop {
+            match self.get_offset().await {
+                Ok(v) => break v,
+                Err(e) => {
+                    info!(target: "updater", "Waiting for messages in Kafka topic {}: {e}", self.kafka_s3_cfg.topic);
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
+        };
         match offset {
             Some(offset)
                 if offset >= lowest_offset && !self.kafka_s3_cfg.bundle_bucket_name.is_empty() =>
