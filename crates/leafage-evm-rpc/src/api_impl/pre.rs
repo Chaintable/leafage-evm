@@ -7,7 +7,7 @@ use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err};
 use alloy::primitives::Bytes;
 use alloy::rpc::types::trace::geth::GethDefaultTracingOptions;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockContext, EvmStorageRead};
 use leafage_evm_types::{
     block_env_from_block, BlockId, BlockNumberOrTag, CallRequest, DefaultFrame, PreErrorCode,
     PreResult, TransactionInfo, H256,
@@ -57,11 +57,7 @@ where
             .block_info_arc()
             .map_err(|e| database_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address,
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut memory_db = CacheDB::new(self.inner.wrap_storage(state));
 
         // Use geth config to enable step recording for struct logs
         let trace_cfg = TracingInspectorConfig::default_geth();
@@ -134,11 +130,7 @@ where
             .block_info_arc()
             .map_err(|e| database_rpc_err(e.to_string()))?;
         let block_env = block_env_from_block(&block);
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address,
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut memory_db = CacheDB::new(self.inner.wrap_storage(state));
         let mut tx_index: u64 = 0;
         let mut log_index = 0;
         let mut pre_results: Vec<PreResult> = Vec::new();

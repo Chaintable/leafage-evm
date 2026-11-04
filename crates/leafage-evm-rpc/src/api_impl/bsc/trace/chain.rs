@@ -108,9 +108,5 @@ where
 
 /// A BSC state for the EVM: no OVM, slot keys hashed as they are.
 pub(super) fn bsc_state<T>(db: T) -> EvmStorageWrapper<T> {
-    EvmStorageWrapper {
-        db,
-        ovm_address: None,
-        normalize_state_key: false,
-    }
+    EvmStorageWrapper::new(db)
 }
