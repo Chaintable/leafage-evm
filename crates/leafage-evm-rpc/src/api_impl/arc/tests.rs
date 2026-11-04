@@ -471,11 +471,7 @@ fn execute_arc_estimate_probe(
     let block = state.block_info_arc().unwrap();
     request.nonce = None;
     request.gas = Some(gas_limit);
-    let mut cache_db = CacheDB::new(EvmStorageWrapper {
-        db: state,
-        ovm_address: None,
-        normalize_state_key: false,
-    });
+    let mut cache_db = CacheDB::new(EvmStorageWrapper::new(state));
     let mut block_env = block_env_from_block(&block);
     if let Some(overrides) = overrides {
         utils::apply_block_overrides(
@@ -1054,14 +1050,12 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
             .unwrap(),
         estimated
     );
-    let original_state = EvmStorageWrapper {
-        db: fixture
+    let original_state = EvmStorageWrapper::new(
+        fixture
             .api
             .debank_get_state_by_ctx_impl(anchor_context())
             .unwrap(),
-        ovm_address: None,
-        normalize_state_key: false,
-    };
+    );
     assert!(original_state.basic_ref(authority).unwrap().is_none());
 
     let simulated = fixture

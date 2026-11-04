@@ -33,6 +33,7 @@ use std::sync::Arc;
 pub struct EvmCfg<SpecId, CustomCfg> {
     pub is_archive: bool,
     pub normalize_state_key: bool,
+    pub zksync_era: bool,
     pub cfg: CfgEnv<SpecId>,
     pub ovm_address: Option<H256>,
     pub version: String,
@@ -55,6 +56,17 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub multicall_parallelism: usize,
 }
 
+impl<SpecId, CustomCfg> EvmCfg<SpecId, CustomCfg> {
+    pub fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
+        leafage_evm_storage::EvmStorageWrapper {
+            db,
+            ovm_address: self.ovm_address,
+            normalize_state_key: self.normalize_state_key,
+            zksync_era: self.zksync_era,
+        }
+    }
+}
+
 pub(crate) trait ApiCore:
     ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
 {
@@ -68,6 +80,10 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn db(&self) -> &Self::DB;
 
     fn evm_cfg(&self) -> &EvmCfg<Self::SpecId, Self::CustomCfg>;
+
+    fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
+        self.evm_cfg().wrap_storage(db)
+    }
 
     fn historical_client(&self) -> Option<&HttpClient>;
 
