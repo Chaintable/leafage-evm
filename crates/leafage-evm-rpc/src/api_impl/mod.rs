@@ -45,6 +45,7 @@ mod moonbeam;
 mod polygon;
 mod rsk;
 mod tempo;
+pub(crate) mod zksync_era;
 
 pub(crate) mod token_collector;
 pub use token_collector::TokenCollector;

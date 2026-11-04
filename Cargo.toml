@@ -54,6 +54,8 @@ brotlic = "0.8"
 etcd-client = "0.14"
 md-5 = "0.10.6"
 sha1 = "0.10.6"
+zksync_vm2 = { git = "https://github.com/matter-labs/vm2", tag = "v0.6.2" }
+primitive-types = "0.12"
 http = "1.3"
 http-body = "1"
 procfs = "0.17"
