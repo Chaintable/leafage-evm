@@ -42,6 +42,7 @@ aws-sdk-s3.workspace = true
 bytes.workspace = true
 zksync_vm2.workspace = true
 primitive-types.workspace = true
+tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Recover transaction senders with libsecp256k1 instead of the much slower k256.
 alloy-consensus = { version = "2.5.0", default-features = false, features = ["secp256k1"] }
 
