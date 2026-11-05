@@ -24,6 +24,13 @@ impl ArbOwnerPublic {
     pub(super) fn run<DB: Database>(
         input: ArbPrecompileInput<'_, ArbitrumContext<DB>>,
     ) -> PrecompileResult {
+        if input.context.chain().ape_yield()
+            && super::ape::is_call::<super::ape::IApeArbOwnerPublic::IApeArbOwnerPublicCalls>(
+                input.data,
+            )
+        {
+            return super::ape::run_owner_public(input);
+        }
         let gas_limit = input.gas;
         let data = input.data;
         let is_static = input.is_static;
