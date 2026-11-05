@@ -337,3 +337,84 @@ fn p256_precompile_follows_op_fork_in_normal_and_trace_execution() {
         assert_eq!(results[1].gas_used() - results[0].gas_used(), 3450);
     }
 }
+
+/// On OP Mainnet a call runs the fork of its block through both execution paths:
+/// PUSH0 halts on the last pre-Canyon block and runs from the Canyon block on.
+#[test]
+fn op_mainnet_calls_run_the_block_fork() {
+    let mut cfg = cfg("{}");
+    cfg.chain_id = 10;
+    let api: ApiImpl<(), OpSpecId, NoneEvmCustomConfig> = ApiImpl::new(
+        (),
+        cfg,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+        String::new(),
+        0,
+        None,
+        None,
+        None,
+    );
+    let target = Address::repeat_byte(0x22);
+    let mut db = CacheDB::new(EmptyDB::default());
+    // PUSH0, PUSH0, MSTORE, PUSH1 32, PUSH0, RETURN
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![0x5f, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3].into(),
+        )),
+    );
+    let at = |number: u64, timestamp: u64| BlockEnv {
+        number: U256::from(number),
+        timestamp: U256::from(timestamp),
+        ..Default::default()
+    };
+    for inspect in [false, true] {
+        for (block, canyon) in [
+            (at(114_696_811, 1_704_992_399), false),
+            (at(114_696_812, 1_704_992_401), true),
+        ] {
+            let req = CallRequest {
+                inner: TransactionRequest::default()
+                    .to(target)
+                    .from(Address::repeat_byte(0x11))
+                    .gas_limit(100_000),
+                tempo: None,
+            };
+            let tx = api
+                .create_txn_env(&BlockInfo::default(), &block, req, &db, 10)
+                .unwrap();
+            let result = if inspect {
+                api.inspect_tx_commit(
+                    &block,
+                    &mut db,
+                    TracingInspectorConfig::default_parity(),
+                    |_| (),
+                    tx,
+                )
+                .unwrap()
+                .0
+            } else {
+                api.transact(&block, &db, tx).unwrap()
+            };
+            if canyon {
+                assert!(result.is_success(), "{result:?}");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        ExecutionResult::Halt {
+                            reason: OpHaltReason::Base(HaltReason::NotActivated),
+                            ..
+                        }
+                    ),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+}
