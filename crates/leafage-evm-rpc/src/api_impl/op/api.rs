@@ -3,6 +3,7 @@ use crate::api_impl::core::{
     ApiCore, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::op::evm::{create_op_evm_from_state, create_op_txn_env};
+use crate::api_impl::op::legacy;
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::core::RpcResult;
@@ -86,6 +87,9 @@ where
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
+        if legacy::is_legacy(&self.evm_cfg.cfg, block_env) {
+            return legacy::transact(&self.evm_cfg.cfg, block_env, state, tx);
+        }
         let mut evm = create_op_evm_from_state(
             block_env.clone(),
             block_cfg(&self.evm_cfg.cfg, block_env),
@@ -113,6 +117,11 @@ where
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
         let mut inspector = TracingInspector::new(inspector_cfg);
+        if legacy::is_legacy(&self.evm_cfg.cfg, block_env) {
+            let res =
+                legacy::inspect_tx_commit(&self.evm_cfg.cfg, block_env, state, &mut inspector, tx);
+            return res.map(|res| (res, inspector_collect(inspector)));
+        }
         let mut evm = create_op_evm_from_state(
             block_env.clone(),
             block_cfg(&self.evm_cfg.cfg, block_env),

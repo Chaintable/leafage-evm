@@ -35,8 +35,9 @@ const TIMESTAMP_FORKS: [(u64, OpSpecId); 8] = [
 /// The [`OpSpecId`] active on OP Mainnet at `(block_number, timestamp)`.
 ///
 /// Regolith is active from the Bedrock block (timestamp 0). Pre-Bedrock blocks
-/// ran on l2geth (OVM 2.0, Berlin-based), which no `OpSpecId` models; they get
-/// `BEDROCK`, the oldest rules available.
+/// ran on l2geth (OVM 2.0, Istanbul / Berlin-based), which no `OpSpecId` models:
+/// they get `BEDROCK` here, and calls on them execute with the rules of
+/// [`super::legacy`] instead.
 pub fn op_mainnet_spec_at(block_number: u64, timestamp: u64) -> OpSpecId {
     if block_number < OP_MAINNET_BEDROCK_BLOCK {
         return OpSpecId::BEDROCK;
