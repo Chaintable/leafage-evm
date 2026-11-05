@@ -201,8 +201,8 @@ pub(super) struct BlockIndex {
     shards: Vec<RwLock<Arc<Shard>>>,
     recent: RwLock<Recent>,
     /// The block last merged into the shards; every block CF `3` had when
-    /// it was committed is in them too. None once a block at or below it is
-    /// rewritten, until the next merge.
+    /// it was committed is in them too. None once a block below it, or
+    /// another block at it, is written, until the next merge.
     last: Mutex<Option<(u32, H256)>>,
     /// Held by a merge.
     merge: Mutex<()>,
@@ -445,12 +445,13 @@ impl BlockIndex {
         // No merge saves a snapshot without these blocks once the check
         // below has passed.
         let _merge = self.merge.lock().unwrap();
-        if self
-            .last
-            .lock()
-            .unwrap()
-            .is_some_and(|(number, _)| lowest <= number)
-        {
+        // On its first commit after an open the state tree writes the head
+        // it opened on again, unchanged; that keeps the file.
+        if self.last.lock().unwrap().is_some_and(|(last, last_hash)| {
+            blocks
+                .iter()
+                .any(|&(hash, number)| number < last || (number == last && hash != last_hash))
+        }) {
             // Blocks the file covers are rewritten (after a head-only
             // rewind), while CF 3 may still hold its last one: drop it before
             // the write. `last` stays until the file is gone, so a failed
@@ -1226,9 +1227,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Blocks rewritten at or below the saved index's last one (after a
-    /// head-only rewind, CF 3 keeps the higher blocks) drop the file, so the
-    /// next open rebuilds and finds them.
+    /// Blocks rewritten below the saved index's last one, or another block
+    /// at it (after a head-only rewind, CF 3 keeps the higher blocks), drop
+    /// the file, so the next open rebuilds and finds them.
     #[test]
     fn rewritten_blocks_drop_the_saved_index() {
         let _g = super::super::ARCHIVE_DB_TEST_LOCK
@@ -1261,6 +1262,47 @@ mod tests {
             Some(info(5, true))
         );
         assert_reads(&db, (1..=8).filter(|&n| n != 5));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The head committed again unchanged, as the state tree does on its
+    /// first commit after an open, keeps the saved index; another block at
+    /// the head's number drops it.
+    #[test]
+    fn recommitted_head_keeps_the_saved_index() {
+        let _g = super::super::ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("recommit", true);
+        {
+            let db = open(&dir, true);
+            for number in 1..=8 {
+                commit(&db, [number], false);
+            }
+        }
+        let file = dir.join(FILE);
+        assert_eq!(load(&file).unwrap().unwrap().2 .0, 8);
+        {
+            let db = open(&dir, false);
+            commit(&db, [8, 9], false);
+            assert!(file.exists());
+            assert_reads(&db, 1..=9);
+        }
+        {
+            // Loaded from the file, with block 9 from CF 3.
+            let db = open(&dir, false);
+            assert!(file.exists());
+            assert_reads(&db, 1..=9);
+            rewrite(&db, 8).unwrap();
+            assert!(!file.exists());
+        }
+        let db = open(&dir, false);
+        assert_eq!(
+            db.read_block_info(hash(8, true)).unwrap(),
+            Some(info(8, true))
+        );
+        assert_reads(&db, (1..=9).filter(|&n| n != 8));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
