@@ -2,8 +2,8 @@
 //! rules of `leafage_evm_chains::op::legacy` instead of an OP fork.
 use crate::api_impl::mainnet::evm::create_main_evm_from_state;
 use leafage_evm_chains::op::legacy::{
-    deployer_allowed_ref, not_whitelisted_output, op_legacy_instructions, op_legacy_spec_at,
-    OVM_FEE_WALLET,
+    deployer_allowed_ref, not_whitelisted_output, op_legacy_gas_params, op_legacy_instructions,
+    op_legacy_spec_at, OVM_FEE_WALLET,
 };
 use leafage_evm_chains::op::mainnet::{OP_MAINNET_BEDROCK_BLOCK, OP_MAINNET_CHAIN_ID};
 use leafage_evm_types::{CfgEnv, MainnetSpecId, OpSpecId, U256};
@@ -21,12 +21,15 @@ pub(super) fn is_legacy(cfg: &CfgEnv<OpSpecId>, block_env: &BlockEnv) -> bool {
     cfg.chain_id == OP_MAINNET_CHAIN_ID && block_env.number < U256::from(OP_MAINNET_BEDROCK_BLOCK)
 }
 
-/// The l2geth view of the block: Istanbul / Berlin rules, COINBASE is the OVM fee
+/// The l2geth view of the block: Istanbul / Berlin rules (with l2geth's refund
+/// amounts), COINBASE is the OVM fee
 /// wallet and DIFFICULTY is zero. Everything else (fee and limit switches) is the
 /// configured cfg.
 fn legacy_env(cfg: &CfgEnv<OpSpecId>, block_env: &BlockEnv) -> (CfgEnv<MainnetSpecId>, BlockEnv) {
     let spec = op_legacy_spec_at(block_env.number.saturating_to());
-    let cfg = cfg.clone().with_spec_and_mainnet_gas_params(spec);
+    let cfg = cfg
+        .clone()
+        .with_spec_and_gas_params(spec, op_legacy_gas_params(spec));
     let mut block = block_env.clone();
     block.beneficiary = OVM_FEE_WALLET;
     block.difficulty = U256::ZERO;

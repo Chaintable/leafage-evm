@@ -5,6 +5,9 @@
 //! `OpSpecId` models that, so pre-Bedrock calls run on the Ethereum EVM with:
 //! - Istanbul blocks charging the EIP-2929 cold cost on every state access, with
 //!   no access list and nothing warm (l2geth `enableMinimal2929`);
+//! - Berlin blocks taking the EIP-3529 refund amounts (SSTORE clears refund
+//!   4800, SELFDESTRUCT refunds nothing) but keeping the refund cap at half the
+//!   gas used (l2geth `newBerlinInstructionSet` + `refundGas`);
 //! - COINBASE as the OVM fee wallet and DIFFICULTY as zero (l2geth `core/evm.go`);
 //! - CREATE limited to whitelisted deployers while the OVM deployer whitelist has
 //!   an owner (l2geth `EVM.AddressWhitelisted`). The whitelist was retired for good
@@ -16,6 +19,7 @@
 
 use alloy_sol_types::{Revert, SolError};
 use revm::bytecode::opcode;
+use revm::context_interface::cfg::{GasId, GasParams};
 use revm::handler::instructions::EthInstructions;
 use revm::interpreter::instructions::contract;
 use revm::interpreter::interpreter::EthInterpreter;
@@ -46,6 +50,26 @@ pub fn op_legacy_spec_at(block_number: u64) -> SpecId {
     } else {
         SpecId::ISTANBUL
     }
+}
+
+/// SSTORE refund for clearing a slot under EIP-3529 (SSTORE_RESET - COLD_SLOAD + ACCESS_LIST_STORAGE_KEY).
+const EIP3529_SSTORE_CLEARS_REFUND: u64 = 4800;
+
+/// The gas parameters for `spec` (from [`op_legacy_spec_at`]). l2geth's Berlin
+/// table also enabled the EIP-3529 refund amounts, while its state transition
+/// kept the Berlin cap of half the gas used.
+pub fn op_legacy_gas_params(spec: SpecId) -> GasParams {
+    let mut params = GasParams::new_spec(spec);
+    if spec.is_enabled_in(SpecId::BERLIN) {
+        params.override_gas([
+            (
+                GasId::sstore_clearing_slot_refund(),
+                EIP3529_SSTORE_CLEARS_REFUND,
+            ),
+            (GasId::selfdestruct_refund(), 0),
+        ]);
+    }
+    params
 }
 
 /// The instruction table for `spec` (from [`op_legacy_spec_at`]). On Istanbul
@@ -194,6 +218,19 @@ mod tests {
             SpecId::ISTANBUL
         );
         assert_eq!(op_legacy_spec_at(OP_MAINNET_BERLIN_BLOCK), SpecId::BERLIN);
+    }
+
+    #[test]
+    fn berlin_takes_eip3529_refund_amounts_but_keeps_the_half_cap() {
+        let berlin = op_legacy_gas_params(SpecId::BERLIN);
+        assert_eq!(berlin.sstore_clearing_slot_refund(), 4800);
+        assert_eq!(berlin.selfdestruct_refund(), 0);
+        assert_eq!(berlin.max_refund_quotient(), 2);
+        // Istanbul keeps EIP-2200 refunds.
+        assert_eq!(
+            op_legacy_gas_params(SpecId::ISTANBUL),
+            GasParams::new_spec(SpecId::ISTANBUL)
+        );
     }
 
     #[test]

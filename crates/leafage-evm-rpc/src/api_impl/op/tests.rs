@@ -594,6 +594,33 @@ mod pre_bedrock {
     }
 
     #[test]
+    fn refunds_follow_l2geth() {
+        // Clear three set slots: PUSH1 0; PUSH1 i; SSTORE (x3); STOP.
+        let mut code = Vec::new();
+        for slot in 0..3u8 {
+            code.extend([0x60, 0, 0x60, slot, 0x55]);
+        }
+        code.push(0x00);
+        for (number, gas_used) in [
+            // EIP-2200 clears refund 15000 each, capped at half of 36018.
+            (ISTANBUL_BLOCK, 18_009),
+            // l2geth Berlin: EIP-3529 clears refund 4800 each, Berlin half cap.
+            (BERLIN_BLOCK, 21_618),
+        ] {
+            for inspect in [false, true] {
+                let mut db = with_code(&code);
+                for slot in 0..3u64 {
+                    db.insert_account_storage(TARGET, U256::from(slot), U256::ONE)
+                        .unwrap();
+                }
+                let result = run(&mut db, number, Some(TARGET), vec![], inspect);
+                assert!(result.is_success(), "{result:?}");
+                assert_eq!(result.tx_gas_used(), gas_used, "block {number}");
+            }
+        }
+    }
+
+    #[test]
     fn no_london_code_rules() {
         // Deploy runtime code 0xEF (EIP-3541 is London).
         let init = vec![0x60, 0xef, 0x60, 0, 0x53, 0x60, 1, 0x60, 0, 0xf3];
