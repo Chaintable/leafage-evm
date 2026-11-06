@@ -253,11 +253,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
@@ -285,11 +281,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
@@ -323,11 +315,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<H256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
@@ -361,11 +349,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
@@ -398,10 +382,8 @@ where
 
     fn debank_eth_erc20_handle<StateDB>(
         block_header: &Header,
-        state: StateDB,
+        state: EvmStorageWrapper<StateDB>,
         request: CallRequest,
-        ovm_address: Option<H256>,
-        normalize_state_key: bool,
     ) -> DebankSingleCallResult
     where
         StateDB: leafage_evm_storage::StateDB,
@@ -436,11 +418,7 @@ where
                 let user_addr = Address::from(h160_bytes);
                 // get address's native balance
                 let res = Self::get_balance_from_state(
-                    EvmStorageWrapper {
-                        db: state,
-                        ovm_address,
-                        normalize_state_key,
-                    },
+                    state,
                     user_addr,
                 )
                 .unwrap_or_default();
@@ -540,10 +518,8 @@ where
                 if *address == *utils::NATIVE_TOKEN_SENTINEL {
                     let mut res = Self::debank_eth_erc20_handle(
                         &block.header,
-                        state.clone(),
+                        self.inner.wrap_storage(state.clone()),
                         request,
-                        self.inner.evm_cfg().ovm_address.clone(),
-                        self.inner.evm_cfg().normalize_state_key,
                     );
                     res.time_cost = start.elapsed().as_secs_f64();
                     return Ok(res);
@@ -686,11 +662,7 @@ where
         // shared by every call in this multicall: overrides apply once,
         // and repeated keys across calls skip the layered-state walk.
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut cache_db = CacheDB::new(self.inner.wrap_storage(state.clone()));
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
@@ -1071,11 +1043,7 @@ where
             block_hash: block.header.hash,
             success: true,
         };
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut memory_db = CacheDB::new(self.inner.wrap_storage(state));
         if let Some(overrides) = block_overrides {
             let header = super::utils::apply_block_overrides(
                 overrides,
@@ -1158,11 +1126,7 @@ where
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut cache_db = CacheDB::new(self.inner.wrap_storage(state));
         if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(
                 overrides,

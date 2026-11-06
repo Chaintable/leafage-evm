@@ -39,6 +39,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
             evm_cfg: EvmCfg {
                 is_archive,
                 normalize_state_key,
+                zksync_era: cfg.chain_id == 324 || cfg.chain_id == 300,
                 cfg,
                 ovm_address: ovm_address.map(|addr| keccak256(addr.as_slice())),
                 version,
