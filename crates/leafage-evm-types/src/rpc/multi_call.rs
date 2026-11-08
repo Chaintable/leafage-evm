@@ -110,7 +110,7 @@ mod tests {
     fn reverted_call_keeps_revert_data() {
         let output = Bytes::from_static(&[0x55, 0x6f, 0x18, 0x30, 0xde, 0xad]);
         let res: SingleCallResult = ExecutionResult::<HaltReason>::Revert {
-            gas: ResultGas::new(21_000, 0, 0),
+            gas: ResultGas::default().with_total_gas_spent(21_000),
             logs: vec![],
             output: output.clone(),
         }
