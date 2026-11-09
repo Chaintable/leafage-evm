@@ -1042,10 +1042,9 @@ impl Command {
             ),
         )?);
 
-        let historical_rpc = self.historical_rpc.clone().or_else(|| self.rpc_addr.clone());
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
-            .with_historical_config(historical_rpc, self.historical_height)
+            .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_trace_block_rpc(
                 self.trace_block_rpc.clone(),
                 !self.trace_block_skip_state_check,
