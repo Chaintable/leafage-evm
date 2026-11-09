@@ -1,6 +1,7 @@
 use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
 use crate::utils::{
-    s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
+    s3_get_block_info, s3_get_block_info_and_diff_by_number,
+    s3_get_block_info_and_diff_by_number_for_genesis,
     s3_get_block_info_and_diff_by_number_with_parent_state_root, StateDiffKey,
     DEFAULT_S3_READ_TIMEOUT_SECS,
 };
@@ -67,9 +68,17 @@ pub struct Command {
     #[arg(long, value_name = "PATH")]
     db_path: PathBuf,
 
-    /// The RPC address for fetching block info
+    /// The RPC address for fetching block info (optional; if omitted, fetched from S3)
     #[arg(long, value_name = "URL")]
-    rpc_addr: String,
+    rpc_addr: Option<String>,
+
+    /// Only fix/backfill block headers from S3 without re-ingesting accounts or storage slots
+    #[arg(long, default_value = "false")]
+    headers_only: bool,
+
+    /// Start block number (optional, defaults to resuming from DB or 0 if headers_only)
+    #[arg(long)]
+    start_block: Option<u64>,
 
     /// S3 bucket name for block diff
     #[arg(long)]
@@ -204,6 +213,13 @@ impl ArchiveStorage {
         match self {
             ArchiveStorage::RocksDB(db) => Ok(db.read_block_info(block_hash)?),
             ArchiveStorage::MDBX(db) => Ok(db.read_block_info(block_hash)?),
+        }
+    }
+
+    fn read_block_hash(&self, block_num: u64) -> Result<H256, anyhow::Error> {
+        match self {
+            ArchiveStorage::RocksDB(db) => Ok(db.read_block_hash(block_num)?),
+            ArchiveStorage::MDBX(db) => Ok(db.read_block_hash(block_num)?),
         }
     }
 
@@ -882,8 +898,8 @@ impl Command {
     pub async fn run(&mut self) -> Result<()> {
         let state_diff_key = StateDiffKey::resolve(self.state_diff_key, &self.s3_chain_id);
         info!(target: "archive_init", %state_diff_key, "Starting archive initialization");
-        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, db_type: {:?}, inverted_block_encoding: {}",
-              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type, self.inverted_block_encoding);
+        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {:?}, end_block: {}, max_tasks: {}, db_type: {:?}, inverted_block_encoding: {}, headers_only: {}",
+              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type, self.inverted_block_encoding, self.headers_only);
 
         // Fix the versioned-key encoding before any key is encoded (fetchers
         // call encode_account_key / encode_storage_key off the writer thread).
@@ -909,7 +925,11 @@ impl Command {
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
         // Initialize RPC client
-        let rpc_client = HttpClientBuilder::default().build(&self.rpc_addr)?;
+        let rpc_client = if let Some(ref addr) = self.rpc_addr {
+            Some(HttpClientBuilder::default().build(addr)?)
+        } else {
+            None
+        };
 
         if matches!(self.db_type, StorageKind::Rocksdb) {
             crate::archive_udt::prepare_archive_schema(
@@ -970,6 +990,10 @@ impl Command {
                 .map_err(|e| anyhow::anyhow!("failed to write encoding marker: {e}"))?;
         }
 
+        if self.headers_only {
+            return self.run_headers_only(db, s3_client).await;
+        }
+
         // Determine start block (support resume)
         let (start_block, parent_state_root) = self.get_start_block(&db)?;
 
@@ -985,7 +1009,7 @@ impl Command {
         let overall_start = Instant::now();
 
         // Capture variables for the fetcher async block
-        let rpc_client = Some(rpc_client);
+        let rpc_client = rpc_client;
         let bucket = self.s3_bucket.clone();
         let bundle_bucket = self.s3_bundle_bucket.clone();
         let bundle_range_size_mib = self.bundle_read.bundle_range_size_mib;
@@ -1143,6 +1167,147 @@ impl Command {
             info!(target: "archive_init", "Database compaction completed.");
         }
 
+        Ok(())
+    }
+
+    /// Fast backfill of block headers from S3 directly into BlockHashToBlockInfo,
+    /// skipping account and storage state diffs.
+    async fn run_headers_only(
+        &self,
+        db: Arc<ArchiveStorage>,
+        s3_client: Client,
+    ) -> Result<()> {
+        let start_block = self.start_block.unwrap_or(0);
+        let end_block = self.end_block;
+        if start_block > end_block {
+            anyhow::bail!("start_block {start_block} cannot be greater than end_block {end_block}");
+        }
+        let total_blocks = end_block - start_block + 1;
+        info!(target: "archive_init",
+            "Starting headers-only backfill from block {} to {} ({} blocks total), max_tasks: {}, checkpoint_interval: {}",
+            start_block, end_block, total_blocks, self.max_tasks, self.checkpoint_interval
+        );
+
+        let (tx, mut rx) = mpsc::channel::<(u64, BlockInfo)>(self.max_tasks * 2);
+
+        let db_fetch = db.clone();
+        let bucket = self.s3_bucket.clone();
+        let chain_id = self.s3_chain_id.clone();
+        let version = self.s3_version.clone();
+        let max_tasks = self.max_tasks;
+
+        let fetcher_handle = tokio::spawn(async move {
+            let mut join_set = tokio::task::JoinSet::new();
+            let mut next_block = start_block;
+
+            while next_block <= end_block || !join_set.is_empty() {
+                while join_set.len() < max_tasks && next_block <= end_block {
+                    let block_num = next_block;
+                    next_block += 1;
+
+                    let block_hash = match db_fetch.read_block_hash(block_num) {
+                        Ok(h) if h != H256::ZERO => h,
+                        Ok(_) => {
+                            return Err(anyhow::anyhow!("Block {} has zero block hash in DB", block_num));
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Failed to read block hash for {}: {}", block_num, e));
+                        }
+                    };
+
+                    let s3 = s3_client.clone();
+                    let b = bucket.clone();
+                    let cid = chain_id.clone();
+                    let v = version.clone();
+
+                    join_set.spawn(async move {
+                        let mut last_err = None;
+                        for attempt in 1..=MAX_RETRIES {
+                            match s3_get_block_info(&s3, &b, &cid, &v, block_hash).await {
+                                Ok(info) => return Ok((block_num, info)),
+                                Err(e) => {
+                                    last_err = Some(e);
+                                    sleep(Duration::from_millis(200 * attempt as u64)).await;
+                                }
+                            }
+                        }
+                        Err(anyhow::anyhow!(
+                            "Failed to fetch block info for {} (hash {:?}): {:?}",
+                            block_num, block_hash, last_err
+                        ))
+                    });
+                }
+
+                if let Some(res) = join_set.join_next().await {
+                    match res {
+                        Ok(Ok((num, info))) => {
+                            if tx.send((num, info)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(anyhow::anyhow!("Join error: {}", e)),
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let checkpoint_interval = self.checkpoint_interval;
+        let db_writer = db.clone();
+        let writer_handle = tokio::task::spawn_blocking(move || {
+            let mut pending_blocks: BTreeMap<u64, BlockInfo> = BTreeMap::new();
+            let mut next_to_write = start_block;
+            let mut written_count = 0u64;
+            let mut batch = db_writer.prepare_write_batch()?;
+            let mut last_log_time = Instant::now();
+            let start_time = Instant::now();
+            let mut last_checkpoint = start_block / checkpoint_interval;
+
+            while let Some((num, info)) = rx.blocking_recv() {
+                pending_blocks.insert(num, info);
+
+                while let Some(block_info) = pending_blocks.remove(&next_to_write) {
+                    db_writer.write_block_info(&mut batch, block_info)?;
+                    written_count += 1;
+
+                    let current_checkpoint = next_to_write / checkpoint_interval;
+                    if current_checkpoint > last_checkpoint {
+                        db_writer.commit_sync(batch)?;
+                        batch = db_writer.prepare_write_batch()?;
+                        last_checkpoint = current_checkpoint;
+
+                        if last_log_time.elapsed().as_secs() >= 5 {
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            let speed = written_count as f64 / elapsed.max(0.001);
+                            let pct = (written_count as f64 / total_blocks as f64) * 100.0;
+                            info!(target: "archive_init",
+                                "Fixed block headers: {}/{} ({:.2}%) at block {} | Speed: {:.1} blocks/s",
+                                written_count, total_blocks, pct, next_to_write, speed
+                            );
+                            last_log_time = Instant::now();
+                        }
+                    }
+
+                    next_to_write += 1;
+                }
+            }
+
+            // Flush remaining writes
+            db_writer.commit_sync(batch)?;
+            let total_elapsed = start_time.elapsed().as_secs_f64();
+            info!(target: "archive_init",
+                "Headers backfill completed: {} blocks written in {:.1}s ({:.1} blocks/s)",
+                written_count, total_elapsed, written_count as f64 / total_elapsed.max(0.001)
+            );
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        fetcher_handle.await??;
+        writer_handle.await??;
+
+        info!(target: "archive_init", "Headers-only backfill finished successfully.");
         Ok(())
     }
 
