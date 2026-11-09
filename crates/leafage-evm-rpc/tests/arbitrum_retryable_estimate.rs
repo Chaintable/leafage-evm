@@ -466,7 +466,10 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             ),
             TransactionRequest::default().from(sender).to(target),
         ])
-        .map(|inner| CallRequest { inner, tempo: None })
+        .map(|inner| CallRequest {
+            inner,
+            ..Default::default()
+        })
         .collect();
     for parallel in [false, true] {
         let response = DebankApiClient::contract_multi_call(
@@ -527,7 +530,10 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
                 default_call.clone(),
             ]
             .into_iter()
-            .map(|inner| CallRequest { inner, tempo: None })
+            .map(|inner| CallRequest {
+                inner,
+                ..Default::default()
+            })
             .collect(),
             None,
             None,
