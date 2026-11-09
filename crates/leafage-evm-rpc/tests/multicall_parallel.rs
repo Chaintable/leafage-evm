@@ -210,6 +210,7 @@ async fn run_differential(serial_addr: &'static str, parallel_addr: &'static str
         .unwrap();
 
     let call = |to: Address| CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default().from(alice).to(to),
         tempo: None,
     };

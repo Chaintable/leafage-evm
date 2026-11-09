@@ -448,6 +448,7 @@ fn anchor_context() -> Option<DebankBlockContext> {
 
 fn call_request(from: Address, to: Address) -> CallRequest {
     CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default().from(from).to(to),
         tempo: None,
     }
@@ -514,6 +515,7 @@ fn output_words(output: &Bytes) -> Vec<U256> {
 
 fn request_with_input(from: Address, to: Address, input: Bytes) -> CallRequest {
     CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(from)
             .to(to)
@@ -563,6 +565,7 @@ async fn arc_call_uses_shared_environment_and_overrides() {
     let anchor = BlockId::Number(BlockNumberOrTag::Number(ANCHOR_NUMBER));
 
     let historical = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(addresses.environment)
@@ -593,6 +596,7 @@ async fn arc_call_uses_shared_environment_and_overrides() {
         ..Default::default()
     };
     let next_request = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(addresses.environment)
@@ -694,6 +698,7 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
     let initial_funded_balance = U256::ONE << 128;
     let transferred = U256::from(123);
     let first = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(addresses.counter)
@@ -780,6 +785,7 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
 
     let explicit_nonce = vec![
         CallRequest {
+            celo: Default::default(),
             inner: TransactionRequest::default()
                 .from(addresses.funded)
                 .to(addresses.counter)
@@ -787,6 +793,7 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
             tempo: None,
         },
         CallRequest {
+            celo: Default::default(),
             inner: TransactionRequest::default()
                 .from(addresses.funded)
                 .to(addresses.counter)
@@ -836,6 +843,7 @@ async fn arc_simulation_zero8_commits_drain_cleanup_and_value_recreation() {
         burn_input(addresses.drain_target, drained_balance),
     );
     let recredit = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(addresses.drain_target)
@@ -970,6 +978,7 @@ async fn arc_pre_traces_expose_post_zero7_callfrom_as_the_logical_child() {
     let child_input = Bytes::new();
     let input = call_from_input(addresses.funded, addresses.counter, child_input.clone());
     let request = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(MEMO_ADDRESS)
@@ -1042,6 +1051,7 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
     authorize.authorization_list = Some(vec![authorization.into_signed(signature)]);
 
     let estimate_request = CallRequest {
+        celo: Default::default(),
         inner: authorize.clone(),
         tempo: None,
     };
@@ -1069,6 +1079,7 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
         .simulate_transactions(
             vec![
                 CallRequest {
+                    celo: Default::default(),
                     inner: authorize,
                     tempo: None,
                 },
@@ -1205,6 +1216,7 @@ async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
         ]
     };
     let value_call = |to: Address| CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(to)
@@ -1218,7 +1230,11 @@ async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
             .gas_limit(200_000)
             .input(TransactionInput::new(init_code.into()));
         inner.to = Some(TxKind::Create);
-        CallRequest { inner, tempo: None }
+        CallRequest {
+            inner,
+            tempo: None,
+            ..Default::default()
+        }
     };
     let created = addresses.funded.create(0);
     // Receives value from the created contract, by SELFDESTRUCT or by a nested CALL.
@@ -1589,6 +1605,7 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
     );
 
     let transfer_with_low_request_gas = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(addresses.empty)
@@ -1603,6 +1620,7 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
     );
 
     let value_without_balance = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.empty)
             .to(addresses.funded)
@@ -1628,6 +1646,7 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
     assert_eq!(insufficient.message(), "Halted: OutOfFunds");
 
     let fee_without_balance = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.empty)
             .to(addresses.funded)
@@ -1759,6 +1778,7 @@ async fn arc_estimate_preserves_revert_and_normal_transaction_errors() {
     assert!(blocked.message().contains("Blocked address"));
 
     let invalid_fee = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(addresses.funded)
             .to(addresses.empty)
@@ -1777,6 +1797,7 @@ async fn arc_estimate_preserves_revert_and_normal_transaction_errors() {
     let empty_authorization = estimate(
         &fixture.api,
         CallRequest {
+            celo: Default::default(),
             inner: empty_authorization,
             tempo: None,
         },

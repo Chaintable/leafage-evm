@@ -157,7 +157,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--historical-rpc` | - | Historical RPC endpoint for pre-fork queries (e.g., OP pre-bedrock) |
 | `--historical-height` | - | Fork height threshold for historical RPC forwarding |
 
-For Celo L2 mainnet, use `--evm-type=celo --chain-cfg=42220`. Execution selects Granite / Isthmus / Jovian at the requested block and includes the CELO native transfer precompile (`0xfd`) and the 64 KiB code limit. This mode reuses OP fee handling; Celo-specific fee distribution, `feeCurrency` / CIP-64 and Celo L1 execution are not yet supported. Fixed-fork overrides are not accepted.
+For Celo L2 mainnet, use `--evm-type=celo --chain-cfg=42220`. Execution selects Granite / Isthmus / Jovian at the requested block and includes the CELO native transfer precompile (`0xfd`) and the 64 KiB code limit. This mode reuses OP fee handling; Celo-specific L2 fee distribution and `feeCurrency` / CIP-64 are not yet supported. Select historical L1 execution with `--evm-custom-config='{"execution_mode":"l1"}'`; see [Celo L1 execution](docs/celo-l1.md) for its precompiles, historical fees and verification. Fixed-fork overrides are not accepted.
 
 ### Kafka + S3 Configuration
 

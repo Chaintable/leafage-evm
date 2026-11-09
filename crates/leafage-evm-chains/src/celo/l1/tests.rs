@@ -553,6 +553,12 @@ fn native_opcode_gas_at_fork_boundaries() {
         ))
         .unwrap(),
     );
+    cases.extend(
+        serde_json::from_str::<Vec<serde_json::Value>>(include_str!(
+            "../../../testdata/celo_l1/return_copy.json"
+        ))
+        .unwrap(),
+    );
     for case in cases {
         let params = case["params"].as_array().unwrap();
         let request = &params[0];

@@ -223,6 +223,7 @@ fn setup(
         .unwrap();
 
     let call = |to: Address| CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default().from(alice).to(to),
         tempo: None,
     };

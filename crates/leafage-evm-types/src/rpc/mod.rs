@@ -1,11 +1,11 @@
 mod call;
-pub use call::CallRequest;
+pub use call::{CallRequest, CeloCallExtension};
 
 mod tempo;
 pub use tempo::{
     CallScope, InvalidTempoFields, SelectorRule, TempoAuthGasInfo, TempoCallExtension,
-    TempoKeyAuthGasInfo, TempoP256SignatureInfo, TempoPrimitiveSignatureInfo,
-    TempoTokenLimitInfo, TempoWebAuthnSignatureInfo,
+    TempoKeyAuthGasInfo, TempoP256SignatureInfo, TempoPrimitiveSignatureInfo, TempoTokenLimitInfo,
+    TempoWebAuthnSignatureInfo,
 };
 
 mod key;

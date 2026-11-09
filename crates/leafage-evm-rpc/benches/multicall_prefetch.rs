@@ -205,6 +205,7 @@ fn setup(enable_cache: bool, block_cache_mb: usize, sets: usize, addr: &str) -> 
         .map(|s| {
             (0..CALLS)
                 .map(|i| CallRequest {
+                    celo: Default::default(),
                     inner: TransactionRequest::default()
                         .from(alice)
                         .to(contract(s * CALLS + i)),

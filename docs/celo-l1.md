@@ -49,6 +49,24 @@ warmth. The implementation preserves the deployed precompiles' return bytes,
 length rules, gas schedule, compressed BLS encoding, GLV arithmetic and legacy
 multi-exponentiation window behavior.
 
+Between Donut and Espresso, the native identity and native-transfer precompiles
+alias their return data with call memory. The adapter preserves this historical
+copy behavior, including overlapping output memory and subsequent RETURNDATACOPY.
+
+L1 calls support `feeCurrency`, `gatewayFeeRecipient`, `gatewayFee` and
+`ethCompatible` with historical fork checks. Alternative-currency intrinsic gas,
+whitelist, balances, gas-price minimums and exchange rates come from contracts at
+the requested state. Ordinary calls perform native fee debit/credit in their
+temporary journal; estimation clears prices and skips debit/credit like native
+Celo. Access lists on call messages are charged before Espresso as well, while
+their storage/account warming starts at Espresso. `maxFeeInFeeCurrency` is
+rejected because Celo mainnet L1 never activated denominated transactions.
+
+Before Gingerbread, block responses omit `nonce`, `mixHash`, `sha3Uncles` and
+`uncles`. A synthesized archive `baseFeePerGas` does not activate dynamic call
+fees early. Call and estimate errors preserve raw revert bytes in `error.data`
+alongside Leafage's existing DeBank error codes.
+
 One malformed-input behavior is deliberately hardened: a zero denominator in
 `fractionMulExp` fails the EVM call. The old Go implementation can panic while
 dividing by zero because its zero check compares pointers.
@@ -61,6 +79,9 @@ change and must be checked against the native Celo implementation.
 
 ```sh
 cargo test -p leafage-evm-chains --lib celo::
+cargo test -p leafage-evm-types --lib rpc::call::
+cargo test -p leafage-evm-rpc --lib api_impl::celo::
+cargo test -p leafage-evm-rpc --test eth_error_codes
 cargo test -p leafage-evm celo_selects_mainnet_l2_without_fixed_fork_overrides
 ```
 
@@ -89,3 +110,20 @@ The system-call regression also checks that metered SLOAD/SSTORE accesses
 warm the storage owner, including the pre-Espresso, Espresso and Gingerbread
 boundaries and rollback. Native system-storage vectors can be added to the
 RPC comparison with `--system-storage crates/leafage-evm-chains/testdata/celo_l1/system_storage_gas.json`.
+
+The native return-memory regressions are in
+`crates/leafage-evm-chains/testdata/celo_l1/return_copy.json` (125 cases).
+RPC unit tests additionally cover nondefault alternative intrinsic gas, visible
+currency debits, skipped settlement during estimation, fee validation and block
+formatting across forks. HTTP tests check raw custom-error bytes and estimation
+request conversion.
+
+For sampled live verification, use `dettack leafagetest -l <leafage-rpc>
+-r <native-archive-rpc> --chain-id 42220`. It compares Leafage's custom
+`estimateGas` with native `eth_estimateGas`; Leafage does not expose the latter.
+Match the estimator padding configuration before interpreting numeric results:
+native Celo defaults to `--rpc.gasinflationrate=1.3`, corresponding to Leafage
+`--estimate-gas-buffer=130`. The estimate search can still differ slightly.
+Check raw revert bytes separately, and exercise explicit fee fields because the
+dettack transaction projection does not retain them. Archive balance/code
+sampling alone does not verify historical calls, tracing or every stored block.

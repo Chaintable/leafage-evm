@@ -220,6 +220,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     .abi_encode();
 
     let call_request = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
@@ -238,6 +239,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     assert_eq!(ticket_id.len(), 32);
 
     let read_request = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default().from(sender).to(target),
         tempo: None,
     };
@@ -304,6 +306,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
         let estimate = DebankApiClient::estimate_gas(
             &client,
             CallRequest {
+                celo: Default::default(),
                 inner: tx,
                 tempo: None,
             },
@@ -320,6 +323,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     assert!(estimates[0] < U256::from(100_000u64));
 
     let low_gas_request = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
@@ -348,6 +352,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     }
     .abi_encode();
     let reverting_request = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
@@ -381,6 +386,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
         .any(|trace| trace.to_addr == NODE_INTERFACE_ADDRESS));
 
     let above_eip7825_cap = CallRequest {
+        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(target)
@@ -578,6 +584,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     let high_gas_estimate = DebankApiClient::estimate_gas(
         &osaka_client,
         CallRequest {
+            celo: Default::default(),
             inner: TransactionRequest::default()
                 .from(sender)
                 .to(high_gas_target),
