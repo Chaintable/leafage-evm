@@ -12,7 +12,6 @@ use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err, rpc_err
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::{core::RpcResult, http_client::HttpClient};
-use tracing::warn;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{
     block_env_from_block, Address, BlockEnv, BlockId, BlockInfo, BlockNumberOrTag, BlockOverrides,
@@ -1166,10 +1165,11 @@ where
             self.inner.evm_cfg().cfg.chain_id,
         )?;
         tx.set_gas_estimation();
-        // Skip no_code_callee early return for Tempo and ZKsync Era:
-        // - Tempo: TIP-1000 nonce==0 surcharge adds 250k gas that this optimization doesn't account for.
-        // - ZKsync Era: transactions have bootloader overhead and pubdata cost (140k+ gas).
-        if !self.inner.evm_cfg().zksync_era && self.inner.virtual_balance().is_none() && tx.input().is_empty() {
+        // Skip no_code_callee early return for Tempo — TIP-1000 nonce==0 surcharge
+        // adds 250k gas that this optimization doesn't account for. The early return
+        // would incorrectly return MIN_TRANSACTION_GAS (21000) when the actual
+        // required gas is 271000+.
+        if self.inner.virtual_balance().is_none() && tx.input().is_empty() {
             if let TransactTo::Call(to) = tx.kind() {
                 if let Ok(account) = memory_db.basic_ref(to) {
                     let no_code_callee = account
@@ -1748,24 +1748,6 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
-        if self.inner.evm_cfg().zksync_era {
-            if let Some(historical_client) = self.inner.historical_client() {
-                match historical_client
-                    .estimate_gas(request.clone(), block_ctx.clone(), block_overrides.clone())
-                    .await
-                {
-                    Ok(result) => return Ok(result),
-                    Err(err) => {
-                        warn!(
-                            target: "rpc",
-                            "zksync_era upstream estimate_gas failed: {:?}, falling back to local",
-                            err
-                        );
-                    }
-                }
-            }
-        }
-
         match self
             .debank_estimate_gas_impl(request.clone(), block_ctx.clone(), block_overrides.clone())
             .await
