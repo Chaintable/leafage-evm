@@ -1139,6 +1139,39 @@ where
         // the request-scoped cache lets every retry after the first read
         // its state from memory instead of re-walking the layered state.
         let memory_db = utils::RequestCacheDB::new(cache_db);
+
+        if self.inner.evm_cfg().zksync_era {
+            let caller = request.from.unwrap_or_else(|| Address::repeat_byte(0x11));
+            let to = match request.to {
+                Some(alloy::primitives::TxKind::Call(addr)) => Some(addr),
+                _ => None,
+            };
+            let data = request.input.clone().into_input().unwrap_or_default();
+            let value = request.value.unwrap_or_default();
+            let block_number = block_env.number.to();
+            let block_timestamp = block_env.timestamp.to();
+            let base_fee = block_env.basefee;
+            let gas_per_pubdata_byte = 0;
+
+            let gas = crate::api_impl::zksync_era::estimate_era_gas(
+                &memory_db,
+                caller,
+                to,
+                &data,
+                value,
+                block_number,
+                block_timestamp,
+                base_fee,
+                gas_per_pubdata_byte,
+                cancel_token,
+            )
+            .map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e)
+            })?;
+
+            return Ok(U256::from(gas));
+        }
+
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
