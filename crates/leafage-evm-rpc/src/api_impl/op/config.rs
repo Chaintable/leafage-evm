@@ -21,7 +21,7 @@ struct OpCustomConfig {
 /// Builds the OP `CfgEnv` from `--evm-custom-config`.
 ///
 /// `op_spec_id` is an OP fork name (e.g. "Jovian"); omitted keeps Karst (Osaka rules).
-/// On a chain with a built-in fork schedule (OP Mainnet, Soneium; see
+/// On a chain with a built-in fork schedule (OP Mainnet, Soneium, Unichain; see
 /// `leafage_evm_chains::op::schedule`) each call runs the fork of its block instead.
 /// Without an initcode override, revm uses 2 * code size, matching geth.
 pub fn build_op_custom_config(json: Option<&str>) -> Result<CfgEnv<OpSpecId>> {

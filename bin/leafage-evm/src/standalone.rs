@@ -74,8 +74,8 @@ pub struct Command {
     /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode
     /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
     /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules);
-    /// chains with a built-in fork schedule, OP Mainnet 10 and Soneium 1868, follow it per
-    /// block instead),
+    /// chains with a built-in fork schedule, OP Mainnet 10, Soneium 1868 and Unichain 130,
+    /// follow it per block instead),
     /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
     /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
     ///
