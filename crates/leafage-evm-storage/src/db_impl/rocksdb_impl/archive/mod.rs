@@ -57,6 +57,8 @@ mod block_index;
 mod iterator_tracker;
 mod rewind;
 mod state_cache;
+#[cfg(test)]
+mod state_cache_bench;
 mod stats;
 pub(crate) mod udt;
 use block_index::BlockIndex;
@@ -2812,7 +2814,7 @@ impl StateDB {
     }
 
     /// Schema v3: cache `span`, which a miss on `key` just read (it ends at
-    /// the read block), after probing at the head if that can extend it.
+    /// the read block), learning its full interval on a repeated version.
     fn udt_record<const N: usize, V>(
         &self,
         view: &state_cache::ReadView,
@@ -2826,7 +2828,31 @@ impl StateDB {
         V: Copy + PartialEq + std::fmt::Debug + Send + Sync + 'static,
     {
         let mut newer = None;
-        if counted_probe(StateCache::probe(cached, view, self.block_num, &span)) {
+        if StateCache::probe_udt_interval(cached, view, self.block_num, &span) {
+            STORAGE_METRICS.state_cache_probes.increment(1);
+            let start = std::time::Instant::now();
+            let next = udt::next_version(self.db.db, col, &key, self.block_num, view.head());
+            STORAGE_METRICS
+                .state_cache_interval_probe_latency
+                .record(start.elapsed().as_secs_f64());
+            match next {
+                Ok(next) => {
+                    newer = next;
+                    span.hi = next.map_or(view.head(), |n| n - 1);
+                    if next.is_some() {
+                        STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                    }
+                }
+                Err(error) => {
+                    // This is optional cache learning; the original Get already
+                    // succeeded. Retain its proven span if the probe fails.
+                    STORAGE_METRICS
+                        .state_cache_interval_probe_errors
+                        .increment(1);
+                    debug!(target: "rocksdb", %error, "archive state-cache interval probe failed");
+                }
+            }
+        } else if counted_probe(StateCache::probe(cached, view, self.block_num, &span)) {
             let reader = self
                 .udt_head
                 .get_or_init(|| udt::UdtReader::new(view.head()));

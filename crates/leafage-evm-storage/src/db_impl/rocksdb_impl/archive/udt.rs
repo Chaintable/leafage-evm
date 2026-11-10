@@ -178,6 +178,48 @@ pub(super) struct UdtReader {
     _ts: Box<[u8; 8]>,
 }
 
+/// First version in (block, head], bounded to this key and read view.
+/// Timestamp-range iteration exposes all versions, newest first, so
+/// SeekForPrev finds the oldest one in the range. The pinned RocksDB exposes
+/// internal keys in this mode: user key || timestamp (8) || sequence/type (8).
+pub(super) fn next_version(
+    db: &DB,
+    col: StorageTypeColumn,
+    key: &[u8],
+    block: u64,
+    head: u64,
+) -> Result<Option<u64>, Error> {
+    debug_assert!(block < head);
+    let mut ro = ReadOptions::default();
+    ro.set_verify_checksums(false);
+    ro.set_total_order_seek(true);
+    ro.set_timestamp(encode_ts(head));
+    ro.set_iter_start_ts(encode_ts(block + 1));
+    ro.set_iterate_lower_bound(key.to_vec());
+    if let Some(end) = key_after_prefix(key) {
+        ro.set_iterate_upper_bound(end);
+    }
+    let cf = db.cf_handle(col.to_str()).unwrap();
+    let mut iter = db.raw_iterator_cf_opt(cf, ro);
+    iter.seek_for_prev(key);
+    iter.status()?;
+    let Some(raw) = iter.key() else {
+        return Ok(None);
+    };
+    if raw.len() != key.len() + 16 || &raw[..key.len()] != key {
+        return Err(Error::RocksDBMessage(
+            "unexpected timestamp-range iterator key".into(),
+        ));
+    }
+    let next = u64::from_le_bytes(raw[key.len()..key.len() + 8].try_into().unwrap());
+    if next <= block || next > head {
+        return Err(Error::RocksDBMessage(
+            "timestamp-range iterator outside read view".into(),
+        ));
+    }
+    Ok(Some(next))
+}
+
 // SAFETY: the options are only read after construction; RocksDB reads them
 // concurrently from any thread.
 unsafe impl Send for UdtReader {}
@@ -1289,9 +1331,70 @@ mod tests {
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 
-    /// State cache probes on v3: a slot unchanged up to the head, written or
-    /// not, is cached up to the head; a slot with a newer version keeps the
-    /// span it read.
+    #[test]
+    fn test_udt_next_version_bounds() {
+        let _g = ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("leafage-udt-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_archive_schema(&dir, ArchiveSchema::V3).unwrap();
+        let db = DataBaseRef::open(&dir, 16, true, false);
+        let columns = [
+            (StorageTypeColumn::AddressToAccount, 32),
+            (StorageTypeColumn::AddressToStorage, 64),
+        ];
+        let mut batch = WriteBatch::default();
+        for (col, len) in columns {
+            let cf = db.db.cf_handle(col.to_str()).unwrap();
+            for byte in [0, 0xff] {
+                for version in [10, 100, 200, u64::MAX] {
+                    // Empty values represent archive deletion/zero and still
+                    // end the preceding version's interval.
+                    let value: &[u8] = if version == 100 { &[] } else { &[1] };
+                    batch.put_cf_with_ts(cf, vec![byte; len], encode_ts(version), value);
+                }
+            }
+        }
+        db.db.write(batch).unwrap();
+        for phase in 0..3 {
+            if phase == 1 {
+                db.flush().unwrap();
+            }
+            if phase == 2 {
+                db.compact().unwrap();
+            }
+            for (col, len) in columns {
+                assert_eq!(
+                    next_version(db.db, col, &vec![0x80; len], 0, u64::MAX).unwrap(),
+                    None
+                );
+                for byte in [0, 0xff] {
+                    for (block, head, expected) in [
+                        (0, 9, None),
+                        (0, 10, Some(10)),
+                        (9, 200, Some(10)),
+                        (10, 199, Some(100)),
+                        (99, 100, Some(100)),
+                        (100, 199, None),
+                        (100, 200, Some(200)),
+                        (200, 300, None),
+                        (u64::MAX - 1, u64::MAX, Some(u64::MAX)),
+                    ] {
+                        assert_eq!(
+                            next_version(db.db, col, &vec![byte; len], block, head).unwrap(),
+                            expected,
+                            "phase {phase}, {col:?}, key {byte}, ({block}, {head}]"
+                        );
+                    }
+                }
+            }
+        }
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Repeated misses learn the whole version interval, including absence.
     #[test]
     fn test_udt_state_cache_probe() {
         let _g = ARCHIVE_DB_TEST_LOCK
@@ -1316,8 +1419,24 @@ mod tests {
                 match n {
                     10 => diff.storage_diffs = vec![write(stable, 1), write(changing, 2)],
                     100 => diff.storage_diffs = vec![write(changing, 3)],
+                    110 => {
+                        diff.storage_diffs = vec![write(changing, 0)];
+                        diff.deleted_accounts.push(changing);
+                    }
+                    115 => diff.storage_diffs = vec![write(changing, 4)],
                     _ => {}
                 }
+                diff.new_accounts = diff
+                    .storage_diffs
+                    .iter()
+                    .filter(|_| n != 110)
+                    .map(|d| NewAccount {
+                        address: d.address,
+                        balance: d.diffs[0].value,
+                        nonce: n,
+                        code_hash: KECCAK256_EMPTY,
+                    })
+                    .collect();
                 (n, diff)
             })
             .collect();
@@ -1350,8 +1469,60 @@ mod tests {
                 assert_eq!(read(n, stable), (U256::from(1), Some(10)));
                 assert_eq!(read(n, changing), (U256::from(2), Some(10)));
                 assert_eq!(read(n, never), (U256::ZERO, None));
+                let state = db
+                    .db_at(BlockId::Number(BlockNumberOrTag::Number(n)))
+                    .unwrap()
+                    .unwrap();
+                // Nine items also exercise the actual MultiGet path.
+                let accounts = state
+                    .read_account_many(&[stable, changing, never].repeat(3))
+                    .unwrap();
+                assert_eq!(
+                    accounts
+                        .iter()
+                        .map(|a| a.as_ref().map(|a| a.balance))
+                        .collect::<Vec<_>>(),
+                    [Some(U256::from(1)), Some(U256::from(2)), None].repeat(3)
+                );
             }
             let cache = db.state_cache.as_ref().unwrap();
+            // A failed optional probe must not fail an already successful
+            // read or cache any unproven heights. A non-timestamped CF makes
+            // RocksDB return InvalidArgument without fault-injection hooks.
+            let failed_key = key(H256::repeat_byte(0x24));
+            let mut span = Span {
+                lo: 10,
+                hi: 15,
+                found: true,
+                value: U256::from(1),
+            };
+            cache.storage.record_udt(failed_key, span, None);
+            let Lookup::Miss(prev) = cache.storage.lookup(&failed_key, 16) else {
+                panic!("expected miss")
+            };
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Number(16)))
+                .unwrap()
+                .unwrap();
+            span.hi = 16;
+            assert!(state
+                .udt_record(
+                    state.cache_view.as_ref().unwrap(),
+                    &cache.storage,
+                    &prev,
+                    StorageTypeColumn::HashToCode,
+                    failed_key,
+                    span
+                )
+                .is_ok());
+            assert!(matches!(
+                cache.storage.lookup(&failed_key, 16),
+                Lookup::Hit(Span { hi: 16, .. })
+            ));
+            assert!(matches!(
+                cache.storage.lookup(&failed_key, 17),
+                Lookup::Miss(_)
+            ));
             assert!(matches!(
                 cache.storage.lookup(&key(stable), 120),
                 Lookup::Hit(_)
@@ -1361,22 +1532,37 @@ mod tests {
                 Lookup::Hit(Span { found: false, .. })
             ));
             assert!(matches!(
-                cache.storage.lookup(&key(changing), 16),
-                Lookup::Hit(Span { lo: 10, hi: 16, .. })
+                cache.storage.lookup(&key(changing), 99),
+                Lookup::Hit(Span { lo: 10, hi: 99, .. })
             ));
             assert!(matches!(
-                cache.storage.lookup(&key(changing), 17),
+                cache.storage.lookup(&key(changing), 100),
                 Lookup::Miss(_)
             ));
-            // A later miss on that version extends the span by the read
-            // alone: the probe found version 100.
+            assert!(matches!(
+                cache.accounts.lookup(&changing.0, 99),
+                Lookup::Hit(Span { lo: 10, hi: 99, .. })
+            ));
+            assert!(matches!(
+                cache.accounts.lookup(&changing.0, 100),
+                Lookup::Miss(_)
+            ));
+            // The exact boundary includes 99 but never version 100.
             assert_eq!(read(50, changing), (U256::from(2), Some(10)));
             assert!(matches!(
                 cache.storage.lookup(&key(changing), 50),
-                Lookup::Hit(Span { lo: 10, hi: 50, .. })
+                Lookup::Hit(Span { lo: 10, hi: 99, .. })
             ));
             assert_eq!(read(99, changing), (U256::from(2), Some(10)));
             assert_eq!(read(100, changing), (U256::from(3), Some(100)));
+            assert_eq!(read(109, changing), (U256::from(3), Some(100)));
+            assert_eq!(read(110, changing), (U256::ZERO, Some(110)));
+            assert_eq!(read(115, changing), (U256::from(4), Some(115)));
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Number(110)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.read_account(changing).unwrap(), None);
             assert_eq!(read(120, stable), (U256::from(1), Some(10)));
         }
         let _ = std::fs::remove_dir_all(&base);
