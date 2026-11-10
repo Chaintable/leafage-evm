@@ -68,6 +68,7 @@ pub struct EraStorageWorld<DB> {
     db: DB,
     program_cache: HashMap<U256, Program<(), Self>>,
     precompiles: EraPrecompiles,
+    expected_caller: Option<H160>,
 }
 
 impl<DB: DatabaseRef> EraStorageWorld<DB> {
@@ -76,10 +77,12 @@ impl<DB: DatabaseRef> EraStorageWorld<DB> {
             db,
             program_cache: HashMap::new(),
             precompiles: EraPrecompiles::default(),
+            expected_caller: None,
         }
     }
 
     pub fn set_expected_caller(&mut self, caller: H160) {
+        self.expected_caller = Some(caller);
         self.precompiles.expected_caller = Some(caller);
     }
 }
@@ -93,18 +96,29 @@ impl<DB: DatabaseRef> StorageInterface for EraStorageWorld<DB> {
     }
 
     fn read_storage_value(&mut self, contract: H160, key: U256) -> U256 {
+        use super::bootloader::constants::L2_BASE_TOKEN_ADDRESS;
         let address = Address::from_slice(contract.as_bytes());
         let mut key_bytes = [0u8; 32];
         key.to_big_endian(&mut key_bytes);
         let index = AlloyU256::from_be_bytes(key_bytes);
 
-        match self.db.storage_ref(address, index) {
+        let val = match self.db.storage_ref(address, index) {
             Ok(val) => {
                 let out_bytes = val.to_be_bytes::<32>();
                 U256::from_big_endian(&out_bytes)
             }
             Err(_) => U256::zero(),
+        };
+
+        if contract == L2_BASE_TOKEN_ADDRESS {
+            if let Some(caller) = self.expected_caller {
+                if key == super::bootloader::constants::eth_balance_storage_key(caller) {
+                    return val.saturating_add(U256::from(10u128.pow(25)));
+                }
+            }
         }
+
+        val
     }
 
     fn cost_of_writing_storage(&mut self, slot: StorageSlot, new_value: U256) -> u32 {
@@ -263,6 +277,7 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     value: AlloyU256,
     block_number: u64,
     block_timestamp: u64,
+    block_hash: Option<alloy::primitives::B256>,
     base_fee: u64,
     gas_per_pubdata_byte: u64,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -295,20 +310,35 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     let fair_l2_gas_price = base_fee;
     let fair_pubdata_price = gas_per_pubdata_byte * fair_l2_gas_price;
 
-    let prev_block_hash = if block_number == 1 {
+    let (sim_block_number, sim_block_timestamp, prev_block_hash) = if let Some(hash) = block_hash {
+        let h256 = primitive_types::H256::from_slice(hash.as_slice());
+        if block_number == 0 {
+            (1, 1, h256)
+        } else {
+            (block_number + 1, block_timestamp + 1, h256)
+        }
+    } else if block_number <= 1 {
         // Legacy L2 block 0 hash: keccak256(uint32(0))
-        primitive_types::H256([
-            0xe8, 0xe7, 0x76, 0x26, 0x58, 0x6f, 0x73, 0xb9, 0x55, 0x36, 0x4c, 0x7b, 0x4b, 0xbf,
-            0x0b, 0xb7, 0xf7, 0x68, 0x5e, 0xbd, 0x40, 0xe8, 0x52, 0xb1, 0x64, 0x63, 0x3a, 0x4a,
-            0xcb, 0xd3, 0x24, 0x4c,
-        ])
+        (
+            1,
+            1,
+            primitive_types::H256([
+                0xe8, 0xe7, 0x76, 0x26, 0x58, 0x6f, 0x73, 0xb9, 0x55, 0x36, 0x4c, 0x7b, 0x4b,
+                0xbf, 0x0b, 0xb7, 0xf7, 0x68, 0x5e, 0xbd, 0x40, 0xe8, 0x52, 0xb1, 0x64, 0x63,
+                0x3a, 0x4a, 0xcb, 0xd3, 0x24, 0x4c,
+            ]),
+        )
     } else {
-        primitive_types::H256::zero()
+        (
+            block_number + 1,
+            block_timestamp + 1,
+            primitive_types::H256::zero(),
+        )
     };
 
     let env = BootloaderEnv {
-        block_number,
-        block_timestamp,
+        block_number: sim_block_number,
+        block_timestamp: sim_block_timestamp,
         prev_block_hash,
         fee_account: BOOTLOADER_ADDRESS,
         fair_pubdata_price,
@@ -323,6 +353,11 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
         sig
     };
 
+    let nonce = match db.basic_ref(caller) {
+        Ok(Some(account)) => U256::from(account.nonce),
+        _ => U256::zero(),
+    };
+
     let tx = TransactionData {
         tx_type: EIP_712_TX_TYPE,
         from: caller_h160,
@@ -332,7 +367,7 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
         max_fee_per_gas: U256::from(base_fee),
         max_priority_fee_per_gas: U256::zero(),
         paymaster: H160::zero(),
-        nonce: U256::zero(),
+        nonce,
         value: value_u256,
         reserved: [U256::zero(); 4],
         data: data.to_vec(),
@@ -910,6 +945,7 @@ mod tests {
             AlloyU256::ZERO,
             1,
             1,
+            None,
             250_000_000,
             800,
             cancel_token,

@@ -52,15 +52,19 @@ pub const SYSTEM_CONTEXT_ADDRESS: H160 = H160([
     0x00, 0x00, 0x80, 0x0b,
 ]);
 
-pub fn bootloader_balance_key() -> U256 {
+pub fn eth_balance_storage_key(address: H160) -> U256 {
     use tiny_keccak::{Hasher, Keccak};
     let mut bytes = [0u8; 64];
-    bytes[12..32].copy_from_slice(BOOTLOADER_ADDRESS.as_bytes());
+    bytes[12..32].copy_from_slice(address.as_bytes());
     let mut hasher = Keccak::v256();
     let mut out = [0u8; 32];
     hasher.update(&bytes);
     hasher.finalize(&mut out);
     U256::from_big_endian(&out)
+}
+
+pub fn bootloader_balance_key() -> U256 {
+    eth_balance_storage_key(BOOTLOADER_ADDRESS)
 }
 
 pub const BOOTLOADER_UTILITIES_ADDRESS: H160 = H160([

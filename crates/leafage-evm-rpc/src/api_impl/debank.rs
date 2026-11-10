@@ -1152,6 +1152,7 @@ where
             let block_timestamp = block_env.timestamp.to();
             let base_fee = block_env.basefee;
             let gas_per_pubdata_byte = 0;
+            let block_hash = block.header.hash;
 
             let gas = crate::api_impl::zksync_era::estimate_era_gas(
                 &memory_db,
@@ -1161,6 +1162,7 @@ where
                 value,
                 block_number,
                 block_timestamp,
+                Some(block_hash),
                 base_fee,
                 gas_per_pubdata_byte,
                 cancel_token,
