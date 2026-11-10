@@ -1510,7 +1510,7 @@ impl Command {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    last_error = e.to_string();
+                    last_error = format!("{e:#}");
                     if attempt < MAX_RETRIES {
                         warn!(target: "archive_init",
                             "Block {} fetch failed (attempt {}/{}): {}. Retrying...",
