@@ -1524,6 +1524,100 @@ mod tests {
         assert_eq!(retryable_gas_remaining, 900_000);
     }
 
+    #[test]
+    fn zero_l1_price_counts_units_before_gas_info_getter() {
+        use revm::inspector::NoOpInspector;
+        use revm::primitives::TxKind;
+        use revm::state::AccountInfo;
+        use revm::{ExecuteEvm, InspectEvm};
+
+        // Writer eth_call vector from Elysium block 3_621_823 (L1 price = 0).
+        let initial_units = U256::from(0x8600ff1u64);
+        let getter = TxEnv {
+            caller: Address::ZERO,
+            kind: TxKind::Call(Address::with_last_byte(0x6c)),
+            gas_limit: 0x300000,
+            gas_price: 0,
+            data: Bytes::from_static(&[0xef, 0xf0, 0x13, 0x06]),
+            ..Default::default()
+        };
+        for (price, basefee) in [(0u64, 500_000_000), (1_000_000_000, 500_000_000), (0, 0)] {
+            let mut db = db_with_pricing();
+            for (slot, value) in [
+                (
+                    ArbitrumHandler::<TestDb, ()>::l1_pricing_slot(
+                        arbos_state::L1_PRICE_PER_UNIT_OFFSET,
+                    ),
+                    U256::from(price),
+                ),
+                (
+                    arbos_state::slot_at(&[], arbos_state::ARBOS_VERSION_OFFSET),
+                    U256::from(61),
+                ),
+                (
+                    ArbitrumHandler::<TestDb, ()>::l1_pricing_slot(
+                        arbos_state::L1_UNITS_SINCE_UPDATE_OFFSET,
+                    ),
+                    initial_units,
+                ),
+            ] {
+                db.insert_account_storage(arbos_state::ARBOS_STATE_ADDRESS, slot, value)
+                    .unwrap();
+            }
+            db.insert_account_info(
+                Address::ZERO,
+                AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    ..Default::default()
+                },
+            );
+            let mut execution_context = ArbitrumExecutionContext::default();
+            execution_context.set_current_l2_context(U256::ZERO, basefee);
+            let mut evm = ArbitrumEvm::new(
+                // Unpriced eth_call exposes BASEFEE=0 while the hook uses the original fee.
+                BlockEnv {
+                    basefee: 0,
+                    gas_limit: 30_000_000,
+                    ..Default::default()
+                },
+                CfgEnv::new_with_spec(ArbitrumHardfork::Prague),
+                db,
+                NoOpInspector {},
+                ArbitrumPrecompileEnv {
+                    current_arbos_version: 61,
+                    ..Default::default()
+                },
+                execution_context,
+            );
+            // Non-committing calls must give the same answer on repetition and on
+            // the inspected path used by RPC simulation.
+            for inspected in [false, true] {
+                let tx = ArbitrumTxEnv::new(getter.clone(), Default::default());
+                let result = if inspected {
+                    evm.inspect_tx(tx)
+                } else {
+                    evm.transact(tx)
+                }
+                .expect("execute units getter");
+                assert!(result.result.is_success());
+                let charge = evm.ctx().chain().current_poster_charge().unwrap();
+                let expected_units = if basefee == 0 { 0 } else { 2_343 };
+                assert_eq!(charge.calldata_units, expected_units);
+                assert_eq!(
+                    U256::from_be_slice(result.result.output().unwrap()),
+                    initial_units + U256::from(expected_units)
+                );
+                if price == 0 {
+                    assert_eq!(charge.poster_fee, U256::ZERO);
+                    assert_eq!(charge.poster_gas, 0);
+                    assert_eq!(result.result.gas().tx_gas_used(), 22_667);
+                } else {
+                    assert!(charge.poster_gas > 0);
+                }
+            }
+        }
+    }
+
     /// The tx-level gas-estimation flag switches poster charging between
     /// nitro's padded estimation mode and the unpadded call mode.
     #[test]

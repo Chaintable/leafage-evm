@@ -175,25 +175,24 @@ pub struct ArbPricing {
 }
 
 impl ArbPricing {
-    fn from_values(price_per_unit: U256, min_base_fee: U256, brotli_raw: U256) -> Option<Self> {
-        if price_per_unit.is_zero() {
-            return None;
-        }
-        Some(Self {
+    fn from_values(price_per_unit: U256, min_base_fee: U256, brotli_raw: U256) -> Self {
+        // A zero price makes posting free, but Nitro still counts calldata units.
+        Self {
             price_per_unit,
             min_base_fee,
             brotli_level: brotli_raw.wrapping_to::<u64>().min(11),
-        })
+        }
     }
 
     pub(crate) fn read_from_db<DB: Database>(db: &mut DB) -> Result<Option<Self>, DB::Error> {
         let price_per_unit = db.storage(ARBOS_STATE_ADDRESS, *PRICE_PER_UNIT_SLOT)?;
-        if price_per_unit.is_zero() {
-            return Ok(None);
-        }
         let min_base_fee = db.storage(ARBOS_STATE_ADDRESS, *MIN_BASE_FEE_SLOT)?;
         let brotli_raw = db.storage(ARBOS_STATE_ADDRESS, *BROTLI_LEVEL_SLOT)?;
-        Ok(Self::from_values(price_per_unit, min_base_fee, brotli_raw))
+        Ok(Some(Self::from_values(
+            price_per_unit,
+            min_base_fee,
+            brotli_raw,
+        )))
     }
 }
 
@@ -208,21 +207,17 @@ pub trait ArbStateReader: DatabaseRef {
 
     fn try_read_pricing(&self) -> Result<Option<ArbPricing>, Self::Error> {
         let price_per_unit = self.try_read_root(*PRICE_PER_UNIT_SLOT)?;
-        if price_per_unit.is_zero() {
-            return Ok(None);
-        }
         let min_base_fee = self.try_read_root(*MIN_BASE_FEE_SLOT)?;
         let brotli_raw = self.try_read_root(*BROTLI_LEVEL_SLOT)?;
-        Ok(ArbPricing::from_values(
+        Ok(Some(ArbPricing::from_values(
             price_per_unit,
             min_base_fee,
             brotli_raw,
-        ))
+        )))
     }
 
-    /// Optional pricing is retained for callers where an absent pre-L1-pricing
-    /// state is expected. Execution paths use `try_read_pricing` so a database
-    /// failure cannot be mistaken for a zero L1 charge.
+    /// Best-effort pricing for callers that tolerate database errors. A zero
+    /// L1 price is valid pricing, not an absent value.
     fn read_pricing(&self) -> Option<ArbPricing> {
         self.try_read_pricing().ok().flatten()
     }
@@ -544,6 +539,27 @@ mod tests {
     fn slot_keeps_offset_low_byte() {
         let slot = slot_at(&[], 7);
         assert_eq!((slot & U256::from(0xff)).to::<u64>(), 7);
+    }
+
+    #[test]
+    fn zero_price_preserves_pricing_in_both_readers() {
+        use revm::database::{in_memory_db::CacheDB, EmptyDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(ARBOS_STATE_ADDRESS, *MIN_BASE_FEE_SLOT, U256::from(100))
+            .unwrap();
+        db.insert_account_storage(ARBOS_STATE_ADDRESS, *BROTLI_LEVEL_SLOT, U256::from(6))
+            .unwrap();
+
+        let readonly = db.try_read_pricing().unwrap().expect("zero price is valid");
+        let mutable = ArbPricing::read_from_db(&mut db)
+            .unwrap()
+            .expect("zero price is valid");
+        for pricing in [readonly, mutable] {
+            assert_eq!(pricing.price_per_unit, U256::ZERO);
+            assert_eq!(pricing.min_base_fee, U256::from(100));
+            assert_eq!(pricing.brotli_level, 6);
+        }
     }
 
     /// Live vector: hood (Robinhood, ArbOS 61) writer at block 0x59b600 holds
