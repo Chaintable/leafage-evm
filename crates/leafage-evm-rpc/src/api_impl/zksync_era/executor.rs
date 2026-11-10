@@ -310,26 +310,56 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     let fair_l2_gas_price = base_fee;
     let fair_pubdata_price = gas_per_pubdata_byte * fair_l2_gas_price;
 
-    let (sim_block_number, sim_block_timestamp, prev_block_hash) = if block_number <= 1 {
-        // Legacy L2 block 0 hash: keccak256(uint32(0))
-        (
-            1,
-            1,
-            primitive_types::H256([
-                0xe8, 0xe7, 0x76, 0x26, 0x58, 0x6f, 0x73, 0xb9, 0x55, 0x36, 0x4c, 0x7b, 0x4b,
-                0xbf, 0x0b, 0xb7, 0xf7, 0x68, 0x5e, 0xbd, 0x40, 0xe8, 0x52, 0xb1, 0x64, 0x63,
-                0x3a, 0x4a, 0xcb, 0xd3, 0x24, 0x4c,
-            ]),
-        )
-    } else {
-        let prev_hash = block_hash
-            .map(|h| primitive_types::H256::from_slice(h.as_slice()))
-            .unwrap_or(primitive_types::H256::zero());
-        (
-            block_number + 1,
-            block_timestamp + 1,
-            prev_hash,
-        )
+    let (sim_block_number, sim_block_timestamp, prev_block_hash) = {
+        let sys_ctx = Address::from_slice(super::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes());
+        let slot9 = db.storage_ref(sys_ctx, AlloyU256::from(9)).unwrap_or_default();
+        let s9_bytes = slot9.to_be_bytes::<32>();
+        let num_u128 = u128::from_be_bytes(s9_bytes[0..16].try_into().unwrap());
+        let ts_u128 = u128::from_be_bytes(s9_bytes[16..32].try_into().unwrap());
+
+        if num_u128 > 0 {
+            use tiny_keccak::{Hasher, Keccak};
+            let rolling_hash = db.storage_ref(sys_ctx, AlloyU256::from(10)).unwrap_or_default();
+            let prev_slot = 11 + (num_u128.saturating_sub(1) % 257);
+            let prev_l2_hash = db.storage_ref(sys_ctx, AlloyU256::from(prev_slot)).unwrap_or_default();
+
+            let mut digest = [0u8; 128];
+            primitive_types::U256::from(num_u128).to_big_endian(&mut digest[0..32]);
+            primitive_types::U256::from(ts_u128).to_big_endian(&mut digest[32..64]);
+            digest[64..96].copy_from_slice(&prev_l2_hash.to_be_bytes::<32>());
+            digest[96..128].copy_from_slice(&rolling_hash.to_be_bytes::<32>());
+
+            let mut hasher = Keccak::v256();
+            hasher.update(&digest);
+            let mut expected_hash = [0u8; 32];
+            hasher.finalize(&mut expected_hash);
+
+            (
+                (num_u128 + 1) as u64,
+                (ts_u128 + 1) as u64,
+                primitive_types::H256(expected_hash),
+            )
+        } else if block_number <= 1 {
+            // Legacy L2 block 0 hash: keccak256(uint32(0))
+            (
+                1,
+                1,
+                primitive_types::H256([
+                    0xe8, 0xe7, 0x76, 0x26, 0x58, 0x6f, 0x73, 0xb9, 0x55, 0x36, 0x4c, 0x7b, 0x4b,
+                    0xbf, 0x0b, 0xb7, 0xf7, 0x68, 0x5e, 0xbd, 0x40, 0xe8, 0x52, 0xb1, 0x64, 0x63,
+                    0x3a, 0x4a, 0xcb, 0xd3, 0x24, 0x4c,
+                ]),
+            )
+        } else {
+            let prev_hash = block_hash
+                .map(|h| primitive_types::H256::from_slice(h.as_slice()))
+                .unwrap_or(primitive_types::H256::zero());
+            (
+                block_number + 1,
+                block_timestamp + 1,
+                prev_hash,
+            )
+        }
     };
 
     let env = BootloaderEnv {
@@ -952,30 +982,30 @@ mod tests {
 
         // Also test with SystemContext slots populated
         let sys_ctx = address!("000000000000000000000000000000000000800b");
-        let s9_num: u128 = 72824832;
-        let s9_ts: u128 = 1794287363;
+        let s9_num: u128 = 72828124;
+        let s9_ts: u128 = 1794300907;
         let mut s9_bytes = [0u8; 32];
         s9_bytes[0..16].copy_from_slice(&s9_num.to_be_bytes());
         s9_bytes[16..32].copy_from_slice(&s9_ts.to_be_bytes());
         db.insert_account_storage(sys_ctx, AlloyU256::from(9), AlloyU256::from_be_bytes(s9_bytes)).unwrap();
 
-        let rolling_bytes: [u8; 32] = hex::decode("742e22f5e6d6372604862a24a41cdabc64d805026a931e1d7d719034155cd05e").unwrap().try_into().unwrap();
+        let rolling_bytes: [u8; 32] = hex::decode("8799e1a28079a3ab301552d09d0fa5a73ae38c1e1922fd70912dea091ea0cd49").unwrap().try_into().unwrap();
         db.insert_account_storage(sys_ctx, AlloyU256::from(10), AlloyU256::from_be_bytes(rolling_bytes)).unwrap();
 
-        let prev_hash_bytes: [u8; 32] = hex::decode("398bd317b9b323edcb68748d800b855e2e5f5fc323621ebfd7a257490d0f8a25").unwrap().try_into().unwrap();
+        let prev_hash_bytes: [u8; 32] = hex::decode("43b0bea92f3bdc2e5c4a547e23e51ab7931f09d88d1fb1112750983013cd35fe").unwrap().try_into().unwrap();
         let prev_slot = 11 + (s9_num - 1) % 257;
         db.insert_account_storage(sys_ctx, AlloyU256::from(prev_slot), AlloyU256::from_be_bytes(prev_hash_bytes)).unwrap();
 
-        let prev_block_hash = b256!("f953da6fb9bb8a31f816c4f6ff1e52d7cc3dbf58e2a6706a6fd4c515db8af858");
+        // Test with dynamic SystemContext hash calculation (passing None for block_hash)
         let gas_estimate_with_ctx = estimate_era_gas(
             &db,
             caller,
             Some(to),
             &calldata,
             AlloyU256::ZERO,
-            72824832,
-            1794287363,
-            Some(prev_block_hash),
+            72828124,
+            1794300907,
+            None,
             250_000_000,
             800,
             cancel_token,
