@@ -739,7 +739,9 @@ pub fn simulate_era_transaction<DB: DatabaseRef>(
     let (output_bytes, revert_reason, error_info) = match &execution_result {
         ExecutionResult::Success { output, .. } => (output.clone().into_data().to_vec(), None, None),
         ExecutionResult::Revert { output, .. } => {
-            let msg = decode_vm_revert_reason(output.as_ref());
+            let bytes = output.as_ref();
+            let payload = if !bytes.is_empty() { &bytes[1..] } else { bytes };
+            let msg = decode_vm_revert_reason(payload);
             (vec![], Some(msg.clone()), Some((1002, msg)))
         }
         ExecutionResult::Halt { reason, .. } => {
