@@ -419,6 +419,98 @@ fn op_mainnet_calls_run_the_block_fork() {
     }
 }
 
+/// Other chains with a built-in schedule follow it too: on Soneium (1868) CLZ halts on
+/// the last pre-Karst block and runs on the Karst block. A chain without a schedule keeps
+/// the configured spec (Karst) at the same height.
+#[test]
+fn scheduled_op_stack_chains_run_the_block_fork() {
+    let api_for = |chain_id: u64| -> ApiImpl<(), OpSpecId, NoneEvmCustomConfig> {
+        let mut cfg = cfg("{}");
+        cfg.chain_id = chain_id;
+        ApiImpl::new(
+            (),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            0,
+            None,
+            None,
+            None,
+        )
+    };
+    let target = Address::repeat_byte(0x22);
+    let mut db = CacheDB::new(EmptyDB::default());
+    // PUSH1 1, CLZ, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![0x60, 1, 0x1e, 0x60, 0, 0x52, 0x60, 0x20, 0x60, 0, 0xf3].into(),
+        )),
+    );
+    let at = |number: u64, timestamp: u64| BlockEnv {
+        number: U256::from(number),
+        timestamp: U256::from(timestamp),
+        ..Default::default()
+    };
+    let pre_karst = at(25_195_824, 1_783_526_399);
+    let karst = at(25_195_825, 1_783_526_401);
+    for inspect in [false, true] {
+        for (chain_id, block, runs) in [
+            (1868, &pre_karst, false),
+            (1868, &karst, true),
+            (480, &pre_karst, true),
+        ] {
+            let api = api_for(chain_id);
+            let req = CallRequest {
+                inner: TransactionRequest::default()
+                    .to(target)
+                    .from(Address::repeat_byte(0x11))
+                    .gas_limit(100_000),
+                ..Default::default()
+            };
+            let tx = api
+                .create_txn_env(&BlockInfo::default(), block, req, &db, chain_id)
+                .unwrap();
+            let result = if inspect {
+                api.inspect_tx_commit(
+                    block,
+                    &mut db,
+                    TracingInspectorConfig::default_parity(),
+                    |_| (),
+                    tx,
+                )
+                .unwrap()
+                .0
+            } else {
+                api.transact(block, &db, tx).unwrap()
+            };
+            if runs {
+                assert_eq!(
+                    U256::from_be_slice(result.output().unwrap()),
+                    U256::from(255),
+                    "chain {chain_id}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        ExecutionResult::Halt {
+                            reason: OpHaltReason::Base(HaltReason::NotActivated),
+                            ..
+                        }
+                    ),
+                    "chain {chain_id}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
 mod pre_bedrock {
     //! OP Mainnet pre-Bedrock calls follow l2geth (OVM 2.0). Expected values were
     //! measured against the legacy l2geth archive (op-pre-l2geth) on 2026-11-05.
