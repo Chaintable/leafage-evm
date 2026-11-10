@@ -70,9 +70,8 @@ fn execute(
             &BlockInfo::default(),
             &block,
             CallRequest {
-                celo: Default::default(),
                 inner: req,
-                tempo: None,
+                other: Default::default(),
             },
             &db,
             1,
@@ -303,13 +302,12 @@ fn p256_precompile_follows_op_fork_in_normal_and_trace_execution() {
             );
             let mut db = CacheDB::new(EmptyDB::default());
             let req = CallRequest {
-                celo: Default::default(),
                 inner: TransactionRequest::default()
                     .to(Address::from_word(U256::from(256).into()))
                     .from(Address::repeat_byte(0x11))
                     .gas_limit(100000)
                     .input(TransactionInput::new(input.clone())),
-                tempo: None,
+                other: Default::default(),
             };
             let block = BlockEnv::default();
             let tx = api

@@ -114,12 +114,11 @@ async fn serve(tree: Arc<StateTree<MultiStorage>>, is_archive: bool) -> (ServerH
 
 fn call_to(n: u8) -> CallRequest {
     CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(Address::repeat_byte(0x11))
             .to(contract(n))
             .gas_limit(100_000),
-        tempo: None,
+        other: Default::default(),
     }
 }
 
@@ -153,13 +152,12 @@ async fn eth_methods_use_debank_error_codes() {
     assert_eq!(error_code(out_of_gas), -39001);
     // 100 nonzero calldata bytes: intrinsic gas 22600, EIP-7623 floor 25000.
     let below_floor = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(Address::repeat_byte(0x11))
             .to(Address::repeat_byte(0x22))
             .gas_limit(23_000)
             .input(TransactionInput::new(Bytes::from(vec![0xff; 100]))),
-        tempo: None,
+        other: Default::default(),
     };
     let below_floor = EthApiClient::call(&state, below_floor, latest, None, None).await;
     match &below_floor {

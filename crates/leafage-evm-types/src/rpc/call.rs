@@ -1,43 +1,41 @@
 use alloy::rpc::types::TransactionRequest;
+use alloy::serde::{OtherFields, WithOtherFields};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-use super::tempo::TempoCallExtension;
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Standard transaction fields plus opaque extensions interpreted by the selected chain.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(from = "WithOtherFields<TransactionRequest>")]
 pub struct CallRequest {
-    #[serde(flatten)]
     pub inner: TransactionRequest,
-
-    #[serde(flatten)]
-    pub celo: CeloCallExtension,
-
-    /// Malformed Tempo fields never fail parsing here, so other chains ignore
-    /// them; the Tempo adapter rejects them through `TempoCallExtension::invalid`.
-    #[serde(
-        flatten,
-        deserialize_with = "super::tempo::deserialize_call_extension",
-        serialize_with = "super::tempo::serialize_call_extension"
-    )]
-    pub tempo: Option<TempoCallExtension>,
+    pub other: OtherFields,
 }
 
-/// Keep Celo fields intact when forwarding requests. Values are validated by
-/// the Celo adapter, so unrelated chains continue to ignore these extensions.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CeloCallExtension {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fee_currency: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_fee_recipient: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_fee: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_fee_in_fee_currency: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eth_compatible: Option<serde_json::Value>,
+impl From<WithOtherFields<TransactionRequest>> for CallRequest {
+    fn from(request: WithOtherFields<TransactionRequest>) -> Self {
+        Self {
+            inner: request.inner,
+            other: request.other,
+        }
+    }
+}
+
+impl Serialize for CallRequest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Alloy can retain explicit nulls for standard fields in `other`.
+        // Prefer the typed values when simulation fills gas/nonce/etc., and
+        // merge before serialization so forwarding never emits duplicate keys.
+        let serde_json::Value::Object(standard) =
+            serde_json::to_value(&self.inner).map_err(serde::ser::Error::custom)?
+        else {
+            return Err(serde::ser::Error::custom(
+                "transaction request must be an object",
+            ));
+        };
+        let mut fields = self.other.clone();
+        fields.extend(standard);
+        fields.serialize(serializer)
+    }
 }
 
 impl Deref for CallRequest {
@@ -56,17 +54,18 @@ impl DerefMut for CallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TempoCallExtension;
     use alloy::primitives::{Address, Bytes, U256};
 
-    /// Parses a request, which never fails on Tempo fields, and returns the
-    /// recorded Tempo field error.
+    /// Generic parsing preserves malformed extensions; Tempo validates them separately.
     fn tempo_error(json: serde_json::Value) -> Option<String> {
         let request: CallRequest =
             serde_json::from_value(json).expect("Tempo fields must not fail parsing");
         request
-            .tempo
-            .and_then(|tempo| tempo.invalid)
-            .map(|invalid| invalid.error)
+            .other
+            .deserialize_as::<TempoCallExtension>()
+            .err()
+            .map(|e| e.to_string())
     }
 
     #[test]
@@ -109,7 +108,7 @@ mod tests {
                 serde_json::json!({"nonceKey":"0x0", "validAfter":after, "validBefore":before}),
             )
             .unwrap();
-            let tempo = request.tempo.expect("Tempo fields must not be discarded");
+            let tempo: TempoCallExtension = request.other.deserialize_as().unwrap();
             assert_eq!(tempo.valid_after, Some(100));
             assert_eq!(tempo.valid_before, Some(200));
         }
@@ -151,7 +150,7 @@ mod tests {
         });
 
         let req: CallRequest = serde_json::from_value(json).expect("should deserialize");
-        let t = req.tempo.as_ref().expect("tempo extension should be present");
+        let t: TempoCallExtension = req.other.deserialize_as().unwrap();
         assert_eq!(t.nonce_key, Some(U256::from(1)));
         assert_eq!(t.key_type, Some("p256".to_string()));
         assert_eq!(t.key_data, Some(Bytes::from(vec![0xab, 0xcd])));
@@ -199,7 +198,8 @@ mod tests {
         });
 
         let req: CallRequest = serde_json::from_value(json).expect("should deserialize standard request");
-        let t = req.tempo.unwrap_or_default();
+        assert!(req.other.is_empty());
+        let t: TempoCallExtension = req.other.deserialize_as().unwrap();
         assert!(t.tempo_calls.is_none());
         assert!(t.nonce_key.is_none());
         assert!(t.key_type.is_none());
@@ -231,8 +231,8 @@ mod tests {
         let serialized = serde_json::to_value(&req).expect("serialize");
         let req2: CallRequest = serde_json::from_value(serialized).expect("re-deserialize");
 
-        let t1 = req.tempo.as_ref().unwrap();
-        let t2 = req2.tempo.as_ref().unwrap();
+        let t1: TempoCallExtension = req.other.deserialize_as().unwrap();
+        let t2: TempoCallExtension = req2.other.deserialize_as().unwrap();
         assert_eq!(t1.nonce_key, t2.nonce_key);
         assert_eq!(t1.key_type, t2.key_type);
         assert_eq!(t1.fee_token, t2.fee_token);
@@ -252,9 +252,7 @@ mod tests {
             "feeToken": "0x0000000000000000000000000000000000000004"
         });
         let request: CallRequest = serde_json::from_value(json.clone()).unwrap();
-        let tempo = request.tempo.as_ref().unwrap();
-        assert!(tempo.invalid.is_some());
-        assert!(tempo.fee_token.is_none() && tempo.key_type.is_none());
+        assert!(request.other.deserialize_as::<TempoCallExtension>().is_err());
 
         let serialized = serde_json::to_value(&request).unwrap();
         for key in ["keyType", "validBefore", "feeToken", "from", "to"] {

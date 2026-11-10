@@ -220,12 +220,11 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     .abi_encode();
 
     let call_request = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
             .input(TransactionInput::new(Bytes::from(calldata.clone()))),
-        tempo: None,
+        other: Default::default(),
     };
     let ticket_id = EthApiClient::call(
         &client,
@@ -239,9 +238,8 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     assert_eq!(ticket_id.len(), 32);
 
     let read_request = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default().from(sender).to(target),
-        tempo: None,
+        other: Default::default(),
     };
     let simulation = DebankApiClient::simulate_transactions(
         &client,
@@ -306,9 +304,8 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
         let estimate = DebankApiClient::estimate_gas(
             &client,
             CallRequest {
-                celo: Default::default(),
                 inner: tx,
-                tempo: None,
+                other: Default::default(),
             },
             None,
             None,
@@ -323,13 +320,12 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     assert!(estimates[0] < U256::from(100_000u64));
 
     let low_gas_request = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
             .gas_limit(21_000)
             .input(TransactionInput::new(Bytes::from(calldata.clone()))),
-        tempo: None,
+        other: Default::default(),
     };
     assert!(EthApiClient::call(
         &client,
@@ -352,12 +348,11 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     }
     .abi_encode();
     let reverting_request = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
             .input(TransactionInput::new(Bytes::from(reverting_calldata))),
-        tempo: None,
+        other: Default::default(),
     };
     assert!(EthApiClient::call(
         &client,
@@ -386,14 +381,13 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
         .any(|trace| trace.to_addr == NODE_INTERFACE_ADDRESS));
 
     let above_eip7825_cap = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(sender)
             .to(target)
             // A real Nitro transaction with this declared gas limit was included
             // successfully and also replays successfully at its parent block.
             .gas_limit(20_000_000),
-        tempo: None,
+        other: Default::default(),
     };
     EthApiClient::call(
         &client,
@@ -590,11 +584,10 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
     let high_gas_estimate = DebankApiClient::estimate_gas(
         &osaka_client,
         CallRequest {
-            celo: Default::default(),
             inner: TransactionRequest::default()
                 .from(sender)
                 .to(high_gas_target),
-            tempo: None,
+            other: Default::default(),
         },
         None,
         None,

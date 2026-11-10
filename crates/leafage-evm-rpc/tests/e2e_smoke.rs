@@ -147,20 +147,18 @@ async fn rpc_smoke_over_layered_state() {
         .parse()
         .unwrap();
     let balance_req = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .to(sentinel)
             .input(TransactionInput::new(Bytes::from(balance_of))),
-        tempo: None,
+        other: Default::default(),
     };
     // Plain value transfer to an empty account (goes through the EVM).
     let transfer_req = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(alice)
             .to(bob)
             .value(U256::from(1u64)),
-        tempo: None,
+        other: Default::default(),
     };
 
     // The repeated balance call exercises the shared request cache.
@@ -196,12 +194,11 @@ async fn rpc_smoke_over_layered_state() {
     // A request gas above the estimate cap is clamped to the cap, so a
     // call that needs 20M gas fails instead of estimating past 2^24.
     let gas_gate_req = CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(alice)
             .to(gas_gate)
             .gas_limit(30_000_000),
-        tempo: None,
+        other: Default::default(),
     };
     let res = DebankApiClient::estimate_gas(&client, gas_gate_req, None, None).await;
     assert!(res.is_err(), "estimated past the cap: {res:?}");
@@ -217,9 +214,8 @@ async fn rpc_smoke_over_layered_state() {
     let baseline = DebankApiClient::estimate_gas(
         &client,
         CallRequest {
-            celo: Default::default(),
             inner: whale_call.clone(),
-            tempo: None,
+            other: Default::default(),
         },
         None,
         None,
@@ -229,9 +225,8 @@ async fn rpc_smoke_over_layered_state() {
     let max_gas = DebankApiClient::estimate_gas(
         &client,
         CallRequest {
-            celo: Default::default(),
             inner: whale_call.gas_limit(u64::MAX).gas_price(1),
-            tempo: None,
+            other: Default::default(),
         },
         None,
         None,
@@ -396,21 +391,19 @@ async fn multicall_prefetch_matches_scalar_semantics() {
     );
 
     let call = |to: Address| CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default().from(alice).to(to),
-        tempo: None,
+        other: Default::default(),
     };
     let mut requests: Vec<CallRequest> = (0..6u8).map(|n| call(contract(n))).collect();
     // An EOA callee (no code) and a value transfer to a nonexistent
     // account keep None/empty accounts on the prefetch path.
     requests.push(call(alice));
     requests.push(CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default()
             .from(alice)
             .to(bob)
             .value(U256::from(1u64)),
-        tempo: None,
+        other: Default::default(),
     });
     // EXTCODEHASH(CALLER) with alice as caller: her stored code hash
     // is literally zero and must survive the prefetch unnormalized.

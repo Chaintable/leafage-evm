@@ -223,9 +223,8 @@ fn setup(
         .unwrap();
 
     let call = |to: Address| CallRequest {
-        celo: Default::default(),
         inner: TransactionRequest::default().from(alice).to(to),
-        tempo: None,
+        other: Default::default(),
     };
     let sload_sets = (0..sets)
         .map(|s| (0..CALLS).map(|i| call(contract(s * CALLS + i))).collect())

@@ -19,11 +19,10 @@ pub fn create_txn_env<DB: DatabaseRef>(
     chain_id: u64,
 ) -> Result<CeloCallTx, CallInputError<DB::Error>> {
     let cfg = CeloL1Config::cfg_at(cfg, block).map_err(CallInputError::InvalidParams)?;
-    let fields = serde_json::from_value(
-        serde_json::to_value(&request.celo)
-            .map_err(|e| CallInputError::InvalidParams(e.to_string()))?,
-    )
-    .map_err(|e| CallInputError::InvalidParams(e.to_string()))?;
+    let fields: CeloFields = request
+        .other
+        .deserialize_as()
+        .map_err(|e| CallInputError::InvalidParams(e.to_string()))?;
     if request.gas_price.is_some()
         && (request.max_fee_per_gas.is_some() || request.max_priority_fee_per_gas.is_some())
     {
@@ -91,11 +90,20 @@ pub fn create_txn_env<DB: DatabaseRef>(
 pub(super) struct CeloFields {
     pub fee_currency: Option<Address>,
     pub gateway_fee_recipient: Option<Address>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     pub gateway_fee: U256,
     pub max_fee_in_fee_currency: Option<U256>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     pub eth_compatible: bool,
+}
+
+// RPC callers may explicitly send null for omitted Celo parameters.
+fn default_on_null<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Clone, Debug)]

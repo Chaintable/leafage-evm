@@ -96,12 +96,11 @@ async fn op_config_reaches_call_estimate_multicall_and_trace() {
             .unwrap();
         let latest = BlockId::Number(BlockNumberOrTag::Latest);
         let req = |data: Bytes| CallRequest {
-            celo: Default::default(),
             inner: TransactionRequest::default()
                 .from(alice)
                 .gas_limit(10_000_000)
                 .input(TransactionInput::new(data)),
-            tempo: None,
+            other: Default::default(),
         };
         let mut clz = req(Bytes::new());
         clz.inner = clz.inner.to(contract);
