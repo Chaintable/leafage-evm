@@ -310,7 +310,43 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     let fair_l2_gas_price = base_fee;
     let fair_pubdata_price = gas_per_pubdata_byte * fair_l2_gas_price;
 
-    let (sim_block_number, sim_block_timestamp, prev_block_hash) = if let Some(hash) = block_hash {
+    let system_context_addr = Address::from_slice(super::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes());
+    let slot9 = db
+        .storage_ref(system_context_addr, AlloyU256::from(9))
+        .unwrap_or_default();
+
+    let (sim_block_number, sim_block_timestamp, prev_block_hash) = if slot9 != AlloyU256::ZERO {
+        use tiny_keccak::{Hasher, Keccak};
+        let s9_bytes = slot9.to_be_bytes::<32>();
+        let num_u128 = u128::from_be_bytes(s9_bytes[0..16].try_into().unwrap());
+        let ts_u128 = u128::from_be_bytes(s9_bytes[16..32].try_into().unwrap());
+
+        let rolling_hash = db
+            .storage_ref(system_context_addr, AlloyU256::from(10))
+            .unwrap_or_default();
+
+        let prev_hash_slot = 11 + (num_u128.saturating_sub(1) % 257);
+        let prev_l2_hash = db
+            .storage_ref(system_context_addr, AlloyU256::from(prev_hash_slot))
+            .unwrap_or_default();
+
+        let mut digest = [0u8; 128];
+        primitive_types::U256::from(num_u128).to_big_endian(&mut digest[0..32]);
+        primitive_types::U256::from(ts_u128).to_big_endian(&mut digest[32..64]);
+        digest[64..96].copy_from_slice(&prev_l2_hash.to_be_bytes::<32>());
+        digest[96..128].copy_from_slice(&rolling_hash.to_be_bytes::<32>());
+
+        let mut hasher = Keccak::v256();
+        hasher.update(&digest);
+        let mut expected_hash = [0u8; 32];
+        hasher.finalize(&mut expected_hash);
+
+        (
+            (num_u128 + 1) as u64,
+            (ts_u128 + 1) as u64,
+            primitive_types::H256(expected_hash),
+        )
+    } else if let Some(hash) = block_hash {
         let h256 = primitive_types::H256::from_slice(hash.as_slice());
         if block_number == 0 {
             (1, 1, h256)
@@ -948,10 +984,68 @@ mod tests {
             None,
             250_000_000,
             800,
-            cancel_token,
+            cancel_token.clone(),
         ).unwrap();
 
         assert!(gas_estimate > 0);
         assert!(gas_estimate < crate::api_impl::zksync_era::bootloader::constants::MAX_L2_TX_GAS_LIMIT);
+
+        // Also test with SystemContext slots populated
+        let sys_ctx = address!("000000000000000000000000000000000000800b");
+        let s9_num: u128 = 72824372;
+        let s9_ts: u128 = 1794283702;
+        let mut s9_bytes = [0u8; 32];
+        s9_bytes[0..16].copy_from_slice(&s9_num.to_be_bytes());
+        s9_bytes[16..32].copy_from_slice(&s9_ts.to_be_bytes());
+        db.insert_account_storage(sys_ctx, AlloyU256::from(9), AlloyU256::from_be_bytes(s9_bytes)).unwrap();
+
+        let rolling_bytes: [u8; 32] = hex::decode("6ebb9d437ddaf610f297836e7ce5d32006f93a9e8d39003a589c806b1c4f42d6").unwrap().try_into().unwrap();
+        db.insert_account_storage(sys_ctx, AlloyU256::from(10), AlloyU256::from_be_bytes(rolling_bytes)).unwrap();
+
+        let prev_hash_bytes: [u8; 32] = hex::decode("75bf8b3b007b9089629d773691c559e6c870fa0d0775ccd1ef7cd1b79ec5eca6").unwrap().try_into().unwrap();
+        let prev_slot = 11 + (s9_num - 1) % 257;
+        db.insert_account_storage(sys_ctx, AlloyU256::from(prev_slot), AlloyU256::from_be_bytes(prev_hash_bytes)).unwrap();
+
+        let gas_estimate_with_ctx = estimate_era_gas(
+            &db,
+            caller,
+            Some(to),
+            &calldata,
+            AlloyU256::ZERO,
+            1,
+            1,
+            None,
+            250_000_000,
+            800,
+            cancel_token,
+        ).expect("Gas estimation should succeed with dynamic SystemContext block hash!");
+
+        assert!(gas_estimate_with_ctx > 0);
+        assert!(gas_estimate_with_ctx < crate::api_impl::zksync_era::bootloader::constants::MAX_L2_TX_GAS_LIMIT);
+    }
+
+    #[test]
+    fn test_verify_hash() {
+        use tiny_keccak::{Hasher, Keccak};
+        use alloy::hex;
+        let s9_num: u128 = 72824372;
+        let s9_ts: u128 = 1794283702;
+        let prev_l2_hash = hex::decode("75bf8b3b007b9089629d773691c559e6c870fa0d0775ccd1ef7cd1b79ec5eca6").unwrap();
+        let rolling = hex::decode("6ebb9d437ddaf610f297836e7ce5d32006f93a9e8d39003a589c806b1c4f42d6").unwrap();
+
+        let mut digest = [0u8; 128];
+        primitive_types::U256::from(s9_num).to_big_endian(&mut digest[0..32]);
+        primitive_types::U256::from(s9_ts).to_big_endian(&mut digest[32..64]);
+        digest[64..96].copy_from_slice(&prev_l2_hash);
+        digest[96..128].copy_from_slice(&rolling);
+
+        let mut hasher = Keccak::v256();
+        hasher.update(&digest);
+        let mut out = [0u8; 32];
+        hasher.finalize(&mut out);
+
+        let hex_out = hex::encode(out);
+        eprintln!("CALCULATED HASH: 0x{}", hex_out);
+        assert_eq!(hex_out, "8e57f8b6e88130691e8406b011b254d19210b7f29b63f261ac3049cc3475e226");
     }
 }
