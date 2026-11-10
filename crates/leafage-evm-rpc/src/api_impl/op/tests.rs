@@ -71,7 +71,7 @@ fn execute(
             &block,
             CallRequest {
                 inner: req,
-                tempo: None,
+                other: Default::default(),
             },
             &db,
             1,
@@ -307,7 +307,7 @@ fn p256_precompile_follows_op_fork_in_normal_and_trace_execution() {
                     .from(Address::repeat_byte(0x11))
                     .gas_limit(100000)
                     .input(TransactionInput::new(input.clone())),
-                tempo: None,
+                other: Default::default(),
             };
             let block = BlockEnv::default();
             let tx = api
@@ -383,7 +383,7 @@ fn op_mainnet_calls_run_the_block_fork() {
                     .to(target)
                     .from(Address::repeat_byte(0x11))
                     .gas_limit(100_000),
-                tempo: None,
+                ..Default::default()
             };
             let tx = api
                 .create_txn_env(&BlockInfo::default(), &block, req, &db, 10)
@@ -507,7 +507,7 @@ mod pre_bedrock {
         }
         let req = CallRequest {
             inner: req,
-            tempo: None,
+            ..Default::default()
         };
         let tx = api
             .create_txn_env(&BlockInfo::default(), &block, req, &*db, 10)

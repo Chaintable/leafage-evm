@@ -208,7 +208,7 @@ fn setup(enable_cache: bool, block_cache_mb: usize, sets: usize, addr: &str) -> 
                     inner: TransactionRequest::default()
                         .from(alice)
                         .to(contract(s * CALLS + i)),
-                    tempo: None,
+                    other: Default::default(),
                 })
                 .collect()
         })

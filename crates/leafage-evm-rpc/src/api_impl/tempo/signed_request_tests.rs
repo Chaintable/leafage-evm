@@ -276,11 +276,12 @@ fn review_self_sponsorship_gate_and_incomplete_requests() {
         "maxFeePerGas":"0x0","maxPriorityFeePerGas":"0x0","feePayerSignature":signature
     });
     let request: CallRequest = serde_json::from_value(json.clone()).unwrap();
+    let extension: TempoCallExtension = request.other.deserialize_as().unwrap();
     assert_eq!(
-        resolve_fee_payer(&request, &[], TempoHardfork::T1C).unwrap(),
+        resolve_fee_payer(&request, &extension, &[], TempoHardfork::T1C).unwrap(),
         Some(caller)
     );
-    assert!(resolve_fee_payer(&request, &[], TempoHardfork::T2)
+    assert!(resolve_fee_payer(&request, &extension, &[], TempoHardfork::T2)
         .unwrap_err()
         .message()
         .contains("cannot resolve to sender"));
@@ -290,14 +291,13 @@ fn review_self_sponsorship_gate_and_incomplete_requests() {
         incomplete.as_object_mut().unwrap().remove(field);
         let request = serde_json::from_value(incomplete).unwrap();
         assert!(
-            resolve_fee_payer(&request, &[], TempoHardfork::T1C).is_err(),
+            resolve_fee_payer(&request, &extension, &[], TempoHardfork::T1C).is_err(),
             "{field}"
         );
     }
-    let mut bad = request;
-    bad.tempo.as_mut().unwrap().fee_payer_signature =
-        Some(Signature::new(U256::ZERO, U256::ZERO, false));
-    assert!(resolve_fee_payer(&bad, &[], TempoHardfork::T1C).is_err());
+    let mut bad = extension;
+    bad.fee_payer_signature = Some(Signature::new(U256::ZERO, U256::ZERO, false));
+    assert!(resolve_fee_payer(&request, &bad, &[], TempoHardfork::T1C).is_err());
 }
 
 #[test]

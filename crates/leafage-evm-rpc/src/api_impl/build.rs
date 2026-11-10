@@ -327,8 +327,35 @@ where
                 run_chain_setup!(env, custom_evm_cfg)
             }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
-            MultiChainCfgEnv::Celo(env) => {
+            MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L2(env)) => {
                 run_chain_setup!(env, Some(leafage_evm_chains::celo::CeloConfig))
+            }
+            MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L1(env)) => {
+                let mut api_impl = ApiImpl::new(
+                    self.db,
+                    env,
+                    Some(leafage_evm_chains::celo::l1::CeloL1Config),
+                    self.ovm_address,
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                    version.clone(),
+                    estimate_gas_buffer,
+                    self.token_collector.clone(),
+                    exec_limiter.clone(),
+                    state_read_limiter.clone(),
+                );
+                api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                let api = Api::new(api_impl);
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
+                register_api(&mut rpc_module, api.clone())?;
+                super::celo::l1::rpc::register(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Base(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
