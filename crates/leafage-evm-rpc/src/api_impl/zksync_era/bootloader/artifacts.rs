@@ -2,11 +2,18 @@ use primitive_types::U256;
 
 pub const FEE_ESTIMATE_BYTECODE: &[u8] = include_bytes!("artifacts/fee_estimate.yul.zbin");
 pub const DEFAULT_AA_BYTECODE: &[u8] = include_bytes!("artifacts/default_aa.bin");
+pub const EVM_EMULATOR_BYTECODE: &[u8] = include_bytes!("artifacts/evm_emulator.bin");
 
 pub const DEFAULT_AA_CODE_HASH: [u8; 32] = [
     0x01, 0x00, 0x05, 0x5b, 0x7a, 0x8b, 0xe9, 0x05, 0x22, 0x25, 0x1b, 0xe8, 0xbe, 0x1a, 0x18,
     0x64, 0x64, 0xd0, 0x56, 0x46, 0x29, 0x73, 0x50, 0x2a, 0xc8, 0xa0, 0x43, 0x7c, 0x85, 0xe4,
     0xd2, 0xa9,
+];
+
+pub const EVM_EMULATOR_CODE_HASH: [u8; 32] = [
+    0x01, 0x00, 0x0c, 0x07, 0xb3, 0xdb, 0x6a, 0xf3, 0xa6, 0x45, 0x75, 0x9f, 0x18, 0x1e, 0xe4,
+    0x9d, 0xdb, 0xa1, 0xa8, 0x9e, 0x50, 0x17, 0x96, 0xde, 0x17, 0x6d, 0xde, 0x6b, 0x98, 0x0d,
+    0x2a, 0x60,
 ];
 
 pub const FEE_ESTIMATE_CODE_HASH: [u8; 32] = [
@@ -17,6 +24,10 @@ pub const FEE_ESTIMATE_CODE_HASH: [u8; 32] = [
 
 pub fn default_aa_hash_u256() -> U256 {
     U256::from_big_endian(&DEFAULT_AA_CODE_HASH)
+}
+
+pub fn evm_emulator_hash_u256() -> U256 {
+    U256::from_big_endian(&EVM_EMULATOR_CODE_HASH)
 }
 
 pub fn fee_estimate_hash_u256() -> U256 {
@@ -51,5 +62,8 @@ mod tests {
 
         let computed_bootloader = compute_bytecode_hash(FEE_ESTIMATE_BYTECODE, true);
         assert_eq!(computed_bootloader, FEE_ESTIMATE_CODE_HASH);
+
+        let computed_evm_emulator = compute_bytecode_hash(EVM_EMULATOR_BYTECODE, false);
+        assert_eq!(computed_evm_emulator, EVM_EMULATOR_CODE_HASH);
     }
 }

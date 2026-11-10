@@ -158,14 +158,17 @@ impl<DB: DatabaseRef> World<()> for EraStorageWorld<DB> {
 
     fn decommit_code(&mut self, hash: U256) -> Vec<u8> {
         use super::bootloader::artifacts::{
-            default_aa_hash_u256, fee_estimate_hash_u256, DEFAULT_AA_BYTECODE,
-            FEE_ESTIMATE_BYTECODE,
+            default_aa_hash_u256, evm_emulator_hash_u256, fee_estimate_hash_u256,
+            DEFAULT_AA_BYTECODE, EVM_EMULATOR_BYTECODE, FEE_ESTIMATE_BYTECODE,
         };
         if hash == fee_estimate_hash_u256() {
             return FEE_ESTIMATE_BYTECODE.to_vec();
         }
         if hash == default_aa_hash_u256() {
             return DEFAULT_AA_BYTECODE.to_vec();
+        }
+        if hash == evm_emulator_hash_u256() {
+            return EVM_EMULATOR_BYTECODE.to_vec();
         }
 
         let mut hash_bytes = [0u8; 32];
@@ -236,7 +239,7 @@ pub fn execute_era_call<DB: DatabaseRef>(
     let mut world = EraStorageWorld::new(db);
     let settings = Settings {
         default_aa_code_hash: super::bootloader::artifacts::DEFAULT_AA_CODE_HASH,
-        evm_interpreter_code_hash: [0; 32],
+        evm_interpreter_code_hash: super::bootloader::artifacts::EVM_EMULATOR_CODE_HASH,
         hook_address: 0,
     };
 
@@ -297,14 +300,34 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     let val_bytes = value.to_be_bytes::<32>();
     let value_u256 = U256::from_big_endian(&val_bytes);
 
+    let sys_ctx = Address::from_slice(super::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes());
+
     let gas_per_pubdata_byte = if gas_per_pubdata_byte == 0 {
-        DEFAULT_GAS_PER_PUBDATA
+        let s271: u64 = db
+            .storage_ref(sys_ctx, AlloyU256::from(271))
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(0);
+        if s271 > 0 {
+            s271
+        } else {
+            DEFAULT_GAS_PER_PUBDATA
+        }
     } else {
         gas_per_pubdata_byte
     };
 
     let base_fee = if base_fee == 0 {
-        DEFAULT_L2_BASE_FEE
+        let s6: u64 = db
+            .storage_ref(sys_ctx, AlloyU256::from(6))
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(0);
+        if s6 > 0 {
+            s6
+        } else {
+            DEFAULT_L2_BASE_FEE
+        }
     } else {
         base_fee
     };
@@ -313,7 +336,6 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     let fair_pubdata_price = gas_per_pubdata_byte * fair_l2_gas_price;
 
     let (sim_block_number, sim_block_timestamp, prev_block_hash) = {
-        let sys_ctx = Address::from_slice(super::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes());
         let slot9 = db.storage_ref(sys_ctx, AlloyU256::from(9)).unwrap_or_default();
         let s9_bytes = slot9.to_be_bytes::<32>();
         let num_u128 = u128::from_be_bytes(s9_bytes[0..16].try_into().unwrap());

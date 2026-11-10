@@ -92,7 +92,7 @@ pub fn execute_bootloader<DB: DatabaseRef>(
 
     let settings = Settings {
         default_aa_code_hash: artifacts::DEFAULT_AA_CODE_HASH,
-        evm_interpreter_code_hash: artifacts::DEFAULT_AA_CODE_HASH,
+        evm_interpreter_code_hash: artifacts::EVM_EMULATOR_CODE_HASH,
         hook_address: VM_HOOK_ADDRESS,
     };
 
